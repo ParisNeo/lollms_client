@@ -22,20 +22,20 @@ pip install lollms_client
 Here's an example of how to use the LoLLMs Client library:
 
 ```python
-from lollms_client import send_post_request
+from lollms_client import generate_text
 
-response = send_post_request(host_address="http://localhost:9600", prompt="Your prompt here")
+response = generate_text(host_address="http://localhost:9600", prompt="Your prompt here")
 print(response)
 ```
 
 ## API Reference
 
-### send_post_request
+### generate_text
 
 Sends a POST request to the specified LoLLMs generate endpoint.
 
 ```python
-send_post_request(
+generate_text(
     host_address: str,
     prompt: str,
     model_name: Optional[str] = None,

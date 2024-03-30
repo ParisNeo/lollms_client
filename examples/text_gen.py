@@ -6,7 +6,7 @@ host_address = "http://localhost:9600"
 prompt = "Your prompt here"
 
 # Send a POST request
-response = generate_text(host_address, prompt)
+response = generate_text(host_address, prompt,personality=2)
 
 # Print the response
 print(response)
