@@ -1,6 +1,6 @@
 import requests
 
-def send_post_request(host_address, prompt, model_name=None, personality=-1, n_predict=1024, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8):
+def generate_text(host_address, prompt, model_name=None, personality=-1, n_predict=1024, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8):
     url = f"{host_address}/lollms_generate"
 
     data = {
