@@ -21,6 +21,14 @@ def generate_text(host_address, prompt, model_name=None, personality=-1, n_predi
     response = requests.post(url, json=data)
 
     if response.status_code == 200:
-        return response.text
+        try:
+            text = response.text.strip()
+            if text[0]=='"':
+                text = text[1:]
+            if text[-1]=='"':
+                text = text[:-1]
+            return text
+        except Exception as ex:
+            return {"status": False, "error": str(ex)}
     else:
         return {"status": False, "error": response.text}
