@@ -22,7 +22,7 @@ def generate_text(host_address, prompt, model_name=None, personality=-1, n_predi
 
     if response.status_code == 200:
         try:
-            text = response.text.strip()
+            text = response.text.strip().replace('\"','"')
             if text[0]=='"':
                 text = text[1:]
             if text[-1]=='"':
