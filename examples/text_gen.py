@@ -1,12 +1,20 @@
-# Import the library
-from lollms_client import generate_text
+from lollms_client import LollmsClient
 
-# Define the host address and prompt
-host_address = "http://localhost:9600"
-prompt = "Your prompt here"
+# Initialize the LollmsClient instance
+lc = LollmsClient("http://localhost:9600")
 
-# Send a POST request
-response = generate_text(host_address, prompt,personality=2)
+# Generate Text
+response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
+print(response)
 
-# Print the response
+# Generate Completion
+response = lc.generate_completion(prompt="What is the capital of France", stream=False, temperature=0.5)
+print(response)
+
+# List Mounted Personalities
+response = lc.listMountedPersonalities()
+print(response)
+
+# List Models
+response = lc.listModels()
 print(response)

@@ -1,80 +1,89 @@
-# LoLLMs Client Library
+# lollms_client
 
-LoLLMs Client is a Python library for interacting with the LoLLMs generate endpoint. This library simplifies the process of sending POST requests to the endpoint and handling responses.
+[![Python Version](https://img.shields.io/pypi/pyversions/lollms-client)](https://pypi.org/project/lollms-client/) [![PyPI Downloads](https://img.shields.io/pypi/dw/lollms-client)](https://pypi.org/project/lollms-client/) [![Apache License](https://img.shields.io/apachie/2.0)](https://www.apache.org/licenses/LICENSE-2.0)
 
-## Table of Contents
-1. [Installation](#installation)
-2. [Usage](#usage)
-3. [API Reference](#api-reference)
-4. [Contributing](#contributing)
-5. [License](#license)
+Welcome to the lollms_client repository! This library is built by [ParisNeo](https://github.com/ParisNeo) and provides a convenient way to interact with the lollms (Lord Of Large Language Models) API. It is available on [PyPI](https://pypi.org/project/lollms-client/) and distributed under the Apache 2.0 License.
 
 ## Installation
 
-To install the LoLLMs Client library, use pip:
+To install the library from PyPI using `pip`, run:
 
-```bash
-pip install lollms_client
+```
+pip install lollms-client
 ```
 
 ## Usage
 
-Here's an example of how to use the LoLLMs Client library:
+To use the lollms_client, first import the necessary classes:
 
 ```python
-from lollms_client import generate_text
+from lollms_client import LollmsClient
 
-response = generate_text(host_address="http://localhost:9600", prompt="Your prompt here")
+# Initialize the LollmsClient instance
+lc = LollmsClient("http://localhost:9600")
+```
+
+### Text Generation
+
+Use `generate_text()` for generating text from the lollms API.
+
+```python
+response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
 print(response)
 ```
 
-## API Reference
+### Completion
 
-### generate_text
-
-Sends a POST request to the specified LoLLMs generate endpoint.
+Use `generate_completion()` for getting a completion of the prompt from the lollms API.
 
 ```python
-generate_text(
-    host_address: str,
-    prompt: str,
-    model_name: Optional[str] = None,
-    personality: int = -1,
-    n_predict: int = 1024,
-    stream: bool = False,
-    temperature: float = 0.1,
-    top_k: int = 50,
-    top_p: float = 0.95,
-    repeat_penalty: float = 0.8,
-    repeat_last_n: int = 40,
-    seed: Optional[int] = None,
-    n_threads: int = 8
-)
+response = lc.generate_completion(prompt="What is the capital of France", stream=False, temperature=0.5)
+print(response)
 ```
 
-#### Parameters
-- `host_address` (str): The host address of the LoLLMs generate endpoint (e.g., 'http://localhost:9600').
-- `prompt` (str): The prompt to be sent to the LoLLMs generate endpoint.
-- `model_name` (Optional[str]): The name of the model to be used (default: None).
-- `personality` (int): The personality to be used (default: -1).
-- `n_predict` (int): The number of tokens to predict (default: 1024).
-- `stream` (bool): Whether to stream the response (default: False).
-- `temperature` (float): The temperature for sampling (default: 0.1).
-- `top_k` (int): The number of top choices for sampling (default: 50).
-- `top_p` (float): The cumulative probability for top-p sampling (default: 0.95).
-- `repeat_penalty` (float): The penalty for repeating previous tokens (default: 0.8).
-- `repeat_last_n` (int): The number of previous tokens to consider for repeat penalty (default: 40).
-- `seed` (Optional[int]): The seed for random number generation (default: None).
-- `n_threads` (int): The number of threads to use for token prediction (default: 8).
+### List Mounted Personalities
 
-#### Returns
-- If the request is successful, the function returns the response text.
-- If the request fails, the function returns a dictionary with the status set to False and the error message in the response: `{"status": False, "error": str(ex)}`.
+List mounted personalities of the lollms API with the `listMountedPersonalities()` method.
 
-## Contributing
+```python
+response = lc.listMountedPersonalities()
+print(response)
+```
 
-Contributions are welcome! If you'd like to contribute to this project, please open a pull request with your proposed changes.
+### List Models
 
-## License
+List available models of the lollms API with the `listModels()` method.
 
-LoLLMs Client is released under the [Apache 2.0 License](LICENSE).
+```python
+response = lc.listModels()
+print(response)
+```
+
+## Complete Example
+
+```python
+from lollms_client import LollmsClient
+
+# Initialize the LollmsClient instance
+lc = LollmsClient("http://localhost:9600")
+
+# Generate Text
+response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
+print(response)
+
+# Generate Completion
+response = lc.generate_completion(prompt="What is the capital of France", stream=False, temperature=0.5)
+print(response)
+
+# List Mounted Personalities
+response = lc.listMountedPersonalities()
+print(response)
+
+# List Models
+response = lc.listModels()
+print(response)
+```
+
+Feel free to contribute to the project by submitting issues or pull requests. Follow [ParisNeo](https://github.com/ParisNeo) on [GitHub](https://github.com/ParisNeo), [Twitter](https://twitter.com/ParisNeo_AI), [Discord](https://discord.gg/BDxacQmv), [Sub-Reddit](r/lollms), and [Instagram](https://www.instagram.com/spacenerduino/) for updates and news.
+
+Happy coding!
