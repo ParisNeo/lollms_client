@@ -1,3 +1,4 @@
+from  enum import Enum
 class MSG_TYPE(Enum):
     # Messaging
     MSG_TYPE_CHUNK                  = 0 # A chunk of a message (used for classical chat)
