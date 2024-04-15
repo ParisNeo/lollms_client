@@ -3,9 +3,12 @@ import setuptools
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
+with open('requirements.txt', 'r') as f:
+    install_requires = f.read().splitlines()
+    
 setuptools.setup(
     name="lollms_client",
-    version="0.2.8",
+    version="0.3.0",
     author="ParisNeo",
     author_email="parisneoai@gmail.com",
     description="A client library for LoLLMs generate endpoint",

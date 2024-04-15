@@ -60,7 +60,7 @@ class LollmsClient():
             "prompt": prompt,
             "model_name": self.model_name,
             "personality": self.personality,
-            "n_predict": self.n_predict,
+            "n_predict": n_predict,
             "stream": stream,
             "temperature": self.temperature,
             "top_k": self.top_k,
