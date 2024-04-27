@@ -1,2 +1,7 @@
 requests>=2.25.1
 ascii-colors
+safe_store
+pillow
+pipmaster
+yaml
+tiktoken
