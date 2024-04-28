@@ -22,7 +22,8 @@ class LollmsClient():
                     model_name=None,
                     ctx_size=4096,
                     personality=-1, 
-                    n_predict=1024, 
+                    n_predict=1024,
+                    min_n_predict=512, 
                     temperature=0.1, 
                     top_k=50, 
                     top_p=0.95, 
@@ -40,6 +41,7 @@ class LollmsClient():
         self.model_name = model_name
         self.ctx_size = ctx_size
         self.n_predict = n_predict
+        self.min_n_predict = min_n_predict
         self.personality = personality
         self.temperature = temperature
         self.top_k = top_k
