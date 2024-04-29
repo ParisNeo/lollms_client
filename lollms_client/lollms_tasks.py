@@ -1,7 +1,8 @@
 from lollms_client.lollms_core import LollmsClient
+from lollms_client.lollms_types import  SUMMARY_MODE
 from typing import List
 from ascii_colors import ASCIIColors
-
+from safe_store.document_decomposer import DocumentDecomposer
 class TasksLibrary:
     def __init__(self, lollms:LollmsClient) -> None:
         self.lollms = lollms
@@ -227,3 +228,147 @@ class TasksLibrary:
                 return -1
         else:
             return -1
+
+
+    def summerize_text(
+                        self,
+                        text,
+                        summary_instruction="summerize",
+                        doc_name="chunk",
+                        answer_start="",
+                        max_generation_size=3000,
+                        max_summary_size=512,
+                        callback=None,
+                        chunk_summary_post_processing=None,
+                        summary_mode=SUMMARY_MODE.SUMMARY_MODE_SEQUENCIAL
+                    ):
+        depth=0
+        tk = self.lollms.tokenize(text)
+        prev_len = len(tk)
+        document_chunks=None
+        while len(tk)>max_summary_size and (document_chunks is None or len(document_chunks)>1):
+            self.step_start(f"Comprerssing {doc_name}... [depth {depth+1}]")
+            chunk_size = int(self.lollms.ctx_size*0.6)
+            document_chunks = DocumentDecomposer.decompose_document(text, chunk_size, 0, self.lollms.tokenize, self.lollms.detokenize, True)
+            text = self.summerize_chunks(
+                                            document_chunks,
+                                            summary_instruction, 
+                                            doc_name, 
+                                            answer_start, 
+                                            max_generation_size, 
+                                            callback, 
+                                            chunk_summary_post_processing=chunk_summary_post_processing,
+                                            summary_mode=summary_mode)
+            tk = self.lollms.tokenize(text)
+            tk = self.lollms.tokenize(text)
+            dtk_ln=prev_len-len(tk)
+            prev_len = len(tk)
+            self.step(f"Current text size : {prev_len}, max summary size : {max_summary_size}")
+            self.step_end(f"Comprerssing {doc_name}... [depth {depth+1}]")
+            depth += 1
+            if dtk_ln<=10: # it is not sumlmarizing
+                break
+        return text
+
+    def smart_data_extraction(
+                                self,
+                                text,
+                                data_extraction_instruction="summerize",
+                                final_task_instruction="reformulate with better wording",
+                                doc_name="chunk",
+                                answer_start="",
+                                max_generation_size=3000,
+                                max_summary_size=512,
+                                callback=None,
+                                chunk_summary_post_processing=None,
+                                summary_mode=SUMMARY_MODE.SUMMARY_MODE_SEQUENCIAL
+                            ):
+        depth=0
+        tk = self.lollms.tokenize(text)
+        prev_len = len(tk)
+        while len(tk)>max_summary_size:
+            self.step_start(f"Comprerssing... [depth {depth+1}]")
+            chunk_size = int(self.lollms.ctx_size*0.6)
+            document_chunks = DocumentDecomposer.decompose_document(text, chunk_size, 0, self.lollms.tokenize, self.lollms.detokenize, True)
+            text = self.summerize_chunks(
+                                            document_chunks, 
+                                            data_extraction_instruction, 
+                                            doc_name, 
+                                            answer_start, 
+                                            max_generation_size, 
+                                            callback, 
+                                            chunk_summary_post_processing=chunk_summary_post_processing, 
+                                            summary_mode=summary_mode
+                                        )
+            tk = self.lollms.tokenize(text)
+            dtk_ln=prev_len-len(tk)
+            prev_len = len(tk)
+            self.step(f"Current text size : {prev_len}, max summary size : {max_summary_size}")
+            self.step_end(f"Comprerssing... [depth {depth+1}]")
+            depth += 1
+            if dtk_ln<=10: # it is not sumlmarizing
+                break
+        self.step_start(f"Rewriting ...")
+        text = self.summerize_chunks(
+                                        [text],
+                                        final_task_instruction, 
+                                        doc_name, answer_start, 
+                                        max_generation_size, 
+                                        callback, 
+                                        chunk_summary_post_processing=chunk_summary_post_processing
+                                    )
+        self.step_end(f"Rewriting ...")
+
+        return text
+
+    def summerize_chunks(
+                            self,
+                            chunks,
+                            summary_instruction="summerize",
+                            doc_name="chunk",
+                            answer_start="",
+                            max_generation_size=3000,
+                            callback=None,
+                            chunk_summary_post_processing=None,
+                            summary_mode=SUMMARY_MODE.SUMMARY_MODE_SEQUENCIAL
+                        ):
+        if summary_mode==SUMMARY_MODE.SUMMARY_MODE_SEQUENCIAL:
+            summary = ""
+            for i, chunk in enumerate(chunks):
+                self.step_start(f" Summary of {doc_name} - Processing chunk : {i+1}/{len(chunks)}")
+                summary = f"{answer_start}"+ self.fast_gen(
+                            "\n".join([
+                                f"!@>Document_chunk: {doc_name}:",
+                                f"{summary}",
+                                f"{chunk}",
+                                f"!@>instruction: {summary_instruction}",
+                                f"Answer directly with the summary with no extra comments.",
+                                f"!@>summary:",
+                                f"{answer_start}"
+                                ]),
+                                max_generation_size=max_generation_size,
+                                callback=callback)
+                if chunk_summary_post_processing:
+                    summary = chunk_summary_post_processing(summary)
+                self.step_end(f" Summary of {doc_name} - Processing chunk : {i+1}/{len(chunks)}")
+            return summary
+        else:
+            summeries = []
+            for i, chunk in enumerate(chunks):
+                self.step_start(f" Summary of {doc_name} - Processing chunk : {i+1}/{len(chunks)}")
+                summary = f"{answer_start}"+ self.fast_gen(
+                            "\n".join([
+                                f"!@>Document_chunk: {doc_name}:",
+                                f"{chunk}",
+                                f"!@>instruction: {summary_instruction}",
+                                f"Answer directly with the summary with no extra comments.",
+                                f"!@>summary:",
+                                f"{answer_start}"
+                                ]),
+                                max_generation_size=max_generation_size,
+                                callback=callback)
+                if chunk_summary_post_processing:
+                    summary = chunk_summary_post_processing(summary)
+                summeries.append(summary)
+                self.step_end(f" Summary of {doc_name} - Processing chunk : {i+1}/{len(chunks)}")
+            return "\n".join(summeries)

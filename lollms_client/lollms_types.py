@@ -34,3 +34,9 @@ class SENDER_TYPES(Enum):
     SENDER_TYPES_USER               = 0 # Sent by user
     SENDER_TYPES_AI                 = 1 # Sent by ai
     SENDER_TYPES_SYSTEM             = 2 # Sent by athe system
+
+
+
+class SUMMARY_MODE(Enum):
+    SUMMARY_MODE_SEQUENCIAL        = 0
+    SUMMARY_MODE_HIERARCHICAL      = 0

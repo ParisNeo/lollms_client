@@ -14,7 +14,7 @@ lc = LollmsClient("http://localhost:9600")
 def cb(chunk, type):
     print(chunk,end="",flush=True)
     
-response = lc.generate_text(prompt="Once upon a time", stream=True, temperature=0.5, streaming_callback=cb)
+response = lc.generate_text(prompt="One plus one equals ", stream=True, temperature=0.5, streaming_callback=cb)
 # print(response)
 
 # List Mounted Personalities
