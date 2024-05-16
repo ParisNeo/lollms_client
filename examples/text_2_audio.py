@@ -1,7 +1,9 @@
-from lollms_client import LollmsClient, ELF_GENERATION_FORMAT
+from lollms_client import LollmsClient, ELF_GENERATION_FORMAT, LollmsXTTS
 
 # Initialize the LollmsClient instance
 lc = LollmsClient("http://localhost:9600",default_generation_mode=ELF_GENERATION_FORMAT.OLLAMA)
+tts = LollmsXTTS(lc)
+
 # Generate Text
 # response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
 # print(response)
@@ -17,7 +19,7 @@ response = lc.generate_text(prompt="One plus one equals ", stream=False, tempera
 print()
 print(response)
 print()
-
+tts.text2Audio(response)
 
 # List Mounted Personalities
 response = lc.listMountedPersonalities()

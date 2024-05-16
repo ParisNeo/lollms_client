@@ -306,7 +306,7 @@ class LollmsClient():
         data = {
             'model':model_name,
             'prompt': prompt,
-            "stream":True,
+            "stream":stream,
             "temperature": float(temperature),
             "max_tokens": n_predict
         }
@@ -320,17 +320,19 @@ class LollmsClient():
         if response.status_code==404:
             ASCIIColors.error(response.content.decode("utf-8", errors='ignore'))
         text = ""
-        for line in response.iter_lines():
-            decoded = line.decode("utf-8")
-            json_data = json.loads(decoded)
-            chunk = json_data["response"]
-            ## Process the JSON data here
-            text +=chunk
-            if streaming_callback:
-                if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
-                    break            
-            return text
-
+        if stream:
+            for line in response.iter_lines():
+                decoded = line.decode("utf-8")
+                json_data = json.loads(decoded)
+                chunk = json_data["response"]
+                ## Process the JSON data here
+                text +=chunk
+                if streaming_callback:
+                    if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
+                        break            
+                return text
+        else:
+            return response.content["response"]
     def litellm_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, completion_format:ELF_COMPLETION_FORMAT=ELF_COMPLETION_FORMAT.Instruct, service_key:str="", streaming_callback=None):
         # Set default values to instance variables if optional arguments are None
         host_address = host_address if host_address else self.host_address
