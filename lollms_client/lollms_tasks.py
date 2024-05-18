@@ -1,8 +1,14 @@
 from lollms_client.lollms_core import LollmsClient
-from lollms_client.lollms_types import  SUMMARY_MODE
-from typing import List
+from lollms_client.lollms_types import  SUMMARY_MODE, MSG_TYPE
+from lollms_client.lollms_utilities import remove_text_from_string, PromptReshaper, process_ai_output
+from typing import List, Callable, Dict, Any, Optional
 from ascii_colors import ASCIIColors
 from safe_store.document_decomposer import DocumentDecomposer
+from functools import partial
+import json
+import sys
+from datetime import datetime
+
 class TasksLibrary:
     def __init__(self, lollms:LollmsClient) -> None:
         self.lollms = lollms
@@ -13,6 +19,195 @@ class TasksLibrary:
         ASCIIColors.red(" *-*-*-*-*-*-*-*")
         ASCIIColors.yellow(prompt)
         ASCIIColors.red(" *-*-*-*-*-*-*-*")
+
+    def setCallback(self, callback: Callable[[str, MSG_TYPE, dict, list], bool]):
+        self.callback = callback
+        if self._processor:
+            self._processor.callback = callback
+
+    def process(self, text:str, message_type:MSG_TYPE, callback=None, show_progress=False):
+        if callback is None:
+            callback = self.callback
+        if text is None:
+            return True
+        if message_type==MSG_TYPE.MSG_TYPE_CHUNK:
+            bot_says = self.bot_says + text
+        elif  message_type==MSG_TYPE.MSG_TYPE_FULL:
+            bot_says = text
+
+        if show_progress:
+            if self.nb_received_tokens==0:
+                self.start_time = datetime.now()
+            dt =(datetime.now() - self.start_time).seconds
+            if dt==0:
+                dt=1
+            spd = self.nb_received_tokens/dt
+            ASCIIColors.green(f"Received {self.nb_received_tokens} tokens (speed: {spd:.2f}t/s)              ",end="\r",flush=True)
+            sys.stdout = sys.__stdout__
+            sys.stdout.flush()
+            self.nb_received_tokens+=1
+
+
+        antiprompt = self.detect_antiprompt(bot_says)
+        if antiprompt:
+            self.bot_says = remove_text_from_string(bot_says,antiprompt)
+            ASCIIColors.warning(f"\n{antiprompt} detected. Stopping generation")
+            return False
+        else:
+            if callback:
+                callback(text,message_type)
+            self.bot_says = bot_says
+            return True
+    def generate(self, prompt, max_size, temperature = None, top_k = None, top_p=None, repeat_penalty=None, repeat_last_n=None, callback=None, debug=False, show_progress=False, stream= False ):
+        ASCIIColors.info("Text generation started: Warming up")
+        self.nb_received_tokens = 0
+        self.bot_says = ""
+        if debug:
+            self.print_prompt("gen",prompt)
+
+        bot_says = self.lollms.generate(
+                                prompt,
+                                max_size,
+                                stream=stream,
+                                streaming_callback=partial(self.process, callback=callback, show_progress=show_progress),
+                                temperature= temperature if temperature is not None else self.lollms.temperature,
+                                top_k= top_k if top_k is not None else self.lollms.top_k ,
+                                top_p= top_p if top_p is not None else self.lollms.top_p ,
+                                repeat_penalty= repeat_penalty if repeat_penalty is not None else self.lollms.repeat_penalty,
+                                repeat_last_n= repeat_last_n if repeat_last_n is not None else self.lollms.repeat_last_n,
+                                ).strip()
+        return self.bot_says if stream else bot_says
+
+
+    def fast_gen(
+                    self, 
+                    prompt: str, 
+                    max_generation_size: int=None, 
+                    placeholders: dict = {}, 
+                    sacrifice: list = ["previous_discussion"], 
+                    debug: bool  = False, 
+                    callback=None, 
+                    show_progress=False, 
+                    temperature = None, 
+                    top_k = None, 
+                    top_p=None, 
+                    repeat_penalty=None, 
+                    repeat_last_n=None
+                ) -> str:
+        """
+        Fast way to generate code
+
+        This method takes in a prompt, maximum generation size, optional placeholders, sacrifice list, and debug flag.
+        It reshapes the context before performing text generation by adjusting and cropping the number of tokens.
+
+        Parameters:
+        - prompt (str): The input prompt for text generation.
+        - max_generation_size (int): The maximum number of tokens to generate.
+        - placeholders (dict, optional): A dictionary of placeholders to be replaced in the prompt. Defaults to an empty dictionary.
+        - sacrifice (list, optional): A list of placeholders to sacrifice if the window is bigger than the context size minus the number of tokens to generate. Defaults to ["previous_discussion"].
+        - debug (bool, optional): Flag to enable/disable debug mode. Defaults to False.
+
+        Returns:
+        - str: The generated text after removing special tokens ("<s>" and "</s>") and stripping any leading/trailing whitespace.
+        """
+        if max_generation_size is None:
+            prompt_size = self.lollms.tokenize(prompt)
+            max_generation_size = self.lollms.ctx_size - len(prompt_size)
+
+        pr = PromptReshaper(prompt)
+        prompt = pr.build(placeholders,
+                        self.lollms.tokenize,
+                        self.lollms.detokenize,
+                        self.lollms.ctx_size - max_generation_size,
+                        sacrifice
+                        )
+        ntk = len(self.lollms.tokenize(prompt))
+        max_generation_size = min(self.lollms.ctx_size - ntk, max_generation_size)
+        # TODO : add show progress
+
+        gen = self.generate(prompt, max_generation_size, temperature = temperature, top_k = top_k, top_p=top_p, repeat_penalty=repeat_penalty, repeat_last_n=repeat_last_n, callback=callback, show_progress=show_progress).strip().replace("</s>", "").replace("<s>", "")
+        if debug:
+            self.print_prompt("prompt", prompt+gen)
+
+        return gen
+
+    def generate_with_images(self, prompt, images, max_size, temperature = None, top_k = None, top_p=None, repeat_penalty=None, repeat_last_n=None, callback=None, debug=False, show_progress=False, stream=False ):
+        ASCIIColors.info("Text generation started: Warming up")
+        self.nb_received_tokens = 0
+        self.bot_says = ""
+        if debug:
+            self.print_prompt("gen",prompt)
+
+        bot_says = self.lollms.generate_with_images(
+                                prompt,
+                                images,
+                                max_size,
+                                stream=stream,
+                                streaming_callback= partial(self.process, callback=callback, show_progress=show_progress),
+                                temperature=self.lollms.temperature if temperature is None else temperature,
+                                top_k=self.lollms.top_k if top_k is None else top_k,
+                                top_p=self.lollms.top_p if top_p is None else top_p,
+                                repeat_penalty=self.lollms.repeat_penalty if repeat_penalty is None else repeat_penalty,
+                                repeat_last_n = self.lollms.repeat_last_n if repeat_last_n is None else repeat_last_n
+                                ).strip()
+        return self.bot_says if stream else bot_says
+
+    
+    def fast_gen_with_images(self, prompt: str, images:list, max_generation_size: int=None, placeholders: dict = {}, sacrifice: list = ["previous_discussion"], debug: bool  = False, callback=None, show_progress=False) -> str:
+        """
+        Fast way to generate text from text and images
+
+        This method takes in a prompt, maximum generation size, optional placeholders, sacrifice list, and debug flag.
+        It reshapes the context before performing text generation by adjusting and cropping the number of tokens.
+
+        Parameters:
+        - prompt (str): The input prompt for text generation.
+        - max_generation_size (int): The maximum number of tokens to generate.
+        - placeholders (dict, optional): A dictionary of placeholders to be replaced in the prompt. Defaults to an empty dictionary.
+        - sacrifice (list, optional): A list of placeholders to sacrifice if the window is bigger than the context size minus the number of tokens to generate. Defaults to ["previous_discussion"].
+        - debug (bool, optional): Flag to enable/disable debug mode. Defaults to False.
+
+        Returns:
+        - str: The generated text after removing special tokens ("<s>" and "</s>") and stripping any leading/trailing whitespace.
+        """
+        prompt = "\n".join([
+            "!@>system: I am an AI assistant that can converse and analyze images. When asked to locate something in an image you send, I will reply with:",
+            "boundingbox(image_index, label, left, top, width, height)",
+            "Where:",
+            "image_index: 0-based index of the image",
+            "label: brief description of what is located",
+            "left, top: x,y coordinates of top-left box corner (0-1 scale)",
+            "width, height: box dimensions as fraction of image size",
+            "Coordinates have origin (0,0) at top-left, (1,1) at bottom-right.",
+            "For other queries, I will respond conversationally to the best of my abilities.",
+            prompt
+        ])
+
+        if max_generation_size is None:
+            prompt_size = self.lollms.tokenize(prompt)
+            max_generation_size = self.lollms.ctx_size - len(prompt_size)
+
+        pr = PromptReshaper(prompt)
+        prompt = pr.build(placeholders,
+                        self.lollms.tokenize,
+                        self.lollms.detokenize,
+                        self.lollms.ctx_size - max_generation_size,
+                        sacrifice
+                        )
+        ntk = len(self.lollms.tokenize(prompt))
+        max_generation_size = min(self.lollms.ctx_size - ntk, max_generation_size)
+        # TODO : add show progress
+
+        gen = self.generate_with_images(prompt, images, max_generation_size, callback=callback, show_progress=show_progress).strip().replace("</s>", "").replace("<s>", "")
+        try:
+            gen = process_ai_output(gen, images, "/discussions/")
+        except Exception as ex:
+            pass
+        if debug:
+            self.print_prompt("prompt", prompt+gen)
+
+        return gen    
+
 
     def sink(self, s=None,i=None,d=None):
         pass
@@ -372,3 +567,148 @@ class TasksLibrary:
                 summeries.append(summary)
                 self.step_end(f" Summary of {doc_name} - Processing chunk : {i+1}/{len(chunks)}")
             return "\n".join(summeries)
+
+    #======================= Function calls
+    def _upgrade_prompt_with_function_info(self, prompt: str, functions: List[Dict[str, Any]]) -> str:
+        """
+        Upgrades the prompt with information about function calls.
+
+        Args:
+            prompt (str): The original prompt.
+            functions (List[Dict[str, Any]]): A list of dictionaries describing functions that can be called.
+
+        Returns:
+            str: The upgraded prompt that includes information about the function calls.
+        """
+        function_descriptions = ["!@>information: If you need to call a function to fulfull the user request, use a function markdown tag with the function call as the following json format:",
+                                 "```function",
+                                 "{",
+                                 '"function_name":the name of the function to be called,',
+                                 '"function_parameters": a list of  parameter values',
+                                 "}",
+                                 "```",
+                                 "You can call multiple functions in one generation.",
+                                 "Each function call needs to be in a separate function markdown tag.",
+                                 "Do not add status of the execution as it will be added automatically by the system.",
+                                 "If you want to get the output of the function before answering the user, then use the keyword @<NEXT>@ at the end of your message.",
+                                 "!@>List of possible functions to be called:\n"]
+        for function in functions:
+            description = f"{function['function_name']}: {function['function_description']}\nparameters:{function['function_parameters']}"
+            function_descriptions.append(description)
+
+        # Combine the function descriptions with the original prompt.
+        function_info = ' '.join(function_descriptions)
+        upgraded_prompt = f"{function_info}\n{prompt}"
+
+        return upgraded_prompt
+    def extract_function_calls_as_json(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Extracts function calls formatted as JSON inside markdown code blocks.
+
+        Args:
+            text (str): The generated text containing JSON markdown entries for function calls.
+
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries representing the function calls.
+        """
+        # Extract markdown code blocks that contain JSON.
+        code_blocks = self.extract_code_blocks(text)
+
+        # Filter out and parse JSON entries.
+        function_calls = []
+        for block in code_blocks:
+            if block["type"]=="function":
+                content = block.get("content", "")
+                try:
+                    # Attempt to parse the JSON content of the code block.
+                    function_call = json.loads(content)
+                    if type(function_call)==dict:
+                        function_calls.append(function_call)
+                    elif type(function_call)==list:
+                        function_calls+=function_call
+                except json.JSONDecodeError:
+                    # If the content is not valid JSON, skip it.
+                    continue
+
+        return function_calls    
+    def execute_function_calls(self, function_calls: List[Dict[str, Any]], function_definitions: List[Dict[str, Any]]) -> List[Any]:
+        """
+        Executes the function calls with the parameters extracted from the generated text,
+        using the original functions list to find the right function to execute.
+
+        Args:
+            function_calls (List[Dict[str, Any]]): A list of dictionaries representing the function calls.
+            function_definitions (List[Dict[str, Any]]): The original list of functions with their descriptions and callable objects.
+
+        Returns:
+            List[Any]: A list of results from executing the function calls.
+        """
+        results = []
+        # Convert function_definitions to a dict for easier lookup
+        functions_dict = {func['function_name']: func['function'] for func in function_definitions}
+
+        for call in function_calls:
+            function_name = call.get("function_name")
+            parameters = call.get("function_parameters", [])
+            function = functions_dict.get(function_name)
+
+            if function:
+                try:
+                    # Assuming parameters is a dictionary that maps directly to the function's arguments.
+                    if type(parameters)==list:
+                        result = function(*parameters)
+                    elif type(parameters)==dict:
+                        result = function(**parameters)
+                    results.append(result)
+                except TypeError as e:
+                    # Handle cases where the function call fails due to incorrect parameters, etc.
+                    results.append(f"Error calling {function_name}: {e}")
+            else:
+                results.append(f"Function {function_name} not found.")
+
+        return results
+    def generate_with_function_calls(self, prompt: str, functions: List[Dict[str, Any]], max_answer_length: Optional[int] = None, callback: Callable[[str,MSG_TYPE],bool]=None) -> List[Dict[str, Any]]:
+        """
+        Performs text generation with function calls.
+
+        Args:
+            prompt (str): The full prompt (including conditioning, user discussion, extra data, and the user prompt).
+            functions (List[Dict[str, Any]]): A list of dictionaries describing functions that can be called.
+            max_answer_length (int, optional): Maximum string length allowed for the generated text.
+
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries with the function names and parameters to execute.
+        """
+        # Upgrade the prompt with information about the function calls.
+        upgraded_prompt = self._upgrade_prompt_with_function_info(prompt, functions)
+
+        # Generate the initial text based on the upgraded prompt.
+        generated_text = self.fast_gen(upgraded_prompt, max_answer_length, callback=callback)
+
+        # Extract the function calls from the generated text.
+        function_calls = self.extract_function_calls_as_json(generated_text)
+
+        return generated_text, function_calls
+
+    def generate_with_function_calls_and_images(self, prompt: str, images:list, functions: List[Dict[str, Any]], max_answer_length: Optional[int] = None, callback: Callable[[str,MSG_TYPE],bool]=None) -> List[Dict[str, Any]]:
+        """
+        Performs text generation with function calls.
+
+        Args:
+            prompt (str): The full prompt (including conditioning, user discussion, extra data, and the user prompt).
+            functions (List[Dict[str, Any]]): A list of dictionaries describing functions that can be called.
+            max_answer_length (int, optional): Maximum string length allowed for the generated text.
+
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries with the function names and parameters to execute.
+        """
+        # Upgrade the prompt with information about the function calls.
+        upgraded_prompt = self._upgrade_prompt_with_function_info(prompt, functions)
+
+        # Generate the initial text based on the upgraded prompt.
+        generated_text = self.fast_gen_with_images(upgraded_prompt, images, max_answer_length, callback=callback)
+
+        # Extract the function calls from the generated text.
+        function_calls = self.extract_function_calls_as_json(generated_text)
+
+        return generated_text, function_calls

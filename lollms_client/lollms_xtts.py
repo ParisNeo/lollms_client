@@ -22,6 +22,16 @@ class LollmsXTTS:
         else:
             response.raise_for_status()
 
+    def get_voices(self):
+        endpoint = f"{self.base_url}/list_voices"
+        try:
+            response = requests.get(endpoint)
+            response.raise_for_status()  # Raise an error for bad status codes
+            voices = response.json()  # Assuming the response is in JSON format
+            return voices["voices"]
+        except requests.exceptions.RequestException as e:
+            print(f"Couldn't list voices: {e}")
+            return ["main_voice"]
 # Example usage
 if __name__ == "__main__":
     base_url = "http://your_flask_server_url"
