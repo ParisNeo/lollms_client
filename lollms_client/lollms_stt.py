@@ -3,19 +3,19 @@ from pydantic import BaseModel
 from lollms_client.lollms_core import LollmsClient
 from typing import Optional
 
-class LollmsXTTSRequest(BaseModel):
-    text: str
-    voice: str|None = None
-    fn: str|None = None
+class LollmSTTRequest(BaseModel):
+    wave_file_path: str
+    model: str = None
+    fn:str = None
 
-class LollmsXTTS:
+class LollmsSTT:
     def __init__(self, lollmsClient:LollmsClient):
         self.base_url = lollmsClient.host_address
 
-    def text2Audio(self, text, voice=None, fn=None):
+    def audio2text(self, text, model=None, fn=None):
         endpoint = f"{self.base_url}/text2Audio"
-        request_data = LollmsXTTSRequest(text=text, voice=voice if voice else "main_voice", fn=fn if fn else "fn.wav")
-        response = requests.post(endpoint, json=request_data.dict())
+        request_data = LollmSTTRequest(text=text, model=model if model else "base", fn=fn if fn else "fn.wav")
+        response = requests.post(endpoint, json=request_data.model_dump())
         
         if response.status_code == 200:
             return response.json()
@@ -23,7 +23,7 @@ class LollmsXTTS:
             response.raise_for_status()
 
     def get_voices(self):
-        endpoint = f"{self.base_url}/list_voices"
+        endpoint = f"{self.base_url}/list_stt_models"
         try:
             response = requests.get(endpoint)
             response.raise_for_status()  # Raise an error for bad status codes
@@ -32,10 +32,4 @@ class LollmsXTTS:
         except requests.exceptions.RequestException as e:
             print(f"Couldn't list voices: {e}")
             return ["main_voice"]
-# Example usage
-if __name__ == "__main__":
-    base_url = "http://your_flask_server_url"
-    lollms_xtts = LollmsXTTS(LollmsClient("http://localhost:9600"))
-    
-    response = lollms_xtts.text2Audio(text="Hello, world!", voice="default", fn="output_audio.wav")
-    print(response)
+

@@ -1,9 +1,9 @@
-from lollms_client import LollmsClient, ELF_GENERATION_FORMAT, LollmsXTTS
+from lollms_client import LollmsClient, ELF_GENERATION_FORMAT, LollmsTTS
 import random
 
 # Initialize the LollmsClient instance
 lc = LollmsClient("http://localhost:9600",default_generation_mode=ELF_GENERATION_FORMAT.LOLLMS)
-tts = LollmsXTTS(lc)
+tts = LollmsTTS(lc)
 voices = tts.get_voices()
 
 # Pick a voice randomly
