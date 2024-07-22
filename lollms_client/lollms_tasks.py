@@ -23,8 +23,6 @@ class TasksLibrary:
 
     def setCallback(self, callback: Callable[[str, MSG_TYPE, dict, list], bool]):
         self.callback = callback
-        if self._processor:
-            self._processor.callback = callback
 
     def process(self, text:str, message_type:MSG_TYPE, callback=None, show_progress=False):
         if callback is None:
