@@ -10,8 +10,9 @@ import sys
 from datetime import datetime
 
 class TasksLibrary:
-    def __init__(self, lollms:LollmsClient) -> None:
+    def __init__(self, lollms:LollmsClient, callback: Callable[[str, MSG_TYPE, dict, list], bool]=None) -> None:
         self.lollms = lollms
+        self.callback = callback
 
     def print_prompt(self, title, prompt):
         ASCIIColors.red("*-*-*-*-*-*-*-* ", end="")
