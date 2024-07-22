@@ -8,7 +8,7 @@ with open('requirements.txt', 'r') as f:
     
 setuptools.setup(
     name="lollms_client",
-    version="0.6.0",
+    version="0.6.1",
     author="ParisNeo",
     author_email="parisneoai@gmail.com",
     description="A client library for LoLLMs generate endpoint",

@@ -1,4 +1,5 @@
 import urllib
+import numpy
 from pathlib import Path
 from pipmaster import PackageManager
 class PromptReshaper:
@@ -134,3 +135,4 @@ def process_ai_output(output, images, output_folder):
         output += f'\n<img src="{url}">'
 
     return output
+

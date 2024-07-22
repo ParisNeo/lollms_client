@@ -10,7 +10,7 @@ To install the library from PyPI using `pip`, run:
 
 ```
 pip install lollms-client
-```
+``` 
 
 ## Usage
 

@@ -209,6 +209,52 @@ class TasksLibrary:
         return gen    
 
 
+
+    def step_start(self, step_text, callback: Callable[[str, MSG_TYPE, dict, list], bool]=None):
+        """This triggers a step start
+
+        Args:
+            step_text (str): The step text
+            callback (callable, optional): A callable with this signature (str, MSG_TYPE) to send the step start to. Defaults to None.
+        """
+        if not callback and self.callback:
+            callback = self.callback
+
+        if callback:
+            callback(step_text, MSG_TYPE.MSG_TYPE_STEP_START)
+
+    def step_end(self, step_text, status=True, callback: Callable[[str, int, dict, list], bool]=None):
+        """This triggers a step end
+
+        Args:
+            step_text (str): The step text
+            callback (callable, optional): A callable with this signature (str, MSG_TYPE) to send the step end to. Defaults to None.
+        """
+        if not callback and self.callback:
+            callback = self.callback
+
+        if callback:
+            callback(step_text, MSG_TYPE.MSG_TYPE_STEP_END, {'status':status})
+
+    def step(self, step_text, callback: Callable[[str, MSG_TYPE, dict, list], bool]=None):
+        """This triggers a step information
+
+        Args:
+            step_text (str): The step text
+            callback (callable, optional): A callable with this signature (str, MSG_TYPE, dict, list) to send the step to. Defaults to None.
+            The callback has these fields:
+            - chunk
+            - Message Type : the type of message
+            - Parameters (optional) : a dictionary of parameters
+            - Metadata (optional) : a list of metadata
+        """
+        if not callback and self.callback:
+            callback = self.callback
+
+        if callback:
+            callback(step_text, MSG_TYPE.MSG_TYPE_STEP)
+
+
     def sink(self, s=None,i=None,d=None):
         pass
 
