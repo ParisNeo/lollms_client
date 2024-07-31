@@ -1,7 +1,11 @@
 import ast
 import argparse
 from pathlib import Path
-from typing import List, Dict, Union, Optional, Any
+from typing import List, Optional
+from lollms_client.lollms_core import LollmsClient, ELF_GENERATION_FORMAT
+from lollms_client.lollms_tasks import TasksLibrary
+
+from ascii_colors import ASCIIColors
 
 class MethodInfo:
     def __init__(self, node: ast.FunctionDef):
@@ -105,12 +109,19 @@ class Analyzer:
         self.classes: List[ClassInfo] = []
         self.enums: List[EnumInfo] = []
         self.functions: List[FunctionInfo] = []
+        self.dependencies: List[str] = []
 
     def analyze(self) -> None:
+        ASCIIColors.yellow("Parsing the file to analyze its structure...")
         tree = self._parse_file()
+        ASCIIColors.yellow("Analyzing classes...")
         self.classes = self._analyze_classes(tree)
+        ASCIIColors.yellow("Analyzing enums...")
         self.enums = self._analyze_enums(tree)
+        ASCIIColors.yellow("Analyzing functions...")
         self.functions = self._analyze_functions(tree)
+        ASCIIColors.yellow("Extracting dependencies...")
+        self.dependencies = self._extract_dependencies(tree)
 
     def _parse_file(self) -> ast.AST:
         with self.file_path.open('r') as file:
@@ -124,18 +135,33 @@ class Analyzer:
         return [EnumInfo(node) for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and self._is_enum(node)]
 
     def _analyze_functions(self, tree: ast.AST) -> List[FunctionInfo]:
-        return [FunctionInfo(node) for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and not self._is_method(node)]
+        all_functions = [FunctionInfo(node) for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+        methods = {method.name for cls in self.classes for method in cls.methods}
+        return [func for func in all_functions if func.name not in methods]
 
     def _is_enum(self, node: ast.ClassDef) -> bool:
         return any(isinstance(base, ast.Name) and base.id == 'Enum' for base in node.bases)
 
-    def _is_method(self, node: ast.FunctionDef) -> bool:
-        return any(isinstance(parent, ast.ClassDef) for parent in ast.walk(node) if isinstance(parent, ast.ClassDef))
+    def _extract_dependencies(self, tree: ast.AST) -> List[str]:
+        dependencies = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    dependencies.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                dependencies.add(node.module)
+        return list(dependencies)
 
     def generate_markdown(self) -> str:
         markdown = f"# Information for {self.file_path.name}\n\n"
         markdown += f"File: `{self.file_path}`\n\n"
         
+        # List dependencies
+        markdown += "## Dependencies\n\n"
+        for dep in self.dependencies:
+            markdown += f"- {dep}\n"
+        markdown += "\n"
+
         if self.classes:
             markdown += "## Classes\n\n"
             for class_info in self.classes:
@@ -168,12 +194,41 @@ class Analyzer:
         
         markdown = self.generate_markdown()
         output_path.write_text(markdown)
-        print(f"Markdown file generated: {output_path}")
+        ASCIIColors.yellow(f"Markdown file generated: {output_path}")
+
+    def generate_documentation(self) -> None:
+        md_file_path = self.file_path.with_name(f"{self.file_path.stem}_info.md")
+
+        # Read the existing Markdown file
+        with open(md_file_path, 'r') as file:
+            md_content = file.read()
+
+        # Initialize LollmsClient
+        client = LollmsClient()
+        tasks = TasksLibrary(client)
+
+        # Prepare the prompt for Lollms
+        prompt = f"Generate a short documentation introduction based on the following Markdown content:\n\n{md_content}\n\n# Documentation Introduction\n\n"
+
+        # Generate documentation using Lollms
+        ASCIIColors.yellow("Generating documentation introduction...")
+        generated_intro = client.generate_text(prompt)
+
+        # Create the new content with the introduction at the beginning
+        new_md_content = f"# Documentation Introduction\n\n{generated_intro}\n\n{md_content}"
+
+        # Write the new content back to the Markdown file
+        with open(md_file_path, 'w') as output_file:
+            output_file.write(new_md_content)
 
 def main(file_path: Path) -> None:
     analyzer = Analyzer(file_path)
     analyzer.analyze()
     analyzer.save_markdown()
+    try:
+        analyzer.generate_documentation()
+    except Exception as ex:
+        ASCIIColors.error("Couldn't generate textual documentation. I need lollms to be running to be able to interact with it")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse Python file and extract class, enum, and function information.")

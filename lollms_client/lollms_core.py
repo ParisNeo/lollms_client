@@ -5,6 +5,8 @@ import json
 from enum import Enum
 import tiktoken
 import base64
+import requests
+from typing import List, Optional, Callable, Union
 
 class ELF_GENERATION_FORMAT(Enum):
     LOLLMS = 0
@@ -19,7 +21,7 @@ class ELF_COMPLETION_FORMAT(Enum):
 class LollmsClient():
     def __init__(
                     self, 
-                    host_address=None,
+                    host_address="http://localhost:9600",
                     model_name=None,
                     ctx_size=4096,
                     personality=-1, 
@@ -175,15 +177,57 @@ class LollmsClient():
                     return {"status": False, "error": str(ex)}
             else:
                 return {"status": False, "error": response.text}
-            
+    def lollms_generate_with_images(
+        self,
+        prompt: str,
+        images: List[str],
+        host_address: Optional[str] = None,
+        model_name: Optional[str] = None,
+        personality: Optional[str] = None,
+        n_predict: Optional[int] = None,
+        stream: bool = False,
+        temperature: float = 0.1,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        repeat_penalty: float = 0.8,
+        repeat_last_n: int = 40,
+        seed: Optional[int] = None,
+        n_threads: int = 8,
+        service_key: str = "",
+        streaming_callback: Optional[Callable[[str, int], None]] = None
+    ) -> Union[str, dict]:
+        """
+        Generates text based on a prompt and a list of images using a specified model.
 
-    def lollms_generate_with_images(self, prompt, images, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
+        Args:
+            prompt (str): The text prompt to generate responses for.
+            images (List[str]): A list of file paths to images to be included in the generation.
+            host_address (Optional[str]): The host address for the service. Defaults to instance variable.
+            model_name (Optional[str]): The model name to use. Defaults to instance variable.
+            personality (Optional[str]): The personality setting for the generation. Defaults to instance variable.
+            n_predict (Optional[int]): The number of tokens to predict. Defaults to instance variable.
+            stream (bool): Whether to stream the response. Defaults to False.
+            temperature (float): Sampling temperature. Defaults to 0.1.
+            top_k (int): Top-k sampling parameter. Defaults to 50.
+            top_p (float): Top-p (nucleus) sampling parameter. Defaults to 0.95.
+            repeat_penalty (float): Penalty for repeating tokens. Defaults to 0.8.
+            repeat_last_n (int): Number of last tokens to consider for repeat penalty. Defaults to 40.
+            seed (Optional[int]): Random seed for generation. Defaults to instance variable.
+            n_threads (int): Number of threads to use. Defaults to 8.
+            service_key (str): Optional service key for authorization.
+            streaming_callback (Optional[Callable[[str, int], None]]): Callback for streaming responses.
+
+        Returns:
+            Union[str, dict]: The generated text if not streaming, or a dictionary with status and error if applicable.
+        """
+        
         # Set default values to instance variables if optional arguments are None
         host_address = host_address if host_address else self.host_address
         model_name = model_name if model_name else self.model_name
         n_predict = n_predict if n_predict else self.n_predict
         personality = personality if personality is not None else self.personality
-        # Set temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads to the instance variables if they are not provided or None
+        
+        # Set parameters to instance variables if they are not provided or None
         temperature = temperature if temperature is not None else self.temperature
         top_k = top_k if top_k is not None else self.top_k
         top_p = top_p if top_p is not None else self.top_p
@@ -191,32 +235,31 @@ class LollmsClient():
         repeat_last_n = repeat_last_n if repeat_last_n is not None else self.repeat_last_n
         seed = seed or self.seed  # Use the instance seed if not provided
         n_threads = n_threads if n_threads else self.n_threads
-        def encode_image_to_base64(image_path):
+
+        def encode_image_to_base64(image_path: str) -> str:
+            """Encodes an image file to a base64 string."""
             with open(image_path, "rb") as image_file:
                 encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
             return encoded_string
+
         # Encode images in base64
         encoded_images = [encode_image_to_base64(image) for image in images]
 
         url = f"{host_address}/lollms_generate_with_images"
-        if service_key!="":
-            headers = {
-                'Content-Type': 'application/json;',
-                'Authorization': f'Bearer {service_key}',
-            }
-        else:
-            headers = {
-                'Content-Type': 'application/json',
-            }
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {service_key}' if service_key else '',
+        }
+
         data = {
             "prompt": prompt,
-            "model_name": self.model_name,
-            "personality": self.personality,
+            "model_name": model_name,
+            "personality": personality,
             "n_predict": n_predict,
             "stream": stream,
-            "temperature": self.temperature,
-            "top_k": self.top_k,
-            "top_p": self.top_p,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
             "repeat_penalty": repeat_penalty,
             "repeat_last_n": repeat_last_n,
             "seed": seed,
@@ -236,16 +279,16 @@ class LollmsClient():
                 return {"status": False, "error": response.text}
         else:
             text = ""
-            if response.status_code==200:
+            if response.status_code == 200:
                 try:
                     for line in response.iter_lines():
                         chunk = line.decode("utf-8")
                         text += chunk
                         if streaming_callback:
                             streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK)
-                    if text[0]=='"':
+                    if text[0] == '"':
                         text = text[1:]
-                    if text[-1]=='"':
+                    if text[-1] == '"':
                         text = text[:-1]
                     return text
                 except Exception as ex:
@@ -254,7 +297,31 @@ class LollmsClient():
                 return {"status": False, "error": response.text}
 
 
-    def openai_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, completion_format:ELF_COMPLETION_FORMAT=ELF_COMPLETION_FORMAT.Instruct, service_key:str="", streaming_callback=None):
+    def openai_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Instruct, service_key: str = "", streaming_callback=None):
+        """
+        Generates text using the OpenAI API based on the provided prompt and parameters.
+
+        Parameters:
+            prompt (str): The input text prompt to generate completions for.
+            host_address (str, optional): The API host address. Defaults to instance variable.
+            model_name (str, optional): The model to use for generation. Defaults to instance variable.
+            personality (str, optional): The personality setting for the model. Defaults to instance variable.
+            n_predict (int, optional): The number of tokens to predict. Defaults to instance variable.
+            stream (bool, optional): Whether to stream the response. Defaults to False.
+            temperature (float, optional): Sampling temperature. Higher values mean more randomness. Defaults to 0.1.
+            top_k (int, optional): The number of highest probability vocabulary tokens to keep for top-k filtering. Defaults to 50.
+            top_p (float, optional): The cumulative probability of parameter options to keep for nucleus sampling. Defaults to 0.95.
+            repeat_penalty (float, optional): The penalty for repeating tokens. Defaults to 0.8.
+            repeat_last_n (int, optional): The number of last tokens to consider for repeat penalty. Defaults to 40.
+            seed (int, optional): Random seed for reproducibility. Defaults to instance variable.
+            n_threads (int, optional): The number of threads to use for generation. Defaults to 8.
+            completion_format (ELF_COMPLETION_FORMAT, optional): The format of the completion request (Instruct or Chat). Defaults to ELF_COMPLETION_FORMAT.Instruct.
+            service_key (str, optional): The API service key for authorization. Defaults to an empty string.
+            streaming_callback (callable, optional): A callback function to handle streaming responses.
+
+        Returns:
+            str: The generated text response from the OpenAI API.
+        """
         # Set default values to instance variables if optional arguments are None
         host_address = host_address if host_address else self.host_address
         model_name = model_name if model_name else self.model_name
@@ -269,8 +336,7 @@ class LollmsClient():
         seed = seed or self.seed  # Use the instance seed if not provided
         n_threads = n_threads if n_threads else self.n_threads
 
-    
-        if service_key!="":
+        if service_key != "":
             headers = {
                 'Content-Type': 'application/json',
                 'Authorization': f'Bearer {service_key}',
@@ -280,37 +346,35 @@ class LollmsClient():
                 'Content-Type': 'application/json',
             }
 
-        if completion_format==ELF_COMPLETION_FORMAT.Instruct:
+        if completion_format == ELF_COMPLETION_FORMAT.Instruct:
             data = {
-                'model':model_name,#self.config.model_name,
+                'model': model_name,  # self.config.model_name,
                 'prompt': prompt,
-                "stream":True,
+                "stream": True,
                 "temperature": float(temperature),
                 "max_tokens": n_predict
             }
             completion_format_path = "/v1/completions"
-        elif completion_format==ELF_COMPLETION_FORMAT.Chat:
+        elif completion_format == ELF_COMPLETION_FORMAT.Chat:
             data = {
-                'model':model_name,
+                'model': model_name,
                 'messages': [{
                     'role': "user",
                     'content': prompt
                 }],
-                "stream":True,
+                "stream": True,
                 "temperature": float(temperature),
                 "max_tokens": n_predict
             }
             completion_format_path = "/v1/chat/completions"
 
-
         if host_address.endswith("/"):
             host_address = host_address[:-1]
         url = f'{host_address}{completion_format_path}'
 
-
         response = requests.post(url, json=data, headers=headers)
 
-        if response.status_code==400:
+        if response.status_code == 400:
             try:
                 content = response.content.decode("utf8")
                 content = json.loads(content)
@@ -321,23 +385,24 @@ class LollmsClient():
                 content = json.loads(content)
                 self.error(content["message"])
                 return
-        elif response.status_code==404:
+        elif response.status_code == 404:
             ASCIIColors.error(response.content.decode("utf-8", errors='ignore'))
+        
         text = ""
         for line in response.iter_lines():
             decoded = line.decode("utf-8")
             if decoded.startswith("data: "):
                 try:
                     json_data = json.loads(decoded[5:].strip())
-                    if completion_format==ELF_COMPLETION_FORMAT.Chat:
+                    if completion_format == ELF_COMPLETION_FORMAT.Chat:
                         try:
                             chunk = json_data["choices"][0]["delta"]["content"]
                         except:
                             chunk = ""
                     else:
                         chunk = json_data["choices"][0]["text"]
-                    ## Process the JSON data here
-                    text +=chunk
+                    # Process the JSON data here
+                    text += chunk
                     if streaming_callback:
                         if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
                             break
@@ -349,17 +414,17 @@ class LollmsClient():
                         decoded += line_.decode("utf-8")
                     try:
                         json_data = json.loads(decoded)
-                        if json_data["object"]=="error":
+                        if json_data["object"] == "error":
                             self.error(json_data["message"])
                             break
                     except:
                         self.error("Couldn't generate text, verify your key or model name")
                 else:
-                    text +=decoded
+                    text += decoded
                     if streaming_callback:
                         if not streaming_callback(decoded, MSG_TYPE.MSG_TYPE_CHUNK):
                             break
-            return text
+        return text
 
     def ollama_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, completion_format:ELF_COMPLETION_FORMAT=ELF_COMPLETION_FORMAT.Instruct, service_key:str="", streaming_callback=None):
         # Set default values to instance variables if optional arguments are None
@@ -472,6 +537,8 @@ class LollmsClient():
                             break
        
             return text
+
+
 
 ####
 
