@@ -1,6 +1,7 @@
 import requests
 from ascii_colors import ASCIIColors
 from lollms_client.lollms_types import MSG_TYPE
+from lollms_client.lollms_utilities import encode_image
 import json
 from enum import Enum
 import tiktoken
@@ -177,6 +178,8 @@ class LollmsClient():
                     return {"status": False, "error": str(ex)}
             else:
                 return {"status": False, "error": response.text}
+            
+
     def lollms_generate_with_images(
         self,
         prompt: str,
@@ -297,7 +300,23 @@ class LollmsClient():
                 return {"status": False, "error": response.text}
 
 
-    def openai_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Instruct, service_key: str = "", streaming_callback=None):
+    def openai_generate(self, 
+                        prompt, 
+                        host_address=None, 
+                        model_name=None, 
+                        personality=None, 
+                        n_predict=None, 
+                        stream=False, 
+                        temperature=0.1, 
+                        top_k=50, 
+                        top_p=0.95, 
+                        repeat_penalty=0.8, 
+                        repeat_last_n=40, 
+                        seed=None, 
+                        n_threads=8, 
+                        completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Instruct, 
+                        service_key: str = "", 
+                        streaming_callback=None):
         """
         Generates text using the OpenAI API based on the provided prompt and parameters.
 
@@ -425,6 +444,142 @@ class LollmsClient():
                         if not streaming_callback(decoded, MSG_TYPE.MSG_TYPE_CHUNK):
                             break
         return text
+    
+    
+    
+    def openai_generate_with_images(self, 
+                        prompt,
+                        images,
+                        host_address=None, 
+                        model_name=None, 
+                        personality=None, 
+                        n_predict=None, 
+                        stream=False, 
+                        temperature=0.1, 
+                        top_k=50, 
+                        top_p=0.95, 
+                        repeat_penalty=0.8, 
+                        repeat_last_n=40, 
+                        seed=None, 
+                        n_threads=8,
+                        max_image_width=-1, 
+                        service_key: str = "", 
+                        streaming_callback=None,):
+        """Generates text out of a prompt
+
+        Args:
+            prompt (str): The prompt to use for generation
+            n_predict (int, optional): Number of tokens to prodict. Defaults to 128.
+            callback (Callable[[str], None], optional): A callback function that is called everytime a new text element is generated. Defaults to None.
+            verbose (bool, optional): If true, the code will spit many informations about the generation process. Defaults to False.
+        """
+        # Set default values to instance variables if optional arguments are None
+        host_address = host_address if host_address else self.host_address
+        model_name = model_name if model_name else self.model_name
+        n_predict = n_predict if n_predict else self.n_predict
+        personality = personality if personality is not None else self.personality
+        # Set temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads to the instance variables if they are not provided or None
+        temperature = temperature if temperature is not None else self.temperature
+        top_k = top_k if top_k is not None else self.top_k
+        top_p = top_p if top_p is not None else self.top_p
+        repeat_penalty = repeat_penalty if repeat_penalty is not None else self.repeat_penalty
+        repeat_last_n = repeat_last_n if repeat_last_n is not None else self.repeat_last_n
+        seed = seed or self.seed  # Use the instance seed if not provided
+        n_threads = n_threads if n_threads else self.n_threads
+        if service_key != "":
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {service_key}',
+            }
+        else:
+            headers = {
+                'Content-Type': 'application/json',
+            }
+
+        
+        data = {
+            'model': model_name,
+            'messages': [            
+                    {
+                        "role": "user", 
+                        "content": [
+                            {
+                                "type":"text",
+                                "text":prompt
+                            }
+                        ]+[
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                "url": f"data:image/jpeg;base64,{encode_image(image_path, max_image_width)}"
+                                }                                    
+                            }
+                            for image_path in images
+                        ]
+                    }
+            ],
+            "stream": True,
+            "temperature": float(temperature),
+            "max_tokens": n_predict
+        }
+
+        completion_format_path = "/v1/chat/completions"
+
+        if host_address.endswith("/"):
+            host_address = host_address[:-1]
+        url = f'{host_address}{completion_format_path}'
+
+        response = requests.post(url, json=data, headers=headers)
+
+        if response.status_code == 400:
+            try:
+                content = response.content.decode("utf8")
+                content = json.loads(content)
+                self.error(content["error"]["message"])
+                return
+            except:
+                content = response.content.decode("utf8")
+                content = json.loads(content)
+                self.error(content["message"])
+                return
+        elif response.status_code == 404:
+            ASCIIColors.error(response.content.decode("utf-8", errors='ignore'))
+        
+        text = ""
+        for line in response.iter_lines():
+            decoded = line.decode("utf-8")
+            if decoded.startswith("data: "):
+                try:
+                    json_data = json.loads(decoded[5:].strip())
+                    try:
+                        chunk = json_data["choices"][0]["delta"]["content"]
+                    except:
+                        chunk = ""
+                    # Process the JSON data here
+                    text += chunk
+                    if streaming_callback:
+                        if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
+                            break
+                except:
+                    break
+            else:
+                if decoded.startswith("{"):
+                    for line_ in response.iter_lines():
+                        decoded += line_.decode("utf-8")
+                    try:
+                        json_data = json.loads(decoded)
+                        if json_data["object"] == "error":
+                            self.error(json_data["message"])
+                            break
+                    except:
+                        self.error("Couldn't generate text, verify your key or model name")
+                else:
+                    text += decoded
+                    if streaming_callback:
+                        if not streaming_callback(decoded, MSG_TYPE.MSG_TYPE_CHUNK):
+                            break
+        return text
+
 
     def ollama_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, completion_format:ELF_COMPLETION_FORMAT=ELF_COMPLETION_FORMAT.Instruct, service_key:str="", streaming_callback=None):
         # Set default values to instance variables if optional arguments are None

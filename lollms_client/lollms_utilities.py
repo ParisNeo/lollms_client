@@ -2,6 +2,7 @@ import urllib
 import numpy
 from pathlib import Path
 from pipmaster import PackageManager
+from PIL import Image
 class PromptReshaper:
     def __init__(self, template:str):
         self.template = template
@@ -47,6 +48,32 @@ class PromptReshaper:
         
         return fill_template(self.template, placeholders)
 
+
+# Function to encode the image
+def encode_image(image_path, max_image_width=-1):
+    image = Image.open(image_path)
+    width, height = image.size
+
+    # Check and convert image format if needed
+    if image.format not in ['PNG', 'JPEG', 'GIF', 'WEBP']:
+        image = image.convert('JPEG')
+
+
+    if max_image_width != -1 and width > max_image_width:
+        ratio = max_image_width / width
+        new_width = max_image_width
+        new_height = int(height * ratio)
+        f = image.format
+        image = image.resize((new_width, new_height))
+        image.format = f
+
+
+    # Save the image to a BytesIO object
+    byte_arr = io.BytesIO()
+    image.save(byte_arr, format=image.format)
+    byte_arr = byte_arr.getvalue()
+
+    return base64.b64encode(byte_arr).decode('utf-8')
 
 def discussion_path_to_url(file_path:str|Path)->str:
     """
