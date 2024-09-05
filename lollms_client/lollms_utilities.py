@@ -3,6 +3,8 @@ import numpy
 from pathlib import Path
 from pipmaster import PackageManager
 from PIL import Image
+import io
+import base64
 class PromptReshaper:
     def __init__(self, template:str):
         self.template = template
