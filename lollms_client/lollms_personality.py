@@ -6,8 +6,10 @@ from lollms_client.lollms_utilities import PromptReshaper
 import pkg_resources
 from typing import List, Optional, Union, Callable
 
+from lollmsvectordb.vector_database import VectorDatabase
+from lollmsvectordb.text_document_loader import TextDocumentsLoader
+from lollmsvectordb.text_chunker import TextChunker
 
-from safe_store import GenericDataLoader, TextVectorizer, VisualizationMethod
 from PIL import Image
 import importlib
 import yaml
@@ -210,33 +212,38 @@ class LollmsPersonality:
 
 
         # Load parameters from the configuration file
-        self.version = config.get("version", self._version)
-        self.author = config.get("author", self._author)
-        self.name = config.get("name", self._name)
-        self.user_name = config.get("user_name", self._user_name)
-        self.category_desc = config.get("category", self._category)
-        self.language = config.get("language", self._language)
+        self._version = config.get("version", self._version)
+        self._author = config.get("author", self._author)
+        self._name = config.get("name", self._name)
+        self._user_name = config.get("user_name", self._user_name)
+        self._category_desc = config.get("category", self._category)
+        self._language = config.get("language", self._language)
+
+        self._ignore_discussion_documents_rag = config.get("ignore_discussion_documents_rag", self._ignore_discussion_documents_rag)
 
 
-        self.personality_description = config.get("personality_description", self._personality_description)
-        self.personality_conditioning = config.get("personality_conditioning", self._personality_conditioning)
-        self.welcome_message = config.get("welcome_message", self._welcome_message)
-        self.include_welcome_message_in_discussion = config.get("include_welcome_message_in_discussion", self._include_welcome_message_in_discussion)
+        self._personality_description = config.get("personality_description", self._personality_description)
+        self._personality_conditioning = config.get("personality_conditioning", self._personality_conditioning)
+        self._prompts_list = config.get("prompts_list", self._prompts_list)
+        self._welcome_message = config.get("welcome_message", self._welcome_message)
+        self._include_welcome_message_in_discussion = config.get("include_welcome_message_in_discussion", self._include_welcome_message_in_discussion)
 
-        self.user_message_prefix = config.get("user_message_prefix", self._user_message_prefix)
-        self.link_text = config.get("link_text", self._link_text)
-        self.ai_message_prefix = config.get("ai_message_prefix", self._ai_message_prefix)
-        self.anti_prompts = [self.config.discussion_prompt_separator]+config.get("anti_prompts", self._anti_prompts)
-        self.dependencies = config.get("dependencies", self._dependencies)
-        self.disclaimer = config.get("disclaimer", self._disclaimer)
-        self.help = config.get("help", self._help)
-        self.commands = config.get("commands", self._commands)
-        self.model_temperature = config.get("model_temperature", self._model_temperature)
-        self.model_n_predicts = config.get("model_n_predicts", self._model_n_predicts)
-        self.model_top_k = config.get("model_top_k", self._model_top_k)
-        self.model_top_p = config.get("model_top_p", self._model_top_p)
-        self.model_repeat_penalty = config.get("model_repeat_penalty", self._model_repeat_penalty)
-        self.model_repeat_last_n = config.get("model_repeat_last_n", self._model_repeat_last_n)
+        self._user_message_prefix = config.get("user_message_prefix", self._user_message_prefix)
+        self._link_text = config.get("link_text", self._link_text)
+        self._ai_message_prefix = config.get("ai_message_prefix", self._ai_message_prefix)
+        self._dependencies = config.get("dependencies", self._dependencies)
+        self._disclaimer = config.get("disclaimer", self._disclaimer)
+        self._help = config.get("help", self._help)
+        self._commands = config.get("commands", self._commands)
+        self._model_temperature = config.get("model_temperature", self._model_temperature)
+        self._model_top_k = config.get("model_top_k", self._model_top_k)
+        self._model_top_p = config.get("model_top_p", self._model_top_p)
+        self._model_repeat_penalty = config.get("model_repeat_penalty", self._model_repeat_penalty)
+        self._model_repeat_last_n = config.get("model_repeat_last_n", self._model_repeat_last_n)
+
+        # Script parameters (for example keys to connect to search engine or any other usage)
+        self._processor_cfg = config.get("processor_cfg", self._processor_cfg)
+
 
         #set package path
         self.personality_package_path = package_path
@@ -259,6 +266,7 @@ class LollmsPersonality:
         # Get the data folder path
         self.welcome_audio_path = self.personality_package_path / "welcome_audio"
 
+
         # If not exist recreate
         self.assets_path.mkdir(parents=True, exist_ok=True)
 
@@ -273,46 +281,42 @@ class LollmsPersonality:
 
         # Verify if the persona has a data folder
         if self.data_path.exists():
-            self.database_path = self.data_path / "db.json"
-            if self.database_path.exists():
-                ASCIIColors.info("Loading database ...",end="")
-                self.persona_data_vectorizer = TextVectorizer(
-                            "tfidf_vectorizer", # self.config.data_vectorization_method, # supported "model_embedding" or "tfidf_vectorizer"
-                            model=self.model, #needed in case of using model_embedding
-                            save_db=True,
-                            database_path=self.database_path,
-                            data_visualization_method=VisualizationMethod.PCA,
-                            database_dict=None)
-                ASCIIColors.green("Ok")
-            else:
-                files = [f for f in self.data_path.iterdir() if f.suffix.lower() in ['.asm', '.bat', '.c', '.cpp', '.cs', '.csproj', '.css',
-                    '.csv', '.docx', '.h', '.hh', '.hpp', '.html', '.inc', '.ini', '.java', '.js', '.json', '.log',
-                    '.lua', '.map', '.md', '.pas', '.pdf', '.php', '.pptx', '.ps1', '.py', '.rb', '.rtf', '.s', '.se', '.sh', '.sln',
-                    '.snippet', '.snippets', '.sql', '.sym', '.ts', '.txt', '.xlsx', '.xml', '.yaml', '.yml'] ]
-                if len(files)>0:
-                    dl = GenericDataLoader()
-                    self.persona_data_vectorizer = TextVectorizer(
-                                "tfidf_vectorizer", # self.config.data_vectorization_method, # supported "model_embedding" or "tfidf_vectorizer"
-                                model=self.model, #needed in case of using model_embedding
-                                save_db=True,
-                                database_path=self.database_path,
-                                data_visualization_method=VisualizationMethod.PCA,
-                                database_dict=None)
-                    for f in files:
-                        text = dl.read_file(f)
-                        self.persona_data_vectorizer.add_document(f.name,text,self.config.data_vectorization_chunk_size, self.config.data_vectorization_overlap_size)
-                        # data_vectorization_chunk_size: 512 # chunk size
-                        # data_vectorization_overlap_size: 128 # overlap between chunks size
-                        # data_vectorization_nb_chunks: 2 # number of chunks to use
-                    self.persona_data_vectorizer.index()
-                    self.persona_data_vectorizer.save_db()
-                else:
-                    self.persona_data_vectorizer = None
-                    self._data = None
+            self.database_path = self.data_path / "db.sqlite"
+            from lollmsvectordb.lollms_tokenizers.tiktoken_tokenizer import TikTokenTokenizer
+
+            if self.config.rag_vectorizer == "semantic":
+                from lollmsvectordb.lollms_vectorizers.semantic_vectorizer import SemanticVectorizer
+                v = SemanticVectorizer()
+            elif self.config.rag_vectorizer == "tfidf":
+                from lollmsvectordb.lollms_vectorizers.tfidf_vectorizer import TFIDFVectorizer
+                v = TFIDFVectorizer()
+            elif self.config.rag_vectorizer == "openai":
+                from lollmsvectordb.lollms_vectorizers.openai_vectorizer import OpenAIVectorizer
+                v = OpenAIVectorizer(api_key=self.config.rag_vectorizer_openai_key)
+
+            self.persona_data_vectorizer = VectorDatabase(self.database_path, v, TikTokenTokenizer(), self.config.rag_chunk_size, self.config.rag_overlap)
+
+            files = [f for f in self.data_path.iterdir() if f.suffix.lower() in ['.asm', '.bat', '.c', '.cpp', '.cs', '.csproj', '.css',
+                '.csv', '.docx', '.h', '.hh', '.hpp', '.html', '.inc', '.ini', '.java', '.js', '.json', '.log',
+                '.lua', '.map', '.md', '.pas', '.pdf', '.php', '.pptx', '.ps1', '.py', '.rb', '.rtf', '.s', '.se', '.sh', '.sln',
+                '.snippet', '.snippets', '.sql', '.sym', '.ts', '.txt', '.xlsx', '.xml', '.yaml', '.yml', '.msg'] ]
+            dl = TextDocumentsLoader()
+
+            for f in files:
+                text = dl.read_file(f)
+                self.persona_data_vectorizer.add_document(f.name, text, f)
+                # data_vectorization_chunk_size: 512 # chunk size
+                # data_vectorization_overlap_size: 128 # overlap between chunks size
+                # data_vectorization_nb_chunks: 2 # number of chunks to use
+            self.persona_data_vectorizer.build_index()
 
         else:
             self.persona_data_vectorizer = None
             self._data = None
+
+        self.personality_output_folder = self.lollms_paths.personal_outputs_path/self.name
+        self.personality_output_folder.mkdir(parents=True, exist_ok=True)
+
 
         if self.run_scripts:
             # Search for any processor code
@@ -334,6 +338,7 @@ class LollmsPersonality:
 
         self._assets_list = contents
         return config
+
     
     def notify(self, notification):
         print(notification)        
