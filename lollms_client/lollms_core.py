@@ -13,7 +13,7 @@ class ELF_GENERATION_FORMAT(Enum):
     LOLLMS = 0
     OPENAI = 1
     OLLAMA = 2
-    LITELLM = 2
+    LITELLM = 3
 
 class ELF_COMPLETION_FORMAT(Enum):
     Instruct = 0
