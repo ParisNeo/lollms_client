@@ -71,10 +71,10 @@ class LollmsClient():
                 import torch
             
             if not pm.is_installed("transformers"):
-                PackageManager.install_or_update("transformers")
-            from transformers import AutoModelForCausalLM, AutoTokenizer    
+                pm.install_or_update("transformers")
+            from transformers import AutoModelForCausalLM, AutoTokenizer,   GenerationConfig  
             self.tokenizer = AutoTokenizer.from_pretrained(
-                    str(model_name), trust_remote_code=self.binding_config.trust_remote_code
+                    str(model_name), trust_remote_code=False
                     )
             
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -137,7 +137,7 @@ class LollmsClient():
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.LITELLM:
             return self.litellm_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.TRANSFORMERS:
-            return self.transformers_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
+            return self.transformers_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, service_key, streaming_callback)
 
 
     def generate_text(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
@@ -401,48 +401,47 @@ class LollmsClient():
                             raise Exception("canceled")    
                     
                     def _is_chinese_char(self, cp):
-                    """Checks whether CP is the codepoint of a CJK character."""
-                    # This defines a "chinese character" as anything in the CJK Unicode block:
-                    #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
-                    #
-                    # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
-                    # despite its name. The modern Korean Hangul alphabet is a different block,
-                    # as is Japanese Hiragana and Katakana. Those alphabets are used to write
-                    # space-separated words, so they are not treated specially and handled
-                    # like the all of the other languages.
-                    if (
-                        (cp >= 0x4E00 and cp <= 0x9FFF)
-                        or (cp >= 0x3400 and cp <= 0x4DBF)  #
-                        or (cp >= 0x20000 and cp <= 0x2A6DF)  #
-                        or (cp >= 0x2A700 and cp <= 0x2B73F)  #
-                        or (cp >= 0x2B740 and cp <= 0x2B81F)  #
-                        or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
-                        or (cp >= 0xF900 and cp <= 0xFAFF)
-                        or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
-                    ):  #
-                        return True
-                    
-                    return False
+                        """Checks whether CP is the codepoint of a CJK character."""
+                        # This defines a "chinese character" as anything in the CJK Unicode block:
+                        #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
+                        #
+                        # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
+                        # despite its name. The modern Korean Hangul alphabet is a different block,
+                        # as is Japanese Hiragana and Katakana. Those alphabets are used to write
+                        # space-separated words, so they are not treated specially and handled
+                        # like the all of the other languages.
+                        if (
+                            (cp >= 0x4E00 and cp <= 0x9FFF)
+                            or (cp >= 0x3400 and cp <= 0x4DBF)  #
+                            or (cp >= 0x20000 and cp <= 0x2A6DF)  #
+                            or (cp >= 0x2A700 and cp <= 0x2B73F)  #
+                            or (cp >= 0x2B740 and cp <= 0x2B81F)  #
+                            or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
+                            or (cp >= 0xF900 and cp <= 0xFAFF)
+                            or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
+                        ):  #
+                            return True
+                        
+                        return False
                     def end(self):
-                    """Flushes any remaining cache and prints a newline to stdout."""
-                    # Flush the cache, if it exists
-                    if len(self.token_cache) > 0:
-                        text = self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
-                        printable_text = text[self.print_len :]
-                        self.token_cache = []
-                        self.print_len = 0
-                    else:
-                        printable_text = ""
-                    
-                    self.next_tokens_are_prompt = True
-                    if  self.callback:
-                        if self.callback(printable_text, MSG_OPERATION_TYPE.MSG_OPERATION_TYPE_ADD_CHUNK):
-                            raise Exception("canceled")    
+                        """Flushes any remaining cache and prints a newline to stdout."""
+                        # Flush the cache, if it exists
+                        if len(self.token_cache) > 0:
+                            text = self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
+                            printable_text = text[self.print_len :]
+                            self.token_cache = []
+                            self.print_len = 0
+                        else:
+                            printable_text = ""
+                        
+                        self.next_tokens_are_prompt = True
+                        if  self.callback:
+                            if self.callback(printable_text, 0):
+                                raise Exception("canceled")    
             streamer = StreamerClass()
-            streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK)
             self.model.generate(
                         inputs=input_ids, 
-                        generation_config=generation_config,
+                        generation_config=self.generation_config,
                         streamer = streamer,
                         )
             return streamer.output.rstrip('!')
