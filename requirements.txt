@@ -6,3 +6,4 @@ yaml
 tiktoken
 pydantic
 lollmsvectordb
+pipmaster
