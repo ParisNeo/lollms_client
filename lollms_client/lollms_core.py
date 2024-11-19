@@ -14,6 +14,7 @@ class ELF_GENERATION_FORMAT(Enum):
     OPENAI = 1
     OLLAMA = 2
     LITELLM = 3
+    TRANSFORMERS = 4
 
 class ELF_COMPLETION_FORMAT(Enum):
     Instruct = 0
