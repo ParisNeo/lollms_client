@@ -355,10 +355,18 @@ class LollmsClient():
         self.generation_config.output_attentions = False
 
         try:
-            input_ids = self.tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids.to(self.model_device)
+            input_ids = self.tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids
             class StreamerClass:
-                def __init__(self, callback):
+                def __init__(self, tokenizer, callback):
                     self.output = ""
+                    self.skip_prompt = True
+                    self.decode_kwargs = {}
+                    self.tokenizer = tokenizer
+
+                    # variables used in the streaming process
+                    self.token_cache = []
+                    self.print_len = 0
+                    self.next_tokens_are_prompt = True                    
                     self.callback = callback
                 def put(self, value):
                     """
@@ -397,48 +405,48 @@ class LollmsClient():
                     
                     self.output += printable_text
                     if  self.callback:
-                        if not self.callback(printable_text, MSG_OPERATION_TYPE.MSG_OPERATION_TYPE_ADD_CHUNK):
+                        if not self.callback(printable_text, 0):
                             raise Exception("canceled")    
                     
-                    def _is_chinese_char(self, cp):
-                        """Checks whether CP is the codepoint of a CJK character."""
-                        # This defines a "chinese character" as anything in the CJK Unicode block:
-                        #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
-                        #
-                        # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
-                        # despite its name. The modern Korean Hangul alphabet is a different block,
-                        # as is Japanese Hiragana and Katakana. Those alphabets are used to write
-                        # space-separated words, so they are not treated specially and handled
-                        # like the all of the other languages.
-                        if (
-                            (cp >= 0x4E00 and cp <= 0x9FFF)
-                            or (cp >= 0x3400 and cp <= 0x4DBF)  #
-                            or (cp >= 0x20000 and cp <= 0x2A6DF)  #
-                            or (cp >= 0x2A700 and cp <= 0x2B73F)  #
-                            or (cp >= 0x2B740 and cp <= 0x2B81F)  #
-                            or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
-                            or (cp >= 0xF900 and cp <= 0xFAFF)
-                            or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
-                        ):  #
-                            return True
-                        
-                        return False
-                    def end(self):
-                        """Flushes any remaining cache and prints a newline to stdout."""
-                        # Flush the cache, if it exists
-                        if len(self.token_cache) > 0:
-                            text = self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
-                            printable_text = text[self.print_len :]
-                            self.token_cache = []
-                            self.print_len = 0
-                        else:
-                            printable_text = ""
-                        
-                        self.next_tokens_are_prompt = True
-                        if  self.callback:
-                            if self.callback(printable_text, 0):
-                                raise Exception("canceled")    
-            streamer = StreamerClass()
+                def _is_chinese_char(self, cp):
+                    """Checks whether CP is the codepoint of a CJK character."""
+                    # This defines a "chinese character" as anything in the CJK Unicode block:
+                    #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
+                    #
+                    # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
+                    # despite its name. The modern Korean Hangul alphabet is a different block,
+                    # as is Japanese Hiragana and Katakana. Those alphabets are used to write
+                    # space-separated words, so they are not treated specially and handled
+                    # like the all of the other languages.
+                    if (
+                        (cp >= 0x4E00 and cp <= 0x9FFF)
+                        or (cp >= 0x3400 and cp <= 0x4DBF)  #
+                        or (cp >= 0x20000 and cp <= 0x2A6DF)  #
+                        or (cp >= 0x2A700 and cp <= 0x2B73F)  #
+                        or (cp >= 0x2B740 and cp <= 0x2B81F)  #
+                        or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
+                        or (cp >= 0xF900 and cp <= 0xFAFF)
+                        or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
+                    ):  #
+                        return True
+                    
+                    return False
+                def end(self):
+                    """Flushes any remaining cache and prints a newline to stdout."""
+                    # Flush the cache, if it exists
+                    if len(self.token_cache) > 0:
+                        text = self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
+                        printable_text = text[self.print_len :]
+                        self.token_cache = []
+                        self.print_len = 0
+                    else:
+                        printable_text = ""
+                    
+                    self.next_tokens_are_prompt = True
+                    if  self.callback:
+                        if self.callback(printable_text, 0):
+                            raise Exception("canceled")    
+            streamer = StreamerClass(self.tokenizer, streaming_callback)
             self.model.generate(
                         inputs=input_ids, 
                         generation_config=self.generation_config,
