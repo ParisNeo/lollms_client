@@ -7,13 +7,15 @@ from enum import Enum
 import tiktoken
 import base64
 import requests
+import pipmaster as pm
 from typing import List, Optional, Callable, Union
 
 class ELF_GENERATION_FORMAT(Enum):
     LOLLMS = 0
     OPENAI = 1
     OLLAMA = 2
-    LITELLM = 2
+    LITELLM = 3
+    TRANSFORMERS = 4
 
 class ELF_COMPLETION_FORMAT(Enum):
     Instruct = 0
@@ -57,6 +59,32 @@ class LollmsClient():
         self.service_key = service_key
         self.default_generation_mode = default_generation_mode
         self.tokenizer = tiktoken.model.encoding_for_model("gpt-3.5-turbo-1106") if tokenizer is None else tokenizer
+        if default_generation_mode == ELF_GENERATION_FORMAT.TRANSFORMERS:
+            if not pm.is_installed("torch"):
+                ASCIIColors.yellow("Diffusers: Torch not found. Installing it")
+                pm.install_multiple(["torch","torchvision","torchaudio"], "https://download.pytorch.org/whl/cu121", force_reinstall=True)
+            
+            import torch
+            if not torch.cuda.is_available():
+                ASCIIColors.yellow("Diffusers: Torch not using cuda. Reinstalling it")
+                pm.install_multiple(["torch","torchvision","torchaudio"], "https://download.pytorch.org/whl/cu121", force_reinstall=True)
+                import torch
+            
+            if not pm.is_installed("transformers"):
+                pm.install_or_update("transformers")
+            from transformers import AutoModelForCausalLM, AutoTokenizer,   GenerationConfig  
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_name), trust_remote_code=False
+                    )
+            
+            self.model = AutoModelForCausalLM.from_pretrained(
+                        str(model_name),
+                        device_map="auto",
+                        load_in_4bit=True,
+                        torch_dtype=torch.bfloat16  # Load in float16 for quantization
+                    )
+            self.generation_config = GenerationConfig.from_pretrained(str(model_name))
+
         self.start_header_id_template ="!@>"
         self.end_header_id_template =": "
         self.system_message_template =""
@@ -141,6 +169,8 @@ class LollmsClient():
             return self.ollama_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.LITELLM:
             return self.litellm_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
+        elif self.default_generation_mode == ELF_GENERATION_FORMAT.TRANSFORMERS:
+            return self.transformers_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, service_key, streaming_callback)
 
 
     def generate_text(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
@@ -332,7 +362,133 @@ class LollmsClient():
             else:
                 return {"status": False, "error": response.text}
 
+    
+    def transformers_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
+        # Set default values to instance variables if optional arguments are None
+        model_name = model_name if model_name else self.model_name
+        n_predict = n_predict if n_predict else self.n_predict
+        personality = personality if personality is not None else self.personality
+        # Set temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads to the instance variables if they are not provided or None
+        temperature = temperature if temperature is not None else self.temperature
+        top_k = top_k if top_k is not None else self.top_k
+        top_p = top_p if top_p is not None else self.top_p
+        repeat_penalty = repeat_penalty if repeat_penalty is not None else self.repeat_penalty
+        repeat_last_n = repeat_last_n if repeat_last_n is not None else self.repeat_last_n
+        seed = seed or self.seed  # Use the instance seed if not provided
+        n_threads = n_threads if n_threads else self.n_threads
 
+        self.generation_config.max_new_tokens = int(n_predict)
+        self.generation_config.temperature = float(temperature)
+        self.generation_config.top_k = int(top_k)
+        self.generation_config.top_p = float(top_p)
+        self.generation_config.repetition_penalty = float(repeat_penalty)
+        self.generation_config.do_sample = True if float(temperature)>0 else False
+        self.generation_config.pad_token_id = self.tokenizer.pad_token_id
+        self.generation_config.eos_token_id = self.tokenizer.eos_token_id
+        self.generation_config.output_attentions = False
+
+        try:
+            input_ids = self.tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids
+            class StreamerClass:
+                def __init__(self, tokenizer, callback):
+                    self.output = ""
+                    self.skip_prompt = True
+                    self.decode_kwargs = {}
+                    self.tokenizer = tokenizer
+
+                    # variables used in the streaming process
+                    self.token_cache = []
+                    self.print_len = 0
+                    self.next_tokens_are_prompt = True                    
+                    self.callback = callback
+                def put(self, value):
+                    """
+                    Recives tokens, decodes them, and prints them to stdout as soon as they form entire words.
+                    """
+                    if len(value.shape)==1 and (value[0] == self.tokenizer.eos_token_id or value[0] == self.tokenizer.bos_token_id):
+                        print("eos detected")
+                        return
+                    if len(value.shape) > 1 and value.shape[0] > 1:
+                        raise ValueError("TextStreamer only supports batch size 1")
+                    elif len(value.shape) > 1:
+                        value = value[0]
+                    
+                    if self.skip_prompt and self.next_tokens_are_prompt:
+                        self.next_tokens_are_prompt = False
+                        return
+                    
+                    # Add the new token to the cache and decodes the entire thing.
+                    self.token_cache.extend(value.tolist())
+                    text = self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
+                    
+                    # After the symbol for a new line, we flush the cache.
+                    if text.endswith("\n"):
+                        printable_text = text[self.print_len :]
+                        self.token_cache = []
+                        self.print_len = 0
+                    # If the last token is a CJK character, we print the characters.
+                    elif len(text) > 0 and self._is_chinese_char(ord(text[-1])):
+                        printable_text = text[self.print_len :]
+                        self.print_len += len(printable_text)
+                    # Otherwise, prints until the last space char (simple heuristic to avoid printing incomplete words,
+                    # which may change with the subsequent token -- there are probably smarter ways to do this!)
+                    else:
+                        printable_text = text[self.print_len : text.rfind(" ") + 1]
+                        self.print_len += len(printable_text)
+                    
+                    self.output += printable_text
+                    if  self.callback:
+                        if not self.callback(printable_text, 0):
+                            raise Exception("canceled")    
+                    
+                def _is_chinese_char(self, cp):
+                    """Checks whether CP is the codepoint of a CJK character."""
+                    # This defines a "chinese character" as anything in the CJK Unicode block:
+                    #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
+                    #
+                    # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
+                    # despite its name. The modern Korean Hangul alphabet is a different block,
+                    # as is Japanese Hiragana and Katakana. Those alphabets are used to write
+                    # space-separated words, so they are not treated specially and handled
+                    # like the all of the other languages.
+                    if (
+                        (cp >= 0x4E00 and cp <= 0x9FFF)
+                        or (cp >= 0x3400 and cp <= 0x4DBF)  #
+                        or (cp >= 0x20000 and cp <= 0x2A6DF)  #
+                        or (cp >= 0x2A700 and cp <= 0x2B73F)  #
+                        or (cp >= 0x2B740 and cp <= 0x2B81F)  #
+                        or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
+                        or (cp >= 0xF900 and cp <= 0xFAFF)
+                        or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
+                    ):  #
+                        return True
+                    
+                    return False
+                def end(self):
+                    """Flushes any remaining cache and prints a newline to stdout."""
+                    # Flush the cache, if it exists
+                    if len(self.token_cache) > 0:
+                        text = self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
+                        printable_text = text[self.print_len :]
+                        self.token_cache = []
+                        self.print_len = 0
+                    else:
+                        printable_text = ""
+                    
+                    self.next_tokens_are_prompt = True
+                    if  self.callback:
+                        if self.callback(printable_text, 0):
+                            raise Exception("canceled")    
+            streamer = StreamerClass(self.tokenizer, streaming_callback)
+            self.model.generate(
+                        inputs=input_ids, 
+                        generation_config=self.generation_config,
+                        streamer = streamer,
+                        )
+            return streamer.output.rstrip('!')
+        except Exception as ex:
+            return {"status": False, "error": str(ex)}
+                
     def openai_generate(self, 
                         prompt, 
                         host_address=None, 
