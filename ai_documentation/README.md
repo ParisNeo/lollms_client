@@ -62,9 +62,9 @@ The main class for interacting with AI models. It provides methods for text gene
 
 #### Parameters:
 - `host_address` (str): The server address hosting the AI model (default: `http://localhost:9600`).
-- `model_name` (str): The name of the model to use.
-- `ctx_size` (int): Context size for the model (default: 4096).
-- `n_predict` (int): Number of tokens to predict (default: 1024).
+- `model_name` (str): The name of the model to use (optional if you are using lollms as backend).
+- `ctx_size` (int): Context size for the model (default: 32000).
+- `n_predict` (int): Number of tokens to predict (default: 4096).
 - `temperature` (float): Sampling temperature (default: 0.1).
 - `top_k` (int): Top-k sampling parameter (default: 50).
 - `top_p` (float): Top-p (nucleus) sampling parameter (default: 0.95).
@@ -95,18 +95,17 @@ An enumeration of completion formats:
 ---
 
 ## 4. Key Methods
-
 ### Initialization
 
 ```python
 from lollms_client import LollmsClient
 
 client = LollmsClient(
-    host_address="http://localhost:9600",
-    model_name="gpt-3.5-turbo",
-    n_predict=512,
-    temperature=0.7,
-    default_generation_mode=ELF_GENERATION_FORMAT.OPENAI
+    host_address="http://localhost:9600", #optional
+    model_name="gpt-3.5-turbo", # optional
+    n_predict=512, # optional (default 4096)
+    temperature=0.7, # optional (default 0.1)
+    default_generation_mode=ELF_GENERATION_FORMAT.OPENAI # optional (default ELF_GENERATION_FORMAT.LOLLMS)
 )
 ```
 
@@ -152,26 +151,6 @@ print(response)
 
 ---
 
-### Model and Personality Management
-
-#### `listMountedPersonalities() -> list`
-Lists all mounted personalities on the server.
-
-```python
-personalities = client.listMountedPersonalities()
-print(personalities)
-```
-
-#### `listModels() -> list`
-Lists all available models on the server.
-
-```python
-models = client.listModels()
-print(models)
-```
-
----
-
 ### Code Generation
 
 #### `generate_code(prompt: str, ...) -> str`
@@ -198,6 +177,27 @@ Extracts code blocks from a given text.
 code_blocks = client.extract_code_blocks(response)
 print(code_blocks)
 ```
+
+---
+
+### Model and Personality Management
+
+#### `listMountedPersonalities() -> list`
+Lists all mounted personalities on the server.
+
+```python
+personalities = client.listMountedPersonalities()
+print(personalities)
+```
+
+#### `listModels() -> list`
+Lists all available models on the server.
+
+```python
+models = client.listModels()
+print(models)
+```
+
 
 ---
 
