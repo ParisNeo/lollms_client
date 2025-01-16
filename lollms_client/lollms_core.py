@@ -41,10 +41,13 @@ class LollmsClient():
                     service_key:str="",
                     tokenizer=None,
                     default_generation_mode=ELF_GENERATION_FORMAT.LOLLMS,
-                    verify_ssl_certificate = True
+                    verify_ssl_certificate = True,
+                    user_name = "user",
+                    ai_name = "assistant"
                 ) -> None:
         import tiktoken
-
+        self.user_name = user_name
+        self.ai_name = ai_name
         self.host_address=host_address
         self.model_name = model_name
         self.ctx_size = ctx_size
@@ -90,7 +93,7 @@ class LollmsClient():
 
         self.start_header_id_template ="!@>"
         self.end_header_id_template =": "
-        self.system_message_template =""
+        self.system_message_template ="system"
         self.separator_template ="!@>"
         self.start_user_header_id_template ="!@>"
         self.end_user_header_id_template =": "
@@ -112,15 +115,15 @@ class LollmsClient():
     @property
     def ai_full_header(self) -> str:
         """Get the start_header_id_template."""
-        return f"{self.start_user_header_id_template}{self.name}{self.end_user_header_id_template}"
+        return f"{self.start_ai_header_id_template}{self.ai_name}{self.end_ai_header_id_template}"
 
     def system_custom_header(self, ai_name) -> str:
         """Get the start_header_id_template."""
-        return f"{self.start_user_header_id_template}{ai_name}{self.end_user_header_id_template}"
+        return f"{self.start_header_id_template}{ai_name}{self.end_header_id_template}"
 
     def ai_custom_header(self, ai_name) -> str:
         """Get the start_header_id_template."""
-        return f"{self.start_user_header_id_template}{ai_name}{self.end_user_header_id_template}"
+        return f"{self.start_ai_header_id_template}{ai_name}{self.end_ai_header_id_template}"
 
 
     def tokenize(self, prompt:str):
@@ -1211,7 +1214,22 @@ class LollmsClient():
             return {"status": False, "error": response.text}
 
 
-    def generate_codes(self, prompt, images=[], max_size = None, temperature = None, top_k = None, top_p=None, repeat_penalty=None, repeat_last_n=None, callback=None, debug=False ):
+    def generate_codes(
+                        self, 
+                        prompt, 
+                        images=[], 
+                        template=None,
+                        language="json",
+                        code_tag_format="markdown", # or "html"
+                        max_size = None, 
+                        temperature = None, 
+                        top_k = None, 
+                        top_p=None, 
+                        repeat_penalty=None, 
+                        repeat_last_n=None, 
+                        callback=None, 
+                        debug=False 
+                        ):
         if len(images)>0:
             response = self.generate_with_images(self.system_custom_header("Generation infos")+ "Generated code must be put inside the adequate markdown code tag. Use this template:\n```language name\nCode\n```\n" + self.separator_template + prompt, images, max_size, temperature, top_k, top_p, repeat_penalty, repeat_last_n, streaming_callback=callback)
         else:
@@ -1219,11 +1237,55 @@ class LollmsClient():
         codes = self.extract_code_blocks(response)
         return codes
     
-    def generate_code(self, prompt, images=[], max_size = None,  temperature = None, top_k = None, top_p=None, repeat_penalty=None, repeat_last_n=None, callback=None, debug=False ):
+    def generate_code(
+                        self, 
+                        prompt, 
+                        images=[],
+                        template=None,
+                        language="json",
+                        code_tag_format="markdown", # or "html"                         
+                        max_size = None,  
+                        temperature = None,
+                        top_k = None,
+                        top_p=None,
+                        repeat_penalty=None,
+                        repeat_last_n=None,
+                        callback=None,
+                        debug=False ):
+        
+        full_prompt = f"""{self.system_full_header}Act as a code generation assistant that generates code from user prompt.    
+{self.user_full_header} 
+{prompt}
+Make sure only a single code tag is generated at each dialogue turn.
+"""
+        if template:
+            full_prompt += "Here is a template of the answer:\n"
+            if code_tag_format=="markdown":
+                full_prompt += f"""You must answer with the code placed inside the markdown code tag like this:
+```{language}
+{template}
+```
+{"Make sure you fill all fields and to use the exact same keys as the template." if language in ["json","yaml","xml"] else ""}
+The code tag is mandatory.
+Don't forget encapsulate the code inside a markdown code tag. This is mandatory.
+You must return a single code tag.
+Do not split the code in multiple tags.
+{self.ai_full_header} 
+"""
+            elif code_tag_format=="html":
+                full_prompt +=f"""You must answer with the code placed inside the html code tag like this:
+<code language="{language}">
+{template}
+</code>
+{"Make sure you fill all fields and to use the exact same keys as the template." if language in ["json","yaml","xml"] else ""}
+The code tag is mandatory.
+Don't forget encapsulate the code inside a html code tag. This is mandatory.
+{self.ai_full_header} 
+"""      
         if len(images)>0:
-            response = self.generate_with_images(self.system_custom_header("Generation infos")+ "Generated code must be put inside the adequate markdown code tag. Use this template:\n```language name\nCode\n```\nMake sure only a single code tag is generated at each dialogue turn." + self.separator_template + prompt, images, max_size, temperature, top_k, top_p, repeat_penalty, repeat_last_n, streaming_callback=callback)
+            response = self.generate_with_images(full_prompt, images, max_size, temperature, top_k, top_p, repeat_penalty, repeat_last_n, streaming_callback=callback)
         else:
-            response = self.generate(self.system_custom_header("Generation infos")+ "Generated code must be put inside the adequate markdown code tag. Use this template:\n```language name\nCode\n```\nMake sure only a single code tag is generated at each dialogue turn." + self.separator_template + prompt, max_size, False, temperature, top_k, top_p, repeat_penalty, repeat_last_n, streaming_callback=callback)
+            response = self.generate(full_prompt, max_size, False, temperature, top_k, top_p, repeat_penalty, repeat_last_n, streaming_callback=callback)
         codes = self.extract_code_blocks(response)
         if len(codes)>0:
             if not codes[-1]["is_complete"]:
