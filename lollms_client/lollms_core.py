@@ -976,7 +976,7 @@ class LollmsClient():
                         break            
                 return text
         else:
-            return response.content["response"]
+            return response.json()["response"]
 
     def ollama_generate_with_images(self, 
                         prompt,
@@ -1438,7 +1438,8 @@ Do not split the code in multiple tags.
         return code_blocks
 
 if __name__=="__main__":
-    lc = LollmsClient("http://localhost:9600")
+    #lc = LollmsClient("http://localhost:9600")
+    lc = LollmsClient("http://localhost:11434", model_name="mistral-nemo:latest", default_generation_mode=ELF_GENERATION_FORMAT.OLLAMA)
     print(lc.listMountedPersonalities())
     print(lc.listModels())
     code = lc.generate_code("Build a simple json that containes name and age. put the output inside a json markdown tag")
