@@ -17,12 +17,13 @@ Steps:
 Make sure you have the necessary dependencies installed and your webcam is accessible.
 """
 import cv2
-from lollms_client import LollmsClient, ELF_GENERATION_FORMAT, LollmsXTTS
+from lollms_client import LollmsClient, ELF_GENERATION_FORMAT
+from lollms_client.lollms_tts import LollmsTTS 
 import random
 
 # Initialize the LollmsClient instance
 lc = LollmsClient("http://localhost:9600", default_generation_mode=ELF_GENERATION_FORMAT.LOLLMS)
-tts = LollmsXTTS(lc)
+tts = LollmsTTS(lc)
 voices = tts.get_voices()
 
 # Pick a voice randomly

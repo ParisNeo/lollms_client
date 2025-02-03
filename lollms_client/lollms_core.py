@@ -9,6 +9,7 @@ import base64
 import requests
 import pipmaster as pm
 from typing import List, Optional, Callable, Union
+import numpy as np
 
 class ELF_GENERATION_FORMAT(Enum):
     LOLLMS = 0
@@ -157,10 +158,49 @@ class LollmsClient():
     def embed(self, text):
         if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
             return self.lollms_embed(text)
+        elif self.default_generation_mode == ELF_GENERATION_FORMAT.OLLAMA:
+            return self.ollama_embed(text)
         else:
             return #not implemented
             
-    def lollms_embed(self, text, **kwargs):
+    def ollama_embed(self, text, **kwargs):
+        """
+        Get embeddings for the input text using Ollama API
+        
+        Args:
+            text (str or List[str]): Input text to embed
+            **kwargs: Additional arguments like model, truncate, options, keep_alive
+        
+        Returns:
+            dict: Response containing embeddings
+        """
+        import requests
+        
+        url = f"{self.base_url}/api/embed"
+        
+        # Prepare the request payload
+        payload = {
+            "input": text,
+            "model": kwargs.get("model", "llama2")  # default model
+        }
+        
+        # Add optional parameters if provided
+        if "truncate" in kwargs:
+            payload["truncate"] = kwargs["truncate"]
+        if "options" in kwargs:
+            payload["options"] = kwargs["options"]
+        if "keep_alive" in kwargs:
+            payload["keep_alive"] = kwargs["keep_alive"]
+        
+        try:
+            response = requests.post(url, json=payload)
+            response.raise_for_status()  # Raise exception for bad status codes
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Embedding request failed: {str(e)}")
+
+
+    def lollms_embed(self, texts, **kwargs):
         api_key = kwargs.pop("api_key", None)
         headers = (
             {"Content-Type": "application/json", "Authorization": api_key}
@@ -170,7 +210,7 @@ class LollmsClient():
         embeddings = []
         for text in texts:
             request_data = {"text": text}
-            response = requests.post(f"{base_url}/lollms_embed", json=request_data, headers=headers)
+            response = requests.post(f"{self.host_address}/lollms_embed", json=request_data, headers=headers)
             response.raise_for_status()
             result = response.json()
             embeddings.append(result["vector"])
@@ -1357,7 +1397,6 @@ Do not split the code in multiple tags.
         else:
             return None
 
-
     def extract_code_blocks(self, text: str) -> List[dict]:
         """
         This function extracts code blocks from a given text.
@@ -1457,6 +1496,49 @@ Do not split the code in multiple tags.
                 continue
 
         return code_blocks
+
+    def extract_thinking_blocks(text: str) -> List[str]:
+        """
+        Extracts content between <thinking> tags from a given text.
+        
+        Parameters:
+        text (str): The text containing thinking blocks
+        
+        Returns:
+        List[str]: List of extracted thinking contents
+        """
+        import re
+        
+        # Find all matches between thinking tags
+        pattern = r'<thinking>(.*?)</thinking>'
+        # re.DOTALL allows . to match newlines
+        matches = re.finditer(pattern, text, re.DOTALL)
+        
+        # Extract and clean the content
+        thinking_blocks = [match.group(1).strip() for match in matches]
+        
+        return thinking_blocks
+
+    def remove_thinking_blocks(text: str) -> str:
+        """
+        Removes thinking blocks from text including the tags.
+        
+        Parameters:
+        text (str): The text containing thinking blocks
+        
+        Returns:
+        str: Text with thinking blocks removed
+        """
+        import re
+        
+        # Replace thinking blocks with empty string
+        pattern = r'<thinking>.*?</thinking>'
+        cleaned_text = re.sub(pattern, '', text, flags=re.DOTALL)
+        
+        # Remove extra whitespace and normalize newlines
+        cleaned_text = re.sub(r'\n\s*\n', '\n\n', cleaned_text.strip())
+        
+        return cleaned_text
 
 if __name__=="__main__":
     #lc = LollmsClient("http://localhost:9600")
