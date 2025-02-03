@@ -154,6 +154,27 @@ class LollmsClient():
 
         return text
     
+    def embed(self, text):
+        if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
+            return self.lollms_embed(text)
+        else:
+            return #not implemented
+            
+    def lollms_embed(self, text, **kwargs):
+        api_key = kwargs.pop("api_key", None)
+        headers = (
+            {"Content-Type": "application/json", "Authorization": api_key}
+            if api_key
+            else {"Content-Type": "application/json"}
+        )
+        embeddings = []
+        for text in texts:
+            request_data = {"text": text}
+            response = requests.post(f"{base_url}/lollms_embed", json=request_data, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            embeddings.append(result["vector"])
+        return np.array(embeddings)
     
     def generate_with_images(self, prompt, images, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
         if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
