@@ -1497,7 +1497,7 @@ Do not split the code in multiple tags.
 
         return code_blocks
 
-    def extract_thinking_blocks(text: str) -> List[str]:
+    def extract_thinking_blocks(self, text: str) -> List[str]:
         """
         Extracts content between <thinking> tags from a given text.
         
@@ -1519,7 +1519,7 @@ Do not split the code in multiple tags.
         
         return thinking_blocks
 
-    def remove_thinking_blocks(text: str) -> str:
+    def remove_thinking_blocks(self, text: str) -> str:
         """
         Removes thinking blocks from text including the tags.
         
