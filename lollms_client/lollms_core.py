@@ -895,20 +895,11 @@ class LollmsClient():
         repeat_last_n = repeat_last_n if repeat_last_n is not None else self.repeat_last_n
         seed = seed or self.seed  # Use the instance seed if not provided
         n_threads = n_threads if n_threads else self.n_threads
-        if service_key != "":
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {service_key}',
-            }
-        else:
-            headers = {
-                'Content-Type': 'application/json',
-            }
 
-        
-        data = {
-            'model': model_name,
-            'messages': [            
+        count = 0
+        output = ""
+
+        messages = [
                     {
                         "role": "user", 
                         "content": [
@@ -926,68 +917,31 @@ class LollmsClient():
                             for image_path in images
                         ]
                     }
-            ],
-            "stream": True,
-            "temperature": float(temperature),
-            "max_tokens": n_predict
-        }
-
-        completion_format_path = "/v1/chat/completions"
-
-        if host_address.endswith("/"):
-            host_address = host_address[:-1]
-        url = f'{host_address}{completion_format_path}'
-
-        response = requests.post(url, json=data, headers=headers)
-
-        if response.status_code == 400:
-            try:
-                content = response.content.decode("utf8")
-                content = json.loads(content)
-                self.error(content["error"]["message"])
-                return
-            except:
-                content = response.content.decode("utf8")
-                content = json.loads(content)
-                self.error(content["message"])
-                return
-        elif response.status_code == 404:
-            ASCIIColors.error(response.content.decode("utf-8", errors='ignore'))
+                ]
+        chat_completion = self.client.chat.completions.create(
+                        model=self.model_name,  # Choose the engine according to your OpenAI plan
+                        messages=messages,
+                        max_tokens=n_predict,  # Adjust the desired length of the generated response
+                        n=1,  # Specify the number of responses you want
+                        temperature=temperature,  # Adjust the temperature for more or less randomness in the output
+                        stream=True
+                        )
         
-        text = ""
-        for line in response.iter_lines():
-            decoded = line.decode("utf-8")
-            if decoded.startswith("data: "):
-                try:
-                    json_data = json.loads(decoded[5:].strip())
-                    try:
-                        chunk = json_data["choices"][0]["delta"]["content"]
-                    except:
-                        chunk = ""
-                    # Process the JSON data here
-                    text += chunk
-                    if streaming_callback:
-                        if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
-                            break
-                except:
+        for resp in chat_completion:
+            if count >= n_predict:
+                break
+            try:
+                word = resp.choices[0].delta.content
+            except Exception as ex:
+                word = ""
+            if streaming_callback is not None:
+                if not streaming_callback(word):
                     break
-            else:
-                if decoded.startswith("{"):
-                    for line_ in response.iter_lines():
-                        decoded += line_.decode("utf-8")
-                    try:
-                        json_data = json.loads(decoded)
-                        if json_data["object"] == "error":
-                            self.error(json_data["message"])
-                            break
-                    except:
-                        self.error("Couldn't generate text, verify your key or model name")
-                else:
-                    text += decoded
-                    if streaming_callback:
-                        if not streaming_callback(decoded, MSG_TYPE.MSG_TYPE_CHUNK):
-                            break
-        return text
+            if word:
+                output += word
+                count += 1
+        return output
+    
     
     def ollama_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, completion_format:ELF_COMPLETION_FORMAT=ELF_COMPLETION_FORMAT.Instruct, service_key:str="", streaming_callback=None):
         # Set default values to instance variables if optional arguments are None
