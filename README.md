@@ -19,29 +19,27 @@ To use the lollms_client, first import the necessary classes:
 ```python
 from lollms_client import LollmsClient
 
-# Initialize the LollmsClient instance
-lc = LollmsClient("http://localhost:9600")
+# Initialize the LollmsClient instance this uses the default lollms localhost service http://localhost:9600
+lc = LollmsClient()
+# You can also use a different host and port number if you please
+lc = LollmsClient("http://some.other.server:9600")
+# You can also use a local or remote ollama server
+lc = LollmsClient(model_name="mistral-nemo:latest", default_generation_mode = ELF_GENERATION_FORMAT.OLLAMA)
+# You can also use a local or remote openai server (you can either set your key as an environment variable or pass it here)
+lc = LollmsClient(model_name="gpt-3.5-turbo-0125", default_generation_mode = ELF_GENERATION_FORMAT.OPENAI)
 ```
 
 ### Text Generation
 
-Use `generate_text()` for generating text from the lollms API.
+Use `generate()` for generating text from the lollms API.
 
 ```python
-response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
+response = lc.generate(prompt="Once upon a time", stream=False, temperature=0.5)
 print(response)
 ```
 
-### Completion
 
-Use `generate_completion()` for getting a completion of the prompt from the lollms API.
-
-```python
-response = lc.generate_completion(prompt="What is the capital of France", stream=False, temperature=0.5)
-print(response)
-```
-
-### List Mounted Personalities
+### List Mounted Personalities (only on lollms)
 
 List mounted personalities of the lollms API with the `listMountedPersonalities()` method.
 
@@ -65,14 +63,10 @@ print(response)
 from lollms_client import LollmsClient
 
 # Initialize the LollmsClient instance
-lc = LollmsClient("http://localhost:9600")
+lc = LollmsClient()
 
 # Generate Text
-response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
-print(response)
-
-# Generate Completion
-response = lc.generate_completion(prompt="What is the capital of France", stream=False, temperature=0.5)
+response = lc.generate(prompt="Once upon a time", stream=False, temperature=0.5)
 print(response)
 
 # List Mounted Personalities

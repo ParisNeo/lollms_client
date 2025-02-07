@@ -1,5 +1,5 @@
 import requests
-from ascii_colors import ASCIIColors
+from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_utilities import encode_image
 import json
@@ -10,6 +10,8 @@ import requests
 import pipmaster as pm
 from typing import List, Optional, Callable, Union
 import numpy as np
+import pipmaster as pm
+import os
 
 class ELF_GENERATION_FORMAT(Enum):
     LOLLMS = 0
@@ -26,7 +28,7 @@ class ELF_COMPLETION_FORMAT(Enum):
 class LollmsClient():
     def __init__(
                     self, 
-                    host_address="http://localhost:9600",
+                    host_address=None,
                     model_name=None,
                     ctx_size=32000,
                     personality=-1, 
@@ -50,6 +52,16 @@ class LollmsClient():
         self.user_name = user_name
         self.ai_name = ai_name
         self.host_address=host_address
+        if not self.host_address:
+            if default_generation_mode==ELF_GENERATION_FORMAT.LOLLMS:
+                self.host_address = "http://localhost:9600"
+            elif default_generation_mode==ELF_GENERATION_FORMAT.OPENAI:
+                self.host_address = "https://api.openai.com"
+            elif default_generation_mode==ELF_GENERATION_FORMAT.OLLAMA:
+                self.host_address = "http://localhost:11434"
+            else:
+                self.host_address = "http://localhost:9600"
+
         self.model_name = model_name
         self.ctx_size = ctx_size
         self.n_predict = n_predict
@@ -63,6 +75,8 @@ class LollmsClient():
         self.seed = seed
         self.n_threads = n_threads
         self.service_key = service_key
+        if not self.service_key and default_generation_mode == ELF_GENERATION_FORMAT.OPENAI:
+            self.service_key = os.getenv("OPENAI_API_KEY","")
         self.default_generation_mode = default_generation_mode
         self.verify_ssl_certificate = verify_ssl_certificate
         self.tokenizer = tiktoken.model.encoding_for_model("gpt-3.5-turbo-1106") if tokenizer is None else tokenizer
@@ -103,6 +117,11 @@ class LollmsClient():
         self.end_ai_header_id_template =": "
         self.end_ai_message_id_template =""
 
+        if default_generation_mode==ELF_GENERATION_FORMAT.OPENAI:        
+            if not pm.is_installed("openai"):
+                pm.install("openai")
+            import openai
+            self.client = openai.OpenAI(base_url=host_address)
 
 
     @property
@@ -227,17 +246,17 @@ class LollmsClient():
             return # To be implemented #self.litellm_generate_with_images(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
 
 
-    def generate(self, prompt, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
+    def generate(self, prompt, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None, completion_format = ELF_COMPLETION_FORMAT.Chat):
         if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
             return self.lollms_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, service_key, streaming_callback)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.OPENAI:
-            return self.openai_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
+            return self.openai_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, completion_format, service_key, streaming_callback)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.OLLAMA:
-            return self.ollama_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
+            return self.ollama_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, completion_format, service_key, streaming_callback)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.LITELLM:
-            return self.litellm_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
+            return self.litellm_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, completion_format, service_key, streaming_callback)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.VLLM:
-            return self.vllm_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
+            return self.vllm_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, completion_format, service_key, streaming_callback)
         
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.TRANSFORMERS:
             return self.transformers_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, service_key, streaming_callback)
@@ -573,7 +592,7 @@ class LollmsClient():
                         repeat_last_n=40, 
                         seed=None, 
                         n_threads=8, 
-                        completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Instruct, 
+                        completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat, 
                         service_key: str = "", 
                         streaming_callback=None):
         """
@@ -613,96 +632,83 @@ class LollmsClient():
         repeat_last_n = repeat_last_n if repeat_last_n is not None else self.repeat_last_n
         seed = seed or self.seed  # Use the instance seed if not provided
         n_threads = n_threads if n_threads else self.n_threads
+        service_key = service_key if service_key else self.service_key
+        self.client.api_key = service_key
+        count = 0
+        output= ""
 
-        if service_key != "":
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {service_key}',
-            }
+
+        if "vision" in self.model_name:
+            messages = [
+                        {
+                            "role": "user", 
+                            "content": [
+                                {
+                                    "type":"text",
+                                    "text":prompt
+                                }
+                            ]
+                        }
+                    ]
         else:
-            headers = {
-                'Content-Type': 'application/json',
-            }
+            messages = [{"role": "user", "content": prompt}]
+            
 
-        if completion_format == ELF_COMPLETION_FORMAT.Instruct:
-            data = {
-                'model': model_name, 
-                'prompt': prompt,
-                "stream": True,
-                "temperature": float(temperature),
-                "max_tokens": n_predict
-            }
-            completion_format_path = "/v1/completions"
-        elif completion_format == ELF_COMPLETION_FORMAT.Chat:
-            data = {
-                'model': model_name,
-                'messages': [{
-                    'role': "user",
-                    'content': prompt
-                }],
-                "stream": True,
-                "temperature": float(temperature),
-                "max_tokens": n_predict
-            }
-            completion_format_path = "/v1/chat/completions"
-
-        if host_address.endswith("/"):
-            host_address = host_address[:-1]
-        url = f'{host_address}{completion_format_path}'
-
-        response = requests.post(url, json=data, headers=headers)
-
-        if response.status_code == 400:
-            try:
-                content = response.content.decode("utf8")
-                content = json.loads(content)
-                ASCIIColors.error(content["error"]["message"])
-                return
-            except:
-                content = response.content.decode("utf8")
-                content = json.loads(content)
-                ASCIIColors.error(content["message"])
-                return
-        elif response.status_code == 404:
-            ASCIIColors.error(response.content.decode("utf-8", errors='ignore'))
-        
-        text = ""
-        for line in response.iter_lines():
-            decoded = line.decode("utf-8")
-            if decoded.startswith("data: "):
-                try:
-                    json_data = json.loads(decoded[5:].strip())
-                    if completion_format == ELF_COMPLETION_FORMAT.Chat:
-                        try:
-                            chunk = json_data["choices"][0]["delta"]["content"]
-                        except:
-                            chunk = ""
-                    else:
-                        chunk = json_data["choices"][0]["text"]
-                    # Process the JSON data here
-                    text += chunk
-                    if streaming_callback:
-                        if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
-                            break
-                except:
-                    break
+        if completion_format == ELF_COMPLETION_FORMAT.Chat:
+            if "o1" in self.model_name:
+                chat_completion = self.client.chat.completions.create(
+                            model=self.model_name,  # Choose the engine according to your OpenAI plan
+                            messages=messages,
+                            n=1,  # Specify the number of responses you want
+                            )
+                output = chat_completion.choices[0].message.content
             else:
-                if decoded.startswith("{"):
-                    for line_ in response.iter_lines():
-                        decoded += line_.decode("utf-8")
+                chat_completion = self.client.chat.completions.create(
+                                model=self.model_name,  # Choose the engine according to your OpenAI plan
+                                messages=messages,
+                                max_tokens=n_predict-7 if n_predict>512 else n_predict,  # Adjust the desired length of the generated response
+                                n=1,  # Specify the number of responses you want
+                                temperature=float(self.temperature),  # Adjust the temperature for more or less randomness in the output
+                                stream=True)
+            
+                for resp in chat_completion:
+                    if count >= n_predict:
+                        break
                     try:
-                        json_data = json.loads(decoded)
-                        if json_data["object"] == "error":
-                            self.error(json_data["message"])
+                        word = resp.choices[0].delta.content
+                    except Exception as ex:
+                        word = ""
+                    if streaming_callback is not None:
+                        if not streaming_callback(word):
                             break
-                    except:
-                        self.error("Couldn't generate text, verify your key or model name")
-                else:
-                    text += decoded
-                    if streaming_callback:
-                        if not streaming_callback(decoded, MSG_TYPE.MSG_TYPE_CHUNK):
-                            break
-        return text
+                    if word:
+                        output += word
+                        count += 1
+        else:
+            completion = self.client.completions.create(
+                            model=self.model_name,  # Choose the engine according to your OpenAI plan
+                            prompt=prompt,
+                            max_tokens=n_predict-7 if n_predict>512 else n_predict,  # Adjust the desired length of the generated response
+                            n=1,  # Specify the number of responses you want
+                            temperature=float(self.temperature),  # Adjust the temperature for more or less randomness in the output
+                            stream=True)
+            
+            for resp in completion:
+                if count >= n_predict:
+                    break
+                try:
+                    word = resp.choices[0].text
+                except Exception as ex:
+                    word = ""
+                if streaming_callback is not None:
+                    if not streaming_callback(word):
+                        break
+                if word:
+                    output += word
+                    count += 1
+
+        return output
+
 
     def vllm_generate(self, 
                         prompt, 
@@ -1244,7 +1250,7 @@ class LollmsClient():
             return text
 
 
-    def listMountedPersonalities(self, host_address:str=None):
+    def lollms_listMountedPersonalities(self, host_address:str=None):
         host_address = host_address if host_address else self.host_address
         url = f"{host_address}/list_mounted_personalities"
 
@@ -1260,6 +1266,14 @@ class LollmsClient():
             return {"status": False, "error": response.text}
 
     def listModels(self, host_address:str=None):
+        if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
+            return self.lollms_listModels(host_address)
+        elif self.default_generation_mode == ELF_GENERATION_FORMAT.OLLAMA:
+            return self.ollama_listModels(host_address)
+        elif self.default_generation_mode == ELF_GENERATION_FORMAT.OPENAI:
+            return self.openai_listModels(host_address)
+
+    def lollms_listModels(self, host_address:str=None):
         host_address = host_address if host_address else self.host_address
         url = f"{host_address}/list_models"
 
@@ -1273,6 +1287,54 @@ class LollmsClient():
                 return {"status": False, "error": str(ex)}
         else:
             return {"status": False, "error": response.text}
+
+    def ollama_listModels(self, host_address:str=None):
+        if host_address is None:
+            host_address = self.host_address
+        url = f'{host_address}/api/tags'
+        headers = {
+                    'accept': 'application/json',
+                    'Authorization': f'Bearer {self.service_key}'
+                }
+        response = requests.get(url, headers=headers, verify= self.verify_ssl_certificate)
+        try:
+            data = response.json()
+            model_info = []
+
+            for model in data['models']:
+                model_name = model['name']
+                owned_by = ""
+                created_datetime = model["modified_at"]
+                model_info.append({'model_name': model_name, 'owned_by': owned_by, 'created_datetime': created_datetime})
+
+            return model_info
+        except Exception as ex:
+            trace_exception(ex)
+            return []
+
+    def openai_listModels(self, host_address:str=None):
+        if host_address is None:
+            host_address = self.host_address
+        url = f'{host_address}/v1/models'
+        headers = {
+                    'accept': 'application/json',
+                    'Authorization': f'Bearer {self.service_key}'
+                }
+        response = requests.get(url, headers=headers, verify= self.verify_ssl_certificate)
+        try:
+            data = response.json()
+            model_info = []
+
+            for model in data["data"]:
+                model_name = model['id']
+                owned_by = model['owned_by']
+                created_datetime = model["created"]
+                model_info.append({'model_name': model_name, 'owned_by': owned_by, 'created_datetime': created_datetime})
+
+            return model_info
+        except Exception as ex:
+            trace_exception(ex)
+            return []
 
 
     def generate_codes(
@@ -1499,7 +1561,7 @@ Do not split the code in multiple tags.
 
     def extract_thinking_blocks(self, text: str) -> List[str]:
         """
-        Extracts content between <thinking> tags from a given text.
+        Extracts content between <thinking> or <think> tags from a given text.
         
         Parameters:
         text (str): The text containing thinking blocks
@@ -1509,19 +1571,18 @@ Do not split the code in multiple tags.
         """
         import re
         
-        # Find all matches between thinking tags
-        pattern = r'<thinking>(.*?)</thinking>'
-        # re.DOTALL allows . to match newlines
+        # Pattern to match both <thinking> and <think> blocks with matching tags
+        pattern = r'<(thinking|think)>(.*?)</\1>'
         matches = re.finditer(pattern, text, re.DOTALL)
         
-        # Extract and clean the content
-        thinking_blocks = [match.group(1).strip() for match in matches]
+        # Extract content from the second group (index 2) and clean
+        thinking_blocks = [match.group(2).strip() for match in matches]
         
         return thinking_blocks
 
     def remove_thinking_blocks(self, text: str) -> str:
         """
-        Removes thinking blocks from text including the tags.
+        Removes thinking blocks (either <thinking> or <think>) from text including the tags.
         
         Parameters:
         text (str): The text containing thinking blocks
@@ -1531,8 +1592,8 @@ Do not split the code in multiple tags.
         """
         import re
         
-        # Replace thinking blocks with empty string
-        pattern = r'<thinking>.*?</thinking>'
+        # Pattern to remove both <thinking> and <think> blocks with matching tags
+        pattern = r'<(thinking|think)>.*?</\1>'
         cleaned_text = re.sub(pattern, '', text, flags=re.DOTALL)
         
         # Remove extra whitespace and normalize newlines
@@ -1540,10 +1601,32 @@ Do not split the code in multiple tags.
         
         return cleaned_text
 
+def error(self, content, duration:int=4, client_id=None, verbose:bool=True):
+    ASCIIColors.error(content)
+
+
+
 if __name__=="__main__":
     #lc = LollmsClient("http://localhost:9600")
-    lc = LollmsClient("http://localhost:11434", model_name="mistral-nemo:latest", default_generation_mode=ELF_GENERATION_FORMAT.OLLAMA)
-    print(lc.listMountedPersonalities())
+    #lc = LollmsClient("http://localhost:11434", model_name="mistral-nemo:latest", default_generation_mode=ELF_GENERATION_FORMAT.OLLAMA)
+    lc = LollmsClient(model_name="gpt-3.5-turbo-0125", default_generation_mode=ELF_GENERATION_FORMAT.OPENAI)
     print(lc.listModels())
     code = lc.generate_code("Build a simple json that containes name and age. put the output inside a json markdown tag")
     print(code)
+
+    code ="""<thinking>
+Hello world thinking!
+How you doing?
+    
+</thinking>
+This is no thinking
+
+<think>
+Hello world think!
+How you doing?
+    
+</think>
+
+"""
+    print(lc.extract_thinking_blocks(code))
+    print(lc.remove_thinking_blocks(code))
