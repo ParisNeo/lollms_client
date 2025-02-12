@@ -569,7 +569,7 @@ class LollmsClient():
                         if self.callback(printable_text, 0):
                             raise Exception("canceled")    
             streamer = StreamerClass(self.tokenizer, streaming_callback)
-            self.model.generate(
+            self.generate(
                         inputs=input_ids, 
                         generation_config=self.generation_config,
                         streamer = streamer,
@@ -1554,6 +1554,93 @@ Do not split the code in multiple tags.
         cleaned_text = re.sub(r'\n\s*\n', '\n\n', cleaned_text.strip())
         
         return cleaned_text
+
+    def sequential_summarize(self, text, summary_context="", task="Create final summary using this memory.", format="bullet points", tone="neutral", ctx_size=8192, callback = None):
+        """
+        Summarizes a long text sequentially by processing chunks and maintaining a memory.
+        
+        Args:
+            text (str): The input text to summarize.
+            summary_context (str): Optional context to guide the summarization.
+            format (str): Desired format for the final summary (e.g., "bullet points").
+            tone (str): Desired tone for the final summary (e.g., "neutral").
+            ctx_size (int): Total context window size of the model.
+        
+        Returns:
+            str: The final formatted summary.
+        """
+        
+        # Tokenize entire text
+        all_tokens = self.tokenize(text)
+        total_tokens = len(all_tokens)
+        
+        # Initialize memory and chunk index
+        memory = ""
+        start_token_idx = 0
+        
+        # Create static prompt template
+        static_prompt_template = f"""!@>instruction:
+Update the summary memory by combining previous memory with key information from this text chunk. {summary_context if summary_context else ''}
+Keep memory concise using bullet points.
+
+!@>current memory:
+{{memory}}
+
+!@>new text chunk:
+{{chunk}}
+
+!@>updated memory:
+"""
+        
+        # Calculate static prompt tokens (with empty memory and chunk)
+        example_prompt = static_prompt_template.format(memory="", chunk="")
+        static_tokens = len(self.tokenize(example_prompt))
+        
+        # Process text in chunks
+        while start_token_idx < total_tokens:
+            # Calculate available tokens for chunk
+            current_memory_tokens = len(self.tokenize(memory))
+            available_tokens = ctx_size - static_tokens - current_memory_tokens
+            
+            if available_tokens <= 0:
+                raise ValueError("Memory too large - consider reducing chunk size or increasing context window")
+            
+            # Get chunk tokens
+            end_token_idx = min(start_token_idx + available_tokens, total_tokens)
+            chunk_tokens = all_tokens[start_token_idx:end_token_idx]
+            chunk = self.detokenize(chunk_tokens)
+            
+            # Generate memory update
+            prompt = static_prompt_template.format(memory=memory, chunk=chunk)
+            memory = self.generate(prompt, n_predict=ctx_size//4, streaming_callback=callback).strip()
+            
+            # Move to next chunk
+            start_token_idx = end_token_idx
+        
+        # Prepare final summary prompt
+        final_prompt_template = f"""!@>instruction:
+{task}. Follow these requirements:
+Format: {format}
+Tone: {tone}
+
+!@>memory:
+{{memory}}
+
+!@>summary:
+"""
+        
+        # Truncate memory if needed for final prompt
+        example_final_prompt = final_prompt_template.format(memory=memory)
+        final_static_tokens = len(self.tokenize(example_final_prompt))
+        available_final_tokens = ctx_size - final_static_tokens
+        
+        memory_tokens = self.tokenize(memory)
+        if len(memory_tokens) > available_final_tokens:
+            memory = self.detokenize(memory_tokens[:available_final_tokens])
+        
+        # Generate final summary
+        final_prompt = final_prompt_template.format(memory=memory)
+        return self.generate(final_prompt, streaming_callback=callback)
 
 def error(self, content, duration:int=4, client_id=None, verbose:bool=True):
     ASCIIColors.error(content)
