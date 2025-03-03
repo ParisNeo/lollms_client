@@ -48,6 +48,61 @@ class LollmsClient():
                     user_name = "user",
                     ai_name = "assistant"
                 ) -> None:
+        """
+        Initializes a LollmsClient instance.
+
+        Args:
+            host_address (str): The server address hosting the AI 
+                model. Defaults to "http://localhost:9600".
+            model_name (str): The name of the model to use (optionnal,
+                if you are using lollms as backend)
+            ctx_size (int): The context size for the model. Defaults to
+                32000.
+            personnality (LollmsPersonality): The personality the model
+                uses. Defaults to none (-1).
+            n_predict (int): The number of tokens to predict. Defaults
+                to 4096.
+            min_n_predict (int): The minimum number of tokens to
+                predict. Defaults to 512. Feature is not in use yet.
+            temperature (float): The sampling temperature. A higher
+                temperature will result in lower probability, i.e more
+                creative outputs. A lower temperature will result in
+                higher probability, therefore more predictable outputs.
+                Defaults to 0.1.
+            top_k (int): The top-k sampling parameters. The number of
+                tokens candidate for the next token prediction. 
+                Defaults to 50.
+            top_p (float): The top-p (or nucleus) sampling parameter.
+                Restricts the sampling to the set of most probable 
+                tokens with cumulative probability more than p.
+                Defaults to 0.95.
+            repeat_penalty (float): The penalty for repeating tokens.
+                Defaults to 0.8.
+            repeat_last_n (int): The number of last tokens to consider
+                for repeat penalty. Defaults to 40.
+            seed (int): The seed used for randomness.
+            n_threads (int): The number of threads to use.
+                Defaults to 8.
+            service_key (str): Optional service key for authorization.
+            tokenizer: The tokenizer used to tokenize text. Defaults
+                to None (gpt-3.5-turbo-1106).
+            default_generation_mode (ELF_GENERATION_FORMAT): Default
+                generation format. Defaults to LOLLMS.
+            verify_ssl_certificate (bool): Wether the SSL Certificate
+                is verified during certain operations. Defaults to
+                True.
+            user_name (str): The user's name to be used by the model.
+                Defaults to "user".
+            ai_name (str): The model's name to be used by the model.
+                Defaults to "assistant".
+
+        Example:
+            lc = LollmsClient(
+                host_address="http://some.server:9600",
+                model_name="deepseek-r1:70b",
+                ctx_size=128000
+            )            
+        """
         import tiktoken
         self.user_name = user_name
         self.ai_name = ai_name
@@ -93,7 +148,7 @@ class LollmsClient():
             
             if not pm.is_installed("transformers"):
                 pm.install_or_update("transformers")
-            from transformers import AutoModelForCausalLM, AutoTokenizer,   GenerationConfig  
+            from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig  
             self.tokenizer = AutoTokenizer.from_pretrained(
                     str(model_name), trust_remote_code=False
                     )
@@ -106,6 +161,7 @@ class LollmsClient():
                     )
             self.generation_config = GenerationConfig.from_pretrained(str(model_name))
 
+        # Define several templates used to engineer prompts.
         self.start_header_id_template ="!@>"
         self.end_header_id_template =": "
         self.system_message_template ="system"
@@ -175,6 +231,16 @@ class LollmsClient():
         return text
     
     def embed(self, text):
+        """
+        Get embeddings from the input text - Redirects to specialized
+            methods.
+        
+        Args:
+            text (str or List[str]): Input text to embed
+            
+        Returns:
+            dict: Response containing the embeddings.
+        """
         if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
             return self.lollms_embed(text)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.OLLAMA:
@@ -218,8 +284,17 @@ class LollmsClient():
         except requests.exceptions.RequestException as e:
             raise Exception(f"Embedding request failed: {str(e)}")
 
-
     def lollms_embed(self, texts, **kwargs):
+        """
+        Get embeddings for the input text using lollms API.
+        
+        Args:
+            texts: (str or List[str]): List of input texts to embed
+            **kwargs: Additionnal arguments
+
+        Returns:
+            dict: Response containing embeddings
+        """
         api_key = kwargs.pop("api_key", None)
         headers = (
             {"Content-Type": "application/json", "Authorization": api_key}
@@ -235,6 +310,7 @@ class LollmsClient():
             embeddings.append(result["vector"])
         return np.array(embeddings)
     
+
     def generate_with_images(self, prompt, images, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
         if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
             return self.lollms_generate_with_images(prompt, images, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, service_key, streaming_callback)
@@ -242,11 +318,25 @@ class LollmsClient():
             return self.openai_generate_with_images(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.OLLAMA:
             return self.ollama_generate_with_images(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
-        elif self.default_generation_mode == ELF_GENERATION_FORMAT.LITELLM:
-            return # To be implemented #self.litellm_generate_with_images(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
+        # TODO: Implement this
+        # elif self.default_generation_mode == ELF_GENERATION_FORMAT.LITELLM:
+            # return # To be implemented #self.litellm_generate_with_images(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, ELF_COMPLETION_FORMAT.Instruct, service_key, streaming_callback)
+        else:
+            raise ValueError(f"Unsupported generation mode: {self.default_generation_mode}")
 
 
     def generate(self, prompt, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None, completion_format = ELF_COMPLETION_FORMAT.Chat):
+        """
+        Generic generation method.
+        
+        Args:
+            prompt (str): The prompt passed as input to the model
+            completion_format (ELF_COMPLETION_FORMAT): Chat or Instruct.
+                The mode of prompt completion. Defaults to Chat.
+        
+        Returns:
+            str: The LLMs response to the prompt.
+        """
         if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
             return self.lollms_generate(prompt, self.host_address, self.model_name, -1, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, service_key, streaming_callback)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.OPENAI:
@@ -263,6 +353,9 @@ class LollmsClient():
 
 
     def generate_text(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
+        """
+        Generic generation function for text.
+        """
         return self.lollms_generate(prompt, host_address, model_name, personality, n_predict, stream, temperature, top_k, top_p, repeat_penalty, repeat_last_n, seed, n_threads, service_key, streaming_callback)
 
     def lollms_generate(self, prompt, host_address=None, model_name=None, personality=None, n_predict=None, stream=False, temperature=0.1, top_k=50, top_p=0.95, repeat_penalty=0.8, repeat_last_n=40, seed=None, n_threads=8, service_key:str="", streaming_callback=None):
@@ -1205,6 +1298,18 @@ class LollmsClient():
 
 
     def lollms_listMountedPersonalities(self, host_address:str=None):
+        """
+        Returns a list of mounted personalities, queried from lollms
+            server.
+            
+        Args:
+            host_address (str): The host address of the server. If not
+                specified, defaults to the one specified at
+                LollmsClient instantiation.
+        
+        Returns:
+            List: a list of personalities mounted on the server.
+        """
         host_address = host_address if host_address else self.host_address
         url = f"{host_address}/list_mounted_personalities"
 
@@ -1220,12 +1325,25 @@ class LollmsClient():
             return {"status": False, "error": response.text}
 
     def listModels(self, host_address:str=None):
+        """
+        List models available on the server.
+        
+        Args:
+            host_address (str): The host address of the server. If not
+                specified, defaults to the one specified at
+                LollmsClient instantiation.
+        
+        Returns:
+            List: a list of models available on the server.
+        """
         if self.default_generation_mode == ELF_GENERATION_FORMAT.LOLLMS:
             return self.lollms_listModels(host_address)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.OLLAMA:
             return self.ollama_listModels(host_address)
         elif self.default_generation_mode == ELF_GENERATION_FORMAT.OPENAI:
             return self.openai_listModels(host_address)
+        else:
+            raise ValueError(f"LollmsClient.listModels: Unsupported generation mode: {self.default_generation_mode}")
 
     def lollms_listModels(self, host_address:str=None):
         host_address = host_address if host_address else self.host_address
@@ -1307,6 +1425,23 @@ class LollmsClient():
                         callback=None, 
                         debug=False 
                         ):
+        """
+        Generates one or more snippets of code in the specified
+            language and format.
+        
+        Args:
+            prompt (str): The prompt passed as input to the model
+            images (List): Images that are passed as input to the model.
+                Can be left empty.
+            template (str): String destined to provide a template to
+                follow when the model responds. Useful when working
+                with json for example.
+            language (str): Language (python, c, json, markdown...) the
+                code will be generated in.
+        
+        Returns:
+            str: The LLMs response to the prompt.
+        """
         response_full = ""
         full_prompt = f"""{self.system_full_header}Act as a code generation assistant that generates code from user prompt.    
 {self.user_full_header} 
@@ -1360,7 +1495,44 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
                         repeat_last_n=None,
                         callback=None,
                         debug=False ):
+        """
+        Generates one snippet of code in the specified language and
+            format.
         
+        Args:
+            prompt (str): The prompt passed as input to the model
+            images (List): Images that are passed as input to the model.
+                Can be left empty.
+            template (str): String destined to provide a template to
+                follow when the model responds. Useful when working
+                with json for example.
+            language (str): Language (python, c, json, markdown...) the
+                code will be generated in.
+        
+        Returns:
+            str: The LLMs response to the prompt.
+
+        Example: 
+            # Writes a C snippet to add two prime numbers
+            response = lc.generate_code("Write a function that checks if
+                two numbers are prime and add them when it's the case.",
+                language='c')
+
+            # Fills a json dict following a specific pattern
+            response = lc.generate_code(
+                prompt="Mr Alex Brown presents himself to the pharmacist. He is 20 years old and seeks an appointment for the 12th of October. Fill out his application.",
+                language='json',
+                template='''
+                {
+                    "name": "the first name of the person",
+                    "family_name": "the family name of the person",
+                    "age": "the age of the person",
+                    "appointment_date": "the date of the appointment in the format DD/MM/YYYY",
+                    "reason": "the reason for the appointment. if not specified fill out with 'N/A'"
+                }
+                '''
+                )
+        """        
         full_prompt = f"""{self.system_full_header}Act as a code generation assistant that generates code from user prompt.    
 {self.user_full_header} 
 {prompt}
