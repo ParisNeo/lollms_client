@@ -1564,6 +1564,8 @@ Do not split the code in multiple tags.
                                 final_output_format="markdown",
                                 ctx_size:int=None,
                                 chunk_size:int=None,
+                                bootstrap_chunk_size:int=None,
+                                bootstrap_steps:int=None,
                                 callback = None,
                                 debug:bool= False):
         """
@@ -1651,7 +1653,10 @@ Do not discuss the information inside thememory, just put the relevant informati
                 raise ValueError("Memory too large - consider reducing chunk size or increasing context window")
             
             # Get chunk tokens
-            end_token_idx = min(start_token_idx + chunk_size, total_tokens)
+            if bootstrap_chunk_size is not None and chunk_id < bootstrap_steps:
+                end_token_idx = min(start_token_idx + bootstrap_chunk_size, total_tokens)
+            else:                
+                end_token_idx = min(start_token_idx + chunk_size, total_tokens)
             chunk_tokens = all_tokens[start_token_idx:end_token_idx]
             chunk = self.detokenize(chunk_tokens)
             chunk_id +=1
