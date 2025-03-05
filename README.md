@@ -23,7 +23,7 @@ from lollms_client import LollmsClient
 lc = LollmsClient()
 
 # Specify a custom host and port
-lc = LollmsClient(host_adress="http://some.server:9600")
+lc = LollmsClient(host_address="http://some.server:9600")
 
 # Use a specific model with a local or remote ollama server
 from lollms_client import ELF_GENERATION_FORMAT
