@@ -14,7 +14,7 @@ lc = LollmsClient(
     default_generation_mode=ELF_GENERATION_FORMAT.OLLAMA
 )
 # Create prompts for each section
-article_url = "https://arxiv.org/pdf/2410.05779"
+article_url = "https://arxiv.org/pdf/2109.09572"
 converter = DocumentConverter()
 result = converter.convert(article_url)
 article_text = result.document.export_to_markdown()
@@ -28,16 +28,14 @@ summary = lc.sequential_summarize(
 Extract the following information if present in the chunk:
 
 1. **Title**: 
-   - Found in text chunk number 1 at the beginning.
+   - Found in text chunk number 1 at the beginning. It should be followed by # or ##
    - Copy exactly as presented; do not interpret.
-   - Do not alter if already in memory.
    - Never alter this if already in the memory. This is important
 
 2. **Authors**: 
    - Listed in text chunk number 1 at the beginning.
    - If you fail to find the authors keep this empty.
    - Copy exactly as presented; do not interpret.
-   - Do not alter if already in memory.
    - Never alter this if already in the memory. This is important
 
 3. **Summary**: 
@@ -56,7 +54,9 @@ Ensure that any information already in memory is retained unless explicitly upda
 ## Results
                     """,
                     ctx_size=128000,
-                    chunk_size=1024,
+                    chunk_size=4096,
+                    bootstrap_chunk_size=1024,
+                    bootstrap_steps=1,
                     debug = True
                 )
 
