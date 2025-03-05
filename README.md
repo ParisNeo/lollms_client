@@ -34,7 +34,7 @@ lc = LollmsClient(model_name="gpt-3.5-turbo-0125", default_generation_mode = ELF
 
 # Use a specific model with an Ollama binding on the server, with a context size of 32800
 lc = LollmsClient(
-    host_adress="http://some.other.server:11434",
+    host_address="http://some.other.server:11434",
     model_name="phi4:latest",
     ctx_size=32800,
     default_generation_mode=ELF_GENERATION_FORMAT.OLLAMA
