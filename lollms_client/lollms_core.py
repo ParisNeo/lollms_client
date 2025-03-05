@@ -1558,7 +1558,7 @@ Do not split the code in multiple tags.
     def sequential_summarize(
                                 self, 
                                 text:str,
-                                chunk_processing_prompt:str="",
+                                chunk_processing_prompt:str="Extract relevant information from the current text chunk and update the memory if needed.",
                                 chunk_processing_output_format="markdown",
                                 final_memory_processing_prompt="Create final summary using this memory.",
                                 final_output_format="markdown",
@@ -1567,17 +1567,22 @@ Do not split the code in multiple tags.
                                 callback = None,
                                 debug:bool= False):
         """
-        Summarizes a long text sequentially by processing chunks and maintaining a memory.
-        
-        Args:
-            text (str): The input text to summarize.
-            summary_context (str): Optional context to guide the summarization.
-            format (str): Desired format for the final summary (e.g., "bullet points").
-            tone (str): Desired tone for the final summary (e.g., "neutral").
-            ctx_size (int): Total context window size of the model.
-        
-        Returns:
-            str: The final formatted summary.
+            This function processes a given text in chunks and generates a summary for each chunk.
+            It then combines the summaries to create a final summary.
+
+            Parameters:
+            text (str): The input text to be summarized.
+            chunk_processing_prompt (str, optional): The prompt used for processing each chunk. Defaults to "".
+            chunk_processing_output_format (str, optional): The format of the output for each chunk. Defaults to "markdown".
+            final_memory_processing_prompt (str, optional): The prompt used for processing the final memory. Defaults to "Create final summary using this memory.".
+            final_output_format (str, optional): The format of the final output. Defaults to "markdown".
+            ctx_size (int, optional): The size of the context. Defaults to None.
+            chunk_size (int, optional): The size of each chunk. Defaults to None.
+            callback (callable, optional): A function to be called after processing each chunk. Defaults to None.
+            debug (bool, optional): A flag to enable debug mode. Defaults to False.
+
+            Returns:
+            The final summary in the specified format.
         """
         if ctx_size is None:
             ctx_size = self.ctx_size
@@ -1653,14 +1658,16 @@ Do not discuss the information inside thememory, just put the relevant informati
             
             # Generate memory update
             prompt = static_prompt_template.format(custom_prompt=chunk_processing_prompt if chunk_processing_prompt else '', memory=memory, chunk=chunk, chunk_id=chunk_id)
+            if debug:
+                ASCIIColors.yellow(f" ----- {chunk_id-1} ------")
+                ASCIIColors.red(prompt)
+            
             memory = self.generate(prompt, n_predict=ctx_size//4, streaming_callback=callback).strip()
             code = self.extract_code_blocks(memory)
             if code:
                 memory=code[0]["content"]
                 
             if debug:
-                ASCIIColors.yellow(f" ----- {chunk_id-1} ------")
-                ASCIIColors.red(prompt)
                 ASCIIColors.yellow(f" ----- OUT ------")
                 ASCIIColors.yellow(memory)
                 ASCIIColors.yellow(" ----- ------")
