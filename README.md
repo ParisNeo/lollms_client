@@ -73,6 +73,40 @@ data = json.loads(response)
 print(data['name'], data['family_name'], "- Reason:", data['reason'])
 ```
 
+In some cases, you may be interested in extracting the code from the response. There's a function for that:
+```python
+code_blocks = lc.extract_code_blocks(response)
+```
+
+### Thinking Processing
+In case you are using a reasoning model such as Deepseek-r1 or Qwen QwQ, the model will think, and the reasoning will be added to the response. Here's how you can process it:
+```python
+response = lc.generate(prompt="Once upon a time", stream=False, temperature=0.5)
+
+# Remove thinking from the response
+response_without_thinking = lc.remove_thinking_blocks(response)
+print("Answer: ", response_without_thinking)
+
+# Keep only the thinking
+reasoning = lc.extract_thinking_blocks(response)
+print("Reasoning: ", reasoning)
+```
+
+### Text Summarization
+Lollms_client supports sequential summarization. You can create summaries of long texts using the sequential_summarize function:
+```python
+# Generic use
+summary = lc.sequential_summarize(text)
+
+# You can specify a context length, and guide the summarization and its tone
+summary = lc.sequential_summarize(
+    text,
+    summary_context="keep the title and the authors names",
+    tone="neutral",
+    ctx_size=2048
+)
+```
+
 
 ### List Mounted Personalities (only on lollms)
 
