@@ -97,15 +97,9 @@ Lollms_client supports sequential summarization. You can create summaries of lon
 ```python
 # Generic use
 summary = lc.sequential_summarize(text)
-
-# You can specify a context length, and guide the summarization and its tone
-summary = lc.sequential_summarize(
-    text,
-    summary_context="keep the title and the authors names",
-    tone="neutral",
-    ctx_size=2048
-)
 ```
+You can specify a context length, and guide the summarization.
+An example further details this function use, see /examples/article_summary.py
 
 
 ### List Mounted Personalities (only on lollms)
