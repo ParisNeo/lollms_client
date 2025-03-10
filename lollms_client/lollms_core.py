@@ -1752,6 +1752,8 @@ Do not split the code in multiple tags.
             final_output_format (str, optional): The format of the final output. Defaults to "markdown".
             ctx_size (int, optional): The size of the context. Defaults to None.
             chunk_size (int, optional): The size of each chunk. Defaults to None.
+            bootstrap_chunk_size (int, optional): The size of bootstrap chunks. Defaults to None.
+            bootstrap_steps (int, optional): The number of chunks to process with the bootstrap_chunk_size chunk size. Defaults to None.
             callback (callable, optional): A function to be called after processing each chunk. Defaults to None.
             debug (bool, optional): A flag to enable debug mode. Defaults to False.
 
