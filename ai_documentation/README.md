@@ -170,8 +170,19 @@ for code in codes:
     print(code)
 ```
 
-#### `extract_code_blocks(text: str) -> list`
-Extracts code blocks from a given text.
+#### `extract_code_blocks(text: str) -> list[Dict]`
+Extracts code blocks enclosed in triple backticks (```) from text, returning metadata for each block.
+**Parameters**
+- `text` (`str`): Input text to parse.
+
+**Returns**
+A list of dictionaries with keys:
+- `index` (`int`): Block index.
+- `file_name` (`str`): File name from preceding `<file_name>...</file_name>` or `## filename: ...`.
+- `section` (`str`): Section name from preceding `<section>...</section>`.
+- `content` (`str`): Code content.
+- `type` (`str`): Language (e.g., "python") or "language-specific" if unspecified.
+- `is_complete` (`bool`): `True` if block is properly closed with ```.
 
 ```python
 code_blocks = client.extract_code_blocks(response)

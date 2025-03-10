@@ -73,6 +73,40 @@ data = json.loads(response)
 print(data['name'], data['family_name'], "- Reason:", data['reason'])
 ```
 
+In some cases, you may be interested in extracting the code from the response. There's a function for that:
+```python
+code_blocks = lc.extract_code_blocks(response)
+```
+The returned code blocks consists of a list of dictionnaries, containing an `index`, a `file_name`, the code's `content` and the `type` of language the code is written in. An additional boolean `is_complete` indicates whether the code block is complete or not.
+
+### Thinking Processing
+In case you are using a reasoning model such as Deepseek-r1 or Qwen QwQ, the model will think, and the reasoning will be added to the response. Here's how you can process it:
+```python
+response = lc.generate(prompt="Once upon a time", stream=False, temperature=0.5)
+
+# Remove thinking from the response
+response_without_thinking = lc.remove_thinking_blocks(response)
+print("Answer: ", response_without_thinking)
+
+# Keep only the thinking
+reasoning = lc.extract_thinking_blocks(response)
+print("Reasoning: ", reasoning)
+```
+
+### Text Summarization
+Lollms_client supports sequential summarization. You can create summaries of long texts using the sequential_summarize function:
+```python
+# Generic use
+summary = lc.sequential_summarize(text)
+```
+You can guide the summarization with several arguments such as:
+- **chunk_processing_prompt: str** is used to provide informations or instructions to process each chunk, and **chunk_processing_output_format** defines the output's language (*'markdown'* by default)
+- **final_memory_processing_prompt: str** is used to provide instructions to the final memory processing. It can be used to specify a specific format, or tone, in the final summarization. **final_memory_processing_format** defines the final summary output format (*'markdown'* by default)
+- **ctx_size: int**, **chunk_size: int** are used respectively to specify the size of the context and the size processing chunk size.
+- **bootstrap_chunk_size: int** and **bootstrap_steps: int** are used to define the size and number of the first chunk read in the sequential summarization. It provides a way to "warm up" the summarization.
+  
+An example further details this function use, see `/examples/article_summary.py`
+
 
 ### List Mounted Personalities (only on lollms)
 
