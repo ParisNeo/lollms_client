@@ -20,11 +20,38 @@ class ELF_GENERATION_FORMAT(Enum):
     LITELLM = 3
     TRANSFORMERS = 4
     VLLM = 5
+    
+    @classmethod
+    def from_string(cls, format_string: str) -> 'ELF_GENERATION_FORMAT':
+        format_mapping = {
+            "LOLLMS": cls.LOLLMS,
+            "OPENAI": cls.OPENAI,
+            "OLLAMA": cls.OLLAMA,
+            "LITELLM": cls.LITELLM,
+            "TRANSFORMERS": cls.TRANSFORMERS,
+            "VLLM": cls.VLLM
+        }
 
+        try:
+            return format_mapping[format_string.upper()]
+        except KeyError:
+            raise ValueError(f"Invalid format string: {format_string}. Must be one of {list(format_mapping.keys())}.")
+        
 class ELF_COMPLETION_FORMAT(Enum):
     Instruct = 0
     Chat = 1
+    @classmethod
+    def from_string(cls, format_string: str) -> 'ELF_COMPLETION_FORMAT':
+        format_mapping = {
+            "Instruct": cls.Instruct,
+            "Chat": cls.Chat,
+        }
 
+        try:
+            return format_mapping[format_string.upper()]
+        except KeyError:
+            raise ValueError(f"Invalid format string: {format_string}. Must be one of {list(format_mapping.keys())}.")
+        
 class LollmsClient():
     def __init__(
                     self, 
