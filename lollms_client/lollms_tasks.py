@@ -435,12 +435,12 @@ class TasksLibrary:
         choices = "\n".join([f"{i}. {possible_answer}" for i, possible_answer in enumerate(possible_answers)])
         elements = [conditionning] if conditionning!="" else []
         elements += [
-                "!@>system:",
+                self.lollms.system_full_header,
                 "Answer this multi choices question.",
         ]
         if context!="":
             elements+=[
-                       "!@>Context:",
+                       self.lollms.system_custom_header("Context"),
                         f"{context}",
                     ]
         elements +=[
@@ -450,11 +450,11 @@ class TasksLibrary:
                 "the output should be an integer."
         ]
         elements += [
-                f"!@>question: {question}",
-                "!@>possible answers:",
+                f'{self.lollms.user_custom_header("question")} {question}',
+                f'{self.lollms.user_custom_header("possible answers")}',
                 f"{choices}",
         ]
-        elements += ["!@>answer:"]
+        elements += [self.lollms.ai_custom_header("answer")]
         prompt = self.build_prompt(elements)
 
         gen = self.lollms.generate(prompt, max_answer_length, temperature=0.1, top_k=50, top_p=0.9, repeat_penalty=1.0, repeat_last_n=50, streaming_callback=self.sink).strip().replace("</s>","").replace("<s>","")
