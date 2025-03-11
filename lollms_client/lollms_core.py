@@ -160,18 +160,24 @@ class LollmsClient():
     def system_full_header(self) -> str:
         """Get the start_header_id_template."""
         return f"{self.start_header_id_template}{self.system_message_template}{self.end_header_id_template}"
+    
+    def system_custom_header(self, ai_name) -> str:
+        """Get the start_header_id_template."""
+        return f"{self.start_header_id_template}{ai_name}{self.end_header_id_template}"
+    
     @property
     def user_full_header(self) -> str:
         """Get the start_header_id_template."""
         return f"{self.start_user_header_id_template}{self.user_name}{self.end_user_header_id_template}"
+    
+    def user_custom_header(self, user_name="user") -> str:
+        """Get the start_header_id_template."""
+        return f"{self.start_user_header_id_template}{user_name}{self.end_user_header_id_template}"
+    
     @property
     def ai_full_header(self) -> str:
         """Get the start_header_id_template."""
         return f"{self.start_ai_header_id_template}{self.ai_name}{self.end_ai_header_id_template}"
-
-    def system_custom_header(self, ai_name) -> str:
-        """Get the start_header_id_template."""
-        return f"{self.start_header_id_template}{ai_name}{self.end_header_id_template}"
 
     def ai_custom_header(self, ai_name) -> str:
         """Get the start_header_id_template."""
@@ -1586,6 +1592,69 @@ Do not split the code in multiple tags.
         cleaned_text = re.sub(r'\n\s*\n', '\n\n', cleaned_text.strip())
         
         return cleaned_text
+
+    def yes_no(self, question: str, context:str="", max_answer_length: int = 50, conditionning="") -> bool:
+        """
+        Analyzes the user prompt and answers whether it is asking to generate an image.
+
+        Args:
+            question (str): The user's message.
+            max_answer_length (int, optional): The maximum length of the generated answer. Defaults to 50.
+            conditionning: An optional system message to put at the beginning of the prompt
+        Returns:
+            bool: True if the user prompt is asking to generate an image, False otherwise.
+        """
+        return self.multichoice_question(question, ["no","yes"], context, max_answer_length, conditionning=conditionning)>0
+
+    def multichoice_question(self, question: str, possible_answers:list, context:str = "", max_answer_length: int = 50, conditionning="") -> int:
+        """
+        Interprets a multi-choice question from a users response. This function expects only one choice as true. All other choices are considered false. If none are correct, returns -1.
+
+        Args:
+            question (str): The multi-choice question posed by the user.
+            possible_ansers (List[Any]): A list containing all valid options for the chosen value. For each item in the list, either 'True', 'False', None or another callable should be passed which will serve as the truth test function when checking against the actual user input.
+            max_answer_length (int, optional): Maximum string length allowed while interpreting the users' responses. Defaults to 50.
+            conditionning: An optional system message to put at the beginning of the prompt
+
+        Returns:
+            int: Index of the selected option within the possible_ansers list. Or -1 if there was not match found among any of them.
+        """
+        choices = "\n".join([f"{i}. {possible_answer}" for i, possible_answer in enumerate(possible_answers)])
+        elements = [conditionning] if conditionning!="" else []
+        elements += [
+                self.lollms.system_full_header,
+                "Answer this multi choices question.",
+        ]
+        if context!="":
+            elements+=[
+                       self.lollms.system_custom_header("Context"),
+                        f"{context}",
+                    ]
+        elements +=[
+                "Answer with an id from the possible answers.",
+                "Do not answer with an id outside this possible answers.",
+                "Do not explain your reasons or add comments.",
+                "the output should be an integer."
+        ]
+        elements += [
+                f'{self.lollms.user_custom_header("question")} {question}',
+                f'{self.lollms.user_custom_header("possible answers")}',
+                f"{choices}",
+        ]
+        elements += [self.lollms.ai_custom_header("answer")]
+        prompt = self.build_prompt(elements)
+
+        gen = self.lollms.generate(prompt, max_answer_length, temperature=0.1, top_k=50, top_p=0.9, repeat_penalty=1.0, repeat_last_n=50, streaming_callback=self.sink).strip().replace("</s>","").replace("<s>","")
+        if len(gen)>0:
+            selection = gen.strip().split()[0].replace(",","").replace(".","")
+            self.print_prompt("Multi choice selection",prompt+gen)
+            try:
+                return int(selection)
+            except:
+                ASCIIColors.cyan("Model failed to answer the question")
+                return -1
+        else:
+            return -1
 
     def sequential_summarize(
                                 self, 
