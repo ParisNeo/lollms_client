@@ -1637,8 +1637,6 @@ Do not split the code in multiple tags.
             language="json",
             code_tag_format="markdown",
             max_size=max_answer_length,
-            include_code_directives=True,
-            accept_all_if_no_code_tags_is_present=True,
             callback=callback
         )
         
