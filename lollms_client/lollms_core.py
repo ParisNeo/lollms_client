@@ -183,6 +183,8 @@ class LollmsClient():
         """Get the start_header_id_template."""
         return f"{self.start_ai_header_id_template}{ai_name}{self.end_ai_header_id_template}"
 
+    def sink(self, s=None,i=None,d=None):
+        pass
 
     def tokenize(self, prompt:str):
         """
@@ -1593,69 +1595,184 @@ Do not split the code in multiple tags.
         
         return cleaned_text
 
-    def yes_no(self, question: str, context:str="", max_answer_length: int = 50, conditionning="") -> bool:
+    def yes_no(
+            self,
+            question: str,
+            context: str = "",
+            max_answer_length: int = None,
+            conditionning: str = "",
+            return_explanation: bool = False,
+            callback = None
+        ) -> bool | dict:
         """
-        Analyzes the user prompt and answers whether it is asking to generate an image.
+        Answers a yes/no question.
 
         Args:
-            question (str): The user's message.
-            max_answer_length (int, optional): The maximum length of the generated answer. Defaults to 50.
-            conditionning: An optional system message to put at the beginning of the prompt
-        Returns:
-            bool: True if the user prompt is asking to generate an image, False otherwise.
-        """
-        return self.multichoice_question(question, ["no","yes"], context, max_answer_length, conditionning=conditionning)>0
+            question (str): The yes/no question to answer.
+            context (str, optional): Additional context to provide for the question.
+            max_answer_length (int, optional): Maximum string length allowed for the response. Defaults to None.
+            conditionning (str, optional): An optional system message to put at the beginning of the prompt.
+            return_explanation (bool, optional): If True, returns a dictionary with the answer and explanation. Defaults to False.
 
-    def multichoice_question(self, question: str, possible_answers:list, context:str = "", max_answer_length: int = 50, conditionning="") -> int:
+        Returns:
+            bool or dict: 
+                - If return_explanation is False, returns a boolean (True for 'yes', False for 'no').
+                - If return_explanation is True, returns a dictionary with the answer and explanation.
         """
-        Interprets a multi-choice question from a users response. This function expects only one choice as true. All other choices are considered false. If none are correct, returns -1.
+        if not callback:
+            callback=self.sink
+
+        prompt = f"{conditionning}\nQuestion: {question}\nContext: {context}\n"
+        
+        template = """
+        {
+            "answer": true | false,
+            "explanation": "Optional explanation if return_explanation is True"
+        }
+        """
+        
+        response = self.generate_code(
+            prompt=prompt,
+            template=template,
+            language="json",
+            code_tag_format="markdown",
+            max_size=max_answer_length,
+            include_code_directives=True,
+            accept_all_if_no_code_tags_is_present=True,
+            callback=callback
+        )
+        
+        try:
+            parsed_response = json.loads(response)
+            answer = parsed_response.get("answer", False)
+            explanation = parsed_response.get("explanation", "")
+            
+            if return_explanation:
+                return {"answer": answer, "explanation": explanation}
+            else:
+                return answer
+        except json.JSONDecodeError:
+            return False
+
+    def multichoice_question(
+            self, 
+            question: str, 
+            possible_answers: list, 
+            context: str = "", 
+            max_answer_length: int = None, 
+            conditionning: str = "", 
+            return_explanation: bool = False,
+            callback = None
+        ) -> dict:
+        """
+        Interprets a multi-choice question from a user's response. This function expects only one choice as true. 
+        All other choices are considered false. If none are correct, returns -1.
 
         Args:
             question (str): The multi-choice question posed by the user.
-            possible_ansers (List[Any]): A list containing all valid options for the chosen value. For each item in the list, either 'True', 'False', None or another callable should be passed which will serve as the truth test function when checking against the actual user input.
-            max_answer_length (int, optional): Maximum string length allowed while interpreting the users' responses. Defaults to 50.
-            conditionning: An optional system message to put at the beginning of the prompt
+            possible_answers (List[Any]): A list containing all valid options for the chosen value.
+            context (str, optional): Additional context to provide for the question.
+            max_answer_length (int, optional): Maximum string length allowed while interpreting the user's responses. Defaults to None.
+            conditionning (str, optional): An optional system message to put at the beginning of the prompt.
+            return_explanation (bool, optional): If True, returns a dictionary with the choice and explanation. Defaults to False.
 
         Returns:
-            int: Index of the selected option within the possible_ansers list. Or -1 if there was not match found among any of them.
+            dict: 
+                - If return_explanation is False, returns a JSON object with only the selected choice index.
+                - If return_explanation is True, returns a JSON object with the selected choice index and an explanation.
+                - Returns {"index": -1} if no match is found among the possible answers.
         """
-        choices = "\n".join([f"{i}. {possible_answer}" for i, possible_answer in enumerate(possible_answers)])
-        elements = [conditionning] if conditionning!="" else []
-        elements += [
-                self.system_full_header,
-                "Answer this multi choices question.",
-        ]
-        if context!="":
-            elements+=[
-                       self.system_custom_header("Context"),
-                        f"{context}",
-                    ]
-        elements +=[
-                "Answer with an id from the possible answers.",
-                "Do not answer with an id outside this possible answers.",
-                "Do not explain your reasons or add comments.",
-                "the output should be an integer."
-        ]
-        elements += [
-                f'{self.user_custom_header("question")} {question}',
-                f'{self.user_custom_header("possible answers")}',
-                f"{choices}",
-        ]
-        elements += [self.ai_custom_header("answer")]
-        prompt = self.build_prompt(elements)
-
-        gen = self.generate(prompt, max_answer_length, temperature=0.1, top_k=50, top_p=0.9, repeat_penalty=1.0, repeat_last_n=50, streaming_callback=self.sink).strip().replace("</s>","").replace("<s>","")
-        if len(gen)>0:
-            selection = gen.strip().split()[0].replace(",","").replace(".","")
-            self.print_prompt("Multi choice selection",prompt+gen)
-            try:
-                return int(selection)
-            except:
-                ASCIIColors.cyan("Model failed to answer the question")
-                return -1
+        if not callback:
+            callback=self.sink
+        
+        prompt = f"""
+        {conditionning}\n
+        QUESTION:\n{question}\n
+        POSSIBLE ANSWERS:\n"""
+        for i, answer in enumerate(possible_answers):
+            prompt += f"{i}. {answer}\n"
+        
+        if context:
+            prompt += f"\nADDITIONAL CONTEXT:\n{context}\n"
+        
+        prompt += "\nRespond with a JSON object containing:\n"
+        if return_explanation:
+            prompt += "{\"index\": (the selected answer index), \"explanation\": (reasoning for selection)}"
         else:
-            return -1
+            prompt += "{\"index\": (the selected answer index)}"
+        
+        response = self.generate_code(prompt, language="json", max_size=max_answer_length, 
+            accept_all_if_no_code_tags_is_present=True, return_full_generated_code=False, callback=callback)
+        
+        try:
+            result = json.loads(response)
+            if return_explanation:
+                if "index" in result and isinstance(result["index"], int):
+                    return result["index"], result["index"]
+            else:
+                if "index" in result and isinstance(result["index"], int):
+                    return result["index"]
+        except json.JSONDecodeError:
+            if return_explanation:
+                return -1, "failed to decide"
+            else:
+                return -1
+            
+    def multichoice_ranking(
+            self, 
+            question: str, 
+            possible_answers: list, 
+            context: str = "", 
+            max_answer_length: int = 512, 
+            conditionning: str = "", 
+            return_explanation: bool = False,
+            callback = None
+        ) -> dict:
+        """
+        Ranks answers for a question from best to worst. Returns a JSON object containing the ranked order.
 
+        Args:
+            question (str): The question for which the answers are being ranked.
+            possible_answers (List[Any]): A list of possible answers to rank.
+            context (str, optional): Additional context to provide for the question.
+            max_answer_length (int, optional): Maximum string length allowed for the response. Defaults to 50.
+            conditionning (str, optional): An optional system message to put at the beginning of the prompt.
+            return_explanation (bool, optional): If True, returns a dictionary with the ranked order and explanations. Defaults to False.
+
+        Returns:
+            dict: 
+                - If return_explanation is False, returns a JSON object with only the ranked order.
+                - If return_explanation is True, returns a JSON object with the ranked order and explanations.
+        """
+        if not callback:
+            callback=self.sink
+        
+        prompt = f"""
+        {conditionning}\n
+        QUESTION:\n{question}\n
+        POSSIBLE ANSWERS:\n"""
+        for i, answer in enumerate(possible_answers):
+            prompt += f"{i}. {answer}\n"
+        
+        if context:
+            prompt += f"\nADDITIONAL CONTEXT:\n{context}\n"
+        
+        prompt += "\nRespond with a JSON object containing:\n"
+        if return_explanation:
+            prompt += "{\"ranking\": (list of indices ordered from best to worst), \"explanations\": (list of reasons for each ranking)}"
+        else:
+            prompt += "{\"ranking\": (list of indices ordered from best to worst)}"
+        
+        response = self.generate_code(prompt, language="json", return_full_generated_code=False, callback=callback)
+        
+        try:
+            result = json.loads(response)
+            if "ranking" in result and isinstance(result["ranking"], list):
+                return result
+        except json.JSONDecodeError:
+            return {"ranking": []}
+        
+        
     def sequential_summarize(
                                 self, 
                                 text:str,
