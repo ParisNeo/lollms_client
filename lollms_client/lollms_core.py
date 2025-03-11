@@ -1736,6 +1736,156 @@ The updated memory must be put in a {chunk_processing_output_format} markdown ta
             memory=code[0]["content"]
         return memory
 
+    def deepsearch(
+            self,
+            query: str,
+            text: str = None,
+            files: list = None,
+            search_prompt: str = "Extract information related to the query from the current text chunk and update the memory with new findings.",
+            aggregation_prompt: str = None,
+            output_format: str = "markdown",
+            ctx_size: int = None,
+            chunk_size: int = None,
+            bootstrap_chunk_size: int = None,
+            bootstrap_steps: int = None,
+            callback=None,
+            debug: bool = False
+        ):
+            """
+            Searches for specific information related to a query in a long text or a list of files.
+            Processes the input in chunks, updates a memory with relevant findings, and optionally aggregates them.
+
+            Parameters:
+            - query (str): The query to search for.
+            - text (str, optional): The input text to search in. Defaults to None.
+            - files (list, optional): List of file paths to search in. Defaults to None.
+            - search_prompt (str, optional): Prompt for processing each chunk. Defaults to a standard extraction prompt.
+            - aggregation_prompt (str, optional): Prompt for aggregating findings. Defaults to None.
+            - output_format (str, optional): Output format. Defaults to "markdown".
+            - ctx_size (int, optional): Context size for the model. Defaults to None (uses self.ctx_size).
+            - chunk_size (int, optional): Size of each chunk. Defaults to None (ctx_size // 4). Smaller chunk sizes yield better results but is slower.
+            - bootstrap_chunk_size (int, optional): Size for initial chunks. Defaults to None.
+            - bootstrap_steps (int, optional): Number of initial chunks using bootstrap size. Defaults to None.
+            - callback (callable, optional): Function called after each chunk. Defaults to None.
+            - debug (bool, optional): Enable debug output. Defaults to False.
+
+            Returns:
+            - str: The search findings or aggregated output in the specified format.
+            """
+            # Set defaults
+            if ctx_size is None:
+                ctx_size = self.ctx_size
+            if chunk_size is None:
+                chunk_size = ctx_size // 4
+
+            # Prepare input
+            if files:
+                all_texts = [(file, open(file, 'r', encoding='utf-8').read()) for file in files]
+            elif text:
+                all_texts = [("input_text", text)]
+            else:
+                raise ValueError("Either text or files must be provided.")
+
+            # Initialize memory and chunk counter
+            memory = ""
+            chunk_id = 0
+
+            # Define search prompt template using f-string and the provided search_prompt
+            search_prompt_template = f"""{self.system_full_header}
+You are a search assistant that processes documents chunk by chunk to find information related to a query, updating a memory of findings at each step.
+
+Your goal is to extract and combine relevant information from each text chunk with the existing memory, ensuring no key details are omitted or invented.
+
+
+----
+# Chunk number: {{chunk_id}}
+# Text chunk:
+```markdown
+{{chunk}}
+```
+
+Current findings memory:
+```markdown
+{{memory}}
+```
+{self.user_full_header}
+Query: '{query}'
+Task: {search_prompt}
+
+Update the memory by adding new relevant information from this chunk. Retain all prior findings unless contradicted or updated. Only include explicitly relevant details.
+Make sure to extrafct only information relevant to be able to answer the query of the user or at least gives important contextual information that can be completed to answer the user query.
+{self.ai_full_header}
+"""
+
+            # Calculate static prompt tokens
+            example_prompt = search_prompt_template.replace("{{chunk_id}}", "0")\
+                                                .replace("{{memory}}", "")\
+                                                .replace("{{chunk}}", "")
+            static_tokens = len(self.tokenize(example_prompt))
+
+            # Process each text (file or input)
+            for file_name, file_text in all_texts:
+                file_tokens = self.tokenize(file_text)
+                start_token_idx = 0
+
+                while start_token_idx < len(file_tokens):
+                    # Calculate available tokens
+                    current_memory_tokens = len(self.tokenize(memory))
+                    available_tokens = ctx_size - static_tokens - current_memory_tokens
+                    if available_tokens <= 0:
+                        raise ValueError("Memory too large - consider reducing chunk size or increasing context window")
+
+                    # Adjust chunk size
+                    actual_chunk_size = (
+                        min(bootstrap_chunk_size, available_tokens)
+                        if bootstrap_chunk_size is not None and bootstrap_steps is not None and chunk_id < bootstrap_steps
+                        else min(chunk_size, available_tokens)
+                    )
+                    
+                    end_token_idx = min(start_token_idx + actual_chunk_size, len(file_tokens))
+                    chunk_tokens = file_tokens[start_token_idx:end_token_idx]
+                    chunk = self.detokenize(chunk_tokens)
+
+                    # Generate updated memory
+                    prompt = search_prompt_template.replace("{chunk_id}", str(chunk_id))\
+                                                .replace("{memory}", memory)\
+                                                .replace("{chunk}", chunk)
+                    if debug:
+                        print(f"----- Chunk {chunk_id} from {file_name} ------")
+                        print(prompt)
+
+                    output = self.generate(prompt, n_predict=ctx_size // 4, streaming_callback=callback).strip()
+                    code = self.extract_code_blocks(output)
+                    memory = code[0]["content"] if code else output
+
+                    if debug:
+                        print("----- Updated Memory ------")
+                        print(memory)
+                        print("---------------------------")
+
+                    start_token_idx = end_token_idx
+                    chunk_id += 1
+
+            # Aggregate findings if requested
+            if aggregation_prompt:
+                final_prompt = f"""{self.system_full_header}
+You are a search results aggregator.
+
+{self.user_full_header}
+{aggregation_prompt}
+
+Collected findings:
+```markdown
+{memory}
+```
+
+Provide the final output in {output_format} format.
+{self.ai_full_header}
+"""
+                final_output = self.generate(final_prompt, streaming_callback=callback)
+                code = self.extract_code_blocks(final_output)
+                return code[0]["content"] if code else final_output
+            return memory
 def error(self, content, duration:int=4, client_id=None, verbose:bool=True):
     ASCIIColors.error(content)
 
