@@ -36,7 +36,9 @@ class ELF_GENERATION_FORMAT(Enum):
             return format_mapping[format_string.upper()]
         except KeyError:
             raise ValueError(f"Invalid format string: {format_string}. Must be one of {list(format_mapping.keys())}.")
-        
+    
+    def __str__(self):
+        return self.name    
 class ELF_COMPLETION_FORMAT(Enum):
     Instruct = 0
     Chat = 1
@@ -51,6 +53,9 @@ class ELF_COMPLETION_FORMAT(Enum):
             return format_mapping[format_string.upper()]
         except KeyError:
             raise ValueError(f"Invalid format string: {format_string}. Must be one of {list(format_mapping.keys())}.")
+    
+    def __str__(self):
+        return self.name    
         
 class LollmsClient():
     def __init__(
