@@ -40,3 +40,21 @@ class SENDER_TYPES(Enum):
 class SUMMARY_MODE(Enum):
     SUMMARY_MODE_SEQUENCIAL        = 0
     SUMMARY_MODE_HIERARCHICAL      = 0
+
+class ELF_COMPLETION_FORMAT(Enum):
+    Instruct = 0
+    Chat = 1
+    @classmethod
+    def from_string(cls, format_string: str) -> 'ELF_COMPLETION_FORMAT':
+        format_mapping = {
+            "Instruct": cls.Instruct,
+            "Chat": cls.Chat,
+        }
+
+        try:
+            return format_mapping[format_string.upper()]
+        except KeyError:
+            raise ValueError(f"Invalid format string: {format_string}. Must be one of {list(format_mapping.keys())}.")
+    
+    def __str__(self):
+        return self.name    

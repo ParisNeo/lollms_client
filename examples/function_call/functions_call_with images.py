@@ -1,16 +1,17 @@
 import cv2
-from lollms_client import LollmsClient, ELF_GENERATION_FORMAT, LollmsXTTS, TasksLibrary, FunctionCalling_Library
+from lollms_client import LollmsClient, LollmsTTS, TasksLibrary, FunctionCalling_Library
 import random
 
 # Initialize the LollmsClient instance
-lc = LollmsClient("http://localhost:9600", default_generation_mode=ELF_GENERATION_FORMAT.LOLLMS)
+lc = LollmsClient()
 tl = TasksLibrary(lc)
-tts = LollmsXTTS(lc)
+tts = LollmsTTS(lc)
 fcl = FunctionCalling_Library(tl)
 voices = tts.get_voices()
-# Pick a voice randomly
-random_voice = random.choice(voices)
-print(f"Selected voice: {random_voice}")
+if voices:
+    # Pick a voice randomly
+    random_voice = random.choice(voices)
+    print(f"Selected voice: {random_voice}")
 
 # File path to save the captured image
 file_path = "captured_image.jpg"

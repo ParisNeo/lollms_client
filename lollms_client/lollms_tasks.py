@@ -57,23 +57,23 @@ class TasksLibrary:
                 callback(text,message_type)
             self.bot_says = bot_says
             return True
-    def generate(self, prompt, max_size, temperature = None, top_k = None, top_p=None, repeat_penalty=None, repeat_last_n=None, callback=None, debug=False, show_progress=False, stream= False ):
+    def generate(self, prompt, n_predict, temperature = None, top_k = None, top_p=None, repeat_penalty=None, repeat_last_n=None, callback=None, debug=False, show_progress=False, stream= False ):
         ASCIIColors.info("Text generation started: Warming up")
         self.nb_received_tokens = 0
         self.bot_says = ""
         if debug:
             self.print_prompt("gen",prompt)
 
-        bot_says = self.lollms.generate(
-                                prompt,
-                                max_size,
+        bot_says = self.lollms.generate_text(
+                                prompt=prompt,
+                                n_predict = n_predict,
                                 stream=stream,
                                 streaming_callback=partial(self.process, callback=callback, show_progress=show_progress),
-                                temperature= temperature if temperature is not None else self.lollms.temperature,
-                                top_k= top_k if top_k is not None else self.lollms.top_k ,
-                                top_p= top_p if top_p is not None else self.lollms.top_p ,
-                                repeat_penalty= repeat_penalty if repeat_penalty is not None else self.lollms.repeat_penalty,
-                                repeat_last_n= repeat_last_n if repeat_last_n is not None else self.lollms.repeat_last_n,
+                                temperature= temperature,
+                                top_k= top_k,
+                                top_p= top_p,
+                                repeat_penalty= repeat_penalty,
+                                repeat_last_n= repeat_last_n,
                                 ).strip()
         return self.bot_says if stream else bot_says
 
@@ -81,10 +81,11 @@ class TasksLibrary:
     def fast_gen(
                     self, 
                     prompt: str, 
-                    max_generation_size: int=None, 
+                    n_predict: int=None, 
                     placeholders: dict = {}, 
                     sacrifice: list = ["previous_discussion"], 
                     debug: bool  = False, 
+                    stream: bool = False,
                     callback=None, 
                     show_progress=False, 
                     temperature = None, 
@@ -109,106 +110,39 @@ class TasksLibrary:
         Returns:
         - str: The generated text after removing special tokens ("<s>" and "</s>") and stripping any leading/trailing whitespace.
         """
-        if max_generation_size is None:
+        if n_predict is None:
             prompt_size = self.lollms.tokenize(prompt)
-            max_generation_size = self.lollms.ctx_size - len(prompt_size)
+            n_predict = self.lollms.default_ctx_size - len(prompt_size)
 
         pr = PromptReshaper(prompt)
         prompt = pr.build(placeholders,
-                        self.lollms.tokenize,
-                        self.lollms.detokenize,
-                        self.lollms.ctx_size - max_generation_size,
+                        self.lollms.binding.tokenize,
+                        self.lollms.binding.detokenize,
+                        self.lollms.default_ctx_size - n_predict,
                         sacrifice
                         )
-        ntk = len(self.lollms.tokenize(prompt))
-        max_generation_size = min(self.lollms.ctx_size - ntk, max_generation_size)
+        ntk = len(self.lollms.binding.tokenize(prompt))
+        n_predict = min(self.lollms.default_ctx_size - ntk, n_predict)
         # TODO : add show progress
 
-        gen = self.generate(prompt, max_generation_size, temperature = temperature, top_k = top_k, top_p=top_p, repeat_penalty=repeat_penalty, repeat_last_n=repeat_last_n, callback=callback, show_progress=show_progress).strip().replace("</s>", "").replace("<s>", "")
+        gen = self.lollms.generate_text(
+                            prompt=prompt,
+                            n_predict = n_predict,
+                            stream=stream,
+                            streaming_callback=partial(self.process, callback=callback, show_progress=show_progress),
+                            temperature= temperature,
+                            top_k= top_k,
+                            top_p= top_p,
+                            repeat_penalty= repeat_penalty,
+                            repeat_last_n= repeat_last_n
+            ).strip().replace("</s>", "").replace("<s>", "")
         if debug:
             self.print_prompt("prompt", prompt+gen)
 
         return gen
 
-    def generate_with_images(self, prompt, images, max_size, temperature = None, top_k = None, top_p=None, repeat_penalty=None, repeat_last_n=None, callback=None, debug=False, show_progress=False, stream=False ):
-        ASCIIColors.info("Text generation started: Warming up")
-        self.nb_received_tokens = 0
-        self.bot_says = ""
-        if debug:
-            self.print_prompt("gen",prompt)
-
-        bot_says = self.lollms.generate_with_images(
-                                prompt,
-                                images,
-                                max_size,
-                                stream=stream,
-                                streaming_callback= partial(self.process, callback=callback, show_progress=show_progress),
-                                temperature=self.lollms.temperature if temperature is None else temperature,
-                                top_k=self.lollms.top_k if top_k is None else top_k,
-                                top_p=self.lollms.top_p if top_p is None else top_p,
-                                repeat_penalty=self.lollms.repeat_penalty if repeat_penalty is None else repeat_penalty,
-                                repeat_last_n = self.lollms.repeat_last_n if repeat_last_n is None else repeat_last_n
-                                ).strip()
-        return self.bot_says if stream else bot_says
 
     
-    def fast_gen_with_images(self, prompt: str, images:list, max_generation_size: int=None, placeholders: dict = {}, sacrifice: list = ["previous_discussion"], debug: bool  = False, callback=None, show_progress=False) -> str:
-        """
-        Fast way to generate text from text and images
-
-        This method takes in a prompt, maximum generation size, optional placeholders, sacrifice list, and debug flag.
-        It reshapes the context before performing text generation by adjusting and cropping the number of tokens.
-
-        Parameters:
-        - prompt (str): The input prompt for text generation.
-        - max_generation_size (int): The maximum number of tokens to generate.
-        - placeholders (dict, optional): A dictionary of placeholders to be replaced in the prompt. Defaults to an empty dictionary.
-        - sacrifice (list, optional): A list of placeholders to sacrifice if the window is bigger than the context size minus the number of tokens to generate. Defaults to ["previous_discussion"].
-        - debug (bool, optional): Flag to enable/disable debug mode. Defaults to False.
-
-        Returns:
-        - str: The generated text after removing special tokens ("<s>" and "</s>") and stripping any leading/trailing whitespace.
-        """
-        prompt = "\n".join([
-            "!@>system: I am an AI assistant that can converse and analyze images. When asked to locate something in an image you send, I will reply with:",
-            "boundingbox(image_index, label, left, top, width, height)",
-            "Where:",
-            "image_index: 0-based index of the image",
-            "label: brief description of what is located",
-            "left, top: x,y coordinates of top-left box corner (0-1 scale)",
-            "width, height: box dimensions as fraction of image size",
-            "Coordinates have origin (0,0) at top-left, (1,1) at bottom-right.",
-            "For other queries, I will respond conversationally to the best of my abilities.",
-            prompt
-        ])
-
-        if max_generation_size is None:
-            prompt_size = self.lollms.tokenize(prompt)
-            max_generation_size = self.lollms.ctx_size - len(prompt_size)
-
-        pr = PromptReshaper(prompt)
-        prompt = pr.build(placeholders,
-                        self.lollms.tokenize,
-                        self.lollms.detokenize,
-                        self.lollms.ctx_size - max_generation_size,
-                        sacrifice
-                        )
-        ntk = len(self.lollms.tokenize(prompt))
-        max_generation_size = min(self.lollms.ctx_size - ntk, max_generation_size)
-        # TODO : add show progress
-
-        gen = self.generate_with_images(prompt, images, max_generation_size, callback=callback, show_progress=show_progress).strip().replace("</s>", "").replace("<s>", "")
-        try:
-            gen = process_ai_output(gen, images, "/discussions/")
-        except Exception as ex:
-            pass
-        if debug:
-            self.print_prompt("prompt", prompt+gen)
-
-        return gen    
-
-
-
     def step_start(self, step_text, callback: Callable[[str, MSG_TYPE, dict, list], bool]=None):
         """This triggers a step start
 
@@ -294,7 +228,7 @@ class TasksLibrary:
             prompt_parts[sacrifice_id] = sacrifice_text
             return "\n".join([s for s in prompt_parts if s!=""])
 
-    def translate_text_chunk(self, text_chunk, output_language:str="french", host_address:str=None, model_name: str = None, temperature=0.1, max_generation_size=3000):
+    def translate_text_chunk(self, text_chunk, output_language:str="french", host_address:str=None, model_name: str = None, temperature=0.1, max_generation_size=3000, callback=None, show_progress:bool=False):
         """
         This function translates a given text chunk into a specified language.
 
@@ -310,22 +244,19 @@ class TasksLibrary:
         str: The translated text.
         """        
         translated = self.lollms.generate_text(
-                                "\n".join([
-                                    f"!@>system:",
+                            prompt= "\n".join([
+                                    self.lollms.system_full_header,
                                     f"Translate the following text to {output_language}.",
                                     "Be faithful to the original text and do not add or remove any information.",
                                     "Respond only with the translated text.",
                                     "Do not add comments or explanations.",
-                                    f"!@>text to translate:",
+                                    self.lollms.system_custom_header("text to translate"),
                                     f"{text_chunk}",
-                                    f"!@>translation:",
+                                    self.lollms.ai_custom_header("translation"),
                                     ]),
-                                    host_address,
-                                    model_name,
-                                    personality = -1,
-                                    n_predict=max_generation_size,
-                                    stream=False,
-                                    temperature=temperature
+                                    n_predict = max_generation_size,
+                                    streaming_callback=partial(self.process, callback=callback, show_progress=show_progress),
+                                    temperature= temperature
                                     )
         return translated
 
@@ -457,7 +388,9 @@ class TasksLibrary:
         elements += [self.lollms.ai_custom_header("answer")]
         prompt = self.build_prompt(elements)
 
-        gen = self.lollms.generate(prompt, max_answer_length, temperature=0.1, top_k=50, top_p=0.9, repeat_penalty=1.0, repeat_last_n=50, streaming_callback=self.sink).strip().replace("</s>","").replace("<s>","")
+        gen = self.lollms.generate_text(
+                            prompt=prompt,
+                            streaming_callback=self.sink).strip().replace("</s>","").replace("<s>","")
         if len(gen)>0:
             selection = gen.strip().split()[0].replace(",","").replace(".","")
             self.print_prompt("Multi choice selection",prompt+gen)
@@ -499,8 +432,8 @@ class TasksLibrary:
                                             callback, 
                                             chunk_summary_post_processing=chunk_summary_post_processing,
                                             summary_mode=summary_mode)
-            tk = self.lollms.tokenize(text)
-            tk = self.lollms.tokenize(text)
+            tk = self.lollms.binding.tokenize(text)
+            tk = self.lollms.binding.tokenize(text)
             dtk_ln=prev_len-len(tk)
             prev_len = len(tk)
             self.step(f"Current text size : {prev_len}, max summary size : {max_summary_size}")

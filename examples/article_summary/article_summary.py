@@ -1,4 +1,4 @@
-from lollms_client import LollmsClient, ELF_GENERATION_FORMAT
+from lollms_client import LollmsClient
 import pipmaster as pm
 from ascii_colors import ASCIIColors
 if not pm.is_installed("docling"):
@@ -7,12 +7,7 @@ from docling.document_converter import DocumentConverter
 
 ASCIIColors.set_log_file("log.log")
 
-lc = LollmsClient(
-    host_address="http://lollms:11434",
-    model_name="phi4:latest",
-    ctx_size=32800,
-    default_generation_mode=ELF_GENERATION_FORMAT.OLLAMA
-)
+lc = LollmsClient()
 # Create prompts for each section
 article_url = "https://arxiv.org/pdf/2109.09572"
 converter = DocumentConverter()
@@ -60,4 +55,4 @@ Ensure that any information already in memory is retained unless explicitly upda
                     debug = True
                 )
 
-print(summary)
+ASCIIColors.yellow(summary)

@@ -1,9 +1,9 @@
-from lollms_client import LollmsClient, ELF_GENERATION_FORMAT
+from lollms_client import LollmsClient
 
 # Initialize the LollmsClient instance please select a different model to test with
-lc = LollmsClient(model_name= r"E:\drumber\LOLLMS_AWARE_LLAMA_mi_lord",default_generation_mode=ELF_GENERATION_FORMAT.TRANSFORMERS)
+lc = LollmsClient("transformers", model_name= r"E:\drumber\Llama-3.2-1B-Instruct-lollms-smart-router")
 def cb(text, msg_type=0):
     print(text,end='', flush=True)
     return True
-out = lc.generate("!@>system: Act as lollms, a helpful assistant.\n!@>user:Write a poem about love.\n!@>lollms:",streaming_callback=cb)
+out = lc.generate_text(f"{lc.system_full_header} Act as lollms, a helpful assistant.\n!@>user:Write a poem about love.\n!@>lollms:",streaming_callback=cb)
 print(out)

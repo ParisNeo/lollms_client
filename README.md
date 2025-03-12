@@ -23,30 +23,34 @@ from lollms_client import LollmsClient
 lc = LollmsClient()
 
 # Specify a custom host and port
-lc = LollmsClient(host_address="http://some.server:9600")
+lc = LollmsClient(host_address="http://some.lollms.server:9600")
 
-# Use a specific model with a local or remote ollama server
-from lollms_client import ELF_GENERATION_FORMAT
-lc = LollmsClient(model_name="phi4:latest", default_generation_mode = ELF_GENERATION_FORMAT.OLLAMA)
-
-# Use a specific model with a local or remote OpenAI server (you can either set your key as an environment variable or pass it here)
-lc = LollmsClient(model_name="gpt-3.5-turbo-0125", default_generation_mode = ELF_GENERATION_FORMAT.OPENAI)
-
+# Use a specific model with a local ollama server
+lc = LollmsClient("ollama", model_name="phi4:latest")
 # Use a specific model with an Ollama binding on the server, with a context size of 32800
 lc = LollmsClient(
+    "ollama",
     host_address="http://some.other.server:11434",
     model_name="phi4:latest",
     ctx_size=32800,
-    default_generation_mode=ELF_GENERATION_FORMAT.OLLAMA
 )
+# Use a specific model with a local or remote OpenAI server (you can either set your key as an environment variable or pass it here)
+lc = LollmsClient("openai", model_name="gpt-3.5-turbo-0125", service_key="Key, or don't put anything if you have already an environment variable with these informations")
+
+# Use a specific model with a other OpenAI compatible server
+lc = LollmsClient("openai", host_address="http://some.other.server", model_name="gpt-3.5-turbo-0125")
 ```
 
 ### Text Generation
 
-Use `generate()` for generating text from the lollms API.
+Use `generate_text()` for generating text from the lollms API.
 
 ```python
-response = lc.generate(prompt="Once upon a time", stream=False, temperature=0.5)
+response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
+print(response)
+```
+```python
+response = lc.generate_text(prompt="Once upon a time", images= ["path to image1", "path to image 2"] stream=False, temperature=0.5)
 print(response)
 ```
 
