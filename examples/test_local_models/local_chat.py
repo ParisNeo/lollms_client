@@ -1,7 +1,7 @@
 from lollms_client import LollmsClient
 
 # Initialize the LollmsClient instance please select a different model to test with
-lc = LollmsClient("transformers", model_name= r"E:\drumber\Llama-3.2-1B-Instruct-lollms-smart-router")
+lc = LollmsClient("transformers", model_name= r"microsoft/Phi-4-mini-instruct")
 def cb(text, msg_type=0):
     print(text,end='', flush=True)
     return True
