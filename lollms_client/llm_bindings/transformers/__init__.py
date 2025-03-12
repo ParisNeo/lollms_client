@@ -26,6 +26,7 @@ BindingName = "TransformersBinding"
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, BitsAndBytesConfig
 from packaging import version
+import transformers
 
 class TransformersBinding(LollmsLLMBinding):
     """Transformers-specific binding implementation"""
