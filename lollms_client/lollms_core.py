@@ -13,7 +13,6 @@ import numpy as np
 import pipmaster as pm
 from pathlib import Path
 import os
-
         
 class LollmsClient():
     """Core class for interacting with LOLLMS bindings"""
@@ -380,103 +379,135 @@ Do not split the code in multiple tags.
         else:
             return None
 
-    def extract_code_blocks(self, text: str) -> List[dict]:
+    def extract_code_blocks(self, text: str, format: str = "markdown") -> List[dict]:
         """
-        This function extracts code blocks from a given text.
+        Extracts code blocks from text in Markdown or HTML format.
 
         Parameters:
-        text (str): The text from which to extract code blocks. Code blocks are identified by triple backticks (```).
+        text (str): The text to extract code blocks from.
+        format (str): The format of code blocks ("markdown" for ``` or "html" for <code class="">).
 
         Returns:
-        List[dict]: A list of dictionaries where each dictionary represents a code block and contains the following keys:
-            - 'index' (int): The index of the code block in the text.
-            - 'file_name' (str): The name of the file extracted from the preceding line, if available.
-            - 'content' (str): The content of the code block.
-            - 'type' (str): The type of the code block. If the code block starts with a language specifier (like 'python' or 'java'), this field will contain that specifier. Otherwise, it will be set to 'language-specific'.
-            - 'is_complete' (bool): True if the block has a closing tag, False otherwise.
-
-        Note:
-        The function assumes that the number of triple backticks in the text is even.
-        If the number of triple backticks is odd, it will consider the rest of the text as the last code block.
-        """        
+        List[dict]: A list of dictionaries with:
+            - 'index' (int): Index of the code block.
+            - 'file_name' (str): File name from preceding text, if available.
+            - 'content' (str): Code block content.
+            - 'type' (str): Language type (from Markdown first line or HTML class).
+            - 'is_complete' (bool): True if block has a closing tag.
+        """
+        code_blocks = []
         remaining = text
-        bloc_index = 0
         first_index = 0
         indices = []
-        while len(remaining) > 0:
-            try:
-                index = remaining.index("```")
-                indices.append(index + first_index)
-                remaining = remaining[index + 3:]
-                first_index += index + 3
-                bloc_index += 1
-            except Exception as ex:
-                if bloc_index % 2 == 1:
-                    index = len(remaining)
-                    indices.append(index)
-                remaining = ""
 
-        code_blocks = []
-        is_start = True
-        for index, code_delimiter_position in enumerate(indices):
+        if format.lower() == "markdown":
+            # Markdown: Find triple backtick positions
+            while remaining:
+                try:
+                    index = remaining.index("```")
+                    indices.append(index + first_index)
+                    remaining = remaining[index + 3:]
+                    first_index += index + 3
+                except ValueError:
+                    if len(indices) % 2 == 1:  # Odd number of delimiters
+                        indices.append(first_index + len(remaining))
+                    break
+
+        elif format.lower() == "html":
+            # HTML: Find <code> and </code> positions, handling nested tags
+            while remaining:
+                try:
+                    # Look for opening <code> tag
+                    start_index = remaining.index("<code")
+                    end_of_opening = remaining.index(">", start_index)
+                    indices.append(start_index + first_index)
+                    opening_tag = remaining[start_index:end_of_opening + 1]
+                    remaining = remaining[end_of_opening + 1:]
+                    first_index += end_of_opening + 1
+
+                    # Look for matching </code>, accounting for nested <code>
+                    nest_level = 0
+                    temp_index = 0
+                    while temp_index < len(remaining):
+                        if remaining[temp_index:].startswith("<code"):
+                            nest_level += 1
+                            temp_index += remaining[temp_index:].index(">") + 1
+                        elif remaining[temp_index:].startswith("</code>"):
+                            if nest_level == 0:
+                                indices.append(first_index + temp_index)
+                                remaining = remaining[temp_index + len("</code>"):]
+                                first_index += temp_index + len("</code>")
+                                break
+                            nest_level -= 1
+                            temp_index += len("</code>")
+                        else:
+                            temp_index += 1
+                    else:
+                        indices.append(first_index + len(remaining))
+                        break
+                except ValueError:
+                    break
+
+        else:
+            raise ValueError("Format must be 'markdown' or 'html'")
+
+        for i in range(0, len(indices), 2):
             block_infos = {
-                'index': index,
+                'index': i // 2,
                 'file_name': "",
-                'section': "",
                 'content': "",
-                'type': "",
+                'type': 'language-specific',
                 'is_complete': False
             }
-            if is_start:
-                # Check the preceding line for file name
-                preceding_text = text[:code_delimiter_position].strip().splitlines()
-                if preceding_text:
-                    last_line = preceding_text[-1].strip()
-                    if last_line.startswith("<file_name>") and last_line.endswith("</file_name>"):
-                        file_name = last_line[len("<file_name>"):-len("</file_name>")].strip()
-                        block_infos['file_name'] = file_name
-                    elif last_line.startswith("## filename:"):
-                        file_name = last_line[len("## filename:"):].strip()
-                        block_infos['file_name'] = file_name
-                    if last_line.startswith("<section>") and last_line.endswith("</section>"):
-                        section = last_line[len("<section>"):-len("</section>")].strip()
-                        block_infos['section'] = section
 
-                sub_text = text[code_delimiter_position + 3:]
-                if len(sub_text) > 0:
-                    try:
-                        find_space = sub_text.index(" ")
-                    except:
-                        find_space = int(1e10)
-                    try:
-                        find_return = sub_text.index("\n")
-                    except:
-                        find_return = int(1e10)
-                    next_index = min(find_return, find_space)
-                    if '{' in sub_text[:next_index]:
-                        next_index = 0
-                    start_pos = next_index
-                    if code_delimiter_position + 3 < len(text) and text[code_delimiter_position + 3] in ["\n", " ", "\t"]:
-                        block_infos["type"] = 'language-specific'
-                    else:
-                        block_infos["type"] = sub_text[:next_index]
+            # Extract preceding text for file name
+            start_pos = indices[i]
+            preceding_text = text[:start_pos].strip().splitlines()
+            if preceding_text:
+                last_line = preceding_text[-1].strip()
+                if last_line.startswith("<file_name>") and last_line.endswith("</file_name>"):
+                    block_infos['file_name'] = last_line[len("<file_name>"):-len("</file_name>")].strip()
+                elif last_line.startswith("## filename:"):
+                    block_infos['file_name'] = last_line[len("## filename:"):].strip()
 
-                    if index + 1 < len(indices):
-                        next_pos = indices[index + 1] - code_delimiter_position
-                        if next_pos - 3 < len(sub_text) and sub_text[next_pos - 3] == "`":
-                            block_infos["content"] = sub_text[start_pos:next_pos - 3].strip()
-                            block_infos["is_complete"] = True
-                        else:
-                            block_infos["content"] = sub_text[start_pos:next_pos].strip()
-                            block_infos["is_complete"] = False
-                    else:
-                        block_infos["content"] = sub_text[start_pos:].strip()
-                        block_infos["is_complete"] = False
-                    code_blocks.append(block_infos)
-                is_start = False
-            else:
-                is_start = True
-                continue
+            # Extract content and type
+            if format.lower() == "markdown":
+                sub_text = text[start_pos + 3:]
+                if i + 1 < len(indices):
+                    end_pos = indices[i + 1]
+                    content = text[start_pos + 3:end_pos].strip()
+                    block_infos['is_complete'] = True
+                else:
+                    content = sub_text.strip()
+                    block_infos['is_complete'] = False
+
+                if content:
+                    first_line = content.split('\n', 1)[0].strip()
+                    if first_line and not first_line.startswith(('{', ' ', '\t')):
+                        block_infos['type'] = first_line
+                        content = content[len(first_line):].strip()
+
+            elif format.lower() == "html":
+                opening_tag = text[start_pos:text.index(">", start_pos) + 1]
+                sub_text = text[start_pos + len(opening_tag):]
+                if i + 1 < len(indices):
+                    end_pos = indices[i + 1]
+                    content = text[start_pos + len(opening_tag):end_pos].strip()
+                    block_infos['is_complete'] = True
+                else:
+                    content = sub_text.strip()
+                    block_infos['is_complete'] = False
+
+                # Extract language from class attribute
+                if 'class="' in opening_tag:
+                    class_start = opening_tag.index('class="') + len('class="')
+                    class_end = opening_tag.index('"', class_start)
+                    class_value = opening_tag[class_start:class_end]
+                    if class_value.startswith("language-"):
+                        block_infos['type'] = class_value[len("language-"):]
+
+            block_infos['content'] = content
+            code_blocks.append(block_infos)
 
         return code_blocks
 
@@ -852,156 +883,191 @@ The updated memory must be put in a {chunk_processing_output_format} markdown ta
             memory=code[0]["content"]
         return memory
 
-    def deep_analyze(
-            self,
-            query: str,
-            text: str = None,
-            files: list = None,
-            search_prompt: str = "Extract information related to the query from the current text chunk and update the memory with new findings.",
-            aggregation_prompt: str = None,
-            output_format: str = "markdown",
-            ctx_size: int = None,
-            chunk_size: int = None,
-            bootstrap_chunk_size: int = None,
-            bootstrap_steps: int = None,
-            callback=None,
-            debug: bool = False
-        ):
-            """
-            Searches for specific information related to a query in a long text or a list of files.
-            Processes the input in chunks, updates a memory with relevant findings, and optionally aggregates them.
 
-            Parameters:
-            - query (str): The query to search for.
-            - text (str, optional): The input text to search in. Defaults to None.
-            - files (list, optional): List of file paths to search in. Defaults to None.
-            - search_prompt (str, optional): Prompt for processing each chunk. Defaults to a standard extraction prompt.
-            - aggregation_prompt (str, optional): Prompt for aggregating findings. Defaults to None.
-            - output_format (str, optional): Output format. Defaults to "markdown".
-            - ctx_size (int, optional): Context size for the model. Defaults to None (uses self.ctx_size).
-            - chunk_size (int, optional): Size of each chunk. Defaults to None (ctx_size // 4). Smaller chunk sizes yield better results but is slower.
-            - bootstrap_chunk_size (int, optional): Size for initial chunks. Defaults to None.
-            - bootstrap_steps (int, optional): Number of initial chunks using bootstrap size. Defaults to None.
-            - callback (callable, optional): Function called after each chunk. Defaults to None.
-            - debug (bool, optional): Enable debug output. Defaults to False.
+    def update_memory_from_file_chunk_prompt(self, file_name, file_chunk_id, global_chunk_id, chunk, memory, memory_template, query, task_prompt):
+        return f"""{self.system_full_header}
+You are a search assistant that processes documents chunk by chunk to find information related to a query, updating a markdown memory of findings at each step.
 
-            Returns:
-            - str: The search findings or aggregated output in the specified format.
-            """
-            # Set defaults
-            if ctx_size is None:
-                ctx_size = self.ctx_size
-            if chunk_size is None:
-                chunk_size = ctx_size // 4
-
-            # Prepare input
-            if files:
-                all_texts = [(file, open(file, 'r', encoding='utf-8').read()) for file in files]
-            elif text:
-                all_texts = [("input_text", text)]
-            else:
-                raise ValueError("Either text or files must be provided.")
-
-            # Initialize memory and chunk counter
-            memory = ""
-            chunk_id = 0
-
-            # Define search prompt template using f-string and the provided search_prompt
-            search_prompt_template = f"""{self.system_full_header}
-You are a search assistant that processes documents chunk by chunk to find information related to a query, updating a memory of findings at each step.
-
-Your goal is to extract and combine relevant information from each text chunk with the existing memory, ensuring no key details are omitted or invented.
-
+Your goal is to extract relevant information from each text chunk and update the provided markdown memory structure, ensuring no key details are omitted or invented. Maintain the structure of the JSON template.
 
 ----
-# Chunk number: {{chunk_id}}
+# Current file: {file_name}
+# Chunk number in this file: {file_chunk_id}
+# Global chunk number: {global_chunk_id}
 # Text chunk:
 ```markdown
-{{chunk}}
+{chunk}
 ```
-
-Current findings memory:
+{'Current findings memory (cumulative across all files):' if memory!="" else 'Memory template:'}
 ```markdown
-{{memory}}
+{memory if memory!="" else memory_template}
 ```
 {self.user_full_header}
 Query: '{query}'
-Task: {search_prompt}
-
-Update the memory by adding new relevant information from this chunk. Retain all prior findings unless contradicted or updated. Only include explicitly relevant details.
-Make sure to extrafct only information relevant to be able to answer the query of the user or at least gives important contextual information that can be completed to answer the user query.
+Task: {task_prompt}
+Update the markdown memory by adding new information from this chunk relevant to the query. Retain all prior findings unless contradicted or updated. Only include explicitly relevant details.
+Ensure the output is valid markdown matching the structure of the provided template.
+Make sure to extract only information relevant to answering the user's query or providing important contextual information.
+Return the updated markdown memory inside a markdown code block.
 {self.ai_full_header}
 """
 
-            # Calculate static prompt tokens
-            example_prompt = search_prompt_template.replace("{{chunk_id}}", "0")\
-                                                .replace("{{memory}}", "")\
-                                                .replace("{{chunk}}", "")
-            static_tokens = len(self.tokenize(example_prompt))
+    def update_memory_from_file_chunk_prompt_markdown(self, file_name, file_chunk_id, global_chunk_id, chunk, memory, query):
+        return f"""{self.system_full_header}
+You are a search assistant that processes documents chunk by chunk to find information related to a query, updating a markdown memory of findings at each step.
 
-            # Process each text (file or input)
-            for file_name, file_text in all_texts:
-                file_tokens = self.tokenize(file_text)
-                start_token_idx = 0
+Your goal is to extract relevant information from each text chunk and update the provided markdown memory structure, ensuring no key details are omitted or invented. Maintain the structure of the markdown template.
 
-                while start_token_idx < len(file_tokens):
-                    # Calculate available tokens
-                    current_memory_tokens = len(self.tokenize(memory))
-                    available_tokens = ctx_size - static_tokens - current_memory_tokens
-                    if available_tokens <= 0:
-                        raise ValueError("Memory too large - consider reducing chunk size or increasing context window")
-
-                    # Adjust chunk size
-                    actual_chunk_size = (
-                        min(bootstrap_chunk_size, available_tokens)
-                        if bootstrap_chunk_size is not None and bootstrap_steps is not None and chunk_id < bootstrap_steps
-                        else min(chunk_size, available_tokens)
-                    )
-                    
-                    end_token_idx = min(start_token_idx + actual_chunk_size, len(file_tokens))
-                    chunk_tokens = file_tokens[start_token_idx:end_token_idx]
-                    chunk = self.detokenize(chunk_tokens)
-
-                    # Generate updated memory
-                    prompt = search_prompt_template.replace("{chunk_id}", str(chunk_id))\
-                                                .replace("{memory}", memory)\
-                                                .replace("{chunk}", chunk)
-                    if debug:
-                        print(f"----- Chunk {chunk_id} from {file_name} ------")
-                        print(prompt)
-
-                    output = self.generate_text(prompt, n_predict=ctx_size // 4, streaming_callback=callback).strip()
-                    code = self.extract_code_blocks(output)
-                    memory = code[0]["content"] if code else output
-
-                    if debug:
-                        print("----- Updated Memory ------")
-                        print(memory)
-                        print("---------------------------")
-
-                    start_token_idx = end_token_idx
-                    chunk_id += 1
-
-            # Aggregate findings if requested
-            if aggregation_prompt:
-                final_prompt = f"""{self.system_full_header}
-You are a search results aggregator.
-
-{self.user_full_header}
-{aggregation_prompt}
-
-Collected findings:
+----
+# Current file: {file_name}
+# Chunk number in this file: {file_chunk_id}
+# Global chunk number: {global_chunk_id}
+# Text chunk:
+```markdown
+{chunk}
+```
+Current findings memory (cumulative across all files):
 ```markdown
 {memory}
 ```
+{self.user_full_header}
+Query: '{query}'
+{'Start Creating a memory from the text chunk in a format adapted to answer the user Query' if memory=="" else 'Update the markdown memory by adding new information from this chunk relevant to the query.'} Retain all prior findings unless contradicted or updated. Only include explicitly relevant details.
+{'Ensure the output is valid markdown matching the structure of the current memory' if memory!='' else 'Ensure the output is valid markdown matching the structure of the provided template.'}
+Make sure to extract only information relevant to answering the user's query or providing important contextual information.
+Return the updated markdown memory inside a markdown code block.
+{self.ai_full_header}
+"""
 
+    def deep_analyze(
+        self,
+        query: str,
+        text: str = None,
+        files: list = None,
+        aggregation_prompt: str = None,
+        output_format: str = "markdown",
+        ctx_size: int = None,
+        chunk_size: int = None,
+        bootstrap_chunk_size: int = None,
+        bootstrap_steps: int = None,
+        callback=None,
+        debug: bool = False
+    ):
+        """
+        Searches for specific information related to a query in a long text or a list of files.
+        Processes each file separately in chunks, updates a shared markdown memory with relevant findings, and optionally aggregates them.
+
+        Parameters:
+        - query (str): The query to search for.
+        - text (str, optional): The input text to search in. Defaults to None.
+        - files (list, optional): List of file paths to search in. Defaults to None.
+        - task_prompt (str, optional): Prompt for processing each chunk. Defaults to a standard markdown extraction prompt.
+        - aggregation_prompt (str, optional): Prompt for aggregating findings. Defaults to None.
+        - output_format (str, optional): Output format. Defaults to "markdown".
+        - ctx_size (int, optional): Context size for the model. Defaults to None (uses self.ctx_size).
+        - chunk_size (int, optional): Size of each chunk. Defaults to None (ctx_size // 4). Smaller chunk sizes yield better results but are slower.
+        - bootstrap_chunk_size (int, optional): Size for initial chunks. Defaults to None.
+        - bootstrap_steps (int, optional): Number of initial chunks using bootstrap size. Defaults to None.
+        - callback (callable, optional): Function called after each chunk. Defaults to None.
+        - debug (bool, optional): Enable debug output. Defaults to False.
+
+        Returns:
+        - str: The search findings or aggregated output in the specified format.
+        """
+        # Set defaults
+        if ctx_size is None:
+            ctx_size = self.default_ctx_size
+        if chunk_size is None:
+            chunk_size = ctx_size // 4
+
+        # Prepare input
+        if files:
+            all_texts = [(file, open(file, 'r', encoding='utf-8').read()) for file in files]
+        elif text:
+            all_texts = [("input_text", text)]
+        else:
+            raise ValueError("Either text or files must be provided.")
+
+        # Set default memory template for article analysis if none provided
+        memory = ""
+
+        # Initialize global chunk counter
+        global_chunk_id = 0
+        
+        # Calculate static prompt tokens
+        example_prompt = self.update_memory_from_file_chunk_prompt_markdown("example.txt","0", "0", "", "", query)
+        static_tokens = len(self.tokenize(example_prompt))
+
+        # Process each file separately
+        for file_name, file_text in all_texts:
+            file_tokens = self.tokenize(file_text)
+            start_token_idx = 0
+            file_chunk_id = 0  # Reset chunk counter for each file
+
+            while start_token_idx < len(file_tokens):
+                # Calculate available tokens
+                current_memory_tokens = len(self.tokenize(memory))
+                available_tokens = ctx_size - static_tokens - current_memory_tokens
+                if available_tokens <= 0:
+                    raise ValueError("Memory too large - consider reducing chunk size or increasing context window")
+
+                # Adjust chunk size
+                actual_chunk_size = (
+                    min(bootstrap_chunk_size, available_tokens)
+                    if bootstrap_chunk_size is not None and bootstrap_steps is not None and global_chunk_id < bootstrap_steps
+                    else min(chunk_size, available_tokens)
+                )
+                
+                end_token_idx = min(start_token_idx + actual_chunk_size, len(file_tokens))
+                chunk_tokens = file_tokens[start_token_idx:end_token_idx]
+                chunk = self.detokenize(chunk_tokens)
+
+                # Generate updated memory
+                prompt = self.update_memory_from_file_chunk_prompt_markdown(
+                                                file_name=file_name,
+                                                file_chunk_id=file_chunk_id,
+                                                global_chunk_id=global_chunk_id,
+                                                chunk=chunk,
+                                                memory=memory,
+                                                query=query) 
+                if debug:
+                    print(f"----- Chunk {file_chunk_id} (Global {global_chunk_id}) from {file_name} ------")
+                    print(prompt)
+
+                output = self.generate_text(prompt, n_predict=ctx_size // 4, streaming_callback=callback).strip()
+                code = self.extract_code_blocks(output)
+                if code:
+                    memory = code[0]["content"]
+                else:
+                    memory = output
+
+                if debug:
+                    ASCIIColors.red("----- Updated Memory ------")
+                    ASCIIColors.white(memory)
+                    ASCIIColors.red("---------------------------")
+
+                start_token_idx = end_token_idx
+                file_chunk_id += 1
+                global_chunk_id += 1
+
+        # Aggregate findings if requested
+        if aggregation_prompt:
+            final_prompt = f"""{self.system_full_header}
+You are a search results aggregator.
+{self.user_full_header}
+{aggregation_prompt}
+Collected findings (across all files):
+```markdown
+{memory}
+```
 Provide the final output in {output_format} format.
 {self.ai_full_header}
 """
-                final_output = self.generate_text(final_prompt, streaming_callback=callback)
-                code = self.extract_code_blocks(final_output)
-                return code[0]["content"] if code else final_output
-            return memory
+            final_output = self.generate_text(final_prompt, streaming_callback=callback)
+            code = self.extract_code_blocks(final_output)
+            return code[0]["content"] if code else final_output
+        return memory
+
 def error(self, content, duration:int=4, client_id=None, verbose:bool=True):
     ASCIIColors.error(content)
 
