@@ -211,6 +211,7 @@ class LollmsClient():
                      repeat_last_n: Optional[int] = None,
                      seed: Optional[int] = None,
                      n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None) -> str:
         """
         Generate text using the active binding, using instance defaults if parameters are not provided.
@@ -247,6 +248,7 @@ class LollmsClient():
             repeat_last_n=repeat_last_n if repeat_last_n is not None else self.default_repeat_last_n,
             seed=seed if seed is not None else self.default_seed,
             n_threads=n_threads if n_threads is not None else self.default_n_threads,
+            ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size,
             streaming_callback=streaming_callback if streaming_callback is not None else self.default_streaming_callback
         )
 

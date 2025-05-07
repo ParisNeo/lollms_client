@@ -62,6 +62,7 @@ class OpenAIBinding(LollmsLLMBinding):
                     repeat_last_n: int = 40,
                     seed: Optional[int] = None,
                     n_threads: int = 8,
+                    ctx_size: int | None = None,
                     streaming_callback: Optional[Callable[[str, str], None]] = None) -> str:
         """
         Generate text based on the provided prompt and parameters.

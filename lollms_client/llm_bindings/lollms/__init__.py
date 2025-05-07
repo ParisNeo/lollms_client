@@ -54,6 +54,7 @@ class LollmsLLMBinding(LollmsLLMBinding):
                      repeat_last_n: int = 40,
                      seed: Optional[int] = None,
                      n_threads: int = 8,
+                     ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, str], None]] = None) -> Union[str, dict]:
         """
         Generate text using the LOLLMS service, with optional image support.

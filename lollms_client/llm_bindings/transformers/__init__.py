@@ -124,6 +124,7 @@ class TransformersBinding(LollmsLLMBinding):
                       repeat_last_n: int = 40,
                       seed: Optional[int] = None,
                       n_threads: int = 8,
+                      ctx_size: int | None = None,
                       streaming_callback: Optional[Callable[[str, str], None]] = None,
                       return_legacy_cache: bool = False,
                       system_prompt: str = "You are a helpful assistant.") -> Union[str, dict]:

@@ -54,6 +54,7 @@ class OllamaBinding(LollmsLLMBinding):
                      repeat_last_n: int = 40,
                      seed: Optional[int] = None,
                      n_threads: int = 8,
+                     ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, str], None]] = None) -> Union[str, dict]:
         """
         Generate text using the Ollama service, with optional image support.
@@ -111,8 +112,10 @@ class OllamaBinding(LollmsLLMBinding):
                 }],
                 "stream": stream,
                 "temperature": float(temperature),
-                "max_tokens": n_predict
+                "max_tokens": n_predict,
             }
+            if ctx_size is not None:
+                data["num_ctx"] = ctx_size            
             url = f'{host_address}/api/chat'
         else:
             # Text-only generation using /api/generate endpoint
