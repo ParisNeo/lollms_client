@@ -268,6 +268,7 @@ class OllamaBinding(LollmsLLMBinding):
                 }
         response = requests.get(url, headers=headers, verify= self.verify_ssl_certificate)
         try:
+            ASCIIColors.debug("Listing ollama models")
             data = response.json()
             model_info = []
 

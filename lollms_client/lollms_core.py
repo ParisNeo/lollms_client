@@ -258,7 +258,7 @@ class LollmsClient():
 
 
     def listModels(self):
-        self.binding.listModels()
+        return self.binding.listModels()
 
 
 
