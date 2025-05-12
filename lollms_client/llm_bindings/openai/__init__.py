@@ -40,6 +40,7 @@ class OpenAIBinding(LollmsLLMBinding):
             personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
         """
         super().__init__(
+            binding_name = "openai",
             host_address=host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS,
             model_name=model_name,
             service_key=service_key,
