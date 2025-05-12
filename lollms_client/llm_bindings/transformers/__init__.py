@@ -50,6 +50,7 @@ class TransformersBinding(LollmsLLMBinding):
             prompt_template (Optional[str]): Custom prompt template. If None, inferred from model.
         """
         super().__init__(
+            binding_name = "transformers",
             host_address=host_address,
             model_name=model_name,
             service_key=service_key,
