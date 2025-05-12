@@ -33,6 +33,7 @@ class LollmsLLMBinding(LollmsLLMBinding):
             personality (Optional[int]): Personality ID for generation. Defaults to None.
         """
         super().__init__(
+            binding_name = "lollms",
             host_address=host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS,
             model_name=model_name,
             service_key=service_key,
