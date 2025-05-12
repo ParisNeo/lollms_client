@@ -13,6 +13,7 @@ class LollmsLLMBinding(ABC):
     """Abstract base class for all LOLLMS LLM bindings"""
     
     def __init__(self, 
+                 binding_name: Optional[str] ="unknown",
                  host_address: Optional[str] = None,
                  model_name: str = "",
                  service_key: Optional[str] = None,
