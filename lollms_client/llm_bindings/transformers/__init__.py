@@ -254,6 +254,19 @@ class TransformersBinding(LollmsLLMBinding):
         """Convert a list of tokens back to text."""
         return "".join(tokens)
     
+    def count_tokens(self, text: str) -> int:
+        """
+        Count tokens from a text.
+
+        Args:
+            tokens (list): List of tokens to detokenize.
+
+        Returns:
+            int: Number of tokens in text.
+        """        
+        return len(self.tokenize(text))
+
+    
     def embed(self, text: str, **kwargs) -> list:
         """Get embeddings for the input text (placeholder)."""
         pass
