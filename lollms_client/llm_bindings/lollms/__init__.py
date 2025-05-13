@@ -10,6 +10,7 @@ import json
 
 BindingName = "LollmsLLMBinding"
 
+
 class LollmsLLMBinding(LollmsLLMBinding):
     """LOLLMS-specific binding implementation"""
     
@@ -215,7 +216,18 @@ class LollmsLLMBinding(LollmsLLMBinding):
         except Exception as ex:
             return {"status": False, "error": str(ex)}
 
+    def count_tokens(self, text: str) -> int:
+        """
+        Count tokens from a text.
 
+        Args:
+            tokens (list): List of tokens to detokenize.
+
+        Returns:
+            int: Number of tokens in text.
+        """        
+        return len(self.tokenize(text))
+    
     def embed(self, text: str, **kwargs) -> list:
         """
         Get embeddings for the input text using Ollama API
