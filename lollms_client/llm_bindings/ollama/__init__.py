@@ -11,6 +11,72 @@ from ascii_colors import ASCIIColors, trace_exception
 BindingName = "OllamaBinding"
 
 
+def count_tokens_ollama(
+    text_to_tokenize: str,
+    model_name: str,
+    ollama_host: str = "http://localhost:11434",
+    timeout: int = 30
+) -> int:
+    """
+    Counts the number of tokens in a given text using a specified Ollama model
+    by calling the Ollama server's /api/tokenize endpoint.
+
+    Args:
+        text_to_tokenize (str): The text to be tokenized.
+        model_name (str): The name of the Ollama model to use (e.g., "llama3", "mistral").
+        ollama_host (str): The base URL of the Ollama server (default: "http://localhost:11434").
+        timeout (int): Timeout for the request in seconds (default: 30).
+
+    Returns:
+        int: The number of tokens. Returns -1 if an error occurs.
+
+    Raises:
+        requests.exceptions.RequestException: For network issues or timeouts.
+        requests.exceptions.HTTPError: For HTTP error responses (4xx or 5xx).
+        ValueError: If the response from Ollama is not as expected (e.g., missing 'tokens' key).
+    """
+    api_url = f"{ollama_host}/api/tokenize"
+    payload = {
+        "model": model_name,
+        "prompt": text_to_tokenize
+        # You can add "options" here if needed, but for tokenization, it's usually not required.
+        # "options": {"num_ctx": 4096} # Example, might influence tokenizer for specific context length
+    }
+
+    try:
+        response = requests.post(api_url, json=payload, timeout=timeout)
+        response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
+
+        response_data = response.json()
+
+        if "tokens" in response_data and isinstance(response_data["tokens"], list):
+            return len(response_data["tokens"])
+        else:
+            raise ValueError(
+                f"Ollama response did not contain a 'tokens' list. Response: {response_data}"
+            )
+
+    except requests.exceptions.HTTPError as http_err:
+        # You might want to inspect http_err.response.text for more details from Ollama
+        print(f"HTTP error occurred: {http_err} - {http_err.response.text}")
+        raise  # Re-raise the exception
+    except requests.exceptions.ConnectionError as conn_err:
+        print(f"Connection error occurred: {conn_err}")
+        raise
+    except requests.exceptions.Timeout as timeout_err:
+        print(f"Timeout error occurred: {timeout_err}")
+        raise
+    except requests.exceptions.RequestException as req_err:
+        print(f"An unexpected error occurred with the request: {req_err}")
+        raise
+    except json.JSONDecodeError as json_err:
+        # This can happen if the server returns non-JSON, e.g., an HTML error page
+        raise ValueError(
+            f"Failed to decode JSON response from Ollama: {json_err}. Response text: {response.text}"
+        ) from json_err
+    except ValueError as val_err: # Catches the ValueError raised above for missing 'tokens'
+        print(f"Value error: {val_err}")
+        raise
 class OllamaBinding(LollmsLLMBinding):
     """Ollama-specific binding implementation"""
     
@@ -209,6 +275,18 @@ class OllamaBinding(LollmsLLMBinding):
             str: Detokenized text.
         """
         return "".join(tokens)
+    
+    def count_tokens(self, text: str) -> int:
+        """
+        Count tokens from a text.
+
+        Args:
+            tokens (list): List of tokens to detokenize.
+
+        Returns:
+            int: Number of tokens in text.
+        """        
+        return count_tokens_ollama(text, self.model_name, self.host_address)
     
     def embed(self, text: str, **kwargs) -> list:
         """
