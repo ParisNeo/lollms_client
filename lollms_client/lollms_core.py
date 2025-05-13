@@ -281,7 +281,20 @@ class LollmsClient():
         if self.binding:
             return self.binding.detokenize(tokens)
         raise RuntimeError("LLM binding not initialized.")
+    def count_tokens(self, text: str) -> int:
+        """
+        Counts how many tokens are there in the text using the active LLM binding.
 
+        Args:
+            text (str): The text to tokenize.
+
+        Returns:
+            int: Number of tokens.
+        """
+        if self.binding:
+            return self.binding.count_tokens(text)
+        raise RuntimeError("LLM binding not initialized.")
+    
     def get_model_details(self) -> dict:
         """
         Get model information from the active LLM binding.
