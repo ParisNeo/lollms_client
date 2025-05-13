@@ -199,6 +199,19 @@ class OpenAIBinding(LollmsLLMBinding):
             return tiktoken.model.encoding_for_model(self.model_name).decode(tokens)
         except:
             return tiktoken.model.encoding_for_model("gpt-3.5-turbo").decode(tokens)
+
+    def count_tokens(self, text: str) -> int:
+        """
+        Count tokens from a text.
+
+        Args:
+            tokens (list): List of tokens to detokenize.
+
+        Returns:
+            int: Number of tokens in text.
+        """        
+        return len(self.tokenize(text))
+
         
     def embed(self, text: str, **kwargs) -> list:
         """
