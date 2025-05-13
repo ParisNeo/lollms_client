@@ -103,6 +103,19 @@ class LollmsLLMBinding(ABC):
             str: Detokenized text.
         """
         pass
+    
+    @abstractmethod
+    def count_tokens(self, text: str) -> int:
+        """
+        Count tokens from a text.
+
+        Args:
+            tokens (list): List of tokens to detokenize.
+
+        Returns:
+            int: Number of tokens in text.
+        """        
+        pass
 
     @abstractmethod
     def embed(self, text: str, **kwargs) -> list:
