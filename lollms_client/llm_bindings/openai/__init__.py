@@ -8,10 +8,9 @@ from lollms_client.lollms_types import ELF_COMPLETION_FORMAT
 from typing import Optional, Callable, List, Union
 from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
-if not pm.is_installed("openai"):
-    pm.install("openai")
-if not pm.is_installed("tiktoken"):
-    pm.install("tiktoken")
+
+pm.ensure_packages(["openai","tiktoken"])
+
 import openai
 import tiktoken
 import os
@@ -49,6 +48,7 @@ class OpenAIBinding(LollmsLLMBinding):
         )
         self.service_key = os.getenv("OPENAI_API_KEY","")
         self.client = openai.OpenAI(base_url=host_address)
+        self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     
     def generate_text(self, 
@@ -115,7 +115,7 @@ class OpenAIBinding(LollmsLLMBinding):
             messages = [{"role": "user", "content": prompt}]
 
         # Generate text using the OpenAI API
-        if completion_format == ELF_COMPLETION_FORMAT.Chat:
+        if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
             chat_completion = self.client.chat.completions.create(
                 model=self.model_name,  # Choose the engine according to your OpenAI plan
                 messages=messages,
