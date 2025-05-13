@@ -30,6 +30,7 @@ class LollmsLLMBinding(ABC):
             verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
             default_completion_format (ELF_COMPLETION_FORMAT): The completion format (Chat or Instruct)
         """
+        self.binding_name=binding_name
         if host_address is not None:
             self.host_address = host_address[:-1] if host_address.endswith("/") else host_address
         else:

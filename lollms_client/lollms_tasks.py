@@ -7,7 +7,6 @@ from functools import partial
 import json
 import sys
 from datetime import datetime
-from lollmsvectordb.text_chunker import TextChunker
 
 class TasksLibrary:
     def __init__(self, lollms:LollmsClient, callback: Callable[[str, MSG_TYPE, dict, list], bool]=None) -> None:
@@ -422,7 +421,7 @@ class TasksLibrary:
         while len(tk)>max_summary_size and (document_chunks is None or len(document_chunks)>1):
             self.step_start(f"Comprerssing {doc_name}... [depth {depth+1}]")
             chunk_size = int(self.lollms.ctx_size*0.6)
-            document_chunks = TextChunker.chunk_text(text, self.lollms, chunk_size, 0, True)
+            document_chunks = chunk_text(text, self.lollms, chunk_size, 0, True)
             text = self.summerize_chunks(
                                             document_chunks,
                                             summary_instruction, 

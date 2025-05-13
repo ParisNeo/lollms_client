@@ -5,6 +5,5 @@ pipmaster
 yaml
 tiktoken
 pydantic
-lollmsvectordb
 pipmaster
 numpy

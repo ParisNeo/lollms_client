@@ -891,7 +891,6 @@
     *   `yaml`
     *   `tiktoken` (for OpenAI binding)
     *   `pydantic`
-    *   `lollmsvectordb`
     *   `numpy`
 
     Additional implicit dependencies for specific bindings:
