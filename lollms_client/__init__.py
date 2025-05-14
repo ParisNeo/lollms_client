@@ -6,13 +6,14 @@ from lollms_client.lollms_discussion import LollmsDiscussion, LollmsMessage
 from lollms_client.lollms_utilities import PromptReshaper # Keep general utilities
 from lollms_client.lollms_functions import FunctionCalling_Library
 
+__version__ = "0.13.0"
+
 # Optionally, you could define __all__ if you want to be explicit about exports
 __all__ = [
     "LollmsClient",
     "ELF_COMPLETION_FORMAT",
     "TasksLibrary",
     "MSG_TYPE",
-    "LollmsPersonality",
     "LollmsDiscussion",
     "LollmsMessage",
     "PromptReshaper",

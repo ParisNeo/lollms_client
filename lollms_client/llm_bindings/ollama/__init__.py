@@ -85,8 +85,8 @@ class OllamaBinding(LollmsLLMBinding):
                  host_address: str = None,
                  model_name: str = "",
                  service_key: str = None,
-                 verify_ssl_certificate: bool = True,
-                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat
+                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat,
+                 verify_ssl_certificate: bool = True
                  ):
         """
         Initialize the Ollama binding.
@@ -101,12 +101,13 @@ class OllamaBinding(LollmsLLMBinding):
         _host_address = host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS
         super().__init__(
             binding_name=BindingName, # Use the module-level BindingName
-            host_address=_host_address,
-            model_name=model_name,
-            service_key=service_key,
-            verify_ssl_certificate=verify_ssl_certificate,
-            default_completion_format=default_completion_format
         )
+        self.host_address=_host_address
+        self.model_name=model_name
+        self.service_key=service_key
+        self.verify_ssl_certificate=verify_ssl_certificate
+        self.default_completion_format=default_completion_format
+
         if ollama is None:
             raise ImportError("Ollama library is not installed. Please run 'pip install ollama'.")
 
@@ -333,7 +334,7 @@ class OllamaBinding(LollmsLLMBinding):
         if not self.ollama_client:
              raise Exception("Ollama client not initialized.")
 
-        model_to_use = kwargs.get("model", self.model_name)
+        model_to_use = kwargs.get("model", "bge-m3")
         if not model_to_use:
             raise ValueError("Model name for embedding must be specified either in init or via kwargs.")
             

@@ -32,17 +32,15 @@ class TransformersBinding(LollmsLLMBinding):
     """Transformers-specific binding implementation"""
     
     def __init__(self,
-                 host_address: str = None,
+                 models_folder: str = "./models",
                  model_name: str = "",
-                 service_key: str = None,
-                 verify_ssl_certificate: bool = True,
                  default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat,
                  prompt_template: Optional[str] = None):
         """
         Initialize the Transformers binding.
 
         Args:
-            host_address (str): Host address for the service. Defaults to None.
+            models_folder (str): The folder where we can find local models
             model_name (str): Name of the model to use. Defaults to empty string.
             service_key (str): Authentication key for the service. Defaults to None.
             verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
@@ -50,14 +48,12 @@ class TransformersBinding(LollmsLLMBinding):
             prompt_template (Optional[str]): Custom prompt template. If None, inferred from model.
         """
         super().__init__(
-            binding_name = "transformers",
-            host_address=host_address,
-            model_name=model_name,
-            service_key=service_key,
-            verify_ssl_certificate=verify_ssl_certificate,
-            default_completion_format=default_completion_format
+            binding_name = "transformers"
         )
-        
+        self.models_folder= models_folder
+        self.model_name=model_name
+        self.default_completion_format=default_completion_format
+
         # Configure 4-bit quantization
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,

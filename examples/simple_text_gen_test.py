@@ -5,20 +5,21 @@ from ascii_colors import ASCIIColors, trace_exception
 # --- Configuration ---
 # Choose your LLM binding and parameters here
 # Option 1: Default LOLLMS server binding
-# BINDING_NAME = "lollms"
-# HOST_ADDRESS = "http://localhost:9600"
-# MODEL_NAME = None # Server will use its default or last loaded model
+BINDING_NAME = "lollms"
+HOST_ADDRESS = "http://localhost:9600"
+MODEL_NAME = None # Server will use its default or last loaded model
 
 # Option 2: Ollama binding
-BINDING_NAME = "ollama"
-HOST_ADDRESS = "http://localhost:11434" # Default Ollama host
-MODEL_NAME = "mistral:latest" # Or "llama3:latest", "phi3:latest", etc. - ensure it's pulled in Ollama
+#ensure you have the right models
+#BINDING_NAME = "ollama"
+#HOST_ADDRESS = "http://localhost:11434" # Default Ollama host
+#MODEL_NAME = "mistral:latest" # Or "llama3:latest", "phi3:latest", etc. - ensure it's pulled in Ollama
 
 # Option 3: OpenAI binding (requires OPENAI_API_KEY environment variable or service_key)
 # BINDING_NAME = "openai"
 # HOST_ADDRESS = None # Defaults to OpenAI API
 # MODEL_NAME = "gpt-3.5-turbo"
-# SERVICE_KEY = "sk-your_openai_api_key_here" # Optional, can use env var
+# SERVICE_KEY = "" # Optional, can use env var
 
 # --- Callback for streaming ---
 def simple_streaming_callback(chunk: str, msg_type: MSG_TYPE, params=None, metadata=None) -> bool:
@@ -42,7 +43,7 @@ def test_text_generation():
             "binding_name": BINDING_NAME,
             "host_address": HOST_ADDRESS,
             "model_name": MODEL_NAME,
-            # "service_key": SERVICE_KEY, # Uncomment for OpenAI if needed
+            #"service_key": SERVICE_KEY, # Uncomment for OpenAI if needed
         }
         # Remove None host_address for bindings that have internal defaults (like OpenAI)
         if lc_params["host_address"] is None and BINDING_NAME in ["openai"]:
@@ -90,6 +91,11 @@ def test_text_generation():
             ASCIIColors.cyan(f"\n(Full streamed text was: {response_stream[:100]}...)") # Show a snippet of full text
         elif isinstance(response_stream, dict) and "error" in response_stream:
             ASCIIColors.error(f"Error in streaming generation: {response_stream['error']}")
+
+        print("Testing embedding")
+        emb = lc.embed("hello")
+        print(emb)
+
         # else: if callback returns False early, response_stream might be partial.
 
         # 3. Test generation with a specific model (if applicable and different from default)

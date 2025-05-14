@@ -7,6 +7,8 @@ from lollms_client.lollms_utilities import encode_image
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT
 from typing import Optional, Callable, List, Union
 from ascii_colors import ASCIIColors, trace_exception
+from typing import List, Dict
+
 import pipmaster as pm
 
 pm.ensure_packages(["openai","tiktoken"])
@@ -40,14 +42,16 @@ class OpenAIBinding(LollmsLLMBinding):
         """
         super().__init__(
             binding_name = "openai",
-            host_address=host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS,
-            model_name=model_name,
-            service_key=service_key,
-            verify_ssl_certificate=verify_ssl_certificate,
-            default_completion_format=default_completion_format
         )
-        self.service_key = os.getenv("OPENAI_API_KEY","")
-        self.client = openai.OpenAI(base_url=host_address)
+        self.host_address=host_address
+        self.model_name=model_name
+        self.service_key=service_key
+        self.verify_ssl_certificate=verify_ssl_certificate
+        self.default_completion_format=default_completion_format
+
+        if not self.service_key:
+            self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
+        self.client = openai.OpenAI(api_key=self.service_key, base_url=host_address)
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     
@@ -134,7 +138,7 @@ class OpenAIBinding(LollmsLLMBinding):
                     except Exception as ex:
                         word = ""
                     if streaming_callback is not None:
-                        if not streaming_callback(word, "MSG_TYPE_CHUNK"):
+                        if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
                             break
                     if word:
                         output += word
@@ -238,28 +242,64 @@ class OpenAIBinding(LollmsLLMBinding):
             "host_address": self.host_address,
             "model_name": self.model_name
         }
-    def listModels(self):
-        """ Lists available models """
-        url = f'{self.host_address}/v1/models'
-        headers = {
-                    'accept': 'application/json',
-                    'Authorization': f'Bearer {self.service_key}'
-                }
-        response = requests.get(url, headers=headers, verify= self.verify_ssl_certificate)
+
+    def listModels(self) -> List[Dict]:
+        # Known context lengths
+        known_context_lengths = {
+            "gpt-4o": 128000,
+            "gpt-4": 8192,
+            "gpt-4-0613": 8192,
+            "gpt-4-1106-preview": 128000,
+            "gpt-4-0125-preview": 128000,
+            "gpt-4-turbo": 128000,
+            "gpt-3.5-turbo": 4096,
+            "gpt-3.5-turbo-16k": 16000,
+            "gpt-3.5-turbo-1106": 16385,
+            "gpt-3.5-turbo-0125": 16385,
+            "text-davinci-003": 4097,
+            "text-davinci-002": 4097,
+            "davinci": 2049,
+            "curie": 2049,
+            "babbage": 2049,
+            "ada": 2049,
+        }
+
+        generation_prefixes = (
+            "gpt-",
+            "text-davinci",
+            "davinci",
+            "curie",
+            "babbage",
+            "ada"
+        )
+
+        models_info = []
+        prompt_buffer = 500
+
         try:
-            data = response.json()
-            model_info = []
+            models = self.client.models.list()
+            for model in models.data:
+                model_id = model.id
+                if model_id.startswith(generation_prefixes):
+                    context_length = known_context_lengths.get(model_id, "unknown")
+                    max_generation = (
+                        context_length - prompt_buffer
+                        if isinstance(context_length, int)
+                        else "unknown"
+                    )
+                    models_info.append({
+                        "model_name": model_id,
+                        "owned_by": getattr(model, "owned_by", "N/A"),
+                        "created": getattr(model, "created", "N/A"),
+                        "context_length": context_length,
+                        "max_generation": max_generation,
+                    })
+        except Exception as e:
+            print(f"Failed to list models: {e}")
 
-            for model in data["data"]:
-                model_name = model['id']
-                owned_by = model['owned_by']
-                created_datetime = model["created"]
-                model_info.append({'model_name': model_name, 'owned_by': owned_by, 'created_datetime': created_datetime})
+        return models_info
 
-            return model_info
-        except Exception as ex:
-            trace_exception(ex)
-            return []        
+
     def load_model(self, model_name: str) -> bool:
         """
         Load a specific model into the OpenAI binding.

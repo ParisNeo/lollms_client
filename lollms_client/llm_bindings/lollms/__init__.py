@@ -21,8 +21,9 @@ class LollmsLLMBinding(LollmsLLMBinding):
                  model_name: str = "",
                  service_key: str = None,
                  verify_ssl_certificate: bool = True,
-                 personality: Optional[int] = None,
-                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat):
+                 personality: Optional[int] = None, 
+                 **kwargs
+                 ):
         """
         Initialize the LOLLMS binding.
 
@@ -34,13 +35,14 @@ class LollmsLLMBinding(LollmsLLMBinding):
             personality (Optional[int]): Personality ID for generation. Defaults to None.
         """
         super().__init__(
-            binding_name = "lollms",
-            host_address=host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS,
-            model_name=model_name,
-            service_key=service_key,
-            verify_ssl_certificate=verify_ssl_certificate,
-            default_completion_format=default_completion_format
+            binding_name = "lollms"
         )
+        
+        self.host_address=host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS
+        self.model_name=model_name
+        self.service_key=service_key
+        self.verify_ssl_certificate=verify_ssl_certificate
+        self.default_completion_format=kwargs.get("default_completion_format",ELF_COMPLETION_FORMAT.Chat) 
         self.personality = personality
         self.model = None
     
@@ -133,7 +135,7 @@ class LollmsLLMBinding(LollmsLLMBinding):
         if not stream:
             if response.status_code == 200:
                 try:
-                    text = response.text.strip().rstrip('!')
+                    text = response.text.strip()
                     return text
                 except Exception as ex:
                     return {"status": False, "error": str(ex)}
@@ -276,8 +278,8 @@ class LollmsLLMBinding(LollmsLLMBinding):
 
         if response.status_code == 200:
             try:
-                text = json.loads(response.content.decode("utf-8"))
-                return text
+                models = json.loads(response.content.decode("utf-8"))
+                return [{"model_name":m} for m in models]
             except Exception as ex:
                 return {"status": False, "error": str(ex)}
         else:

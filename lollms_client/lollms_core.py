@@ -32,7 +32,6 @@ class LollmsClient():
                  model_name: str = "",
                  llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
                  llm_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
-                 personality: Optional[int] = None, # Specific to LLM lollms binding
 
                  # Optional Modality Binding Names
                  tts_binding_name: Optional[str] = None,
@@ -73,7 +72,6 @@ class LollmsClient():
             model_name (str): Default model name for the LLM binding.
             llm_bindings_dir (Path): Directory for LLM binding implementations.
             llm_binding_config (Optional[Dict]): Additional config for the LLM binding.
-            personality (Optional[int]): Personality ID (used by LLM 'lollms' binding).
             tts_binding_name (Optional[str]): Name of the TTS binding to use (e.g., "lollms").
             tti_binding_name (Optional[str]): Name of the TTI binding to use (e.g., "lollms").
             stt_binding_name (Optional[str]): Name of the STT binding to use (e.g., "lollms").
@@ -115,7 +113,6 @@ class LollmsClient():
             model_name=model_name,
             service_key=service_key,
             verify_ssl_certificate=verify_ssl_certificate,
-            personality=personality,
             # Pass LLM specific config if needed
             **(llm_binding_config or {})
         )

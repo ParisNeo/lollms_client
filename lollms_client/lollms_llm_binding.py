@@ -13,12 +13,7 @@ class LollmsLLMBinding(ABC):
     """Abstract base class for all LOLLMS LLM bindings"""
     
     def __init__(self, 
-                 binding_name: Optional[str] ="unknown",
-                 host_address: Optional[str] = None,
-                 model_name: str = "",
-                 service_key: Optional[str] = None,
-                 verify_ssl_certificate: bool = True,
-                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat
+                 binding_name: Optional[str] ="unknown"
         ):
         """
         Initialize the LollmsLLMBinding base class.
@@ -31,14 +26,7 @@ class LollmsLLMBinding(ABC):
             default_completion_format (ELF_COMPLETION_FORMAT): The completion format (Chat or Instruct)
         """
         self.binding_name=binding_name
-        if host_address is not None:
-            self.host_address = host_address[:-1] if host_address.endswith("/") else host_address
-        else:
-            self.host_address = None
-        self.model_name = model_name
-        self.service_key = service_key
-        self.verify_ssl_certificate = verify_ssl_certificate
-        self.default_completion_format = default_completion_format
+        self.model_name = None #Must be set by the instance
     
     @abstractmethod
     def generate_text(self, 
@@ -188,21 +176,13 @@ class LollmsLLMBindingManager:
 
     def create_binding(self, 
                       binding_name: str,
-                      host_address: Optional[str] = None,
-                      model_name: str = "",
-                      service_key: Optional[str] = None,
-                      verify_ssl_certificate: bool = True,
-                      personality: Optional[int] = None) -> Optional[LollmsLLMBinding]:
+                      **kwargs) -> Optional[LollmsLLMBinding]:
         """
         Create an instance of a specific binding.
 
         Args:
             binding_name (str): Name of the binding to create.
-            host_address (Optional[str]): Host address for the service.
-            model_name (str): Name of the model to use.
-            service_key (Optional[str]): Authentication key for the service.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates.
-            personality (Optional[int]): Personality ID for LOLLMS binding.
+            kwargs: binding specific arguments
 
         Returns:
             Optional[LollmsLLMBinding]: Binding instance or None if creation failed.
@@ -212,7 +192,7 @@ class LollmsLLMBindingManager:
         
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
-            return binding_class(host_address, model_name, service_key, verify_ssl_certificate, personality)
+            return binding_class(**kwargs)
         return None
 
     def get_available_bindings(self) -> list[str]:
