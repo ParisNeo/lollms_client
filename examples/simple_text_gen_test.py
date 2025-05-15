@@ -97,6 +97,8 @@ def test_text_generation():
         print(emb)
 
         # else: if callback returns False early, response_stream might be partial.
+        nb_tokens = lc.count_tokens("")
+        ASCIIColors.yellow("Number of tokens of : Testing count of tokens\n"+f"{nb_tokens}")
 
         # 3. Test generation with a specific model (if applicable and different from default)
         #    This tests the switch_model or model loading mechanism of the binding.
