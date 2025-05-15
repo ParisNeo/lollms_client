@@ -2,7 +2,7 @@ requests>=2.25.1
 ascii-colors
 pillow
 pipmaster
-yaml
+pyyaml
 tiktoken
 pydantic
 numpy
