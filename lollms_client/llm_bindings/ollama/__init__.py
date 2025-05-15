@@ -20,62 +20,45 @@ BindingName = "OllamaBinding"
 def count_tokens_ollama(
     text_to_tokenize: str,
     model_name: str,
-    ollama_host: str = "http://localhost:11434",
-    timeout: int = 30,
-    verify_ssl_certificate: bool = True,
-    headers: Optional[Dict[str, str]] = None
+    ollama_client: ollama.Client,
+    num_predict_for_eval: int = 0 # Number of tokens to "predict" to trigger evaluation
 ) -> int:
     """
-    Counts the number of tokens in a given text using a specified Ollama model
-    by calling the Ollama server's /api/tokenize endpoint.
+    Counts the number of tokens in a given text for a specified Ollama model
+    by making a minimal request to the /api/generate endpoint and extracting
+    the 'prompt_eval_count' from the response.
+
+    This method is generally more accurate for the specific Ollama model instance
+    than using an external tokenizer, but it incurs the overhead of an API call
+    and model processing for the prompt.
 
     Args:
-        text_to_tokenize (str): The text to be tokenized.
-        model_name (str): The name of the Ollama model to use (e.g., "llama3", "mistral").
-        ollama_host (str): The base URL of the Ollama server (default: "http://localhost:11434").
-        timeout (int): Timeout for the request in seconds (default: 30).
-        verify_ssl_certificate (bool): Whether to verify SSL.
-        headers (Optional[Dict[str, str]]): Optional headers for the request.
+        text_to_tokenize: The string to tokenize.
+        model_name: The name of the Ollama model (e.g., "llama3:8b", "mistral").
+        ollama_host: The URL of the Ollama API host.
+        timeout: Timeout for the request to Ollama.
+        verify_ssl_certificate: Whether to verify SSL certificates for the Ollama host.
+        headers: Optional custom headers for the request to Ollama.
+        num_predict_for_eval: How many tokens to ask the model to "predict" to get
+                              the prompt evaluation count. 0 is usually sufficient and most efficient.
+                              If 0 doesn't consistently yield `prompt_eval_count`, try 1.
 
     Returns:
-        int: The number of tokens. Returns -1 if an error occurs.
+        The number of tokens as reported by 'prompt_eval_count'.
+
+    Raises:
+        requests.exceptions.RequestException: If the API request fails.
+        KeyError: If 'prompt_eval_count' is not found in the response.
+        json.JSONDecodeError: If the response is not valid JSON.
+        RuntimeError: For other operational errors.
     """
-    api_url = f"{ollama_host.rstrip('/')}/api/tokenize"
-    payload = {
-        "model": model_name,
-        "prompt": text_to_tokenize
-    }
-    request_headers = headers if headers else {}
-
-    try:
-        response = requests.post(api_url, json=payload, timeout=timeout, verify=verify_ssl_certificate, headers=request_headers)
-        response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
-
-        response_data = response.json()
-
-        if "tokens" in response_data and isinstance(response_data["tokens"], list):
-            return len(response_data["tokens"])
-        else:
-            ASCIIColors.warning(
-                f"Ollama response for token count did not contain a 'tokens' list. Response: {response_data}"
-            )
-            return -1 # Or raise ValueError
-
-    except requests.exceptions.HTTPError as http_err:
-        ASCIIColors.error(f"HTTP error occurred during token count: {http_err} - {http_err.response.text if http_err.response else 'No response text'}")
-        return -1
-    except requests.exceptions.RequestException as req_err:
-        ASCIIColors.error(f"Request error occurred during token count: {req_err}")
-        return -1
-    except json.JSONDecodeError as json_err:
-        ASCIIColors.error(
-            f"Failed to decode JSON response from Ollama during token count: {json_err}. Response text: {response.text if hasattr(response, 'text') else 'No response object'}"
-        )
-        return -1
-    except Exception as e:
-        ASCIIColors.error(f"An unexpected error occurred during token count: {e}")
-        return -1
-
+    res = ollama_client.chat(
+                        model=model_name,
+                        messages=[{"role":"system","content":""},{"role":"user", "content":text_to_tokenize}],
+                        stream=False,options={"num_predict":1}                        
+                    )
+    
+    return res.prompt_eval_count-5
 class OllamaBinding(LollmsLLMBinding):
     """Ollama-specific binding implementation using the ollama-python library."""
     
@@ -132,6 +115,7 @@ class OllamaBinding(LollmsLLMBinding):
                      images: Optional[List[str]] = None, # List of image file paths
                      n_predict: Optional[int] = None,
                      stream: bool = False,
+                     system_prompt = '',
                      temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
                      top_k: int = 40,          # Ollama default is 40
                      top_p: float = 0.9,       # Ollama default is 0.9
@@ -191,7 +175,7 @@ class OllamaBinding(LollmsLLMBinding):
                     # If images were base64 strings, they would need decoding to bytes first.
                     processed_images.append(img_path)
 
-                messages = [{'role': 'user', 'content': prompt, 'images': processed_images if processed_images else None}]
+                messages = [{'role': 'system', 'content':system_prompt},{'role': 'user', 'content': prompt, 'images': processed_images if processed_images else None}]
                 
                 if stream:
                     response_stream = self.ollama_client.chat(
@@ -314,7 +298,7 @@ class OllamaBinding(LollmsLLMBinding):
         if not self.model_name:
             ASCIIColors.warning("Cannot count tokens, model_name is not set.")
             return -1
-        return count_tokens_ollama(text, self.model_name, self.host_address, verify_ssl_certificate=self.verify_ssl_certificate, headers=self.ollama_client_headers)
+        return count_tokens_ollama(text, self.model_name, self.ollama_client)
     
     def embed(self, text: str, **kwargs) -> List[float]:
         """
