@@ -5,5 +5,4 @@ pipmaster
 yaml
 tiktoken
 pydantic
-pipmaster
 numpy
