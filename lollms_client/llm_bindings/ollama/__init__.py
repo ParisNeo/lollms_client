@@ -21,7 +21,6 @@ def count_tokens_ollama(
     text_to_tokenize: str,
     model_name: str,
     ollama_client: ollama.Client,
-    num_predict_for_eval: int = 0 # Number of tokens to "predict" to trigger evaluation
 ) -> int:
     """
     Counts the number of tokens in a given text for a specified Ollama model
