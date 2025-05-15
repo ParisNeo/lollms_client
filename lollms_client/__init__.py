@@ -6,7 +6,7 @@ from lollms_client.lollms_discussion import LollmsDiscussion, LollmsMessage
 from lollms_client.lollms_utilities import PromptReshaper # Keep general utilities
 from lollms_client.lollms_functions import FunctionCalling_Library
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 # Optionally, you could define __all__ if you want to be explicit about exports
 __all__ = [
