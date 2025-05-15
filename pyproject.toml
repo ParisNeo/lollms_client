@@ -28,6 +28,13 @@ classifiers = [
 ]
 dependencies = [
     "requests",
+    "ascii-colors",
+    "pipmaster",
+    "yaml",
+    "tiktoken",
+    "pydantic",
+    "numpy",
+    "pillow",
 ]
 
 [project.urls]
