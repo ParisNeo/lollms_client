@@ -30,7 +30,7 @@ dependencies = [
     "requests",
     "ascii-colors",
     "pipmaster",
-    "yaml",
+    "pyyaml",
     "tiktoken",
     "pydantic",
     "numpy",
