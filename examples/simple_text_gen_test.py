@@ -1,4 +1,4 @@
-from lollms_client import LollmsClient, ELF_COMPLETION_FORMAT
+from lollms_client import LollmsClient
 from lollms_client.lollms_types import MSG_TYPE # For callback signature
 from ascii_colors import ASCIIColors, trace_exception
 
