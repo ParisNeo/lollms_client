@@ -10,10 +10,11 @@ from typing import Optional, Callable, List, Union, Dict
 
 from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
-pm.ensure_packages(["ollama","pillow"])
+pm.ensure_packages(["ollama","pillow","tiktoken"])
 
 
 import ollama
+import tiktoken
 BindingName = "OllamaBinding"
 
 
@@ -236,53 +237,31 @@ class OllamaBinding(LollmsLLMBinding):
             trace_exception(ex)
             return {"status": False, "error": error_message}
     
-    def tokenize(self, text: str) -> List[Union[int, str]]:
+    def tokenize(self, text: str) -> list:
         """
-        Tokenize the input text. For Ollama, this is complex as tokenization is model-specific
-        and best done by the server. This method provides a basic character-level tokenization
-        as a fallback or placeholder, or one could attempt to call /api/tokenize if desired.
-        The `count_tokens` method is more accurate for Ollama.
+        Tokenize the input text into a list of characters.
 
         Args:
             text (str): The text to tokenize.
 
         Returns:
-            list: List of tokens (characters or token IDs if /api/tokenize is used).
+            list: List of individual characters.
         """
-        # Basic character-level tokenization
-        # return list(text)
-
-        # For actual token IDs (slower, makes a network request):
-        api_url = f"{self.host_address.rstrip('/')}/api/tokenize"
-        payload = {"model": self.model_name, "prompt": text}
-        try:
-            response = requests.post(api_url, json=payload, timeout=10, verify=self.verify_ssl_certificate, headers=self.ollama_client_headers)
-            response.raise_for_status()
-            return response.json().get("tokens", [])
-        except Exception as e:
-            ASCIIColors.warning(f"Failed to tokenize text with Ollama server, falling back to char tokens: {e}")
-            return list(text)
-
-    def detokenize(self, tokens: List[Union[int,str]]) -> str:
+        ## Since ollama has no endpoints to tokenize the text, we use tiktoken to have a rough estimate
+        return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text)
+            
+    def detokenize(self, tokens: list) -> str:
         """
-        Convert a list of tokens back to text. If tokens are characters, joins them.
-        If tokens are IDs, this is non-trivial without the model's tokenizer.
+        Convert a list of tokens back to text.
 
         Args:
-            tokens (list): List of tokens to detokenize.
+            tokens (list): List of tokens (characters) to detokenize.
 
         Returns:
             str: Detokenized text.
         """
-        if not tokens:
-            return ""
-        if isinstance(tokens[0], str): # Assuming character tokens
-            return "".join(tokens)
-        else: 
-            # Detokenizing IDs from Ollama is not straightforward client-side without specific tokenizer.
-            # This is a placeholder. For Ollama, detokenization usually happens server-side.
-            ASCIIColors.warning("Detokenizing integer tokens is not accurately supported by this Ollama client binding. Returning joined string of token IDs.")
-            return "".join(map(str, tokens))
+        ## Since ollama has no endpoints to tokenize the text, we use tiktoken to have a rough estimate
+        return tiktoken.model.encoding_for_model("gpt-3.5-turbo").decode(tokens)
     
     def count_tokens(self, text: str) -> int:
         """
