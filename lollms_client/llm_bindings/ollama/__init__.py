@@ -276,8 +276,8 @@ class OllamaBinding(LollmsLLMBinding):
         if not self.model_name:
             ASCIIColors.warning("Cannot count tokens, model_name is not set.")
             return -1
-        return count_tokens_ollama(text, self.model_name, self.ollama_client)
-    
+        #return count_tokens_ollama(text, self.model_name, self.ollama_client)
+        return len(self.tokenize(text))
     def embed(self, text: str, **kwargs) -> List[float]:
         """
         Get embeddings for the input text using Ollama API.
