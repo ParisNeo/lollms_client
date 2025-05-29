@@ -68,8 +68,8 @@ class OllamaBinding(LollmsLLMBinding):
                  host_address: str = None,
                  model_name: str = "",
                  service_key: str = None,
-                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat,
-                 verify_ssl_certificate: bool = True
+                 verify_ssl_certificate: bool = True,
+                 **kwargs
                  ):
         """
         Initialize the Ollama binding.
@@ -89,7 +89,7 @@ class OllamaBinding(LollmsLLMBinding):
         self.model_name=model_name
         self.service_key=service_key
         self.verify_ssl_certificate=verify_ssl_certificate
-        self.default_completion_format=default_completion_format
+        self.default_completion_format=kwargs.get("default_completion_format",ELF_COMPLETION_FORMAT.Chat) 
 
         if ollama is None:
             raise ImportError("Ollama library is not installed. Please run 'pip install ollama'.")
@@ -113,9 +113,9 @@ class OllamaBinding(LollmsLLMBinding):
     def generate_text(self, 
                      prompt: str,
                      images: Optional[List[str]] = None, # List of image file paths
+                     system_prompt: str = "",
                      n_predict: Optional[int] = None,
                      stream: bool = False,
-                     system_prompt = '',
                      temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
                      top_k: int = 40,          # Ollama default is 40
                      top_p: float = 0.9,       # Ollama default is 0.9
@@ -201,15 +201,16 @@ class OllamaBinding(LollmsLLMBinding):
                     )
                     return response_dict.get('message', {}).get('content', '')
             else: # Text-only
+                messages = [{'role': 'system', 'content':system_prompt},{'role': 'user', 'content': prompt}]
                 if stream:
-                    response_stream = self.ollama_client.generate(
+                    response_stream = self.ollama_client.chat(
                         model=self.model_name,
-                        prompt=prompt,
+                        messages=messages,
                         stream=True,
                         options=options if options else None
                     )
                     for chunk_dict in response_stream:
-                        chunk_content = chunk_dict.get('response', '')
+                        chunk_content = chunk_dict.message.content
                         if chunk_content:
                             full_response_text += chunk_content
                             if streaming_callback:
@@ -217,13 +218,13 @@ class OllamaBinding(LollmsLLMBinding):
                                     break
                     return full_response_text
                 else: # Not streaming
-                    response_dict = self.ollama_client.generate(
+                    response_dict = self.ollama_client.chat(
                         model=self.model_name,
-                        prompt=prompt,
+                        messages=messages,
                         stream=False,
                         options=options if options else None
                     )
-                    return response_dict.get('response', '')
+                    return response_dict.message.content
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
             ASCIIColors.error(error_message)

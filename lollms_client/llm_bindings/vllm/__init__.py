@@ -331,6 +331,7 @@ class VLLMBinding(LollmsLLMBinding):
     def generate_text(self, 
                      prompt: str,
                      images: Optional[List[str]] = None, 
+                     system_prompt: str = "",
                      n_predict: Optional[int] = 1024, 
                      stream: bool = False, # vLLM's generate is blocking, stream is pseudo
                      temperature: float = 0.7,
@@ -381,7 +382,7 @@ class VLLMBinding(LollmsLLMBinding):
                 # If providing multi_modal_data, usually prompt_token_ids are also needed.
                 # This can get complex as it depends on how the model expects images to be interleaved.
                 # For a simple case where image comes first:
-                encoded_prompt_ids = self.tokenizer.encode(prompt)
+                encoded_prompt_ids = self.tokenizer.encode(system_prompt+"\n"+prompt if system_prompt else prompt)
                 gen_kwargs["prompt_token_ids"] = [encoded_prompt_ids] # List of lists
                 gen_kwargs["multi_modal_data"] = [{"image": mm_data_content}] # List of dicts
                 gen_kwargs["prompts"] = None # Don't use prompts if prompt_token_ids is used
@@ -389,7 +390,7 @@ class VLLMBinding(LollmsLLMBinding):
             except Exception as e_mm:
                 return {"status": False, "error": f"Multimodal prep error: {e_mm}"}
         else:
-            gen_kwargs["prompts"] = [prompt]
+            gen_kwargs["prompts"] = [system_prompt+"\n"+prompt if system_prompt else prompt]
 
         try:
             outputs = self.llm_engine.generate(**gen_kwargs, sampling_params=sampling_params)

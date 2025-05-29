@@ -28,7 +28,8 @@ class LollmsClient():
     def __init__(self,
                  # LLM Binding Parameters
                  binding_name: str = "lollms",
-                 host_address: Optional[str] = None, # Shared host address default for all bindings if not specified
+                 host_address: Optional[str] = None, # Shared host address (for service based bindings) default for all bindings if not specified
+                 models_path: Optional[str] = None, # Shared models folder path (for local file based bindings) default for all bindings if not specified
                  model_name: str = "",
                  llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
                  llm_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
@@ -69,6 +70,7 @@ class LollmsClient():
         Args:
             binding_name (str): Name of the primary LLM binding (e.g., "lollms", "ollama").
             host_address (Optional[str]): Default host address for all services. Overridden by binding defaults if None.
+            models_path (Optional[str]): Default models folder path. Overridden by binding defaults if None.
             model_name (str): Default model name for the LLM binding.
             llm_bindings_dir (Path): Directory for LLM binding implementations.
             llm_binding_config (Optional[Dict]): Additional config for the LLM binding.
@@ -102,6 +104,7 @@ class LollmsClient():
             ValueError: If the primary LLM binding cannot be created.
         """
         self.host_address = host_address # Store initial preference
+        self.models_path = models_path
         self.service_key = service_key
         self.verify_ssl_certificate = verify_ssl_certificate
 
@@ -110,6 +113,7 @@ class LollmsClient():
         self.binding = self.binding_manager.create_binding(
             binding_name=binding_name,
             host_address=host_address, # Pass initial host preference
+            models_path=models_path,
             model_name=model_name,
             service_key=service_key,
             verify_ssl_certificate=verify_ssl_certificate,
@@ -123,8 +127,6 @@ class LollmsClient():
 
         # Determine the effective host address (use LLM binding's if initial was None)
         effective_host_address = self.host_address
-        if effective_host_address is None and self.binding:
-            effective_host_address = self.binding.host_address
 
         # --- Modality Binding Setup ---
         self.tts_binding_manager = LollmsTTSBindingManager(tts_bindings_dir)
@@ -329,6 +331,7 @@ class LollmsClient():
     def generate_text(self,
                      prompt: str,
                      images: Optional[List[str]] = None,
+                     system_prompt: str = "",
                      n_predict: Optional[int] = None,
                      stream: Optional[bool] = None,
                      temperature: Optional[float] = None,
@@ -365,6 +368,7 @@ class LollmsClient():
             return self.binding.generate_text(
                 prompt=prompt,
                 images=images,
+                system_prompt=system_prompt,
                 n_predict=n_predict if n_predict is not None else self.default_n_predict,
                 stream=stream if stream is not None else self.default_stream,
                 temperature=temperature if temperature is not None else self.default_temperature,
@@ -438,14 +442,12 @@ class LollmsClient():
         Uses the underlying LLM binding via `generate_text`.
         """
         response_full = ""
-        full_prompt = f"""{self.system_full_header}Act as a code generation assistant that generates code from user prompt.
-{self.user_full_header}
-{prompt}
-"""
+        system_prompt = f"""Act as a code generation assistant that generates code from user prompt."""
+
         if template:
-            full_prompt += "Here is a template of the answer:\n"
+            system_prompt += "Here is a template of the answer:\n"
             if code_tag_format=="markdown":
-                full_prompt += f"""You must answer with the code placed inside the markdown code tag like this:
+                system_prompt += f"""You must answer with the code placed inside the markdown code tag like this:
 ```{language}
 {template}
 ```
@@ -454,7 +456,7 @@ The code tag is mandatory.
 Don't forget encapsulate the code inside a markdown code tag. This is mandatory.
 """
             elif code_tag_format=="html":
-                full_prompt +=f"""You must answer with the code placed inside the html code tag like this:
+                system_prompt +=f"""You must answer with the code placed inside the html code tag like this:
 <code language="{language}">
 {template}
 </code>
@@ -462,13 +464,13 @@ Don't forget encapsulate the code inside a markdown code tag. This is mandatory.
 The code tag is mandatory.
 Don't forget encapsulate the code inside a html code tag. This is mandatory.
 """
-        full_prompt += f"""Do not split the code in multiple tags.
-{self.ai_full_header}"""
+        system_prompt += f"""Do not split the code in multiple tags."""
 
         # Use generate_text which handles images internally
         response = self.generate_text(
-            full_prompt,
+            prompt,
             images=images,
+            system_prompt=system_prompt,
             n_predict=max_size,
             temperature=temperature,
             top_k=top_k,
@@ -507,14 +509,12 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
         Handles potential continuation if the code block is incomplete.
         """
 
-        full_prompt = f"""{self.system_full_header}Act as a code generation assistant that generates code from user prompt.
-{self.user_full_header}
-{prompt}
-"""
+        system_prompt = f"""{self.system_full_header}Act as a code generation assistant that generates code from user prompt."""
+
         if template:
-            full_prompt += "Here is a template of the answer:\n"
+            system_prompt += "Here is a template of the answer:\n"
             if code_tag_format=="markdown":
-                full_prompt += f"""You must answer with the code placed inside the markdown code tag like this:
+                system_prompt += f"""You must answer with the code placed inside the markdown code tag like this:
 ```{language}
 {template}
 ```
@@ -523,7 +523,7 @@ The code tag is mandatory.
 Don't forget encapsulate the code inside a markdown code tag. This is mandatory.
 """
             elif code_tag_format=="html":
-                full_prompt +=f"""You must answer with the code placed inside the html code tag like this:
+                system_prompt +=f"""You must answer with the code placed inside the html code tag like this:
 <code language="{language}">
 {template}
 </code>
@@ -531,13 +531,14 @@ Don't forget encapsulate the code inside a markdown code tag. This is mandatory.
 The code tag is mandatory.
 Don't forget encapsulate the code inside a html code tag. This is mandatory.
 """
-        full_prompt += f"""You must return a single code tag.
+        system_prompt += f"""You must return a single code tag.
 Do not split the code in multiple tags.
 {self.ai_full_header}"""
 
         response = self.generate_text(
-            full_prompt,
+            prompt,
             images=images,
+            system_prompt=system_prompt,
             n_predict=max_size,
             temperature=temperature,
             top_k=top_k,

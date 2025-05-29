@@ -10,10 +10,16 @@ from ascii_colors import ASCIIColors, trace_exception
 # MODEL_NAME = None # Server will use its default or last loaded model
 
 # Option 2: Ollama binding
-BINDING_NAME = "ollama"
-HOST_ADDRESS = "http://localhost:11434" # Default Ollama host
-MODEL_NAME = "llava:latest" # Or "llama3:latest", "phi3:latest", etc. - ensure it's pulled in Ollama
-img = r"path/to/your/image.png"
+# BINDING_NAME = "ollama"
+# HOST_ADDRESS = "http://localhost:11434" # Default Ollama host
+# MODEL_NAME = "llava:latest" # Or "llama3:latest", "phi3:latest", etc. - ensure it's pulled in Ollama
+
+# Option 2: llamacpp binding
+BINDING_NAME = "llamacpp"
+MODELS_PATH = r"E:\drumber" # Change to your own models folder
+MODEL_NAME = "llava-v1.6-mistral-7b.Q3_K_XS.gguf" # Change to your vision capable model (make sure you have a mmprj file with the gguf model with the same name but without the quantization name and with mmproj- prefix (mmproj-llava-v1.6-mistral-7b.gguf))
+# You can also add a clip_model_path parameter to your lc_params
+img = "E:\\drumber\\1711741182996.jpg"
 # Option 3: OpenAI binding (requires OPENAI_API_KEY environment variable or service_key)
 # BINDING_NAME = "openai"
 # HOST_ADDRESS = None # Defaults to OpenAI API
@@ -34,19 +40,25 @@ def simple_streaming_callback(chunk: str, msg_type: MSG_TYPE, params=None, metad
 
 def test_text_generation():
     ASCIIColors.cyan(f"\n--- Testing Text Generation with '{BINDING_NAME}' binding ---")
-    ASCIIColors.cyan(f"Host: {HOST_ADDRESS or 'Default'}, Model: {MODEL_NAME or 'Default'}")
 
+    if BINDING_NAME!="llamacpp":
+        ASCIIColors.cyan(f"Host: {HOST_ADDRESS or 'Default'}, Model: {MODEL_NAME or 'Default'}")
+    else:
+        ASCIIColors.cyan(f"Host: {MODELS_PATH or 'Default'}, Model: {MODEL_NAME or 'Default'}")
     try:
         # Initialize LollmsClient
         lc_params = {
             "binding_name": BINDING_NAME,
-            "host_address": HOST_ADDRESS,
             "model_name": MODEL_NAME,
             # "service_key": SERVICE_KEY, # Uncomment for OpenAI if needed
         }
-        # Remove None host_address for bindings that have internal defaults (like OpenAI)
-        if lc_params["host_address"] is None and BINDING_NAME in ["openai"]:
-             del lc_params["host_address"]
+        if BINDING_NAME!="llamacpp":
+            lc_params["host_address"]= HOST_ADDRESS
+            # Remove None host_address for bindings that have internal defaults (like OpenAI)
+            if lc_params["host_address"] is None and BINDING_NAME in ["openai"]:
+                del lc_params["host_address"]
+        else:
+            lc_params["models_path"]= MODELS_PATH
 
 
         lc = LollmsClient(**lc_params)

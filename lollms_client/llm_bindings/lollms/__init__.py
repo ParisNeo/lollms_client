@@ -49,6 +49,7 @@ class LollmsLLMBinding(LollmsLLMBinding):
     def generate_text(self, 
                      prompt: str,
                      images: Optional[List[str]] = None,
+                     system_prompt: str = "",
                      n_predict: Optional[int] = None,
                      stream: bool = False,
                      temperature: float = 0.1,
@@ -106,7 +107,7 @@ class LollmsLLMBinding(LollmsLLMBinding):
         
         # Prepare request data
         data = {
-            "prompt": prompt,
+            "prompt":"!@>system: "+system_prompt+"\n"+"!@>user: "+prompt if system_prompt else prompt,
             "model_name": self.model_name,
             "personality": self.personality,
             "n_predict": n_predict,

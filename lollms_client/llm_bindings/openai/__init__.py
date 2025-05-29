@@ -58,6 +58,7 @@ class OpenAIBinding(LollmsLLMBinding):
     def generate_text(self, 
                     prompt: str,
                     images: Optional[List[str]] = None,
+                    system_prompt: str = "",
                     n_predict: Optional[int] = None,
                     stream: bool = False,
                     temperature: float = 0.1,
@@ -98,6 +99,11 @@ class OpenAIBinding(LollmsLLMBinding):
         if images:
             messages = [
                 {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+
+                {                    
                     "role": "user", 
                     "content": [
                         {

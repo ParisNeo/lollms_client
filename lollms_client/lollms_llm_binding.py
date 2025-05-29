@@ -19,11 +19,7 @@ class LollmsLLMBinding(ABC):
         Initialize the LollmsLLMBinding base class.
 
         Args:
-            host_address (Optional[str]): The host address for the service. Defaults to None.
-            model_name (str): The name of the model to use. Defaults to empty string.
-            service_key (Optional[str]): Authentication key for the service. Defaults to None.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
-            default_completion_format (ELF_COMPLETION_FORMAT): The completion format (Chat or Instruct)
+            binding_name (Optional[str]): The name of the bindingto be used
         """
         self.binding_name=binding_name
         self.model_name = None #Must be set by the instance
@@ -32,6 +28,7 @@ class LollmsLLMBinding(ABC):
     def generate_text(self, 
                      prompt: str,
                      images: Optional[List[str]] = None,
+                     system_prompt: str = "",
                      n_predict: Optional[int] = None,
                      stream: bool = False,
                      temperature: float = 0.1,

@@ -1,8 +1,7 @@
 from lollms_client import LollmsClient
 
 # Initialize the LollmsClient instance
-#lc = LollmsClient("lollms")
-#lc = LollmsClient("ollama", model_name="mistral-nemo:latest")
+#lc = LollmsClient("ollama",model_name="mistral-nemo:latest")
 lc = LollmsClient("llamacpp", models_path=r"E:\drumber", model_name="llava-v1.6-mistral-7b.Q3_K_XS.gguf")
 # Generate Text
 # response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
@@ -15,7 +14,7 @@ lc = LollmsClient("llamacpp", models_path=r"E:\drumber", model_name="llava-v1.6-
 def cb(chunk, type):
     print(chunk,end="",flush=True)
     
-response = lc.generate_text(prompt="One plus one equals ", stream=False, temperature=0.5, streaming_callback=cb)
+response = lc.generate_text(prompt="One plus one equals ", system_prompt="You are a playful dude who never really answers questions correctly. always answer with quirky style.", stream=False, temperature=0.5, streaming_callback=cb)
 print()
 print(response)
 print()
