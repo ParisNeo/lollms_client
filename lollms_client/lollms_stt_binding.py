@@ -9,26 +9,14 @@ class LollmsSTTBinding(ABC):
     """Abstract base class for all LOLLMS Speech-to-Text bindings."""
 
     def __init__(self,
-                 host_address: Optional[str] = None,
-                 model_name: Optional[str] = None, # Can represent a default model
-                 service_key: Optional[str] = None,
-                 verify_ssl_certificate: bool = True):
+                 binding_name:str="unknown"):
         """
         Initialize the LollmsSTTBinding base class.
 
         Args:
-            host_address (Optional[str]): The host address for the STT service.
-            model_name (Optional[str]): A default identifier for the STT model.
-            service_key (Optional[str]): Authentication key for the service.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates.
+            binding_name (Optional[str]): The binding name
         """
-        if host_address is not None:
-            self.host_address = host_address.rstrip('/')
-        else:
-            self.host_address = None
-        self.model_name = model_name
-        self.service_key = service_key
-        self.verify_ssl_certificate = verify_ssl_certificate
+        self.binding_name = binding_name
 
     @abstractmethod
     def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:

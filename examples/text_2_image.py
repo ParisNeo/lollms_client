@@ -15,7 +15,6 @@ LOLLMS_CLIENT_ID = "my_lollms_client_id" # Replace with your actual client ID or
 # Initialize LollmsClient, enabling the TTI 'lollms' binding
 # The service_key here is used as client_id by the TTI binding for lollms
 lc = LollmsClient(
-    host_address="http://localhost:9600",
     tti_binding_name="lollms"
 )
 

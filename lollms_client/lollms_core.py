@@ -48,6 +48,13 @@ class LollmsClient():
                  ttv_bindings_dir: Path = Path(__file__).parent / "ttv_bindings",
                  ttm_bindings_dir: Path = Path(__file__).parent / "ttm_bindings",
 
+                 # Configurations
+                 tts_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
+                 tti_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
+                 stt_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
+                 ttv_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
+                 ttm_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
+
                  # General Parameters (mostly defaults for LLM generation)
                  service_key: Optional[str] = None, # Shared service key/client_id
                  verify_ssl_certificate: bool = True,
@@ -84,6 +91,11 @@ class LollmsClient():
             stt_bindings_dir (Path): Directory for STT bindings.
             ttv_bindings_dir (Path): Directory for TTV bindings.
             ttm_bindings_dir (Path): Directory for TTM bindings.
+            tts_binding_config (Optional[Dict]): Additional config for the TTS binding.
+            tti_binding_config (Optional[Dict]): Additional config for the TTI binding.
+            stt_binding_config (Optional[Dict]): Additional config for the STT binding.
+            ttv_binding_config (Optional[Dict]): Additional config for the TTV binding.
+            ttm_binding_config (Optional[Dict]): Additional config for the TTM binding.
             service_key (Optional[str]): Shared authentication key or client_id.
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
             ctx_size (Optional[int]): Default context size for LLM.
@@ -144,53 +156,61 @@ class LollmsClient():
         if tts_binding_name:
             self.tts = self.tts_binding_manager.create_binding(
                 binding_name=tts_binding_name,
-                host_address=effective_host_address,
-                service_key=self.service_key,
-                verify_ssl_certificate=self.verify_ssl_certificate
+                **tts_binding_config
             )
             if self.tts is None:
                 ASCIIColors.warning(f"Failed to create TTS binding: {tts_binding_name}. Available: {self.tts_binding_manager.get_available_bindings()}")
 
         if tti_binding_name:
-            self.tti = self.tti_binding_manager.create_binding(
-                binding_name=tti_binding_name,
-                host_address=effective_host_address,
-                service_key=self.service_key, # Passed as service_key, used as client_id by lollms TTI binding
-                verify_ssl_certificate=self.verify_ssl_certificate
-            )
+            if tti_binding_config:
+                self.tti = self.tti_binding_manager.create_binding(
+                    binding_name=tti_binding_name,
+                    **tti_binding_config
+                )
+            else:
+                self.tti = self.tti_binding_manager.create_binding(
+                    binding_name=tti_binding_name
+                )
             if self.tti is None:
                 ASCIIColors.warning(f"Failed to create TTI binding: {tti_binding_name}. Available: {self.tti_binding_manager.get_available_bindings()}")
 
         if stt_binding_name:
-            self.stt = self.stt_binding_manager.create_binding(
-                binding_name=stt_binding_name,
-                host_address=effective_host_address,
-                service_key=self.service_key,
-                verify_ssl_certificate=self.verify_ssl_certificate
-            )
+            if stt_binding_config:
+                self.stt = self.stt_binding_manager.create_binding(
+                    binding_name=stt_binding_name,
+                    **stt_binding_config
+                )
+            else:
+                self.stt = self.stt_binding_manager.create_binding(
+                    binding_name=stt_binding_name,
+                )
             if self.stt is None:
                 ASCIIColors.warning(f"Failed to create STT binding: {stt_binding_name}. Available: {self.stt_binding_manager.get_available_bindings()}")
-
         if ttv_binding_name:
-            self.ttv = self.ttv_binding_manager.create_binding(
-                binding_name=ttv_binding_name,
-                host_address=effective_host_address,
-                service_key=self.service_key,
-                verify_ssl_certificate=self.verify_ssl_certificate
-            )
+            if ttv_binding_config:
+                self.ttv = self.ttv_binding_manager.create_binding(
+                    binding_name=ttv_binding_name,
+                    **ttv_binding_config
+                )
+            else:
+                self.ttv = self.ttv_binding_manager.create_binding(
+                    binding_name=ttv_binding_name
+                )
             if self.ttv is None:
                 ASCIIColors.warning(f"Failed to create TTV binding: {ttv_binding_name}. Available: {self.ttv_binding_manager.get_available_bindings()}")
 
         if ttm_binding_name:
-            self.ttm = self.ttm_binding_manager.create_binding(
-                binding_name=ttm_binding_name,
-                host_address=effective_host_address,
-                service_key=self.service_key,
-                verify_ssl_certificate=self.verify_ssl_certificate
-            )
+            if ttm_binding_config:
+                self.ttm = self.ttm_binding_manager.create_binding(
+                    binding_name=ttm_binding_name,
+                    **ttm_binding_config
+                )
+            else:
+                self.ttm = self.ttm_binding_manager.create_binding(
+                    binding_name=ttm_binding_name
+                )
             if self.ttm is None:
                 ASCIIColors.warning(f"Failed to create TTM binding: {ttm_binding_name}. Available: {self.ttm_binding_manager.get_available_bindings()}")
-
 
         # --- Store Default Generation Parameters ---
         self.default_ctx_size = ctx_size

@@ -16,7 +16,6 @@ class LollmsTTIBinding_Impl(LollmsTTIBinding):
 
     def __init__(self,
                  host_address: Optional[str] = "http://localhost:9600", # Default LOLLMS host
-                 model_name: Optional[str] = None, # Default service name (server decides if None)
                  service_key: Optional[str] = None,
                  verify_ssl_certificate: bool = True):
         """
@@ -24,14 +23,13 @@ class LollmsTTIBinding_Impl(LollmsTTIBinding):
 
         Args:
             host_address (Optional[str]): Host address for the LOLLMS service.
-            model_name (Optional[str]): Default service/model identifier (currently unused by LOLLMS TTI endpoints).
             service_key (Optional[str]): Authentication key (used for client_id verification).
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
         """
-        super().__init__(host_address=host_address,
-                         model_name=model_name, # model_name is not directly used by LOLLMS TTI API yet
-                         service_key=service_key,
-                         verify_ssl_certificate=verify_ssl_certificate)
+        super().__init__(binding_name="lollms")
+        self.host_address=host_address
+        self.verify_ssl_certificate = verify_ssl_certificate
+
         # The 'service_key' here will act as the 'client_id' for TTI requests if provided.
         # This assumes the client library user provides their LOLLMS client_id here.
         self.client_id = service_key

@@ -27,10 +27,11 @@ class LollmsSTTBinding_Impl(LollmsSTTBinding):
             service_key (Optional[str]): Authentication key (currently unused by default LOLLMS STT).
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
         """
-        super().__init__(host_address=host_address,
-                         model_name=model_name,
-                         service_key=service_key,
-                         verify_ssl_certificate=verify_ssl_certificate)
+        super().__init__("lollms")
+        self.host_address=host_address
+        self.model_name=model_name
+        self.service_key=service_key
+        self.verify_ssl_certificate=verify_ssl_certificate
 
     def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:
         """

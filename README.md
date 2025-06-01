@@ -1,162 +1,153 @@
-# lollms_client
+# LoLLMs Client Library
 
-[![Python Version](https://img.shields.io/pypi/pyversions/lollms-client)](https://pypi.org/project/lollms-client/) [![PyPI Downloads](https://img.shields.io/pypi/dw/lollms-client)](https://pypi.org/project/lollms-client/) [![Apache License](https://img.shields.io/apache/2.0)](https://www.apache.org/licenses/LICENSE-2.0)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![PyPI version](https://badge.fury.io/py/lollms_client.svg)](https://badge.fury.io/py/lollms_client)
+[![Python Versions](https://img.shields.io/pypi/pyversions/lollms_client.svg)](https://pypi.org/project/lollms_client/)
+[![Downloads](https://static.pepy.tech/personalized-badge/lollms-client?period=total&units=international_system&left_color=grey&right_color=green&left_text=Downloads)](https://pepy.tech/project/lollms-client)
+[![Documentation - Usage](https://img.shields.io/badge/docs-Usage%20Guide-brightgreen)](DOC_USE.md)
+[![Documentation - Developer](https://img.shields.io/badge/docs-Developer%20Guide-blue)](DOC_DEV.md)
+[![GitHub stars](https://img.shields.io/github/stars/ParisNeo/lollms_client.svg?style=social&label=Star&maxAge=2592000)](https://github.com/ParisNeo/lollms_client/stargazers/)
+[![GitHub issues](https://img.shields.io/github/issues/ParisNeo/lollms_client.svg)](https://github.com/ParisNeo/lollms_client/issues)
 
-Welcome to the lollms_client repository! This library is built by [ParisNeo](https://github.com/ParisNeo) and provides a convenient way to interact with the lollms (Lord Of Large Language Models) API. It is available on [PyPI](https://pypi.org/project/lollms-client/) and distributed under the Apache 2.0 License.
+**`lollms_client`** is a powerful and flexible Python library designed to simplify interactions with the **LoLLMs (Lord of Large Language Models)** ecosystem and various other Large Language Model (LLM) backends. It provides a unified API for text generation, multimodal operations (text-to-image, text-to-speech, etc.), function calling, and advanced AI-driven tasks.
+
+Whether you're connecting to a remote LoLLMs server, an Ollama instance, the OpenAI API, or running models locally using GGUF (via `llama-cpp-python` or a managed `llama.cpp` server), Hugging Face Transformers, or vLLM, `lollms-client` offers a consistent and developer-friendly experience.
+
+## Key Features
+
+*   🔌 **Versatile Binding System:** Seamlessly switch between different LLM backends (LoLLMs, Ollama, OpenAI, Llama.cpp, Transformers, vLLM, OpenLLM) without major code changes.
+*   🗣️ **Multimodal Support:** Interact with models capable of processing images and generate various outputs like speech (TTS) and images (TTI).
+*   🚀 **Streaming & Callbacks:** Efficiently handle real-time text generation with customizable callback functions.
+*   🛠️ **Task-Oriented Library:** High-level `TasksLibrary` for common operations like summarization, Q&A, code generation, and structured data extraction.
+*   📞 **Function Calling:** Enable LLMs to invoke your custom Python functions, bridging the gap between language models and external tools or data sources.
+*   💬 **Discussion Management:** Utilities to easily manage and format conversation histories for chat applications.
+*   ⚙️ **Configuration Management:** Flexible ways to configure bindings and generation parameters.
+*   🧩 **Extensible:** Designed to easily incorporate new LLM backends and modality services.
 
 ## Installation
 
-To install the library from PyPI using `pip`, run:
+You can install `lollms_client` directly from PyPI:
 
-```
+```bash
 pip install lollms-client
-``` 
-
-## Getting Started
-
-The LollmsClient class is the gateway to interacting with the lollms API. Here's how you can instantiate it in various ways to suit your needs:
-
-```python
-from lollms_client import LollmsClient
-
-# Default instantiation using the local lollms service - hosted at http://localhost:9600
-lc = LollmsClient()
-
-# Specify a custom host and port
-lc = LollmsClient(host_address="http://some.lollms.server:9600")
-
-# Use a specific model with a local ollama server
-lc = LollmsClient("ollama", model_name="phi4:latest")
-# Use a specific model with an Ollama binding on the server, with a context size of 32800
-lc = LollmsClient(
-    "ollama",
-    host_address="http://some.other.server:11434",
-    model_name="phi4:latest",
-    ctx_size=32800,
-)
-# Use a specific model with a local or remote OpenAI server (you can either set your key as an environment variable or pass it here)
-lc = LollmsClient("openai", model_name="gpt-3.5-turbo-0125", service_key="Key, or don't put anything if you have already an environment variable with these informations")
-
-# Use a specific model with a other OpenAI compatible server
-lc = LollmsClient("openai", host_address="http://some.other.server", model_name="gpt-3.5-turbo-0125")
 ```
 
-### Text Generation
+This will install the core library. Some bindings may require additional dependencies (e.g., `llama-cpp-python`, `torch`, `transformers`, `ollama`, `vllm`). The library attempts to manage these using `pipmaster`, but for complex dependencies (especially those requiring compilation like `llama-cpp-python` with GPU support), manual installation might be preferred.
 
-Use `generate_text()` for generating text from the lollms API.
+## Quick Start
 
-```python
-response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
-print(response)
-```
-```python
-response = lc.generate_text(prompt="Once upon a time", images= ["path to image1", "path to image 2"] stream=False, temperature=0.5)
-print(response)
-```
-
-### Code Generation
-
-The `generate_code()` function allows you to generate code snippets based on your input. Here's how you can use it:
+Here's a very basic example of how to use `LollmsClient` to generate text with a LoLLMs server (ensure one is running at `http://localhost:9600`):
 
 ```python
-# A generic case to generate a snippet in python
-response = lc.generate_code(prompt="Create a function to add all numbers of a list", language='python')
-print(response)
+from lollms_client import LollmsClient, MSG_TYPE
+from ascii_colors import ASCIIColors
 
-# generate_code can also be used to generate responses ready to be parsed - with json or yaml for instance
-response = lc.generate_code(prompt="Mr Alex Brown presents himself to the pharmacist. He is 20 years old and seeks an appointment for the 12th of October. Fill out his application.", language='json', template="""
-{
- "name":"the first name of the person"
- "family_name":"the family name of the person"
- "age":"the age of the person"
- "appointment_date":"the date of the appointment"
- "reason":"the reason for the appointment. if not specified fill out with 'N/A'"
-}
-""")
-data = json.loads(response)
-print(data['name'], data['family_name'], "- Reason:", data['reason'])
+# Callback for streaming output
+def simple_streaming_callback(chunk: str, msg_type: MSG_TYPE, params=None, metadata=None) -> bool:
+    if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(chunk, end="", flush=True)
+    elif msg_type == MSG_TYPE.MSG_TYPE_EXCEPTION:
+        ASCIIColors.error(f"\nStreaming Error: {chunk}")
+    return True # True to continue streaming
+
+try:
+    # Initialize client to connect to a LoLLMs server
+    # For other backends, change 'binding_name' and provide necessary parameters.
+    # See DOC_USE.md for detailed initialization examples.
+    lc = LollmsClient(
+        binding_name="lollms",
+        host_address="http://localhost:9600"
+    )
+
+    prompt = "Tell me a fun fact about space."
+    ASCIIColors.yellow(f"Prompt: {prompt}")
+
+    # Generate text with streaming
+    ASCIIColors.green("Streaming Response:")
+    response_text = lc.generate_text(
+        prompt,
+        n_predict=100,
+        stream=True,
+        streaming_callback=simple_streaming_callback
+    )
+    print("\n--- End of Stream ---")
+
+    # The 'response_text' variable will contain the full concatenated text
+    # if streaming_callback returns True throughout.
+    if isinstance(response_text, str):
+        ASCIIColors.cyan(f"\nFull streamed text collected: {response_text[:100]}...")
+    elif isinstance(response_text, dict) and "error" in response_text:
+        ASCIIColors.error(f"Error during generation: {response_text['error']}")
+
+except ValueError as ve:
+    ASCIIColors.error(f"Initialization Error: {ve}")
+    ASCIIColors.info("Ensure a LoLLMs server is running or configure another binding.")
+except ConnectionRefusedError:
+    ASCIIColors.error("Connection refused. Is the LoLLMs server running at http://localhost:9600?")
+except Exception as e:
+    ASCIIColors.error(f"An unexpected error occurred: {e}")
+
 ```
 
+## Documentation
 
-### List Mounted Personalities (only on lollms)
+For more in-depth information, please refer to:
 
-List mounted personalities of the lollms API with the `listMountedPersonalities()` method.
+*   **[Usage Guide (DOC_USE.md)](DOC_USE.md):** Learn how to use `LollmsClient`, different bindings, modality features, `TasksLibrary`, and `FunctionCalling_Library` with comprehensive examples.
+*   **[Developer Guide (DOC_DEV.md)](DOC_DEV.md):** Understand the architecture, how to create new bindings, and contribute to the library.
 
-```python
-response = lc.listMountedPersonalities()
-print(response)
+## Core Concepts
+
+```mermaid
+graph LR
+    A[Your Application] --> LC[LollmsClient];
+
+    subgraph LollmsClient_Core
+        LC -- Manages --> LLB[LLM Binding];
+        LC -- Provides Access To --> TL[TasksLibrary];
+        LC -- Provides Access To --> FCL[FunctionCalling_Library];
+        LC -- Provides Access To --> DM[DiscussionManager];
+        LC -- Provides Access To --> ModalityBindings[TTS, TTI, STT etc.];
+    end
+
+    subgraph LLM_Backends
+        LLB --> LollmsServer[LoLLMs Server];
+        LLB --> OllamaServer[Ollama];
+        LLB --> OpenAPIServer[OpenAI API];
+        LLB --> LocalGGUF[Local GGUF<br>(pythonllamacpp / llamacpp server)];
+        LLB --> LocalHF[Local HuggingFace<br>(transformers / vLLM)];
+    end
+
+    ModalityBindings --> ModalityServices[Modality Services<br>(e.g., LoLLMs Server TTS/TTI)];
 ```
 
-### List Models
+*   **`LollmsClient`**: The central class for all interactions. It holds the currently active LLM binding and provides access to modality bindings and helper libraries.
+*   **LLM Bindings**: These are plugins that allow `LollmsClient` to communicate with different LLM backends. You choose a binding (e.g., `"ollama"`, `"lollms"`, `"pythonllamacpp"`) when you initialize `LollmsClient`.
+*   **Modality Bindings**: Similar to LLM bindings, but for services like Text-to-Speech (`tts`), Text-to-Image (`tti`), etc.
+*   **`TasksLibrary`**: Offers high-level functions for common AI tasks (summarization, Q&A) built on top of `LollmsClient`.
+*   **`FunctionCalling_Library`**: Enables you to define Python functions that the LLM can request to execute, allowing for tool usage.
+*   **`LollmsDiscussion`**: Helps manage and format conversation histories for chat applications.
 
-List available models of the lollms API with the `listModels()` method.
+## Examples
 
-```python
-response = lc.listModels()
-print(response)
-```
+The `examples/` directory in this repository contains a rich set of scripts demonstrating various features:
+*   Basic text generation with different bindings.
+*   Streaming and non-streaming examples.
+*   Multimodal generation (text with images).
+*   Using `TasksLibrary` for summarization and Q&A.
+*   Implementing and using function calls.
+*   Text-to-Speech and Text-to-Image generation.
 
-## Complete Example
+Explore these examples to see `lollms-client` in action!
 
-```python
-import json
-from datetime import datetime
+## Contributing
 
-# Assuming LollmsClient is already imported and instantiated as lc
-lc = LollmsClient()
+Contributions are welcome! Whether it's bug reports, feature suggestions, documentation improvements, or new bindings, please feel free to open an issue or submit a pull request on our [GitHub repository](https://github.com/ParisNeo/lollms_client).
 
-# Generate code using the LollmsClient
-response = lc.generate_code(
-    prompt="Mr Alex Brown presents himself to the pharmacist. He is 20 years old and seeks an appointment for the 12th of October. Fill out his application.",
-    language='json',
-    template="""
-    {
-        "name": "the first name of the person",
-        "family_name": "the family name of the person",
-        "age": "the age of the person",
-        "appointment_date": "the date of the appointment in the format DD/MM/YYYY",
-        "reason": "the reason for the appointment. if not specified fill out with 'N/A'"
-    }
-    """
-)
+## License
 
-# Parse the JSON response
-data = json.loads(response)
+This project is licensed under the **Apache 2.0 License**. See the [LICENSE](LICENSE) file for details (assuming you have a LICENSE file, if not, state "Apache 2.0 License").
 
-# Function to validate the data
-def validate_data(data):
-    try:
-        # Validate age
-        if not (0 < int(data['age']) < 120):
-            raise ValueError("Invalid age provided.")
-        
-        # Validate appointment date
-        appointment_date = datetime.strptime(data['appointment_date'], '%d/%m/%Y')
-        if appointment_date < datetime.now():
-            raise ValueError("Appointment date cannot be in the past.")
-        
-        # Validate name fields
-        if not data['name'] or not data['family_name']:
-            raise ValueError("Name fields cannot be empty.")
-        
-        return True
-    except Exception as e:
-        print(f"Validation Error: {e}")
-        return False
+## Changelog
 
-# Function to simulate a response to the user
-def simulate_response(data):
-    if validate_data(data):
-        print(f"Appointment confirmed for {data['name']} {data['family_name']}.")
-        print(f"Date: {data['appointment_date']}")
-        print(f"Reason: {data['reason']}")
-    else:
-        print("Failed to confirm appointment due to invalid data.")
-
-# Execute the simulation
-simulate_response(data)
-```
-
-Feel free to contribute to the project by submitting issues or pull requests. Follow [ParisNeo](https://github.com/ParisNeo) on [GitHub](https://github.com/ParisNeo), [Twitter](https://twitter.com/ParisNeo_AI), [Discord](https://discord.gg/BDxacQmv), [Sub-Reddit](r/lollms), and [Instagram](https://www.instagram.com/spacenerduino/) for updates and news.
-
-Happy coding!
+For a list of changes and updates, please refer to the [CHANGELOG.md](CHANGELOG.md) file.

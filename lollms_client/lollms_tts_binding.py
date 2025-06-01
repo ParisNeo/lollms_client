@@ -9,26 +9,14 @@ class LollmsTTSBinding(ABC):
     """Abstract base class for all LOLLMS Text-to-Speech bindings."""
 
     def __init__(self,
-                 host_address: Optional[str] = None,
-                 model_name: Optional[str] = None, # Can represent a default voice or model
-                 service_key: Optional[str] = None,
-                 verify_ssl_certificate: bool = True):
+                 binding_name:str="unknown"):
         """
         Initialize the LollmsTTSBinding base class.
 
         Args:
-            host_address (Optional[str]): The host address for the TTS service.
-            model_name (Optional[str]): A default identifier (e.g., voice or model name).
-            service_key (Optional[str]): Authentication key for the service.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates.
+            binding_name (Optional[str]): The binding name
         """
-        if host_address is not None:
-            self.host_address = host_address.rstrip('/')
-        else:
-            self.host_address = None
-        self.model_name = model_name
-        self.service_key = service_key
-        self.verify_ssl_certificate = verify_ssl_certificate
+        self.binding_name = binding_name
 
     @abstractmethod
     def generate_audio(self, text: str, voice: Optional[str] = None, **kwargs) -> bytes:
@@ -91,20 +79,12 @@ class LollmsTTSBindingManager:
 
     def create_binding(self,
                       binding_name: str,
-                      host_address: Optional[str] = None,
-                      model_name: Optional[str] = None,
-                      service_key: Optional[str] = None,
-                      verify_ssl_certificate: bool = True,
                       **kwargs) -> Optional[LollmsTTSBinding]:
         """
         Create an instance of a specific TTS binding.
 
         Args:
             binding_name (str): Name of the TTS binding to create.
-            host_address (Optional[str]): Host address for the service.
-            model_name (Optional[str]): Default model/voice identifier.
-            service_key (Optional[str]): Authentication key for the service.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates.
             **kwargs: Additional parameters specific to the binding's __init__.
 
         Returns:
@@ -116,11 +96,7 @@ class LollmsTTSBindingManager:
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
             try:
-                return binding_class(host_address=host_address,
-                                     model_name=model_name,
-                                     service_key=service_key,
-                                     verify_ssl_certificate=verify_ssl_certificate,
-                                     **kwargs)
+                return binding_class(**kwargs)
             except Exception as e:
                 trace_exception(e)
                 print(f"Failed to instantiate TTS binding {binding_name}: {str(e)}")
