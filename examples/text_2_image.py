@@ -14,8 +14,13 @@ LOLLMS_CLIENT_ID = "my_lollms_client_id" # Replace with your actual client ID or
 
 # Initialize LollmsClient, enabling the TTI 'lollms' binding
 # The service_key here is used as client_id by the TTI binding for lollms
+# lc = LollmsClient(
+#     tti_binding_name="lollms"
+# )
+
+# make sure you have a OPENAI_API_KEY environment variable
 lc = LollmsClient(
-    tti_binding_name="lollms"
+    tti_binding_name="dalle"
 )
 
 if not lc.tti:
@@ -79,8 +84,8 @@ def test_generate_image():
     ASCIIColors.cyan("\n--- Testing Generate Image ---")
     prompt = "A futuristic cityscape at sunset, neon lights, flying vehicles"
     negative_prompt = "blurry, low quality, ugly, text, watermark"
-    width = 512
-    height = 512
+    width = 1024
+    height = 1024
     home_dir = Path.home()
     documents_dir = home_dir / "Documents"
     output_filename = documents_dir/"generated_lollms_image.jpg"
