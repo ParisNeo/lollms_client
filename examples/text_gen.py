@@ -15,7 +15,7 @@ lc = LollmsClient("llamacpp", models_path=r"E:\drumber", model_name="llava-v1.6-
 def cb(chunk, type):
     print(chunk,end="",flush=True)
     
-response = lc.generate_text(prompt="One plus one equals ", stream=False, temperature=0.5, streaming_callback=cb)
+response = lc.generate_text(prompt="!@>user: Hi there\n!@>assistant: Hi there, how can I help you?!@>user: what is 1+1?\n!@>assistant: ", stream=False, temperature=0.5, streaming_callback=cb, split=True)
 print()
 print(response)
 print()

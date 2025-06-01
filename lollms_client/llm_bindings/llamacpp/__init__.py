@@ -475,7 +475,12 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                                    temperature: float = 0.7, top_k: int = 40, top_p: float = 0.9,
                                    repeat_penalty: float = 1.1, repeat_last_n: Optional[int] = 64,
                                    seed: Optional[int] = None, stream: bool = False, use_chat_format: bool = True,
-                                   images: Optional[List[str]] = None, **extra_params) -> Dict:
+                                   images: Optional[List[str]] = None,
+                                    split:Optional[bool]=False, # put to true if the prompt is a discussion
+                                    user_keyword:Optional[str]="!@>user:",
+                                    ai_keyword:Optional[str]="!@>assistant:", 
+                                   
+                                   **extra_params) -> Dict:
         payload_params = {
             "temperature": self.server_args.get("temperature", 0.7), "top_k": self.server_args.get("top_k", 40),
             "top_p": self.server_args.get("top_p", 0.9), "repeat_penalty": self.server_args.get("repeat_penalty", 1.1),
@@ -495,6 +500,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             messages = []
             if system_prompt and system_prompt.strip(): messages.append({"role": "system", "content": system_prompt})
             user_content: Union[str, List[Dict[str, Any]]] = prompt
+            if split:
+                messages += self.split_discussion(user_content,user_keyword=user_keyword, ai_keyword=ai_keyword)
+            else:
+                messages.append({"role": "user", "content": user_content})
             if images and self.clip_model_path: # Use the binding's current clip_model_path
                 image_parts = []
                 for img_path in images:
@@ -503,8 +512,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                         image_type = Path(img_path).suffix[1:].lower() or "png"; image_type = "jpeg" if image_type == "jpg" else image_type
                         image_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{image_type};base64,{encoded_string}"}})
                     except Exception as ex: trace_exception(ex)
-                user_content = [{"type": "text", "text": prompt}] + image_parts # type: ignore
-            messages.append({"role": "user", "content": user_content})
+                messages[-1]["content"] =[{"type": "text", "text": messages[-1]["content"]}] +  image_parts # type: ignore
             final_payload = {"messages": messages, "stream": stream, **payload_params}
             if 'n_predict' in final_payload: final_payload['max_tokens'] = final_payload.pop('n_predict')
             return final_payload
@@ -521,16 +529,57 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 if image_data_list: final_payload["image_data"] = image_data_list
             return final_payload
 
-    def generate_text(self, prompt: str, images: Optional[List[str]] = None, system_prompt: str = "",
-                     n_predict: Optional[int] = None, stream: bool = False, temperature: float = None,
-                     top_k: int = None, top_p: float = None, repeat_penalty: float = None,
-                     repeat_last_n: Optional[int] = None, seed: Optional[int] = None,
-                     streaming_callback: Optional[Callable[[str, int], bool]] = None,
-                     use_chat_format_override: Optional[bool] = None, **generation_kwargs) -> Union[str, Dict[str, any]]:
+
+    def generate_text(self,
+                     prompt: str,
+                     images: Optional[List[str]] = None,
+                     system_prompt: str = "",
+                     n_predict: Optional[int] = None,
+                     stream: Optional[bool] = None,
+                     temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
+                     top_k: int = 40,          # Ollama default is 40
+                     top_p: float = 0.9,       # Ollama default is 0.9
+                     repeat_penalty: float = 1.1, # Ollama default is 1.1
+                     repeat_last_n: int = 64,  # Ollama default is 64
+                     seed: Optional[int] = None,
+                     n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:", 
+                     **generation_kwargs
+                     ) -> Union[str, dict]:
+        """
+        Generate text using the active LLM binding, using instance defaults if parameters are not provided.
+
+        Args:
+            prompt (str): The input prompt for text generation.
+            images (Optional[List[str]]): List of image file paths for multimodal generation.
+            n_predict (Optional[int]): Maximum number of tokens to generate. Uses instance default if None.
+            stream (Optional[bool]): Whether to stream the output. Uses instance default if None.
+            temperature (Optional[float]): Sampling temperature. Uses instance default if None.
+            top_k (Optional[int]): Top-k sampling parameter. Uses instance default if None.
+            top_p (Optional[float]): Top-p sampling parameter. Uses instance default if None.
+            repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
+            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
+            seed (Optional[int]): Random seed for generation. Uses instance default if None.
+            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
+            ctx_size (int | None): Context size override for this generation.
+            streaming_callback (Optional[Callable[[str, str], None]]): Callback function for streaming output.
+                - First parameter (str): The chunk of text received.
+                - Second parameter (str): The message type (e.g., MSG_TYPE.MSG_TYPE_CHUNK).
+            split:Optional[bool]: put to true if the prompt is a discussion
+            user_keyword:Optional[str]: when splitting we use this to extract user prompt 
+            ai_keyword:Optional[str]": when splitting we use this to extract ai prompt
+
+        Returns:
+            Union[str, dict]: Generated text or error dictionary if failed.
+        """
         if not self.server_process or not self.server_process.is_healthy:
              return {"status": False, "error": "Llama.cpp server is not running or not healthy."}
 
-        _use_chat_format = use_chat_format_override if use_chat_format_override is not None else (self.default_completion_format == ELF_COMPLETION_FORMAT.Chat)
+        _use_chat_format = True
         payload = self._prepare_generation_payload(
             prompt=prompt, system_prompt=system_prompt, n_predict=n_predict,
             temperature=temperature if temperature is not None else self.server_args.get("temperature",0.7),
@@ -539,7 +588,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             repeat_penalty=repeat_penalty if repeat_penalty is not None else self.server_args.get("repeat_penalty",1.1),
             repeat_last_n=repeat_last_n if repeat_last_n is not None else self.server_args.get("repeat_last_n",64),
             seed=seed if seed is not None else self.server_args.get("seed", -1), stream=stream,
-            use_chat_format=_use_chat_format, images=images, **generation_kwargs
+            use_chat_format=_use_chat_format, images=images,
+            split= split, user_keyword=user_keyword, ai_keyword=ai_keyword, **generation_kwargs
         )
         endpoint = "/v1/chat/completions" if _use_chat_format else "/completion"
         request_url = self._get_request_url(endpoint)

@@ -109,47 +109,53 @@ class OllamaBinding(LollmsLLMBinding):
             self.ollama_client = None # Ensure it's None if initialization fails
             # Optionally re-raise or handle so the binding is clearly unusable
             raise ConnectionError(f"Could not connect or initialize Ollama client at {self.host_address}: {e}") from e
-    
-    def generate_text(self, 
+
+    def generate_text(self,
                      prompt: str,
-                     images: Optional[List[str]] = None, # List of image file paths
+                     images: Optional[List[str]] = None,
                      system_prompt: str = "",
                      n_predict: Optional[int] = None,
-                     stream: bool = False,
+                     stream: Optional[bool] = None,
                      temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
                      top_k: int = 40,          # Ollama default is 40
                      top_p: float = 0.9,       # Ollama default is 0.9
                      repeat_penalty: float = 1.1, # Ollama default is 1.1
                      repeat_last_n: int = 64,  # Ollama default is 64
                      seed: Optional[int] = None,
-                     n_threads: Optional[int] = None, # Ollama calls this num_thread
-                     ctx_size: Optional[int] = None,  # Ollama calls this num_ctx
-                     streaming_callback: Optional[Callable[[str, int], bool]] = None
-                     ) -> Union[str, Dict[str, any]]:
+                     n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:",
+                     ) -> Union[str, dict]:
         """
-        Generate text using the Ollama service, with optional image support.
+        Generate text using the active LLM binding, using instance defaults if parameters are not provided.
 
         Args:
             prompt (str): The input prompt for text generation.
             images (Optional[List[str]]): List of image file paths for multimodal generation.
-            n_predict (Optional[int]): Maximum number of tokens to generate (num_predict).
-            stream (bool): Whether to stream the output. Defaults to False.
-            temperature (float): Sampling temperature.
-            top_k (int): Top-k sampling parameter.
-            top_p (float): Top-p sampling parameter.
-            repeat_penalty (float): Penalty for repeated tokens.
-            repeat_last_n (int): Number of previous tokens to consider for repeat penalty.
-            seed (Optional[int]): Random seed for generation.
-            n_threads (Optional[int]): Number of threads to use (num_thread).
-            ctx_size (Optional[int]): Context window size (num_ctx).
-            streaming_callback (Optional[Callable[[str, int], bool]]): Callback for streaming output.
-                - First parameter (str): The chunk of text received from the stream.
-                - Second parameter (int): The message type (typically MSG_TYPE.MSG_TYPE_CHUNK).
-                Return False to stop streaming.
+            n_predict (Optional[int]): Maximum number of tokens to generate. Uses instance default if None.
+            stream (Optional[bool]): Whether to stream the output. Uses instance default if None.
+            temperature (Optional[float]): Sampling temperature. Uses instance default if None.
+            top_k (Optional[int]): Top-k sampling parameter. Uses instance default if None.
+            top_p (Optional[float]): Top-p sampling parameter. Uses instance default if None.
+            repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
+            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
+            seed (Optional[int]): Random seed for generation. Uses instance default if None.
+            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
+            ctx_size (int | None): Context size override for this generation.
+            streaming_callback (Optional[Callable[[str, str], None]]): Callback function for streaming output.
+                - First parameter (str): The chunk of text received.
+                - Second parameter (str): The message type (e.g., MSG_TYPE.MSG_TYPE_CHUNK).
+            split:Optional[bool]: put to true if the prompt is a discussion
+            user_keyword:Optional[str]: when splitting we use this to extract user prompt 
+            ai_keyword:Optional[str]": when splitting we use this to extract ai prompt
 
         Returns:
-            Union[str, Dict[str, any]]: Generated text if successful, or a dictionary with status and error if failed.
+            Union[str, dict]: Generated text or error dictionary if failed.
         """
+
         if not self.ollama_client:
              return {"status": False, "error": "Ollama client not initialized."}
 
@@ -175,8 +181,15 @@ class OllamaBinding(LollmsLLMBinding):
                     # If images were base64 strings, they would need decoding to bytes first.
                     processed_images.append(img_path)
 
-                messages = [{'role': 'system', 'content':system_prompt},{'role': 'user', 'content': prompt, 'images': processed_images if processed_images else None}]
-                
+                messages = [
+                            {'role': 'system', 'content':system_prompt},
+                        ]
+                if split:
+                    messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
+                    if processed_images:
+                        messages[-1]["images"]=processed_images
+                else:
+                    messages.append({'role': 'user', 'content': prompt, 'images': processed_images if processed_images else None})
                 if stream:
                     response_stream = self.ollama_client.chat(
                         model=self.model_name,
@@ -201,7 +214,14 @@ class OllamaBinding(LollmsLLMBinding):
                     )
                     return response_dict.get('message', {}).get('content', '')
             else: # Text-only
-                messages = [{'role': 'system', 'content':system_prompt},{'role': 'user', 'content': prompt}]
+                messages = [
+                            {'role': 'system', 'content':system_prompt},
+                        ]
+                if split:
+                    messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
+                else:
+                    messages.append({'role': 'user', 'content': prompt})
+
                 if stream:
                     response_stream = self.ollama_client.chat(
                         model=self.model_name,

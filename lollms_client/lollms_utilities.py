@@ -1,10 +1,12 @@
 import urllib
 import numpy
 from pathlib import Path
-from pipmaster import PackageManager
+import pipmaster as pm
 from PIL import Image
 import io
 import base64
+import re
+import numpy as np
 class PromptReshaper:
     def __init__(self, template:str):
         self.template = template
@@ -122,8 +124,8 @@ def remove_text_from_string(string: str, text_to_find:str):
 
 
 def process_ai_output(output, images, output_folder):
-    if not PackageManager.is_installed("cv2"):
-        PackageManager.install("opencv-python")
+    if not pm.is_installed("opencv-python"):
+        pm.install("opencv-python")
     import cv2
     images = [cv2.imread(str(img)) for img in images]
     # Find all bounding box entries in the output

@@ -10,14 +10,14 @@ from ascii_colors import ASCIIColors, trace_exception
 # MODEL_NAME = None # Server will use its default or last loaded model
 
 # Option 2: Ollama binding
-# BINDING_NAME = "ollama"
-# HOST_ADDRESS = "http://localhost:11434" # Default Ollama host
-# MODEL_NAME = "llava:latest" # Or "llama3:latest", "phi3:latest", etc. - ensure it's pulled in Ollama
+BINDING_NAME = "ollama"
+HOST_ADDRESS = "http://localhost:11434" # Default Ollama host
+MODEL_NAME = "llava:latest" # Or "llama3:latest", "phi3:latest", etc. - ensure it's pulled in Ollama
 
-# Option 2: llamacpp binding
-BINDING_NAME = "llamacpp"
-MODELS_PATH = r"E:\drumber" # Change to your own models folder
-MODEL_NAME = "llava-v1.6-mistral-7b.Q3_K_XS.gguf" # Change to your vision capable model (make sure you have a mmprj file with the gguf model with the same name but without the quantization name and with mmproj- prefix (mmproj-llava-v1.6-mistral-7b.gguf))
+# Option 3: llamacpp binding
+# BINDING_NAME = "llamacpp"
+# MODELS_PATH = r"E:\drumber" # Change to your own models folder
+# MODEL_NAME = "llava-v1.6-mistral-7b.Q3_K_XS.gguf" # Change to your vision capable model (make sure you have a mmprj file with the gguf model with the same name but without the quantization name and with mmproj- prefix (mmproj-llava-v1.6-mistral-7b.gguf))
 # You can also add a clip_model_path parameter to your lc_params
 img = "E:\\drumber\\1711741182996.jpg"
 # Option 3: OpenAI binding (requires OPENAI_API_KEY environment variable or service_key)

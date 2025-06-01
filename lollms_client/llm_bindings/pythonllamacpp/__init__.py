@@ -216,6 +216,9 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
                      streaming_callback: Optional[Callable[[str, int], bool]] = None,
                      use_chat_format: bool = True, 
                      grammar: Optional[Union[str, LlamaGrammar]] = None,
+                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:",
                      **generation_kwargs 
                      ) -> Union[str, Dict[str, any]]:
         

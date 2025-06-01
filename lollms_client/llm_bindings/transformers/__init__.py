@@ -312,6 +312,9 @@ class HuggingFaceHubBinding(LollmsLLMBinding):
                      seed: Optional[int] = None,
                      stop_words: Optional[List[str]] = None, # Added custom stop_words
                      streaming_callback: Optional[Callable[[str, int], bool]] = None,
+                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:",
                      use_chat_format_override: Optional[bool] = None,
                      **generation_kwargs 
                      ) -> Union[str, Dict[str, Any]]:

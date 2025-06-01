@@ -21,7 +21,7 @@ class TasksLibrary:
     def step(self, step_text, callback: Callable[([str, MSG_TYPE, dict, list], bool)] = None) -> Any
     def sink(self, s = None, i = None, d = None) -> Any
     def build_prompt(self, prompt_parts: List[str], sacrifice_id: int = -1, context_size: int = None, minimum_spare_context_size: int = None) -> Any
-    def translate_text_chunk(self, text_chunk, output_language: str = 'french', host_address: str = None, model_name: str = None, temperature = 0.1, max_generation_size = 3000) -> Any
+    def translate_text_chunk(self, text_chunk, output_language: str = 'french', host_address: str = None, model_name: str = None, temperature = 0.7, max_generation_size = 3000) -> Any
     def extract_code_blocks(self, text: str) -> List[dict]
     def yes_no(self, question: str, context: str = '', max_answer_length: int = 50, conditionning = '') -> bool
     def multichoice_question(self, question: str, possible_answers: list, context: str = '', max_answer_length: int = 50, conditionning = '') -> int

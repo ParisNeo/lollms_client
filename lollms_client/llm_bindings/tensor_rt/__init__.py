@@ -341,7 +341,10 @@ class VLLMBinding(LollmsLLMBinding):
                      repeat_last_n: int = 64, # Note: vLLM applies penalty to full context
                      seed: Optional[int] = None,
                      n_threads: int = 8, # Note: vLLM manages its own threading/parallelism
-                     streaming_callback: Optional[Callable[[str, int], bool]] = None
+                     streaming_callback: Optional[Callable[[str, int], bool]] = None,
+                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:",
                      ) -> Union[str, Dict[str, any]]:
         if not self.llm_engine: return {"status": False, "error": "Engine not loaded."}
 

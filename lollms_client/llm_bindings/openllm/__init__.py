@@ -154,7 +154,10 @@ class OpenLLMBinding(LollmsLLMBinding):
                      seed: Optional[int] = None,
                      # n_threads: Optional[int] = None, # Server-side config for OpenLLM
                      # ctx_size: Optional[int] = None,  # Server-side config, though some models might allow via llm_config
-                     streaming_callback: Optional[Callable[[str, int], bool]] = None
+                     streaming_callback: Optional[Callable[[str, int], bool]] = None,
+                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:",                     
                      ) -> Union[str, Dict[str, any]]:
         
         if not self.openllm_client:

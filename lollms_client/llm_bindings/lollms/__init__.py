@@ -46,43 +46,50 @@ class LollmsLLMBinding(LollmsLLMBinding):
         self.personality = personality
         self.model = None
     
-    def generate_text(self, 
+    def generate_text(self,
                      prompt: str,
                      images: Optional[List[str]] = None,
                      system_prompt: str = "",
                      n_predict: Optional[int] = None,
-                     stream: bool = False,
-                     temperature: float = 0.1,
-                     top_k: int = 50,
-                     top_p: float = 0.95,
-                     repeat_penalty: float = 0.8,
-                     repeat_last_n: int = 40,
+                     stream: Optional[bool] = None,
+                     temperature: Optional[float] = None,
+                     top_k: Optional[int] = None,
+                     top_p: Optional[float] = None,
+                     repeat_penalty: Optional[float] = None,
+                     repeat_last_n: Optional[int] = None,
                      seed: Optional[int] = None,
-                     n_threads: int = 8,
+                     n_threads: Optional[int] = None,
                      ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, str], None]] = None) -> Union[str, dict]:
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:",
+                     ) -> Union[str, dict]:
         """
-        Generate text using the LOLLMS service, with optional image support.
+        Generate text using the active LLM binding, using instance defaults if parameters are not provided.
 
         Args:
             prompt (str): The input prompt for text generation.
             images (Optional[List[str]]): List of image file paths for multimodal generation.
-                If provided, uses the /lollms_generate_with_images endpoint.
-            n_predict (Optional[int]): Maximum number of tokens to generate.
-            stream (bool): Whether to stream the output. Defaults to False.
-            temperature (float): Sampling temperature. Defaults to 0.1.
-            top_k (int): Top-k sampling parameter. Defaults to 50.
-            top_p (float): Top-p sampling parameter. Defaults to 0.95.
-            repeat_penalty (float): Penalty for repeated tokens. Defaults to 0.8.
-            repeat_last_n (int): Number of previous tokens to consider for repeat penalty. Defaults to 40.
-            seed (Optional[int]): Random seed for generation.
-            n_threads (int): Number of threads to use. Defaults to 8.
-            streaming_callback (Optional[Callable[[str, str], None]]): Callback for streaming output.
-                - First parameter (str): The chunk of text received from the stream.
-                - Second parameter (str): The message type (typically MSG_TYPE.MSG_TYPE_CHUNK).
+            n_predict (Optional[int]): Maximum number of tokens to generate. Uses instance default if None.
+            stream (Optional[bool]): Whether to stream the output. Uses instance default if None.
+            temperature (Optional[float]): Sampling temperature. Uses instance default if None.
+            top_k (Optional[int]): Top-k sampling parameter. Uses instance default if None.
+            top_p (Optional[float]): Top-p sampling parameter. Uses instance default if None.
+            repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
+            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
+            seed (Optional[int]): Random seed for generation. Uses instance default if None.
+            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
+            ctx_size (int | None): Context size override for this generation.
+            streaming_callback (Optional[Callable[[str, str], None]]): Callback function for streaming output.
+                - First parameter (str): The chunk of text received.
+                - Second parameter (str): The message type (e.g., MSG_TYPE.MSG_TYPE_CHUNK).
+            split:Optional[bool]: put to true if the prompt is a discussion
+            user_keyword:Optional[str]: when splitting we use this to extract user prompt 
+            ai_keyword:Optional[str]": when splitting we use this to extract ai prompt
 
         Returns:
-            Union[str, dict]: Generated text if successful, or a dictionary with status and error if failed.
+            Union[str, dict]: Generated text or error dictionary if failed.
         """
         # Determine endpoint based on presence of images
         endpoint = "/lollms_generate_with_images" if images else "/lollms_generate"

@@ -11,7 +11,7 @@ from lollms_client.lollms_stt_binding import LollmsSTTBinding, LollmsSTTBindingM
 from lollms_client.lollms_ttv_binding import LollmsTTVBinding, LollmsTTVBindingManager
 from lollms_client.lollms_ttm_binding import LollmsTTMBinding, LollmsTTMBindingManager
 
-import json
+import re
 from enum import Enum
 import base64
 import requests
@@ -61,11 +61,12 @@ class LollmsClient():
                  ctx_size: Optional[int] = 8192,
                  n_predict: Optional[int] = 4096,
                  stream: bool = False,
-                 temperature: float = 0.1,
-                 top_k: int = 50,
-                 top_p: float = 0.95,
-                 repeat_penalty: float = 0.8,
-                 repeat_last_n: int = 40,
+                 temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
+                 top_k: int = 40,          # Ollama default is 40
+                 top_p: float = 0.9,       # Ollama default is 0.9
+                 repeat_penalty: float = 1.1, # Ollama default is 1.1
+                 repeat_last_n: int = 64,  # Ollama default is 64
+
                  seed: Optional[int] = None,
                  n_threads: int = 8,
                  streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
@@ -362,7 +363,11 @@ class LollmsClient():
                      seed: Optional[int] = None,
                      n_threads: Optional[int] = None,
                      ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None) -> Union[str, dict]:
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:",
+                     ) -> Union[str, dict]:
         """
         Generate text using the active LLM binding, using instance defaults if parameters are not provided.
 
@@ -380,6 +385,9 @@ class LollmsClient():
             n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
             ctx_size (int | None): Context size override for this generation.
             streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+            split:Optional[bool]: put to true if the prompt is a discussion
+            user_keyword:Optional[str]: when splitting we use this to extract user prompt 
+            ai_keyword:Optional[str]": when splitting we use this to extract ai prompt
 
         Returns:
             Union[str, dict]: Generated text or error dictionary if failed.
@@ -399,7 +407,10 @@ class LollmsClient():
                 seed=seed if seed is not None else self.default_seed,
                 n_threads=n_threads if n_threads is not None else self.default_n_threads,
                 ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size,
-                streaming_callback=streaming_callback if streaming_callback is not None else self.default_streaming_callback
+                streaming_callback=streaming_callback if streaming_callback is not None else self.default_streaming_callback,
+                split= split,
+                user_keyword=user_keyword,
+                ai_keyword=ai_keyword
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -981,7 +992,6 @@ Do not split the code in multiple tags.
         Ranks answers for a question from best to worst using LLM JSON generation.
         (Implementation requires self.generate_code which uses self.generate_text)
         """
-        # ... (Implementation as provided before, relies on self.generate_code) ...
         if not callback:
             callback = self.sink
 
@@ -1567,6 +1577,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         callback("Deep analysis complete.", MSG_TYPE.MSG_TYPE_STEP_END)
         return final_output
 
+
 def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators=True):
     """
     Chunks text based on token count.
@@ -1646,3 +1657,5 @@ def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators
                 break
 
     return chunks
+
+
