@@ -30,7 +30,7 @@ try:
     torch_index_url = None
     if preferred_torch_device_for_install == "cuda":
         # Specify a common CUDA version index. Pip should resolve the correct torch version.
-        # As of late 2023/early 2024, cu118 or cu121 are common. Let's use cu121.
+        # As of late 2023/early 2024, cu118 or cu121 are common. Let's use cu126.
         # Users with different CUDA setups might need to pre-install torch manually.
         torch_index_url = "https://download.pytorch.org/whl/cu126"
         ASCIIColors.info(f"Attempting to ensure PyTorch with CUDA support (target index: {torch_index_url})")
