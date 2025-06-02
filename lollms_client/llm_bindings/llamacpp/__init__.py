@@ -24,7 +24,7 @@ pm.ensure_packages(["requests", "pillow"]) # pillow for dummy image in test
 if not pm.is_installed("llama-cpp-binaries"):
     def install_llama_cpp():
         system = platform.system()
-        python_version_simple = f"py{sys.version_info.major}{sys.version_info.minor}" # e.g. py310 for 3.10
+        python_version_simple = f"py{sys.version_info.major}" # e.g. py310 for 3.10
 
         # Determine CUDA suffix based on common recent versions. Adjust if needed.
         # For simplicity, we'll target a common recent CUDA version.
@@ -35,13 +35,13 @@ if not pm.is_installed("llama-cpp-binaries"):
 
 
         if system == "Windows":
-            # llama_cpp_binaries-0.12.0+cu124-py3-none-win_amd64.whl
-            url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.12.0/llama_cpp_binaries-0.12.0{cuda_suffix}-{python_version_simple}-none-win_amd64.whl"
-            fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.12.0/llama_cpp_binaries-0.12.0+cu124-py3-none-win_amd64.whl" # Generic py3
+            # llama_cpp_binaries-0.14.0+cu124-py3-none-win_amd64.whl
+            url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.12.0/llama_cpp_binaries-0.14.0{cuda_suffix}-{python_version_simple}-none-win_amd64.whl"
+            fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.14.0/llama_cpp_binaries-0.14.0+cu124-py3-none-win_amd64.whl" # Generic py3
         elif system == "Linux":
-            # llama_cpp_binaries-0.12.0+cu124-py3-none-linux_x86_64.whl
+            # llama_cpp_binaries-0.14.0+cu124-py3-none-linux_x86_64.whl
             url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.14.0/llama_cpp_binaries-0.14.0{cuda_suffix}-{python_version_simple}-none-linux_x86_64.whl"
-            fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.12.0/llama_cpp_binaries-0.12.0+cu124-py3-none-linux_x86_64.whl" # Generic py3
+            fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.14.0/llama_cpp_binaries-0.14.0+cu124-py3-none-linux_x86_64.whl" # Generic py3
         else:
             ASCIIColors.warning(f"Unsupported OS for prebuilt llama-cpp-binaries: {system}. Please install manually.")
             return
