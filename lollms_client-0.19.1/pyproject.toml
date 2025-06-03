@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+# REMOVE THE LINE BELOW:
+# backend-path = ["."]
+
+[project]
+name = "lollms_client"
+dynamic = ["version"]
+authors = [
+    {name = "ParisNeo", email = "parisneoai@gmail.com"},
+]
+description = "A client library for LoLLMs generate endpoint"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "Apache Software License"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "requests",
+    "ascii-colors",
+    "pipmaster",
+    "pyyaml",
+    "tiktoken",
+    "pydantic",
+    "numpy",
+    "pillow",
+]
+
+[project.urls]
+Homepage = "https://github.com/ParisNeo/lollms_client"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.dynamic]
+version = {attr = "lollms_client.__version__"}

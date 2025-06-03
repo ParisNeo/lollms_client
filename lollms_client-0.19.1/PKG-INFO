@@ -1,3 +1,33 @@
+Metadata-Version: 2.4
+Name: lollms_client
+Version: 0.19.1
+Summary: A client library for LoLLMs generate endpoint
+Author-email: ParisNeo <parisneoai@gmail.com>
+License: Apache Software License
+Project-URL: Homepage, https://github.com/ParisNeo/lollms_client
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: requests
+Requires-Dist: ascii-colors
+Requires-Dist: pipmaster
+Requires-Dist: pyyaml
+Requires-Dist: tiktoken
+Requires-Dist: pydantic
+Requires-Dist: numpy
+Requires-Dist: pillow
+Dynamic: license-file
+
 # LoLLMs Client Library
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
