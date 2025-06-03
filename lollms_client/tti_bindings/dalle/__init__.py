@@ -152,7 +152,8 @@ class DalleTTIBinding_Impl(LollmsTTIBinding):
         # Format size string and validate against the active model for this generation
         size_str = f"{width}x{height}"
         if size_str not in model_props["sizes"]:
-            raise ValueError(f"Unsupported size '{size_str}' for model '{active_model_name}'. Supported sizes: {model_props['sizes']}. Adjust width/height for this model.")
+            ASCIIColors.warning(f"Unsupported size '{size_str}' for model '{active_model_name}'. Supported sizes: {model_props['sizes']}. Adjust width/height for this model.")
+            size_str = model_props["sizes"][0]
 
         # Handle prompt and negative prompt based on the active model
         final_prompt = prompt

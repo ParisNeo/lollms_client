@@ -10,12 +10,13 @@ from lollms_client.lollms_tti_binding import LollmsTTIBinding, LollmsTTIBindingM
 from lollms_client.lollms_stt_binding import LollmsSTTBinding, LollmsSTTBindingManager
 from lollms_client.lollms_ttv_binding import LollmsTTVBinding, LollmsTTVBindingManager
 from lollms_client.lollms_ttm_binding import LollmsTTMBinding, LollmsTTMBindingManager
+from lollms_client.lollms_mcp_binding import LollmsMCPBinding, LollmsMCPBindingManager
 
-import re
+import json
 from enum import Enum
 import base64
 import requests
-from typing import List, Optional, Callable, Union, Dict
+from typing import List, Optional, Callable, Union, Dict, Any
 import numpy as np
 from pathlib import Path
 import os
@@ -32,7 +33,7 @@ class LollmsClient():
                  models_path: Optional[str] = None, # Shared models folder path (for local file based bindings) default for all bindings if not specified
                  model_name: str = "",
                  llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
-                 llm_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
+                 llm_binding_config: Optional[Dict[str, any]] = None, 
 
                  # Optional Modality Binding Names
                  tts_binding_name: Optional[str] = None,
@@ -40,6 +41,7 @@ class LollmsClient():
                  stt_binding_name: Optional[str] = None,
                  ttv_binding_name: Optional[str] = None,
                  ttm_binding_name: Optional[str] = None,
+                 mcp_binding_name: Optional[str] = None,
 
                  # Modality Binding Directories
                  tts_bindings_dir: Path = Path(__file__).parent / "tts_bindings",
@@ -47,13 +49,15 @@ class LollmsClient():
                  stt_bindings_dir: Path = Path(__file__).parent / "stt_bindings",
                  ttv_bindings_dir: Path = Path(__file__).parent / "ttv_bindings",
                  ttm_bindings_dir: Path = Path(__file__).parent / "ttm_bindings",
+                 mcp_bindings_dir: Path = Path(__file__).parent / "mcp_bindings",
 
                  # Configurations
-                 tts_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
-                 tti_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
-                 stt_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
-                 ttv_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
-                 ttm_binding_config: Optional[Dict[str, any]] = None, # Renamed for clarity
+                 tts_binding_config: Optional[Dict[str, any]] = None, 
+                 tti_binding_config: Optional[Dict[str, any]] = None, 
+                 stt_binding_config: Optional[Dict[str, any]] = None, 
+                 ttv_binding_config: Optional[Dict[str, any]] = None, 
+                 ttm_binding_config: Optional[Dict[str, any]] = None, 
+                 mcp_binding_config: Optional[Dict[str, any]] = None,
 
                  # General Parameters (mostly defaults for LLM generation)
                  service_key: Optional[str] = None, # Shared service key/client_id
@@ -147,12 +151,14 @@ class LollmsClient():
         self.stt_binding_manager = LollmsSTTBindingManager(stt_bindings_dir)
         self.ttv_binding_manager = LollmsTTVBindingManager(ttv_bindings_dir)
         self.ttm_binding_manager = LollmsTTMBindingManager(ttm_bindings_dir)
+        self.mcp_binding_manager = LollmsMCPBindingManager(mcp_bindings_dir)
 
         self.tts: Optional[LollmsTTSBinding] = None
         self.tti: Optional[LollmsTTIBinding] = None
         self.stt: Optional[LollmsSTTBinding] = None
         self.ttv: Optional[LollmsTTVBinding] = None
         self.ttm: Optional[LollmsTTMBinding] = None
+        self.mcp: Optional[LollmsMCPBinding] = None
 
         if tts_binding_name:
             self.tts = self.tts_binding_manager.create_binding(
@@ -212,6 +218,19 @@ class LollmsClient():
                 )
             if self.ttm is None:
                 ASCIIColors.warning(f"Failed to create TTM binding: {ttm_binding_name}. Available: {self.ttm_binding_manager.get_available_bindings()}")
+
+        if mcp_binding_name:
+            if mcp_binding_config:
+                self.mcp = self.mcp_binding_manager.create_binding(
+                    mcp_binding_name,
+                    **mcp_binding_config
+                )
+            else:
+                self.mcp = self.mcp_binding_manager.create_binding(
+                    mcp_binding_name
+                )
+            if self.mcp is None:
+                ASCIIColors.warning(f"Failed to create MCP binding: {mcp_binding_name}. Available: {self.mcp_binding_manager.get_available_bindings()}")
 
         # --- Store Default Generation Parameters ---
         self.default_ctx_size = ctx_size
@@ -340,7 +359,7 @@ class LollmsClient():
             return self.binding.load_model(model_name)
         raise RuntimeError("LLM binding not initialized.")
 
-    def get_available_llm_bindings(self) -> List[str]: # Renamed for clarity
+    def get_available_llm_bindings(self) -> List[str]: 
         """
         Get list of available LLM binding names.
 
@@ -519,6 +538,322 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
         codes = self.extract_code_blocks(response, format=code_tag_format)
         return codes
 
+    # --- Function Calling with MCP ---
+    def generate_with_mcp(
+        self,
+        prompt: str,
+        discussion_history: Optional[List[Dict[str, str]]] = None, # e.g. [{"role":"user", "content":"..."}, {"role":"assistant", "content":"..."}]
+        images: Optional[List[str]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None, # List of MCP tool definitions
+        max_tool_calls: int = 5,
+        max_llm_iterations: int = 10, # Safety break for LLM deciding to call tools repeatedly
+        tool_call_decision_temperature: float = 0.1, # Lower temp for more deterministic decision making
+        final_answer_temperature: float = None, # Use instance default if None
+        streaming_callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict], Optional[List]], bool]] = None,
+        interactive_tool_execution: bool = False, # If true, prompts user before executing a tool
+        **llm_generation_kwargs
+    ) -> Dict[str, Any]:
+        """
+        Generates a response that may involve calling one or more tools via MCP.
+
+        Args:
+            prompt (str): The user's initial prompt.
+            discussion_history (Optional[List[Dict[str, str]]]): Previous turns of conversation.
+            images (Optional[List[str]]): Images provided with the current user prompt.
+            tools (Optional[List[Dict[str, Any]]]): A list of MCP tool definitions available for this call.
+                                                     If None, tools will be discovered from the MCP binding.
+            max_tool_calls (int): Maximum number of distinct tool calls allowed in one interaction turn.
+            max_llm_iterations (int): Maximum number of times the LLM can decide to call a tool
+                                      before being forced to generate a final answer.
+            tool_call_decision_temperature (float): Temperature for LLM when deciding on tool calls.
+            final_answer_temperature (float): Temperature for LLM when generating the final answer.
+            streaming_callback (Optional[Callable]): Callback for streaming LLM responses (tool decisions/final answer).
+                                                     Signature: (chunk_str, msg_type, metadata_dict, history_list_of_dicts_for_this_turn) -> bool
+            interactive_tool_execution (bool): If True, ask user for confirmation before executing each tool.
+
+        Returns:
+            Dict[str, Any]: A dictionary containing:
+                - "final_answer" (str): The LLM's final textual answer.
+                - "tool_calls" (List[Dict]): A list of tools called, their params, and results.
+                - "error" (Optional[str]): Error message if something went wrong.
+        """
+        if not self.binding:
+            return {"final_answer": "", "tool_calls": [], "error": "LLM binding not initialized."}
+        if not self.mcp:
+            return {"final_answer": "", "tool_calls": [], "error": "MCP binding not initialized."}
+
+        turn_history: List[Dict[str, Any]] = [] # Tracks this specific turn's interactions (LLM thoughts, tool calls, tool results)
+        
+        # 1. Discover tools if not provided
+        if tools is None:
+            try:
+                tools = self.mcp.discover_tools()
+                if not tools:
+                    ASCIIColors.warning("No MCP tools discovered by the binding.")
+            except Exception as e_disc:
+                return {"final_answer": "", "tool_calls": [], "error": f"Failed to discover MCP tools: {e_disc}"}
+        
+        if not tools: # If still no tools after discovery attempt
+            ASCIIColors.info("No tools available for function calling. Generating direct response.")
+            final_answer = self.remove_thinking_blocks(self.generate_text(
+                prompt=prompt,
+                system_prompt= (discussion_history[0]['content'] if discussion_history and discussion_history[0]['role'] == 'system' else "") + "\nYou are a helpful assistant.", # Basic system prompt
+                images=images,
+                stream=streaming_callback is not None, # stream if callback is provided
+                streaming_callback=lambda chunk, msg_type: streaming_callback(chunk, msg_type, None, turn_history) if streaming_callback else None, # Adapt callback
+                temperature=final_answer_temperature if final_answer_temperature is not None else self.default_temperature,
+                **(llm_generation_kwargs or {})
+            ))
+            if isinstance(final_answer, dict) and "error" in final_answer: # Handle generation error
+                return {"final_answer": "", "tool_calls": [], "error": final_answer["error"]}
+            return {"final_answer": final_answer, "tool_calls": [], "error": None}
+
+
+        formatted_tools_list = "\n".join([
+            f"- Name: {t.get('name')}\n  Description: {t.get('description')}\n  Input Schema: {json.dumps(t.get('input_schema'))}"
+            for t in tools
+        ])
+
+        current_conversation: List[Dict[str, str]] = []
+        if discussion_history:
+            current_conversation.extend(discussion_history)
+        current_conversation.append({"role": "user", "content": prompt})
+        if images: # Add image representations to the last user message if supported by LLM and chat format
+            # This part is highly dependent on how the specific LLM binding handles images in chat.
+            # For simplicity, we'll assume if images are passed, the underlying generate_text handles it.
+            # A more robust solution would modify current_conversation[-1]['content'] structure.
+            ASCIIColors.info("Images provided. Ensure LLM binding's generate_text handles them with chat history.")
+
+
+        tool_calls_made_this_turn = []
+        llm_iterations = 0
+
+        while llm_iterations < max_llm_iterations:
+            llm_iterations += 1
+            
+            # 2. Construct prompt for LLM to decide on tool call or direct answer
+            # We need to convert current_conversation into a single string prompt for `generate_code`
+            # or adapt `generate_code` to take a message list if underlying LLM supports chat for structured output.
+            # For now, let's assume `generate_code` takes a flat prompt.
+            
+            # Create a string representation of the conversation history
+            history_str = ""
+            for msg in current_conversation:
+                role_prefix = self.user_custom_header(msg["role"]) if msg["role"]=="user" else self.ai_custom_header(msg["role"]) if msg["role"]=="assistant" else self.system_custom_header(msg["role"]) if msg["role"]=="system" else "!@>unknown:"
+                history_str += f"{role_prefix}{msg['content']}\n"
+            
+            # Add tool execution results from previous iterations in this turn to the history string
+            for tc_info in tool_calls_made_this_turn:
+                if tc_info.get("result"): # Only add if there's a result (successful or error)
+                    history_str += f"{self.ai_full_header}(Executed tool '{tc_info['name']}' with params {tc_info['params']}. Result: {json.dumps(tc_info['result'])})\n"
+
+
+            decision_prompt_template = f"""You are an AI assistant that can use tools to answer user requests.
+Available tools:
+{formatted_tools_list}
+
+Current conversation:
+{history_str}
+
+Based on the available tools and the current conversation, decide the next step.
+Respond with a JSON object containing ONE of the following structures:
+1. If you need to use a tool:
+   {{"action": "call_tool", "tool_name": "<name_of_tool_to_call>", "tool_params": {{<parameters_for_tool_as_json_object>}}}}
+2. If you can answer directly without using a tool OR if you have sufficient information from previous tool calls:
+   {{"action": "final_answer"}}
+3. If the user's request is unclear or you need more information before deciding:
+   {{"action": "clarify", "clarification_request": "<your_question_to_the_user>"}}
+""" # No {self.ai_full_header} here, generate_code will get raw JSON
+
+            if streaming_callback:
+                streaming_callback(f"LLM deciding next step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_START, {"type": "decision_making"}, turn_history)
+
+            # Use generate_code to get structured JSON output from LLM
+            # Note: generate_code itself uses generate_text. We are asking for JSON here.
+            raw_llm_decision_json = self.generate_text(
+                prompt=decision_prompt_template, # This is the full prompt for the LLM
+                n_predict=512, # Reasonable size for decision JSON
+                temperature=tool_call_decision_temperature,
+                images=images
+                # `images` are part of the history_str if relevant to the binding
+                # streaming_callback=None, # Decisions are usually not streamed chunk by chunk
+            )
+            if streaming_callback:
+                streaming_callback(f"LLM decision received.", MSG_TYPE.MSG_TYPE_STEP_END, {"type": "decision_making"}, turn_history)
+
+
+            if not raw_llm_decision_json:
+                ASCIIColors.error("LLM failed to provide a decision JSON.")
+                turn_history.append({"type": "error", "content": "LLM failed to provide a decision."})
+                return {"final_answer": "I'm sorry, I encountered an issue trying to process your request.", "tool_calls": tool_calls_made_this_turn, "error": "LLM decision JSON was empty."}
+            
+            processed_raw_json = raw_llm_decision_json.strip() # Strip whitespace first
+            try:
+                llm_decision = json.loads(processed_raw_json)
+                turn_history.append({"type": "llm_decision", "content": llm_decision})
+            except json.JSONDecodeError:
+                ASCIIColors.error(f"Failed to parse LLM decision JSON: {raw_llm_decision_json}")
+                try:
+                    decoder = json.JSONDecoder()
+                    # Try to decode the first JSON object from the (stripped) string
+                    llm_decision, end_index = decoder.raw_decode(processed_raw_json)
+                    turn_history.append({"type": "llm_decision_extracted", "content": llm_decision, "raw_trimmed": processed_raw_json[:end_index]})
+                    
+                    remaining_text = processed_raw_json[end_index:].strip()
+                    if remaining_text:
+                        ASCIIColors.warning(f"LLM output contained additional text after the first JSON object: '{remaining_text}'. Processing only the first object.")
+                        turn_history.append({"type": "llm_extra_output_ignored", "content": remaining_text})
+                except json.JSONDecodeError as e_inner:
+                    ASCIIColors.error(f"Failed to parse LLM decision JSON even after attempting to extract first object: {raw_llm_decision_json}. Error: {e_inner}")
+                    turn_history.append({"type": "error", "content": "Failed to parse LLM decision JSON.", "raw_json": raw_llm_decision_json, "error_details": str(e_inner)})
+                    # Provide a generic error message, as the LLM's output was malformed.
+                    # Adding the raw output or a snippet to the conversation history might help the LLM recover or inform the user.
+                    current_conversation.append({
+                        "role": "assistant", 
+                        "content": "(I encountered an internal error trying to understand my next step. I will try to answer directly based on what I have so far.)"
+                    })
+                    break # Break to generate final answer with current info
+
+            if llm_decision is None: # If parsing failed and couldn't recover
+                return {"final_answer": "I'm sorry, I had trouble understanding the next step due to a formatting issue.", "tool_calls": tool_calls_made_this_turn, "error": "Invalid JSON from LLM for decision."}
+
+            action = llm_decision.get("action")
+
+            if action == "call_tool":
+                if len(tool_calls_made_this_turn) >= max_tool_calls:
+                    ASCIIColors.warning("Maximum tool calls reached for this turn. Forcing final answer.")
+                    current_conversation.append({"role":"assistant", "content":"(Max tool calls reached. I will now try to formulate an answer based on available information.)"})
+                    break # Exit loop to generate final answer
+
+                tool_name = llm_decision.get("tool_name")
+                tool_params = llm_decision.get("tool_params", {})
+
+                if not tool_name:
+                    ASCIIColors.warning("LLM decided to call a tool but didn't specify tool_name.")
+                    current_conversation.append({"role":"assistant", "content":"(I decided to use a tool, but I'm unsure which one. Could you clarify?)"})
+                    break # Or ask LLM to try again without this faulty decision in history
+
+                tool_call_info = {"type": "tool_call_request", "name": tool_name, "params": tool_params}
+                turn_history.append(tool_call_info)
+                if streaming_callback:
+                     streaming_callback(f"LLM requests to call tool: {tool_name} with params: {tool_params}", MSG_TYPE.MSG_TYPE_INFO, tool_call_info, turn_history)
+                
+                # Interactive execution if enabled
+                if interactive_tool_execution:
+                    try:
+                        user_confirmation = input(f"AI wants to execute tool '{tool_name}' with params {tool_params}. Allow? (yes/no/details): ").lower()
+                        if user_confirmation == "details":
+                            tool_def_for_details = next((t for t in tools if t.get("name") == tool_name), None)
+                            print(f"Tool details: {json.dumps(tool_def_for_details, indent=2)}")
+                            user_confirmation = input(f"Allow execution of '{tool_name}'? (yes/no): ").lower()
+                        
+                        if user_confirmation != "yes":
+                            ASCIIColors.info("Tool execution cancelled by user.")
+                            tool_result = {"error": "Tool execution cancelled by user."}
+                            # Add this info to conversation for LLM
+                            current_conversation.append({"role": "assistant", "content": f"(Tool '{tool_name}' execution was cancelled by the user. What should I do next?)"})
+                            tool_call_info["result"] = tool_result # Record cancellation
+                            tool_calls_made_this_turn.append(tool_call_info)
+                            continue # Back to LLM for next decision
+                    except Exception as e_input: # Catch issues with input() e.g. in non-interactive env
+                        ASCIIColors.warning(f"Error during interactive confirmation: {e_input}. Proceeding without confirmation.")
+
+
+                if streaming_callback:
+                    streaming_callback(f"Executing tool: {tool_name}...", MSG_TYPE.MSG_TYPE_STEP_START, {"type": "tool_execution", "tool_name": tool_name}, turn_history)
+                
+                tool_result = self.mcp.execute_tool(tool_name, tool_params, lollms_client_instance=self)
+                
+                tool_call_info["result"] = tool_result # Add result to this call's info
+                tool_calls_made_this_turn.append(tool_call_info) # Log the completed call
+
+                if streaming_callback:
+                    streaming_callback(f"Tool {tool_name} execution finished. Result: {json.dumps(tool_result)}", MSG_TYPE.MSG_TYPE_STEP_END, {"type": "tool_execution", "tool_name": tool_name, "result": tool_result}, turn_history)
+
+                # Add tool execution result to conversation for the LLM
+                # The format of this message can influence how the LLM uses the tool output.
+                # current_conversation.append({"role": "tool_result", "tool_name": tool_name, "content": json.dumps(tool_result)}) # More structured
+                current_conversation.append({"role": "assistant", "content": f"(Tool '{tool_name}' executed. Result: {json.dumps(tool_result)})"})
+
+
+            elif action == "clarify":
+                clarification_request = llm_decision.get("clarification_request", "I need more information. Could you please clarify?")
+                if streaming_callback:
+                    streaming_callback(clarification_request, MSG_TYPE.MSG_TYPE_FULL, {"type": "clarification_request"}, turn_history)
+                turn_history.append({"type":"clarification_request_sent", "content": clarification_request})
+                return {"final_answer": clarification_request, "tool_calls": tool_calls_made_this_turn, "error": None}
+
+            elif action == "final_answer":
+                ASCIIColors.info("LLM decided to formulate a final answer.")
+                current_conversation.append({"role":"assistant", "content":"(I will now formulate the final answer based on the information gathered.)"}) # Inform LLM's "thought process"
+                break # Exit loop to generate final answer
+            
+            else:
+                ASCIIColors.warning(f"LLM returned unknown action: {action}")
+                current_conversation.append({"role":"assistant", "content":f"(Received an unexpected decision: {action}. I will try to answer directly.)"})
+                break # Exit loop
+            
+            # Safety break if too many iterations without reaching final answer or max_tool_calls
+            if llm_iterations >= max_llm_iterations:
+                ASCIIColors.warning("Max LLM iterations reached. Forcing final answer.")
+                current_conversation.append({"role":"assistant", "content":"(Max iterations reached. I will now try to formulate an answer.)"})
+                break
+        
+        # 3. Generate final answer if LLM decided to, or if loop broke
+        if streaming_callback:
+            streaming_callback("LLM generating final answer...", MSG_TYPE.MSG_TYPE_STEP_START, {"type": "final_answer_generation"}, turn_history)
+
+        # Construct the final prompt string for generate_text from current_conversation
+        final_prompt_str = ""
+        final_system_prompt = ""
+        
+        # Consolidate system messages if any
+        interim_history_for_final_answer = []
+        for msg in current_conversation:
+            if msg["role"] == "system":
+                final_system_prompt += msg["content"] + "\n"
+            else:
+                interim_history_for_final_answer.append(msg)
+        
+        if not any(msg['role'] == 'user' for msg in interim_history_for_final_answer): # Ensure there's a user turn if only system + tool calls
+            interim_history_for_final_answer.append({'role':'user', 'content': prompt}) # Add original prompt if lost
+
+
+        # The generate_text method needs a single prompt and an optional system_prompt.
+        # We need to format the interim_history_for_final_answer into a single prompt string,
+        # or modify generate_text to accept a list of messages.
+        # For now, flatten to string:
+        current_prompt_for_final_answer = ""
+        for i, msg in enumerate(interim_history_for_final_answer):
+            role_prefix = self.user_custom_header(msg["role"]) if msg["role"]=="user" else self.ai_custom_header(msg["role"]) if msg["role"]=="assistant" else f"!@>{msg['role']}:"
+            current_prompt_for_final_answer += f"{role_prefix}{msg['content']}"
+            if i < len(interim_history_for_final_answer) -1 : # Add newline separator except for last
+                 current_prompt_for_final_answer += "\n"
+        # Add AI header to prompt AI to speak
+        current_prompt_for_final_answer += f"\n{self.ai_full_header}"
+
+
+        final_answer_text = self.generate_text(
+            prompt=current_prompt_for_final_answer, # Pass the conversation history as the prompt
+            system_prompt=final_system_prompt.strip(),
+            images=images if not tool_calls_made_this_turn else None, # Only pass initial images if no tool calls happened (context might be lost)
+            stream=streaming_callback is not None,
+            streaming_callback=lambda chunk, msg_type: streaming_callback(chunk, msg_type, {"type":"final_answer_chunk"}, turn_history) if streaming_callback else None,
+            temperature=final_answer_temperature if final_answer_temperature is not None else self.default_temperature,
+            **(llm_generation_kwargs or {})
+        )
+
+        if streaming_callback:
+            streaming_callback("Final answer generation complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"type": "final_answer_generation"}, turn_history)
+
+        if isinstance(final_answer_text, dict) and "error" in final_answer_text: # Handle generation error
+            turn_history.append({"type":"error", "content":f"LLM failed to generate final answer: {final_answer_text['error']}"})
+            return {"final_answer": "", "tool_calls": tool_calls_made_this_turn, "error": final_answer_text["error"]}
+
+        turn_history.append({"type":"final_answer_generated", "content":final_answer_text})
+        return {"final_answer": final_answer_text, "tool_calls": tool_calls_made_this_turn, "error": None}
+
+
     def generate_code(
                         self,
                         prompt,
@@ -540,7 +875,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
         Handles potential continuation if the code block is incomplete.
         """
 
-        system_prompt = f"""{self.system_full_header}Act as a code generation assistant that generates code from user prompt."""
+        system_prompt = f"""Act as a code generation assistant that generates code from user prompt."""
 
         if template:
             system_prompt += "Here is a template of the answer:\n"

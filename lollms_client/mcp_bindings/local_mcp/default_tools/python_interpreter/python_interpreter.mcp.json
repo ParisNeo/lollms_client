@@ -1,0 +1,28 @@
+{
+    "name": "python_interpreter",
+    "description": "Executes a given snippet of Python code and returns its standard output, standard error, and any returned value. The code is executed in a restricted environment. Avoid using this tool for long-running tasks or tasks requiring network access unless explicitly permitted by the environment.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "The Python code snippet to execute."
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "default": 10,
+                "description": "Maximum execution time for the code snippet in seconds."
+            }
+        },
+        "required": ["code"]
+    },
+    "output_schema": {
+        "type": "object",
+        "properties": {
+            "stdout": {"type": "string", "description": "The standard output from the executed code."},
+            "stderr": {"type": "string", "description": "The standard error from the executed code. Empty if no error."},
+            "returned_value": {"type": "string", "description": "The string representation of the value returned by the script, if any. None if the script doesn't explicitly return or returns None."},
+            "execution_status": {"type": "string", "enum": ["success", "timeout", "error"], "description": "Status of the code execution."}
+        }
+    }
+}

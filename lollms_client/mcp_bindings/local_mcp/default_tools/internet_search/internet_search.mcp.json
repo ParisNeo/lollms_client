@@ -1,0 +1,42 @@
+{
+    "name": "internet_search",
+    "description": "Performs an internet search using DuckDuckGo for a given query and returns a list of search results, including titles, links, and snippets.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query to look for on the internet."
+            },
+            "num_results": {
+                "type": "integer",
+                "default": 5,
+                "description": "The desired number of search results to return. Maximum is typically around 25-30 for a single request with this library."
+            }
+        },
+        "required": ["query"]
+    },
+    "output_schema": {
+        "type": "object",
+        "properties": {
+            "search_results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "The title of the search result."},
+                        "link": {"type": "string", "description": "The URL link to the search result."},
+                        "snippet": {"type": "string", "description": "A brief snippet or description of the search result content."}
+                    },
+                    "required": ["title", "link", "snippet"]
+                },
+                "description": "A list of search results."
+            },
+            "error": {
+                "type": "string",
+                "description": "An error message if the search operation failed. Null or absent if successful."
+            }
+        },
+        "required": ["search_results"]
+    }
+}

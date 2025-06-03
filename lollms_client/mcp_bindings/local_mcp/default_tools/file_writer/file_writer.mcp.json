@@ -1,0 +1,32 @@
+{
+    "name": "file_writer",
+    "description": "Writes or appends text content to a specified file. Creates the file if it doesn't exist. Will create parent directories if they don't exist.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "The relative or absolute path to the file where content should be written."
+            },
+            "content": {
+                "type": "string",
+                "description": "The text content to write to the file."
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["overwrite", "append"],
+                "default": "overwrite",
+                "description": "Mode of writing: 'overwrite' to replace file content, 'append' to add to existing content."
+            }
+        },
+        "required": ["file_path", "content"]
+    },
+    "output_schema": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["success", "error"]},
+            "message": {"type": "string", "description": "A message indicating the result of the operation."},
+            "file_path": {"type": "string", "description": "The absolute path to the written file."}
+        }
+    }
+}

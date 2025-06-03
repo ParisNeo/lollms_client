@@ -1,0 +1,48 @@
+{
+    "name": "generate_image_from_prompt",
+    "description": "Generates an image based on a textual prompt using the currently configured Text-to-Image (TTI) service in the LollmsClient. The image is saved locally and a path or reference is returned.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The detailed textual description of the image to be generated."
+            },
+            "negative_prompt": {
+                "type": "string",
+                "default": "",
+                "description": "Optional textual description of elements to avoid in the image."
+            },
+            "width": {
+                "type": "integer",
+                "description": "Optional desired width of the image. Uses TTI binding's default if not specified."
+            },
+            "height": {
+                "type": "integer",
+                "description": "Optional desired height of the image. Uses TTI binding's default if not specified."
+            },
+            "output_filename_suggestion": {
+                "type": "string",
+                "default": "generated_image.png",
+                "description": "A suggested filename (without path) for the generated image. The system may add unique identifiers."
+            }
+        },
+        "required": ["prompt"]
+    },
+    "output_schema": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["success", "error", "tti_not_available"]},
+            "message": {"type": "string", "description": "A message indicating the result."},
+            "image_path": {
+                "type": "string", 
+                "description": "The relative path to the saved image if generation was successful (relative to a workspace or a predefined output folder)."
+            },
+            "image_url": {
+                "type": "string",
+                "description": "A URL (e.g., a data URL or a server-hosted URL) for the generated image, if applicable."
+            }
+        },
+        "required": ["status", "message"]
+    }
+}
