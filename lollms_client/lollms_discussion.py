@@ -1,7 +1,7 @@
 import yaml
 from lollms_client.lollms_core import LollmsClient
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Dict
 import uuid
 import os
 
@@ -11,9 +11,9 @@ class LollmsMessage:
     sender: str
     content: str
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-
+    metadata: str = "{}"
     def to_dict(self):
-        return {'sender': self.sender, 'content': self.content, 'id': self.id}
+        return {'sender': self.sender, 'content': self.content, 'metadata': self.metadata, 'id': self.id}
 
 # LollmsDiscussion Class
 class LollmsDiscussion:
@@ -21,8 +21,8 @@ class LollmsDiscussion:
         self.messages:List[LollmsMessage] = []
         self.lollmsClient = lollmsClient
 
-    def add_message(self, sender, content):
-        message = LollmsMessage(sender, content)
+    def add_message(self, sender, content, metadata={}):
+        message = LollmsMessage(sender, content, str(metadata))
         self.messages.append(message)
 
     def save_to_disk(self, file_path):
