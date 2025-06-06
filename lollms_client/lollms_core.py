@@ -923,27 +923,34 @@ Respond with a JSON object containing ONE of the following structures:
             if streaming_callback:
                 streaming_callback(f"Starting RAG Hop {hop_count + 1}", MSG_TYPE.MSG_TYPE_STEP, {"type": "rag_hop_start", "hop": hop_count + 1}, turn_rag_history_for_callback)
 
-            # Generate refined query for multi-hop
-            if hop_count > 0:
-                # build system prompt and history...
-                # (same as before, omitted for brevity)
-                # result => current_query_for_rag
-                pass
-            elif current_query_for_rag is None:
-                current_query_for_rag = prompt
-
-            if not current_query_for_rag:
-                rag_hops_details_list.append({
-                    "query": "EMPTY_QUERY_STOPPED_HOPS",
-                    "retrieved_chunks_details": [],
-                    "status": "Stopped: empty query."
-                })
-                break
+            txt_previous_queries = f"Previous queries:\n"+'\n'.join(previous_queries)+"\n\n" if len(previous_queries)>0 else ""
+            txt_informations = f"Information:\n"+'\n'.join([f"(from {chunk['document']}):{chunk['content']}" for _, chunk in all_unique_retrieved_chunks_map.items()]) if len(all_unique_retrieved_chunks_map)>0 else "This is the first request. No data received yet. Build a new query."
+            txt_sp = "Your objective is to analyze the provided chunks of information, then decise if they are sufficient to reach the objective. If you need more information, formulate a new query to extract more data."
+            txt_formatting = """The output format must be in form of json placed inside a json markdown tag. Here is the schema to use:
+```json
+{
+    "decision": A boolean depicting your decision (true: more data is needed, false: there is enough data to reach objective),
+    "query": (optional, only if decision is true). A new query to recover more information from the data source (do not use previous queries as they have already been used)
+}
+```
+"""
+            p = f"Objective:\n{objectives_text}\n\n{txt_previous_queries}\n\n{txt_informations}\n\n{txt_formatting}\n\n"
+            response = self.generate_code(p,system_prompt=txt_sp)
+            try:
+                answer = json.loads(response)
+                decision = answer["decision"]
+                if not decision:
+                    break
+                else:
+                    current_query_for_rag = answer["query"]
+            except Exception as ex:
+                trace_exception(ex)
 
             # Retrieve chunks
             try:
                 retrieved = rag_query_function(current_query_for_rag, rag_vectorizer_name, rag_top_k, rag_min_similarity_percent)
             except Exception as e:
+                trace_exception(e)
                 return {"final_answer": "", "rag_hops_history": rag_hops_details_list, "all_retrieved_sources": list(all_unique_retrieved_chunks_map.values()), "error": str(e)}
 
             hop_details = {"query": current_query_for_rag, "retrieved_chunks_details": [], "status": ""}
@@ -965,30 +972,7 @@ Respond with a JSON object containing ONE of the following structures:
                 hop_details["status"] = "No *new* unique chunks retrieved"
             rag_hops_details_list.append(hop_details)
 
-            # reset for next hop
-            if hop_count < max_rag_hops:
-                txt_previous_queries = f"Previous queries:\n"+'\n'.join(previous_queries)+"\n\n" if len(previous_queries)>0 else ""
-                txt_informations = f"Information:\n"+'\n'.join([f"(from {chunk['document']}):{chunk['content']}" for _, chunk in all_unique_retrieved_chunks_map.items()])
-                txt_sp = "Your objective is to analyze the provided chunks of information, then decise if they are sufficient to reach the objective. If you need more information, formulate a new query to extract more data."
-                txt_formatting = """The output format must be in form of json placed inside a json markdown tag. Here is the schema to use:
-```json
-{
-    "decision": A boolean depicting your decision (true: more data is needed, false: there is enough data to reach objective),
-    "query": (optional, only if decision is true). A new query to recover more information from the data source (do not use previous queries as they have already been used)
-}
-```
-"""
-                p = f"Objective:\n{objectives_text}\n\n{txt_previous_queries}\n\n{txt_informations}\n\n{txt_formatting}\n\n"
-                response = self.generate_code(p,system_prompt=txt_sp)
-                try:
-                    answer = json.loads(response)
-                    decision = answer["decision"]
-                    if not decision:
-                        break
-                    else:
-                        current_query_for_rag = answer["query"]
-                except Exception as ex:
-                    trace_exception(ex)
+
 
         # 2. Prepare & Summarize Context
         sorted_chunks = sorted(all_unique_retrieved_chunks_map.values(),
