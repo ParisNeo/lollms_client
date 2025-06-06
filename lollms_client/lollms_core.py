@@ -922,7 +922,6 @@ Respond with a JSON object containing ONE of the following structures:
         for hop_count in range(max_rag_hops + 1):
             if streaming_callback:
                 streaming_callback(f"Starting RAG Hop {hop_count + 1}", MSG_TYPE.MSG_TYPE_STEP, {"type": "rag_hop_start", "hop": hop_count + 1}, turn_rag_history_for_callback)
-            print(previous_queries) # for debug
             txt_previous_queries = f"Previous queries:\n"+'\n'.join(previous_queries)+"\n\n" if len(previous_queries)>0 else ""
             txt_informations = f"Information:\n"+'\n'.join([f"(from {chunk['document']}):{chunk['content']}" for _, chunk in all_unique_retrieved_chunks_map.items()]) if len(all_unique_retrieved_chunks_map)>0 else "This is the first request. No data received yet. Build a new query."
             txt_sp = "Your objective is to analyze the provided chunks of information, then decise if they are sufficient to reach the objective. If you need more information, formulate a new query to extract more data."
@@ -930,7 +929,7 @@ Respond with a JSON object containing ONE of the following structures:
 ```json
 {
     "decision": A boolean depicting your decision (true: more data is needed, false: there is enough data to reach objective),
-    "query": (optional, only if decision is true). A new query to recover more information from the data source (do not use previous queries as they have already been used)
+    "query": (str, optional, only if decision is true). A new query to recover more information from the data source (do not use previous queries as they have already been used)
 }
 ```
 """
@@ -942,7 +941,7 @@ Respond with a JSON object containing ONE of the following structures:
                 if not decision:
                     break
                 else:
-                    current_query_for_rag = answer["query"]
+                    current_query_for_rag = str(answer["query"])
             except Exception as ex:
                 trace_exception(ex)
 
