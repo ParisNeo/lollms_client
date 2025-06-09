@@ -587,7 +587,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
         # 1. Discover tools if not provided
         if tools is None:
             try:
-                tools = self.mcp.discover_tools()
+                tools = self.mcp.discover_tools(force_refresh=True)
                 if not tools:
                     ASCIIColors.warning("No MCP tools discovered by the binding.")
             except Exception as e_disc:
@@ -898,7 +898,7 @@ Respond with a JSON object containing ONE of the following structures:
         # 0. Optional Objectives Extraction Step
         if extract_objectives:
             if streaming_callback:
-                streaming_callback("Extracting and structuring objectives...", MSG_TYPE.MSG_TYPE_STEP, {"type": "objectives_extraction"}, turn_rag_history_for_callback)
+                streaming_callback("Extracting and structuring objectives...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
             obj_prompt = (
                 "You are an expert analyst. "
                 "Your task is to extract and structure the key objectives from the user's request below. "
@@ -914,22 +914,33 @@ Respond with a JSON object containing ONE of the following structures:
             )
             objectives_text = self.remove_thinking_blocks(obj_gen).strip()
             if streaming_callback:
-                streaming_callback(f"Objectives extracted:\n{objectives_text}", MSG_TYPE.MSG_TYPE_STEP_END, {"type": "objectives_extracted"}, turn_rag_history_for_callback)
+                streaming_callback(f"Objectives: {objectives_text}", MSG_TYPE.MSG_TYPE_STEP, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
+
+            if streaming_callback:
+                streaming_callback(f"Objectives extracted:\n{objectives_text}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
 
         current_query_for_rag = rag_query_text or None
         previous_queries=[]
         # 1. RAG Hops
         for hop_count in range(max_rag_hops + 1):
             if streaming_callback:
-                streaming_callback(f"Starting RAG Hop {hop_count + 1}", MSG_TYPE.MSG_TYPE_STEP, {"type": "rag_hop_start", "hop": hop_count + 1}, turn_rag_history_for_callback)
+                streaming_callback(f"Starting RAG Hop {hop_count + 1}", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"rag_hop_{hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
             txt_previous_queries = f"Previous queries:\n"+'\n'.join(previous_queries)+"\n\n" if len(previous_queries)>0 else ""
             txt_informations = f"Information:\n"+'\n'.join([f"(from {chunk['document']}):{chunk['content']}" for _, chunk in all_unique_retrieved_chunks_map.items()]) if len(all_unique_retrieved_chunks_map)>0 else "This is the first request. No data received yet. Build a new query."
-            txt_sp = "Your objective is to analyze the provided chunks of information, then decise if they are sufficient to reach the objective. If you need more information, formulate a new query to extract more data."
-            txt_formatting = """The output format must be in form of json placed inside a json markdown tag. Here is the schema to use:
+            txt_sp = (
+                "Your objective is to analyze the provided chunks of information to determine "
+                "whether they are sufficient to reach the objective. If not, formulate a refined and focused query "
+                "that can retrieve more relevant information from a vector database. Ensure the query captures the semantic essence "
+                "of what is missing, is contextually independent, and is optimized for vector-based similarity search. "
+                "Do not repeat or rephrase earlier queries—always generate a new, meaningful atomic query targeting the current gap in knowledge."
+            )
+
+            txt_formatting = """The output format must be in form of JSON placed inside a JSON markdown tag. Use the following schema:
 ```json
 {
-    "decision": A boolean depicting your decision (true: more data is needed, false: there is enough data to reach objective),
-    "query": (str, optional, only if decision is true). A new query to recover more information from the data source (do not use previous queries as they have already been used)
+    "decision": A boolean indicating your decision (true: more data is needed, false: the current data is sufficient),
+    "query": (str, optional, only if decision is true). A new, atomic query suitable for semantic search in a vector database. 
+            It should capture the missing concept or insight in concise, context-rich language, avoiding reuse of earlier queries.
 }
 ```
 """
@@ -944,6 +955,9 @@ Respond with a JSON object containing ONE of the following structures:
                     current_query_for_rag = str(answer["query"])
             except Exception as ex:
                 trace_exception(ex)
+
+            if streaming_callback:
+                streaming_callback(f"Query: {current_query_for_rag}", MSG_TYPE.MSG_TYPE_STEP, {"id": f"query for hop {hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
 
             # Retrieve chunks
             try:
@@ -971,6 +985,8 @@ Respond with a JSON object containing ONE of the following structures:
                 hop_details["status"] = "No *new* unique chunks retrieved"
             rag_hops_details_list.append(hop_details)
 
+            if streaming_callback:
+                streaming_callback(f"RAG Hop {hop_count + 1} done", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"rag_hop_{hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
 
 
         # 2. Prepare & Summarize Context
@@ -994,7 +1010,7 @@ Respond with a JSON object containing ONE of the following structures:
         # If context exceeds our effective limit, summarize it
         if self.count_tokens(accumulated_context) > effective_ctx_size:
             if streaming_callback:
-                streaming_callback("Context too large, performing intermediate summary...", MSG_TYPE.MSG_TYPE_STEP, {"type": "intermediate_summary"}, turn_rag_history_for_callback)
+                streaming_callback("Context too large, performing intermediate summary...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "intermediate_summary"}, turn_rag_history_for_callback)
             summary_prompt = (
                 "Summarize the following gathered context into a concise form "
                 "that preserves all key facts and sources needed to answer the user's request:\n\n"
@@ -1009,7 +1025,7 @@ Respond with a JSON object containing ONE of the following structures:
             )
             accumulated_context = self.remove_thinking_blocks(summary).strip()
             if streaming_callback:
-                streaming_callback("Intermediate summary complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"type": "intermediate_summary"}, turn_rag_history_for_callback)
+                streaming_callback("Intermediate summary complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "intermediate_summary"}, turn_rag_history_for_callback)
 
         # 3. Final Answer Generation
         final_prompt = [
