@@ -666,7 +666,7 @@ Respond with a JSON object containing ONE of the following structures:
 """ # No {self.ai_full_header} here, generate_code will get raw JSON
 
             if streaming_callback:
-                streaming_callback(f"LLM deciding next step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_START, {"type": "decision_making"}, turn_history)
+                streaming_callback(f"LLM deciding next step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "decision_making"}, turn_history)
 
             # Use generate_code to get structured JSON output from LLM
             # Note: generate_code itself uses generate_text. We are asking for JSON here.
@@ -679,7 +679,7 @@ Respond with a JSON object containing ONE of the following structures:
                 # streaming_callback=None, # Decisions are usually not streamed chunk by chunk
             )
             if streaming_callback:
-                streaming_callback(f"LLM decision received.", MSG_TYPE.MSG_TYPE_STEP_END, {"type": "decision_making"}, turn_history)
+                streaming_callback(f"LLM decision received.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "decision_making"}, turn_history)
 
 
             if not raw_llm_decision_json:
@@ -733,10 +733,11 @@ Respond with a JSON object containing ONE of the following structures:
                     current_conversation.append({"role":"assistant", "content":"(I decided to use a tool, but I'm unsure which one. Could you clarify?)"})
                     break # Or ask LLM to try again without this faulty decision in history
 
-                tool_call_info = {"type": "tool_call_request", "name": tool_name, "params": tool_params}
+                tool_call_info = {"id": "tool_call_request", "name": tool_name, "params": tool_params}
                 turn_history.append(tool_call_info)
                 if streaming_callback:
                      streaming_callback(f"LLM requests to call tool: {tool_name} with params: {tool_params}", MSG_TYPE.MSG_TYPE_INFO, tool_call_info, turn_history)
+                     streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_CALL, tool_call_info, turn_history)
                 
                 # Interactive execution if enabled
                 if interactive_tool_execution:
@@ -760,15 +761,17 @@ Respond with a JSON object containing ONE of the following structures:
 
 
                 if streaming_callback:
-                    streaming_callback(f"Executing tool: {tool_name}...", MSG_TYPE.MSG_TYPE_STEP_START, {"type": "tool_execution", "tool_name": tool_name}, turn_history)
+                    streaming_callback(f"Executing tool: {tool_name}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "tool_execution", "tool_name": tool_name}, turn_history)
                 
                 tool_result = self.mcp.execute_tool(tool_name, tool_params, lollms_client_instance=self)
                 
                 tool_call_info["result"] = tool_result # Add result to this call's info
                 tool_calls_made_this_turn.append(tool_call_info) # Log the completed call
+                if streaming_callback:
+                     streaming_callback(f"", MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, tool_result, turn_history)
 
                 if streaming_callback:
-                    streaming_callback(f"Tool {tool_name} execution finished. Result: {json.dumps(tool_result)}", MSG_TYPE.MSG_TYPE_STEP_END, {"type": "tool_execution", "tool_name": tool_name, "result": tool_result}, turn_history)
+                    streaming_callback(f"Tool {tool_name} execution finished. Result: {json.dumps(tool_result)}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "tool_execution", "tool_name": tool_name, "result": tool_result}, turn_history)
 
                 # Add tool execution result to conversation for the LLM
                 # The format of this message can influence how the LLM uses the tool output.
@@ -950,6 +953,9 @@ Respond with a JSON object containing ONE of the following structures:
                 answer = json.loads(response)
                 decision = answer["decision"]
                 if not decision:
+                    if streaming_callback:
+                        streaming_callback(f"RAG Hop {hop_count + 1} done", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"rag_hop_{hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
+
                     break
                 else:
                     current_query_for_rag = str(answer["query"])
@@ -969,12 +975,14 @@ Respond with a JSON object containing ONE of the following structures:
             hop_details = {"query": current_query_for_rag, "retrieved_chunks_details": [], "status": ""}
             previous_queries.append(current_query_for_rag)
             new_unique = 0
+            documents = []
             for chunk in retrieved:
                 doc = chunk.get("file_path", "Unknown")
                 content = str(chunk.get("chunk_text", ""))
                 sim = float(chunk.get("similarity_percent", 0.0))
                 detail = {"document": doc, "similarity": sim, "content": content,
                           "retrieved_in_hop": hop_count + 1, "query_used": current_query_for_rag}
+                documents.append(doc)
                 hop_details["retrieved_chunks_details"].append(detail)
                 key = f"{doc}::{content[:100]}"
                 if key not in all_unique_retrieved_chunks_map:
@@ -984,6 +992,8 @@ Respond with a JSON object containing ONE of the following structures:
             if hop_count > 0 and new_unique == 0:
                 hop_details["status"] = "No *new* unique chunks retrieved"
             rag_hops_details_list.append(hop_details)
+            if streaming_callback:
+                streaming_callback(f"Retreived {len(retrieved)} data chunks from {set(documents)}", MSG_TYPE.MSG_TYPE_STEP, {"id": f"retreival {hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
 
             if streaming_callback:
                 streaming_callback(f"RAG Hop {hop_count + 1} done", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"rag_hop_{hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)

@@ -28,6 +28,9 @@ class MSG_TYPE(Enum):
     MSG_TYPE_NEW_MESSAGE            = 15# A new message
     MSG_TYPE_FINISHED_MESSAGE       = 17# End of current message
 
+    #Tool calling
+    MSG_TYPE_TOOL_CALL              = 18# a tool call
+    MSG_TYPE_TOOL_OUTPUT            = 19# the output of the tool
 
 
 class SENDER_TYPES(Enum):
