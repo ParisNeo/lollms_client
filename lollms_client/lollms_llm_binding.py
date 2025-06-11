@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 from ascii_colors import trace_exception
 from lollms_client.lollms_types import MSG_TYPE
+from lollms_client.lollms_discussion import LollmsDiscussion
 import re
 class LollmsLLMBinding(ABC):
     """Abstract base class for all LOLLMS LLM bindings"""
@@ -73,6 +74,48 @@ class LollmsLLMBinding(ABC):
         """
         pass
     
+    @abstractmethod
+    def chat(self,
+             discussion: LollmsDiscussion,
+             branch_tip_id: Optional[str] = None,
+             n_predict: Optional[int] = None,
+             stream: Optional[bool] = None,
+             temperature: Optional[float] = None,
+             top_k: Optional[int] = None,
+             top_p: Optional[float] = None,
+             repeat_penalty: Optional[float] = None,
+             repeat_last_n: Optional[int] = None,
+             seed: Optional[int] = None,
+             n_threads: Optional[int] = None,
+             ctx_size: Optional[int] = None,
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             ) -> Union[str, dict]:
+        """
+        A method to conduct a chat session with the model using a LollmsDiscussion object.
+        This method is responsible for formatting the discussion into the specific
+        format required by the model's API and then calling the generation endpoint.
+
+        Args:
+            discussion (LollmsDiscussion): The discussion object containing the conversation history.
+            branch_tip_id (Optional[str]): The ID of the message to use as the tip of the conversation branch. Defaults to the active branch.
+            n_predict (Optional[int]): Maximum number of tokens to generate.
+            stream (Optional[bool]): Whether to stream the output.
+            temperature (Optional[float]): Sampling temperature.
+            top_k (Optional[int]): Top-k sampling parameter.
+            top_p (Optional[float]): Top-p sampling parameter.
+            repeat_penalty (Optional[float]): Penalty for repeated tokens.
+            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty.
+            seed (Optional[int]): Random seed for generation.
+            n_threads (Optional[int]): Number of threads to use.
+            ctx_size (Optional[int]): Context size override for this generation.
+            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+
+        Returns:
+            Union[str, dict]: The generated text or an error dictionary.
+        """
+        pass
+
+
     @abstractmethod
     def tokenize(self, text: str) -> list:
         """

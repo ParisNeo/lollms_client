@@ -168,7 +168,108 @@ class LollmsLLMBinding(LollmsLLMBinding):
                     return {"status": False, "error": str(ex)}
             else:
                 return {"status": False, "error": response.text}
-    
+    def chat(self,
+             discussion: LollmsDiscussion,
+             branch_tip_id: Optional[str] = None,
+             n_predict: Optional[int] = None,
+             stream: Optional[bool] = None,
+             temperature: Optional[float] = None,
+             top_k: Optional[int] = None,
+             top_p: Optional[float] = None,
+             repeat_penalty: Optional[float] = None,
+             repeat_last_n: Optional[int] = None,
+             seed: Optional[int] = None,
+             n_threads: Optional[int] = None,
+             ctx_size: int | None = None,
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             ) -> Union[str, dict]:
+        """
+        Conduct a chat session with a lollms-webui server using a LollmsDiscussion object.
+
+        Args:
+            discussion (LollmsDiscussion): The discussion object containing the conversation history.
+            branch_tip_id (Optional[str]): The ID of the message to use as the tip of the conversation branch. Defaults to the active branch.
+            ... (other parameters) ...
+
+        Returns:
+            Union[str, dict]: The generated text or an error dictionary.
+        """
+        # 1. Export the discussion to the lollms-native text format
+        prompt_text = discussion.export("lollms_text", branch_tip_id)
+        
+        # 2. Extract images from the LAST message of the branch
+        # lollms-webui's endpoint associates images with the final prompt
+        active_branch_id = branch_tip_id or discussion.active_branch_id
+        branch = discussion.get_branch(active_branch_id)
+        last_message = branch[-1] if branch else None
+        
+        image_data = []
+        if last_message and last_message.images:
+            # The endpoint expects a list of base64 strings.
+            # We will only process images of type 'base64'. URL types are not supported by this endpoint.
+            for img in last_message.images:
+                if img['type'] == 'base64':
+                    image_data.append(img['data'])
+                # Note: 'url' type images are ignored for this binding.
+
+        # 3. Determine endpoint and build payload
+        endpoint = "/lollms_generate_with_images" if image_data else "/lollms_generate"
+        url = f"{self.host_address}{endpoint}"
+        
+        headers = {'Content-Type': 'application/json'}
+        if self.service_key:
+            headers['Authorization'] = f'Bearer {self.service_key}'
+
+        data = {
+            "prompt": prompt_text,
+            "model_name": self.model_name,
+            "personality": self.personality,
+            "n_predict": n_predict,
+            "stream": stream,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "repeat_penalty": repeat_penalty,
+            "repeat_last_n": repeat_last_n,
+            "seed": seed,
+            "n_threads": n_threads
+        }
+        if image_data:
+            data["images"] = image_data
+
+        # 4. Make the request (logic copied and adapted from generate_text)
+        try:
+            response = requests.post(
+                url, 
+                json=data, 
+                headers=headers, 
+                stream=stream,
+                verify=self.verify_ssl_certificate
+            )
+            response.raise_for_status() # Raise an exception for bad status codes
+
+            if not stream:
+                return response.text.strip()
+            else:
+                full_response_text = ""
+                for line in response.iter_lines():
+                    if line:
+                        chunk = line.decode("utf-8")
+                        full_response_text += chunk
+                        if streaming_callback:
+                            if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
+                                break
+                # Clean up potential quotes from some streaming formats
+                if full_response_text.startswith('"') and full_response_text.endswith('"'):
+                    full_response_text = full_response_text[1:-1]
+                return full_response_text.rstrip('!')
+
+        except requests.exceptions.RequestException as e:
+            error_message = f"lollms-webui request error: {e}"
+            return {"status": "error", "message": error_message}
+        except Exception as ex:
+            error_message = f"lollms-webui generation error: {str(ex)}"
+            return {"status": "error", "message": error_message}    
     def tokenize(self, text: str) -> list:
         """
         Tokenize the input text into a list of tokens using the /lollms_tokenize endpoint.

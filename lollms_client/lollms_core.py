@@ -12,6 +12,7 @@ from lollms_client.lollms_ttv_binding import LollmsTTVBinding, LollmsTTVBindingM
 from lollms_client.lollms_ttm_binding import LollmsTTMBinding, LollmsTTMBindingManager
 from lollms_client.lollms_mcp_binding import LollmsMCPBinding, LollmsMCPBindingManager
 
+from lollms_client.lollms_discussion import LollmsDiscussion
 import json, re
 from enum import Enum
 import base64
@@ -386,6 +387,7 @@ class LollmsClient():
                      split:Optional[bool]=False, # put to true if the prompt is a discussion
                      user_keyword:Optional[str]="!@>user:",
                      ai_keyword:Optional[str]="!@>assistant:",
+                     **kwargs
                      ) -> Union[str, dict]:
         """
         Generate text using the active LLM binding, using instance defaults if parameters are not provided.
@@ -433,6 +435,64 @@ class LollmsClient():
             )
         raise RuntimeError("LLM binding not initialized.")
 
+
+    def chat(self,
+             discussion: LollmsDiscussion,
+             branch_tip_id: Optional[str] = None,
+             n_predict: Optional[int] = None,
+             stream: Optional[bool] = None,
+             temperature: Optional[float] = None,
+             top_k: Optional[int] = None,
+             top_p: Optional[float] = None,
+             repeat_penalty: Optional[float] = None,
+             repeat_last_n: Optional[int] = None,
+             seed: Optional[int] = None,
+             n_threads: Optional[int] = None,
+             ctx_size: Optional[int] = None,
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             ) -> Union[str, dict]:
+        """
+        High-level method to perform a chat generation using a LollmsDiscussion object.
+
+        This is the recommended method for conversational interactions. It uses the
+        discussion object to correctly format the context for the model, including
+        system prompts, roles, and multi-modal content.
+
+        Args:
+            discussion (LollmsDiscussion): The discussion object to use for context.
+            branch_tip_id (Optional[str]): The ID of the message to use as the end of the conversation branch. If None, the active branch is used.
+            n_predict (Optional[int]): Maximum number of tokens to generate. Uses instance default if None.
+            stream (Optional[bool]): Whether to stream the output. Uses instance default if None.
+            temperature (Optional[float]): Sampling temperature. Uses instance default if None.
+            top_k (Optional[int]): Top-k sampling parameter. Uses instance default if None.
+            top_p (Optional[float]): Top-p sampling parameter. Uses instance default if None.
+            repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
+            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
+            seed (Optional[int]): Random seed for generation. Uses instance default if None.
+            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
+            ctx_size (Optional[int]): Context size override for this generation.
+            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+
+        Returns:
+            Union[str, dict]: Generated text or an error dictionary if failed.
+        """
+        if self.binding:
+            return self.binding.chat(
+                discussion=discussion,
+                branch_tip_id=branch_tip_id,
+                n_predict=n_predict if n_predict is not None else self.default_n_predict,
+                stream=stream if stream is not None else self.default_stream,
+                temperature=temperature if temperature is not None else self.default_temperature,
+                top_k=top_k if top_k is not None else self.default_top_k,
+                top_p=top_p if top_p is not None else self.default_top_p,
+                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.default_repeat_penalty,
+                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.default_repeat_last_n,
+                seed=seed if seed is not None else self.default_seed,
+                n_threads=n_threads if n_threads is not None else self.default_n_threads,
+                ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size,
+                streaming_callback=streaming_callback if streaming_callback is not None else self.default_streaming_callback
+            )
+        raise RuntimeError("LLM binding not initialized.")
 
     def embed(self, text, **kwargs):
         """

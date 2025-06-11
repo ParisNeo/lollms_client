@@ -376,7 +376,7 @@ Manages conversation history.
 ```python
 from lollms_client import LollmsClient, LollmsDiscussion
 
-client = LollmsClient(binding_name="ollama", model_name="mistral")
+client = LollmsClient(binding_name="ollama", model_name="mistral:latest")
 discussion = LollmsDiscussion(lollmsClient=client) # Pass client for tokenization
 
 discussion.add_message(sender="user", content="Hello, AI!")
@@ -389,6 +389,74 @@ print("\n--- Full Discussion ---")
 for msg in discussion.messages:
     print(f"{msg.sender}: {msg.content}")
 ```
+
+## 6. `LollmsDiscussion` and the `chat()` Method
+
+The `LollmsDiscussion` class is a powerful tool for managing conversation histories. The recommended way to generate text from a discussion is by using the `LollmsClient.chat()` method, which operates directly on a `LollmsDiscussion` object.
+
+This approach is cleaner and more reliable than manually formatting prompts with `format_discussion()`, as it leverages the structured data within the discussion to build the perfect, API-specific payload for the backend model, including roles, images, and system prompts.
+
+### 6.1. A Typical Chat Workflow
+
+Here is a complete example demonstrating the standard conversational workflow.
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion
+
+# 1. Initialize the Client and Discussion
+# We pass the client to the discussion for tokenization capabilities.
+client = LollmsClient(binding_name="ollama", model_name="llava")
+discussion = LollmsDiscussion(lollmsClient=client)
+
+# 2. Configure the Discussion (Optional but Recommended)
+discussion.set_participants({
+    "Explorer": "user",
+    "Guide": "assistant"
+})
+discussion.set_system_prompt("You are a helpful 'Guide' for an 'Explorer'. Be concise and encouraging.")
+
+# 3. Add the User's First Message
+discussion.add_message(
+    sender="Explorer",
+    content="I've found a strange glowing mushroom. Is it safe?",
+    images=[{"type": "url", "data": "https://example.com/glowing_mushroom.jpg"}]
+)
+
+# 4. Use client.chat() to Generate a Response
+print("Guide is thinking...")
+# The chat method handles all formatting internally.
+# We can use a streaming callback to get the response token by token.
+full_response = ""
+def my_callback(token, message_type):
+    global full_response
+    print(token, end="", flush=True)
+    full_response += token
+
+# The chat() method takes the discussion and any generation parameters.
+client.chat(
+    discussion=discussion,
+    stream=True,
+    streaming_callback=my_callback,
+    n_predict=256
+)
+
+# 5. Add the AI's Full Response Back to the Discussion
+# This keeps the context updated for the next turn.
+discussion.add_message(sender="Guide", content=full_response)
+
+print("\n\n--- Full Discussion History ---")
+# You can now view the complete, structured conversation
+for msg in discussion.messages:
+    print(f"<{msg.sender}>: {msg.content}" + (f" [{len(msg.images)} image(s)]" if msg.images else ""))
+```
+
+### 6.2. Benefits of Using `chat()`
+
+*   **Simplicity**: No need to manually format prompts with special tokens (`!@>user:`).
+*   **Robustness**: Automatically handles system prompts, participant roles, and multi-modal data (images).
+*   **API-Agnostic**: Your code remains the same whether you're talking to an OpenAI, Ollama, or other compatible backend. The `LollmsBinding` handles the specific formatting.
+*   **Branching Support**: You can easily generate a response from an alternative conversation path by passing the `branch_tip_id` to the `chat()` method.
+
 
 ## 7. Available Bindings (Summary)
 

@@ -173,8 +173,7 @@ if __name__ == "__main__":
             rag_top_k=2, # Get 2 search results per query
             rag_min_similarity_percent=50.0,
             streaming_callback=rag_streaming_callback,
-            n_predict=400,
-            rag_hop_query_generation_temperature=0.1
+            n_predict=400
         )
         print("\n--- End of Multi-Hop Search RAG (1 hop max) ---")
         ASCIIColors.magenta("\nMulti-Hop Search RAG (1 hop max) Final Output Structure:")

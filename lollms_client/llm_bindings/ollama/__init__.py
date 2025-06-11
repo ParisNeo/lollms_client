@@ -6,6 +6,7 @@ from lollms_client.lollms_types import MSG_TYPE
 # encode_image is not strictly needed if ollama-python handles paths, but kept for consistency if ever needed.
 # from lollms_client.lollms_utilities import encode_image 
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT
+from lollms_client.lollms_discussion import LollmsDiscussion
 from typing import Optional, Callable, List, Union, Dict
 
 from ascii_colors import ASCIIColors, trace_exception
@@ -258,6 +259,104 @@ class OllamaBinding(LollmsLLMBinding):
             trace_exception(ex)
             return {"status": False, "error": error_message}
     
+    def chat(self,
+             discussion: LollmsDiscussion,
+             branch_tip_id: Optional[str] = None,
+             n_predict: Optional[int] = None,
+             stream: Optional[bool] = None,
+             temperature: float = 0.7,
+             top_k: int = 40,
+             top_p: float = 0.9,
+             repeat_penalty: float = 1.1,
+             repeat_last_n: int = 64,
+             seed: Optional[int] = None,
+             n_threads: Optional[int] = None,
+             ctx_size: Optional[int] = None,
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             ) -> Union[str, dict]:
+        """
+        Conduct a chat session with the Ollama model using a LollmsDiscussion object.
+
+        Args:
+            discussion (LollmsDiscussion): The discussion object containing the conversation history.
+            branch_tip_id (Optional[str]): The ID of the message to use as the tip of the conversation branch. Defaults to the active branch.
+            n_predict (Optional[int]): Maximum number of tokens to generate.
+            stream (Optional[bool]): Whether to stream the output.
+            temperature (float): Sampling temperature.
+            top_k (int): Top-k sampling parameter.
+            top_p (float): Top-p sampling parameter.
+            repeat_penalty (float): Penalty for repeated tokens.
+            repeat_last_n (int): Number of previous tokens to consider for repeat penalty.
+            seed (Optional[int]): Random seed for generation.
+            n_threads (Optional[int]): Number of threads to use.
+            ctx_size (Optional[int]): Context size override for this generation.
+            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+
+        Returns:
+            Union[str, dict]: The generated text or an error dictionary.
+        """
+        if not self.ollama_client:
+             return {"status": "error", "message": "Ollama client not initialized."}
+
+        # 1. Export the discussion to the Ollama chat format
+        # This handles system prompts, user/assistant roles, and base64-encoded images.
+        messages = discussion.export("ollama_chat", branch_tip_id)
+
+        # 2. Build the generation options dictionary
+        options = {
+            'num_predict': n_predict,
+            'temperature': float(temperature),
+            'top_k': top_k,
+            'top_p': top_p,
+            'repeat_penalty': repeat_penalty,
+            'repeat_last_n': repeat_last_n,
+            'seed': seed,
+            'num_thread': n_threads,
+            'num_ctx': ctx_size,
+        }
+        # Remove None values, as ollama-python expects them to be absent
+        options = {k: v for k, v in options.items() if v is not None}
+
+        full_response_text = ""
+
+        try:
+            # 3. Call the Ollama API
+            if stream:
+                response_stream = self.ollama_client.chat(
+                    model=self.model_name,
+                    messages=messages,
+                    stream=True,
+                    options=options if options else None
+                )
+                for chunk in response_stream:
+                    chunk_content = chunk.get('message', {}).get('content', '')
+                    if chunk_content:
+                        full_response_text += chunk_content
+                        if streaming_callback:
+                            if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                break
+                return full_response_text
+            else: # Not streaming
+                response_dict = self.ollama_client.chat(
+                    model=self.model_name,
+                    messages=messages,
+                    stream=False,
+                    options=options if options else None
+                )
+                return response_dict.get('message', {}).get('content', '')
+
+        except ollama.ResponseError as e:
+            error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
+            ASCIIColors.error(error_message)
+            return {"status": "error", "message": error_message}
+        except ollama.RequestError as e:
+            error_message = f"Ollama API RequestError: {str(e)}"
+            ASCIIColors.error(error_message)
+            return {"status": "error", "message": error_message}
+        except Exception as ex:
+            error_message = f"An unexpected error occurred: {str(ex)}"
+            trace_exception(ex)
+            return {"status": "error", "message": error_message}    
     def tokenize(self, text: str) -> list:
         """
         Tokenize the input text into a list of characters.

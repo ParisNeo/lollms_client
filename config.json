@@ -1,0 +1,7 @@
+{
+  "binding_name": "ollama",
+  "host_address": "http://localhost:11434",
+  "model_name": "mistral:latest",
+  "openai_api_key": "",
+  "openai_model_name": "gpt-4o"
+}

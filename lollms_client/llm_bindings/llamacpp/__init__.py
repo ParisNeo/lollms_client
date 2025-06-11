@@ -635,6 +635,110 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             error_message = f"Llama.cpp generation error: {str(ex)}"; trace_exception(ex)
             return {"status": False, "error": error_message}
 
+    def chat(self,
+             discussion: LollmsDiscussion,
+             branch_tip_id: Optional[str] = None,
+             n_predict: Optional[int] = None,
+             stream: Optional[bool] = None,
+             temperature: float = 0.7,
+             top_k: int = 40,
+             top_p: float = 0.9,
+             repeat_penalty: float = 1.1,
+             repeat_last_n: int = 64,
+             seed: Optional[int] = None,
+             n_threads: Optional[int] = None,
+             ctx_size: Optional[int] = None,
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+             **generation_kwargs
+             ) -> Union[str, dict]:
+        """
+        Conduct a chat session with the llama.cpp server using a LollmsDiscussion object.
+
+        Args:
+            discussion (LollmsDiscussion): The discussion object containing the conversation history.
+            branch_tip_id (Optional[str]): The ID of the message to use as the tip of the conversation branch. Defaults to the active branch.
+            n_predict (Optional[int]): Maximum number of tokens to generate.
+            stream (Optional[bool]): Whether to stream the output.
+            temperature (float): Sampling temperature.
+            top_k (int): Top-k sampling parameter.
+            top_p (float): Top-p sampling parameter.
+            repeat_penalty (float): Penalty for repeated tokens.
+            repeat_last_n (int): Number of previous tokens to consider for repeat penalty.
+            seed (Optional[int]): Random seed for generation.
+            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+
+        Returns:
+            Union[str, dict]: The generated text or an error dictionary.
+        """
+        if not self.server_process or not self.server_process.is_healthy:
+            return {"status": "error", "message": "Llama.cpp server is not running or not healthy."}
+
+        # 1. Export the discussion to the OpenAI chat format, which llama.cpp server understands.
+        # This handles system prompts, user/assistant roles, and multi-modal content.
+        messages = discussion.export("openai_chat", branch_tip_id)
+
+        # 2. Build the generation payload for the server
+        payload = {
+            "messages": messages,
+            "max_tokens": n_predict,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "repeat_penalty": repeat_penalty,
+            "seed": seed,
+            "stream": stream,
+            **generation_kwargs # Pass any extra parameters
+        }
+        # Remove None values, as the API expects them to be absent
+        payload = {k: v for k, v in payload.items() if v is not None}
+        
+        endpoint = "/v1/chat/completions"
+        request_url = self._get_request_url(endpoint)
+        full_response_text = ""
+
+        try:
+            # 3. Make the request to the server
+            response = self.server_process.session.post(request_url, json=payload, stream=stream, timeout=self.server_args.get("generation_timeout", 300))
+            response.raise_for_status()
+
+            if stream:
+                for line in response.iter_lines():
+                    if not line: continue
+                    line_str = line.decode('utf-8').strip()
+                    if line_str.startswith('data: '): line_str = line_str[6:]
+                    if line_str == '[DONE]': break
+                    try:
+                        chunk_data = json.loads(line_str)
+                        chunk_content = chunk_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                        if chunk_content:
+                            full_response_text += chunk_content
+                            if streaming_callback and not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                ASCIIColors.info("Streaming callback requested stop.")
+                                response.close()
+                                break
+                    except json.JSONDecodeError:
+                        ASCIIColors.warning(f"Failed to decode JSON stream chunk: {line_str}")
+                        continue
+                return full_response_text
+            else: # Not streaming
+                response_data = response.json()
+                return response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+
+        except requests.exceptions.RequestException as e:
+            error_message = f"Llama.cpp server request error: {e}"
+            if e.response is not None:
+                try:
+                    error_details = e.response.json()
+                    error_message += f" - Details: {error_details.get('error', e.response.text)}"
+                except json.JSONDecodeError:
+                    error_message += f" - Response: {e.response.text[:200]}"
+            ASCIIColors.error(error_message)
+            return {"status": "error", "message": error_message}
+        except Exception as ex:
+            error_message = f"Llama.cpp generation error: {str(ex)}"
+            trace_exception(ex)
+            return {"status": "error", "message": error_message}
+        
     def tokenize(self, text: str) -> List[int]:
         if not self.server_process or not self.server_process.is_healthy: raise ConnectionError("Server not running.")
         try:

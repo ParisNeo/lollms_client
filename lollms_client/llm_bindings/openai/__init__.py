@@ -5,6 +5,7 @@ from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_utilities import encode_image
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT
+from lollms_client.lollms_discussion import LollmsDiscussion
 from typing import Optional, Callable, List, Union
 from ascii_colors import ASCIIColors, trace_exception
 from typing import List, Dict
@@ -207,6 +208,114 @@ class OpenAIBinding(LollmsLLMBinding):
 
         return output
     
+    def chat(self,
+             discussion: LollmsDiscussion,
+             branch_tip_id: Optional[str] = None,
+             n_predict: Optional[int] = None,
+             stream: Optional[bool] = None,
+             temperature: float = 0.7,
+             top_k: int = 40,
+             top_p: float = 0.9,
+             repeat_penalty: float = 1.1,
+             repeat_last_n: int = 64,
+             seed: Optional[int] = None,
+             n_threads: Optional[int] = None,
+             ctx_size: Optional[int] = None,
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             ) -> Union[str, dict]:
+        """
+        Conduct a chat session with the OpenAI model using a LollmsDiscussion object.
+
+        Args:
+            discussion (LollmsDiscussion): The discussion object containing the conversation history.
+            branch_tip_id (Optional[str]): The ID of the message to use as the tip of the conversation branch. Defaults to the active branch.
+            n_predict (Optional[int]): Maximum number of tokens to generate.
+            stream (Optional[bool]): Whether to stream the output.
+            temperature (float): Sampling temperature.
+            top_k (int): Top-k sampling parameter (Note: not all OpenAI models use this).
+            top_p (float): Top-p sampling parameter.
+            repeat_penalty (float): Frequency penalty for repeated tokens.
+            seed (Optional[int]): Random seed for generation.
+            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+
+        Returns:
+            Union[str, dict]: The generated text or an error dictionary.
+        """
+        # 1. Export the discussion to the OpenAI chat format
+        # This handles system prompts, user/assistant roles, and multi-modal content automatically.
+        messages = discussion.export("openai_chat", branch_tip_id)
+
+        # Build the request parameters
+        params = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": n_predict,
+            "n": 1,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": repeat_penalty,
+            "stream": stream
+        }
+        # Add seed if available, as it's supported by newer OpenAI models
+        if seed is not None:
+            params["seed"] = seed
+
+        # Remove None values, as the API expects them to be absent
+        params = {k: v for k, v in params.items() if v is not None}
+        
+        output = ""
+        # 2. Call the API
+        try:
+            # Check if we should use the chat completions or legacy completions endpoint
+            if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
+                completion = self.client.chat.completions.create(**params)
+
+                if stream:
+                    for chunk in completion:
+                        # The streaming response for chat has a different structure
+                        delta = chunk.choices[0].delta
+                        if delta.content:
+                            word = delta.content
+                            if streaming_callback is not None:
+                                if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                                    break
+                            output += word
+                else:
+                    output = completion.choices[0].message.content
+
+            else: # Fallback to legacy completion format (not recommended for chat)
+                # We need to format the messages list into a single string prompt
+                legacy_prompt = discussion.export("openai_completion", branch_tip_id)
+                legacy_params = {
+                    "model": self.model_name,
+                    "prompt": legacy_prompt,
+                    "max_tokens": n_predict,
+                    "n": 1,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "frequency_penalty": repeat_penalty,
+                    "stream": stream
+                }
+                completion = self.client.completions.create(**legacy_params)
+
+                if stream:
+                    for chunk in completion:
+                        word = chunk.choices[0].text
+                        if streaming_callback is not None:
+                            if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                                break
+                        output += word
+                else:
+                    output = completion.choices[0].text
+        
+        except Exception as e:
+            # Handle API errors gracefully
+            error_message = f"An error occurred with the OpenAI API: {e}"
+            if streaming_callback:
+                streaming_callback(error_message, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": error_message}
+            
+        return output    
     def tokenize(self, text: str) -> list:
         """
         Tokenize the input text into a list of characters.
