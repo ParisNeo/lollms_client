@@ -7,7 +7,7 @@ from lollms_client.lollms_utilities import PromptReshaper # Keep general utiliti
 from lollms_client.lollms_mcp_binding import LollmsMCPBinding, LollmsMCPBindingManager
 
 
-__version__ = "0.20.5" # Updated version
+__version__ = "0.20.6" # Updated version
 
 # Optionally, you could define __all__ if you want to be explicit about exports
 __all__ = [
