@@ -54,10 +54,13 @@ class LollmsDiscussion:
         content: str,
         metadata: Dict = {},
         parent_id: Optional[str] = None,
-        images: Optional[List[Dict[str, str]]] = None
+        images: Optional[List[Dict[str, str]]] = None,
+        override_id: Optional[str] = None
     ) -> str:
         if parent_id is None:
             parent_id = self.active_branch_id
+        if parent_id is None:
+            parent_id = "main"
 
         message = LollmsMessage(
             sender=sender,
@@ -66,6 +69,8 @@ class LollmsDiscussion:
             metadata=str(metadata),
             images=images or []
         )
+        if override_id:
+            message.id = override_id
 
         self.messages.append(message)
         self.message_index[message.id] = message
