@@ -9,6 +9,7 @@ from collections import defaultdict
 @dataclass
 class LollmsMessage:
     sender: str
+    sender_type: str
     content: str
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     parent_id: Optional[str] = None
@@ -18,6 +19,7 @@ class LollmsMessage:
     def to_dict(self):
         return {
             'sender': self.sender,
+            'sender_type': self.sender_type,
             'content': self.content,
             'id': self.id,
             'parent_id': self.parent_id,
@@ -51,6 +53,7 @@ class LollmsDiscussion:
     def add_message(
         self,
         sender: str,
+        sender_type: str,
         content: str,
         metadata: Dict = {},
         parent_id: Optional[str] = None,
@@ -64,6 +67,7 @@ class LollmsDiscussion:
 
         message = LollmsMessage(
             sender=sender,
+            sender_type=sender_type,
             content=content,
             parent_id=parent_id,
             metadata=str(metadata),
@@ -151,8 +155,10 @@ class LollmsDiscussion:
             # Legacy v1 format
             prev_id = None
             for msg_data in data:
+                sender = msg_data.get('sender',"unknown")
                 msg = LollmsMessage(
-                    sender=msg_data['sender'],
+                    sender=sender,
+                    sender_type=msg_data.get("sender_type", "user" if sender!="lollms" and sender!="assistant" else "assistant"),
                     content=msg_data['content'],
                     parent_id=prev_id,
                     id=msg_data.get('id', str(uuid.uuid4())),
