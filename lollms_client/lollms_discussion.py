@@ -1,13 +1,22 @@
+# lollms_discussion.py
+
 import yaml
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Any
 import uuid
-import os
 from collections import defaultdict
 
-# LollmsMessage Class with parent_id support
+# It's good practice to forward-declare the type for the client to avoid circular imports.
+if False:
+    from lollms.client import LollmsClient
+
+
 @dataclass
 class LollmsMessage:
+    """
+    Represents a single message in a LollmsDiscussion, including its content,
+    sender, and relationship within the discussion tree.
+    """
     sender: str
     sender_type: str
     content: str
@@ -16,7 +25,8 @@ class LollmsMessage:
     metadata: str = "{}"
     images: List[Dict[str, str]] = field(default_factory=list)
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes the message object to a dictionary."""
         return {
             'sender': self.sender,
             'sender_type': self.sender_type,
@@ -26,52 +36,100 @@ class LollmsMessage:
             'metadata': self.metadata,
             'images': self.images
         }
- 
 
 
-# Enhanced LollmsDiscussion Class with branching support
 class LollmsDiscussion:
+    """
+    Manages a branching conversation tree, including system prompts, participants,
+    an internal knowledge scratchpad, and context pruning capabilities.
+    """
+
     def __init__(self, lollmsClient: 'LollmsClient'):
-        self.messages: List[LollmsMessage] = []
+        """
+        Initializes a new LollmsDiscussion instance.
+
+        Args:
+            lollmsClient: An instance of LollmsClient, required for tokenization.
+        """
         self.lollmsClient = lollmsClient
+        self.version: int = 3  # Current version of the format with scratchpad support
+        self._reset_state()
+
+    def _reset_state(self):
+        """Helper to reset all discussion attributes to their defaults."""
+        self.messages: List[LollmsMessage] = []
         self.active_branch_id: Optional[str] = None
         self.message_index: Dict[str, LollmsMessage] = {}
         self.children_index: Dict[Optional[str], List[str]] = defaultdict(list)
-        self.version: int = 2  # Current version of the format
-        self.participants: Dict[str, str] = {}  # name -> type ("user" or "assistant")
+        self.participants: Dict[str, str] = {}
         self.system_prompt: Optional[str] = None
+        self.scratchpad: Optional[str] = None
 
+    # --- Scratchpad Management Methods ---
+    def set_scratchpad(self, content: str):
+        """Sets or replaces the entire content of the internal scratchpad."""
+        self.scratchpad = content
+
+    def update_scratchpad(self, new_content: str, append: bool = True):
+        """
+        Updates the scratchpad. By default, it appends with a newline separator.
+
+        Args:
+            new_content: The new text to add to the scratchpad.
+            append: If True, appends to existing content. If False, replaces it.
+        """
+        if append and self.scratchpad:
+            self.scratchpad += f"\n{new_content}"
+        else:
+            self.scratchpad = new_content
+
+    def get_scratchpad(self) -> Optional[str]:
+        """Returns the current content of the scratchpad."""
+        return self.scratchpad
+
+    def clear_scratchpad(self):
+        """Clears the scratchpad content."""
+        self.scratchpad = None
+
+    # --- Configuration Methods ---
     def set_system_prompt(self, prompt: str):
+        """Sets the main system prompt for the discussion."""
         self.system_prompt = prompt
 
     def set_participants(self, participants: Dict[str, str]):
+        """
+        Defines the participants and their roles ('user' or 'assistant').
+
+        Args:
+            participants: A dictionary mapping sender names to roles.
+        """
         for name, role in participants.items():
             if role not in ["user", "assistant"]:
                 raise ValueError(f"Invalid role '{role}' for participant '{name}'")
         self.participants = participants
 
+    # --- Core Message Tree Methods ---
     def add_message(
         self,
         sender: str,
         sender_type: str,
         content: str,
-        metadata: Dict = {},
+        metadata: Optional[Dict] = None,
         parent_id: Optional[str] = None,
         images: Optional[List[Dict[str, str]]] = None,
         override_id: Optional[str] = None
     ) -> str:
+        """
+        Adds a new message to the discussion tree.
+        """
         if parent_id is None:
             parent_id = self.active_branch_id
         if parent_id is None:
-            parent_id = "main"
+            parent_id = "main_root"
 
         message = LollmsMessage(
-            sender=sender,
-            sender_type=sender_type,
-            content=content,
-            parent_id=parent_id,
-            metadata=str(metadata),
-            images=images or []
+            sender=sender, sender_type=sender_type, content=content,
+            parent_id=parent_id, metadata=str(metadata or {}), images=images or []
         )
         if override_id:
             message.id = override_id
@@ -79,427 +137,276 @@ class LollmsDiscussion:
         self.messages.append(message)
         self.message_index[message.id] = message
         self.children_index[parent_id].append(message.id)
-
         self.active_branch_id = message.id
         return message.id
 
-
     def get_branch(self, leaf_id: str) -> List[LollmsMessage]:
-        """Get full branch from root to specified leaf"""
+        """Gets the full branch of messages from the root to the specified leaf."""
         branch = []
-        current_id = leaf_id
-        
-        while current_id in self.message_index:
+        current_id: Optional[str] = leaf_id
+        while current_id and current_id in self.message_index:
             msg = self.message_index[current_id]
             branch.append(msg)
             current_id = msg.parent_id
-        
-        # Return from root to leaf
         return list(reversed(branch))
 
     def set_active_branch(self, message_id: str):
+        """Sets the active message, effectively switching to a different branch."""
         if message_id not in self.message_index:
-            raise ValueError(f"Message ID {message_id} not found")
+            raise ValueError(f"Message ID {message_id} not found in discussion.")
         self.active_branch_id = message_id
 
-    def remove_message(self, message_id: str):
-        if message_id not in self.message_index:
-            return
-
-        msg = self.message_index[message_id]
-        parent_id = msg.parent_id
-        
-        # Reassign children to parent
-        for child_id in self.children_index[message_id]:
-            child = self.message_index[child_id]
-            child.parent_id = parent_id
-            self.children_index[parent_id].append(child_id)
-        
-        # Clean up indexes
-        del self.message_index[message_id]
-        del self.children_index[message_id]
-        
-        # Remove from parent's children list
-        if parent_id in self.children_index and message_id in self.children_index[parent_id]:
-            self.children_index[parent_id].remove(message_id)
-        
-        # Remove from main messages list
-        self.messages = [m for m in self.messages if m.id != message_id]
-        
-        # Update active branch if needed
-        if self.active_branch_id == message_id:
-            self.active_branch_id = parent_id
-
+    # --- Persistence ---
     def save_to_disk(self, file_path: str):
+        """Saves the entire discussion state to a YAML file."""
         data = {
-            'version': self.version,
-            'active_branch_id': self.active_branch_id,
-            'system_prompt': self.system_prompt,
-            'participants': self.participants,
-            'messages': [m.to_dict() for m in self.messages]
+            'version': self.version, 'active_branch_id': self.active_branch_id,
+            'system_prompt': self.system_prompt, 'participants': self.participants,
+            'scratchpad': self.scratchpad, 'messages': [m.to_dict() for m in self.messages]
         }
         with open(file_path, 'w', encoding='utf-8') as file:
-            yaml.dump(data, file, allow_unicode=True)
-
+            yaml.dump(data, file, allow_unicode=True, sort_keys=False)
 
     def load_from_disk(self, file_path: str):
+        """Loads a discussion state from a YAML file."""
         with open(file_path, 'r', encoding='utf-8') as file:
             data = yaml.safe_load(file)
 
-        # Reset
-        self.messages = []
-        self.message_index = {}
-        self.children_index = defaultdict(list)
-
-        if isinstance(data, list):
-            # Legacy v1 format
-            prev_id = None
-            for msg_data in data:
-                sender = msg_data.get('sender',"unknown")
-                msg = LollmsMessage(
-                    sender=sender,
-                    sender_type=msg_data.get("sender_type", "user" if sender!="lollms" and sender!="assistant" else "assistant"),
-                    content=msg_data['content'],
-                    parent_id=prev_id,
-                    id=msg_data.get('id', str(uuid.uuid4())),
-                    metadata=msg_data.get('metadata', '{}')
-                )
-                self.messages.append(msg)
-                self.message_index[msg.id] = msg
-                self.children_index[prev_id].append(msg.id)
-                prev_id = msg.id
-            self.active_branch_id = prev_id if self.messages else None
-            self.system_prompt = None
-            self.participants = {}
-            self.save_to_disk(file_path)  # Upgrade
-            return
-
-        # v2 format
+        self._reset_state()
         version = data.get("version", 1)
-        if version != self.version:
-            raise ValueError(f"Unsupported version: {version}")
+        if version > self.version:
+            raise ValueError(f"File version {version} is newer than supported version {self.version}.")
 
         self.active_branch_id = data.get('active_branch_id')
         self.system_prompt = data.get('system_prompt', None)
         self.participants = data.get('participants', {})
+        self.scratchpad = data.get('scratchpad', None)
 
         for msg_data in data.get('messages', []):
-            # FIXED: Added `images=msg_data.get('images', [])` to correctly load images from the file.
             msg = LollmsMessage(
-                sender=msg_data['sender'],
-                content=msg_data['content'],
-                parent_id=msg_data.get('parent_id'),
-                id=msg_data.get('id'),
-                metadata=msg_data.get('metadata', '{}'),
-                images=msg_data.get('images', []) 
+                sender=msg_data['sender'], sender_type=msg_data.get('sender_type', 'user'),
+                content=msg_data['content'], parent_id=msg_data.get('parent_id'),
+                id=msg_data.get('id', str(uuid.uuid4())), metadata=msg_data.get('metadata', '{}'),
+                images=msg_data.get('images', [])
             )
             self.messages.append(msg)
             self.message_index[msg.id] = msg
             self.children_index[msg.parent_id].append(msg.id)
 
+    # --- Context Management and Formatting ---
+    def _get_full_system_prompt(self) -> Optional[str]:
+        """Combines the scratchpad and system prompt into a single string for the LLM."""
+        full_sys_prompt_parts = []
+        if self.scratchpad and self.scratchpad.strip():
+            full_sys_prompt_parts.append("--- KNOWLEDGE SCRATCHPAD ---")
+            full_sys_prompt_parts.append(self.scratchpad.strip())
+            full_sys_prompt_parts.append("--- END SCRATCHPAD ---")
+        
+        if self.system_prompt and self.system_prompt.strip():
+            full_sys_prompt_parts.append(self.system_prompt.strip())
+        return "\n\n".join(full_sys_prompt_parts) if full_sys_prompt_parts else None
+
+    def summarize_and_prune(self, max_tokens: int, preserve_last_n: int = 4, branch_tip_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Checks context size and, if exceeded, summarizes the oldest messages
+        into the scratchpad and prunes them to free up token space.
+        """
+        if branch_tip_id is None: branch_tip_id = self.active_branch_id
+        if not branch_tip_id: return {"pruned": False, "reason": "No active branch."}
+
+        full_prompt_text = self.export("lollms_text", branch_tip_id)
+        current_tokens = len(self.lollmsClient.binding.tokenize(full_prompt_text))
+        if current_tokens <= max_tokens: return {"pruned": False, "reason": "Token count within limit."}
+
+        branch = self.get_branch(branch_tip_id)
+        if len(branch) <= preserve_last_n: return {"pruned": False, "reason": "Not enough messages to prune."}
+
+        messages_to_prune = branch[:-preserve_last_n]
+        messages_to_keep = branch[-preserve_last_n:]
+        text_to_summarize = "\n\n".join([f"{self.participants.get(m.sender, 'user').capitalize()}: {m.content}" for m in messages_to_prune])
+        
+        summary_prompt = (
+            "You are a summarization expert. Read the following conversation excerpt and create a "
+            "concise, factual summary of all key information, decisions, and outcomes. This summary "
+            "will be placed in a knowledge scratchpad for future reference. Omit conversational filler.\n\n"
+            f"CONVERSATION EXCERPT:\n---\n{text_to_summarize}\n---\n\nCONCISE SUMMARY:"
+        )
+        try:
+            summary = self.lollmsClient.generate_text(summary_prompt, max_new_tokens=300, temperature=0.1)
+        except Exception as e:
+            return {"pruned": False, "reason": f"Failed to generate summary: {e}"}
+
+        summary_block = f"--- Summary of earlier conversation (pruned on {uuid.uuid4().hex[:8]}) ---\n{summary.strip()}"
+        self.update_scratchpad(summary_block, append=True)
+
+        ids_to_prune = {msg.id for msg in messages_to_prune}
+        new_root_of_branch = messages_to_keep[0]
+        original_parent_id = messages_to_prune[0].parent_id
+
+        self.message_index[new_root_of_branch.id].parent_id = original_parent_id
+        if original_parent_id in self.children_index:
+            self.children_index[original_parent_id] = [mid for mid in self.children_index[original_parent_id] if mid != messages_to_prune[0].id]
+            self.children_index[original_parent_id].append(new_root_of_branch.id)
+
+        for msg_id in ids_to_prune:
+            self.message_index.pop(msg_id, None)
+            self.children_index.pop(msg_id, None)
+        self.messages = [m for m in self.messages if m.id not in ids_to_prune]
+
+        new_prompt_text = self.export("lollms_text", branch_tip_id)
+        new_tokens = len(self.lollmsClient.binding.tokenize(new_prompt_text))
+        return {"pruned": True, "tokens_saved": current_tokens - new_tokens, "summary_added": True}
 
     def format_discussion(self, max_allowed_tokens: int, splitter_text: str = "!@>", branch_tip_id: Optional[str] = None) -> str:
+        """
+        Formats the discussion into a single string for instruct models,
+        truncating from the start to respect the token limit.
+
+        Args:
+            max_allowed_tokens: The maximum token limit for the final prompt.
+            splitter_text: The separator token to use (e.g., '!@>').
+            branch_tip_id: The ID of the branch to format. Defaults to active.
+
+        Returns:
+            A single, truncated prompt string.
+        """
         if branch_tip_id is None:
             branch_tip_id = self.active_branch_id
-
+        
         branch_msgs = self.get_branch(branch_tip_id) if branch_tip_id else []
-        formatted_text = ""
+        full_system_prompt = self._get_full_system_prompt()
+        
+        prompt_parts = []
         current_tokens = 0
-
-        # Start with system prompt if defined
-        if self.system_prompt:
-            sys_msg = f"!>system:\n{self.system_prompt.strip()}\n"
-            sys_tokens = len(self.lollmsClient.tokenize(sys_msg))
-            if max_allowed_tokens and current_tokens + sys_tokens <= max_allowed_tokens:
-                formatted_text += sys_msg
+        
+        # Start with the system prompt if defined
+        if full_system_prompt:
+            sys_msg_text = f"{splitter_text}system:\n{full_system_prompt}\n"
+            sys_tokens = len(self.lollmsClient.binding.tokenize(sys_msg_text))
+            if sys_tokens <= max_allowed_tokens:
+                prompt_parts.append(sys_msg_text)
                 current_tokens += sys_tokens
-
+        
+        # Iterate from newest to oldest to fill the remaining context
         for msg in reversed(branch_msgs):
+            sender_str = msg.sender.replace(':', '').replace(splitter_text, '')
             content = msg.content.strip()
-            # FIXED: Add a placeholder for images to represent them in text-only formats.
             if msg.images:
                 content += f"\n({len(msg.images)} image(s) attached)"
 
-            msg_text = f"{splitter_text}{msg.sender.replace(':', '').replace('!@>', '')}:\n{content}\n"
-            msg_tokens = len(self.lollmsClient.tokenize(msg_text))
+            msg_text = f"{splitter_text}{sender_str}:\n{content}\n"
+            msg_tokens = len(self.lollmsClient.binding.tokenize(msg_text))
+
             if current_tokens + msg_tokens > max_allowed_tokens:
-                break
-            formatted_text = msg_text + formatted_text
+                break # Stop if adding the next message exceeds the limit
+
+            prompt_parts.insert(1 if full_system_prompt else 0, msg_text) # Prepend after system prompt
             current_tokens += msg_tokens
-
-        return formatted_text.strip()
-
-    # gradio helpers -------------------------
-    def get_branch_as_chatbot_history(self, branch_tip_id: Optional[str] = None) -> List[List[str]]:
-        """
-        Converts a discussion branch into Gradio's chatbot list format.
-        [[user_msg, ai_reply], [user_msg, ai_reply], ...]
-        """
-        if branch_tip_id is None:
-            branch_tip_id = self.active_branch_id
-        if not branch_tip_id:
-            return []
-        
-        branch = self.get_branch(branch_tip_id)
-        history = []
-        for msg in branch:
-            # Determine the role from participants, default to 'user'
-            role = self.participants.get(msg.sender, "user")
-
-            if role == "user":
-                history.append([msg.content, None])
-            else:  # assistant
-                # If the last user message has no reply yet, append to it
-                if history and history[-1][1] is None:
-                    history[-1][1] = msg.content
-                else:  # Standalone assistant message (e.g., the first message)
-                    history.append([None, msg.content])
-        return history
-
-    def render_discussion_tree(self, active_branch_highlight: bool = True) -> str:
-        """
-        Renders the entire discussion tree as formatted Markdown for display.
-        """
-        if not self.messages:
-            return "No messages yet."
-
-        tree_markdown = "### Discussion Tree\n\n"
-        tree_markdown += "Click a message in the dropdown to switch branches.\n\n"
-        
-        # Find root nodes (messages with no parent)
-        root_ids = [msg.id for msg in self.messages if msg.parent_id is None]
-        
-        # Recursive function to render a node and its children
-        def _render_node(node_id: str, depth: int) -> str:
-            node = self.message_index.get(node_id)
-            if not node:
-                return ""
-
-            indent = "    " * depth
-            # Highlight the active message
-            is_active = ""
-            if active_branch_highlight and node.id == self.active_branch_id:
-                is_active = "  <span class='activ'>[ACTIVE]</span>"
             
-            # Format the message line
-            prefix = f"{indent}- **{node.sender}**: "
-            content_preview = node.content.replace('\n', ' ').strip()[:80]
-            line = f"{prefix} _{content_preview}..._{is_active}\n"
-            
-            # Recursively render children
-            children_ids = self.children_index.get(node.id, [])
-            for child_id in children_ids:
-                line += _render_node(child_id, depth + 1)
-            
-            return line
+        return "".join(prompt_parts).strip()
 
-        for root_id in root_ids:
-            tree_markdown += _render_node(root_id, 0)
-            
-        return tree_markdown
 
-    def get_message_choices(self) -> List[tuple]:
-        """
-        Creates a list of (label, id) tuples for a Gradio Dropdown component.
-        """
-        choices = [(f"{msg.sender}: {msg.content[:40]}... (ID: ...{msg.id[-4:]})", msg.id) for msg in self.messages]
-        # Sort by message creation order (assuming self.messages is ordered)
-        return choices
-    
-    
     def export(self, format_type: str, branch_tip_id: Optional[str] = None) -> Union[List[Dict], str]:
         """
-        Exports the discussion history in a specific format suitable for different model APIs.
-
-        Args:
-            format_type (str): The target format. Supported values are:
-                - "openai_chat": For OpenAI, llama.cpp, and other compatible chat APIs.
-                - "ollama_chat": For Ollama's chat API.
-                - "lollms_text": For the native lollms-webui text/image endpoints.
-                - "openai_completion": For legacy text completion APIs.
-            branch_tip_id (Optional[str]): The ID of the message to use as the
-                tip of the conversation branch. Defaults to the active branch.
-
-        Returns:
-            Union[List[Dict], str]: The formatted conversation history, either as a
-            list of dictionaries (for chat formats) or a single string.
+        Exports the full, untruncated discussion history in a specific format.
         """
-        if branch_tip_id is None:
-            branch_tip_id = self.active_branch_id
-        
-        # Handle case of an empty or uninitialized discussion
-        if branch_tip_id is None:
-            return "" if format_type in ["lollms_text", "openai_completion"] else []
+        if branch_tip_id is None: branch_tip_id = self.active_branch_id
+        if branch_tip_id is None and not self._get_full_system_prompt(): return "" if format_type in ["lollms_text", "openai_completion"] else []
 
-        branch = self.get_branch(branch_tip_id)
+        branch = self.get_branch(branch_tip_id) if branch_tip_id else []
+        full_system_prompt = self._get_full_system_prompt()
 
-        # --------------------- OpenAI Chat Format ---------------------
-        # Used by: OpenAI API, llama.cpp server, and many other compatible services.
-        # Structure: List of dictionaries with 'role' and 'content'.
-        # Images are handled via multi-part 'content'.
-        # --------------------------------------------------------------
         if format_type == "openai_chat":
             messages = []
-            if self.system_prompt:
-                messages.append({"role": "system", "content": self.system_prompt.strip()})
-
+            if full_system_prompt: messages.append({"role": "system", "content": full_system_prompt})
             def openai_image_block(image: Dict[str, str]) -> Dict:
-                """Creates a dict for an image URL, either from a URL or base64 data."""
                 image_url = image['data'] if image['type'] == 'url' else f"data:image/jpeg;base64,{image['data']}"
                 return {"type": "image_url", "image_url": {"url": image_url, "detail": "auto"}}
-
             for msg in branch:
                 role = self.participants.get(msg.sender, "user")
                 if msg.images:
-                    content_parts = []
-                    if msg.content.strip(): # Add text part only if content exists
-                        content_parts.append({"type": "text", "text": msg.content.strip()})
+                    content_parts = [{"type": "text", "text": msg.content.strip()}] if msg.content.strip() else []
                     content_parts.extend(openai_image_block(img) for img in msg.images)
                     messages.append({"role": role, "content": content_parts})
-                else:
-                    messages.append({"role": role, "content": msg.content.strip()})
+                else: messages.append({"role": role, "content": msg.content.strip()})
             return messages
 
-        # --------------------- Ollama Chat Format ---------------------
-        # Used by: Ollama's '/api/chat' endpoint.
-        # Structure: List of dictionaries with 'role', 'content', and an optional 'images' key.
-        # Images must be a list of base64-encoded strings. URLs are ignored.
-        # --------------------------------------------------------------
         elif format_type == "ollama_chat":
             messages = []
-            if self.system_prompt:
-                messages.append({"role": "system", "content": self.system_prompt.strip()})
-            
+            if full_system_prompt: messages.append({"role": "system", "content": full_system_prompt})
             for msg in branch:
                 role = self.participants.get(msg.sender, "user")
                 message_dict = {"role": role, "content": msg.content.strip()}
-                
-                # Filter for and add base64 images, as required by Ollama
                 ollama_images = [img['data'] for img in msg.images if img['type'] == 'base64']
-                if ollama_images:
-                    message_dict["images"] = ollama_images
-                
+                if ollama_images: message_dict["images"] = ollama_images
                 messages.append(message_dict)
             return messages
 
-        # --------------------- LoLLMs Native Text Format ---------------------
-        # Used by: lollms-webui's '/lollms_generate' and '/lollms_generate_with_images' endpoints.
-        # Structure: A single string with messages separated by special tokens like '!@>user:'.
-        # Images are not part of the string but are sent separately by the binding.
-        # --------------------------------------------------------------------
         elif format_type == "lollms_text":
             full_prompt_parts = []
-            if self.system_prompt:
-                full_prompt_parts.append(f"!@>system:\n{self.system_prompt.strip()}")
-            
+            if full_system_prompt: full_prompt_parts.append(f"!@>system:\n{full_system_prompt}")
             for msg in branch:
                 sender_str = msg.sender.replace(':', '').replace('!@>', '')
                 content = msg.content.strip()
-                # Images are handled separately by the binding, but a placeholder can be useful for context
-                if msg.images:
-                    content += f"\n({len(msg.images)} image(s) attached)"
+                if msg.images: content += f"\n({len(msg.images)} image(s) attached)"
                 full_prompt_parts.append(f"!@>{sender_str}:\n{content}")
-            
             return "\n".join(full_prompt_parts)
 
-        # ------------------ Legacy OpenAI Completion Format ------------------
-        # Used by: Older text-completion models.
-        # Structure: A single string with human-readable roles (e.g., "User:", "Assistant:").
-        # Images are represented by a text placeholder.
-        # ----------------------------------------------------------------------
         elif format_type == "openai_completion":
             full_prompt_parts = []
-            if self.system_prompt:
-                full_prompt_parts.append(f"System:\n{self.system_prompt.strip()}")
-            
+            if full_system_prompt: full_prompt_parts.append(f"System:\n{full_system_prompt}")
             for msg in branch:
                 role_label = self.participants.get(msg.sender, "user").capitalize()
                 content = msg.content.strip()
-                if msg.images:
-                    content += f"\n({len(msg.images)} image(s) attached)"
+                if msg.images: content += f"\n({len(msg.images)} image(s) attached)"
                 full_prompt_parts.append(f"{role_label}:\n{content}")
-            
             return "\n\n".join(full_prompt_parts)
 
-        else:
-            raise ValueError(f"Unsupported export format_type: {format_type}")
-# Example usage
+        else: raise ValueError(f"Unsupported export format_type: {format_type}")
+
+
 if __name__ == "__main__":
-    import base64
+    class MockBinding:
+        def tokenize(self, text: str) -> List[int]: return text.split()
+    class MockLollmsClient:
+        def __init__(self): self.binding = MockBinding()
+        def generate(self, prompt: str, max_new_tokens: int, temperature: float) -> str: return "This is a generated summary."
 
-    # 🔧 Mock client for token counting
-    from lollms_client import LollmsClient
-    client = LollmsClient(binding_name="ollama",model_name="mistral:latest")
-    discussion = LollmsDiscussion(client)
+    print("--- Initializing Mock Client and Discussion ---")
+    mock_client = MockLollmsClient()
+    discussion = LollmsDiscussion(mock_client)
+    discussion.set_participants({"User": "user", "Project Lead": "assistant"})
+    discussion.set_system_prompt("This is a formal discussion about Project Phoenix.")
+    discussion.set_scratchpad("Initial State: Project Phoenix is in the planning phase.")
 
-    # 👥 Set participants
-    discussion.set_participants({
-        "Alice": "user",
-        "Bob": "assistant"
-    })
+    print("\n--- Creating a long discussion history ---")
+    parent_id = None
+    long_text = "extra text to increase token count"
+    for i in range(10):
+        user_msg = f"Message #{i*2+1}: Update on task {i+1}? {long_text}"
+        user_id = discussion.add_message("User", "user", user_msg, parent_id=parent_id)
+        assistant_msg = f"Message #{i*2+2}: Task {i+1} status is blocked. {long_text}"
+        assistant_id = discussion.add_message("Project Lead", "assistant", assistant_msg, parent_id=user_id)
+        parent_id = assistant_id
     
-    # 📝 Set a system prompt
-    discussion.set_system_prompt("You are a helpful and friendly assistant.")
+    initial_tokens = len(mock_client.binding.tokenize(discussion.export("lollms_text")))
+    print(f"Initial message count: {len(discussion.messages)}, Initial tokens: {initial_tokens}")
 
-    # 📩 Add root message
-    msg1 = discussion.add_message('Alice', 'Hello!')
+    print("\n--- Testing Pruning ---")
+    prune_result = discussion.summarize_and_prune(max_tokens=200, preserve_last_n=4)
+    if prune_result.get("pruned"):
+        print("✅ Pruning was successful!")
+        assert "Summary" in discussion.get_scratchpad()
+    else: print(f"❌ Pruning failed: {prune_result.get('reason')}")
 
-    # 📩 Add reply
-    msg2 = discussion.add_message('Bob', 'Hi there!')
+    print("\n--- Testing format_discussion (Instruct Model Format) ---")
+    truncated_prompt = discussion.format_discussion(max_allowed_tokens=80)
+    truncated_tokens = len(mock_client.binding.tokenize(truncated_prompt))
+    print(f"Truncated prompt tokens: {truncated_tokens}")
+    print("Truncated Prompt:\n" + "="*20 + f"\n{truncated_prompt}\n" + "="*20)
 
-    # 🌿 Branch from msg1 with an image
-    msg3 = discussion.add_message(
-        'Alice',
-        'Here is an image of my dog.',
-        parent_id=msg1,
-        images=[{"type": "url", "data": "https://example.com/alices_dog.jpg"}]
-    )
-
-    # 🖼️ FIXED: Add another message with images using the 'images' parameter directly.
-    sample_base64 = base64.b64encode(b'This is a test image of a cat').decode('utf-8')
-    msg4 = discussion.add_message(
-        'Bob',
-        "Nice! Here's my cat.",
-        parent_id=msg3,
-        images=[
-            {"type": "url", "data": "https://example.com/bobs_cat.jpg"},
-            {"type": "base64", "data": sample_base64}
-        ]
-    )
-
-    # 🌿 Switch to the new branch
-    discussion.set_active_branch(msg4)
-
-    # 📁 Save and load discussion
-    discussion.save_to_disk("test_discussion.yaml")
-
-    print("\n💾 Discussion saved to test_discussion.yaml")
-    
-    new_discussion = LollmsDiscussion(client)
-    new_discussion.load_from_disk("test_discussion.yaml")
-    # Participants must be set again as they are part of the runtime configuration
-    # but the loader now correctly loads them from the file.
-    print("📂 Discussion loaded from test_discussion.yaml")
-
-
-    # 🧾 Format the discussion
-    formatted = new_discussion.format_discussion(1000)
-    print("\n📜 Formatted discussion (text-only with placeholders):\n", formatted)
-
-    # 🔁 Export to OpenAI Chat format
-    openai_chat = new_discussion.export("openai_chat")
-    print("\n📦 OpenAI Chat format:\n", yaml.dump(openai_chat, allow_unicode=True, sort_keys=False))
-
-    # 🔁 Export to OpenAI Completion format
-    openai_completion = new_discussion.export("openai_completion")
-    print("\n📜 OpenAI Completion format:\n", openai_completion)
-
-    # 🔁 Export to Ollama Chat format
-    ollama_export = new_discussion.export("ollama_chat")
-    print("\n🤖 Ollama Chat format:\n", yaml.dump(ollama_export, allow_unicode=True, sort_keys=False))
-
-    # Test that images were loaded correctly
-    final_message = new_discussion.message_index[new_discussion.active_branch_id]
-    assert len(final_message.images) == 2
-    assert final_message.images[1]['type'] == 'base64'
-    print("\n✅ Verification successful: Images were loaded correctly from the file.")
+    # Verification
+    assert truncated_tokens <= 80
+    # Check that it contains the newest message that fits
+    assert "Message #19" in truncated_prompt or "Message #20" in truncated_prompt 
+    print("✅ format_discussion correctly truncated the prompt.")

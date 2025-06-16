@@ -2,9 +2,9 @@ from  enum import Enum
 class MSG_TYPE(Enum):
     # Messaging
     MSG_TYPE_CHUNK                  = 0 # A chunk of a message (used for classical chat)
-    MSG_TYPE_FULL                   = 1 # A full message (for some personality the answer is sent in bulk)
-    MSG_TYPE_FULL_INVISIBLE_TO_AI   = 2 # A full message (for some personality the answer is sent in bulk)
-    MSG_TYPE_FULL_INVISIBLE_TO_USER = 3 # A full message (for some personality the answer is sent in bulk)
+    MSG_TYPE_CONTENT                   = 1 # A full message (for some personality the answer is sent in bulk)
+    MSG_TYPE_CONTENT_INVISIBLE_TO_AI   = 2 # A full message (for some personality the answer is sent in bulk)
+    MSG_TYPE_CONTENT_INVISIBLE_TO_USER = 3 # A full message (for some personality the answer is sent in bulk)
 
     # Conditionning
     # Informations

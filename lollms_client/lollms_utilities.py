@@ -7,6 +7,103 @@ import io
 import base64
 import re
 import numpy as np
+
+import json
+import re
+from ascii_colors import ASCIIColors, trace_exception
+def robust_json_parser(json_string: str) -> dict:
+    """
+    Parses a JSON string that may be malformed by an LLM by applying a series of cleaning strategies.
+
+    Args:
+        json_string: The string that is expected to contain a JSON object.
+
+    Returns:
+        A dictionary parsed from the JSON string.
+
+    Raises:
+        ValueError: If the string cannot be parsed after all cleaning attempts.
+
+    Strategies Applied in Order:
+    1.  Tries to parse the string directly.
+    2.  If that fails, it extracts the main JSON object or array from the string.
+    3.  Applies a series of fixes:
+        a. Replaces Python/JS boolean/null values with JSON-compliant ones.
+        b. Removes single-line and multi-line comments.
+        c. Fixes improperly escaped characters (e.g., \_).
+        d. Removes trailing commas from objects and arrays.
+        e. Escapes unescaped newline characters within strings.
+    4.  Tries to parse the cleaned string.
+    """
+    # 1. First attempt: Standard parsing
+    try:
+        return json.loads(json_string)
+    except json.JSONDecodeError:
+        pass # Will proceed to cleaning steps
+
+    # 2. Second attempt: Find a JSON object or array within a larger string
+    # This is useful if the LLM adds text like "Here is the JSON: {..}"
+    # Regex to find a JSON object `{...}` or array `[...]`
+    json_match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', json_string)
+    if json_match:
+        json_substring = json_match.group(0)
+    else:
+        # If no object or array is found, we work with the original string
+        json_substring = json_string
+        
+    # Store the potentially cleaned string
+    cleaned_string = json_substring
+
+    # 3. Third attempt: Apply a series of cleaning functions
+    try:
+        # a. Fix boolean and null values
+        cleaned_string = re.sub(r'\bTrue\b', 'true', cleaned_string)
+        cleaned_string = re.sub(r'\bFalse\b', 'false', cleaned_string)
+        cleaned_string = re.sub(r'\bNone\b', 'null', cleaned_string)
+
+        # b. Remove comments
+        # Remove // comments
+        cleaned_string = re.sub(r'//.*', '', cleaned_string)
+        # Remove /* ... */ comments
+        cleaned_string = re.sub(r'/\*[\s\S]*?\*/', '', cleaned_string)
+        
+        # c. Un-escape characters that are not valid JSON escape sequences
+        # e.g., \_ , \- , \* etc. that LLMs sometimes add.
+        cleaned_string = re.sub(r'\\([_`*#-])', r'\1', cleaned_string)
+
+        # d. Remove trailing commas
+        cleaned_string = re.sub(r',\s*(\}|\])', r'\1', cleaned_string)
+
+        # e. Fix unescaped newlines within strings. This is the most complex part.
+        # We iterate through the string and escape newlines only when inside a string literal.
+        in_string = False
+        escaped_string = []
+        for i, char in enumerate(cleaned_string):
+            if char == '"' and (i == 0 or cleaned_string[i-1] != '\\'):
+                in_string = not in_string
+            
+            if in_string and char == '\n':
+                escaped_string.append('\\n')
+            else:
+                escaped_string.append(char)
+        
+        cleaned_string = "".join(escaped_string)
+
+        return json.loads(cleaned_string)
+
+    except json.JSONDecodeError as e:
+        # If all else fails, raise the final error with context
+        ASCIIColors.error("Failed to parse JSON after all cleaning attempts. See details below.")
+        print("\n--- JSONDecodeError ---")
+        trace_exception(e)
+        print("\n--- Original String ---")
+        print(json_string)
+        print("\n--- Final Cleaned String Attempted ---")
+        print(cleaned_string)
+        raise ValueError(f"Failed to parse JSON. Final error: {e}") from e
+
+
+
 class PromptReshaper:
     def __init__(self, template:str):
         self.template = template

@@ -92,9 +92,9 @@ This module defines various enumerations used throughout the `lollms_client` lib
 *   **Purpose**: Enumerates different types of messages or events that can occur during LLM interaction, especially when streaming. This helps the client application understand the nature of each piece of information received.
 *   **Members**:
     *   `MSG_TYPE_CHUNK` (0): A segment of a larger message, typical for streamed responses.
-    *   `MSG_TYPE_FULL` (1): A complete message, sent in bulk.
-    *   `MSG_TYPE_FULL_INVISIBLE_TO_AI` (2): A complete message intended for the user/UI but not to be fed back to the AI in subsequent turns.
-    *   `MSG_TYPE_FULL_INVISIBLE_TO_USER` (3): A complete message intended for internal processing or AI context but not directly shown to the user (e.g., a thought process).
+    *   `MSG_TYPE_CONTENT` (1): A complete message, sent in bulk.
+    *   `MSG_TYPE_CONTENT_INVISIBLE_TO_AI` (2): A complete message intended for the user/UI but not to be fed back to the AI in subsequent turns.
+    *   `MSG_TYPE_CONTENT_INVISIBLE_TO_USER` (3): A complete message intended for internal processing or AI context but not directly shown to the user (e.g., a thought process).
     *   `MSG_TYPE_EXCEPTION` (4): An error or exception occurred.
     *   `MSG_TYPE_WARNING` (5): A warning message.
     *   `MSG_TYPE_INFO` (6): An informational message.

@@ -2,7 +2,7 @@
 import requests
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE, ELF_COMPLETION_FORMAT
-from lollms_client.lollms_utilities import encode_image # Keep utilities needed by core
+from lollms_client.lollms_utilities import robust_json_parser # Keep utilities needed by core
 from lollms_client.lollms_llm_binding import LollmsLLMBinding, LollmsLLMBindingManager
 # Import new Abstract Base Classes and Managers
 from lollms_client.lollms_tts_binding import LollmsTTSBinding, LollmsTTSBindingManager
@@ -597,336 +597,327 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
         response_full += response
         codes = self.extract_code_blocks(response, format=code_tag_format)
         return codes
+    
+    def _synthesize_knowledge(
+        self,
+        previous_scratchpad: str,
+        tool_name: str,
+        tool_params: dict,
+        tool_result: dict
+    ) -> str:
+        """
+        A dedicated LLM call to interpret a tool's output and update the knowledge scratchpad.
+        """
+        synthesis_prompt = (
+            "You are a data analyst assistant. Your sole job is to interpret the output of a tool and integrate it into the existing research summary (knowledge scratchpad).\n\n"
+            "--- PREVIOUS KNOWLEDGE SCRATCHPAD ---\n"
+            f"{previous_scratchpad}\n\n"
+            "--- ACTION JUST TAKEN ---\n"
+            f"Tool Called: `{tool_name}`\n"
+            f"Parameters: {json.dumps(tool_params)}\n\n"
+            "--- RAW TOOL OUTPUT ---\n"
+            f"```json\n{json.dumps(tool_result, indent=2)}\n```\n\n"
+            "--- YOUR TASK ---\n"
+            "Read the 'RAW TOOL OUTPUT' and explain what it means in plain language. Then, integrate this new information with the 'PREVIOUS KNOWLEDGE SCRATCHPAD' to create a new, complete, and self-contained summary.\n"
+            "Your output should be ONLY the text of the new scratchpad, with no extra commentary or formatting.\n\n"
+            "--- NEW KNOWLEDGE SCRATCHPAD ---\n"
+        )
+        new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
+        return self.remove_thinking_blocks(new_scratchpad_text).strip()
 
-    # --- Function Calling with MCP ---
+    def _build_final_decision_prompt(
+        self,
+        formatted_tools_list: str,
+        formatted_conversation_history: str,
+        current_plan: str,
+        knowledge_scratchpad: str,
+        agent_work_history_str: str,
+        ctx_size: Optional[int],
+    ) -> str:
+        """
+        Builds the decision prompt with explicit state-checking instructions to prevent loops.
+        """
+        final_agent_history = agent_work_history_str
+
+        if ctx_size:
+            get_token_count = len
+            static_parts_text = (
+                "You are a task-oriented AI assistant. Your goal is to execute a plan step-by-step without repeating work.\n\n"
+                "--- AVAILABLE TOOLS ---\n"
+                f"{formatted_tools_list}\n\n"
+                "--- CONVERSATION HISTORY ---\n"
+                f"{formatted_conversation_history}\n\n"
+                "--- CUMULATIVE KNOWLEDGE (What you know so far) ---\n"
+                f"{knowledge_scratchpad}\n\n"
+                "--- THE OVERALL PLAN ---\n"
+                f"{current_plan}\n\n"
+                "--- ACTIONS TAKEN THIS TURN ---\n"
+                "\n\n" # Empty history for size calculation
+                "--- YOUR TASK: STATE-DRIVEN EXECUTION ---\n"
+                "1.  **Identify the next step:** Look at 'THE OVERALL PLAN' and identify the very next incomplete step.\n"
+                "2.  **Check your knowledge:** Look at the 'CUMULATIVE KNOWLEDGE'. Have you already performed this step and recorded the result? For example, if the step is 'search for papers', check if the search results are already in the knowledge base.\n"
+                "3.  **Decide your action:**\n"
+                "    -   **If the step is NOT DONE:** Your action is `call_tool` to execute it.\n"
+                "    -   **If the step IS ALREADY DONE:** Your job is to update the plan by removing the completed step. Then, re-evaluate from step 1 with the *new, shorter plan*.\n"
+                "    -   **If ALL steps are done:** Your action is `final_answer`.\n"
+                "    -   **If you are blocked:** Your action is `clarify`.\n\n"
+                "--- OUTPUT FORMAT ---\n"
+                "Respond with a single JSON object inside a ```json markdown tag.\n"
+                "```json\n{\n"
+                '    "thought": "My explicit reasoning. First, I will state the next step from the plan. Second, I will check the cumulative knowledge to see if this step is already complete. Third, I will state my conclusion and chosen action based on that comparison.",\n'
+                '    "updated_plan": "The new, remaining plan. It is CRITICAL that you remove any step that you have confirmed is complete in your thought process.",\n'
+                '    "action": "The chosen action: \'call_tool\', \'clarify\', or \'final_answer\'.",\n'
+                '    "action_details": {\n'
+                '        "tool_name": "(Required if action is \'call_tool\') The tool for the CURRENT incomplete step.",\n'
+                '        "tool_params": {},\n'
+                '        "clarification_request": "(Required if action is \'clarify\') Your specific question to the user."\n'
+                "    }\n}\n```"
+            )
+            fixed_parts_size = get_token_count(static_parts_text)
+            available_space_for_history = ctx_size - fixed_parts_size - 100
+            if get_token_count(agent_work_history_str) > available_space_for_history:
+                if available_space_for_history > 0:
+                    truncation_point = len(agent_work_history_str) - available_space_for_history
+                    final_agent_history = ("[...history truncated due to context size...]\n" + agent_work_history_str[truncation_point:])
+                    ASCIIColors.warning("Agent history was truncated to fit the context window.")
+                else:
+                    final_agent_history = "[...history truncated due to context size...]"
+        
+        return (
+            "You are a task-oriented AI assistant. Your goal is to execute a plan step-by-step without repeating work.\n\n"
+            "--- AVAILABLE TOOLS ---\n"
+            f"{formatted_tools_list}\n\n"
+            "--- CONVERSATION HISTORY ---\n"
+            f"{formatted_conversation_history}\n\n"
+            "--- CUMULATIVE KNOWLEDGE (What you know so far) ---\n"
+            f"{knowledge_scratchpad}\n\n"
+            "--- THE OVERALL PLAN ---\n"
+            f"{current_plan}\n\n"
+            "--- ACTIONS TAKEN THIS TURN ---\n"
+            f"{final_agent_history}\n\n"
+            "--- YOUR TASK: STATE-DRIVEN EXECUTION ---\n"
+            "1.  **Identify the next step:** Look at 'THE OVERALL PLAN' and identify the very next incomplete step.\n"
+            "2.  **Check your knowledge:** Look at the 'CUMULATIVE KNOWLEDGE'. Have you already performed this step and recorded the result? For example, if the step is 'search for papers', check if the search results are already in the knowledge base.\n"
+            "3.  **Decide your action:**\n"
+            "    -   **If the step is NOT DONE:** Your action is `call_tool` to execute it.\n"
+            "    -   **If the step IS ALREADY DONE:** Your job is to update the plan by removing the completed step. Then, re-evaluate from step 1 with the *new, shorter plan*.\n"
+            "    -   **If ALL steps are done:** Your action is `final_answer`.\n"
+            "    -   **If you are blocked:** Your action is `clarify`.\n\n"
+            "--- OUTPUT FORMAT ---\n"
+            "Respond with a single JSON object inside a ```json markdown tag.\n"
+            "```json\n"
+            "{\n"
+            '    "thought": "My explicit reasoning. First, I will state the next step from the plan. Second, I will check the cumulative knowledge to see if this step is already complete. Third, I will state my conclusion and chosen action based on that comparison.",\n'
+            '    "updated_plan": "The new, remaining plan. It is CRITICAL that you remove any step that you have confirmed is complete in your thought process.",\n'
+            '    "action": "The chosen action: \'call_tool\', \'clarify\', or \'final_answer\'.",\n'
+            '    "action_details": {\n'
+            '        "tool_name": "(Required if action is \'call_tool\') The tool for the CURRENT incomplete step.",\n'
+            '        "tool_params": {},\n'
+            '        "clarification_request": "(Required if action is \'clarify\') Your specific question to the user."\n'
+            "    }\n"
+            "}\n"
+            "```"
+        )
+
+
     def generate_with_mcp(
         self,
         prompt: str,
-        discussion_history: Optional[List[Dict[str, str]]] = None, # e.g. [{"role":"user", "content":"..."}, {"role":"assistant", "content":"..."}]
+        system_prompt:str = None,
+        objective_extraction_system_prompt="Build a plan",
         images: Optional[List[str]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None, # List of MCP tool definitions
+        tools: Optional[List[Dict[str, Any]]] = None,
         max_tool_calls: int = 5,
-        max_llm_iterations: int = 10, # Safety break for LLM deciding to call tools repeatedly
-        tool_call_decision_temperature: float = 0.1, # Lower temp for more deterministic decision making
-        final_answer_temperature: float = None, # Use instance default if None
-        streaming_callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict], Optional[List]], bool]] = None,
-        interactive_tool_execution: bool = False, # If true, prompts user before executing a tool
+        max_llm_iterations: int = 10,
+        ctx_size: Optional[int] = None,
+        max_json_retries: int = 1,
+        tool_call_decision_temperature: float = 0.0,
+        final_answer_temperature: float = None,
+        streaming_callback: Optional[Callable[[str, int, Optional[Dict], Optional[List]], bool]] = None,
         **llm_generation_kwargs
     ) -> Dict[str, Any]:
-        """
-        Generates a response that may involve calling one or more tools via MCP.
+        if not self.binding or not self.mcp:
+            return {"final_answer": "", "tool_calls": [], "error": "LLM or MCP binding not initialized."}
 
-        Args:
-            prompt (str): The user's initial prompt.
-            discussion_history (Optional[List[Dict[str, str]]]): Previous turns of conversation.
-            images (Optional[List[str]]): Images provided with the current user prompt.
-            tools (Optional[List[Dict[str, Any]]]): A list of MCP tool definitions available for this call.
-                                                     If None, tools will be discovered from the MCP binding.
-            max_tool_calls (int): Maximum number of distinct tool calls allowed in one interaction turn.
-            max_llm_iterations (int): Maximum number of times the LLM can decide to call a tool
-                                      before being forced to generate a final answer.
-            tool_call_decision_temperature (float): Temperature for LLM when deciding on tool calls.
-            final_answer_temperature (float): Temperature for LLM when generating the final answer.
-            streaming_callback (Optional[Callable]): Callback for streaming LLM responses (tool decisions/final answer).
-                                                     Signature: (chunk_str, msg_type, metadata_dict, history_list_of_dicts_for_this_turn) -> bool
-            interactive_tool_execution (bool): If True, ask user for confirmation before executing each tool.
+        turn_history: List[Dict[str, Any]] = []
+        conversation_context = prompt 
 
-        Returns:
-            Dict[str, Any]: A dictionary containing:
-                - "final_answer" (str): The LLM's final textual answer.
-                - "tool_calls" (List[Dict]): A list of tools called, their params, and results.
-                - "error" (Optional[str]): Error message if something went wrong.
-        """
-        if not self.binding:
-            return {"final_answer": "", "tool_calls": [], "error": "LLM binding not initialized."}
-        if not self.mcp:
-            return {"final_answer": "", "tool_calls": [], "error": "MCP binding not initialized."}
-
-        turn_history: List[Dict[str, Any]] = [] # Tracks this specific turn's interactions (LLM thoughts, tool calls, tool results)
-        
-        # 1. Discover tools if not provided
         if tools is None:
             try:
                 tools = self.mcp.discover_tools(force_refresh=True)
-                if not tools:
-                    ASCIIColors.warning("No MCP tools discovered by the binding.")
+                if not tools: ASCIIColors.warning("No MCP tools discovered.")
             except Exception as e_disc:
                 return {"final_answer": "", "tool_calls": [], "error": f"Failed to discover MCP tools: {e_disc}"}
+
+        if not tools:
+            final_answer_text = self.generate_text(prompt=prompt, system_prompt=system_prompt, stream=streaming_callback is not None, streaming_callback=streaming_callback)
+            return {"final_answer": self.remove_thinking_blocks(final_answer_text), "tool_calls": [], "error": None}
+
+        knowledge_scratchpad = "No information gathered yet."
+        agent_work_history = [] 
+        formatted_tools_list = "\n".join([f"- Tool: {t.get('name')}\n  Description: {t.get('description')}\n  Schema: {json.dumps(t.get('input_schema'))}" for t in tools])
         
-        if not tools: # If still no tools after discovery attempt
-            ASCIIColors.info("No tools available for function calling. Generating direct response.")
-            final_answer = self.remove_thinking_blocks(self.generate_text(
-                prompt=prompt,
-                system_prompt= (discussion_history[0]['content'] if discussion_history and discussion_history[0]['role'] == 'system' else "") + "\nYou are a helpful assistant.", # Basic system prompt
-                images=images,
-                stream=streaming_callback is not None, # stream if callback is provided
-                streaming_callback=lambda chunk, msg_type: streaming_callback(chunk, msg_type, None, turn_history) if streaming_callback else None, # Adapt callback
-                temperature=final_answer_temperature if final_answer_temperature is not None else self.default_temperature,
-                **(llm_generation_kwargs or {})
-            ))
-            if isinstance(final_answer, dict) and "error" in final_answer: # Handle generation error
-                return {"final_answer": "", "tool_calls": [], "error": final_answer["error"]}
-            return {"final_answer": final_answer, "tool_calls": [], "error": None}
+        if streaming_callback:
+            streaming_callback("Building/Revising plan...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "plan_extraction"}, turn_history)
+        
+        obj_prompt = (
+            "You are an Intelligent Workflow Planner. Your mission is to create the most efficient plan possible by analyzing the user's request within the context of the full conversation.\n\n"
+            "Your Guiding Principle: **Always choose the path of least resistance.**\n\n"
+            "**Your Logical Process:**\n"
+            "1.  **Analyze the Entire Conversation:** Understand the user's ultimate goal based on all interaction so far.\n"
+            "2.  **Check for a Single-Step Solution:** Scrutinize the available tools. Can a single tool call directly achieve the user's current goal? \n"
+            "3.  **Formulate a Plan:** Based on your analysis, create a concise, numbered list of steps to achieve the goal. If the goal is simple, this may be only one step. If it is complex or multi-turn, it may be several steps.\n\n"
+            "**CRITICAL RULES:**\n"
+            "*   **MANDATORY: NEVER add steps the user did not ask for.** Do not embellish or add 'nice-to-have' features.\n"
+            "*   **Focus on the Goal:** Your plan should directly address the user's request as it stands now in the conversation.\n\n"
+            "---\n"
+            "**Available Tools:**\n"
+            f"{formatted_tools_list}\n\n"
+            "**Full Conversation History:**\n"
+            f'"{conversation_context}"'
+        )
+        initial_plan_gen = self.generate_text(prompt=obj_prompt, system_prompt=objective_extraction_system_prompt, temperature=0.0, stream=False)
+        current_plan = self.remove_thinking_blocks(initial_plan_gen).strip()
 
-
-        formatted_tools_list = "\n".join([
-            f"- Name: {t.get('name')}\n  Description: {t.get('description')}\n  Input Schema: {json.dumps(t.get('input_schema'))}"
-            for t in tools
-        ])
-
-        current_conversation: List[Dict[str, str]] = []
-        if discussion_history:
-            current_conversation.extend(discussion_history)
-        current_conversation.append({"role": "user", "content": prompt})
-        if images: # Add image representations to the last user message if supported by LLM and chat format
-            # This part is highly dependent on how the specific LLM binding handles images in chat.
-            # For simplicity, we'll assume if images are passed, the underlying generate_text handles it.
-            # A more robust solution would modify current_conversation[-1]['content'] structure.
-            ASCIIColors.info("Images provided. Ensure LLM binding's generate_text handles them with chat history.")
-
-
+        if streaming_callback:
+            streaming_callback(f"Current plan:\n{current_plan}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "plan_extraction"}, turn_history)
+        turn_history.append({"type": "initial_plan", "content": current_plan})
+        
         tool_calls_made_this_turn = []
         llm_iterations = 0
 
         while llm_iterations < max_llm_iterations:
             llm_iterations += 1
+            if streaming_callback: streaming_callback(f"LLM reasoning step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"planning_step_{llm_iterations}"}, turn_history)
             
-            # 2. Construct prompt for LLM to decide on tool call or direct answer
-            # We need to convert current_conversation into a single string prompt for `generate_code`
-            # or adapt `generate_code` to take a message list if underlying LLM supports chat for structured output.
-            # For now, let's assume `generate_code` takes a flat prompt.
-            
-            # Create a string representation of the conversation history
-            history_str = ""
-            for msg in current_conversation:
-                role_prefix = self.user_custom_header(msg["role"]) if msg["role"]=="user" else self.ai_custom_header(msg["role"]) if msg["role"]=="assistant" else self.system_custom_header(msg["role"]) if msg["role"]=="system" else "!@>unknown:"
-                history_str += f"{role_prefix}{msg['content']}\n"
-            
-            # Add tool execution results from previous iterations in this turn to the history string
-            for tc_info in tool_calls_made_this_turn:
-                if tc_info.get("result"): # Only add if there's a result (successful or error)
-                    history_str += f"{self.ai_full_header}(Executed tool '{tc_info['name']}' with params {tc_info['params']}. Result: {json.dumps(tc_info['result'])})\n"
+            formatted_agent_history = "No actions taken yet in this turn."
+            if agent_work_history:
+                history_parts = [ f"### Step {i+1}:\n**Thought:** {entry['thought']}\n**Action:** Called tool `{entry['tool_name']}` with parameters `{json.dumps(entry['tool_params'])}`\n**Observation (Tool Output):**\n```json\n{json.dumps(entry['tool_result'], indent=2)}\n```" for i, entry in enumerate(agent_work_history)]
+                formatted_agent_history = "\n\n".join(history_parts)
 
-
-            decision_prompt_template = f"""You are an AI assistant that can use tools to answer user requests.
-Available tools:
-{formatted_tools_list}
-
-Current conversation:
-{history_str}
-
-Based on the available tools and the current conversation, decide the next step.
-Respond with a JSON object containing ONE of the following structures:
-1. If you need to use a tool:
-   {{"action": "call_tool", "tool_name": "<name_of_tool_to_call>", "tool_params": {{<parameters_for_tool_as_json_object>}}}}
-2. If you can answer directly without using a tool OR if you have sufficient information from previous tool calls:
-   {{"action": "final_answer"}}
-3. If the user's request is unclear or you need more information before deciding:
-   {{"action": "clarify", "clarification_request": "<your_question_to_the_user>"}}
-""" # No {self.ai_full_header} here, generate_code will get raw JSON
-
-            if streaming_callback:
-                streaming_callback(f"LLM deciding next step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "decision_making"}, turn_history)
-
-            # Use generate_code to get structured JSON output from LLM
-            # Note: generate_code itself uses generate_text. We are asking for JSON here.
-            raw_llm_decision_json = self.generate_text(
-                prompt=decision_prompt_template, # This is the full prompt for the LLM
-                n_predict=512, # Reasonable size for decision JSON
-                temperature=tool_call_decision_temperature,
-                images=images
-                # `images` are part of the history_str if relevant to the binding
-                # streaming_callback=None, # Decisions are usually not streamed chunk by chunk
+            llm_decision = None
+            current_decision_prompt = self._build_final_decision_prompt(
+                formatted_tools_list=formatted_tools_list, formatted_conversation_history=conversation_context,
+                current_plan=current_plan, knowledge_scratchpad=knowledge_scratchpad,
+                agent_work_history_str=formatted_agent_history, ctx_size=ctx_size
             )
-            if streaming_callback:
-                streaming_callback(f"LLM decision received.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "decision_making"}, turn_history)
 
-
-            if not raw_llm_decision_json:
-                ASCIIColors.error("LLM failed to provide a decision JSON.")
-                turn_history.append({"type": "error", "content": "LLM failed to provide a decision."})
-                return {"final_answer": "I'm sorry, I encountered an issue trying to process your request.", "tool_calls": tool_calls_made_this_turn, "error": "LLM decision JSON was empty."}
-            
-            processed_raw_json = raw_llm_decision_json.strip() # Strip whitespace first
-            try:
-                llm_decision = json.loads(processed_raw_json)
-                turn_history.append({"type": "llm_decision", "content": llm_decision})
-            except json.JSONDecodeError:
-                ASCIIColors.error(f"Failed to parse LLM decision JSON: {raw_llm_decision_json}")
+            for i in range(max_json_retries + 1):
+                raw_llm_decision_json = self.generate_text(prompt=current_decision_prompt, n_predict=2048, temperature=tool_call_decision_temperature)
                 try:
-                    decoder = json.JSONDecoder()
-                    # Try to decode the first JSON object from the (stripped) string
-                    llm_decision, end_index = decoder.raw_decode(processed_raw_json)
-                    turn_history.append({"type": "llm_decision_extracted", "content": llm_decision, "raw_trimmed": processed_raw_json[:end_index]})
-                    
-                    remaining_text = processed_raw_json[end_index:].strip()
-                    if remaining_text:
-                        ASCIIColors.warning(f"LLM output contained additional text after the first JSON object: '{remaining_text}'. Processing only the first object.")
-                        turn_history.append({"type": "llm_extra_output_ignored", "content": remaining_text})
-                except json.JSONDecodeError as e_inner:
-                    ASCIIColors.error(f"Failed to parse LLM decision JSON even after attempting to extract first object: {raw_llm_decision_json}. Error: {e_inner}")
-                    turn_history.append({"type": "error", "content": "Failed to parse LLM decision JSON.", "raw_json": raw_llm_decision_json, "error_details": str(e_inner)})
-                    # Provide a generic error message, as the LLM's output was malformed.
-                    # Adding the raw output or a snippet to the conversation history might help the LLM recover or inform the user.
-                    current_conversation.append({
-                        "role": "assistant", 
-                        "content": "(I encountered an internal error trying to understand my next step. I will try to answer directly based on what I have so far.)"
-                    })
-                    break # Break to generate final answer with current info
+                    llm_decision = robust_json_parser(raw_llm_decision_json)
+                    if "action" not in llm_decision or "action_details" not in llm_decision or "updated_plan" not in llm_decision:
+                        raise KeyError("The JSON is missing required keys: 'action', 'action_details', or 'updated_plan'.")
+                    break 
+                except (json.JSONDecodeError, AttributeError, KeyError) as e:
+                    error_message = f"JSON parsing failed (Attempt {i+1}/{max_json_retries+1}). Error: {e}"
+                    ASCIIColors.warning(error_message)
+                    if streaming_callback: streaming_callback(error_message, MSG_TYPE.MSG_TYPE_WARNING, None, turn_history)
+                    turn_history.append({"type": "error", "content": f"Invalid JSON response: {raw_llm_decision_json}"})
+                    if i >= max_json_retries:
+                        ASCIIColors.error("Max JSON retries reached. Aborting agent loop.")
+                        llm_decision = None
+                        break
+                    current_decision_prompt = (
+                        "You previously failed to generate a valid JSON object. Review the error and your last output, then try again, adhering strictly to the required schema.\n\n"
+                        "--- ERROR ---\n"
+                        f"{str(e)}\n\n"
+                        "--- YOUR PREVIOUS (INVALID) OUTPUT ---\n"
+                        f"{raw_llm_decision_json}\n\n"
+                        "--- REQUIRED SCHEMA REMINDER ---\n"
+                        "Your response MUST be a single JSON object inside a ```json markdown tag. It must contain 'action', 'action_details', and 'updated_plan' keys.\n\n"
+                        "Now, please re-generate the JSON response correctly."
+                    )
+            if not llm_decision: break
 
-            if llm_decision is None: # If parsing failed and couldn't recover
-                return {"final_answer": "I'm sorry, I had trouble understanding the next step due to a formatting issue.", "tool_calls": tool_calls_made_this_turn, "error": "Invalid JSON from LLM for decision."}
-
+            turn_history.append({"type": "llm_decision", "content": llm_decision})
+            current_plan = llm_decision.get("updated_plan", current_plan)
             action = llm_decision.get("action")
+            action_details = llm_decision.get("action_details", {})
+            if streaming_callback: streaming_callback(f"LLM thought: {llm_decision.get('thought', 'N/A')}", MSG_TYPE.MSG_TYPE_INFO, {"id": "llm_thought"}, turn_history)
 
             if action == "call_tool":
                 if len(tool_calls_made_this_turn) >= max_tool_calls:
-                    ASCIIColors.warning("Maximum tool calls reached for this turn. Forcing final answer.")
-                    current_conversation.append({"role":"assistant", "content":"(Max tool calls reached. I will now try to formulate an answer based on available information.)"})
-                    break # Exit loop to generate final answer
-
-                tool_name = llm_decision.get("tool_name")
-                tool_params = llm_decision.get("tool_params", {})
-
-                if not tool_name:
-                    ASCIIColors.warning("LLM decided to call a tool but didn't specify tool_name.")
-                    current_conversation.append({"role":"assistant", "content":"(I decided to use a tool, but I'm unsure which one. Could you clarify?)"})
-                    break # Or ask LLM to try again without this faulty decision in history
-
-                tool_call_info = {"id": "tool_call_request", "name": tool_name, "params": tool_params}
-                turn_history.append(tool_call_info)
-                if streaming_callback:
-                     streaming_callback(f"LLM requests to call tool: {tool_name} with params: {tool_params}", MSG_TYPE.MSG_TYPE_INFO, tool_call_info, turn_history)
-                     streaming_callback("", MSG_TYPE.MSG_TYPE_TOOL_CALL, tool_call_info, turn_history)
+                    ASCIIColors.warning("Max tool calls reached. Forcing final answer.")
+                    break
+                tool_name = action_details.get("tool_name")
+                tool_params = action_details.get("tool_params", {})
+                if not tool_name or not isinstance(tool_params, dict):
+                    ASCIIColors.error(f"Invalid tool call from LLM: name={tool_name}, params={tool_params}")
+                    break
                 
-                # Interactive execution if enabled
-                if interactive_tool_execution:
-                    try:
-                        user_confirmation = input(f"AI wants to execute tool '{tool_name}' with params {tool_params}. Allow? (yes/no/details): ").lower()
-                        if user_confirmation == "details":
-                            tool_def_for_details = next((t for t in tools if t.get("name") == tool_name), None)
-                            print(f"Tool details: {json.dumps(tool_def_for_details, indent=2)}")
-                            user_confirmation = input(f"Allow execution of '{tool_name}'? (yes/no): ").lower()
-                        
-                        if user_confirmation != "yes":
-                            ASCIIColors.info("Tool execution cancelled by user.")
-                            tool_result = {"error": "Tool execution cancelled by user."}
-                            # Add this info to conversation for LLM
-                            current_conversation.append({"role": "assistant", "content": f"(Tool '{tool_name}' execution was cancelled by the user. What should I do next?)"})
-                            tool_call_info["result"] = tool_result # Record cancellation
-                            tool_calls_made_this_turn.append(tool_call_info)
-                            continue # Back to LLM for next decision
-                    except Exception as e_input: # Catch issues with input() e.g. in non-interactive env
-                        ASCIIColors.warning(f"Error during interactive confirmation: {e_input}. Proceeding without confirmation.")
-
-
-                if streaming_callback:
-                    streaming_callback(f"Executing tool: {tool_name}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "tool_execution", "tool_name": tool_name}, turn_history)
-                
+                if streaming_callback: streaming_callback(f"Executing tool: {tool_name}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"tool_exec_{llm_iterations}"}, turn_history)
                 tool_result = self.mcp.execute_tool(tool_name, tool_params, lollms_client_instance=self)
+                if streaming_callback:
+                    streaming_callback(f"Tool {tool_name} finished.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"tool_exec_{llm_iterations}"}, turn_history)
+                    streaming_callback(json.dumps(tool_result, indent=2), MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, tool_result, turn_history)
+
+                if streaming_callback: streaming_callback("Synthesizing new knowledge...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"synthesis_step_{llm_iterations}"}, turn_history)
+                new_scratchpad = self._synthesize_knowledge(previous_scratchpad=knowledge_scratchpad, tool_name=tool_name, tool_params=tool_params, tool_result=tool_result)
+                knowledge_scratchpad = new_scratchpad
+                if streaming_callback:
+                    streaming_callback(f"Knowledge scratchpad updated.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"synthesis_step_{llm_iterations}"}, turn_history)
+                    streaming_callback(f"New Scratchpad:\n{knowledge_scratchpad}", MSG_TYPE.MSG_TYPE_INFO, {"id": "scratchpad_update"}, turn_history)
                 
-                tool_call_info["result"] = tool_result # Add result to this call's info
-                tool_calls_made_this_turn.append(tool_call_info) # Log the completed call
-                if streaming_callback:
-                     streaming_callback(f"", MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, tool_result, turn_history)
-
-                if streaming_callback:
-                    streaming_callback(f"Tool {tool_name} execution finished. Result: {json.dumps(tool_result)}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "tool_execution", "tool_name": tool_name, "result": tool_result}, turn_history)
-
-                # Add tool execution result to conversation for the LLM
-                # The format of this message can influence how the LLM uses the tool output.
-                # current_conversation.append({"role": "tool_result", "tool_name": tool_name, "content": json.dumps(tool_result)}) # More structured
-                current_conversation.append({"role": "assistant", "content": f"(Tool '{tool_name}' executed. Result: {json.dumps(tool_result)})"})
-
-
+                work_entry = { "thought": llm_decision.get("thought", "N/A"), "tool_name": tool_name, "tool_params": tool_params, "tool_result": tool_result, "synthesized_knowledge": knowledge_scratchpad }
+                agent_work_history.append(work_entry)
+                tool_calls_made_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
+            
             elif action == "clarify":
-                clarification_request = llm_decision.get("clarification_request", "I need more information. Could you please clarify?")
-                if streaming_callback:
-                    streaming_callback(clarification_request, MSG_TYPE.MSG_TYPE_FULL, {"type": "clarification_request"}, turn_history)
-                turn_history.append({"type":"clarification_request_sent", "content": clarification_request})
-                return {"final_answer": clarification_request, "tool_calls": tool_calls_made_this_turn, "error": None}
-
+                clarification_request = action_details.get("clarification_request", "I need more information to proceed. Could you please clarify?")
+                return { "final_answer": clarification_request, "tool_calls": tool_calls_made_this_turn, "error": None, "clarification": True }
+            
             elif action == "final_answer":
                 ASCIIColors.info("LLM decided to formulate a final answer.")
-                current_conversation.append({"role":"assistant", "content":"(I will now formulate the final answer based on the information gathered.)"}) # Inform LLM's "thought process"
-                break # Exit loop to generate final answer
-            
-            else:
-                ASCIIColors.warning(f"LLM returned unknown action: {action}")
-                current_conversation.append({"role":"assistant", "content":f"(Received an unexpected decision: {action}. I will try to answer directly.)"})
-                break # Exit loop
-            
-            # Safety break if too many iterations without reaching final answer or max_tool_calls
-            if llm_iterations >= max_llm_iterations:
-                ASCIIColors.warning("Max LLM iterations reached. Forcing final answer.")
-                current_conversation.append({"role":"assistant", "content":"(Max iterations reached. I will now try to formulate an answer.)"})
                 break
-        
-        # 3. Generate final answer if LLM decided to, or if loop broke
-        if streaming_callback:
-            streaming_callback("LLM generating final answer...", MSG_TYPE.MSG_TYPE_STEP_START, {"type": "final_answer_generation"}, turn_history)
-
-        # Construct the final prompt string for generate_text from current_conversation
-        final_prompt_str = ""
-        final_system_prompt = ""
-        
-        # Consolidate system messages if any
-        interim_history_for_final_answer = []
-        for msg in current_conversation:
-            if msg["role"] == "system":
-                final_system_prompt += msg["content"] + "\n"
+            
             else:
-                interim_history_for_final_answer.append(msg)
+                ASCIIColors.warning(f"LLM returned unknown or missing action: '{action}'. Forcing final answer.")
+                break
+            
+            if streaming_callback: 
+                streaming_callback(f"LLM reasoning step (iteration {llm_iterations}) complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"planning_step_{llm_iterations}"}, turn_history)
+       
+        if streaming_callback: 
+            streaming_callback(f"LLM reasoning step (iteration {llm_iterations}) complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"planning_step_{llm_iterations}"}, turn_history)
+        if streaming_callback: 
+            streaming_callback("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "final_answer_synthesis"}, turn_history)
         
-        if not any(msg['role'] == 'user' for msg in interim_history_for_final_answer): # Ensure there's a user turn if only system + tool calls
-            interim_history_for_final_answer.append({'role':'user', 'content': prompt}) # Add original prompt if lost
-
-
-        # The generate_text method needs a single prompt and an optional system_prompt.
-        # We need to format the interim_history_for_final_answer into a single prompt string,
-        # or modify generate_text to accept a list of messages.
-        # For now, flatten to string:
-        current_prompt_for_final_answer = ""
-        for i, msg in enumerate(interim_history_for_final_answer):
-            role_prefix = self.user_custom_header(msg["role"]) if msg["role"]=="user" else self.ai_custom_header(msg["role"]) if msg["role"]=="assistant" else f"!@>{msg['role']}:"
-            current_prompt_for_final_answer += f"{role_prefix}{msg['content']}"
-            if i < len(interim_history_for_final_answer) -1 : # Add newline separator except for last
-                 current_prompt_for_final_answer += "\n"
-        # Add AI header to prompt AI to speak
-        current_prompt_for_final_answer += f"\n{self.ai_full_header}"
-
-
-        final_answer_text = self.generate_text(
-            prompt=current_prompt_for_final_answer, # Pass the conversation history as the prompt
-            system_prompt=final_system_prompt.strip(),
-            images=images if not tool_calls_made_this_turn else None, # Only pass initial images if no tool calls happened (context might be lost)
-            stream=streaming_callback is not None,
-            streaming_callback=lambda chunk, msg_type: streaming_callback(chunk, msg_type, {"type":"final_answer_chunk"}, turn_history) if streaming_callback else None,
-            temperature=final_answer_temperature if final_answer_temperature is not None else self.default_temperature,
-            **(llm_generation_kwargs or {})
+        final_answer_prompt = (
+            "You are an AI assistant tasked with providing a final, comprehensive answer to the user based on the research performed.\n\n"
+            "--- FULL CONVERSATION CONTEXT ---\n"
+            f"{conversation_context}\n\n"
+            "--- SUMMARY OF FINDINGS (Your Knowledge Scratchpad) ---\n"
+            f"{knowledge_scratchpad}\n\n"
+            "--- INSTRUCTIONS ---\n"
+            "- Synthesize a clear and complete answer for the user based ONLY on the information in the 'Summary of Findings'.\n"
+            "- Address the user directly and answer their latest query, considering the full conversation.\n"
+            "- Do not make up information. If the findings are insufficient to fully answer the request, state what you found and what remains unanswered.\n"
+            "- Format your response clearly using markdown where appropriate.\n"
         )
+        final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature if final_answer_temperature is not None else self.default_temperature, **(llm_generation_kwargs or {}))
+        
+        if streaming_callback: 
+            streaming_callback("Final answer generation complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "final_answer_synthesis"}, turn_history)
 
-        if streaming_callback:
-            streaming_callback("Final answer generation complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"type": "final_answer_generation"}, turn_history)
+        final_answer = self.remove_thinking_blocks(final_answer_text)
+        turn_history.append({"type":"final_answer_generated", "content": final_answer})
+        
+        return {"final_answer": final_answer, "tool_calls": tool_calls_made_this_turn, "error": None}
 
-        if isinstance(final_answer_text, dict) and "error" in final_answer_text: # Handle generation error
-            turn_history.append({"type":"error", "content":f"LLM failed to generate final answer: {final_answer_text['error']}"})
-            return {"final_answer": "", "tool_calls": tool_calls_made_this_turn, "error": final_answer_text["error"]}
-
-        turn_history.append({"type":"final_answer_generated", "content":final_answer_text})
-        return {"final_answer": final_answer_text, "tool_calls": tool_calls_made_this_turn, "error": None}
 
     def generate_text_with_rag(
         self,
         prompt: str,
         rag_query_function: Callable[[str, Optional[str], int, float], List[Dict[str, Any]]],
+        system_prompt: str = "",
+        objective_extraction_system_prompt="Extract objectives",
         rag_query_text: Optional[str] = None,
         rag_vectorizer_name: Optional[str] = None,
         rag_top_k: int = 5,
         rag_min_similarity_percent: float = 70.0,
-        max_rag_hops: int = 0,
+        max_rag_hops: int = 3,
         images: Optional[List[str]] = None,
-        system_prompt: str = "",
         n_predict: Optional[int] = None,
         stream: Optional[bool] = None,
         temperature: Optional[float] = None,
@@ -943,13 +934,11 @@ Respond with a JSON object containing ONE of the following structures:
         **llm_generation_kwargs
     ) -> Dict[str, Any]:
         """
-        Enhanced RAG with optional initial objective extraction and automatic intermediate summaries
-        when context grows beyond ctx_size or self.default_ctx_size.
+        Enhanced RAG with dynamic objective refinement and a knowledge scratchpad.
         """
         if not self.binding:
             return {"final_answer": "", "rag_hops_history": [], "all_retrieved_sources": [], "error": "LLM binding not initialized."}
 
-        # Determine effective context size limit
         effective_ctx_size = ctx_size or getattr(self, "default_ctx_size", 20000)
 
         turn_rag_history_for_callback: List[Dict[str, Any]] = []
@@ -957,183 +946,251 @@ Respond with a JSON object containing ONE of the following structures:
         all_unique_retrieved_chunks_map: Dict[str, Dict[str, Any]] = {}
 
         original_user_prompt = prompt
-        objectives_text = ""
-        # 0. Optional Objectives Extraction Step
+        
+        knowledge_scratchpad = "No information gathered yet."
+        current_objectives = ""
+
         if extract_objectives:
             if streaming_callback:
-                streaming_callback("Extracting and structuring objectives...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
+                streaming_callback("Extracting initial objectives...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
+            
             obj_prompt = (
-                "You are an expert analyst. "
-                "Your task is to extract and structure the key objectives from the user's request below. "
-                "Output a bullet list of objectives only.\n\n"
+                "You are an expert analyst. Your task is to extract and structure the key research objectives from the user's request below. "
+                "These objectives will guide a research process. Frame them as questions or tasks. "
+                "Output a bulleted list of objectives only without a comment.\n\n"
                 f"User request:\n\"{original_user_prompt}\""
             )
-            obj_gen = self.generate_text(
-                prompt=obj_prompt,
-                system_prompt="Extract objectives",
-                temperature=0.0,
-                n_predict=200,
-                stream=False
-            )
-            objectives_text = self.remove_thinking_blocks(obj_gen).strip()
+            initial_objectives_gen = self.generate_text(prompt=obj_prompt, system_prompt=objective_extraction_system_prompt, temperature=0.0, stream=False)
+            current_objectives = self.remove_thinking_blocks(initial_objectives_gen).strip()
+            
             if streaming_callback:
-                streaming_callback(f"Objectives:\n{objectives_text}", MSG_TYPE.MSG_TYPE_STEP, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
+                streaming_callback(f"Initial Objectives:\n{current_objectives}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
+        else:
+            current_objectives = f"Answer the user's request: '{original_user_prompt}'"
 
-            if streaming_callback:
-                streaming_callback(f"Objectives extracted:\n{objectives_text}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
+        if streaming_callback:
+            streaming_callback("Generating initial search query...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "initial_query_generation"}, turn_rag_history_for_callback)
+        if not rag_query_text:
+            initial_query_gen_prompt = f"""
+You are a research assistant. Your task is to formulate the first search query for a vector database based on an initial user request and research objectives. The query should be concise and target the most crucial information needed to start.
 
-        current_query_for_rag = rag_query_text or None
-        previous_queries=[]
-        # 1. RAG Hops
-        for hop_count in range(max_rag_hops + 1):
-            if streaming_callback:
-                streaming_callback(f"Starting RAG Hop {hop_count + 1}", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"rag_hop_{hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
-            txt_previous_queries = f"Previous queries:\n"+'\n'.join(previous_queries)+"\n\n" if len(previous_queries)>0 else ""
-            txt_informations = f"Information:\n"+'\n'.join([f"(from {chunk['document']}):{chunk['content']}" for _, chunk in all_unique_retrieved_chunks_map.items()]) if len(all_unique_retrieved_chunks_map)>0 else "This is the first request. No data received yet. Build a new query."
-            txt_sp = (
-                "Your objective is to analyze the provided chunks of information to determine "
-                "whether they are sufficient to reach the objective. If not, formulate a refined and focused query "
-                "that can retrieve more relevant information from a vector database. Ensure the query captures the semantic essence "
-                "of what is missing, is contextually independent, and is optimized for vector-based similarity search. "
-                "Do not repeat or rephrase earlier queries—always generate a new, meaningful atomic query targeting the current gap in knowledge."
-            )
+--- User's Request ---
+{original_user_prompt}
 
-            txt_formatting = """The output format must be in form of JSON placed inside a JSON markdown tag. Use the following schema:
+--- Initial Research Objectives ---
+{current_objectives}
+
+--- INSTRUCTIONS ---
+Generate a single, effective search query.
+
+--- OUTPUT FORMAT ---
+Provide your response as a single JSON object with one key, "query".
 ```json
-{
-    "decision": A boolean indicating your decision (true: more data is needed, false: the current data is sufficient),
-    "query": (str, optional, only if decision is true). A new, atomic query suitable for semantic search in a vector database. 
-            It should capture the missing concept or insight in concise, context-rich language, avoiding reuse of earlier queries.
-}
+{{
+    "query": "Your generated search query here."
+}}
 ```
 """
-            p = f"Objective:\n{objectives_text}\n\n{txt_previous_queries}\n\n{txt_informations}\n\n{txt_formatting}\n\n"
-            response = self.generate_code(p,system_prompt=txt_sp)
             try:
-                answer = json.loads(response)
-                decision = answer["decision"]
-                if not decision:
-                    if streaming_callback:
-                        streaming_callback(f"RAG Hop {hop_count + 1} done", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"rag_hop_{hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
+                raw_initial_query_response = self.generate_code(initial_query_gen_prompt, system_prompt="You are a query generation expert.", temperature=0.0)
+                initial_plan = json.loads(raw_initial_query_response)
+                current_query_for_rag = initial_plan.get("query")
+                if not current_query_for_rag:
+                    raise ValueError("LLM returned an empty initial query.")
+                if streaming_callback:
+                    streaming_callback(f"Initial query generated:\n'{current_query_for_rag}'", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "initial_query_generation"}, turn_rag_history_for_callback)
+            except Exception as e:
+                trace_exception(e)
+                current_query_for_rag = original_user_prompt
+                if streaming_callback:
+                    streaming_callback(f"Failed to generate initial query, falling back to user prompt. Error: {e}", MSG_TYPE.MSG_TYPE_WARNING, {"id": "initial_query_failure"}, turn_rag_history_for_callback)
+        else:
+            current_query_for_rag=rag_query_text
+            
+        previous_queries = []
 
-                    break
-                else:
-                    current_query_for_rag = str(answer["query"])
-            except Exception as ex:
-                trace_exception(ex)
-
+        for hop_count in range(max_rag_hops):
             if streaming_callback:
-                streaming_callback(f"Query: {current_query_for_rag}", MSG_TYPE.MSG_TYPE_STEP, {"id": f"query for hop {hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
-
-            # Retrieve chunks
+                streaming_callback(f"Starting RAG Hop {hop_count + 1}", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"rag_hop_{hop_count + 1}"}, turn_rag_history_for_callback)
+            
+            if streaming_callback:
+                streaming_callback(f"Executing Query:\n{current_query_for_rag}", MSG_TYPE.MSG_TYPE_STEP, {"id": f"query_exec_{hop_count + 1}"}, turn_rag_history_for_callback)
+            
             try:
-                retrieved = rag_query_function(current_query_for_rag, rag_vectorizer_name, rag_top_k, rag_min_similarity_percent)
+                retrieved_chunks = rag_query_function(current_query_for_rag, rag_vectorizer_name, rag_top_k, rag_min_similarity_percent)
             except Exception as e:
                 trace_exception(e)
                 return {"final_answer": "", "rag_hops_history": rag_hops_details_list, "all_retrieved_sources": list(all_unique_retrieved_chunks_map.values()), "error": str(e)}
 
             hop_details = {"query": current_query_for_rag, "retrieved_chunks_details": [], "status": ""}
             previous_queries.append(current_query_for_rag)
-            new_unique = 0
-            documents = []
-            for chunk in retrieved:
-                doc = chunk.get("file_path", "Unknown")
-                content = str(chunk.get("chunk_text", ""))
-                sim = float(chunk.get("similarity_percent", 0.0))
-                detail = {"document": doc, "similarity": sim, "content": content,
-                          "retrieved_in_hop": hop_count + 1, "query_used": current_query_for_rag}
-                documents.append(doc)
-                hop_details["retrieved_chunks_details"].append(detail)
-                key = f"{doc}::{content[:100]}"
-                if key not in all_unique_retrieved_chunks_map:
-                    all_unique_retrieved_chunks_map[key] = detail
-                    new_unique += 1
-            hop_details["status"] = "Completed" if retrieved else "No chunks retrieved"
-            if hop_count > 0 and new_unique == 0:
-                hop_details["status"] = "No *new* unique chunks retrieved"
+            
+            newly_retrieved_text = ""
+            new_chunks_count = 0
+            if retrieved_chunks:
+                for chunk in retrieved_chunks:
+                    doc = chunk.get("file_path", "Unknown")
+                    content = str(chunk.get("chunk_text", ""))
+                    sim = float(chunk.get("similarity_percent", 0.0))
+                    detail = {"document": doc, "similarity": sim, "content": content, "retrieved_in_hop": hop_count + 1, "query_used": current_query_for_rag}
+                    hop_details["retrieved_chunks_details"].append(detail)
+                    
+                    key = f"{doc}::{content[:100]}"
+                    if key not in all_unique_retrieved_chunks_map:
+                        all_unique_retrieved_chunks_map[key] = detail
+                        newly_retrieved_text += f"--- Document: {doc} (Similarity: {sim:.1f}%)\n{content}\n---\n"
+                        new_chunks_count += 1
+            
+            hop_details["status"] = f"Completed, found {len(retrieved_chunks)} chunks ({new_chunks_count} new)."
             rag_hops_details_list.append(hop_details)
-            if streaming_callback:
-                streaming_callback(f"Retreived {len(retrieved)} data chunks from {set(documents)}", MSG_TYPE.MSG_TYPE_STEP, {"id": f"retreival {hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
 
             if streaming_callback:
-                streaming_callback(f"RAG Hop {hop_count + 1} done", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"rag_hop_{hop_count + 1}", "hop": hop_count + 1}, turn_rag_history_for_callback)
+                streaming_callback(f"Retrieved {len(retrieved_chunks)} chunks ({new_chunks_count} new).", MSG_TYPE.MSG_TYPE_STEP, {"id": f"retrieval_info_{hop_count + 1}"}, turn_rag_history_for_callback)
 
+            if new_chunks_count == 0 and hop_count > 0:
+                 if streaming_callback:
+                    streaming_callback("No new unique information found, stopping RAG hops.", MSG_TYPE.MSG_TYPE_INFO, {"id": "rag_stop_no_new_info"}, turn_rag_history_for_callback)
+                 break
 
-        # 2. Prepare & Summarize Context
-        sorted_chunks = sorted(all_unique_retrieved_chunks_map.values(),
-                               key=lambda c: c["similarity"], reverse=True)
+            if streaming_callback:
+                streaming_callback("Analyzing findings and refining plan...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"planning_step_{hop_count + 1}"}, turn_rag_history_for_callback)
+                
+            planning_system_prompt = (
+                "You are a strategic research agent via multiple hops. Your task is to analyze new information, update your "
+                "understanding, refine your research objectives, and decide on the next best action."
+            )
+
+            planning_prompt = f"""
+--- Original User Request ---
+{original_user_prompt}
+
+--- Objectives you have formulated ---
+{current_objectives}
+
+--- Existing Knowledge Scratchpad (Summary of previous findings) ---
+{knowledge_scratchpad}
+
+--- Newly Retrieved Documents for this Hop ---
+{newly_retrieved_text if newly_retrieved_text else "No new documents were found with the last query."}
+
+--- Previous Queries (for reference, do not repeat) ---
+- {"- ".join(previous_queries)}
+
+--- INSTRUCTIONS ---
+1.  **Analyze & Update Knowledge:** Read the 'Newly Retrieved Documents'. Summarize the most important new facts and insights into a few bullet points for the 'new_notes_for_scratchpad'.
+2.  **Refine Objectives:** Review the 'Current Research Objectives'. Do the new documents answer any objectives? Do they reveal that some objectives need to be changed or made more specific? Rewrite the complete, updated list of objectives.
+3.  **Decide & Plan Next Query:** Based on your updated objectives and knowledge, decide if you have enough information to form a final answer.
+    - If YES, set `decision` to `false`.
+    - If NO, set `decision` to `true` and formulate a new, focused `query` to address the most critical remaining gap in your knowledge. The query must be different from previous ones.
+
+--- OUTPUT FORMAT ---
+Provide your response as a single JSON object inside a JSON markdown tag. Use this exact schema:
+```json
+{{
+    "updated_objectives": "(string) A bulleted list of the new, refined objectives based on the latest information.",
+    "new_notes_for_scratchpad": "(string) A concise summary in bullet points of key findings from the new documents.",
+    "decision": "boolean (true if you need to query again, false if you are done).",
+    "query": "(string, optional) The next query for the vector database if decision is true."
+}}
+```
+"""
+            raw_planning_response = self.generate_code(planning_prompt, system_prompt=planning_system_prompt, temperature=0.0)
+            
+            try:
+                plan = robust_json_parser(raw_planning_response)
+                
+                raw_notes = plan.get("new_notes_for_scratchpad")
+                if isinstance(raw_notes, list):
+                    notes_from_hop = "\n".join(str(item) for item in raw_notes if item).strip()
+                elif isinstance(raw_notes, str):
+                    notes_from_hop = raw_notes.strip()
+                else:
+                    notes_from_hop = ""
+                
+                if notes_from_hop:
+                    if knowledge_scratchpad == "No information gathered yet.":
+                        knowledge_scratchpad = f"Findings from Hop {hop_count + 1}:\n{notes_from_hop}"
+                    else:
+                        knowledge_scratchpad += f"\n\nFindings from Hop {hop_count + 1}:\n{notes_from_hop}"
+                
+                raw_objectives = plan.get("updated_objectives")
+                if isinstance(raw_objectives, list):
+                    current_objectives = "\n".join(str(item) for item in raw_objectives if item).strip()
+                elif isinstance(raw_objectives, str) and raw_objectives.strip():
+                     current_objectives = raw_objectives.strip()
+
+                if streaming_callback:
+                    streaming_callback(f"Refined Objectives:\n{current_objectives}\n\nNew Learnings:\n{notes_from_hop}", MSG_TYPE.MSG_TYPE_STEP, {"id": f"planning_output_{hop_count + 1}"}, turn_rag_history_for_callback)
+
+                if not plan.get("decision", False):
+                    if streaming_callback:
+                        streaming_callback("LLM decided it has enough information.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"rag_hop_{hop_count + 1}"}, turn_rag_history_for_callback)
+                    break
+                else:
+                    next_query = plan.get("query")
+                    if not next_query:
+                        if streaming_callback:
+                            streaming_callback("LLM decided to continue but provided no query. Stopping.", MSG_TYPE.MSG_TYPE_WARNING, {"id": "rag_stop_no_query"}, turn_rag_history_for_callback)
+                        break
+                    current_query_for_rag = next_query
+            
+            except Exception as ex:
+                trace_exception(ex)
+                if streaming_callback:
+                    streaming_callback(f"Error processing planning step: {ex}. Stopping RAG.", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": f"planning_error_{hop_count + 1}"}, turn_rag_history_for_callback)
+                break
+
+            if streaming_callback:
+                streaming_callback(f"RAG Hop {hop_count + 1} done", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"rag_hop_{hop_count + 1}"}, turn_rag_history_for_callback)
+
+        sorted_chunks = sorted(all_unique_retrieved_chunks_map.values(), key=lambda c: c["similarity"], reverse=True)
         context_lines = []
         total_chars = 0
         for c in sorted_chunks:
-            snippet = (
-                f"Source: {c['document']} (Sim: {c['similarity']:.1f}%, "
-                f"Hop: {c['retrieved_in_hop']}, Query: '{c['query_used']}')\n"
-                f"{c['content']}\n---\n"
-            )
-            if total_chars + len(snippet) > max_rag_context_characters:
-                break
+            snippet = (f"Source: {c['document']} (Sim: {c['similarity']:.1f}%)\n{c['content']}\n---\n")
+            if total_chars + len(snippet) > max_rag_context_characters: break
             context_lines.append(snippet)
             total_chars += len(snippet)
-
         accumulated_context = "".join(context_lines)
 
-        # If context exceeds our effective limit, summarize it
         if self.count_tokens(accumulated_context) > effective_ctx_size:
-            if streaming_callback:
-                streaming_callback("Context too large, performing intermediate summary...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "intermediate_summary"}, turn_rag_history_for_callback)
-            summary_prompt = (
-                "Summarize the following gathered context into a concise form "
-                "that preserves all key facts and sources needed to answer the user's request:\n\n"
-                f"{accumulated_context}"
-            )
-            summary = self.generate_text(
-                prompt=summary_prompt,
-                system_prompt="Intermediate summary",
-                temperature=0.0,
-                n_predict= n_predict or 512,
-                stream=False
-            )
-            accumulated_context = self.remove_thinking_blocks(summary).strip()
-            if streaming_callback:
-                streaming_callback("Intermediate summary complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "intermediate_summary"}, turn_rag_history_for_callback)
+            pass
 
-        # 3. Final Answer Generation
-        final_prompt = [
-            f"Original request: {original_user_prompt}"
+        if streaming_callback:
+            streaming_callback("Compiling final answer from all findings...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "final_answer_generation"}, turn_rag_history_for_callback)
+
+        final_prompt_parts = [
+            f"**User's Original Request:**\n{original_user_prompt}\n",
+            f"**Final Research Objectives:**\n{current_objectives}\n",
+            f"**Knowledge Scratchpad (Summary of Findings):**\n{knowledge_scratchpad}\n",
         ]
-        if objectives_text:
-            final_prompt.insert(1, f"Structured Objectives:\n{objectives_text}\n")
         if accumulated_context:
-            final_prompt.append(
-                "\nBased on the gathered context:\n---\n"
-                f"{accumulated_context}\n---"
+            final_prompt_parts.append(
+                "**Supporting Raw Context from Retrieved Documents:**\n---\n"
+                f"{accumulated_context}\n---\n"
             )
         else:
-            final_prompt.append("\n(No relevant context retrieved.)")
-        final_prompt.append(
-            "\nProvide a comprehensive answer using ONLY the above context. "
-            "If context is insufficient, state so clearly."
+            final_prompt_parts.append("**Supporting Raw Context:**\n(No relevant documents were retrieved.)\n")
+        
+        final_prompt_parts.append(
+            "**Final Instruction:**\nSynthesize a comprehensive answer to the user's original request. "
+            "Use the 'Knowledge Scratchpad' as your primary source of information and the 'Supporting Raw Context' for specific details and quotes. "
+            "Adhere strictly to the information provided. If the information is insufficient to fully answer, state what is missing based on your 'Final Research Objectives'."
         )
-        final_prompt.append(self.ai_full_header)
+        final_prompt_parts.append(self.ai_full_header)
 
         final_answer = self.generate_text(
-            prompt="\n".join(final_prompt),
-            images=images,
-            system_prompt=system_prompt,
-            n_predict=n_predict,
-            stream=stream,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repeat_penalty=repeat_penalty,
-            repeat_last_n=repeat_last_n,
-            seed=seed,
-            n_threads=n_threads,
-            ctx_size=ctx_size,
+            prompt="\n".join(final_prompt_parts),
+            images=images, system_prompt=system_prompt, n_predict=n_predict, stream=stream,
+            temperature=temperature, top_k=top_k, top_p=top_p, repeat_penalty=repeat_penalty,
+            repeat_last_n=repeat_last_n, seed=seed, n_threads=n_threads, ctx_size=ctx_size,
             streaming_callback=streaming_callback if stream else None,
             **llm_generation_kwargs
         )
         answer_text = self.remove_thinking_blocks(final_answer) if isinstance(final_answer, str) else final_answer
+        
+        if streaming_callback:
+            streaming_callback("Final answer generated.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "final_answer_generation"}, turn_rag_history_for_callback)
 
         return {
             "final_answer": answer_text,
@@ -1141,7 +1198,303 @@ Respond with a JSON object containing ONE of the following structures:
             "all_retrieved_sources": list(all_unique_retrieved_chunks_map.values()),
             "error": None
         }
+    
+    def generate_with_mcp_rag(
+        self,
+        prompt: str,
+        rag_query_function: Callable[[str, Optional[str], int, float], List[Dict[str, Any]]],
+        system_prompt: str = None,
+        objective_extraction_system_prompt="Extract objectives",
+        images: Optional[List[str]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        max_tool_calls: int = 10,
+        max_llm_iterations: int = 15,
+        tool_call_decision_temperature: float = 0.0,
+        final_answer_temperature: float = None,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict], Optional[List]], bool]] = None,
+        build_plan: bool = True,
+        rag_vectorizer_name: Optional[str] = None,
+        rag_top_k: int = 5,
+        rag_min_similarity_percent: float = 70.0,
+        **llm_generation_kwargs
+    ) -> Dict[str, Any]:
+        """
+        Generates a response using a stateful agent that can choose between calling standard
+        MCP tools and querying a RAG database, all within a unified reasoning loop.
+        """
+        if not self.binding:
+            return {"final_answer": "", "tool_calls": [], "error": "LLM binding not initialized."}
+        if not self.mcp:
+            return {"final_answer": "", "tool_calls": [], "error": "MCP binding not initialized."}
 
+        # --- Initialize Agent State ---
+        turn_history: List[Dict[str, Any]] = []
+        original_user_prompt = prompt
+        knowledge_scratchpad = "No information gathered yet."
+        current_objectives = ""
+        agent_work_history = []
+        tool_calls_made_this_turn = []
+        llm_iterations = 0
+
+        # --- 1. Discover MCP Tools and Inject the RAG Tool ---
+        if tools is None:
+            try:
+                mcp_tools = self.mcp.discover_tools(force_refresh=True)
+                if not mcp_tools: ASCIIColors.warning("No MCP tools discovered.")
+            except Exception as e_disc:
+                return {"final_answer": "", "tool_calls": [], "error": f"Failed to discover MCP tools: {e_disc}"}
+        else:
+            mcp_tools = tools
+
+        # Define the RAG tool and add it to the list
+        rag_tool_definition = {
+            "name": "research::query_database",
+            "description": (
+                "Queries a vector database to find relevant text chunks based on a natural language query. "
+                "Use this to gather information, answer questions, or find context for a task before using other tools."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The natural language query to search for. Be specific to get the best results."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+        available_tools = [rag_tool_definition] + mcp_tools
+
+        # --- 2. Optional Initial Objectives Extraction ---
+        formatted_tools_list = "\n".join([
+            f"- Full Tool Name: {t.get('name')}\n  Description: {t.get('description')}\n  Input Schema: {json.dumps(t.get('input_schema'))}"
+            for t in available_tools
+        ])        
+        if build_plan:
+            if streaming_callback:
+                streaming_callback("Extracting initial objectives...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "objectives_extraction"}, turn_history)
+            
+            # The enhanced prompt is placed inside the original parenthesis format.
+            # The f-strings for tool lists and user prompts are preserved.
+
+            obj_prompt = (
+                "You are a hyper-efficient and logical project planner. Your sole purpose is to analyze the user's request and create a concise, numbered list of actionable steps to fulfill it.\n\n"
+                "Your plan must be the most direct and minimal path to the user's goal.\n\n"
+                "**Your Core Directives:**\n\n"
+                "1.  **Analyze the Request:** Break down the user's prompt into the essential, core tasks required.\n"
+                "2.  **Evaluate Tools with Extreme Scrutiny:** For each task, determine if a tool is **absolutely necessary**. Do not suggest a tool unless the task is impossible without it.\n"
+                "3.  **Prioritize Simplicity:** If the request can be answered directly without any tools (e.g., it's a simple question or requires a creative response), your entire plan should be a single step: \"1. Formulate a direct answer to the user's request.\"\n\n"
+                "**CRITICAL RULES:**\n"
+                "*   **DO NOT** add any steps, objectives, or tool uses that were not explicitly required by the user.\n"
+                "*   **DO NOT** attempt to use a tool just because it is available. Most requests will not require any tools.\n"
+                "*   **DO NOT** add \"nice-to-have\" or \"extra\" tasks. Stick strictly to the request.\n\n"
+                "Your final output must be a short, numbered list of steps. Do not call any tools in this planning phase.\n\n"
+                "---\n"
+                "**Available Tools:**\n"
+                f"{formatted_tools_list}\n\n"
+                "**User Request:**\n"
+                f'"{original_user_prompt}"'
+            )
+            initial_objectives_gen = self.generate_text(prompt=obj_prompt, system_prompt=objective_extraction_system_prompt, temperature=0.0, stream=False)
+            current_objectives = self.remove_thinking_blocks(initial_objectives_gen).strip()
+            
+            if streaming_callback:
+                streaming_callback(f"Initial Objectives:\n{current_objectives}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "objectives_extraction"}, turn_history)
+        else:
+            current_objectives = f"Fulfill the user's request: '{original_user_prompt}'"
+
+        turn_history.append({"type": "initial_objectives", "content": current_objectives})
+
+
+
+        # --- 3. Main Agent Loop ---
+        while llm_iterations < max_llm_iterations:
+            llm_iterations += 1
+            if streaming_callback:
+                streaming_callback(f"LLM reasoning step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"planning_step_{llm_iterations}"}, turn_history)
+            
+            # Format agent history for the prompt
+            formatted_agent_history = "No actions taken yet."
+            if agent_work_history:
+                history_parts = []
+                for i, entry in enumerate(agent_work_history):
+                    history_parts.append(
+                        f"### Step {i+1}:\n"
+                        f"**Thought:** {entry['thought']}\n"
+                        f"**Action:** Called tool `{entry['tool_name']}` with parameters `{json.dumps(entry['tool_params'])}`\n"
+                        f"**Observation:**\n```json\n{json.dumps(entry['tool_result'], indent=2)}\n```"
+                    )
+                formatted_agent_history = "\n\n".join(history_parts)
+
+            # Construct the "Thinking & Planning" prompt
+            decision_prompt_template = f"""You are a strategic AI assistant. Your goal is to achieve a set of objectives by intelligently using research and system tools.
+
+--- AVAILABLE TOOLS ---
+{formatted_tools_list}
+
+--- CURRENT STATE ---
+Original User Request: {original_user_prompt}
+Current Research Objectives:
+{current_objectives}
+
+Knowledge Scratchpad (our current understanding):
+{knowledge_scratchpad}
+
+--- AGENT WORK HISTORY (previous steps in this turn) ---
+{formatted_agent_history}
+
+--- INSTRUCTIONS ---
+1.  **Analyze:** Review the entire work history, objectives, and scratchpad.
+2.  **Update State:** Based on the latest observations, update the scratchpad and refine the objectives. The scratchpad should be a comprehensive summary of ALL knowledge gathered.
+3.  **Decide Next Action:** Choose ONE of the following: `call_tool`, `final_answer`, or `clarify`. Always prefer to gather information with `research::query_database` before attempting to use other tools if you lack context.
+
+--- OUTPUT FORMAT ---
+Respond with a single JSON object inside a JSON markdown tag. Use this exact schema:
+```json
+{{
+    "thought": "Your reasoning for the chosen action, analyzing how the work history informs your next step. Explain why you are choosing a specific tool (or to answer).",
+    "updated_scratchpad": "The new, complete, and comprehensive summary of all knowledge gathered. Integrate new findings with old ones. if no new knowledge is gathered, this should be an empty string.",
+    "updated_objectives": "The full, potentially revised, list of objectives. If no change, repeat the current list.",
+    "action": "The chosen action: 'call_tool', 'final_answer', or 'clarify'.",
+    "tool_name": "(string, if action is 'call_tool') The full 'alias::tool_name' of the tool to use.",
+    "tool_params": {{"query": "...", "param2": "..."}},
+    "clarification_request": "(string, if action is 'clarify') Your question to the user."
+}}
+```
+"""
+            raw_llm_decision_json = self.generate_text(
+                prompt=decision_prompt_template, n_predict=2048, temperature=tool_call_decision_temperature
+            )
+
+            # --- 4. Parse LLM's plan and update state ---
+            try:
+                llm_decision = robust_json_parser(raw_llm_decision_json)
+                turn_history.append({"type": "llm_plan", "content": llm_decision})
+                
+                current_objectives = llm_decision.get("updated_objectives", current_objectives)
+                new_scratchpad = llm_decision.get("updated_scratchpad")
+                
+                if new_scratchpad and new_scratchpad != knowledge_scratchpad:
+                    knowledge_scratchpad = new_scratchpad
+                    if streaming_callback:
+                        streaming_callback(f"Knowledge scratchpad updated.", MSG_TYPE.MSG_TYPE_STEP, {"id": "scratchpad_update"}, turn_history)
+                        streaming_callback(f"New Scratchpad:\n{knowledge_scratchpad}", MSG_TYPE.MSG_TYPE_INFO, {"id":"scratch_pad_update"}, turn_history)
+                
+            except (json.JSONDecodeError, AttributeError, KeyError) as e:
+                ASCIIColors.error(f"Failed to parse LLM decision JSON: {raw_llm_decision_json}. Error: {e}")
+                turn_history.append({"type": "error", "content": f"Failed to parse LLM plan: {raw_llm_decision_json}"})
+                break
+
+            if streaming_callback:
+                streaming_callback(f"LLM thought: {llm_decision.get('thought', 'N/A')}", MSG_TYPE.MSG_TYPE_INFO, {"id": "llm_thought"}, turn_history)
+
+            # --- 5. Execute the chosen action ---
+            action = llm_decision.get("action")
+            tool_result = None
+
+            if action == "call_tool":
+                if len(tool_calls_made_this_turn) >= max_tool_calls:
+                    ASCIIColors.warning("Max tool calls reached. Forcing final answer.")
+                    break
+
+                tool_name = llm_decision.get("tool_name")
+                tool_params = llm_decision.get("tool_params", {})
+
+                if not tool_name or not isinstance(tool_params, dict):
+                    ASCIIColors.error(f"Invalid tool call from LLM: name={tool_name}, params={tool_params}")
+                    break
+
+                if streaming_callback:
+                    streaming_callback(f"Executing tool: {tool_name}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"tool_exec_{llm_iterations}"}, turn_history)
+                
+                try:
+                    # ** DYNAMIC TOOL/RAG DISPATCH **
+                    if tool_name == "research::query_database":
+                        query = tool_params.get("query")
+                        if not query:
+                            tool_result = {"error": "RAG tool called without a 'query' parameter."}
+                        else:
+                            retrieved_chunks = rag_query_function(query, rag_vectorizer_name, rag_top_k, rag_min_similarity_percent)
+                            if not retrieved_chunks:
+                                tool_result = {"summary": "No relevant documents found for the query.", "chunks": []}
+                            else:
+                                tool_result = {
+                                    "summary": f"Found {len(retrieved_chunks)} relevant document chunks.",
+                                    "chunks": retrieved_chunks
+                                }
+                    else:
+                        # Standard MCP tool execution
+                        tool_result = self.mcp.execute_tool(tool_name, tool_params, lollms_client_instance=self)
+                
+                except Exception as e_exec:
+                    trace_exception(e_exec)
+                    tool_result = {"error": f"An exception occurred while executing tool '{tool_name}': {e_exec}"}
+
+                # Record the work cycle in the agent's history
+                work_entry = {
+                    "thought": llm_decision.get("thought", "N/A"),
+                    "tool_name": tool_name,
+                    "tool_params": tool_params,
+                    "tool_result": tool_result
+                }
+                agent_work_history.append(work_entry)
+                tool_calls_made_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
+                
+                if streaming_callback:
+                    streaming_callback(f"Tool {tool_name} finished.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"tool_exec_{llm_iterations}"}, turn_history)
+                    streaming_callback(json.dumps(tool_result, indent=2), MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, tool_result, turn_history)
+
+            elif action == "clarify":
+                clarification_request = llm_decision.get("clarification_request", "I need more information. Could you please clarify?")
+                return {"final_answer": clarification_request, "tool_calls": tool_calls_made_this_turn, "error": None, "clarification": True}
+
+            elif action == "final_answer":
+                ASCIIColors.info("LLM decided to formulate a final answer.")
+                break
+            
+            else:
+                ASCIIColors.warning(f"LLM returned unknown or missing action: '{action}'. Forcing final answer.")
+                break
+            if streaming_callback:
+                streaming_callback(f"LLM reasoning step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"planning_step_{llm_iterations}"}, turn_history)
+       
+        if streaming_callback:
+            streaming_callback(f"LLM reasoning step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"planning_step_{llm_iterations}"}, turn_history)
+        # --- 6. Generate Final Answer ---
+        if streaming_callback:
+            streaming_callback("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "final_answer_synthesis"}, turn_history)
+
+        final_answer_prompt = f"""You are an AI assistant providing a final, comprehensive answer based on research and tool use.
+
+--- CONTEXT ---
+Original User Request: "{original_user_prompt}"
+
+--- SUMMARY OF FINDINGS (Knowledge Scratchpad) ---
+{knowledge_scratchpad}
+
+--- INSTRUCTIONS ---
+- Synthesize a clear, complete answer for the user based ONLY on the information in the 'Summary of Findings'.
+- Address the user directly and answer their original request.
+- Do not make up information. If the findings are insufficient, state what you found and what remains unanswered.
+"""
+        final_answer_text = self.generate_text(
+            prompt=final_answer_prompt,
+            system_prompt=system_prompt,
+            images=images,
+            stream=streaming_callback is not None,
+            streaming_callback=streaming_callback,
+            temperature=final_answer_temperature if final_answer_temperature is not None else self.default_temperature,
+            **(llm_generation_kwargs or {})
+        )
+
+        if streaming_callback:
+            streaming_callback("Final answer generation complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "final_answer_synthesis"}, turn_history)
+
+        final_answer = self.remove_thinking_blocks(final_answer_text)
+        turn_history.append({"type":"final_answer_generated", "content": final_answer})
+        
+        return {"final_answer": final_answer, "tool_calls": tool_calls_made_this_turn, "error": None}
 
     def generate_code(
                         self,
