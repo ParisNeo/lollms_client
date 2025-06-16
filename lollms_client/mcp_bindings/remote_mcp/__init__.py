@@ -5,8 +5,10 @@ from lollms_client.lollms_mcp_binding import LollmsMCPBinding
 from ascii_colors import ASCIIColors, trace_exception
 import threading
 import json
+import pipmaster as pm
 
 try:
+    pm.ensure_packages(["mcp"])
     from mcp import ClientSession, types
     from mcp.client.streamable_http import streamablehttp_client
     MCP_LIBRARY_AVAILABLE = True

@@ -977,7 +977,7 @@ Respond with a JSON object containing ONE of the following structures:
             )
             objectives_text = self.remove_thinking_blocks(obj_gen).strip()
             if streaming_callback:
-                streaming_callback(f"Objectives: {objectives_text}", MSG_TYPE.MSG_TYPE_STEP, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
+                streaming_callback(f"Objectives:\n{objectives_text}", MSG_TYPE.MSG_TYPE_STEP, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
 
             if streaming_callback:
                 streaming_callback(f"Objectives extracted:\n{objectives_text}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "objectives_extraction"}, turn_rag_history_for_callback)
