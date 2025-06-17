@@ -9,18 +9,7 @@ import re
 import numpy as np
 
 import json
-import re
 from ascii_colors import ASCIIColors, trace_exception
-import re
-import json
-import re
-import json
-
-import re
-import json
-
-import re
-import json
 
 def robust_json_parser(json_string: str) -> dict:
     """
