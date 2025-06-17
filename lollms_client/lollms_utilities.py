@@ -11,97 +11,122 @@ import numpy as np
 import json
 import re
 from ascii_colors import ASCIIColors, trace_exception
+import re
+import json
+import re
+import json
+
+import re
+import json
+
+import re
+import json
+
 def robust_json_parser(json_string: str) -> dict:
     """
-    Parses a JSON string that may be malformed by an LLM by applying a series of cleaning strategies.
+    Parses a possibly malformed JSON string using a series of corrective strategies.
 
     Args:
-        json_string: The string that is expected to contain a JSON object.
+        json_string: A string expected to represent a JSON object or array.
 
     Returns:
         A dictionary parsed from the JSON string.
 
     Raises:
-        ValueError: If the string cannot be parsed after all cleaning attempts.
-
-    Strategies Applied in Order:
-    1.  Tries to parse the string directly.
-    2.  If that fails, it extracts the main JSON object or array from the string.
-    3.  Applies a series of fixes:
-        a. Replaces Python/JS boolean/null values with JSON-compliant ones.
-        b. Removes single-line and multi-line comments.
-        c. Fixes improperly escaped characters (e.g., \_).
-        d. Removes trailing commas from objects and arrays.
-        e. Escapes unescaped newline characters within strings.
-    4.  Tries to parse the cleaned string.
+        ValueError: If parsing fails after all correction attempts.
     """
-    # 1. First attempt: Standard parsing
+
+    # STEP 0: Remove code block wrappers if present (e.g., ```json ... ```)
+    json_string = re.sub(r"^```(?:json)?\s*|\s*```$", '', json_string.strip())
+
+    # STEP 1: Attempt to parse directly
     try:
         return json.loads(json_string)
     except json.JSONDecodeError:
-        pass # Will proceed to cleaning steps
+        pass
 
-    # 2. Second attempt: Find a JSON object or array within a larger string
-    # This is useful if the LLM adds text like "Here is the JSON: {..}"
-    # Regex to find a JSON object `{...}` or array `[...]`
+    # STEP 2: Extract likely JSON substring
     json_match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', json_string)
-    if json_match:
-        json_substring = json_match.group(0)
-    else:
-        # If no object or array is found, we work with the original string
-        json_substring = json_string
-        
-    # Store the potentially cleaned string
-    cleaned_string = json_substring
+    cleaned_string = json_match.group(0) if json_match else json_string
 
-    # 3. Third attempt: Apply a series of cleaning functions
     try:
-        # a. Fix boolean and null values
+        # STEP 3a: Normalize Python/JS booleans/nulls
         cleaned_string = re.sub(r'\bTrue\b', 'true', cleaned_string)
         cleaned_string = re.sub(r'\bFalse\b', 'false', cleaned_string)
         cleaned_string = re.sub(r'\bNone\b', 'null', cleaned_string)
 
-        # b. Remove comments
-        # Remove // comments
+        # STEP 3b: Remove comments (single-line and block)
         cleaned_string = re.sub(r'//.*', '', cleaned_string)
-        # Remove /* ... */ comments
         cleaned_string = re.sub(r'/\*[\s\S]*?\*/', '', cleaned_string)
-        
-        # c. Un-escape characters that are not valid JSON escape sequences
-        # e.g., \_ , \- , \* etc. that LLMs sometimes add.
-        cleaned_string = re.sub(r'\\([_`*#-])', r'\1', cleaned_string)
 
-        # d. Remove trailing commas
+        # STEP 3c: Remove bad escape sequences like \_ or \*
+        cleaned_string = re.sub(r'\\([_`*#\-])', r'\1', cleaned_string)
+
+        # STEP 3d: Remove trailing commas
         cleaned_string = re.sub(r',\s*(\}|\])', r'\1', cleaned_string)
 
-        # e. Fix unescaped newlines within strings. This is the most complex part.
-        # We iterate through the string and escape newlines only when inside a string literal.
-        in_string = False
-        escaped_string = []
-        for i, char in enumerate(cleaned_string):
-            if char == '"' and (i == 0 or cleaned_string[i-1] != '\\'):
-                in_string = not in_string
-            
-            if in_string and char == '\n':
-                escaped_string.append('\\n')
-            else:
-                escaped_string.append(char)
-        
-        cleaned_string = "".join(escaped_string)
+        # STEP 3e: Escape unescaped newlines inside string literals
+        def escape_newlines_in_strings(text: str) -> str:
+            in_string = False
+            result = []
+            i = 0
+            while i < len(text):
+                c = text[i]
+                if c == '"' and (i == 0 or text[i - 1] != '\\'):
+                    in_string = not in_string
+                if in_string and c == '\n':
+                    result.append('\\n')
+                else:
+                    result.append(c)
+                i += 1
+            return ''.join(result)
 
+        cleaned_string = escape_newlines_in_strings(cleaned_string)
+
+        # STEP 3f: Escape unescaped inner double quotes inside strings
+        def escape_unescaped_inner_quotes(text: str) -> str:
+            def fix(match):
+                s = match.group(0)
+                inner = s[1:-1]
+                # Escape double quotes that aren't already escaped
+                inner_fixed = re.sub(r'(?<!\\)"', r'\\"', inner)
+                return f'"{inner_fixed}"'
+            return re.sub(r'"(?:[^"\\]|\\.)*"', fix, text)
+
+        cleaned_string = escape_unescaped_inner_quotes(cleaned_string)
+
+        # STEP 3g: Convert single-quoted strings to double quotes (arrays or object keys)
+        cleaned_string = re.sub(
+            r"(?<=[:\[,])\s*'([^']*?)'\s*(?=[,\}\]])", 
+            lambda m: '"' + m.group(1).replace('"', '\\"') + '"', 
+            cleaned_string
+        )
+        cleaned_string = re.sub(
+            r"(?<=\{)\s*'([^']*?)'\s*:", 
+            lambda m: '"' + m.group(1).replace('"', '\\"') + '":', 
+            cleaned_string
+        )
+
+        # STEP 3h: Remove non-breaking spaces and control characters
+        cleaned_string = re.sub(r'[\x00-\x1F\x7F\u00A0]', '', cleaned_string)
+
+        # STEP 3i: Fix smart quotes
+        cleaned_string = cleaned_string.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+
+        # STEP 3j: Remove line breaks between JSON tokens that don't belong
+        cleaned_string = re.sub(r'"\s*\n\s*"', '"\\n"', cleaned_string)
+
+        # Final parse
         return json.loads(cleaned_string)
 
     except json.JSONDecodeError as e:
-        # If all else fails, raise the final error with context
-        ASCIIColors.error("Failed to parse JSON after all cleaning attempts. See details below.")
         print("\n--- JSONDecodeError ---")
-        trace_exception(e)
+        print(e)
         print("\n--- Original String ---")
         print(json_string)
         print("\n--- Final Cleaned String Attempted ---")
         print(cleaned_string)
         raise ValueError(f"Failed to parse JSON. Final error: {e}") from e
-
 
 
 class PromptReshaper:
