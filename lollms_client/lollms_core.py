@@ -260,6 +260,81 @@ class LollmsClient():
         self.end_ai_header_id_template =": "
         self.end_ai_message_id_template =""
 
+    # 
+    def update_llm_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        """Update the LLM binding with a new configuration."""
+        self.binding = self.binding_manager.create_binding(
+            binding_name=binding_name,
+            host_address=self.host_address,
+            models_path=self.models_path,
+            model_name=self.binding.model_name,  # Keep the same model name
+            service_key=self.service_key,
+            verify_ssl_certificate=self.verify_ssl_certificate,
+            **(config or {})
+        )
+        if self.binding is None:
+            available = self.binding_manager.get_available_bindings()
+            raise ValueError(f"Failed to update LLM binding: {binding_name}. Available: {available}")
+
+    def update_tts_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        """Update the TTS binding with a new configuration."""
+        self.tts = self.tts_binding_manager.create_binding(
+            binding_name=binding_name,
+            **(config or {})
+        )
+        if self.tts is None:
+            available = self.tts_binding_manager.get_available_bindings()
+            raise ValueError(f"Failed to update TTS binding: {binding_name}. Available: {available}")
+
+    def update_tti_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        """Update the TTI binding with a new configuration."""
+        self.tti = self.tti_binding_manager.create_binding(
+            binding_name=binding_name,
+            **(config or {})
+        )
+        if self.tti is None:
+            available = self.tti_binding_manager.get_available_bindings()
+            raise ValueError(f"Failed to update TTI binding: {binding_name}. Available: {available}")
+
+    def update_stt_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        """Update the STT binding with a new configuration."""
+        self.stt = self.stt_binding_manager.create_binding(
+            binding_name=binding_name,
+            **(config or {})
+        )
+        if self.stt is None:
+            available = self.stt_binding_manager.get_available_bindings()
+            raise ValueError(f"Failed to update STT binding: {binding_name}. Available: {available}")
+
+    def update_ttv_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        """Update the TTV binding with a new configuration."""
+        self.ttv = self.ttv_binding_manager.create_binding(
+            binding_name=binding_name,
+            **(config or {})
+        )
+        if self.ttv is None:
+            available = self.ttv_binding_manager.get_available_bindings()
+            raise ValueError(f"Failed to update TTV binding: {binding_name}. Available: {available}")
+
+    def update_ttm_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        """Update the TTM binding with a new configuration."""
+        self.ttm = self.ttm_binding_manager.create_binding(
+            binding_name=binding_name,
+            **(config or {})
+        )
+        if self.ttm is None:
+            available = self.ttm_binding_manager.get_available_bindings()
+            raise ValueError(f"Failed to update TTM binding: {binding_name}. Available: {available}")
+
+    def update_mcp_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
+        """Update the MCP binding with a new configuration."""
+        self.mcp = self.mcp_binding_manager.create_binding(
+            binding_name=binding_name,
+            **(config or {})
+        )
+        if self.mcp is None:
+            available = self.mcp_binding_manager.get_available_bindings()
+            raise ValueError(f"Failed to update MCP binding: {binding_name}. Available: {available}")
 
     # --- Prompt Formatting Properties ---
     @property
@@ -780,7 +855,8 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
         current_plan = self.remove_thinking_blocks(initial_plan_gen).strip()
 
         if streaming_callback:
-            streaming_callback(f"Current plan:\n{current_plan}", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "plan_extraction"}, turn_history)
+            streaming_callback("Building/Revising plan...", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "plan_extraction"}, turn_history)
+            streaming_callback(f"Current plan:\n{current_plan}", MSG_TYPE.MSG_TYPE_STEP, {"id": "plan"}, turn_history)
         turn_history.append({"type": "initial_plan", "content": current_plan})
         
         tool_calls_made_this_turn = []
