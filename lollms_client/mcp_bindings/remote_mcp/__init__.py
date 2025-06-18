@@ -44,7 +44,8 @@ class RemoteMCPBinding(LollmsMCPBinding):
             **other_config_params (Any): Additional configuration parameters.
         """
         super().__init__(binding_name="remote_mcp")
-        
+        # initialization in case no servers are present
+        self.servers = None
         if not MCP_LIBRARY_AVAILABLE:
             ASCIIColors.error(f"{self.binding_name}: MCP library not available. This binding will be disabled.")
             return
