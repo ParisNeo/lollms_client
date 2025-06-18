@@ -449,7 +449,7 @@ class OllamaBinding(LollmsLLMBinding):
         """
         return {
             "name": self.binding_name, # from super class
-            "version": ollama.__version__ if ollama else "unknown", # Ollama library version
+            "version": pm.get_installed_version("ollama") if ollama else "unknown", # Ollama library version
             "host_address": self.host_address,
             "model_name": self.model_name,
             "supports_structured_output": False, # Ollama primarily supports text/chat

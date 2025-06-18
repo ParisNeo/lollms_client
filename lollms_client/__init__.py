@@ -1,7 +1,7 @@
 # lollms_client/__init__.py
 from lollms_client.lollms_core import LollmsClient, ELF_COMPLETION_FORMAT
 from lollms_client.lollms_types import MSG_TYPE # Assuming ELF_GENERATION_FORMAT is not directly used by users from here
-from lollms_client.lollms_discussion import LollmsDiscussion, LollmsMessage
+from lollms_client.lollms_discussion import LollmsDiscussion, DatabaseManager
 from lollms_client.lollms_utilities import PromptReshaper # Keep general utilities
 # Import new MCP binding classes
 from lollms_client.lollms_mcp_binding import LollmsMCPBinding, LollmsMCPBindingManager
@@ -15,7 +15,7 @@ __all__ = [
     "ELF_COMPLETION_FORMAT",
     "MSG_TYPE",
     "LollmsDiscussion",
-    "LollmsMessage",
+    "DatabaseManager",
     "PromptReshaper",
     "LollmsMCPBinding", # Export LollmsMCPBinding ABC
     "LollmsMCPBindingManager", # Export LollmsMCPBindingManager

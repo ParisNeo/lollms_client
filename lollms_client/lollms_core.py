@@ -852,10 +852,16 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
             f'"{conversation_context}"'
         )
         initial_plan_gen = self.generate_text(prompt=obj_prompt, system_prompt=objective_extraction_system_prompt, temperature=0.0, stream=False)
+        if type(initial_plan_gen)!=str:
+            if "error" in initial_plan_gen:
+                ASCIIColors.error(initial_plan_gen["error"])
+                raise Exception(initial_plan_gen["error"])
+            else:
+                raise Exception("generate text failed. Make sure you are connected to the binding server if you are using remote one")
         current_plan = self.remove_thinking_blocks(initial_plan_gen).strip()
 
         if streaming_callback:
-            streaming_callback("Building/Revising plan...", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "plan_extraction"}, turn_history)
+            streaming_callback("Building initial plan...", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "plan_extraction"}, turn_history)
             streaming_callback(f"Current plan:\n{current_plan}", MSG_TYPE.MSG_TYPE_STEP, {"id": "plan"}, turn_history)
         turn_history.append({"type": "initial_plan", "content": current_plan})
         
