@@ -76,7 +76,9 @@ class LollmsClient():
                  n_threads: int = 8,
                  streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                  user_name ="user",
-                 ai_name = "assistant"):
+                 ai_name = "assistant",
+                 **kwargs
+                 ):
         """
         Initialize the LollmsClient with LLM and optional modality bindings.
 

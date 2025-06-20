@@ -6,7 +6,7 @@ import shutil
 import gradio as gr
 from pathlib import Path
 # Use the correct, specified import style
-from lollms_client import LollmsClient, LollmsDiscussion, MSG_TYPE, DatabaseManager
+from lollms_client import LollmsClient, LollmsDiscussion, MSG_TYPE, LollmsDataManager
 from ascii_colors import ASCIIColors
 from sqlalchemy import Column, String
 
@@ -22,7 +22,7 @@ class ResearchMessageMixin:
 # These are initialized once and used throughout the app's lifecycle.
 try:
     lc = LollmsClient("ollama", model_name="mistral-nemo:latest")
-    db_manager = DatabaseManager(
+    db_manager = LollmsDataManager(
         db_path="sqlite:///research_projects_gradio.db",
         discussion_mixin=ResearchDiscussionMixin,
         message_mixin=ResearchMessageMixin,

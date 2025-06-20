@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 # Use the correct, specified import style
 from lollms_client import LollmsClient
-from lollms_client.lollms_discussion import DatabaseManager, LollmsDiscussion
+from lollms_client.lollms_discussion import LollmsDataManager, LollmsDiscussion
 from lollms_client.lollms_types import MSG_TYPE
 from sqlalchemy import Column, String
 
@@ -86,8 +86,8 @@ def main():
     MIGRATION_FOLDER = Path("./old_discussions")
     
     try:
-        # Initialize the DatabaseManager with our schema and encryption key.
-        db_manager = DatabaseManager(
+        # Initialize the LollmsDataManager with our schema and encryption key.
+        db_manager = LollmsDataManager(
             db_path=DB_PATH,
             discussion_mixin=ResearchDiscussionMixin,
             message_mixin=ResearchMessageMixin,
