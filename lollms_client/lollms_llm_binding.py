@@ -115,6 +115,9 @@ class LollmsLLMBinding(ABC):
         """
         pass
 
+    def get_ctx_size(self, model_name):
+        return 32000
+
 
     @abstractmethod
     def tokenize(self, text: str) -> list:

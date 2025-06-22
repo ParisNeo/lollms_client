@@ -526,7 +526,8 @@ class LollmsClient():
              seed: Optional[int] = None,
              n_threads: Optional[int] = None,
              ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             streaming_callback: Optional[Callable[[str, MSG_TYPE, Dict], bool]] = None,
+             **kwargs
              ) -> Union[str, dict]:
         """
         High-level method to perform a chat generation using a LollmsDiscussion object.
@@ -558,7 +559,7 @@ class LollmsClient():
                 discussion=discussion,
                 branch_tip_id=branch_tip_id,
                 n_predict=n_predict if n_predict is not None else self.default_n_predict,
-                stream=stream if stream is not None else self.default_stream,
+                stream=stream if stream is not None else True if streaming_callback is not None else self.default_stream,
                 temperature=temperature if temperature is not None else self.default_temperature,
                 top_k=top_k if top_k is not None else self.default_top_k,
                 top_p=top_p if top_p is not None else self.default_top_p,
@@ -1283,33 +1284,180 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             "error": None
         }
     
+    # --- Start of modified/added methods ---
+    def _synthesize_knowledge(
+        self,
+        previous_scratchpad: str,
+        tool_name: str,
+        tool_params: dict,
+        tool_result: dict
+    ) -> str:
+        """
+        A dedicated LLM call to interpret a tool's output and update the knowledge scratchpad.
+        """
+        # Sanitize tool_result for LLM to avoid sending large binary/base64 data
+        sanitized_result = tool_result.copy()
+        if 'image_path' in sanitized_result:
+            sanitized_result['summary'] = f"An image was successfully generated and saved to '{sanitized_result['image_path']}'."
+            # Remove keys that might contain large data if they exist
+            sanitized_result.pop('image_base64', None)
+        elif 'file_path' in sanitized_result and 'content' in sanitized_result:
+             sanitized_result['summary'] = f"Content was successfully written to '{sanitized_result['file_path']}'."
+             sanitized_result.pop('content', None)
+
+
+        synthesis_prompt = (
+            "You are a data analyst assistant. Your sole job is to interpret the output of a tool and integrate it into the existing research summary (knowledge scratchpad).\n\n"
+            "--- PREVIOUS KNOWLEDGE SCRATCHPAD ---\n"
+            f"{previous_scratchpad}\n\n"
+            "--- ACTION JUST TAKEN ---\n"
+            f"Tool Called: `{tool_name}`\n"
+            f"Parameters: {json.dumps(tool_params)}\n\n"
+            "--- RAW TOOL OUTPUT ---\n"
+            f"```json\n{json.dumps(sanitized_result, indent=2)}\n```\n\n"
+            "--- YOUR TASK ---\n"
+            "Read the 'RAW TOOL OUTPUT' and explain what it means in plain language. Then, integrate this new information with the 'PREVIOUS KNOWLEDGE SCRATCHPAD' to create a new, complete, and self-contained summary.\n"
+            "Your output should be ONLY the text of the new scratchpad, with no extra commentary or formatting.\n\n"
+            "--- NEW KNOWLEDGE SCRATCHPAD ---\n"
+        )
+        new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
+        return self.remove_thinking_blocks(new_scratchpad_text).strip()
+    def generate_structured_content(
+        self,
+        prompt: str,
+        template: Union[dict, list],
+        system_prompt: Optional[str] = None,
+        images: Optional[List[str]] = None,
+        max_retries: int = 3,
+        **kwargs
+    ) -> Union[dict, list, None]:
+        """
+        Generates structured content (JSON) from a prompt, ensuring it matches a given template.
+
+        This method repeatedly calls the LLM until a valid JSON object that can be parsed
+        and somewhat matches the template is returned, or until max_retries is reached.
+
+        Args:
+            prompt (str): The main prompt to guide the LLM.
+            template (Union[dict, list]): A Python dict or list representing the desired JSON structure.
+            system_prompt (Optional[str], optional): An optional system prompt. Defaults to None.
+            images (Optional[List[str]], optional): A list of image paths for multimodal prompts. Defaults to None.
+            max_retries (int, optional): The maximum number of times to retry generation if parsing fails. Defaults to 3.
+            **kwargs: Additional keyword arguments to pass to the underlying generate_text method.
+
+        Returns:
+            Union[dict, list, None]: The parsed JSON object (as a Python dict or list), or None if it fails after all retries.
+        """
+        template_str = json.dumps(template, indent=4)
+        
+        if not system_prompt:
+            system_prompt = "You are a highly intelligent AI assistant that excels at generating structured data in JSON format."
+        
+        final_system_prompt = (
+            f"{system_prompt}\n\n"
+            "You MUST generate a response that is a single, valid JSON object matching the structure of the template provided by the user. "
+            "Your entire response should be enclosed in a single ```json markdown code block. "
+            "Do not include any other text, explanations, or apologies outside of the JSON code block.\n"
+            f"Here is the JSON template you must follow:\n{template_str}"
+        )
+
+        current_prompt = prompt
+        for attempt in range(max_retries):
+            raw_llm_output = self.generate_text(
+                prompt=current_prompt,
+                system_prompt=final_system_prompt,
+                images=images,
+                **kwargs
+            )
+            
+            if not raw_llm_output:
+                ASCIIColors.warning(f"Structured content generation failed (Attempt {attempt + 1}/{max_retries}): LLM returned an empty response.")
+                current_prompt = f"You previously returned an empty response. Please try again and adhere strictly to the JSON format. \nOriginal prompt was: {prompt}"
+                continue
+
+            try:
+                # Use robust_json_parser which handles cleanup of markdown tags, comments, etc.
+                parsed_json = robust_json_parser(raw_llm_output)
+                # Optional: Add validation against the template's structure here if needed
+                return parsed_json
+            except (ValueError, json.JSONDecodeError) as e:
+                ASCIIColors.warning(f"Structured content parsing failed (Attempt {attempt + 1}/{max_retries}). Error: {e}")
+                trace_exception(e)
+                # Prepare for retry with more explicit instructions
+                current_prompt = (
+                    "Your previous response could not be parsed as valid JSON. Please review the error and the required template and try again. "
+                    "Ensure your entire output is a single, clean JSON object inside a ```json code block.\n\n"
+                    f"--- PARSING ERROR ---\n{str(e)}\n\n"
+                    f"--- YOUR PREVIOUS INVALID RESPONSE ---\n{raw_llm_output}\n\n"
+                    f"--- REQUIRED JSON TEMPLATE ---\n{template_str}\n\n"
+                    f"--- ORIGINAL PROMPT ---\n{prompt}"
+                )
+
+        ASCIIColors.error("Failed to generate valid structured content after multiple retries.")
+        return None
+
+    def _synthesize_knowledge(
+        self,
+        previous_scratchpad: str,
+        tool_name: str,
+        tool_params: dict,
+        tool_result: dict
+    ) -> str:
+        """
+        A dedicated LLM call to interpret a tool's output and update the knowledge scratchpad.
+        """
+        # Sanitize tool_result for LLM to avoid sending large binary/base64 data
+        sanitized_result = tool_result.copy()
+        if 'image_path' in sanitized_result:
+            sanitized_result['summary'] = f"An image was successfully generated and saved to '{sanitized_result['image_path']}'."
+            # Remove keys that might contain large data if they exist
+            sanitized_result.pop('image_base64', None)
+        elif 'file_path' in sanitized_result and 'content' in sanitized_result:
+             sanitized_result['summary'] = f"Content was successfully written to '{sanitized_result['file_path']}'."
+             sanitized_result.pop('content', None)
+
+
+        synthesis_prompt = (
+            "You are a data analyst assistant. Your sole job is to interpret the output of a tool and integrate it into the existing research summary (knowledge scratchpad).\n\n"
+            "--- PREVIOUS KNOWLEDGE SCRATCHPAD ---\n"
+            f"{previous_scratchpad}\n\n"
+            "--- ACTION JUST TAKEN ---\n"
+            f"Tool Called: `{tool_name}`\n"
+            f"Parameters: {json.dumps(tool_params)}\n\n"
+            "--- RAW TOOL OUTPUT ---\n"
+            f"```json\n{json.dumps(sanitized_result, indent=2)}\n```\n\n"
+            "--- YOUR TASK ---\n"
+            "Read the 'RAW TOOL OUTPUT' and explain what it means in plain language. Then, integrate this new information with the 'PREVIOUS KNOWLEDGE SCRATCHPAD' to create a new, complete, and self-contained summary.\n"
+            "Your output should be ONLY the text of the new scratchpad, with no extra commentary or formatting.\n\n"
+            "--- NEW KNOWLEDGE SCRATCHPAD ---\n"
+        )
+        new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
+        return self.remove_thinking_blocks(new_scratchpad_text).strip()
+
     def generate_with_mcp_rag(
         self,
         prompt: str,
-        rag_query_function: Callable[[str, Optional[str], int, float], List[Dict[str, Any]]],
+        use_mcps: Union[None, bool, List[str]] = None,
+        use_data_store: Union[None, Dict[str, Callable]] = None,
         system_prompt: str = None,
         objective_extraction_system_prompt="Extract objectives",
         images: Optional[List[str]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
         max_tool_calls: int = 10,
         max_llm_iterations: int = 15,
         tool_call_decision_temperature: float = 0.0,
         final_answer_temperature: float = None,
         streaming_callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict], Optional[List]], bool]] = None,
         build_plan: bool = True,
-        rag_vectorizer_name: Optional[str] = None,
         rag_top_k: int = 5,
         rag_min_similarity_percent: float = 70.0,
         **llm_generation_kwargs
     ) -> Dict[str, Any]:
         """
         Generates a response using a stateful agent that can choose between calling standard
-        MCP tools and querying a RAG database, all within a unified reasoning loop.
+        MCP tools and querying one or more RAG databases, all within a unified reasoning loop.
         """
         if not self.binding:
             return {"final_answer": "", "tool_calls": [], "error": "LLM binding not initialized."}
-        if not self.mcp:
-            return {"final_answer": "", "tool_calls": [], "error": "MCP binding not initialized."}
 
         # --- Initialize Agent State ---
         turn_history: List[Dict[str, Any]] = []
@@ -1320,48 +1468,56 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         tool_calls_made_this_turn = []
         llm_iterations = 0
 
-        # --- 1. Discover MCP Tools and Inject the RAG Tool ---
-        if tools is None:
-            try:
-                mcp_tools = self.mcp.discover_tools(force_refresh=True)
-                if not mcp_tools: ASCIIColors.warning("No MCP tools discovered.")
-            except Exception as e_disc:
-                return {"final_answer": "", "tool_calls": [], "error": f"Failed to discover MCP tools: {e_disc}"}
-        else:
-            mcp_tools = tools
-
-        # Define the RAG tool and add it to the list
-        rag_tool_definition = {
-            "name": "research::query_database",
-            "description": (
-                "Queries a vector database to find relevant text chunks based on a natural language query. "
-                "Use this to gather information, answer questions, or find context for a task before using other tools."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The natural language query to search for. Be specific to get the best results."
+        # --- 1. Discover Available Tools (MCP and RAG) ---
+        available_tools = []
+        
+        # Discover MCP tools if requested
+        if use_mcps and self.mcp:
+            discovered_mcp_tools = self.mcp.discover_tools(force_refresh=True)
+            if isinstance(use_mcps, list):
+                # Filter for specific MCP tools
+                available_tools.extend([t for t in discovered_mcp_tools if t['name'] in use_mcps])
+            else: # use_mcps is True
+                available_tools.extend(discovered_mcp_tools)
+        
+        # Define and add RAG tools if requested
+        if use_data_store:
+            for store_name, _ in use_data_store.items():
+                rag_tool_definition = {
+                    "name": f"research::{store_name}",
+                    "description": (
+                        f"Queries the '{store_name}' information database to find relevant text chunks based on a natural language query. "
+                        "Use this to gather information, answer questions, or find context for a task before using other tools."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The natural language query to search for. Be specific to get the best results."
+                            }
+                        },
+                        "required": ["query"]
                     }
-                },
-                "required": ["query"]
-            }
-        }
-        available_tools = [rag_tool_definition] + mcp_tools
+                }
+                available_tools.append(rag_tool_definition)
+        
+        if not available_tools:
+            # If no tools are available, just do a simple text generation
+            final_answer_text = self.generate_text(prompt=prompt, system_prompt=system_prompt, stream=streaming_callback is not None, streaming_callback=streaming_callback)
+            return {"final_answer": self.remove_thinking_blocks(final_answer_text), "tool_calls": [], "error": None}
 
-        # --- 2. Optional Initial Objectives Extraction ---
+
         formatted_tools_list = "\n".join([
             f"- Full Tool Name: {t.get('name')}\n  Description: {t.get('description')}\n  Input Schema: {json.dumps(t.get('input_schema'))}"
             for t in available_tools
-        ])        
+        ])
+
+        # --- 2. Optional Initial Objectives Extraction ---
         if build_plan:
             if streaming_callback:
                 streaming_callback("Extracting initial objectives...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "objectives_extraction"}, turn_history)
             
-            # The enhanced prompt is placed inside the original parenthesis format.
-            # The f-strings for tool lists and user prompts are preserved.
-
             obj_prompt = (
                 "You are a hyper-efficient and logical project planner. Your sole purpose is to analyze the user's request and create a concise, numbered list of actionable steps to fulfill it.\n\n"
                 "Your plan must be the most direct and minimal path to the user's goal.\n\n"
@@ -1390,8 +1546,6 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 
         turn_history.append({"type": "initial_objectives", "content": current_objectives})
 
-
-
         # --- 3. Main Agent Loop ---
         while llm_iterations < max_llm_iterations:
             llm_iterations += 1
@@ -1403,15 +1557,19 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             if agent_work_history:
                 history_parts = []
                 for i, entry in enumerate(agent_work_history):
+                    # Sanitize the result for history display, similar to knowledge synthesis
+                    sanitized_hist_result = entry['tool_result'].copy()
+                    if 'image_base64' in sanitized_hist_result: sanitized_hist_result.pop('image_base64')
+                    if 'content' in sanitized_hist_result and len(sanitized_hist_result['content']) > 200: sanitized_hist_result['content'] = sanitized_hist_result['content'][:200] + '... (truncated)'
+
                     history_parts.append(
                         f"### Step {i+1}:\n"
                         f"**Thought:** {entry['thought']}\n"
                         f"**Action:** Called tool `{entry['tool_name']}` with parameters `{json.dumps(entry['tool_params'])}`\n"
-                        f"**Observation:**\n```json\n{json.dumps(entry['tool_result'], indent=2)}\n```"
+                        f"**Observation:**\n```json\n{json.dumps(sanitized_hist_result, indent=2)}\n```"
                     )
                 formatted_agent_history = "\n\n".join(history_parts)
 
-            # Construct the "Thinking & Planning" prompt
             decision_prompt_template = f"""You are a strategic AI assistant. Your goal is to achieve a set of objectives by intelligently using research and system tools.
 
 --- AVAILABLE TOOLS ---
@@ -1431,50 +1589,47 @@ Knowledge Scratchpad (our current understanding):
 --- INSTRUCTIONS ---
 1.  **Analyze:** Review the entire work history, objectives, and scratchpad.
 2.  **Update State:** Based on the latest observations, update the scratchpad and refine the objectives. The scratchpad should be a comprehensive summary of ALL knowledge gathered.
-3.  **Decide Next Action:** Choose ONE of the following: `call_tool`, `final_answer`, or `clarify`. Always prefer to gather information with `research::query_database` before attempting to use other tools if you lack context.
-
---- OUTPUT FORMAT ---
-Respond with a single JSON object inside a JSON markdown tag. Use this exact schema:
-```json
-{{
-    "thought": "Your reasoning for the chosen action, analyzing how the work history informs your next step. Explain why you are choosing a specific tool (or to answer).",
-    "updated_scratchpad": "The new, complete, and comprehensive summary of all knowledge gathered. Integrate new findings with old ones. if no new knowledge is gathered, this should be an empty string.",
-    "updated_objectives": "The full, potentially revised, list of objectives. If no change, repeat the current list.",
-    "action": "The chosen action: 'call_tool', 'final_answer', or 'clarify'.",
-    "tool_name": "(string, if action is 'call_tool') The full 'alias::tool_name' of the tool to use.",
-    "tool_params": {{"query": "...", "param2": "..."}},
-    "clarification_request": "(string, if action is 'clarify') Your question to the user."
-}}
-```
+3.  **Decide Next Action:** Choose ONE of the following: `call_tool`, `final_answer`, or `clarify`. Always prefer to gather information with a `research::` tool before attempting to use other tools if you lack context.
 """
-            raw_llm_decision_json = self.generate_text(
-                prompt=decision_prompt_template, n_predict=2048, temperature=tool_call_decision_temperature
+            decision_template = {
+                "thought": "Your reasoning for the chosen action, analyzing how the work history informs your next step. Explain why you are choosing a specific tool (or to answer).",
+                "updated_scratchpad": "The new, complete, and comprehensive summary of all knowledge gathered. Integrate new findings with old ones. If no new knowledge is gathered, this should be an empty string.",
+                "updated_objectives": "The full, potentially revised, list of objectives. If no change, repeat the current list.",
+                "action": "The chosen action: 'call_tool', 'final_answer', or 'clarify'.",
+                "action_details": {
+                    "tool_name": "(string, if action is 'call_tool') The full 'alias::tool_name' of the tool to use.",
+                    "tool_params": {"query": "...", "param2": "..."},
+                    "clarification_request": "(string, if action is 'clarify') Your question to the user."
+                }
+            }
+            llm_decision = self.generate_structured_content(
+                prompt=decision_prompt_template, 
+                template=decision_template,
+                temperature=tool_call_decision_temperature
             )
+            
+            if not llm_decision:
+                ASCIIColors.error("LLM failed to generate a valid decision JSON. Aborting loop.")
+                break
 
             # --- 4. Parse LLM's plan and update state ---
-            try:
-                llm_decision = robust_json_parser(raw_llm_decision_json)
-                turn_history.append({"type": "llm_plan", "content": llm_decision})
-                
-                current_objectives = llm_decision.get("updated_objectives", current_objectives)
-                new_scratchpad = llm_decision.get("updated_scratchpad")
-                
-                if new_scratchpad and new_scratchpad != knowledge_scratchpad:
-                    knowledge_scratchpad = new_scratchpad
-                    if streaming_callback:
-                        streaming_callback(f"Knowledge scratchpad updated.", MSG_TYPE.MSG_TYPE_STEP, {"id": "scratchpad_update"}, turn_history)
-                        streaming_callback(f"New Scratchpad:\n{knowledge_scratchpad}", MSG_TYPE.MSG_TYPE_INFO, {"id":"scratch_pad_update"}, turn_history)
-                
-            except (json.JSONDecodeError, AttributeError, KeyError) as e:
-                ASCIIColors.error(f"Failed to parse LLM decision JSON: {raw_llm_decision_json}. Error: {e}")
-                turn_history.append({"type": "error", "content": f"Failed to parse LLM plan: {raw_llm_decision_json}"})
-                break
+            turn_history.append({"type": "llm_plan", "content": llm_decision})
+            
+            current_objectives = llm_decision.get("updated_objectives", current_objectives)
+            new_scratchpad = llm_decision.get("updated_scratchpad")
+            
+            if new_scratchpad and new_scratchpad.strip() and new_scratchpad != knowledge_scratchpad:
+                knowledge_scratchpad = new_scratchpad
+                if streaming_callback:
+                    streaming_callback(f"Knowledge scratchpad updated.", MSG_TYPE.MSG_TYPE_STEP, {"id": "scratchpad_update"}, turn_history)
+                    streaming_callback(f"New Scratchpad:\n{knowledge_scratchpad}", MSG_TYPE.MSG_TYPE_INFO, {"id":"scratch_pad_update"}, turn_history)
 
             if streaming_callback:
                 streaming_callback(f"LLM thought: {llm_decision.get('thought', 'N/A')}", MSG_TYPE.MSG_TYPE_INFO, {"id": "llm_thought"}, turn_history)
 
             # --- 5. Execute the chosen action ---
             action = llm_decision.get("action")
+            action_details = llm_decision.get("action_details", {})
             tool_result = None
 
             if action == "call_tool":
@@ -1482,40 +1637,53 @@ Respond with a single JSON object inside a JSON markdown tag. Use this exact sch
                     ASCIIColors.warning("Max tool calls reached. Forcing final answer.")
                     break
 
-                tool_name = llm_decision.get("tool_name")
-                tool_params = llm_decision.get("tool_params", {})
+                tool_name = action_details.get("tool_name")
+                tool_params = action_details.get("tool_params", {})
 
                 if not tool_name or not isinstance(tool_params, dict):
                     ASCIIColors.error(f"Invalid tool call from LLM: name={tool_name}, params={tool_params}")
                     break
 
                 if streaming_callback:
-                    streaming_callback(f"Executing tool: {tool_name}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"tool_exec_{llm_iterations}"}, turn_history)
+                    streaming_callback(f"Executing tool: {tool_name}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"tool_exec_{llm_iterations}", "tool_name": tool_name}, turn_history)
                 
                 try:
                     # ** DYNAMIC TOOL/RAG DISPATCH **
-                    if tool_name == "research::query_database":
-                        query = tool_params.get("query")
-                        if not query:
-                            tool_result = {"error": "RAG tool called without a 'query' parameter."}
+                    if tool_name.startswith("research::") and use_data_store:
+                        store_name = tool_name.split("::")[1]
+                        rag_query_function_local = use_data_store.get(store_name)
+                        if not rag_query_function_local:
+                            tool_result = {"error": f"RAG data store '{store_name}' not found or provided."}
                         else:
-                            retrieved_chunks = rag_query_function(query, rag_vectorizer_name, rag_top_k, rag_min_similarity_percent)
-                            if not retrieved_chunks:
-                                tool_result = {"summary": "No relevant documents found for the query.", "chunks": []}
+                            query = tool_params.get("query")
+                            if not query:
+                                tool_result = {"error": "RAG tool called without a 'query' parameter."}
                             else:
-                                tool_result = {
-                                    "summary": f"Found {len(retrieved_chunks)} relevant document chunks.",
-                                    "chunks": retrieved_chunks
-                                }
-                    else:
+                                retrieved_chunks = rag_query_function_local.get("callable", lambda: {'Search error'})(query, rag_top_k, rag_min_similarity_percent)
+                                if not retrieved_chunks:
+                                    tool_result = {"summary": "No relevant documents found for the query.", "chunks": []}
+                                else:
+                                    tool_result = {
+                                        "summary": f"Found {len(retrieved_chunks)} relevant document chunks.",
+                                        "chunks": retrieved_chunks
+                                    }
+                    elif use_mcps and self.mcp:
                         # Standard MCP tool execution
                         tool_result = self.mcp.execute_tool(tool_name, tool_params, lollms_client_instance=self)
+                    else:
+                        tool_result = {"error": f"Tool '{tool_name}' cannot be executed. RAG store not found or MCP binding not configured."}
                 
                 except Exception as e_exec:
                     trace_exception(e_exec)
                     tool_result = {"error": f"An exception occurred while executing tool '{tool_name}': {e_exec}"}
 
-                # Record the work cycle in the agent's history
+                if streaming_callback:
+                    streaming_callback(f"Tool {tool_name} finished.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"tool_exec_{llm_iterations}", "result": tool_result}, turn_history)
+                
+                knowledge_scratchpad = self._synthesize_knowledge(knowledge_scratchpad, tool_name, tool_params, tool_result)
+                if streaming_callback:
+                    streaming_callback(f"Knowledge scratchpad updated after {tool_name} call.", MSG_TYPE.MSG_TYPE_INFO, {"id": "scratchpad_update"}, turn_history)
+
                 work_entry = {
                     "thought": llm_decision.get("thought", "N/A"),
                     "tool_name": tool_name,
@@ -1524,13 +1692,9 @@ Respond with a single JSON object inside a JSON markdown tag. Use this exact sch
                 }
                 agent_work_history.append(work_entry)
                 tool_calls_made_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
-                
-                if streaming_callback:
-                    streaming_callback(f"Tool {tool_name} finished.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"tool_exec_{llm_iterations}"}, turn_history)
-                    streaming_callback(json.dumps(tool_result, indent=2), MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, tool_result, turn_history)
 
             elif action == "clarify":
-                clarification_request = llm_decision.get("clarification_request", "I need more information. Could you please clarify?")
+                clarification_request = action_details.get("clarification_request", "I need more information. Could you please clarify?")
                 return {"final_answer": clarification_request, "tool_calls": tool_calls_made_this_turn, "error": None, "clarification": True}
 
             elif action == "final_answer":
@@ -1544,7 +1708,8 @@ Respond with a single JSON object inside a JSON markdown tag. Use this exact sch
                 streaming_callback(f"LLM reasoning step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"planning_step_{llm_iterations}"}, turn_history)
        
         if streaming_callback:
-            streaming_callback(f"LLM reasoning step (iteration {llm_iterations})...", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"planning_step_{llm_iterations}"}, turn_history)
+             streaming_callback(f"LLM reasoning loop finished.", MSG_TYPE.MSG_TYPE_STEP, {"id": "reasoning_loop_end"}, turn_history)
+
         # --- 6. Generate Final Answer ---
         if streaming_callback:
             streaming_callback("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "final_answer_synthesis"}, turn_history)
@@ -1579,7 +1744,8 @@ Original User Request: "{original_user_prompt}"
         turn_history.append({"type":"final_answer_generated", "content": final_answer})
         
         return {"final_answer": final_answer, "tool_calls": tool_calls_made_this_turn, "error": None}
-
+    
+    
     def generate_code(
                         self,
                         prompt,

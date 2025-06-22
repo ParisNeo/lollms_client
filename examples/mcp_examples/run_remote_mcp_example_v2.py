@@ -7,6 +7,26 @@ from pathlib import Path
 import json
 from lollms_client import LollmsClient
 import subprocess
+from typing import Optional, List, Dict, Any
+
+
+MOCK_KNOWLEDGE_BASE = {
+    "python_basics.md": [
+        {"chunk_id": 1, "text": "Python is a high-level, interpreted programming language known for its readability and versatility. It was created by Guido van Rossum and first released in 1991."},
+        {"chunk_id": 2, "text": "Key features of Python include dynamic typing, automatic memory management (garbage collection), and a large standard library. It supports multiple programming paradigms, such as procedural, object-oriented, and functional programming."},
+        {"chunk_id": 3, "text": "Common applications of Python include web development (e.g., Django, Flask), data science (e.g., Pandas, NumPy, Scikit-learn), machine learning, artificial intelligence, automation, and scripting."},
+    ],
+    "javascript_info.js": [
+        {"chunk_id": 1, "text": "JavaScript is a scripting language primarily used for front-end web development to create interactive effects within web browsers. It is also used in back-end development (Node.js), mobile app development, and game development."},
+        {"chunk_id": 2, "text": "JavaScript is dynamically typed, prototype-based, and multi-paradigm. Along with HTML and CSS, it is one of the core technologies of the World Wide Web."},
+        {"chunk_id": 3, "text": "Popular JavaScript frameworks and libraries include React, Angular, Vue.js for front-end, and Express.js for Node.js back-end applications."},
+    ],
+    "ai_concepts.txt": [
+        {"chunk_id": 1, "text": "Artificial Intelligence (AI) refers to the simulation of human intelligence in machines that are programmed to think like humans and mimic their actions. The term may also be applied to any machine that exhibits traits associated with a human mind such as learning and problem-solving."},
+        {"chunk_id": 2, "text": "Machine Learning (ML) is a subset of AI that provides systems the ability to automatically learn and improve from experience without being explicitly programmed. Deep Learning (DL) is a further subset of ML based on artificial neural networks with representation learning."},
+        {"chunk_id": 3, "text": "Retrieval Augmented Generation (RAG) is an AI framework for improving the quality of LLM-generated responses by grounding the model on external sources of knowledge to supplement the LLM’s internal representation of information."},
+    ]
+}
 # --- Dynamically adjust Python path to find lollms_client ---
 # This assumes the example script is in a directory, and 'lollms_client' is
 # in a sibling directory or a known relative path. Adjust as needed.
@@ -180,10 +200,54 @@ def main():
         return True # Continue streaming
 
     # --- 4. Use generate_with_mcp ---
+
+    def mock_rag_query_function(
+        query_text: str,
+        vectorizer_name: Optional[str] = None, # Ignored in mock
+        top_k: int = 3,
+        min_similarity_percent: float = 0.0 # Ignored in mock, simple keyword match
+    ) -> List[Dict[str, Any]]:
+        """
+        A mock RAG query function.
+        Performs a simple keyword search in the MOCK_KNOWLEDGE_BASE.
+        """
+        ASCIIColors.magenta(f"  [MOCK RAG] Querying with: '{query_text}', top_k={top_k}")
+        results = []
+        query_lower = query_text.lower()
+        
+        all_chunks = []
+        for file_path, chunks_in_file in MOCK_KNOWLEDGE_BASE.items():
+            for chunk_data in chunks_in_file:
+                all_chunks.append({"file_path": file_path, **chunk_data})
+
+        # Simple keyword matching and scoring (very basic)
+        scored_chunks = []
+        for chunk_info in all_chunks:
+            score = 0
+            for keyword in query_lower.split():
+                if keyword in chunk_info["text"].lower() and len(keyword)>2: # Basic relevance
+                    score += 1
+            if "python" in query_lower and "python" in chunk_info["file_path"].lower(): score+=5
+            if "javascript" in query_lower and "javascript" in chunk_info["file_path"].lower(): score+=5
+            if "ai" in query_lower and "ai" in chunk_info["file_path"].lower(): score+=3
+
+
+            if score > 0 : # Only include if some keywords match
+                # Simulate similarity percentage (higher score = higher similarity)
+                similarity = min(100.0, score * 20.0 + 40.0) # Arbitrary scaling
+                if similarity >= min_similarity_percent:
+                    scored_chunks.append({
+                        "file_path": chunk_info["file_path"],
+                        "chunk_text": chunk_info["text"],
+                        "similarity_percent": similarity,
+                        "_score_for_ranking": score # Internal score for sorting
+                    })
     ASCIIColors.magenta("\n2. Calling generate_with_mcp to get current time...")
     time_prompt = "Hey assistant, what time is it right now?"
-    time_response = client.generate_with_mcp(
+    time_response = client.generate_with_mcp_rag(
         prompt=time_prompt,
+        use_mcps=True,
+        use_data_store={"coding_store":mock_rag_query_function},
         streaming_callback=mcp_streaming_callback,
         interactive_tool_execution=False # Set to True to test interactive mode
     )

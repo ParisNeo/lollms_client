@@ -26,10 +26,10 @@ try:
 except ImportError:
     ENCRYPTION_AVAILABLE = False
 
+from lollms_client.lollms_types import MSG_TYPE
 # Type hint placeholders for classes defined externally
 if False: 
     from lollms_client import LollmsClient
-    from lollms_client.lollms_types import MSG_TYPE
     from lollms_personality import LollmsPersonality
 
 class EncryptedString(TypeDecorator):
@@ -341,102 +341,162 @@ class LollmsDiscussion:
             current_id = msg_orm.parent_id
         return [LollmsMessage(self, orm) for orm in reversed(branch_orms)]
 
-    def chat(self, user_message: str, personality: Optional['LollmsPersonality'] = None, **kwargs) -> LollmsMessage:
+
+
+    def chat(
+        self, 
+        user_message: str, 
+        personality: Optional['LollmsPersonality'] = None,
+        use_mcps: Union[None, bool, List[str]] = None,
+        use_data_store: Union[None, Dict[str, Callable]] = None,
+        build_plan: bool = True,
+        add_user_message: bool = True, # New parameter
+        max_tool_calls = 10,
+        rag_top_k = 5,
+        **kwargs
+    ) -> Dict[str, 'LollmsMessage']: # Return type changed
+        """
+        Main interaction method for the discussion. It can perform a simple chat or
+        trigger a complex agentic loop with RAG and MCP tool use.
+
+        Args:
+            user_message (str): The new message from the user.
+            personality (Optional[LollmsPersonality], optional): The personality to use. Defaults to None.
+            use_mcps (Union[None, bool, List[str]], optional): Controls MCP tool usage. Defaults to None.
+            use_data_store (Union[None, Dict[str, Callable]], optional): Controls RAG usage. Defaults to None.
+            build_plan (bool, optional): If True, the agent will generate an initial plan. Defaults to True.
+            add_user_message (bool, optional): If True, a new user message is created from the prompt. 
+                If False, it assumes regeneration on the current active user message. Defaults to True.
+            **kwargs: Additional keyword arguments passed to the underlying generation method.
+
+        Returns:
+            Dict[str, LollmsMessage]: A dictionary with 'user_message' and 'ai_message' objects.
+        """
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
 
-        if user_message:
-            self.add_message(sender="user", sender_type="user", content=user_message)
-
+        # Add user message to the discussion or get the existing one
+        if add_user_message:
+            # Pass kwargs to capture images, etc., sent from the router
+            user_msg = self.add_message(sender="user", sender_type="user", content=user_message, **kwargs)
+        else:
+            # We are regenerating. The current active branch tip must be the user message.
+            if self.active_branch_id not in self._message_index:
+                raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
+            user_msg_orm = self._message_index[self.active_branch_id]
+            if user_msg_orm.sender_type != 'user':
+                raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
+            user_msg = LollmsMessage(self, user_msg_orm)
+        
+        # --- (The existing generation logic remains the same) ---
+        is_agentic_turn = (use_mcps is not None and len(use_mcps)>0) or (use_data_store is not None and len(use_data_store)>0)
         rag_context = None
         original_system_prompt = self.system_prompt
         if personality:
             self.system_prompt = personality.system_prompt
-            if user_message:
+            if user_message and not is_agentic_turn:
                 rag_context = personality.get_rag_context(user_message)
-        
         if rag_context:
             self.system_prompt = f"{original_system_prompt or ''}\n\n--- Relevant Information ---\n{rag_context}\n---"
-
-        from lollms_client.lollms_types import MSG_TYPE
-        is_streaming = "streaming_callback" in kwargs and kwargs.get("streaming_callback") is not None
-        
-        final_raw_response = ""
         start_time = datetime.now()
+        if is_agentic_turn:
+            # --- FIX: Provide the full conversation context to the agent ---
+            # 1. Get the model's max context size.
+            max_ctx = self.lollmsClient.binding.get_ctx_size(self.lollmsClient.binding.model_name) if self.lollmsClient.binding else None
+            
+            # 2. Format the entire discussion up to this point, including the new user message.
+            #    This ensures the agent has the full history.
+            full_context_prompt = self.format_discussion(max_allowed_tokens=max_ctx)
 
-        if personality and personality.script_module and hasattr(personality.script_module, 'run'):
-            try:
-                print(f"[{personality.name}] Running custom script...")
-                final_raw_response = personality.script_module.run(self, kwargs.get("streaming_callback"))
-            except Exception as e:
-                print(f"[{personality.name}] Error in custom script: {e}")
-                final_raw_response = f"Error executing personality script: {e}"
+            # 3. Call the agent with the complete context.
+            #    We pass the full context to the 'prompt' argument. The `system_prompt` is already
+            #    included within the formatted text, so we don't pass it separately to avoid duplication.
+            agent_result = self.lollmsClient.generate_with_mcp_rag(
+                prompt=full_context_prompt, 
+                use_mcps=use_mcps, 
+                use_data_store=use_data_store, 
+                build_plan=build_plan,
+                max_tool_calls = max_tool_calls,
+                rag_top_k= rag_top_k,
+                **kwargs
+            )
+            final_content = agent_result.get("final_answer", "")
+            thoughts_text = None 
+            final_raw_response = json.dumps(agent_result)
         else:
-            raw_response_accumulator = []
-            if is_streaming:
-                full_response_parts, token_buffer, in_thought_block = [], "", False
-                original_callback = kwargs.get("streaming_callback")
-                def accumulating_callback(token: str, msg_type: MSG_TYPE = MSG_TYPE.MSG_TYPE_CHUNK):
-                    nonlocal token_buffer, in_thought_block
-                    raw_response_accumulator.append(token)
-                    continue_streaming = True
-                    if token: token_buffer += token
-                    while True:
-                        if in_thought_block:
-                            end_tag_pos = token_buffer.find("</think>")
-                            if end_tag_pos != -1:
-                                thought_chunk = token_buffer[:end_tag_pos]
-                                if self.show_thoughts and original_callback and thought_chunk:
-                                    if not original_callback(thought_chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK): continue_streaming = False
-                                in_thought_block, token_buffer = False, token_buffer[end_tag_pos + len("</think>"):]
-                            else:
-                                if self.show_thoughts and original_callback and token_buffer:
-                                    if not original_callback(token_buffer, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK): continue_streaming = False
-                                token_buffer = ""; break
-                        else:
-                            start_tag_pos = token_buffer.find("<think>")
-                            if start_tag_pos != -1:
-                                response_chunk = token_buffer[:start_tag_pos]
-                                if response_chunk:
-                                    full_response_parts.append(response_chunk)
-                                    if original_callback:
-                                        if not original_callback(response_chunk, MSG_TYPE.MSG_TYPE_CHUNK): continue_streaming = False
-                                in_thought_block, token_buffer = True, token_buffer[start_tag_pos + len("<think>"):]
-                            else:
-                                if token_buffer:
-                                    full_response_parts.append(token_buffer)
-                                    if original_callback:
-                                        if not original_callback(token_buffer, MSG_TYPE.MSG_TYPE_CHUNK): continue_streaming = False
-                                token_buffer = ""; break
-                    return continue_streaming
-                kwargs["streaming_callback"], kwargs["stream"] = accumulating_callback, True
-                self.lollmsClient.chat(self, **kwargs)
-                final_raw_response = "".join(raw_response_accumulator)
+            if personality and personality.script_module and hasattr(personality.script_module, 'run'):
+                try:
+                    final_raw_response = personality.script_module.run(self, kwargs.get("streaming_callback"))
+                except Exception as e:
+                    final_raw_response = f"Error executing personality script: {e}"
             else:
-                kwargs["stream"] = False
-                final_raw_response = self.lollmsClient.chat(self, **kwargs) or ""
-
-        end_time = datetime.now()
-        if rag_context:
+                is_streaming = "streaming_callback" in kwargs and kwargs.get("streaming_callback") is not None
+                if is_streaming:
+                    raw_response_accumulator = self.lollmsClient.chat(self, **kwargs)
+                    final_raw_response = "".join(raw_response_accumulator)
+                else:
+                    kwargs["stream"] = False
+                    final_raw_response = self.lollmsClient.chat(self, **kwargs) or ""
+            thoughts_match = re.search(r"<think>(.*?)</think>", final_raw_response, re.DOTALL)
+            thoughts_text = thoughts_match.group(1).strip() if thoughts_match else None
+            final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
+        if rag_context or (personality and self.system_prompt != original_system_prompt):
             self.system_prompt = original_system_prompt
-        
+        end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
-        thoughts_match = re.search(r"<think>(.*?)</think>", final_raw_response, re.DOTALL)
-        thoughts_text = thoughts_match.group(1).strip() if thoughts_match else None
-        final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
         token_count = self.lollmsClient.count_tokens(final_content)
         tok_per_sec = (token_count / duration) if duration > 0 else 0
-        
+        # --- (End of existing logic) ---
+
+        # --- FIX: Store agentic results in metadata ---
+        message_meta = {}
+        if is_agentic_turn and isinstance(agent_result, dict):
+            # We store the 'steps' and 'sources' if they exist in the agent result.
+            # This makes them available to the frontend in the final message object.
+            if "steps" in agent_result:
+                message_meta["steps"] = agent_result["steps"]
+            if "sources" in agent_result:
+                message_meta["sources"] = agent_result["sources"]
+
         ai_message_obj = self.add_message(
-            sender="assistant", sender_type="assistant", content=final_content,
+            sender=personality.name if personality else "assistant", sender_type="assistant", content=final_content,
             raw_content=final_raw_response, thoughts=thoughts_text, tokens=token_count,
             binding_name=self.lollmsClient.binding.binding_name, model_name=self.lollmsClient.binding.model_name,
-            generation_speed=tok_per_sec
+            generation_speed=tok_per_sec,
+            parent_id=user_msg.id, # Ensure the AI response is a child of the user message
+            metadata=message_meta # Pass the collected metadata here
         )
-
-        if self._is_db_backed and not self.autosave:
+        if self._is_db_backed and self.autosave:
             self.commit()
-        return ai_message_obj
+            
+        return {"user_message": user_msg, "ai_message": ai_message_obj}
+
+    def regenerate_branch(self, **kwargs) -> Dict[str, 'LollmsMessage']:
+        if not self.active_branch_id or self.active_branch_id not in self._message_index:
+            raise ValueError("No active message to regenerate from.")
+        
+        last_message_orm = self._message_index[self.active_branch_id]
+        
+        # If the current active message is the assistant's, we need to delete it
+        # and set the active branch to its parent (the user message).
+        if last_message_orm.sender_type == 'assistant':
+            parent_id = last_message_orm.parent_id
+            if not parent_id:
+                raise ValueError("Cannot regenerate from an assistant message with no parent.")
+                
+            last_message_id = last_message_orm.id
+            self._db_discussion.messages.remove(last_message_orm)
+            del self._message_index[last_message_id]
+            if self._is_db_backed:
+                self._messages_to_delete_from_db.add(last_message_id)
+            
+            self.active_branch_id = parent_id
+            self.touch()
+
+        # The active branch is now guaranteed to be on a user message.
+        # Call chat, but do not add a new user message.
+        prompt_to_regenerate = self._message_index[self.active_branch_id].content
+        return self.chat(user_message=prompt_to_regenerate, add_user_message=False, **kwargs)
 
     def process_and_summarize(self, large_text: str, user_prompt: str, chunk_size: int = 4096, **kwargs) -> LollmsMessage:
         user_msg = self.add_message(sender="user", sender_type="user", content=user_prompt)
@@ -459,20 +519,6 @@ class LollmsDiscussion:
             self.commit()
         return ai_message_obj
 
-    def regenerate_branch(self, **kwargs) -> LollmsMessage:
-        if not self.active_branch_id or self.active_branch_id not in self._message_index:
-            raise ValueError("No active message to regenerate from.")
-        last_message_orm = self._message_index[self.active_branch_id]
-        if last_message_orm.sender_type != 'assistant':
-            raise ValueError("Can only regenerate from an assistant's message.")
-        parent_id, last_message_id = last_message_orm.parent_id, last_message_orm.id
-        self._db_discussion.messages.remove(last_message_orm)
-        del self._message_index[last_message_id]
-        if self._is_db_backed:
-            self._messages_to_delete_from_db.add(last_message_id)
-        self.active_branch_id = parent_id
-        self.touch()
-        return self.chat("", **kwargs)
 
     def delete_branch(self, message_id: str):
         if not self._is_db_backed:
