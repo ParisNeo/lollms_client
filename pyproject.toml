@@ -35,6 +35,7 @@ dependencies = [
     "pydantic",
     "numpy",
     "pillow",
+    "sqlalchemy"
 ]
 
 [project.urls]
