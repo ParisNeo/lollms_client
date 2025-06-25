@@ -1681,7 +1681,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 
             tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
             current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
-            log_step("{"+'"scratchpad":"'+current_scratchpad+'"}', "scratchpad", is_start=False)
+            log_step(current_scratchpad, "scratchpad", is_start=False)
             
             if reasoning_step_id:
                 log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
