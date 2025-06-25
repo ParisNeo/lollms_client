@@ -1613,8 +1613,6 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 
             current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
             log_step(f"\n\n### Step {i+1}: Thought\n{thought}", "scratchpad", is_start=False)
-            if streaming_callback: 
-                streaming_callback(thought, MSG_TYPE.MSG_TYPE_INFO, {"type": "thought"})
 
             if not tool_name:
                 current_scratchpad += f"\n\n### Step {i+1} Failure\n- **Error:** Did not specify a tool name."
