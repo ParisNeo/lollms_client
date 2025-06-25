@@ -1436,8 +1436,6 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
         return self.remove_thinking_blocks(new_scratchpad_text).strip()
 
-# In lollms_client/lollms_discussion.py -> LollmsClient class
-
     def generate_with_mcp_rag(
         self,
         prompt: str,
@@ -1453,6 +1451,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         rag_top_k: int = 5,
         rag_min_similarity_percent: float = 70.0,
         output_summarization_threshold: int = 500, # In tokens
+        debug: bool = False,
         **llm_generation_kwargs
     ) -> Dict[str, Any]:
         """Generates a response using a dynamic agent with stateful, ID-based step tracking.
@@ -1485,6 +1484,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             rag_min_similarity_percent: Minimum similarity for RAG results.
             output_summarization_threshold: The token count that triggers automatic
                                             summarization of a tool's text output.
+            debug: If True, prints the full prompts and raw AI responses to the console.
             **llm_generation_kwargs: Additional keyword arguments for LLM calls.
 
         Returns:
@@ -1594,6 +1594,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     "clarification_question": "(string, ONLY if tool_name is 'request_clarification')"
                 }
             }
+
+            if debug:
+                print("\n" + "="*50)
+                print(f"--- DEBUG: REASONING PROMPT (Step {i+1}) ---")
+                print(reasoning_prompt_template)
+                print("="*50 + "\n")
             
             structured_action_response = self.generate_code(
                 prompt=reasoning_prompt_template,
@@ -1602,6 +1608,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 temperature=decision_temperature,
                 images=images if i == 0 else None
             )
+
+            if debug:
+                print("\n" + "="*50)
+                print(f"--- DEBUG: RAW REASONING RESPONSE (Step {i+1}) ---")
+                print(structured_action_response)
+                print("="*50 + "\n")
 
             try:
                 action_data = json.loads(structured_action_response)
@@ -1712,8 +1724,20 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 - If images were provided by the user, incorporate your analysis of them into the answer.
 - Do not talk about your internal process unless it's necessary to explain why you couldn't find an answer.
 """
+        if debug:
+            print("\n" + "="*50)
+            print("--- DEBUG: FINAL ANSWER SYNTHESIS PROMPT ---")
+            print(final_answer_prompt)
+            print("="*50 + "\n")
+
         final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature, **llm_generation_kwargs)
         final_answer = self.remove_thinking_blocks(final_answer_text)
+
+        if debug:
+            print("\n" + "="*50)
+            print("--- DEBUG: RAW FINAL ANSWER RESPONSE ---")
+            print(final_answer_text) # Show raw response before cleaning
+            print("="*50 + "\n")
 
         if synthesis_id:
             log_step("Synthesizing final answer...", "final_answer_synthesis", metadata={"id": synthesis_id}, is_start=False)

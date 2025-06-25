@@ -571,6 +571,7 @@ class LollmsDiscussion:
         add_user_message: bool = True,
         max_reasoning_steps: int = 20,
         images: Optional[List[str]] = None,
+        debug: bool = False,
         **kwargs
     ) -> Dict[str, 'LollmsMessage']:
         """Main interaction method that can invoke the dynamic, multi-modal agent.
@@ -599,6 +600,7 @@ class LollmsDiscussion:
                                  before it must provide a final answer.
             images: A list of base64-encoded images provided by the user, which will
                     be passed to the agent or a multi-modal LLM.
+            debug: If True, prints full prompts and raw AI responses to the console.
             **kwargs: Additional keyword arguments passed to the underlying generation
                       methods, such as 'streaming_callback'.
 
@@ -642,12 +644,21 @@ class LollmsDiscussion:
         # Step 3: Execute the appropriate generation logic.
         if is_agentic_turn:
             # --- AGENTIC TURN ---
+            prompt_for_agent = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
+            if debug:
+                print("\n" + "="*50)
+                print("--- DEBUG: AGENTIC TURN TRIGGERED ---")
+                print(f"--- PROMPT FOR AGENT (from discussion history) ---")
+                print(prompt_for_agent)
+                print("="*50 + "\n")
+
             agent_result = self.lollmsClient.generate_with_mcp_rag(
-                prompt=self.export("markdown",branch_tip_id if branch_tip_id else self.active_branch_id),
+                prompt=prompt_for_agent,
                 use_mcps=use_mcps,
                 use_data_store=use_data_store,
                 max_reasoning_steps=max_reasoning_steps,
                 images=images,
+                debug=debug, # Pass the debug flag down
                 **kwargs
             )
             final_content = agent_result.get("final_answer", "The agent did not produce a final answer.")
@@ -656,12 +667,27 @@ class LollmsDiscussion:
 
         else:
             # --- SIMPLE CHAT TURN ---
+            if debug:
+                prompt_for_chat = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
+                print("\n" + "="*50)
+                print("--- DEBUG: SIMPLE CHAT PROMPT ---")
+                print(prompt_for_chat)
+                print("="*50 + "\n")
+
             # For simple chat, we also need to consider images if the model is multi-modal
             final_raw_response = self.lollmsClient.chat(self, images=images, **kwargs) or ""
-            if isinstance(final_content, dict) and final_content["status"]=="error":
-                raise Exception(final_content["message"])
+            
+            if debug:
+                print("\n" + "="*50)
+                print("--- DEBUG: RAW SIMPLE CHAT RESPONSE ---")
+                print(final_raw_response)
+                print("="*50 + "\n")
+
+            if isinstance(final_raw_response, dict) and final_raw_response.get("status") == "error":
+                raise Exception(final_raw_response.get("message", "Unknown error from lollmsClient.chat"))
             else:
                 final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
+
             final_scratchpad = None # No agentic scratchpad in a simple turn
 
         # Step 4: Post-generation processing and statistics.
