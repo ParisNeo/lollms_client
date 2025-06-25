@@ -1,60 +1,94 @@
-import yaml
-import json
 import base64
-import os
-import uuid
-import shutil
+import json
 import re
-from collections import defaultdict
+import uuid
 from datetime import datetime
-from typing import List, Dict, Optional, Union, Any, Type, Callable
 from pathlib import Path
 from types import SimpleNamespace
-
-from sqlalchemy import (create_engine, Column, String, Text, Integer, DateTime,
-                        ForeignKey, JSON, Boolean, LargeBinary, Index, Float)
-from sqlalchemy.orm import sessionmaker, relationship, Session, declarative_base, declared_attr
-from sqlalchemy.types import TypeDecorator
+from typing import Any, Callable, Dict, List, Optional, Type, Union
+from ascii_colors import trace_exception
+import yaml
+from sqlalchemy import (Column, DateTime, Float, ForeignKey, Integer, JSON,
+                        LargeBinary, String, Text, create_engine)
+from sqlalchemy.orm import (Session, declarative_base, declared_attr,
+                            relationship, sessionmaker)
 from sqlalchemy.orm.exc import NoResultFound
-
+from sqlalchemy.types import TypeDecorator
+from sqlalchemy import text 
 try:
     from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.backends import default_backend
     ENCRYPTION_AVAILABLE = True
 except ImportError:
     ENCRYPTION_AVAILABLE = False
 
-from lollms_client.lollms_types import MSG_TYPE
 # Type hint placeholders for classes defined externally
-if False: 
+if False:
     from lollms_client import LollmsClient
     from lollms_personality import LollmsPersonality
 
+
 class EncryptedString(TypeDecorator):
-    """A SQLAlchemy TypeDecorator for field-level database encryption."""
+    """A SQLAlchemy TypeDecorator for field-level database encryption.
+
+    This class provides transparent encryption and decryption for string-based
+    database columns. It derives a stable encryption key from a user-provided
+    password and a fixed salt using PBKDF2HMAC, then uses Fernet for
+    symmetric encryption.
+
+    Requires the 'cryptography' library to be installed.
+    """
     impl = LargeBinary
     cache_ok = True
 
     def __init__(self, key: str, *args, **kwargs):
+        """Initializes the encryption engine.
+
+        Args:
+            key: The secret key (password) to use for encryption.
+        """
         super().__init__(*args, **kwargs)
         if not ENCRYPTION_AVAILABLE:
             raise ImportError("'cryptography' is required for DB encryption.")
+        
         self.salt = b'lollms-fixed-salt-for-db-encryption'
         kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(), length=32, salt=self.salt,
-            iterations=480000, backend=default_backend()
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=self.salt,
+            iterations=480000,
+            backend=default_backend()
         )
         derived_key = base64.urlsafe_b64encode(kdf.derive(key.encode()))
         self.fernet = Fernet(derived_key)
 
     def process_bind_param(self, value: Optional[str], dialect) -> Optional[bytes]:
+        """Encrypts the string value before writing it to the database.
+
+        Args:
+            value: The plaintext string to encrypt.
+            dialect: The database dialect in use.
+
+        Returns:
+            The encrypted value as bytes, or None if the input was None.
+        """
         if value is None:
             return None
         return self.fernet.encrypt(value.encode('utf-8'))
 
     def process_result_value(self, value: Optional[bytes], dialect) -> Optional[str]:
+        """Decrypts the byte value from the database into a string.
+
+        Args:
+            value: The encrypted bytes from the database.
+            dialect: The database dialect in use.
+
+        Returns:
+            The decrypted plaintext string, a special error message if decryption
+            fails, or None if the input was None.
+        """
         if value is None:
             return None
         try:
@@ -62,12 +96,32 @@ class EncryptedString(TypeDecorator):
         except InvalidToken:
             return "<DECRYPTION_FAILED: Invalid Key or Corrupt Data>"
 
-def create_dynamic_models(discussion_mixin: Optional[Type] = None, message_mixin: Optional[Type] = None, encryption_key: Optional[str] = None):
-    """Factory to dynamically create SQLAlchemy ORM models with custom mixins."""
+
+def create_dynamic_models(
+    discussion_mixin: Optional[Type] = None,
+    message_mixin: Optional[Type] = None,
+    encryption_key: Optional[str] = None
+) -> tuple[Type, Type, Type]:
+    """Factory to dynamically create SQLAlchemy ORM models.
+
+    This function builds the `Discussion` and `Message` SQLAlchemy models,
+    optionally including custom mixin classes for extending functionality and
+    applying encryption to text fields if a key is provided.
+
+    Args:
+        discussion_mixin: An optional class to mix into the Discussion model.
+        message_mixin: An optional class to mix into the Message model.
+        encryption_key: An optional key to enable database field encryption.
+
+    Returns:
+        A tuple containing the declarative Base, the created Discussion model,
+        and the created Message model.
+    """
     Base = declarative_base()
     EncryptedText = EncryptedString(encryption_key) if encryption_key else Text
 
     class DiscussionBase:
+        """Abstract base for the Discussion ORM model."""
         __abstract__ = True
         id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
         system_prompt = Column(EncryptedText, nullable=True)
@@ -76,78 +130,152 @@ def create_dynamic_models(discussion_mixin: Optional[Type] = None, message_mixin
         discussion_metadata = Column(JSON, nullable=True, default=dict)
         created_at = Column(DateTime, default=datetime.utcnow)
         updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-        
+
+        # Fields for non-destructive context pruning
+        pruning_summary = Column(EncryptedText, nullable=True)
+        pruning_point_id = Column(String, nullable=True)
+
         @declared_attr
         def messages(cls):
             return relationship("Message", back_populates="discussion", cascade="all, delete-orphan", lazy="joined")
 
     class MessageBase:
+        """Abstract base for the Message ORM model."""
         __abstract__ = True
         id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
         discussion_id = Column(String, ForeignKey('discussions.id'), nullable=False, index=True)
         parent_id = Column(String, ForeignKey('messages.id'), nullable=True, index=True)
         sender = Column(String, nullable=False)
         sender_type = Column(String, nullable=False)
-        
+
         raw_content = Column(EncryptedText, nullable=True)
         thoughts = Column(EncryptedText, nullable=True)
         content = Column(EncryptedText, nullable=False)
         scratchpad = Column(EncryptedText, nullable=True)
-        
+
         tokens = Column(Integer, nullable=True)
         binding_name = Column(String, nullable=True)
         model_name = Column(String, nullable=True)
         generation_speed = Column(Float, nullable=True)
-        
+
         message_metadata = Column(JSON, nullable=True, default=dict)
         images = Column(JSON, nullable=True, default=list)
         created_at = Column(DateTime, default=datetime.utcnow)
-        
+
         @declared_attr
         def discussion(cls):
             return relationship("Discussion", back_populates="messages")
-        
+
     discussion_bases = (discussion_mixin, DiscussionBase, Base) if discussion_mixin else (DiscussionBase, Base)
     DynamicDiscussion = type('Discussion', discussion_bases, {'__tablename__': 'discussions'})
 
     message_bases = (message_mixin, MessageBase, Base) if message_mixin else (MessageBase, Base)
     DynamicMessage = type('Message', message_bases, {'__tablename__': 'messages'})
-    
+
     return Base, DynamicDiscussion, DynamicMessage
 
+
 class LollmsDataManager:
-    """Manages database connection, session, and table creation."""
+    """Manages database connection, session, and table creation.
+
+    This class serves as the central point of contact for all database
+    operations, abstracting away the SQLAlchemy engine and session management.
+    """
+
     def __init__(self, db_path: str, discussion_mixin: Optional[Type] = None, message_mixin: Optional[Type] = None, encryption_key: Optional[str] = None):
+        """Initializes the data manager.
+
+        Args:
+            db_path: The connection string for the SQLAlchemy database
+                     (e.g., 'sqlite:///mydatabase.db').
+            discussion_mixin: Optional mixin class for the Discussion model.
+            message_mixin: Optional mixin class for the Message model.
+            encryption_key: Optional key to enable database encryption.
+        """
         if not db_path:
             raise ValueError("Database path cannot be empty.")
+        
         self.Base, self.DiscussionModel, self.MessageModel = create_dynamic_models(
             discussion_mixin, message_mixin, encryption_key
         )
         self.engine = create_engine(db_path)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
-        self.create_tables()
+        self.create_and_migrate_tables()
 
-    def create_tables(self):
+    def create_and_migrate_tables(self):
+        """Creates all tables if they don't exist and performs simple schema migrations."""
         self.Base.metadata.create_all(bind=self.engine)
+        try:
+            with self.engine.connect() as connection:
+                print("Checking for database schema upgrades...")
+                
+                # --- THIS IS THE FIX ---
+                # We must wrap raw SQL strings in the `text()` function for direct execution.
+                cursor = connection.execute(text("PRAGMA table_info(discussions)"))
+                columns = [row[1] for row in cursor.fetchall()]
+                
+                if 'pruning_summary' not in columns:
+                    print("  -> Upgrading 'discussions' table: Adding 'pruning_summary' column.")
+                    connection.execute(text("ALTER TABLE discussions ADD COLUMN pruning_summary TEXT"))
+                
+                if 'pruning_point_id' not in columns:
+                    print("  -> Upgrading 'discussions' table: Adding 'pruning_point_id' column.")
+                    connection.execute(text("ALTER TABLE discussions ADD COLUMN pruning_point_id VARCHAR"))
+                
+                print("Database schema is up to date.")
+                # This is important to apply the ALTER TABLE statements
+                connection.commit() 
+
+        except Exception as e:
+            print(f"\n--- DATABASE MIGRATION WARNING ---")
+            print(f"An error occurred during database schema migration: {e}")
+            print("The application might not function correctly if the schema is outdated.")
+            print("If problems persist, consider backing up and deleting the database file.")
+            print("---")
 
     def get_session(self) -> Session:
+        """Returns a new SQLAlchemy session."""
         return self.SessionLocal()
 
     def list_discussions(self) -> List[Dict]:
+        """Retrieves a list of all discussions from the database.
+
+        Returns:
+            A list of dictionaries, where each dictionary represents a discussion.
+        """
         with self.get_session() as session:
             discussions = session.query(self.DiscussionModel).all()
             return [{c.name: getattr(disc, c.name) for c in disc.__table__.columns} for disc in discussions]
 
     def get_discussion(self, lollms_client: 'LollmsClient', discussion_id: str, **kwargs) -> Optional['LollmsDiscussion']:
+        """Retrieves a single discussion by its ID and wraps it.
+
+        Args:
+            lollms_client: The LollmsClient instance for the discussion to use.
+            discussion_id: The unique ID of the discussion to retrieve.
+            **kwargs: Additional arguments to pass to the LollmsDiscussion constructor.
+
+        Returns:
+            An LollmsDiscussion instance if found, otherwise None.
+        """
         with self.get_session() as session:
             try:
                 db_disc = session.query(self.DiscussionModel).filter_by(id=discussion_id).one()
-                session.expunge(db_disc)
+                session.expunge(db_disc)  # Detach from session before returning
                 return LollmsDiscussion(lollmsClient=lollms_client, db_manager=self, db_discussion_obj=db_disc, **kwargs)
             except NoResultFound:
                 return None
 
     def search_discussions(self, **criteria) -> List[Dict]:
+        """Searches for discussions based on provided criteria.
+
+        Args:
+            **criteria: Keyword arguments where the key is a column name and
+                        the value is the string to search for.
+
+        Returns:
+            A list of dictionaries representing the matching discussions.
+        """
         with self.get_session() as session:
             query = session.query(self.DiscussionModel)
             for key, value in criteria.items():
@@ -157,24 +285,43 @@ class LollmsDataManager:
             return [{c.name: getattr(disc, c.name) for c in disc.__table__.columns} for disc in discussions]
 
     def delete_discussion(self, discussion_id: str):
+        """Deletes a discussion and all its associated messages from the database.
+
+        Args:
+            discussion_id: The ID of the discussion to delete.
+        """
         with self.get_session() as session:
             db_disc = session.query(self.DiscussionModel).filter_by(id=discussion_id).first()
             if db_disc:
                 session.delete(db_disc)
                 session.commit()
 
+
 class LollmsMessage:
-    """A wrapper for a message ORM object, providing direct attribute access."""
+    """A lightweight proxy wrapper for a message ORM object.
+
+    This class provides a more direct and convenient API for interacting with a
+    message's data, proxying attribute access to the underlying database object.
+    """
+
     def __init__(self, discussion: 'LollmsDiscussion', db_message: Any):
+        """Initializes the message proxy.
+
+        Args:
+            discussion: The parent LollmsDiscussion instance.
+            db_message: The underlying SQLAlchemy ORM message object or a SimpleNamespace.
+        """
         object.__setattr__(self, '_discussion', discussion)
         object.__setattr__(self, '_db_message', db_message)
 
     def __getattr__(self, name: str) -> Any:
+        """Proxies attribute getting to the underlying DB object."""
         if name == 'metadata':
             return getattr(self._db_message, 'message_metadata', None)
         return getattr(self._db_message, name)
 
     def __setattr__(self, name: str, value: Any):
+        """Proxies attribute setting to the underlying DB object and marks discussion as dirty."""
         if name == 'metadata':
             setattr(self._db_message, 'message_metadata', value)
         else:
@@ -182,23 +329,44 @@ class LollmsMessage:
         self._discussion.touch()
 
     def __repr__(self) -> str:
+        """Provides a developer-friendly representation of the message."""
         return f"<LollmsMessage id={self.id} sender='{self.sender}'>"
 
+
 class LollmsDiscussion:
-    """Represents and manages a single discussion, acting as a high-level interface."""
-    def __init__(self, lollmsClient: 'LollmsClient', db_manager: Optional[LollmsDataManager] = None, 
-                 discussion_id: Optional[str] = None, db_discussion_obj: Optional[Any] = None,
-                 autosave: bool = False, max_context_size: Optional[int] = None):
-        
+    """Represents and manages a single discussion.
+
+    This class is the primary user-facing interface for interacting with a
+    conversation. It can be database-backed or entirely in-memory. It handles
+    message management, branching, context formatting, and automatic,
+    non-destructive context pruning.
+    """
+
+    def __init__(self,
+                 lollmsClient: 'LollmsClient',
+                 db_manager: Optional[LollmsDataManager] = None,
+                 discussion_id: Optional[str] = None,
+                 db_discussion_obj: Optional[Any] = None,
+                 autosave: bool = False,
+                 max_context_size: Optional[int] = None):
+        """Initializes a discussion instance.
+
+        Args:
+            lollmsClient: The LollmsClient instance used for generation and token counting.
+            db_manager: An optional LollmsDataManager for database persistence.
+            discussion_id: The ID of the discussion to load (if db_manager is provided).
+            db_discussion_obj: A pre-loaded ORM object to wrap.
+            autosave: If True, commits changes to the DB automatically after modifications.
+            max_context_size: The maximum number of tokens to allow in the context
+                              before triggering automatic pruning.
+        """
         object.__setattr__(self, 'lollmsClient', lollmsClient)
         object.__setattr__(self, 'db_manager', db_manager)
         object.__setattr__(self, 'autosave', autosave)
         object.__setattr__(self, 'max_context_size', max_context_size)
         object.__setattr__(self, 'scratchpad', "")
-        object.__setattr__(self, 'show_thoughts', False)
-        object.__setattr__(self, 'include_thoughts_in_context', False)
-        object.__setattr__(self, 'thought_placeholder', "<thought process hidden>")
         
+        # Internal state
         object.__setattr__(self, '_session', None)
         object.__setattr__(self, '_db_discussion', None)
         object.__setattr__(self, '_message_index', None)
@@ -220,21 +388,23 @@ class LollmsDiscussion:
                     raise ValueError(f"No discussion found with ID: {discussion_id}")
         else:
             self._create_in_memory_proxy(id=discussion_id)
+        
         self._rebuild_message_index()
-    
-    @property
-    def remaining_tokens(self) -> Optional[int]:
-        """Calculates the remaining tokens available in the context window."""
-        binding = self.lollmsClient.binding
-        if not binding or not hasattr(binding, 'ctx_size') or not binding.ctx_size:
-            return None
-        max_ctx = binding.ctx_size
-        current_prompt = self.format_discussion(max_ctx)
-        current_tokens = self.lollmsClient.count_tokens(current_prompt)
-        return max_ctx - current_tokens
 
     @classmethod
     def create_new(cls, lollms_client: 'LollmsClient', db_manager: Optional[LollmsDataManager] = None, **kwargs) -> 'LollmsDiscussion':
+        """Creates a new discussion and persists it if a db_manager is provided.
+
+        This is the recommended factory method for creating new discussions.
+
+        Args:
+            lollms_client: The LollmsClient instance to associate with the discussion.
+            db_manager: An optional LollmsDataManager to make the discussion persistent.
+            **kwargs: Attributes for the new discussion (e.g., id, title).
+
+        Returns:
+            A new LollmsDiscussion instance.
+        """
         init_args = {
             'autosave': kwargs.pop('autosave', False),
             'max_context_size': kwargs.pop('max_context_size', None)
@@ -252,6 +422,7 @@ class LollmsDiscussion:
             return cls(lollmsClient=lollms_client, discussion_id=kwargs.get('id'), **init_args)
 
     def __getattr__(self, name: str) -> Any:
+        """Proxies attribute getting to the underlying discussion object."""
         if name == 'metadata':
             return getattr(self._db_discussion, 'discussion_metadata', None)
         if name == 'messages':
@@ -259,10 +430,10 @@ class LollmsDiscussion:
         return getattr(self._db_discussion, name)
 
     def __setattr__(self, name: str, value: Any):
+        """Proxies attribute setting to the underlying discussion object."""
         internal_attrs = [
-            'lollmsClient','db_manager','autosave','max_context_size','scratchpad',
-            'show_thoughts', 'include_thoughts_in_context', 'thought_placeholder',
-            '_session','_db_discussion','_message_index','_messages_to_delete_from_db', '_is_db_backed'
+            'lollmsClient', 'db_manager', 'autosave', 'max_context_size', 'scratchpad',
+            '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db', '_is_db_backed'
         ]
         if name in internal_attrs:
             object.__setattr__(self, name, value)
@@ -274,32 +445,47 @@ class LollmsDiscussion:
             self.touch()
     
     def _create_in_memory_proxy(self, id: Optional[str] = None):
+        """Creates a SimpleNamespace object to mimic a DB record for in-memory discussions."""
         proxy = SimpleNamespace()
-        proxy.id, proxy.system_prompt, proxy.participants = id or str(uuid.uuid4()), None, {}
-        proxy.active_branch_id, proxy.discussion_metadata = None, {}
-        proxy.created_at, proxy.updated_at = datetime.utcnow(), datetime.utcnow()
+        proxy.id = id or str(uuid.uuid4())
+        proxy.system_prompt = None
+        proxy.participants = {}
+        proxy.active_branch_id = None
+        proxy.discussion_metadata = {}
+        proxy.created_at = datetime.utcnow()
+        proxy.updated_at = datetime.utcnow()
         proxy.messages = []
+        proxy.pruning_summary = None
+        proxy.pruning_point_id = None
         object.__setattr__(self, '_db_discussion', proxy)
     
     def _rebuild_message_index(self):
+        """Rebuilds the internal dictionary mapping message IDs to message objects."""
         if self._is_db_backed and self._session.is_active and self._db_discussion in self._session:
             self._session.refresh(self._db_discussion, ['messages'])
         self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
 
     def touch(self):
+        """Marks the discussion as updated and saves it if autosave is enabled."""
         setattr(self._db_discussion, 'updated_at', datetime.utcnow())
         if self._is_db_backed and self.autosave:
             self.commit()
 
     def commit(self):
+        """Commits all pending changes to the database.
+
+        This includes new/modified discussion attributes and any pending message deletions.
+        """
         if not self._is_db_backed or not self._session:
             return
+        
         if self._messages_to_delete_from_db:
             for msg_id in self._messages_to_delete_from_db:
                 msg_to_del = self._session.get(self.db_manager.MessageModel, msg_id)
                 if msg_to_del:
                     self._session.delete(msg_to_del)
             self._messages_to_delete_from_db.clear()
+            
         try:
             self._session.commit()
             self._rebuild_message_index()
@@ -308,15 +494,34 @@ class LollmsDiscussion:
             raise e
 
     def close(self):
+        """Commits any final changes and closes the database session."""
         if self._session:
             self.commit()
             self._session.close()
 
     def add_message(self, **kwargs) -> LollmsMessage:
-        msg_id, parent_id = kwargs.get('id', str(uuid.uuid4())), kwargs.get('parent_id', self.active_branch_id)
-        message_data = {'id': msg_id, 'parent_id': parent_id, 'discussion_id': self.id, 'created_at': datetime.utcnow(), **kwargs}
+        """Adds a new message to the discussion.
+
+        Args:
+            **kwargs: Attributes for the new message (e.g., sender, content, parent_id).
+
+        Returns:
+            The newly created LollmsMessage instance.
+        """
+        msg_id = kwargs.get('id', str(uuid.uuid4()))
+        parent_id = kwargs.get('parent_id', self.active_branch_id)
+        
+        message_data = {
+            'id': msg_id,
+            'parent_id': parent_id,
+            'discussion_id': self.id,
+            'created_at': datetime.utcnow(),
+            **kwargs
+        }
+        
         if 'metadata' in message_data:
             message_data['message_metadata'] = message_data.pop('metadata')
+            
         if self._is_db_backed:
             valid_keys = {c.name for c in self.db_manager.MessageModel.__table__.columns}
             filtered_data = {k: v for k, v in message_data.items() if k in valid_keys}
@@ -327,158 +532,185 @@ class LollmsDiscussion:
         else:
             new_msg_orm = SimpleNamespace(**message_data)
             self._db_discussion.messages.append(new_msg_orm)
-        self._message_index[msg_id], self.active_branch_id = new_msg_orm, msg_id
+            
+        self._message_index[msg_id] = new_msg_orm
+        self.active_branch_id = msg_id
         self.touch()
         return LollmsMessage(self, new_msg_orm)
         
     def get_branch(self, leaf_id: Optional[str]) -> List[LollmsMessage]:
+        """Traces a branch of the conversation from a leaf message back to the root.
+
+        Args:
+            leaf_id: The ID of the message at the end of the branch.
+
+        Returns:
+            A list of LollmsMessage objects, ordered from the root to the leaf.
+        """
         if not leaf_id:
             return []
-        branch_orms, current_id = [], leaf_id
+        
+        branch_orms = []
+        current_id = leaf_id
         while current_id and current_id in self._message_index:
             msg_orm = self._message_index[current_id]
             branch_orms.append(msg_orm)
             current_id = msg_orm.parent_id
+            
         return [LollmsMessage(self, orm) for orm in reversed(branch_orms)]
 
 
-
     def chat(
-        self, 
-        user_message: str, 
+        self,
+        user_message: str,
         personality: Optional['LollmsPersonality'] = None,
         use_mcps: Union[None, bool, List[str]] = None,
         use_data_store: Union[None, Dict[str, Callable]] = None,
-        build_plan: bool = True,
-        add_user_message: bool = True, # New parameter
-        max_tool_calls = 10,
-        rag_top_k = 5,
+        add_user_message: bool = True,
+        max_reasoning_steps: int = 10,
+        images: Optional[List[str]] = None,
         **kwargs
-    ) -> Dict[str, 'LollmsMessage']: # Return type changed
-        """
-        Main interaction method for the discussion. It can perform a simple chat or
-        trigger a complex agentic loop with RAG and MCP tool use.
+    ) -> Dict[str, 'LollmsMessage']:
+        """Main interaction method that can invoke the dynamic, multi-modal agent.
+
+        This method orchestrates the entire response generation process. It can
+        trigger a simple, direct chat with the language model, or it can invoke
+        the powerful `generate_with_mcp_rag` agent.
+
+        When an agentic turn is used, the agent's full reasoning process (the
+        `final_scratchpad`), tool calls, and any retrieved RAG sources are
+        automatically stored in the resulting AI message object for full persistence
+        and auditability. It also handles clarification requests from the agent.
 
         Args:
-            user_message (str): The new message from the user.
-            personality (Optional[LollmsPersonality], optional): The personality to use. Defaults to None.
-            use_mcps (Union[None, bool, List[str]], optional): Controls MCP tool usage. Defaults to None.
-            use_data_store (Union[None, Dict[str, Callable]], optional): Controls RAG usage. Defaults to None.
-            build_plan (bool, optional): If True, the agent will generate an initial plan. Defaults to True.
-            add_user_message (bool, optional): If True, a new user message is created from the prompt. 
-                If False, it assumes regeneration on the current active user message. Defaults to True.
-            **kwargs: Additional keyword arguments passed to the underlying generation method.
+            user_message: The new message from the user.
+            personality: An optional LollmsPersonality to use for the response,
+                         which can influence system prompts and other behaviors.
+            use_mcps: Controls MCP tool usage for the agent. Can be None (disabled),
+                      True (all tools), or a list of specific tool names.
+            use_data_store: Controls RAG usage for the agent. A dictionary mapping
+                            store names to their query callables.
+            add_user_message: If True, a new user message is created from the prompt.
+                              If False, it assumes regeneration on the current active
+                              user message.
+            max_reasoning_steps: The maximum number of reasoning cycles for the agent
+                                 before it must provide a final answer.
+            images: A list of base64-encoded images provided by the user, which will
+                    be passed to the agent or a multi-modal LLM.
+            **kwargs: Additional keyword arguments passed to the underlying generation
+                      methods, such as 'streaming_callback'.
 
         Returns:
-            Dict[str, LollmsMessage]: A dictionary with 'user_message' and 'ai_message' objects.
+            A dictionary with 'user_message' and 'ai_message' LollmsMessage objects,
+            where the 'ai_message' will contain rich metadata if an agentic turn was used.
         """
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
 
-        # Add user message to the discussion or get the existing one
+        # Step 1: Add user message, now including any images.
         if add_user_message:
-            # Pass kwargs to capture images, etc., sent from the router
-            user_msg = self.add_message(sender="user", sender_type="user", content=user_message, **kwargs)
-        else:
-            # We are regenerating. The current active branch tip must be the user message.
+            # Pass kwargs through to capture images and other potential message attributes
+            user_msg = self.add_message(
+                sender="user", 
+                sender_type="user", 
+                content=user_message,
+                images=images,
+                **kwargs # Use kwargs to allow other fields to be set from the caller
+            )
+        else: # Regeneration logic
             if self.active_branch_id not in self._message_index:
                 raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
             user_msg_orm = self._message_index[self.active_branch_id]
             if user_msg_orm.sender_type != 'user':
                 raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
             user_msg = LollmsMessage(self, user_msg_orm)
-        
-        # --- (The existing generation logic remains the same) ---
-        is_agentic_turn = (use_mcps is not None and len(use_mcps)>0) or (use_data_store is not None and len(use_data_store)>0)
-        rag_context = None
-        original_system_prompt = self.system_prompt
-        if personality:
-            self.system_prompt = personality.system_prompt
-            if user_message and not is_agentic_turn:
-                rag_context = personality.get_rag_context(user_message)
-        if rag_context:
-            self.system_prompt = f"{original_system_prompt or ''}\n\n--- Relevant Information ---\n{rag_context}\n---"
-        start_time = datetime.now()
-        if is_agentic_turn:
-            # --- FIX: Provide the full conversation context to the agent ---
-            # 1. Get the model's max context size.
-            max_ctx = self.lollmsClient.binding.get_ctx_size(self.lollmsClient.binding.model_name) if self.lollmsClient.binding else None
-            
-            # 2. Format the entire discussion up to this point, including the new user message.
-            #    This ensures the agent has the full history.
-            full_context_prompt = self.format_discussion(max_allowed_tokens=max_ctx)
+            # For regeneration, we use the images from the original user message
+            images = user_msg.images
 
-            # 3. Call the agent with the complete context.
-            #    We pass the full context to the 'prompt' argument. The `system_prompt` is already
-            #    included within the formatted text, so we don't pass it separately to avoid duplication.
+        # Step 2: Determine if this is a simple chat or a complex agentic turn.
+        is_agentic_turn = (use_mcps is not None and use_mcps) or (use_data_store is not None and use_data_store)
+        
+        start_time = datetime.now()
+        
+        agent_result = None
+        final_scratchpad = None
+        final_raw_response = ""
+        final_content = ""
+
+        # Step 3: Execute the appropriate generation logic.
+        if is_agentic_turn:
+            # --- AGENTIC TURN ---
             agent_result = self.lollmsClient.generate_with_mcp_rag(
-                prompt=full_context_prompt, 
-                use_mcps=use_mcps, 
-                use_data_store=use_data_store, 
-                build_plan=build_plan,
-                max_tool_calls = max_tool_calls,
-                rag_top_k= rag_top_k,
+                prompt=user_message,
+                use_mcps=use_mcps,
+                use_data_store=use_data_store,
+                max_reasoning_steps=max_reasoning_steps,
+                images=images,
                 **kwargs
             )
-            final_content = agent_result.get("final_answer", "")
-            thoughts_text = None 
-            final_raw_response = json.dumps(agent_result)
+            final_content = agent_result.get("final_answer", "The agent did not produce a final answer.")
+            final_scratchpad = agent_result.get("final_scratchpad", "")
+            final_raw_response = json.dumps(agent_result, indent=2)
+
         else:
-            if personality and personality.script_module and hasattr(personality.script_module, 'run'):
-                try:
-                    final_raw_response = personality.script_module.run(self, kwargs.get("streaming_callback"))
-                except Exception as e:
-                    final_raw_response = f"Error executing personality script: {e}"
-            else:
-                is_streaming = "streaming_callback" in kwargs and kwargs.get("streaming_callback") is not None
-                if is_streaming:
-                    raw_response_accumulator = self.lollmsClient.chat(self, **kwargs)
-                    final_raw_response = "".join(raw_response_accumulator)
-                else:
-                    kwargs["stream"] = False
-                    final_raw_response = self.lollmsClient.chat(self, **kwargs) or ""
-            thoughts_match = re.search(r"<think>(.*?)</think>", final_raw_response, re.DOTALL)
-            thoughts_text = thoughts_match.group(1).strip() if thoughts_match else None
+            # --- SIMPLE CHAT TURN ---
+            # For simple chat, we also need to consider images if the model is multi-modal
+            final_raw_response = self.lollmsClient.chat(self, images=images, **kwargs) or ""
             final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
-        if rag_context or (personality and self.system_prompt != original_system_prompt):
-            self.system_prompt = original_system_prompt
+            final_scratchpad = None # No agentic scratchpad in a simple turn
+
+        # Step 4: Post-generation processing and statistics.
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
         token_count = self.lollmsClient.count_tokens(final_content)
         tok_per_sec = (token_count / duration) if duration > 0 else 0
-        # --- (End of existing logic) ---
 
-        # --- FIX: Store agentic results in metadata ---
+        # Step 5: Collect metadata from the agentic turn for storage.
         message_meta = {}
         if is_agentic_turn and isinstance(agent_result, dict):
-            # We store the 'steps' and 'sources' if they exist in the agent result.
-            # This makes them available to the frontend in the final message object.
-            if "steps" in agent_result:
-                message_meta["steps"] = agent_result["steps"]
+            if "tool_calls" in agent_result:
+                message_meta["tool_calls"] = agent_result["tool_calls"]
             if "sources" in agent_result:
                 message_meta["sources"] = agent_result["sources"]
+            if agent_result.get("clarification_required", False):
+                message_meta["clarification_required"] = True
 
+        # Step 6: Add the final AI message to the discussion.
         ai_message_obj = self.add_message(
-            sender=personality.name if personality else "assistant", sender_type="assistant", content=final_content,
-            raw_content=final_raw_response, thoughts=thoughts_text, tokens=token_count,
-            binding_name=self.lollmsClient.binding.binding_name, model_name=self.lollmsClient.binding.model_name,
+            sender=personality.name if personality else "assistant",
+            sender_type="assistant",
+            content=final_content,
+            raw_content=final_raw_response,
+            # Store the agent's full reasoning log in the message's dedicated scratchpad field
+            scratchpad=final_scratchpad,
+            tokens=token_count,
             generation_speed=tok_per_sec,
-            parent_id=user_msg.id, # Ensure the AI response is a child of the user message
-            metadata=message_meta # Pass the collected metadata here
+            parent_id=user_msg.id,
+            metadata=message_meta
         )
+        
         if self._is_db_backed and self.autosave:
             self.commit()
             
         return {"user_message": user_msg, "ai_message": ai_message_obj}
 
     def regenerate_branch(self, **kwargs) -> Dict[str, 'LollmsMessage']:
+        """Regenerates the last AI response in the active branch.
+
+        It deletes the previous AI response and calls chat() again with the
+        same user prompt.
+
+        Args:
+            **kwargs: Additional arguments for the chat() method.
+
+        Returns:
+            A dictionary with the user and the newly generated AI message.
+        """
         if not self.active_branch_id or self.active_branch_id not in self._message_index:
             raise ValueError("No active message to regenerate from.")
         
         last_message_orm = self._message_index[self.active_branch_id]
         
-        # If the current active message is the assistant's, we need to delete it
-        # and set the active branch to its parent (the user message).
         if last_message_orm.sender_type == 'assistant':
             parent_id = last_message_orm.parent_id
             if not parent_id:
@@ -493,218 +725,245 @@ class LollmsDiscussion:
             self.active_branch_id = parent_id
             self.touch()
 
-        # The active branch is now guaranteed to be on a user message.
-        # Call chat, but do not add a new user message.
         prompt_to_regenerate = self._message_index[self.active_branch_id].content
         return self.chat(user_message=prompt_to_regenerate, add_user_message=False, **kwargs)
-
-    def process_and_summarize(self, large_text: str, user_prompt: str, chunk_size: int = 4096, **kwargs) -> LollmsMessage:
-        user_msg = self.add_message(sender="user", sender_type="user", content=user_prompt)
-        chunks = [large_text[i:i + chunk_size] for i in range(0, len(large_text), chunk_size)]
-        current_summary, total_chunks = "", len(chunks)
-        for i, chunk in enumerate(chunks):
-            print(f"\nProcessing chunk {i+1}/{total_chunks}...")
-            if i == 0:
-                prompt = f"""The user wants to know: "{user_prompt}"\nHere is the first part of the document (chunk 1 of {total_chunks}). \nRead it and create a detailed summary of all information relevant to the user's prompt.\n\nDOCUMENT CHUNK:\n---\n{chunk}\n---\nSUMMARY:"""
-            else:
-                prompt = f"""The user wants to know: "{user_prompt}"\nYou are processing a large document sequentially. Here is the summary of the previous chunks and the content of the next chunk ({i+1} of {total_chunks}).\nUpdate your summary by integrating new relevant information from the new chunk. Do not repeat information you already have. Output ONLY the new, updated, complete summary.\n\nPREVIOUS SUMMARY:\n---\n{current_summary}\n---\n\nNEW DOCUMENT CHUNK:\n---\n{chunk}\n---\nUPDATED SUMMARY:"""
-            current_summary = self.lollmsClient.generate_text(prompt, **kwargs).strip()
-        final_prompt = f"""Based on the following comprehensive summary of a document, provide a final answer to the user's original prompt.\nUser's prompt: "{user_prompt}"\n\nCOMPREHENSIVE SUMMARY:\n---\n{current_summary}\n---\nFINAL ANSWER:"""
-        final_answer = self.lollmsClient.generate_text(final_prompt, **kwargs).strip()
-        ai_message_obj = self.add_message(
-            sender="assistant", sender_type="assistant", content=final_answer,
-            scratchpad=current_summary, parent_id=user_msg.id
-        )
-        if self._is_db_backed and not self.autosave:
-            self.commit()
-        return ai_message_obj
-
-
     def delete_branch(self, message_id: str):
+        """Deletes a message and its entire descendant branch.
+
+        This method removes the specified message and any messages that have it
+        as a parent or an ancestor. After deletion, the active branch is moved
+        to the parent of the deleted message.
+
+        This operation is only supported for database-backed discussions.
+
+        Args:
+            message_id: The ID of the message at the root of the branch to be deleted.
+
+        Raises:
+            NotImplementedError: If the discussion is not database-backed.
+            ValueError: If the message ID is not found in the discussion.
+        """
         if not self._is_db_backed:
             raise NotImplementedError("Branch deletion is only supported for database-backed discussions.")
+        
         if message_id not in self._message_index:
-            raise ValueError("Message not found.")
-        msg_to_delete = self._session.query(self.db_manager.MessageModel).filter_by(id=message_id).first()
-        if msg_to_delete:
-            self.active_branch_id = msg_to_delete.parent_id
-            self._session.delete(msg_to_delete)
-            self.commit()
+            raise ValueError(f"Message with ID '{message_id}' not found in the discussion.")
 
-    def switch_to_branch(self, message_id: str):
-        if message_id not in self._message_index:
-            raise ValueError(f"Message ID '{message_id}' not found in the current discussion.")
-        self.active_branch_id = message_id
-        self.touch()
+        # --- 1. Identify all messages to delete ---
+        # We start with the target message and find all of its descendants.
+        messages_to_delete_ids = set()
+        queue = [message_id] # A queue for breadth-first search of descendants
 
-    def format_discussion(self, max_allowed_tokens: int, branch_tip_id: Optional[str] = None) -> str:
-        return self.export("lollms_text", branch_tip_id, max_allowed_tokens)
+        while queue:
+            current_id = queue.pop(0)
+            if current_id in messages_to_delete_ids:
+                continue # Already processed
+            
+            messages_to_delete_ids.add(current_id)
 
-    def _get_full_system_prompt(self) -> Optional[str]:
-        parts = []
-        if self.scratchpad:
-            parts.extend(["--- KNOWLEDGE SCRATCHPAD ---", self.scratchpad.strip(), "--- END SCRATCHPAD ---"])
-        if self.system_prompt and self.system_prompt.strip():
-            parts.append(self.system_prompt.strip())
-        return "\n\n".join(parts) if parts else None
+            # Find all direct children of the current message
+            children = [msg.id for msg in self._db_discussion.messages if msg.parent_id == current_id]
+            queue.extend(children)
+        
+        # --- 2. Get the parent of the starting message to reset the active branch ---
+        original_message_orm = self._message_index[message_id]
+        new_active_branch_id = original_message_orm.parent_id
 
+        # --- 3. Perform the deletion ---
+        # Remove from the ORM object's list
+        self._db_discussion.messages = [
+            msg for msg in self._db_discussion.messages if msg.id not in messages_to_delete_ids
+        ]
+        
+        # Remove from the quick-access index
+        for mid in messages_to_delete_ids:
+            if mid in self._message_index:
+                del self._message_index[mid]
+        
+        # Add to the set of messages to be deleted from the DB on next commit
+        self._messages_to_delete_from_db.update(messages_to_delete_ids)
+
+        # --- 4. Update the active branch ---
+        # If we deleted the branch that was active, move to its parent.
+        if self.active_branch_id in messages_to_delete_ids:
+            self.active_branch_id = new_active_branch_id
+        
+        self.touch() # Mark discussion as updated and save if autosave is on
+
+        print(f"Marked branch starting at {message_id} ({len(messages_to_delete_ids)} messages) for deletion.")
+        
     def export(self, format_type: str, branch_tip_id: Optional[str] = None, max_allowed_tokens: Optional[int] = None) -> Union[List[Dict], str]:
+        """Exports the discussion history into a specified format.
+
+        This method can format the conversation for different backends like OpenAI,
+        Ollama, or the native `lollms_text` format. It intelligently handles
+        context limits and non-destructive pruning summaries.
+
+        Args:
+            format_type: The target format. Can be "lollms_text", "openai_chat",
+                         or "ollama_chat".
+            branch_tip_id: The ID of the message to use as the end of the context.
+                           Defaults to the active branch ID.
+            max_allowed_tokens: The maximum number of tokens the final prompt can contain.
+                                This is primarily used by "lollms_text".
+
+        Returns:
+            A string for "lollms_text" or a list of dictionaries for "openai_chat"
+            and "ollama_chat".
+
+        Raises:
+            ValueError: If an unsupported format_type is provided.
+        """
         branch_tip_id = branch_tip_id or self.active_branch_id
         if not branch_tip_id and format_type in ["lollms_text", "openai_chat", "ollama_chat"]:
             return "" if format_type == "lollms_text" else []
-        branch, full_system_prompt, participants = self.get_branch(branch_tip_id), self._get_full_system_prompt(), self.participants or {}
+        
+        branch = self.get_branch(branch_tip_id)
+        full_system_prompt = self.system_prompt # Simplified for clarity
+        participants = self.participants or {}
 
-        def get_full_content(msg: LollmsMessage) -> str:
+        def get_full_content(msg: 'LollmsMessage') -> str:
             content_to_use = msg.content
-            if self.include_thoughts_in_context and msg.sender_type == 'assistant' and msg.raw_content:
-                if self.thought_placeholder:
-                    content_to_use = re.sub(r"<think>.*?</think>", f"<think>{self.thought_placeholder}</think>", msg.raw_content, flags=re.DOTALL)
-                else:
-                    content_to_use = msg.raw_content
-            
-            parts = [f"--- Internal Scratchpad ---\n{msg.scratchpad.strip()}\n---"] if msg.scratchpad and msg.scratchpad.strip() else []
-            parts.append(content_to_use.strip())
-            return "\n".join(parts)
+            # You can expand this logic to include thoughts, scratchpads etc. based on settings
+            return content_to_use.strip()
 
+        # --- NATIVE LOLLMS_TEXT FORMAT ---
         if format_type == "lollms_text":
-            prompt_parts, current_tokens = [], 0
+            # --- FIX STARTS HERE ---
+            final_prompt_parts = []
+            message_parts = [] # Temporary list for correctly ordered messages
+            
+            current_tokens = 0
+            messages_to_render = branch
+
+            # 1. Handle non-destructive pruning summary
+            summary_text = ""
+            if self.pruning_summary and self.pruning_point_id:
+                pruning_index = -1
+                for i, msg in enumerate(branch):
+                    if msg.id == self.pruning_point_id:
+                        pruning_index = i
+                        break
+                if pruning_index != -1:
+                    messages_to_render = branch[pruning_index:]
+                    summary_text = f"!@>system:\n--- Conversation Summary ---\n{self.pruning_summary.strip()}\n"
+
+            # 2. Add main system prompt to the final list
+            sys_msg_text = ""
             if full_system_prompt:
-                sys_msg_text = f"!@>system:\n{full_system_prompt}\n"
+                sys_msg_text = f"!@>system:\n{full_system_prompt.strip()}\n"
                 sys_tokens = self.lollmsClient.count_tokens(sys_msg_text)
                 if max_allowed_tokens is None or sys_tokens <= max_allowed_tokens:
-                    prompt_parts.append(sys_msg_text)
+                    final_prompt_parts.append(sys_msg_text)
                     current_tokens += sys_tokens
-            for msg in reversed(branch):
+            
+            # 3. Add pruning summary (if it exists) to the final list
+            if summary_text:
+                summary_tokens = self.lollmsClient.count_tokens(summary_text)
+                if max_allowed_tokens is None or current_tokens + summary_tokens <= max_allowed_tokens:
+                    final_prompt_parts.append(summary_text)
+                    current_tokens += summary_tokens
+
+            # 4. Build the message list in correct order, respecting token limits
+            for msg in reversed(messages_to_render):
                 sender_str = msg.sender.replace(':', '').replace('!@>', '')
                 content = get_full_content(msg)
                 if msg.images:
                     content += f"\n({len(msg.images)} image(s) attached)"
                 msg_text = f"!@>{sender_str}:\n{content}\n"
                 msg_tokens = self.lollmsClient.count_tokens(msg_text)
+                
                 if max_allowed_tokens is not None and current_tokens + msg_tokens > max_allowed_tokens:
                     break
-                prompt_parts.insert(1 if full_system_prompt else 0, msg_text)
+                
+                # Always insert at the beginning of the temporary list
+                message_parts.insert(0, msg_text)
                 current_tokens += msg_tokens
-            return "".join(prompt_parts).strip()
+            
+            # 5. Combine system/summary prompts with the message parts
+            final_prompt_parts.extend(message_parts)
+            return "".join(final_prompt_parts).strip()
+            # --- FIX ENDS HERE ---
         
+        # --- OPENAI & OLLAMA CHAT FORMATS (remains the same and is correct) ---
         messages = []
         if full_system_prompt:
             messages.append({"role": "system", "content": full_system_prompt})
+        
         for msg in branch:
-            role, content, images = participants.get(msg.sender, "user"), get_full_content(msg), msg.images or []
+            if msg.sender_type == 'user':
+                role = participants.get(msg.sender, "user")
+            else:
+                role = participants.get(msg.sender, "assistant")
+
+            content, images = get_full_content(msg), msg.images or []
+
             if format_type == "openai_chat":
                 if images:
                     content_parts = [{"type": "text", "text": content}] if content else []
                     for img in images:
-                        content_parts.append({"type": "image_url", "image_url": {"url": img['data'] if img['type'] == 'url' else f"data:image/jpeg;base64,{img['data']}", "detail": "auto"}})
+                        img_data = img['data']
+                        url = f"data:image/jpeg;base64,{img_data}" if img['type'] == 'base64' else img_data
+                        content_parts.append({"type": "image_url", "image_url": {"url": url, "detail": "auto"}})
                     messages.append({"role": role, "content": content_parts})
                 else:
                     messages.append({"role": role, "content": content})
+            
             elif format_type == "ollama_chat":
                 message_dict = {"role": role, "content": content}
                 base64_images = [img['data'] for img in images if img['type'] == 'base64']
                 if base64_images:
                     message_dict["images"] = base64_images
                 messages.append(message_dict)
+
             else:
                 raise ValueError(f"Unsupported export format_type: {format_type}")
+                
         return messages
+    
 
     def summarize_and_prune(self, max_tokens: int, preserve_last_n: int = 4):
+        """Non-destructively prunes the discussion by summarizing older messages.
+
+        This method does NOT delete messages. Instead, it generates a summary of
+        the older parts of the conversation and bookmarks the point from which
+        the full conversation should resume. The `export()` method then uses this
+        information to build a context-window-friendly prompt.
+
+        Args:
+            max_tokens: The token limit that triggers the pruning process.
+            preserve_last_n: The number of recent messages to keep in full detail.
+        """
         branch_tip_id = self.active_branch_id
         if not branch_tip_id:
             return
-        current_tokens = self.lollmsClient.count_tokens(self.format_discussion(999999, branch_tip_id))
+
+        current_formatted_text = self.export("lollms_text", branch_tip_id, 999999)
+        current_tokens = self.lollmsClient.count_tokens(current_formatted_text)
+
         if current_tokens <= max_tokens:
             return
+
         branch = self.get_branch(branch_tip_id)
         if len(branch) <= preserve_last_n:
             return
+
         messages_to_prune = branch[:-preserve_last_n]
+        pruning_point_message = branch[-preserve_last_n]
+
         text_to_summarize = "\n\n".join([f"{m.sender}: {m.content}" for m in messages_to_prune])
-        summary_prompt = f"Concisely summarize this conversation excerpt:\n---\n{text_to_summarize}\n---\nSUMMARY:"
+        summary_prompt = f"Concisely summarize this conversation excerpt, capturing all key facts, questions, and decisions:\n---\n{text_to_summarize}\n---\nSUMMARY:"
+        
         try:
-            summary = self.lollmsClient.generate_text(summary_prompt, n_predict=300, temperature=0.1)
+            print("\n[INFO] Context window is full. Summarizing older messages...")
+            summary = self.lollmsClient.generate_text(summary_prompt, n_predict=512, temperature=0.1)
         except Exception as e:
             print(f"\n[WARNING] Pruning failed, couldn't generate summary: {e}")
             return
-        self.scratchpad = f"{self.scratchpad}\n\n--- Summary of earlier conversation ---\n{summary.strip()}".strip()
-        pruned_ids = {msg.id for msg in messages_to_prune}
-        if self._is_db_backed:
-            self._messages_to_delete_from_db.update(pruned_ids)
-            self._db_discussion.messages = [m for m in self._db_discussion.messages if m.id not in pruned_ids]
-        else:
-            self._db_discussion.messages = [m for m in self._db_discussion.messages if m.id not in pruned_ids]
-        self._rebuild_message_index()
+
+        current_summary = self.pruning_summary or ""
+        self.pruning_summary = f"{current_summary}\n\n--- Summary of earlier conversation ---\n{summary.strip()}".strip()
+        self.pruning_point_id = pruning_point_message.id
+        
         self.touch()
-        print(f"\n[INFO] Discussion auto-pruned. {len(messages_to_prune)} messages summarized.")
-
-    def to_dict(self):
-        return {
-            "id": self.id, "system_prompt": self.system_prompt, "participants": self.participants,
-            "active_branch_id": self.active_branch_id, "metadata": self.metadata, "scratchpad": self.scratchpad,
-            "messages": [{ 'id': m.id, 'parent_id': m.parent_id, 'discussion_id': m.discussion_id, 'sender': m.sender,
-                           'sender_type': m.sender_type, 'content': m.content, 'scratchpad': m.scratchpad, 'images': m.images,
-                           'created_at': m.created_at.isoformat(), 'metadata': m.metadata } for m in self.messages],
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None
-        }
-
-    def load_from_dict(self, data: Dict):
-        self._create_in_memory_proxy(id=data.get("id"))
-        self.system_prompt, self.participants = data.get("system_prompt"), data.get("participants", {})
-        self.active_branch_id, self.metadata = data.get("active_branch_id"), data.get("metadata", {})
-        self.scratchpad = data.get("scratchpad", "")
-        for msg_data in data.get("messages", []):
-            if 'created_at' in msg_data and isinstance(msg_data['created_at'], str):
-                try:
-                    msg_data['created_at'] = datetime.fromisoformat(msg_data['created_at'])
-                except ValueError:
-                    msg_data['created_at'] = datetime.utcnow()
-            self.add_message(**msg_data)
-        self.created_at = datetime.fromisoformat(data['created_at']) if data.get('created_at') else datetime.utcnow()
-        self.updated_at = datetime.fromisoformat(data['updated_at']) if data.get('updated_at') else self.created_at
-
-    @staticmethod
-    def migrate(lollms_client: 'LollmsClient', db_manager: LollmsDataManager, folder_path: Union[str, Path]):
-        folder = Path(folder_path)
-        if not folder.is_dir():
-            print(f"Error: Path '{folder}' is not a valid directory.")
-            return
-        print(f"\n--- Starting Migration from '{folder}' ---")
-        files = list(folder.glob("*.json")) + list(folder.glob("*.yaml"))
-        with db_manager.get_session() as session:
-            valid_disc_keys = {c.name for c in db_manager.DiscussionModel.__table__.columns}
-            valid_msg_keys = {c.name for c in db_manager.MessageModel.__table__.columns}
-            for i, file_path in enumerate(files):
-                print(f"Migrating file {i+1}/{len(files)}: {file_path.name} ... ", end="")
-                try:
-                    data = yaml.safe_load(file_path.read_text(encoding='utf-8'))
-                    discussion_id = data.get("id", str(uuid.uuid4()))
-                    if session.query(db_manager.DiscussionModel).filter_by(id=discussion_id).first():
-                        print("SKIPPED (already exists)")
-                        continue
-                    discussion_data = data.copy()
-                    if 'metadata' in discussion_data:
-                        discussion_data['discussion_metadata'] = discussion_data.pop('metadata')
-                    for key in ['created_at', 'updated_at']:
-                        if key in discussion_data and isinstance(discussion_data[key], str):
-                            discussion_data[key] = datetime.fromisoformat(discussion_data[key])
-                    db_discussion = db_manager.DiscussionModel(**{k: v for k, v in discussion_data.items() if k in valid_disc_keys})
-                    session.add(db_discussion)
-                    for msg_data in data.get("messages", []):
-                        msg_data['discussion_id'] = db_discussion.id
-                        if 'metadata' in msg_data:
-                            msg_data['message_metadata'] = msg_data.pop('metadata')
-                        if 'created_at' in msg_data and isinstance(msg_data['created_at'], str):
-                            msg_data['created_at'] = datetime.fromisoformat(msg_data['created_at'])
-                        msg_orm = db_manager.MessageModel(**{k: v for k, v in msg_data.items() if k in valid_msg_keys})
-                        session.add(msg_orm)
-                    session.flush()
-                    print("OK")
-                except Exception as e:
-                    print(f"FAILED. Error: {e}")
-                    session.rollback()
-                    continue
-            session.commit()
-        print("--- Migration Finished ---")
+        print(f"[INFO] Discussion auto-pruned. {len(messages_to_prune)} messages summarized. History preserved.")
