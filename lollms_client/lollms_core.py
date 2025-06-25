@@ -13,6 +13,8 @@ from lollms_client.lollms_ttm_binding import LollmsTTMBinding, LollmsTTMBindingM
 from lollms_client.lollms_mcp_binding import LollmsMCPBinding, LollmsMCPBindingManager
 
 from lollms_client.lollms_discussion import LollmsDiscussion
+
+from lollms_client.lollms_utilities import build_image_dicts, dict_to_markdown
 import json, re
 from enum import Enum
 import base64
@@ -1541,7 +1543,10 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         # --- 1. Discover Available Tools ---
         available_tools = []
         if use_mcps and self.mcp:
-            available_tools.extend(self.mcp.discover_tools(force_refresh=True))
+            discovered_tools = self.mcp.discover_tools(force_refresh=True)
+            if isinstance(use_mcps, list):
+                available_tools.extend([t for t in discovered_tools if t["name"] in use_mcps])
+            
         if use_data_store:
             for store_name in use_data_store:
                 available_tools.append({
@@ -1613,6 +1618,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 
             current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
             log_step(f"\n\n### Step {i+1}: Thought\n{thought}", "scratchpad", is_start=False)
+            if tool_params:
+                log_step(f"\n\n**Calling tool:**\nName: {tool_name}\nparams:\n {dict_to_markdown(tool_params)}", "scratchpad", is_start=False)
 
             if not tool_name:
                 current_scratchpad += f"\n\n### Step {i+1} Failure\n- **Error:** Did not specify a tool name."
@@ -1644,7 +1651,9 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     rag_callable = use_data_store.get(store_name, {}).get("callable")
                     query = tool_params.get("query", "")
                     retrieved_chunks = rag_callable(query, rag_top_k=rag_top_k, rag_min_similarity_percent=rag_min_similarity_percent)
+                    log_step(f"\n\n**RAG results:**\nFound: {len(retrieved_chunks)} entries.", "scratchpad", is_start=False)
                     if retrieved_chunks:
+                        # hack to remove internal server infos and reformat
                         sources_this_turn.extend(retrieved_chunks)
                         tool_result = {"status": "success", "summary": f"Found {len(retrieved_chunks)} relevant chunks.", "chunks": retrieved_chunks}
                     else:
@@ -1682,9 +1691,10 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             else:
                 observation_text = f"Tool returned non-dictionary output: {str(tool_result)}"
 
+            
             tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
             current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
-            log_step(f"### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n", "scratchpad", is_start=False)
+            log_step(f"### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Output:**\n{dict_to_markdown(sanitized_result)}", "scratchpad", is_start=False)
             
             if reasoning_step_id:
                 log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
