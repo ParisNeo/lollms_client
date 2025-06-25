@@ -11,6 +11,63 @@ import numpy as np
 import json
 from ascii_colors import ASCIIColors, trace_exception
 
+def dict_to_markdown(d, indent=0):
+    """
+    Formats a dictionary as a markdown list.
+
+    Args:
+        d (dict): The dictionary to format.
+        indent (int): Current indentation level (used recursively).
+
+    Returns:
+        str: The formatted markdown string.
+    """
+    lines = []
+    for key, value in d.items():
+        if isinstance(value, dict):
+            # If the value is a dictionary, process it recursively
+            md_str = f"{' ' * indent*2}- {key}:\n" + dict_to_markdown(value, indent+1)
+        else:
+            # Regular value (non-dictionary)
+            md_str = f"{' ' * indent*2}- {key}: {value}"
+        lines.append(md_str)
+
+    return "\n".join(lines)
+
+def is_base64(s):
+    """Check if the string is a valid base64 encoded string."""
+    try:
+        # Try to decode and then encode back to check for validity
+        import base64
+        base64.b64decode(s)
+        return True
+    except Exception as e:
+        return False
+
+def build_image_dicts(images):
+    """
+    Convert a list of image strings (base64 or URLs) into a list of dictionaries with type and data.
+
+    Args:
+        images (list): List of image strings (either base64-encoded or URLs).
+
+    Returns:
+        list: List of dictionaries in the format {'type': 'base64'/'url', 'data': <image string>}.
+    """
+    result = []
+
+    for img in images:
+        if isinstance(img, str):
+            if is_base64(img):
+                result.append({'type': 'base64', 'data': img})
+            else:
+                # Assuming it's a URL if not base64
+                result.append({'type': 'url', 'data': img})
+        else:
+            result.append(img)
+
+    return result
+
 def robust_json_parser(json_string: str) -> dict:
     """
     Parses a possibly malformed JSON string using a series of corrective strategies.
