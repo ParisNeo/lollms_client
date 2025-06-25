@@ -641,7 +641,7 @@ class LollmsDiscussion:
         if is_agentic_turn:
             # --- AGENTIC TURN ---
             agent_result = self.lollmsClient.generate_with_mcp_rag(
-                prompt=user_message,
+                prompt=self.export("markdown"),
                 use_mcps=use_mcps,
                 use_data_store=use_data_store,
                 max_reasoning_steps=max_reasoning_steps,
@@ -656,7 +656,10 @@ class LollmsDiscussion:
             # --- SIMPLE CHAT TURN ---
             # For simple chat, we also need to consider images if the model is multi-modal
             final_raw_response = self.lollmsClient.chat(self, images=images, **kwargs) or ""
-            final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
+            if isinstance(final_content, dict) and final_content["status"]=="error":
+                raise Exception(final_content["message"])
+            else:
+                final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
             final_scratchpad = None # No agentic scratchpad in a simple turn
 
         # Step 4: Post-generation processing and statistics.
@@ -801,7 +804,7 @@ class LollmsDiscussion:
 
         Args:
             format_type: The target format. Can be "lollms_text", "openai_chat",
-                         or "ollama_chat".
+                         "ollama_chat", or "markdown".
             branch_tip_id: The ID of the message to use as the end of the context.
                            Defaults to the active branch ID.
             max_allowed_tokens: The maximum number of tokens the final prompt can contain.
@@ -809,15 +812,15 @@ class LollmsDiscussion:
 
         Returns:
             A string for "lollms_text" or a list of dictionaries for "openai_chat"
-            and "ollama_chat".
+            and "ollama_chat". For "markdown", returns a Markdown-formatted string.
 
         Raises:
             ValueError: If an unsupported format_type is provided.
         """
         branch_tip_id = branch_tip_id or self.active_branch_id
-        if not branch_tip_id and format_type in ["lollms_text", "openai_chat", "ollama_chat"]:
+        if not branch_tip_id and format_type in ["lollms_text", "openai_chat", "ollama_chat", "markdown"]:
             return "" if format_type == "lollms_text" else []
-        
+
         branch = self.get_branch(branch_tip_id)
         full_system_prompt = self.system_prompt # Simplified for clarity
         participants = self.participants or {}
@@ -829,14 +832,12 @@ class LollmsDiscussion:
 
         # --- NATIVE LOLLMS_TEXT FORMAT ---
         if format_type == "lollms_text":
-            # --- FIX STARTS HERE ---
             final_prompt_parts = []
             message_parts = [] # Temporary list for correctly ordered messages
-            
+
             current_tokens = 0
             messages_to_render = branch
 
-            # 1. Handle non-destructive pruning summary
             summary_text = ""
             if self.pruning_summary and self.pruning_point_id:
                 pruning_index = -1
@@ -848,7 +849,6 @@ class LollmsDiscussion:
                     messages_to_render = branch[pruning_index:]
                     summary_text = f"!@>system:\n--- Conversation Summary ---\n{self.pruning_summary.strip()}\n"
 
-            # 2. Add main system prompt to the final list
             sys_msg_text = ""
             if full_system_prompt:
                 sys_msg_text = f"!@>system:\n{full_system_prompt.strip()}\n"
@@ -856,15 +856,13 @@ class LollmsDiscussion:
                 if max_allowed_tokens is None or sys_tokens <= max_allowed_tokens:
                     final_prompt_parts.append(sys_msg_text)
                     current_tokens += sys_tokens
-            
-            # 3. Add pruning summary (if it exists) to the final list
+
             if summary_text:
                 summary_tokens = self.lollmsClient.count_tokens(summary_text)
                 if max_allowed_tokens is None or current_tokens + summary_tokens <= max_allowed_tokens:
                     final_prompt_parts.append(summary_text)
                     current_tokens += summary_tokens
 
-            # 4. Build the message list in correct order, respecting token limits
             for msg in reversed(messages_to_render):
                 sender_str = msg.sender.replace(':', '').replace('!@>', '')
                 content = get_full_content(msg)
@@ -872,24 +870,21 @@ class LollmsDiscussion:
                     content += f"\n({len(msg.images)} image(s) attached)"
                 msg_text = f"!@>{sender_str}:\n{content}\n"
                 msg_tokens = self.lollmsClient.count_tokens(msg_text)
-                
+
                 if max_allowed_tokens is not None and current_tokens + msg_tokens > max_allowed_tokens:
                     break
-                
-                # Always insert at the beginning of the temporary list
+
                 message_parts.insert(0, msg_text)
                 current_tokens += msg_tokens
-            
-            # 5. Combine system/summary prompts with the message parts
+
             final_prompt_parts.extend(message_parts)
             return "".join(final_prompt_parts).strip()
-            # --- FIX ENDS HERE ---
-        
-        # --- OPENAI & OLLAMA CHAT FORMATS (remains the same and is correct) ---
+
+        # --- OPENAI & OLLAMA CHAT FORMATS ---
         messages = []
         if full_system_prompt:
             messages.append({"role": "system", "content": full_system_prompt})
-        
+
         for msg in branch:
             if msg.sender_type == 'user':
                 role = participants.get(msg.sender, "user")
@@ -908,7 +903,7 @@ class LollmsDiscussion:
                     messages.append({"role": role, "content": content_parts})
                 else:
                     messages.append({"role": role, "content": content})
-            
+
             elif format_type == "ollama_chat":
                 message_dict = {"role": role, "content": content}
                 base64_images = [img['data'] for img in images if img['type'] == 'base64']
@@ -916,10 +911,20 @@ class LollmsDiscussion:
                     message_dict["images"] = base64_images
                 messages.append(message_dict)
 
+            elif format_type == "markdown":
+                # Create Markdown content based on the role and content
+                markdown_line = f"**{role.capitalize()}**: {content}\n"
+                if images:
+                    for img in images:
+                        img_data = img['data']
+                        url = f"![Image](data:image/jpeg;base64,{img_data})" if img['type'] == 'base64' else f"![Image]({img_data})"
+                        markdown_line += f"\n{url}\n"
+                messages.append(markdown_line)
+
             else:
                 raise ValueError(f"Unsupported export format_type: {format_type}")
-                
-        return messages
+
+        return "\n".join(messages) if format_type == "markdown" else messages
     
 
     def summarize_and_prune(self, max_tokens: int, preserve_last_n: int = 4):
