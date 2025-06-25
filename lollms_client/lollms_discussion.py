@@ -29,6 +29,7 @@ if False:
     from lollms_client import LollmsClient
     from lollms_personality import LollmsPersonality
 
+from lollms_client.lollms_utilities import build_image_dicts
 
 class EncryptedString(TypeDecorator):
     """A SQLAlchemy TypeDecorator for field-level database encryption.
@@ -564,10 +565,11 @@ class LollmsDiscussion:
         self,
         user_message: str,
         personality: Optional['LollmsPersonality'] = None,
+        branch_tip_id: Optional[str | None] = None,
         use_mcps: Union[None, bool, List[str]] = None,
         use_data_store: Union[None, Dict[str, Callable]] = None,
         add_user_message: bool = True,
-        max_reasoning_steps: int = 10,
+        max_reasoning_steps: int = 20,
         images: Optional[List[str]] = None,
         **kwargs
     ) -> Dict[str, 'LollmsMessage']:
@@ -641,7 +643,7 @@ class LollmsDiscussion:
         if is_agentic_turn:
             # --- AGENTIC TURN ---
             agent_result = self.lollmsClient.generate_with_mcp_rag(
-                prompt=self.export("markdown"),
+                prompt=self.export("markdown",branch_tip_id if branch_tip_id else self.active_branch_id),
                 use_mcps=use_mcps,
                 use_data_store=use_data_store,
                 max_reasoning_steps=max_reasoning_steps,
@@ -697,7 +699,7 @@ class LollmsDiscussion:
             
         return {"user_message": user_msg, "ai_message": ai_message_obj}
 
-    def regenerate_branch(self, **kwargs) -> Dict[str, 'LollmsMessage']:
+    def regenerate_branch(self, branch_tip_id, **kwargs) -> Dict[str, 'LollmsMessage']:
         """Regenerates the last AI response in the active branch.
 
         It deletes the previous AI response and calls chat() again with the
@@ -725,11 +727,8 @@ class LollmsDiscussion:
             if self._is_db_backed:
                 self._messages_to_delete_from_db.add(last_message_id)
             
-            self.active_branch_id = parent_id
-            self.touch()
-
-        prompt_to_regenerate = self._message_index[self.active_branch_id].content
-        return self.chat(user_message=prompt_to_regenerate, add_user_message=False, **kwargs)
+        return self.chat(user_message="", add_user_message=False, branch_tip_id=branch_tip_id, **kwargs)
+    
     def delete_branch(self, message_id: str):
         """Deletes a message and its entire descendant branch.
 
@@ -892,6 +891,8 @@ class LollmsDiscussion:
                 role = participants.get(msg.sender, "assistant")
 
             content, images = get_full_content(msg), msg.images or []
+            images = build_image_dicts(images)        
+
 
             if format_type == "openai_chat":
                 if images:
@@ -906,6 +907,7 @@ class LollmsDiscussion:
 
             elif format_type == "ollama_chat":
                 message_dict = {"role": role, "content": content}
+                
                 base64_images = [img['data'] for img in images if img['type'] == 'base64']
                 if base64_images:
                     message_dict["images"] = base64_images
