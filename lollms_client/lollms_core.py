@@ -1606,16 +1606,19 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 tool_params = action.get("tool_params", {})
             except (json.JSONDecodeError, TypeError) as e:
                 current_scratchpad += f"\n\n### Step {i+1} Failure\n- **Error:** Failed to generate a valid JSON action: {e}"
+                log_step(f"\n\n### Step {i+1} Failure\n- **Error:** Failed to generate a valid JSON action: {e}", "scratchpad", is_start=False)
                 if reasoning_step_id:
                     log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id, "error": str(e)}, is_start=False)
                 break
 
             current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
+            log_step(f"\n\n### Step {i+1}: Thought\n{thought}", "scratchpad", is_start=False)
             if streaming_callback: 
                 streaming_callback(thought, MSG_TYPE.MSG_TYPE_INFO, {"type": "thought"})
 
             if not tool_name:
                 current_scratchpad += f"\n\n### Step {i+1} Failure\n- **Error:** Did not specify a tool name."
+                log_step(f"\n\n### Step {i+1} Failure\n- **Error:** Did not specify a tool name.", "scratchpad", is_start=False)
                 if reasoning_step_id:
                     log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
                 break
@@ -1623,12 +1626,14 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             if tool_name == "request_clarification":
                 clarification_question = action.get("clarification_question", "Could you please provide more details?")
                 current_scratchpad += f"\n\n### Step {i+1}: Action\n- **Action:** Decided to request clarification.\n- **Question:** {clarification_question}"
+                log_step(f"\n\n### Step {i+1}: Action\n- **Action:** Decided to request clarification.\n- **Question:** {clarification_question}", "scratchpad", is_start=False)
                 if reasoning_step_id:
                     log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
                 return {"final_answer": clarification_question, "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": True, "error": None}
 
             if tool_name == "final_answer":
                 current_scratchpad += f"\n\n### Step {i+1}: Action\n- **Action:** Decided to formulate the final answer."
+                log_step(f"\n\n### Step {i+1}: Action\n- **Action:** Decided to formulate the final answer.", "scratchpad", is_start=False)
                 if reasoning_step_id:
                     log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
                 break
@@ -1681,7 +1686,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 
             tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
             current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
-            log_step(current_scratchpad, "scratchpad", is_start=False)
+            log_step(f"### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n", "scratchpad", is_start=False)
             
             if reasoning_step_id:
                 log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
