@@ -848,7 +848,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
             "2.  **Check for a Single-Step Solution:** Scrutinize the available tools. Can a single tool call directly achieve the user's current goal? \n"
             "3.  **Formulate a Plan:** Based on your analysis, create a concise, numbered list of steps to achieve the goal. If the goal is simple, this may be only one step. If it is complex or multi-turn, it may be several steps.\n\n"
             "**CRITICAL RULES:**\n"
-            "*   **MANDATORY: NEVER add steps the user did not ask for.** Do not embellish or add 'nice-to-have' features.\n"
+            "*   **MANDATORY: Be helpful, curious and creative.\n"
             "*   **Focus on the Goal:** Your plan should directly address the user's request as it stands now in the conversation.\n\n"
             "---\n"
             "**Available Tools:**\n"
@@ -1436,6 +1436,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
         return self.remove_thinking_blocks(new_scratchpad_text).strip()
 
+
     def generate_with_mcp_rag(
         self,
         prompt: str,
@@ -1484,7 +1485,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             rag_min_similarity_percent: Minimum similarity for RAG results.
             output_summarization_threshold: The token count that triggers automatic
                                             summarization of a tool's text output.
-            debug: If True, prints the full prompts and raw AI responses to the console.
+            debug : If true, we'll report the detailed promptin and response information
             **llm_generation_kwargs: Additional keyword arguments for LLM calls.
 
         Returns:
@@ -1508,6 +1509,10 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         if images:
             initial_state_parts.append(f"- The user has provided {len(images)} image(s) for context.")
         current_scratchpad = "\n".join(initial_state_parts)
+        def log_prompt(prompt, type="prompt"):
+            ASCIIColors.cyan(f"** DEBUG: {type} **")
+            ASCIIColors.magenta(prompt[-15000:])
+            ASCIIColors.cyan(f"** DEBUG: DONE **")
 
         # --- Define Inner Helper Function for Stateful Step Logging ---
         def log_step(
@@ -1555,9 +1560,9 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
                 })
         
-        formatted_tools_list = "\n".join([f"- {t['name']}: {t['description']}" for t in available_tools])
-        formatted_tools_list += "\n- request_clarification: Use if the user's request is ambiguous."
-        formatted_tools_list += "\n- final_answer: Use when you are ready to respond to the user."
+        formatted_tools_list = "\n".join([f"**{t['name']}**:\n{t['description']}\ninput schema:\n{t['input_schema']}" for t in available_tools])
+        formatted_tools_list += "\n**request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent."
+        formatted_tools_list += "\n**final_answer**:\nUse when you are ready to respond to the user. In this case, do not provide the final answer as it will be performed in the next step. this tool has no parameters."
 
         # --- 2. Dynamic Reasoning Loop ---
         for i in range(max_reasoning_steps):
@@ -1594,13 +1599,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     "clarification_question": "(string, ONLY if tool_name is 'request_clarification')"
                 }
             }
-
             if debug:
-                print("\n" + "="*50)
-                print(f"--- DEBUG: REASONING PROMPT (Step {i+1}) ---")
-                print(reasoning_prompt_template)
-                print("="*50 + "\n")
-            
+                log_prompt(reasoning_prompt_template, f"REASONING PROMPT (Step {i+1})")
             structured_action_response = self.generate_code(
                 prompt=reasoning_prompt_template,
                 template=json.dumps(action_template, indent=2),
@@ -1608,12 +1608,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 temperature=decision_temperature,
                 images=images if i == 0 else None
             )
-
             if debug:
-                print("\n" + "="*50)
-                print(f"--- DEBUG: RAW REASONING RESPONSE (Step {i+1}) ---")
-                print(structured_action_response)
-                print("="*50 + "\n")
+                log_prompt(structured_action_response, f"RAW REASONING RESPONSE (Step {i+1})")
 
             try:
                 action_data = json.loads(structured_action_response)
@@ -1725,19 +1721,11 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 - Do not talk about your internal process unless it's necessary to explain why you couldn't find an answer.
 """
         if debug:
-            print("\n" + "="*50)
-            print("--- DEBUG: FINAL ANSWER SYNTHESIS PROMPT ---")
-            print(final_answer_prompt)
-            print("="*50 + "\n")
-
+            log_prompt(final_answer_prompt, "FINAL ANSWER SYNTHESIS PROMPT")
         final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature, **llm_generation_kwargs)
         final_answer = self.remove_thinking_blocks(final_answer_text)
-
         if debug:
-            print("\n" + "="*50)
-            print("--- DEBUG: RAW FINAL ANSWER RESPONSE ---")
-            print(final_answer_text) # Show raw response before cleaning
-            print("="*50 + "\n")
+            log_prompt(final_answer_text, "FINAL ANSWER RESPONSE")
 
         if synthesis_id:
             log_step("Synthesizing final answer...", "final_answer_synthesis", metadata={"id": synthesis_id}, is_start=False)
@@ -2890,5 +2878,3 @@ def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators
                 break
 
     return chunks
-
-
