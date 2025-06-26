@@ -294,7 +294,7 @@ class RemoteMCPBinding(LollmsMCPBinding):
 
         try:
             # Ensure this specific server is connected before executing
-            self._ensure_initialized_sync(alias, timeout=min(timeout, 30.0))
+            self._ensure_initialized_sync(alias, timeout=timeout)
             return self._run_async(self._execute_tool_async(alias, actual_tool_name, params), timeout=timeout)
         except (ConnectionError, RuntimeError) as e:
             return {"error": f"{self.binding_name}: Connection issue for server '{alias}': {e}", "status_code": 503}
