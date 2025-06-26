@@ -1561,6 +1561,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 })
         
         formatted_tools_list = "\n".join([f"**{t['name']}**:\n{t['description']}\ninput schema:\n{t['input_schema']}" for t in available_tools])
+        formatted_tools_list += "\n**write_code**:\nIf you need to send code to a tool (python, latex etc..), first call this tool without parameters, the tool will let you generate the code separately and get a uuis, then in the tool that requires code, you put the uuid of the generated code instead of the raw code."
         formatted_tools_list += "\n**request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent."
         formatted_tools_list += "\n**final_answer**:\nUse when you are ready to respond to the user. In this case, do not provide the final answer as it will be performed in the next step. this tool has no parameters."
 
