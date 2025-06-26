@@ -1499,6 +1499,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         # --- Initialize Agent State ---
         sources_this_turn: List[Dict[str, Any]] = []
         tool_calls_this_turn: List[Dict[str, Any]] = []
+        generated_code_store: Dict[str, str] = {} # NEW: Store for UUID -> code
         original_user_prompt = prompt
         
         initial_state_parts = [
@@ -1509,41 +1510,45 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         if images:
             initial_state_parts.append(f"- The user has provided {len(images)} image(s) for context.")
         current_scratchpad = "\n".join(initial_state_parts)
+
         def log_prompt(prompt, type="prompt"):
             ASCIIColors.cyan(f"** DEBUG: {type} **")
             ASCIIColors.magenta(prompt[-15000:])
             ASCIIColors.cyan(f"** DEBUG: DONE **")
 
-        # --- Define Inner Helper Function for Stateful Step Logging ---
+        # --- Define Inner Helper Functions ---
         def log_step(
             description: str,
             step_type: str,
             metadata: Optional[Dict] = None,
             is_start: bool = True
         ) -> Optional[str]:
-            """
-            Logs a step start or end, generating a unique ID for correlation.
-            This is an inner function that has access to the `streaming_callback`.
-            
-            Returns the ID for start events so it can be used for the end event.
-            """
-            if not streaming_callback:
-                return None
-
+            if not streaming_callback: return None
             event_id = str(uuid.uuid4()) if is_start else None
-            
             params = {"type": step_type, "description": description, **(metadata or {})}
-            
             if is_start:
                 params["id"] = event_id
                 streaming_callback(description, MSG_TYPE.MSG_TYPE_STEP_START, params)
                 return event_id
             else:
-                if 'id' in params:
-                    streaming_callback(description, MSG_TYPE.MSG_TYPE_STEP_END, params)
-                else: # Fallback for simple, non-duration steps
-                    streaming_callback(description, MSG_TYPE.MSG_TYPE_STEP, params)
+                if 'id' in params: streaming_callback(description, MSG_TYPE.MSG_TYPE_STEP_END, params)
+                else: streaming_callback(description, MSG_TYPE.MSG_TYPE_STEP, params)
                 return None
+
+        def _substitute_code_uuids_recursive(data: Any, code_store: Dict[str, str]):
+            """Recursively finds and replaces code UUIDs in tool parameters."""
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    if isinstance(value, str) and value in code_store:
+                        data[key] = code_store[value]
+                    else:
+                        _substitute_code_uuids_recursive(value, code_store)
+            elif isinstance(data, list):
+                for i, item in enumerate(data):
+                    if isinstance(item, str) and item in code_store:
+                        data[i] = code_store[item]
+                    else:
+                        _substitute_code_uuids_recursive(item, code_store)
 
         # --- 1. Discover Available Tools ---
         available_tools = []
@@ -1560,18 +1565,23 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
                 })
         
-        formatted_tools_list = "\n".join([f"**{t['name']}**:\n{t['description']}\ninput schema:\n{t['input_schema']}" for t in available_tools])
-        formatted_tools_list += "\n**write_code**:\nIf you need to send code to a tool (python, latex etc..), first call this tool without parameters, the tool will let you generate the code separately and get a uuis, then in the tool that requires code, you put the uuid of the generated code instead of the raw code."
-        formatted_tools_list += "\n**request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent."
-        formatted_tools_list += "\n**final_answer**:\nUse when you are ready to respond to the user. In this case, do not provide the final answer as it will be performed in the next step. this tool has no parameters."
+        # Add the new write_code tool definition
+        available_tools.append({
+            "name": "write_code",
+            "description": "Generates a block of code (e.g., Python, SQL) to be used by another tool. It returns a unique 'code_id'. You must then use this 'code_id' as the value for the code parameter in the subsequent tool call.",
+            "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}}, "required": ["prompt"]}
+        })
+
+        formatted_tools_list = "\n".join([f"**{t['name']}**:\n{t['description']}\ninput schema:\n{json.dumps(t['input_schema'])}" for t in available_tools])
+        formatted_tools_list += "\n**request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent. this tool has no parameters."
+        formatted_tools_list += "\n**final_answer**:\nUse when you are ready to respond to the user. this tool has no parameters."
 
         # --- 2. Dynamic Reasoning Loop ---
         for i in range(max_reasoning_steps):
             reasoning_step_id = log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", is_start=True)
 
             user_context = f'Original User Request: "{original_user_prompt}"'
-            if images:
-                user_context += f'\n(Note: {len(images)} image(s) were provided with this request.)'
+            if images: user_context += f'\n(Note: {len(images)} image(s) were provided with this request.)'
             
             reasoning_prompt_template = f"""You are a logical AI assistant. Your task is to achieve the user's goal by thinking step-by-step and using the available tools.
 
@@ -1588,29 +1598,25 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 2.  **THINK:**
     - Does the latest observation completely fulfill the user's original request?
     - If YES, your next action MUST be to use the `final_answer` tool.
-    - If NO, what is the single next logical step needed?
+    - If NO, what is the single next logical step needed? This may involve writing code first with `write_code`, then using another tool.
     - If you are stuck or the request is ambiguous, use `request_clarification`.
 3.  **ACT:** Formulate your decision as a JSON object.
 """
             action_template = {
                 "thought": "My detailed analysis of the last observation and my reasoning for the next action.",
                 "action": {
-                    "tool_name": "The single tool to use (e.g., 'time_machine::get_current_time', 'final_answer').",
+                    "tool_name": "The single tool to use (e.g., 'write_code', 'time_machine::get_current_time', 'final_answer').",
                     "tool_params": {"param1": "value1"},
                     "clarification_question": "(string, ONLY if tool_name is 'request_clarification')"
                 }
             }
-            if debug:
-                log_prompt(reasoning_prompt_template, f"REASONING PROMPT (Step {i+1})")
+            if debug: log_prompt(reasoning_prompt_template, f"REASONING PROMPT (Step {i+1})")
             structured_action_response = self.generate_code(
-                prompt=reasoning_prompt_template,
-                template=json.dumps(action_template, indent=2),
-                system_prompt=reasoning_system_prompt,
-                temperature=decision_temperature,
+                prompt=reasoning_prompt_template, template=json.dumps(action_template, indent=2),
+                system_prompt=reasoning_system_prompt, temperature=decision_temperature,
                 images=images if i == 0 else None
             )
-            if debug:
-                log_prompt(structured_action_response, f"RAW REASONING RESPONSE (Step {i+1})")
+            if debug: log_prompt(structured_action_response, f"RAW REASONING RESPONSE (Step {i+1})")
 
             try:
                 action_data = json.loads(structured_action_response)
@@ -1620,38 +1626,53 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 tool_params = action.get("tool_params", {})
             except (json.JSONDecodeError, TypeError) as e:
                 current_scratchpad += f"\n\n### Step {i+1} Failure\n- **Error:** Failed to generate a valid JSON action: {e}"
-                log_step(f"\n\n### Step {i+1} Failure\n- **Error:** Failed to generate a valid JSON action: {e}", "scratchpad", is_start=False)
-                if reasoning_step_id:
-                    log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id, "error": str(e)}, is_start=False)
+                log_step(f"Step Failure: Invalid JSON action.", "error", metadata={"details": str(e)}, is_start=False)
+                if reasoning_step_id: log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id, "error": str(e)}, is_start=False)
                 break
 
             current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
-            log_step(f"\n\n### Step {i+1}: Thought\n{thought}", "scratchpad", is_start=False)
-            if tool_params:
-                log_step(f"\n\n**Calling tool:**\nName: {tool_name}\nparams:\n {dict_to_markdown(tool_params)}", "scratchpad", is_start=False)
+            log_step(f"Thought: {thought}", "thought", is_start=False)
 
             if not tool_name:
-                current_scratchpad += f"\n\n### Step {i+1} Failure\n- **Error:** Did not specify a tool name."
-                log_step(f"\n\n### Step {i+1} Failure\n- **Error:** Did not specify a tool name.", "scratchpad", is_start=False)
-                if reasoning_step_id:
-                    log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
+                # Handle error...
                 break
-
+            
+            # --- Handle special, non-executing tools ---
             if tool_name == "request_clarification":
-                clarification_question = action.get("clarification_question", "Could you please provide more details?")
-                current_scratchpad += f"\n\n### Step {i+1}: Action\n- **Action:** Decided to request clarification.\n- **Question:** {clarification_question}"
-                log_step(f"\n\n### Step {i+1}: Action\n- **Action:** Decided to request clarification.\n- **Question:** {clarification_question}", "scratchpad", is_start=False)
-                if reasoning_step_id:
-                    log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
-                return {"final_answer": clarification_question, "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": True, "error": None}
+                # Handle clarification...
+                return {"final_answer": action.get("clarification_question", "Could you please provide more details?"), "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": True, "error": None}
 
             if tool_name == "final_answer":
                 current_scratchpad += f"\n\n### Step {i+1}: Action\n- **Action:** Decided to formulate the final answer."
-                log_step(f"\n\n### Step {i+1}: Action\n- **Action:** Decided to formulate the final answer.", "scratchpad", is_start=False)
-                if reasoning_step_id:
-                    log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
+                log_step("Action: Formulate final answer.", "action_taken", is_start=False)
+                if reasoning_step_id: log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
                 break
 
+            # --- Handle the `write_code` tool specifically ---
+            if tool_name == 'write_code':
+                code_gen_id = log_step(f"Generating code...", "tool_call", metadata={"name": "write_code"}, is_start=True)
+                code_prompt = tool_params.get("prompt", "Generate the requested code.")
+                
+                # Use a specific system prompt to get raw code
+                code_generation_system_prompt = "You are a code generation assistant. Generate ONLY the raw code based on the user's request. Do not add any explanations, markdown code fences, or other text outside of the code itself."
+                generated_code = self.generate_text(prompt=code_prompt, system_prompt=code_generation_system_prompt, **llm_generation_kwargs)
+                
+                code_uuid = str(uuid.uuid4())
+                generated_code_store[code_uuid] = generated_code
+                
+                tool_result = {"status": "success", "code_id": code_uuid, "summary": f"Code generated successfully. Use this ID in the next tool call that requires code."}
+                tool_calls_this_turn.append({"name": "write_code", "params": tool_params, "result": tool_result})
+                observation_text = f"```json\n{json.dumps(tool_result, indent=2)}\n```"
+                current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
+                log_step(f"Observation: Code generated with ID: {code_uuid}", "observation", is_start=False)
+                if code_gen_id: log_step(f"Generating code...", "tool_call", metadata={"id": code_gen_id, "result": tool_result}, is_start=False)
+                if reasoning_step_id: log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
+                continue # Go to the next reasoning step immediately
+
+            # --- Substitute UUIDs and Execute Standard Tools ---
+            log_step(f"Calling tool: `{tool_name}` with params: {dict_to_markdown(tool_params)}", "action_taken", is_start=False)
+            _substitute_code_uuids_recursive(tool_params, generated_code_store)
+            
             tool_call_id = log_step(f"Executing tool: {tool_name}", "tool_call", metadata={"name": tool_name, "parameters": tool_params}, is_start=True)
             tool_result = None
             try:
@@ -1660,9 +1681,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     rag_callable = use_data_store.get(store_name, {}).get("callable")
                     query = tool_params.get("query", "")
                     retrieved_chunks = rag_callable(query, rag_top_k=rag_top_k, rag_min_similarity_percent=rag_min_similarity_percent)
-                    log_step(f"\n\n**RAG results:**\nFound: {len(retrieved_chunks)} entries.", "scratchpad", is_start=False)
                     if retrieved_chunks:
-                        # hack to remove internal server infos and reformat
                         sources_this_turn.extend(retrieved_chunks)
                         tool_result = {"status": "success", "summary": f"Found {len(retrieved_chunks)} relevant chunks.", "chunks": retrieved_chunks}
                     else:
@@ -1676,10 +1695,11 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 trace_exception(e)
                 tool_result = {"status": "failure", "error": f"Exception executing tool: {str(e)}"}
             
-            if tool_call_id:
-                log_step(f"Executing tool: {tool_name}", "tool_call", metadata={"id": tool_call_id, "result": tool_result}, is_start=False)
+            if tool_call_id: log_step(f"Executing tool: {tool_name}", "tool_call", metadata={"id": tool_call_id, "result": tool_result}, is_start=False)
 
+            # ... (Rest of the observation formatting logic is the same) ...
             observation_text = ""
+            sanitized_result = {}
             if isinstance(tool_result, dict):
                 sanitized_result = tool_result.copy()
                 summarized_fields = {}
@@ -1699,14 +1719,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                         observation_text += f"\n- **Summary of '{key}':**\n{summary}"
             else:
                 observation_text = f"Tool returned non-dictionary output: {str(tool_result)}"
-
             
             tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
             current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
-            log_step(f"### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Output:**\n{dict_to_markdown(sanitized_result)}", "scratchpad", is_start=False)
+            log_step(f"Observation: Result from `{tool_name}`:\n{dict_to_markdown(sanitized_result)}", "observation", is_start=False)
             
-            if reasoning_step_id:
-                log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
+            if reasoning_step_id: log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
 
         # --- Final Answer Synthesis ---
         synthesis_id = log_step("Synthesizing final answer...", "final_answer_synthesis", is_start=True)
@@ -1721,15 +1739,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 - If images were provided by the user, incorporate your analysis of them into the answer.
 - Do not talk about your internal process unless it's necessary to explain why you couldn't find an answer.
 """
-        if debug:
-            log_prompt(final_answer_prompt, "FINAL ANSWER SYNTHESIS PROMPT")
+        if debug: log_prompt(final_answer_prompt, "FINAL ANSWER SYNTHESIS PROMPT")
         final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature, **llm_generation_kwargs)
         final_answer = self.remove_thinking_blocks(final_answer_text)
-        if debug:
-            log_prompt(final_answer_text, "FINAL ANSWER RESPONSE")
+        if debug: log_prompt(final_answer_text, "FINAL ANSWER RESPONSE")
 
-        if synthesis_id:
-            log_step("Synthesizing final answer...", "final_answer_synthesis", metadata={"id": synthesis_id}, is_start=False)
+        if synthesis_id: log_step("Synthesizing final answer...", "final_answer_synthesis", metadata={"id": synthesis_id}, is_start=False)
 
         return {
             "final_answer": final_answer,
@@ -1739,7 +1754,6 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             "clarification_required": False,
             "error": None
         }
-    
     def generate_code(
                         self,
                         prompt,
