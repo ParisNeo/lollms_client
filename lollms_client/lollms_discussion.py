@@ -30,6 +30,7 @@ if False:
     from lollms_personality import LollmsPersonality
 
 from lollms_client.lollms_utilities import build_image_dicts
+from ascii_colors import ASCIIColors, trace_exception
 
 class EncryptedString(TypeDecorator):
     """A SQLAlchemy TypeDecorator for field-level database encryption.
@@ -646,11 +647,11 @@ class LollmsDiscussion:
             # --- AGENTIC TURN ---
             prompt_for_agent = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
             if debug:
-                print("\n" + "="*50)
-                print("--- DEBUG: AGENTIC TURN TRIGGERED ---")
-                print(f"--- PROMPT FOR AGENT (from discussion history) ---")
-                print(prompt_for_agent)
-                print("="*50 + "\n")
+                ASCIIColors.cyan("\n" + "="*50)
+                ASCIIColors.cyan("--- DEBUG: AGENTIC TURN TRIGGERED ---")
+                ASCIIColors.cyan(f"--- PROMPT FOR AGENT (from discussion history) ---")
+                ASCIIColors.magenta(prompt_for_agent)
+                ASCIIColors.cyan("="*50 + "\n")
 
             agent_result = self.lollmsClient.generate_with_mcp_rag(
                 prompt=prompt_for_agent,
@@ -669,19 +670,19 @@ class LollmsDiscussion:
             # --- SIMPLE CHAT TURN ---
             if debug:
                 prompt_for_chat = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
-                print("\n" + "="*50)
-                print("--- DEBUG: SIMPLE CHAT PROMPT ---")
-                print(prompt_for_chat)
-                print("="*50 + "\n")
+                ASCIIColors.cyan("\n" + "="*50)
+                ASCIIColors.cyan("--- DEBUG: SIMPLE CHAT PROMPT ---")
+                ASCIIColors.magenta(prompt_for_chat)
+                ASCIIColors.cyan("="*50 + "\n")
 
             # For simple chat, we also need to consider images if the model is multi-modal
             final_raw_response = self.lollmsClient.chat(self, images=images, **kwargs) or ""
             
             if debug:
-                print("\n" + "="*50)
-                print("--- DEBUG: RAW SIMPLE CHAT RESPONSE ---")
-                print(final_raw_response)
-                print("="*50 + "\n")
+                ASCIIColors.cyan("\n" + "="*50)
+                ASCIIColors.cyan("--- DEBUG: RAW SIMPLE CHAT RESPONSE ---")
+                ASCIIColors.magenta(final_raw_response)
+                ASCIIColors.cyan("="*50 + "\n")
 
             if isinstance(final_raw_response, dict) and final_raw_response.get("status") == "error":
                 raise Exception(final_raw_response.get("message", "Unknown error from lollmsClient.chat"))
