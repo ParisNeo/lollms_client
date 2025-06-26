@@ -13,7 +13,7 @@ from ascii_colors import ASCIIColors, trace_exception
 
 def dict_to_markdown(d, indent=0):
     """
-    Formats a dictionary as a markdown list.
+    Formats a dictionary (with potential nested lists and dicts) as a markdown list.
 
     Args:
         d (dict): The dictionary to format.
@@ -23,15 +23,26 @@ def dict_to_markdown(d, indent=0):
         str: The formatted markdown string.
     """
     lines = []
+    indent_str = ' ' * (indent * 2)
+    
     for key, value in d.items():
         if isinstance(value, dict):
-            # If the value is a dictionary, process it recursively
-            md_str = f"{' ' * indent*2}- {key}:\n" + dict_to_markdown(value, indent+1)
+            # Recursively handle nested dictionary
+            lines.append(f"{indent_str}- {key}:")
+            lines.append(dict_to_markdown(value, indent + 1))
+        elif isinstance(value, list):
+            lines.append(f"{indent_str}- {key}:")
+            for item in value:
+                if isinstance(item, dict):
+                    # Render nested dicts in the list
+                    lines.append(dict_to_markdown(item, indent + 1))
+                else:
+                    # Render strings or other simple items in the list
+                    lines.append(f"{' ' * (indent + 1) * 2}- {item}")
         else:
-            # Regular value (non-dictionary)
-            md_str = f"{' ' * indent*2}- {key}: {value}"
-        lines.append(md_str)
-
+            # Simple key-value pair
+            lines.append(f"{indent_str}- {key}: {value}")
+    
     return "\n".join(lines)
 
 def is_base64(s):
