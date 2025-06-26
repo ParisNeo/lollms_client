@@ -1585,23 +1585,23 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 
                 reasoning_prompt_template = f"""You are a logical AI assistant. Your task is to achieve the user's goal by thinking step-by-step and using the available tools.
 
-    --- AVAILABLE TOOLS ---
-    {formatted_tools_list}
-    --- CONTEXT ---
-    {user_context}
-    --- YOUR INTERNAL SCRATCHPAD (Work History & Analysis) ---
-    {current_scratchpad}
-    --- END OF SCRATCHPAD ---
+--- AVAILABLE TOOLS ---
+{formatted_tools_list}
+--- CONTEXT ---
+{user_context}
+--- YOUR INTERNAL SCRATCHPAD (Work History & Analysis) ---
+{current_scratchpad}
+--- END OF SCRATCHPAD ---
 
-    **INSTRUCTIONS:**
-    1.  **OBSERVE:** Review the `Observation` from your most recent step in the scratchpad.
-    2.  **THINK:**
-        - Does the latest observation completely fulfill the user's original request?
-        - If YES, your next action MUST be to use the `final_answer` tool.
-        - If NO, what is the single next logical step needed? This may involve writing code first with `write_code`, then using another tool.
-        - If you are stuck or the request is ambiguous, use `request_clarification`.
-    3.  **ACT:** Formulate your decision as a JSON object.
-    """
+**INSTRUCTIONS:**
+1.  **OBSERVE:** Review the `Observation` from your most recent step in the scratchpad.
+2.  **THINK:**
+    - Does the latest observation completely fulfill the user's original request?
+    - If YES, your next action MUST be to use the `final_answer` tool.
+    - If NO, what is the single next logical step needed? This may involve writing code first with `write_code`, then using another tool.
+    - If you are stuck or the request is ambiguous, use `request_clarification`.
+3.  **ACT:** Formulate your decision as a JSON object.
+"""
                 action_template = {
                     "thought": "My detailed analysis of the last observation and my reasoning for the next action and how it integrates with my global plan.",
                     "action": {
