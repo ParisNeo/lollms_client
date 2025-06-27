@@ -1565,11 +1565,17 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
                 })
         
-        # Add the new write_code tool definition
+        # Add the new put_code_in_buffer tool definition
         available_tools.append({
-            "name": "write_code",
-            "description": "Generates a block of code (e.g., Python, SQL) to be used by another tool. It returns a unique 'code_id'. You must then use this 'code_id' as the value for the code parameter in the subsequent tool call.",
+            "name": "put_code_in_buffer",
+            "description": "Generates a block of code (e.g., Python, SQL) to be used by another tool. It returns a unique 'code_id'. You must then use this 'code_id' as the value for the code parameter in the subsequent tool call. This **does not** execute the code. It only buffers it for future use. Only use it if another tool requires code.",
             "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}}, "required": ["prompt"]}
+        })
+        # Add the new refactor_scratchpad tool definition
+        available_tools.append({
+            "name": "refactor_scratchpad",
+            "description": "Rewrites the scratchpad content to clean it and reorganize it. Only use if the scratchpad is messy or contains too much information compared to what you need.",
+            "input_schema": {"type": "object", "properties": {}}
         })
 
         formatted_tools_list = "\n".join([f"**{t['name']}**:\n{t['description']}\ninput schema:\n{json.dumps(t['input_schema'])}" for t in available_tools])
@@ -1598,14 +1604,14 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 2.  **THINK:**
     - Does the latest observation completely fulfill the user's original request?
     - If YES, your next action MUST be to use the `final_answer` tool.
-    - If NO, what is the single next logical step needed? This may involve writing code first with `write_code`, then using another tool.
+    - If NO, what is the single next logical step needed? This may involve writing code first with `put_code_in_buffer`, then using another tool.
     - If you are stuck or the request is ambiguous, use `request_clarification`.
 3.  **ACT:** Formulate your decision as a JSON object.
 """
                 action_template = {
                     "thought": "My detailed analysis of the last observation and my reasoning for the next action and how it integrates with my global plan.",
                     "action": {
-                        "tool_name": "The single tool to use (e.g., 'write_code', 'time_machine::get_current_time', 'final_answer').",
+                        "tool_name": "The single tool to use (e.g., 'put_code_in_buffer', 'time_machine::get_current_time', 'final_answer').",
                         "tool_params": {"param1": "value1"},
                         "clarification_question": "(string, ONLY if tool_name is 'request_clarification')"
                     }
@@ -1652,9 +1658,9 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     if reasoning_step_id: log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
                     break
 
-                # --- Handle the `write_code` tool specifically ---
-                if tool_name == 'write_code':
-                    code_gen_id = log_step(f"Generating code...", "tool_call", metadata={"name": "write_code"}, is_start=True)
+                # --- Handle the `put_code_in_buffer` tool specifically ---
+                if tool_name == 'put_code_in_buffer':
+                    code_gen_id = log_step(f"Generating code...", "tool_call", metadata={"name": "put_code_in_buffer"}, is_start=True)
                     code_prompt = tool_params.get("prompt", "Generate the requested code.")
                     
                     # Use a specific system prompt to get raw code
@@ -1665,14 +1671,21 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     generated_code_store[code_uuid] = generated_code
                     
                     tool_result = {"status": "success", "code_id": code_uuid, "summary": f"Code generated successfully. Use this ID in the next tool call that requires code."}
-                    tool_calls_this_turn.append({"name": "write_code", "params": tool_params, "result": tool_result})
+                    tool_calls_this_turn.append({"name": "put_code_in_buffer", "params": tool_params, "result": tool_result})
                     observation_text = f"```json\n{json.dumps(tool_result, indent=2)}\n```"
                     current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
                     log_step(f"Observation: Code generated with ID: {code_uuid}", "observation", is_start=False)
                     if code_gen_id: log_step(f"Generating code...", "tool_call", metadata={"id": code_gen_id, "result": tool_result}, is_start=False)
                     if reasoning_step_id: log_step(f"Reasoning Step {i+1}/{max_reasoning_steps}", "reasoning_step", metadata={"id": reasoning_step_id}, is_start=False)
                     continue # Go to the next reasoning step immediately
-
+                if tool_name == 'refactor_scratchpad':
+                    scratchpad_cleaning_prompt = f"""Enhance this scratchpad content to be more organized and comprehensive. Keep relevant experience information and remove any useless redundancies. Try to log learned things from the context so that you won't make the same mistakes again. Do not remove the main objective information or any crucial information that may be useful for the next iterations. Answer directly with the new scratchpad content without any comments.
+--- YOUR INTERNAL SCRATCHPAD (Work History & Analysis) ---
+{current_scratchpad}
+--- END OF SCRATCHPAD ---"""
+                    current_scratchpad = self.generate_text(scratchpad_cleaning_prompt)
+                    log_step(f"New scratchpad:\n{current_scratchpad}")
+                    
                 # --- Substitute UUIDs and Execute Standard Tools ---
                 log_step(f"Calling tool: `{tool_name}` with params:\n{dict_to_markdown(tool_params)}", "action_taken", is_start=False)
                 _substitute_code_uuids_recursive(tool_params, generated_code_store)
