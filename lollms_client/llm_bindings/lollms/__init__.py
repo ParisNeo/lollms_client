@@ -4,6 +4,7 @@ from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_utilities import encode_image
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT
+from lollms_client.lollms_discussion import LollmsDiscussion
 from ascii_colors import ASCIIColors, trace_exception
 from typing import Optional, Callable, List, Union
 import json
