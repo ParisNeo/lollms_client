@@ -1445,13 +1445,13 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         system_prompt: str = None,
         reasoning_system_prompt: str = "You are a logical and adaptive AI assistant.",
         images: Optional[List[str]] = None,
-        max_reasoning_steps: int = 10,
-        decision_temperature: float = 0.0,
+        max_reasoning_steps: int = None,
+        decision_temperature: float = None,
         final_answer_temperature: float = None,
         streaming_callback: Optional[Callable[[str, 'MSG_TYPE', Optional[Dict], Optional[List]], bool]] = None,
-        rag_top_k: int = 5,
-        rag_min_similarity_percent: float = 70.0,
-        output_summarization_threshold: int = 500, # In tokens
+        rag_top_k: int = None,
+        rag_min_similarity_percent: float = None,
+        output_summarization_threshold: int = None, # In tokens
         debug: bool = False,
         **llm_generation_kwargs
     ) -> Dict[str, Any]:
@@ -1496,6 +1496,18 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         if not self.binding:
             return {"final_answer": "", "tool_calls": [], "sources": [], "error": "LLM binding not initialized."}
 
+        if not max_reasoning_steps:
+            max_reasoning_steps= 10
+        if not rag_min_similarity_percent:
+            rag_min_similarity_percent= 50
+        if not rag_top_k:
+            rag_top_k = 5
+        if not decision_temperature:
+            decision_temperature = 0.7
+        if not output_summarization_threshold:
+            output_summarization_threshold = 500
+            
+            
         # --- Initialize Agent State ---
         sources_this_turn: List[Dict[str, Any]] = []
         tool_calls_this_turn: List[Dict[str, Any]] = []
