@@ -38,6 +38,7 @@ class MSG_TYPE(Enum):
 
     MSG_TYPE_REASONING              = 21# the ai shows its reasoning
     MSG_TYPE_SCRATCHPAD             = 22# the ai shows its scratchpad
+    MSG_TYPE_OBSERVATION            = 23# the ai shows its reasoning
 
 
 class SENDER_TYPES(Enum):

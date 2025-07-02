@@ -53,7 +53,7 @@ class OpenAIBinding(LollmsLLMBinding):
 
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=host_address)
+        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if host_address is None else host_address if len(host_address)>0 else None)
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     
