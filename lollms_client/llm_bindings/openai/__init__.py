@@ -30,7 +30,8 @@ class OpenAIBinding(LollmsLLMBinding):
                  model_name: str = "",
                  service_key: str = None,
                  verify_ssl_certificate: bool = True,
-                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat):
+                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat,
+                 **kwargs):
         """
         Initialize the OpenAI binding.
 
