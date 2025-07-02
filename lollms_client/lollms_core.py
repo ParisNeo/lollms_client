@@ -1861,7 +1861,7 @@ Do not split the code in multiple tags.
             while not last_code["is_complete"] and retries < max_retries:
                 retries += 1
                 ASCIIColors.info(f"Code block seems incomplete. Attempting continuation ({retries}/{max_retries})...")
-                continuation_prompt = f"{full_prompt}{code_content}\n\n{self.user_full_header}The previous code block was incomplete. Continue the code exactly from where it left off. Do not repeat the previous part. Only provide the continuation inside a single {code_tag_format} code tag.\n{self.ai_full_header}"
+                continuation_prompt = f"{prompt}\n\nAssistant:\n{code_content}\n\n{self.user_full_header}The previous code block was incomplete. Continue the code exactly from where it left off. Do not repeat the previous part. Only provide the continuation inside a single {code_tag_format} code tag.\n{self.ai_full_header}"
 
                 continuation_response = self.generate_text(
                     continuation_prompt,
