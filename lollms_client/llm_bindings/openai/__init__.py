@@ -104,15 +104,15 @@ class OpenAIBinding(LollmsLLMBinding):
         """
         count = 0
         output = ""
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt or "You are a helpful assistant.",
+            }
+        ]
 
         # Prepare messages based on whether images are provided
         if images:
-            messages = [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                }
-            ]
             if split:
                 messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
                 if images:
@@ -151,7 +151,27 @@ class OpenAIBinding(LollmsLLMBinding):
                 )
             
         else:
-            messages = [{"role": "user", "content": prompt}]
+            
+            if split:
+                messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
+                if images:
+                    messages[-1]["content"] = [
+                        {
+                            "type": "text",
+                            "text": messages[-1]["content"]
+                        }
+                    ]
+            else:
+                messages.append({
+                        'role': 'user', 
+                        'content': [
+                                        {
+                                            "type": "text",
+                                            "text": prompt
+                                        }
+                                    ]
+                    }
+                )
 
         # Generate text using the OpenAI API
         if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
