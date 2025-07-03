@@ -1668,7 +1668,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 if tool_name == "final_answer":
                     current_scratchpad += f"\n\n### Step {i+1}: Action\n- **Action:** Decided to formulate the final answer."
                     log_event("Action: Formulate final answer.", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}",MSG_TYPE.MSG_TYPE_STEP_START, event_id=reasoning_step_id)
+                    if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}",MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
                     break
 
                 # --- Handle the `put_code_in_buffer` tool specifically ---
@@ -1753,11 +1753,11 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
                 log_event(f"Observation: Result from `{tool_name}`:\n{dict_to_markdown(sanitized_result)}", MSG_TYPE.MSG_TYPE_OBSERVATION)
                 
-                if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_REASONING, event_id = reasoning_step_id)
+                if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_END, event_id = reasoning_step_id)
             except Exception as ex:
                 trace_exception(ex)
                 current_scratchpad += f"\n\n### Error : {ex}"
-                if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_REASONING, event_id = reasoning_step_id)
+                if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_END, event_id = reasoning_step_id)
                 
         # --- Final Answer Synthesis ---
         synthesis_id = log_event("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_START)
