@@ -1443,7 +1443,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         use_mcps: Union[None, bool, List[str]] = None,
         use_data_store: Union[None, Dict[str, Callable]] = None,
         system_prompt: str = None,
-        reasoning_system_prompt: str = "You are a logical and adaptive AI assistant.",
+        reasoning_system_prompt: str = "You are a logical AI assistant. Your task is to achieve the user's goal by thinking step-by-step and using the available tools.",
         images: Optional[List[str]] = None,
         max_reasoning_steps: int = None,
         decision_temperature: float = None,
@@ -1529,6 +1529,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         def log_prompt(prompt, type="prompt"):
             ASCIIColors.cyan(f"** DEBUG: {type} **")
             ASCIIColors.magenta(prompt[-15000:])
+            prompt_size = self.count_tokens(prompt)
+            ASCIIColors.red(f"Prompt size:{prompt_size}/{self.default_ctx_size}")
             ASCIIColors.cyan(f"** DEBUG: DONE **")
 
         # --- Define Inner Helper Functions ---
@@ -1578,9 +1580,9 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         
         # Add the new put_code_in_buffer tool definition
         available_tools.append({
-            "name": "put_code_in_buffer",
-            "description": "Generates a block of code (e.g., Python, SQL) to be used by another tool. It returns a unique 'code_id'. You must then use this 'code_id' as the value for the code parameter in the subsequent tool call. This **does not** execute the code. It only buffers it for future use. Only use it if another tool requires code.",
-            "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}}, "required": ["prompt"]}
+            "name": "generate_code",
+            "description": """Generates and stores code into a buffer to be used by another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use generate_code. generate_code do not execute the code nor does it audit it.""",
+            "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}, "language": {"type": "string", "description": "The programming language of the generated code. By default it uses python."}}, "required": ["prompt"]}
         })
         # Add the new refactor_scratchpad tool definition
         available_tools.append({
@@ -1602,8 +1604,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 user_context = f'Original User Request: "{original_user_prompt}"'
                 if images: user_context += f'\n(Note: {len(images)} image(s) were provided with this request.)'
                 
-                reasoning_prompt_template = f"""You are a logical AI assistant. Your task is to achieve the user's goal by thinking step-by-step and using the available tools.
-
+                reasoning_prompt_template = f"""
 --- AVAILABLE TOOLS ---
 {formatted_tools_list}
 --- CONTEXT ---
@@ -1762,7 +1763,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         # --- Final Answer Synthesis ---
         synthesis_id = log_event("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_START)
         
-        final_answer_prompt = f"""You are an AI assistant. Provide a final, comprehensive answer based on your work.
+        final_answer_prompt = f"""
 --- Original User Request ---
 "{original_user_prompt}"
 --- Your Internal Scratchpad (Actions Taken & Findings) ---
@@ -1773,6 +1774,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 - Do not talk about your internal process unless it's necessary to explain why you couldn't find an answer.
 """
         if debug: log_prompt(final_answer_prompt, "FINAL ANSWER SYNTHESIS PROMPT")
+
+            
         final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature, **llm_generation_kwargs)
         final_answer = self.remove_thinking_blocks(final_answer_text)
         if debug: log_prompt(final_answer_text, "FINAL ANSWER RESPONSE")
