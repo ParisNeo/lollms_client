@@ -40,6 +40,10 @@ class MSG_TYPE(Enum):
     MSG_TYPE_SCRATCHPAD             = 22# the ai shows its scratchpad
     MSG_TYPE_OBSERVATION            = 23# the ai shows its reasoning
 
+    MSG_TYPE_ERROR                  = 24#a severe error hapened
+    MSG_TYPE_GENERATING_TITLE_START = 25#a severe error hapened
+    MSG_TYPE_GENERATING_TITLE_END   = 26#a severe error hapened
+
 
 class SENDER_TYPES(Enum):
     SENDER_TYPES_USER               = 0 # Sent by user

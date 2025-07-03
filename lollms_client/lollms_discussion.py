@@ -29,7 +29,7 @@ if False:
     from lollms_client import LollmsClient
     from lollms_personality import LollmsPersonality
 
-from lollms_client.lollms_utilities import build_image_dicts
+from lollms_client.lollms_utilities import build_image_dicts, robust_json_parser
 from ascii_colors import ASCIIColors, trace_exception
 
 class EncryptedString(TypeDecorator):
@@ -726,7 +726,7 @@ class LollmsDiscussion:
             
         return {"user_message": user_msg, "ai_message": ai_message_obj}
 
-    def regenerate_branch(self, branch_tip_id, **kwargs) -> Dict[str, 'LollmsMessage']:
+    def regenerate_branch(self, branch_tip_id=None, **kwargs) -> Dict[str, 'LollmsMessage']:
         """Regenerates the last AI response in the active branch.
 
         It deletes the previous AI response and calls chat() again with the
@@ -738,8 +738,15 @@ class LollmsDiscussion:
         Returns:
             A dictionary with the user and the newly generated AI message.
         """
+        if not branch_tip_id:
+            branch_tip_id = self.active_branch_id
         if not self.active_branch_id or self.active_branch_id not in self._message_index:
-            raise ValueError("No active message to regenerate from.")
+            if len(self._message_index)>0:
+                ASCIIColors.warning("No active message to regenerate from.\n")
+                ASCIIColors.warning(f"Using last available message:{list(self._message_index.keys())[-1]}\n")
+            else:
+                branch_tip_id = list(self._message_index.keys())[-1]
+                raise ValueError("No active message to regenerate from.")
         
         last_message_orm = self._message_index[self.active_branch_id]
         
@@ -1001,3 +1008,26 @@ class LollmsDiscussion:
         
         self.touch()
         print(f"[INFO] Discussion auto-pruned. {len(messages_to_prune)} messages summarized. History preserved.")
+
+    def switch_to_branch(self, branch_id):
+        self.active_branch_id = branch_id
+
+    def auto_title(self):
+        try:
+            if self.metadata is None:
+                self.metadata = {}
+            discussion = self.export("markdown")[0:1000]
+            prompt = f"""You are a title builder. Your oibjective is to build a title for the following discussion:
+{discussion}
+...
+"""
+            template = """{
+    "title": "An short but comprehensive discussion title"
+}"""
+            infos = self.lollmsClient.generate_code(prompt = prompt, template = template)
+            discussion_title = robust_json_parser(infos)["title"]
+            self.metadata['title'] = discussion_title
+            self.commit()
+            return discussion_title
+        except Exception as ex:
+            trace_exception(ex)

@@ -1493,6 +1493,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             answer, the complete internal scratchpad, a log of tool calls,
             any retrieved RAG sources, and other metadata.
         """
+        reasoning_step_id = None
         if not self.binding:
             return {"final_answer": "", "tool_calls": [], "sources": [], "error": "LLM binding not initialized."}
 
@@ -1535,12 +1536,13 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             description: str,
             event_type: MSG_TYPE = MSG_TYPE.MSG_TYPE_CHUNK,
             metadata: Optional[Dict] = None,
+            event_id=None
         ) -> Optional[str]:
             if not streaming_callback: return None
-            event_id = str(uuid.uuid4()) if event_type==MSG_TYPE.MSG_TYPE_STEP_START else None
+            event_id = str(uuid.uuid4()) if event_type==MSG_TYPE.MSG_TYPE_STEP_START else event_id
             params = {"type": event_type, "description": description, **(metadata or {})}
             params["id"] = event_id
-            streaming_callback(description, MSG_TYPE.MSG_TYPE_STEP_START, params)
+            streaming_callback(description, event_type, params)
             return event_id
 
         def _substitute_code_uuids_recursive(data: Any, code_store: Dict[str, str]):
@@ -1558,6 +1560,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     else:
                         _substitute_code_uuids_recursive(item, code_store)
 
+        discovery_step_id = log_event("Discovering tools",MSG_TYPE.MSG_TYPE_STEP_START)
         # --- 1. Discover Available Tools ---
         available_tools = []
         if use_mcps and self.mcp:
@@ -1590,10 +1593,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         formatted_tools_list += "\n**request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent. this tool has no parameters."
         formatted_tools_list += "\n**final_answer**:\nUse when you are ready to respond to the user. this tool has no parameters."
 
+        if discovery_step_id: log_event("Discovering tools",MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id)
+
         # --- 2. Dynamic Reasoning Loop ---
         for i in range(max_reasoning_steps):
             try:
-                reasoning_step_id = log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_REASONING)
+                reasoning_step_id = log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_START)
                 user_context = f'Original User Request: "{original_user_prompt}"'
                 if images: user_context += f'\n(Note: {len(images)} image(s) were provided with this request.)'
                 
@@ -1645,7 +1650,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 except (json.JSONDecodeError, TypeError) as e:
                     current_scratchpad += f"\n\n### Step {i+1} Failure\n- **Error:** Failed to generate a valid JSON action: {e}"
                     log_event(f"Step Failure: Invalid JSON action.", MSG_TYPE.MSG_TYPE_EXCEPTION, metadata={"details": str(e)})
-                    if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_END, metadata={"id": reasoning_step_id, "error": str(e)})
+                    if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_END, metadata={"error": str(e)}, event_id=reasoning_step_id)
                     
 
                 current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
@@ -1663,7 +1668,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 if tool_name == "final_answer":
                     current_scratchpad += f"\n\n### Step {i+1}: Action\n- **Action:** Decided to formulate the final answer."
                     log_event("Action: Formulate final answer.", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}",MSG_TYPE.MSG_TYPE_STEP_START, metadata={"id": reasoning_step_id})
+                    if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}",MSG_TYPE.MSG_TYPE_STEP_START, event_id=reasoning_step_id)
                     break
 
                 # --- Handle the `put_code_in_buffer` tool specifically ---
@@ -1684,7 +1689,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
                     log_event(f"Observation: Code generated with ID: {code_uuid}", MSG_TYPE.MSG_TYPE_OBSERVATION)
                     if code_gen_id: log_event(f"Generating code...", MSG_TYPE.MSG_TYPE_TOOL_CALL, metadata={"id": code_gen_id, "result": tool_result})
-                    if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_END, metadata={"id": reasoning_step_id})
+                    if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_END, event_id= reasoning_step_id)
                     continue # Go to the next reasoning step immediately
                 if tool_name == 'refactor_scratchpad':
                     scratchpad_cleaning_prompt = f"""Enhance this scratchpad content to be more organized and comprehensive. Keep relevant experience information and remove any useless redundancies. Try to log learned things from the context so that you won't make the same mistakes again. Do not remove the main objective information or any crucial information that may be useful for the next iterations. Answer directly with the new scratchpad content without any comments.
@@ -1720,9 +1725,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     trace_exception(e)
                     tool_result = {"status": "failure", "error": f"Exception executing tool: {str(e)}"}
                 
-                if tool_call_id: log_event(f"Executing tool: {tool_name}", MSG_TYPE.MSG_TYPE_TOOL_CALL, metadata={"id": tool_call_id, "result": tool_result})
+                if tool_call_id: log_event(f"Executing tool: {tool_name}", MSG_TYPE.MSG_TYPE_STEP_END, metadata={"result": tool_result}, event_id= tool_call_id)
 
-                # ... (Rest of the observation formatting logic is the same) ...
                 observation_text = ""
                 sanitized_result = {}
                 if isinstance(tool_result, dict):
@@ -1749,11 +1753,11 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
                 log_event(f"Observation: Result from `{tool_name}`:\n{dict_to_markdown(sanitized_result)}", MSG_TYPE.MSG_TYPE_OBSERVATION)
                 
-                if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_REASONING, metadata={"id": reasoning_step_id})
+                if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_REASONING, event_id = reasoning_step_id)
             except Exception as ex:
                 trace_exception(ex)
                 current_scratchpad += f"\n\n### Error : {ex}"
-                if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_REASONING, metadata={"id": reasoning_step_id})
+                if reasoning_step_id: log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_REASONING, event_id = reasoning_step_id)
                 
         # --- Final Answer Synthesis ---
         synthesis_id = log_event("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_START)
@@ -1773,7 +1777,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         final_answer = self.remove_thinking_blocks(final_answer_text)
         if debug: log_prompt(final_answer_text, "FINAL ANSWER RESPONSE")
 
-        if synthesis_id: log_event("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_End, metadata={"id": synthesis_id})
+        if synthesis_id: log_event("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_END, event_id= synthesis_id)
 
         return {
             "final_answer": final_answer,
