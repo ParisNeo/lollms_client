@@ -119,7 +119,26 @@ class RemoteMCPBinding(LollmsMCPBinding):
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout)
 
-    ### MODIFIED: Now operates on a specific server identified by alias
+    def _prepare_headers(self, alias: str) -> Dict[str, str]:
+        """Prepares the headers dictionary from the server's auth_config."""
+        server_info = self.servers[alias]
+        auth_config = server_info.get("auth_config", {})
+        headers = {}
+        auth_type = auth_config.get("type")
+        if auth_type == "api_key":
+            api_key = auth_config.get("key")
+            header_name = auth_config.get("header_name", "X-API-Key") # Default to X-API-Key
+            if api_key:
+                headers[header_name] = api_key
+                ASCIIColors.info(f"{self.binding_name}: Using API Key authentication for server '{alias}'.")
+
+        elif auth_type == "bearer": # <-- NEW BLOCK
+            token = auth_config.get("token")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+                
+        return headers
+
     async def _initialize_connection_async(self, alias: str) -> bool:
         server_info = self.servers[alias]
         if server_info["initialized"]:
@@ -128,10 +147,13 @@ class RemoteMCPBinding(LollmsMCPBinding):
         server_url = server_info["url"]
         ASCIIColors.info(f"{self.binding_name}: Initializing connection to '{alias}' ({server_url})...")
         try:
+            # Prepare authentication headers
+            auth_headers = self._prepare_headers(alias)
+
             exit_stack = AsyncExitStack()
             
             client_streams = await exit_stack.enter_async_context(
-                streamablehttp_client(server_url)
+                streamablehttp_client(url=server_url, headers=auth_headers) # Pass the headers here
             )
             read_stream, write_stream, _ = client_streams
 
@@ -343,3 +365,59 @@ class RemoteMCPBinding(LollmsMCPBinding):
 
     def get_binding_config(self) -> Dict[str, Any]:
         return self.config
+    
+    
+    def set_auth_config(self, alias: str, auth_config: Dict[str, Any]):
+        """
+        Dynamically updates the authentication configuration for a specific server.
+
+        If a connection was already active for this server, it will be closed to force
+        a new connection with the new authentication details on the next call.
+
+        Args:
+            alias (str): The alias of the server to update (the key in servers_infos).
+            auth_config (Dict[str, Any]): The new authentication configuration dictionary.
+                Example: {"type": "bearer", "token": "new-token-here"}
+        """
+        ASCIIColors.info(f"{self.binding_name}: Updating auth_config for server '{alias}'.")
+        
+        server_info = self.servers.get(alias)
+        if not server_info:
+            raise ValueError(f"Server alias '{alias}' does not exist in the configuration.")
+
+        # Update the configuration in the binding's internal state
+        server_info["config"]["auth_config"] = auth_config
+
+        # If the server was already initialized, its connection is now obsolete.
+        # We must close it and mark it as uninitialized.
+        if server_info["initialized"]:
+            ASCIIColors.warning(f"{self.binding_name}: Existing connection for '{alias}' is outdated due to new authentication. It will be reset.")
+            try:
+                # Execute the close operation asynchronously on the event loop thread
+                self._run_async(self._close_connection_async(alias), timeout=10.0)
+            except Exception as e:
+                ASCIIColors.error(f"{self.binding_name}: Error while closing the outdated connection for '{alias}': {e}")
+                # Even on error, reset the state to force a new connection attempt
+                server_info.update({"session": None, "exit_stack": None, "initialized": False})
+
+
+    # --- NEW INTERNAL HELPER METHOD ---
+    async def _close_connection_async(self, alias: str):
+        """Cleanly closes the connection for a specific server alias."""
+        server_info = self.servers.get(alias)
+        if not server_info or not server_info.get("exit_stack"):
+            return # Nothing to do.
+
+        ASCIIColors.info(f"{self.binding_name}: Closing connection for '{alias}'...")
+        try:
+            await server_info["exit_stack"].aclose()
+        except Exception as e:
+            trace_exception(e)
+            ASCIIColors.error(f"{self.binding_name}: Exception while closing the exit_stack for '{alias}': {e}")
+        finally:
+            # Reset the state for this alias, no matter what.
+            server_info.update({
+                "session": None,
+                "exit_stack": None,
+                "initialized": False
+            })
