@@ -155,7 +155,7 @@ graph LR
         LC -- Manages --> LLB[LLM Binding];
         LC -- Manages --> MCPB[MCP Binding];
         LC -- Orchestrates --> MCP_Interaction[generate_with_mcp];
-        LC -- Provides --> HighLevelOps[High-Level Ops<br>(summarize, deep_analyze etc.)];
+        LC -- Provides --> HighLevelOps[High-Level Ops(summarize, deep_analyze etc.)];
         LC -- Provides Access To --> DM[DiscussionManager];
         LC -- Provides Access To --> ModalityBindings[TTS, TTI, STT etc.];
     end
