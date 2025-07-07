@@ -423,6 +423,10 @@ class LollmsDiscussion:
         else:
             return cls(lollmsClient=lollms_client, discussion_id=kwargs.get('id'), **init_args)
 
+    def get_messages(self):
+        """Returns the list of messages"""
+        return self._db_discussion.messages
+
     def __getattr__(self, name: str) -> Any:
         """Proxies attribute getting to the underlying discussion object."""
         if name == 'metadata':
