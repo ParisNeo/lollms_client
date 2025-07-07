@@ -155,7 +155,7 @@ graph LR
         LC -- Manages --> LLB[LLM Binding];
         LC -- Manages --> MCPB[MCP Binding];
         LC -- Orchestrates --> MCP_Interaction[generate_with_mcp];
-        LC -- Provides --> HighLevelOps[High-Level Ops(summarize, deep_analyze etc.)];
+        LC -- Provides --> HighLevelOps["High-Level Ops(summarize, deep_analyze etc.)"];
         LC -- Provides Access To --> DM[DiscussionManager];
         LC -- Provides Access To --> ModalityBindings[TTS, TTI, STT etc.];
     end
@@ -164,16 +164,16 @@ graph LR
         LLB --> LollmsServer[LoLLMs Server];
         LLB --> OllamaServer[Ollama];
         LLB --> OpenAPIServer[OpenAI API];
-        LLB --> LocalGGUF[Local GGUF<br>(pythonllamacpp / llamacpp server)];
-        LLB --> LocalHF[Local HuggingFace<br>(transformers / vLLM)];
+        LLB --> LocalGGUF["Local GGUF<br>(pythonllamacpp / llamacpp server)"];
+        LLB --> LocalHF["Local HuggingFace<br>(transformers / vLLM)"];
     end
 
     MCP_Interaction --> MCPB;
-    MCPB --> LocalTools[Local Python Tools<br>(via local_mcp)];
-    MCPB --> RemoteTools[Remote MCP Tool Servers<br>(Future Potential)];
+    MCPB --> LocalTools["Local Python Tools<br>(via local_mcp)"];
+    MCPB --> RemoteTools["Remote MCP Tool Servers<br>(Future Potential)"];
 
 
-    ModalityBindings --> ModalityServices[Modality Services<br>(e.g., LoLLMs Server TTS/TTI, local Bark/XTTS)];
+    ModalityBindings --> ModalityServices["Modality Services<br>(e.g., LoLLMs Server TTS/TTI, local Bark/XTTS)"];
 ```
 
 *   **`LollmsClient`**: The central class for all interactions. It holds the currently active LLM binding, an optional MCP binding, and provides access to modality bindings and high-level operations.
