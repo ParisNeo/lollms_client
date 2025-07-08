@@ -1595,7 +1595,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         formatted_tools_list += "\n**request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent. this tool has no parameters."
         formatted_tools_list += "\n**final_answer**:\nUse when you are ready to respond to the user. this tool has no parameters."
 
-        if discovery_step_id: log_event("Discovering tools",MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id)
+        if discovery_step_id: log_event("**Discovering tools**",MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id)
 
         # --- 2. Dynamic Reasoning Loop ---
         for i in range(max_reasoning_steps):
@@ -1755,7 +1755,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 
                 tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
                 current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
-                log_event(f"Observation: Result from `{tool_name}`:\n{dict_to_markdown(sanitized_result)}", MSG_TYPE.MSG_TYPE_OBSERVATION)
+                log_event(f"**Observation**: Result from `{tool_name}`:\n{dict_to_markdown(sanitized_result)}", MSG_TYPE.MSG_TYPE_OBSERVATION)
                 
                 if reasoning_step_id: log_event(f"**Reasoning Step {i+1}/{max_reasoning_steps}**", MSG_TYPE.MSG_TYPE_STEP_END, event_id = reasoning_step_id)
             except Exception as ex:

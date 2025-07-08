@@ -138,6 +138,107 @@ except Exception as e:
 ```
 For a comprehensive guide on function calling and setting up tools, please refer to the [Usage Guide (DOC_USE.md)](DOC_USE.md).
 
+### 🤖 Advanced Agentic Generation with RAG: `generate_with_mcp_rag`
+
+For more complex tasks, `generate_with_mcp_rag` provides a powerful, built-in agent that uses a ReAct-style (Reason, Act) loop. This agent can reason about a user's request, use tools (MCP), retrieve information from knowledge bases (RAG), and adapt its plan based on the results of its actions.
+
+**Key Agent Capabilities:**
+
+*   **Observe-Think-Act Loop:** The agent iteratively reviews its progress, thinks about the next logical step, and takes an action (like calling a tool).
+*   **Tool Integration (MCP):** Can use any available MCP tools, such as searching the web or executing code.
+*   **Retrieval-Augmented Generation (RAG):** You can provide one or more "data stores" (knowledge bases). The agent gains a `research::{store_name}` tool to query these stores for relevant information.
+*   **In-Memory Code Generation:** The agent has a special `generate_code` tool. This allows it to first write a piece of code (e.g., a complex Python script) and then pass that code to another tool (e.g., `python_code_interpreter`) in a subsequent step.
+*   **Stateful Progress Tracking:** Designed for rich UI experiences, it emits `step_start` and `step_end` events with unique IDs via the streaming callback. This allows an application to track the agent's individual thoughts and long-running tool calls in real-time.
+*   **Self-Correction:** Includes a `refactor_scratchpad` tool for the agent to clean up its own thought process if it becomes cluttered.
+
+Here is an example of using the agent to answer a question by first performing RAG on a custom knowledge base and then using the retrieved information to generate and execute code.
+
+```python
+import json
+from lollms_client import LollmsClient, MSG_TYPE
+from ascii_colors import ASCIIColors
+
+# 1. Define a mock RAG data store and retrieval function
+project_notes = {
+    "project_phoenix_details": "Project Phoenix has a current budget of $500,000 and an expected quarterly growth rate of 15%."
+}
+
+def retrieve_from_notes(query: str, top_k: int = 1, min_similarity: float = 0.5):
+    """A simple keyword-based retriever for our mock data store."""
+    results = []
+    for key, text in project_notes.items():
+        if query.lower() in text.lower():
+            results.append({"source": key, "content": text})
+    return results[:top_k]
+
+# 2. Define a detailed streaming callback to visualize the agent's process
+def agent_streaming_callback(chunk: str, msg_type: MSG_TYPE, params: dict = None, metadata: list = None) -> bool:
+    if not params: params = {}
+    msg_id = params.get("id", "")
+    
+    if msg_type == MSG_TYPE.MSG_TYPE_STEP_START:
+        ASCIIColors.yellow(f"\n>> Agent Step Start [ID: {msg_id}]: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_STEP_END:
+        ASCIIColors.green(f"<< Agent Step End [ID: {msg_id}]: {chunk}")
+        if params.get('result'):
+            ASCIIColors.cyan(f"   Result: {json.dumps(params['result'], indent=2)}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT:
+        ASCIIColors.magenta(f"\n🤔 Agent Thought: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
+        ASCIIColors.blue(f"\n🛠️  Agent Action: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_OBSERVATION:
+        ASCIIColors.cyan(f"\n👀 Agent Observation: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(chunk, end="", flush=True) # Final answer stream
+    return True
+
+try:
+    # 3. Initialize LollmsClient with an LLM and local tools enabled
+    lc = LollmsClient(
+        binding_name="ollama",          # Use Ollama
+        model_name="llama3",            # Or any capable model like mistral, gemma, etc.
+        mcp_binding_name="local_mcp"    # Enable local tools like python_code_interpreter
+    )
+
+    # 4. Define the user prompt and the RAG data store
+    prompt = "Based on my notes about Project Phoenix, write and run a Python script to calculate its projected budget after two quarters."
+    
+    rag_data_store = {
+        "project_notes": {"callable": retrieve_from_notes}
+    }
+
+    ASCIIColors.yellow(f"User Prompt: {prompt}")
+    print("\n" + "="*50 + "\nAgent is now running...\n" + "="*50)
+
+    # 5. Run the agent
+    agent_output = lc.generate_with_mcp_rag(
+        prompt=prompt,
+        use_data_store=rag_data_store,
+        use_mcps=["python_code_interpreter"], # Make specific tools available
+        streaming_callback=agent_streaming_callback,
+        max_reasoning_steps=5
+    )
+
+    print("\n" + "="*50 + "\nAgent finished.\n" + "="*50)
+
+    # 6. Print the final results
+    if agent_output.get("error"):
+        ASCIIColors.error(f"\nAgent Error: {agent_output['error']}")
+    else:
+        ASCIIColors.green("\n--- Final Answer ---")
+        print(agent_output.get("final_answer"))
+        
+        ASCIIColors.magenta("\n--- Tool Calls ---")
+        print(json.dumps(agent_output.get("tool_calls", []), indent=2))
+
+        ASCIIColors.cyan("\n--- RAG Sources ---")
+        print(json.dumps(agent_output.get("sources", []), indent=2))
+
+except Exception as e:
+    ASCIIColors.red(f"\nAn unexpected error occurred: {e}")
+
+```
+
 ## Documentation
 
 For more in-depth information, please refer to:
