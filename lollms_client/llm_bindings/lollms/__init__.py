@@ -281,6 +281,7 @@ class LollmsLLMBinding(LollmsLLMBinding):
         Returns:
             list: List of tokens.
         """
+        response=None
         try:
             # Prepare the request payload
             payload = {
