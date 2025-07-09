@@ -374,7 +374,9 @@ class LollmsDiscussion:
         object.__setattr__(self, '_message_index', None)
         object.__setattr__(self, '_messages_to_delete_from_db', set())
         object.__setattr__(self, '_is_db_backed', db_manager is not None)
-
+        
+        object.__setattr__(self, '_system_prompt', None)
+        
         if self._is_db_backed:
             if not db_discussion_obj and not discussion_id:
                 raise ValueError("Either discussion_id or db_discussion_obj must be provided for DB-backed discussions.")
@@ -634,6 +636,9 @@ class LollmsDiscussion:
             A dictionary with 'user_message' and 'ai_message' LollmsMessage objects,
             where the 'ai_message' will contain rich metadata if an agentic turn was used.
         """
+        if personality is not None:
+            object.__setattr__(self, '_system_prompt', personality.system_prompt)
+            
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
 
@@ -684,6 +689,7 @@ class LollmsDiscussion:
                 use_data_store=use_data_store,
                 max_reasoning_steps=max_reasoning_steps,
                 images=images,
+                system_prompt = self._system_prompt,
                 debug=debug, # Pass the debug flag down
                 **kwargs
             )
@@ -880,7 +886,7 @@ class LollmsDiscussion:
             return "" if format_type == "lollms_text" else []
 
         branch = self.get_branch(branch_tip_id)
-        full_system_prompt = self.system_prompt # Simplified for clarity
+        full_system_prompt = self._system_prompt # Simplified for clarity
         participants = self.participants or {}
 
         def get_full_content(msg: 'LollmsMessage') -> str:
@@ -940,7 +946,9 @@ class LollmsDiscussion:
 
         # --- OPENAI & OLLAMA CHAT FORMATS ---
         messages = []
-        if full_system_prompt:
+        if full_system_prompt and format_type == "markdown":
+            messages.append(f"system: {full_system_prompt}")
+        else:
             messages.append({"role": "system", "content": full_system_prompt})
 
         for msg in branch:
