@@ -879,7 +879,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
             
             formatted_agent_history = "No actions taken yet in this turn."
             if agent_work_history:
-                history_parts = [ f"### Step {i+1}:\n**Thought:** {entry['thought']}\n**Action:** Called tool `{entry['tool_name']}` with parameters `{json.dumps(entry['tool_params'])}`\n**Observation (Tool Output):**\n```json\n{json.dumps(entry['tool_result'], indent=2)}\n```" for i, entry in enumerate(agent_work_history)]
+                history_parts = [ f"### Step {i+1}:\n**Thought:**\n{entry['thought']}\n**Action:** Called tool `{entry['tool_name']}` with parameters `{json.dumps(entry['tool_params'])}`\n**Observation (Tool Output):**\n```json\n{json.dumps(entry['tool_result'], indent=2)}\n```" for i, entry in enumerate(agent_work_history)]
                 formatted_agent_history = "\n\n".join(history_parts)
 
             llm_decision = None
@@ -1580,8 +1580,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         
         # Add the new put_code_in_buffer tool definition
         available_tools.append({
-            "name": "generate_code",
-            "description": """Generates and stores code into a buffer to be used by another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use generate_code. generate_code do not execute the code nor does it audit it.""",
+            "name": "put_code_in_buffer",
+            "description": """Generates and stores code into a buffer to be used by another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use put_code_in_buffer. put_code_in_buffer do not execute the code nor does it audit it.""",
             "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}, "language": {"type": "string", "description": "The programming language of the generated code. By default it uses python."}}, "required": ["prompt"]}
         })
         # Add the new refactor_scratchpad tool definition
@@ -1658,7 +1658,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     
 
                 current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
-                log_event(f"**Thought**: {thought}", MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT)
+                log_event(f"**Thought**:\n{thought}", MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT)
 
                 if not tool_name:
                     # Handle error...
