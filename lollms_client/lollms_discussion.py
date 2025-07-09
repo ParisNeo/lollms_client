@@ -946,10 +946,11 @@ class LollmsDiscussion:
 
         # --- OPENAI & OLLAMA CHAT FORMATS ---
         messages = []
-        if full_system_prompt and format_type == "markdown":
-            messages.append(f"system: {full_system_prompt}")
-        else:
-            messages.append({"role": "system", "content": full_system_prompt})
+        if full_system_prompt:
+            if format_type == "markdown":
+                messages.append(f"system: {full_system_prompt}")
+            else:
+                messages.append({"role": "system", "content": full_system_prompt})
 
         for msg in branch:
             if msg.sender_type == 'user':
