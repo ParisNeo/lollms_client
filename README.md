@@ -296,6 +296,270 @@ The `examples/` directory in this repository contains a rich set of scripts demo
 
 Explore these examples to see `lollms-client` in action!
 
+## Using LoLLMs Client with Different Bindings
+
+`lollms-client` supports a wide range of LLM backends through its binding system. This section provides practical examples of how to initialize `LollmsClient` for each of the major supported bindings.
+
+### A Note on Configuration
+
+The recommended way to provide credentials and other binding-specific settings is through the `llm_binding_config` dictionary during `LollmsClient` initialization. While many bindings can fall back to reading environment variables (e.g., `OPENAI_API_KEY`), passing them explicitly in the config is clearer and less error-prone.
+
+```python
+# General configuration pattern
+lc = LollmsClient(
+    binding_name="your_binding_name",
+    model_name="a_model_name",
+    llm_binding_config={
+        "specific_api_key_param": "your_api_key_here",
+        "another_specific_param": "some_value"
+    }
+)
+```
+
+---
+
+### 1. Local Bindings
+
+These bindings run models directly on your local machine, giving you full control and privacy.
+
+#### **Ollama**
+
+The `ollama` binding connects to a running Ollama server instance on your machine or network.
+
+**Prerequisites:**
+*   [Ollama installed and running](https://ollama.com/).
+*   Models pulled, e.g., `ollama pull llama3`.
+
+**Usage:**
+
+```python
+from lollms_client import LollmsClient
+
+# Configuration for a local Ollama server
+lc = LollmsClient(
+    binding_name="ollama",
+    model_name="llama3",  # Or any other model you have pulled
+    host_address="http://localhost:11434" # Default Ollama address
+)
+
+# Now you can use lc.generate_text(), lc.chat(), etc.
+response = lc.generate_text("Why is the sky blue?")
+print(response)
+```
+
+#### **PythonLlamaCpp (Local GGUF Models)**
+
+The `pythonllamacpp` binding loads and runs GGUF model files directly using the powerful `llama-cpp-python` library. This is ideal for high-performance, local inference on CPU or GPU.
+
+**Prerequisites:**
+*   A GGUF model file downloaded to your machine.
+*   `llama-cpp-python` installed. For GPU support, it must be compiled with the correct flags (e.g., `CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install llama-cpp-python`).
+
+**Usage:**
+
+```python
+from lollms_client import LollmsClient
+
+# --- Configuration for Llama.cpp ---
+# Path to your GGUF model file
+MODEL_PATH = "/path/to/your/model.gguf" 
+
+# Binding-specific configuration
+LLAMACPP_CONFIG = {
+    "n_gpu_layers": -1,  # -1 for all layers to GPU, 0 for CPU
+    "n_ctx": 4096,       # Context size
+    "seed": -1,          # -1 for random seed
+    "chat_format": "chatml" # Or another format like 'llama-2'
+}
+
+try:
+    lc = LollmsClient(
+        binding_name="pythonllamacpp",
+        model_name=MODEL_PATH, # For this binding, model_name is the file path
+        llm_binding_config=LLAMACPP_CONFIG
+    )
+
+    response = lc.generate_text("Write a recipe for a great day.")
+    print(response)
+
+except Exception as e:
+    print(f"Error initializing Llama.cpp binding: {e}")
+    print("Please ensure llama-cpp-python is installed and the model path is correct.")
+
+```
+
+---
+
+### 2. Cloud Service Bindings
+
+These bindings connect to hosted LLM APIs from major providers.
+
+#### **OpenAI**
+
+Connects to the official OpenAI API to use models like GPT-4o, GPT-4, and GPT-3.5.
+
+**Prerequisites:**
+*   An OpenAI API key.
+
+**Usage:**
+
+```python
+from lollms_client import LollmsClient
+
+OPENAI_CONFIG = {
+    "service_key": "your_openai_api_key_here" # sk-...
+}
+
+lc = LollmsClient(
+    binding_name="openai",
+    model_name="gpt-4o",
+    llm_binding_config=OPENAI_CONFIG
+)
+
+response = lc.generate_text("What is the difference between AI and machine learning?")
+print(response)
+```
+
+#### **Google Gemini**
+
+Connects to Google's Gemini family of models via the Google AI Studio API.
+
+**Prerequisites:**
+*   A Google AI Studio API key.
+
+**Usage:**
+
+```python
+from lollms_client import LollmsClient
+
+GEMINI_CONFIG = {
+    "service_key": "your_google_api_key_here"
+}
+
+lc = LollmsClient(
+    binding_name="gemini",
+    model_name="gemini-1.5-pro-latest",
+    llm_binding_config=GEMINI_CONFIG
+)
+
+response = lc.generate_text("Summarize the plot of 'Dune' in three sentences.")
+print(response)
+```
+
+#### **Anthropic Claude**
+
+Connects to Anthropic's API to use the Claude family of models, including Claude 3.5 Sonnet, Opus, and Haiku.
+
+**Prerequisites:**
+*   An Anthropic API key.
+
+**Usage:**
+
+```python
+from lollms_client import LollmsClient
+
+CLAUDE_CONFIG = {
+    "service_key": "your_anthropic_api_key_here"
+}
+
+lc = LollmsClient(
+    binding_name="claude",
+    model_name="claude-3-5-sonnet-20240620",
+    llm_binding_config=CLAUDE_CONFIG
+)
+
+response = lc.generate_text("What are the core principles of constitutional AI?")
+print(response)
+```
+
+---
+
+### 3. API Aggregator Bindings
+
+These bindings connect to services that provide access to many different models through a single API.
+
+#### **OpenRouter**
+
+OpenRouter provides a unified, OpenAI-compatible interface to access models from dozens of providers (Google, Anthropic, Mistral, Groq, etc.) with one API key.
+
+**Prerequisites:**
+*   An OpenRouter API key (starts with `sk-or-...`).
+
+**Usage:**
+Model names must be specified in the format `provider/model-name`.
+
+```python
+from lollms_client import LollmsClient
+
+OPENROUTER_CONFIG = {
+    "open_router_api_key": "your_openrouter_api_key_here"
+}
+
+# Example using a Claude model through OpenRouter
+lc = LollmsClient(
+    binding_name="open_router",
+    model_name="anthropic/claude-3-haiku-20240307",
+    llm_binding_config=OPENROUTER_CONFIG
+)
+
+response = lc.generate_text("Explain what an API aggregator is, as if to a beginner.")
+print(response)
+```
+
+#### **Groq**
+
+While Groq is a direct provider, it's famous as an aggregator of speed. It runs open-source models on custom LPU hardware for exceptionally fast inference.
+
+**Prerequisites:**
+*   A Groq API key.
+
+**Usage:**
+
+```python
+from lollms_client import LollmsClient
+
+GROQ_CONFIG = {
+    "groq_api_key": "your_groq_api_key_here"
+}
+
+lc = LollmsClient(
+    binding_name="groq",
+    model_name="llama3-8b-8192",
+    llm_binding_config=GROQ_CONFIG
+)
+
+response = lc.generate_text("Write a 3-line poem about incredible speed.")
+print(response)
+```
+
+#### **Hugging Face Inference API**
+
+This connects to the serverless Hugging Face Inference API, allowing experimentation with thousands of open-source models without local hardware.
+
+**Note:** This API can have "cold starts," so the first request might be slow.
+
+**Prerequisites:**
+*   A Hugging Face User Access Token (starts with `hf_...`).
+
+**Usage:**
+
+```python
+from lollms_client import LollmsClient
+
+HF_CONFIG = {
+    "hf_api_key": "your_hugging_face_token_here"
+}
+
+lc = LollmsClient(
+    binding_name="hugging_face_inference_api",
+    model_name="google/gemma-1.1-7b-it",
+    llm_binding_config=HF_CONFIG
+)
+
+response = lc.generate_text("Write a short story about a robot who discovers music.")
+print(response)
+```
+
 ## Contributing
 
 Contributions are welcome! Whether it's bug reports, feature suggestions, documentation improvements, or new bindings, please feel free to open an issue or submit a pull request on our [GitHub repository](https://github.com/ParisNeo/lollms_client).

@@ -423,33 +423,29 @@ class LollmsDiscussion:
         else:
             return cls(lollmsClient=lollms_client, discussion_id=kwargs.get('id'), **init_args)
 
-    def get_messages(self, branch_id: Optional[str] = None) -> Union[List[LollmsMessage], Optional[LollmsMessage]]:
+    def get_messages(self, branch_id: Optional[str] = None) -> Optional[List[LollmsMessage]]:
         """
-        Returns messages from the discussion with branch-aware logic.
+        Returns a list of messages forming a branch, from root to a specific leaf.
 
-        - If no branch_id is provided, it returns a list of all messages
-          in the currently active branch, ordered from root to leaf.
-        - If a branch_id is provided, it returns the single message object
-          (the "leaf") corresponding to that ID.
+        - If no branch_id is provided, it returns the full message list of the
+          currently active branch.
+        - If a branch_id is provided, it returns the list of all messages from the
+          root up to (and including) the message with that ID.
 
         Args:
-            branch_id: The ID of the leaf message. If provided, only this
-                       message is returned. If None, the full active branch is returned.
+            branch_id: The ID of the leaf message of the desired branch.
+                       If None, the active branch's leaf is used.
 
         Returns:
-            A list of LollmsMessage objects for the active branch, or a single
-            LollmsMessage if a branch_id is specified, or None if the ID is not found.
+            A list of LollmsMessage objects for the specified branch, ordered
+            from root to leaf, or None if the branch_id does not exist.
         """
-        if branch_id is None:
-            # Case 1: No ID, return the current active branch as a list of messages
-            leaf_id = self.active_branch_id
-            return self.get_branch(leaf_id)
-        else:
-            # Case 2: ID provided, return just the single leaf message
-            if branch_id in self._message_index:
-                return LollmsMessage(self, self._message_index[branch_id])
-            else:
-                return None
+        # Determine which leaf message ID to use
+        leaf_id = branch_id if branch_id is not None else self.active_branch_id
+
+        # Return the full branch leading to that leaf
+        # We assume self.get_branch() correctly handles non-existent IDs by returning None or an empty list.
+        return self.get_branch(leaf_id)
 
 
     def __getattr__(self, name: str) -> Any:

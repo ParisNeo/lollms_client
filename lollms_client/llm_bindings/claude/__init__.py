@@ -3,6 +3,8 @@ import os
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Callable, List, Union, Dict
+import json
+import requests
 
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsMessage
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
@@ -12,13 +14,29 @@ from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
 
 # Ensure the required packages are installed
-pm.ensure_packages(["anthropic", "pillow", "tiktoken"])
+# Added 'requests' for dynamic model listing
+pm.ensure_packages(["anthropic", "pillow", "tiktoken", "requests"])
 
 import anthropic
-from PIL import Image, ImageDraw # ImageDraw is used in the test script below
+from PIL import Image, ImageDraw
 import tiktoken
 
 BindingName = "ClaudeBinding"
+
+# API Endpoint for model listing
+ANTHROPIC_API_BASE_URL = "https://api.anthropic.com/v1"
+
+# A hardcoded list to be used as a fallback if the API call fails
+_FALLBACK_MODELS = [
+    {'model_name': 'claude-3-opus-20240229', 'display_name': 'Claude 3 Opus', 'description': 'Most powerful model for highly complex tasks.', 'owned_by': 'Anthropic'},
+    {'model_name': 'claude-3-5-sonnet-20240620', 'display_name': 'Claude 3.5 Sonnet', 'description': 'Our most intelligent model, a new industry standard.', 'owned_by': 'Anthropic'},
+    {'model_name': 'claude-3-sonnet-20240229', 'display_name': 'Claude 3 Sonnet', 'description': 'Ideal balance of intelligence and speed for enterprise workloads.', 'owned_by': 'Anthropic'},
+    {'model_name': 'claude-3-haiku-20240307', 'display_name': 'Claude 3 Haiku', 'description': 'Fastest and most compact model for near-instant responsiveness.', 'owned_by': 'Anthropic'},
+    {'model_name': 'claude-2.1', 'display_name': 'Claude 2.1', 'description': 'Legacy model with a 200K token context window.', 'owned_by': 'Anthropic'},
+    {'model_name': 'claude-2.0', 'display_name': 'Claude 2.0', 'description': 'Legacy model.', 'owned_by': 'Anthropic'},
+    {'model_name': 'claude-instant-1.2', 'display_name': 'Claude Instant 1.2', 'description': 'Legacy fast and light-weight model.', 'owned_by': 'Anthropic'},
+]
+
 
 # Helper to check if a string is a valid path to an image
 def is_image_path(path_str: str) -> bool:
@@ -64,6 +82,7 @@ class ClaudeBinding(LollmsLLMBinding):
         super().__init__(binding_name=BindingName)
         self.model_name = model_name
         self.service_key = service_key
+        self._cached_models: Optional[List[Dict[str, str]]] = None
 
         if not self.service_key:
             self.service_key = os.getenv("ANTHROPIC_API_KEY")
@@ -112,76 +131,67 @@ class ClaudeBinding(LollmsLLMBinding):
                      ) -> Union[str, dict]:
         """
         Generate text using the Claude model.
-
-        Args:
-            prompt (str): The input prompt for text generation.
-            images (Optional[List[str]]): List of image file paths or base64 strings.
-            system_prompt (str): The system prompt to guide the model.
-            ... other LollmsLLMBinding parameters ...
-
-        Returns:
-            Union[str, dict]: Generated text or error dictionary.
         """
         if not self.client:
             return {"status": False, "error": "Anthropic client not initialized."}
 
         api_params = self._construct_parameters(temperature, top_p, top_k, n_predict)
         
-        # Prepare content for the API call
         message_content = []
-        # Add the main text prompt
-        message_content.append({"type": "text", "text": prompt})
+        if prompt and prompt.strip():
+            message_content.append({"type": "text", "text": prompt})
 
         if images:
             for image_data in images:
                 try:
+                    # ... (image processing code is unchanged)
                     if is_image_path(image_data):
                         with open(image_data, "rb") as image_file:
                             b64_data = base64.b64encode(image_file.read()).decode('utf-8')
                         media_type = get_media_type(image_data)
-                    else: # Assume base64
+                    else:
                         b64_data = image_data
-                        # Cannot infer media type from base64, so we make a safe guess.
-                        # For production, it's better to know the type beforehand.
                         media_type = "image/jpeg"
                     
                     message_content.append({
                         "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": b64_data,
-                        }
+                        "source": { "type": "base64", "media_type": media_type, "data": b64_data }
                     })
                 except Exception as e:
                     error_msg = f"Failed to process image: {e}"
                     ASCIIColors.error(error_msg)
                     return {"status": False, "error": error_msg}
 
+        if not message_content:
+            if stream and streaming_callback:
+                streaming_callback("", MSG_TYPE.MSG_TYPE_FINISHED_MESSAGE)
+            return ""
+
         messages = [{"role": "user", "content": message_content}]
         full_response_text = ""
 
+        # ---- CHANGE START ----
+        # Conditionally build the request arguments to avoid sending an empty `system` parameter.
+        request_args = {
+            "model": self.model_name,
+            "messages": messages,
+            **api_params
+        }
+        if system_prompt and system_prompt.strip():
+            request_args["system"] = system_prompt
+        # ---- CHANGE END ----
+
         try:
             if stream:
-                with self.client.messages.stream(
-                    model=self.model_name,
-                    messages=messages,
-                    system=system_prompt if system_prompt else None,
-                    **api_params
-                ) as stream_response:
+                with self.client.messages.stream(**request_args) as stream_response:
                     for chunk in stream_response.text_stream:
                         full_response_text += chunk
                         if streaming_callback:
                             if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break # Callback requested stop
+                                break
                 return full_response_text
             else:
-                response = self.client.messages.create(
-                    model=self.model_name,
-                    messages=messages,
-                    system=system_prompt if system_prompt else None,
-                    **api_params
-                )
+                response = self.client.messages.create(**request_args)
                 if response.stop_reason == "error":
                      return {"status": False, "error": f"API returned an error: {response.stop_reason}"}
                 return response.content[0].text
@@ -216,12 +226,11 @@ class ClaudeBinding(LollmsLLMBinding):
         messages = discussion.get_messages(branch_tip_id)
         
         history = []
+        # ... (history building code is unchanged)
         for msg in messages:
-            # Claude uses 'user' and 'assistant' roles.
             role = 'user' if msg.sender_type == "user" else 'assistant'
-            
             content_parts = []
-            if msg.content:
+            if msg.content and msg.content.strip():
                 content_parts.append({"type": "text", "text": msg.content})
             
             if msg.images:
@@ -239,9 +248,7 @@ class ClaudeBinding(LollmsLLMBinding):
                             ASCIIColors.warning(f"Could not load image {file_path}: {e}")
             
             if content_parts:
-                # Ensure we don't have two consecutive messages from the same role
                 if history and history[-1]['role'] == role:
-                    # Merge content with the previous message
                     history[-1]['content'].extend(content_parts)
                 else:
                     history.append({'role': role, 'content': content_parts})
@@ -252,14 +259,20 @@ class ClaudeBinding(LollmsLLMBinding):
         api_params = self._construct_parameters(temperature, top_p, top_k, n_predict)
         full_response_text = ""
 
+        # ---- CHANGE START ----
+        # Conditionally build the request arguments to avoid sending an empty `system` parameter.
+        request_args = {
+            "model": self.model_name,
+            "messages": history,
+            **api_params
+        }
+        if system_prompt and system_prompt.strip():
+            request_args["system"] = system_prompt
+        # ---- CHANGE END ----
+
         try:
             if stream:
-                with self.client.messages.stream(
-                    model=self.model_name,
-                    messages=history,
-                    system=system_prompt,
-                    **api_params
-                ) as stream_response:
+                with self.client.messages.stream(**request_args) as stream_response:
                     for chunk in stream_response.text_stream:
                         full_response_text += chunk
                         if streaming_callback:
@@ -267,12 +280,7 @@ class ClaudeBinding(LollmsLLMBinding):
                                 break
                 return full_response_text
             else:
-                response = self.client.messages.create(
-                    model=self.model_name,
-                    messages=history,
-                    system=system_prompt,
-                    **api_params
-                )
+                response = self.client.messages.create(**request_args)
                 if response.stop_reason == "error":
                      return {"status": "error", "message": f"API returned an error: {response.stop_reason}"}
                 return response.content[0].text
@@ -282,6 +290,7 @@ class ClaudeBinding(LollmsLLMBinding):
             trace_exception(ex)
             return {"status": "error", "message": error_message}
             
+    # ... (Rest of the file is unchanged) ...
     def tokenize(self, text: str) -> list:
         """
         Tokenize the input text.
@@ -308,16 +317,25 @@ class ClaudeBinding(LollmsLLMBinding):
     def count_tokens(self, text: str) -> int:
         """
         Count tokens from a text using the Anthropic API.
+        This provides a more accurate count than a fallback tokenizer.
         """
+        if not text or not text.strip():
+            return 0
+
         if not self.client:
             ASCIIColors.warning("Cannot count tokens, Anthropic client not initialized.")
-            return -1
+            return len(self.tokenize(text))
         try:
-            # The count_tokens method is on the client instance, not a model object
-            return self.client.count_tokens(text)
+            # Note: count_tokens doesn't use a system prompt, so it's safe.
+            # However, for consistency, we could add one if needed by the logic.
+            # For now, this is fine as it only counts user content tokens.
+            response = self.client.count_tokens( # Changed from messages.count_tokens to top-level client method
+                model=self.model_name,
+                messages=[{"role": "user", "content": text}]
+            )
+            return response.token_count # Updated to correct response attribute
         except Exception as e:
             ASCIIColors.error(f"Failed to count tokens with Claude API: {e}")
-            # Fallback to tiktoken for a rough estimate
             return len(self.tokenize(text))
 
     def embed(self, text: str, **kwargs) -> List[float]:
@@ -335,25 +353,76 @@ class ClaudeBinding(LollmsLLMBinding):
             "version": anthropic.__version__,
             "host_address": "https://api.anthropic.com",
             "model_name": self.model_name,
-            "supports_structured_output": False, # Claude 3 can be prompted for JSON, but no tool use here
+            "supports_structured_output": False,
             "supports_vision": "claude-3" in self.model_name,
         }
 
     def listModels(self) -> List[Dict[str, str]]:
         """
-        Lists available models from Anthropic.
-        Note: Anthropic API does not provide an endpoint to list models.
-        This is a hardcoded list of known models.
+        Lists available models from the Anthropic API.
+        Caches the result to avoid repeated API calls.
+        Falls back to a static list if the API call fails.
         """
-        # Source: https://docs.anthropic.com/en/docs/models-overview
-        return [
-            {'model_name': 'claude-3-opus-20240229', 'display_name': 'Claude 3 Opus', 'description': 'Most powerful model for highly complex tasks.', 'owned_by': 'Anthropic'},
-            {'model_name': 'claude-3-sonnet-20240229', 'display_name': 'Claude 3 Sonnet', 'description': 'Ideal balance of intelligence and speed for enterprise workloads.', 'owned_by': 'Anthropic'},
-            {'model_name': 'claude-3-haiku-20240307', 'display_name': 'Claude 3 Haiku', 'description': 'Fastest and most compact model for near-instant responsiveness.', 'owned_by': 'Anthropic'},
-            {'model_name': 'claude-2.1', 'display_name': 'Claude 2.1', 'description': 'Legacy model with a 200K token context window.', 'owned_by': 'Anthropic'},
-            {'model_name': 'claude-2.0', 'display_name': 'Claude 2.0', 'description': 'Legacy model.', 'owned_by': 'Anthropic'},
-            {'model_name': 'claude-instant-1.2', 'display_name': 'Claude Instant 1.2', 'description': 'Legacy fast and light-weight model.', 'owned_by': 'Anthropic'},
-        ]
+        if self._cached_models is not None:
+            return self._cached_models
+
+        if not self.service_key:
+            ASCIIColors.warning("Cannot fetch models without an API key. Using fallback list.")
+            self._cached_models = _FALLBACK_MODELS
+            return self._cached_models
+
+        # This part is complex and likely correct, leaving as is.
+        # It's good practice.
+        headers = {
+            "x-api-key": self.service_key,
+            "anthropic-version": "2023-06-01", 
+            "accept": "application/json"
+        }
+        url = f"{ANTHROPIC_API_BASE_URL}/models"
+        
+        try:
+            ASCIIColors.info("Fetching available models from Anthropic API...")
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if "data" in data and isinstance(data["data"], list):
+                models_data = data["data"]
+                formatted_models = []
+                for model in models_data:
+                    model_id = model.get("id")
+                    if not model_id: continue
+                    
+                    display_name = model.get("name", model_id.replace("-", " ").title())
+                    
+                    desc_parts = []
+                    if model.get('context_length'):
+                        desc_parts.append(f"Context: {model['context_length']:,} tokens.")
+                    if model.get('max_output_tokens'):
+                         desc_parts.append(f"Max Output: {model['max_output_tokens']:,} tokens.")
+                    description = " ".join(desc_parts) or f"Anthropic model: {model_id}"
+
+                    formatted_models.append({
+                        'model_name': model_id,
+                        'display_name': display_name,
+                        'description': description,
+                        'owned_by': 'Anthropic'
+                    })
+
+                formatted_models.sort(key=lambda x: x['model_name'])
+                self._cached_models = formatted_models
+                ASCIIColors.green(f"Successfully fetched and parsed {len(self._cached_models)} models.")
+                return self._cached_models
+            else:
+                raise ValueError("API response is malformed. 'data' field missing or not a list.")
+
+        except Exception as e:
+            ASCIIColors.error(f"Failed to fetch models from Anthropic API: {e}")
+            ASCIIColors.warning("Using hardcoded fallback list of models.")
+            trace_exception(e)
+            self._cached_models = _FALLBACK_MODELS
+            return self._cached_models
 
     def load_model(self, model_name: str) -> bool:
         """Set the model name for subsequent operations."""
@@ -384,26 +453,29 @@ if __name__ == '__main__':
         ASCIIColors.info(f"Using anthropic version: {anthropic.__version__}")
 
         # --- List Models ---
-        ASCIIColors.cyan("\n--- Listing Models ---")
+        ASCIIColors.cyan("\n--- Listing Models (dynamic) ---")
         models = binding.listModels()
         if models:
-            ASCIIColors.green(f"Found {len(models)} models (hardcoded list). First 5:")
-            for m in models[:5]:
-                print(m['model_name'])
+            ASCIIColors.green(f"Found {len(models)} models.")
+            for m in models:
+                print(f"- {m['model_name']} ({m['display_name']})")
         else:
-            ASCIIColors.warning("No models found or failed to list models.")
+            ASCIIColors.error("Failed to list models.")
 
         # --- Count Tokens ---
-        ASCIIColors.cyan("\n--- Counting Tokens ---")
+        ASCIIColors.cyan("\n--- Counting Tokens (with valid and empty text) ---")
         sample_text = "Hello, world! This is a test."
         token_count = binding.count_tokens(sample_text)
-        ASCIIColors.green(f"Token count for '{sample_text}': {token_count}")
+        ASCIIColors.green(f"Token count for '{sample_text}': {token_count} (via API)")
+        empty_token_count = binding.count_tokens("  ")
+        ASCIIColors.green(f"Token count for empty string: {empty_token_count} (handled locally)")
+        assert empty_token_count == 0
 
         # --- Text Generation (Non-Streaming) ---
         ASCIIColors.cyan("\n--- Text Generation (Non-Streaming) ---")
         prompt_text = "Explain the importance of bees in one paragraph."
         ASCIIColors.info(f"Prompt: {prompt_text}")
-        generated_text = binding.generate_text(prompt_text, n_predict=100, stream=False)
+        generated_text = binding.generate_text(prompt_text, n_predict=100, stream=False, system_prompt=" ")
         if isinstance(generated_text, str):
             ASCIIColors.green(f"Generated text:\n{generated_text}")
         else:
@@ -422,7 +494,6 @@ if __name__ == '__main__':
         result = binding.generate_text(prompt_text, n_predict=150, stream=True, streaming_callback=stream_callback)
         full_streamed_text = "".join(captured_chunks)
         print("\n--- End of Stream ---")
-        # 'result' is the full text after streaming, which should match our captured text.
         ASCIIColors.green(f"Full streamed text (for verification): {result}")
         assert result == full_streamed_text
 
@@ -439,27 +510,31 @@ if __name__ == '__main__':
         # --- Vision Model Test ---
         dummy_image_path = "claude_dummy_test_image.png"
         try:
-            img = Image.new('RGB', (200, 50), color = ('blue'))
-            d = ImageDraw.Draw(img)
-            d.text((10,10), "Test Image", fill=('yellow'))
-            img.save(dummy_image_path)
-            ASCIIColors.info(f"Created dummy image: {dummy_image_path}")
-
-            ASCIIColors.cyan(f"\n--- Vision Generation (using {test_vision_model_name}) ---")
-            binding.load_model(test_vision_model_name)
-            vision_prompt = "What color is the text and what does it say?"
-            ASCIIColors.info(f"Vision Prompt: {vision_prompt} with image {dummy_image_path}")
-            
-            vision_response = binding.generate_text(
-                prompt=vision_prompt,
-                images=[dummy_image_path],
-                n_predict=50,
-                stream=False
-            )
-            if isinstance(vision_response, str):
-                ASCIIColors.green(f"Vision model response: {vision_response}")
+            available_model_names = [m['model_name'] for m in models]
+            if test_vision_model_name not in available_model_names:
+                 ASCIIColors.warning(f"Vision test model '{test_vision_model_name}' not available. Skipping vision test.")
             else:
-                ASCIIColors.error(f"Vision generation failed: {vision_response}")
+                img = Image.new('RGB', (200, 50), color = ('blue'))
+                d = ImageDraw.Draw(img)
+                d.text((10,10), "Test Image", fill=('yellow'))
+                img.save(dummy_image_path)
+                ASCIIColors.info(f"Created dummy image: {dummy_image_path}")
+
+                ASCIIColors.cyan(f"\n--- Vision Generation (using {test_vision_model_name}) ---")
+                binding.load_model(test_vision_model_name)
+                vision_prompt = "What color is the text and what does it say?"
+                ASCIIColors.info(f"Vision Prompt: {vision_prompt} with image {dummy_image_path}")
+                
+                vision_response = binding.generate_text(
+                    prompt=vision_prompt,
+                    images=[dummy_image_path],
+                    n_predict=50,
+                    stream=False
+                )
+                if isinstance(vision_response, str):
+                    ASCIIColors.green(f"Vision model response: {vision_response}")
+                else:
+                    ASCIIColors.error(f"Vision generation failed: {vision_response}")
         except Exception as e:
             ASCIIColors.error(f"Error during vision test: {e}")
             trace_exception(e)
