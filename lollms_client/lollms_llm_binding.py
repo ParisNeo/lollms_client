@@ -304,5 +304,5 @@ class LollmsLLMBindingManager:
         return [binding_dir.name for binding_dir in self.llm_bindings_dir.iterdir() if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
 
 def get_available_bindings():
-    bindings_dir = Path(__file__)/"llm_bindings"
+    bindings_dir = Path(__file__).parent/"llm_bindings"
     return [binding_dir.name for binding_dir in bindings_dir.iterdir() if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]

@@ -477,7 +477,6 @@ if __name__ == '__main__':
         
         full_streamed_text = ""
         def stream_callback(chunk: str, msg_type: int):
-            nonlocal full_streamed_text
             ASCIIColors.green(chunk, end="", flush=True)
             full_streamed_text += chunk
             return True
