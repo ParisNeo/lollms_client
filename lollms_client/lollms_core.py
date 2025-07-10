@@ -1918,6 +1918,97 @@ Do not split the code in multiple tags.
 
         return code_content # Return the (potentially completed) code content or None
 
+    def generate_structured_content(
+        self,
+        prompt,
+        output_format,
+        extra_system_prompt=None,
+        **kwargs
+    ):
+        """
+        Generates structured data (a dict) from a prompt using a JSON template.
+
+        This method is a high-level wrapper around `generate_code`, specializing it 
+        for JSON output. It ensures the LLM sticks to a predefined structure,
+        and then parses the output into a Python dictionary.
+
+        Args:
+            prompt (str): 
+                The user's request (e.g., "Extract the name, age, and city of the person described").
+            output_format (dict or str): 
+                A Python dictionary or a JSON string representing the desired output 
+                structure. This will be used as a template for the LLM.
+                Example: {"name": "string", "age": "integer", "city": "string"}
+            extra_system_prompt (str, optional): 
+                Additional instructions for the system prompt, to be appended to the 
+                main instructions. Defaults to None.
+            **kwargs: 
+                Additional keyword arguments to be passed directly to the 
+                `generate_code` method (e.g., temperature, max_size, top_k, debug).
+
+        Returns:
+            dict: The parsed JSON data as a Python dictionary, or None if
+                generation or parsing fails.
+        """
+        # 1. Validate and prepare the template string from the output_format
+        if isinstance(output_format, dict):
+            # Convert the dictionary to a nicely formatted JSON string for the template
+            template_str = json.dumps(output_format, indent=2)
+        elif isinstance(output_format, str):
+            # Assume it's already a valid JSON string template
+            template_str = output_format
+        else:
+            # It's good practice to fail early for invalid input types
+            raise TypeError("output_format must be a dict or a JSON string.")
+
+        # 2. Construct a specialized system prompt for structured data generation
+        system_prompt = (
+            "You are a highly skilled AI assistant that processes user requests "
+            "and returns structured data in JSON format. You must strictly adhere "
+            "to the provided JSON template, filling in the values accurately based "
+            "on the user's prompt. Do not add any commentary, explanations, or text "
+            "outside of the final JSON code block. Your entire response must be a single "
+            "valid JSON object within a markdown code block."
+        )
+        if extra_system_prompt:
+            system_prompt += f"\n\nAdditional instructions:\n{extra_system_prompt}"
+
+        # 3. Call the underlying generate_code method with JSON-specific settings
+        if kwargs.get('debug'):
+            ASCIIColors.info("Generating structured content...")
+
+        json_string = self.generate_code(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            template=template_str,
+            language="json",
+            code_tag_format="markdown", # Sticking to markdown is generally more reliable
+            **kwargs # Pass other params like temperature, top_k, etc.
+        )
+
+        # 4. Parse the result and return
+        if not json_string:
+            # generate_code already logs the error, so no need for another message
+            return None
+
+        if kwargs.get('debug'):
+            ASCIIColors.info("Parsing generated JSON string...")
+            print(f"--- Raw JSON String ---\n{json_string}\n-----------------------")
+
+        try:
+            # Use the provided robust parser
+            parsed_json = self.robust_json_parser(json_string)
+            
+            if parsed_json is None:
+                ASCIIColors.warning("Failed to robustly parse the generated JSON.")
+                return None
+                
+            return parsed_json
+
+        except Exception as e:
+            ASCIIColors.error(f"An unexpected error occurred during JSON parsing: {e}")
+            return None
+
 
     def extract_code_blocks(self, text: str, format: str = "markdown") -> List[dict]:
         """
