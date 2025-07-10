@@ -329,7 +329,7 @@ class ClaudeBinding(LollmsLLMBinding):
             # Note: count_tokens doesn't use a system prompt, so it's safe.
             # However, for consistency, we could add one if needed by the logic.
             # For now, this is fine as it only counts user content tokens.
-            response = self.client.count_tokens( # Changed from messages.count_tokens to top-level client method
+            response = self.client.messages.count_tokens( # Changed from messages.count_tokens to top-level client method
                 model=self.model_name,
                 messages=[{"role": "user", "content": text}]
             )
