@@ -6,7 +6,7 @@ from lollms_client.lollms_personality import LollmsPersonality
 from lollms_client.lollms_utilities import PromptReshaper # Keep general utilities
 # Import new MCP binding classes
 from lollms_client.lollms_mcp_binding import LollmsMCPBinding, LollmsMCPBindingManager
-
+from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
 
 __version__ = "0.26.0" # Updated version
 
@@ -21,5 +21,6 @@ __all__ = [
     "LollmsDataManager",
     "PromptReshaper",
     "LollmsMCPBinding", # Export LollmsMCPBinding ABC
+    "LollmsLLMBindingManager",
     "LollmsMCPBindingManager", # Export LollmsMCPBindingManager
 ]
