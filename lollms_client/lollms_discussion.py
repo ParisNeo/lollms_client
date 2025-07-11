@@ -333,7 +333,12 @@ class LollmsMessage:
     def __repr__(self) -> str:
         """Provides a developer-friendly representation of the message."""
         return f"<LollmsMessage id={self.id} sender='{self.sender}'>"
-
+    
+    def set_metadata_item(self, itemname:str, item_value, discussion):
+        new_metadata = (self.metadata or {}).copy()
+        new_metadata[itemname] = item_value
+        self.metadata = new_metadata
+        discussion.commit()
 
 class LollmsDiscussion:
     """Represents and manages a single discussion.
@@ -1060,8 +1065,17 @@ class LollmsDiscussion:
 }"""
             infos = self.lollmsClient.generate_code(prompt = prompt, template = template)
             discussion_title = robust_json_parser(infos)["title"]
-            self.metadata['title'] = discussion_title
+            new_metadata = (self.metadata or {}).copy()
+            new_metadata['title'] = discussion_title
+            
+            self.metadata = new_metadata
             self.commit()
             return discussion_title
         except Exception as ex:
             trace_exception(ex)
+
+    def set_metadata_item(self, itemname:str, item_value):
+        new_metadata = (self.metadata or {}).copy()
+        new_metadata[itemname] = item_value
+        self.metadata = new_metadata
+        self.commit()
