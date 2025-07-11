@@ -1658,7 +1658,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     
 
                 current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
-                log_event(f"**Thought**:\n{thought}", MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT)
+                log_event(f"{thought}", MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT)
 
                 if not tool_name:
                     # Handle error...
@@ -1691,7 +1691,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     tool_calls_this_turn.append({"name": "put_code_in_buffer", "params": tool_params, "result": tool_result})
                     observation_text = f"```json\n{json.dumps(tool_result, indent=2)}\n```"
                     current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
-                    log_event(f"**Observation**:Code generated with ID: {code_uuid}", MSG_TYPE.MSG_TYPE_OBSERVATION)
+                    log_event(f"Code generated with ID: {code_uuid}", MSG_TYPE.MSG_TYPE_OBSERVATION)
                     if code_gen_id: log_event(f"Generating code...", MSG_TYPE.MSG_TYPE_TOOL_CALL, metadata={"id": code_gen_id, "result": tool_result})
                     if reasoning_step_id: log_event(f"**Reasoning Step {i+1}/{max_reasoning_steps}**", MSG_TYPE.MSG_TYPE_STEP_END, event_id= reasoning_step_id)
                     continue # Go to the next reasoning step immediately
@@ -1755,7 +1755,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 
                 tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
                 current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
-                log_event(f"**Observation**: Result from `{tool_name}`:\n{dict_to_markdown(sanitized_result)}", MSG_TYPE.MSG_TYPE_OBSERVATION)
+                log_event(f"Result from `{tool_name}`:\n{dict_to_markdown(sanitized_result)}", MSG_TYPE.MSG_TYPE_OBSERVATION)
                 
                 if reasoning_step_id: log_event(f"**Reasoning Step {i+1}/{max_reasoning_steps}**", MSG_TYPE.MSG_TYPE_STEP_END, event_id = reasoning_step_id)
             except Exception as ex:
