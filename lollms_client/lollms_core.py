@@ -373,6 +373,10 @@ class LollmsClient():
         pass
 
     # --- Core LLM Binding Methods ---
+    def get_ctx_size(self, model_name):
+        return self.binding.get_ctx_size(model_name)
+
+
     def tokenize(self, text: str) -> list:
         """
         Tokenize text using the active LLM binding.
