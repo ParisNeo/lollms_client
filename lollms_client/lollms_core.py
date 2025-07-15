@@ -373,10 +373,6 @@ class LollmsClient():
         pass
 
     # --- Core LLM Binding Methods ---
-    def get_ctx_size(self, model_name):
-        return self.binding.get_ctx_size(model_name)
-
-
     def tokenize(self, text: str) -> list:
         """
         Tokenize text using the active LLM binding.
@@ -1588,6 +1584,11 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             "description": """Generates and stores code into a buffer to be used by another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use put_code_in_buffer. put_code_in_buffer do not execute the code nor does it audit it.""",
             "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}, "language": {"type": "string", "description": "The programming language of the generated code. By default it uses python."}}, "required": ["prompt"]}
         })
+        available_tools.append({
+            "name": "view_generated_code",
+            "description": """Views the code that was generated and stored to the buffer. You need to have a valid uuid of the generated code.""",
+            "input_schema": {"type": "object", "properties": {"code_id": {"type": "string", "description": "The case sensitive uuid of the generated code."}}, "required": ["uuid"]}
+        })
         # Add the new refactor_scratchpad tool definition
         available_tools.append({
             "name": "refactor_scratchpad",
@@ -1599,7 +1600,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         formatted_tools_list += "\n**request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent. this tool has no parameters."
         formatted_tools_list += "\n**final_answer**:\nUse when you are ready to respond to the user. this tool has no parameters."
 
-        if discovery_step_id: log_event("**Discovering tools**",MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id)
+        if discovery_step_id: log_event(f"**Discovering tools** found {len(available_tools)} tools",MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id)
 
         # --- 2. Dynamic Reasoning Loop ---
         for i in range(max_reasoning_steps):
@@ -1699,6 +1700,16 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     if code_gen_id: log_event(f"Generating code...", MSG_TYPE.MSG_TYPE_TOOL_CALL, metadata={"id": code_gen_id, "result": tool_result})
                     if reasoning_step_id: log_event(f"**Reasoning Step {i+1}/{max_reasoning_steps}**", MSG_TYPE.MSG_TYPE_STEP_END, event_id= reasoning_step_id)
                     continue # Go to the next reasoning step immediately
+                if tool_name == 'view_generated_code':
+                    code_id = tool_params.get("code_id")
+                    if code_id:
+                        tool_result = {"status": "success", "code_id": code_id, "generated_code":generated_code_store[code_uuid]}
+                    else:
+                        tool_result = {"status": "error", "code_id": code_id, "error":"Unknown uuid"}
+                    observation_text = f"```json\n{json.dumps(tool_result, indent=2)}\n```"
+                    current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
+                    log_event(f"Result from `{tool_name}`:\n```\n{generated_code_store[code_uuid]}\n```\n", MSG_TYPE.MSG_TYPE_TOOL_CALL, metadata={"id": code_gen_id, "result": tool_result})
+                    continue
                 if tool_name == 'refactor_scratchpad':
                     scratchpad_cleaning_prompt = f"""Enhance this scratchpad content to be more organized and comprehensive. Keep relevant experience information and remove any useless redundancies. Try to log learned things from the context so that you won't make the same mistakes again. Do not remove the main objective information or any crucial information that may be useful for the next iterations. Answer directly with the new scratchpad content without any comments.
 --- YOUR INTERNAL SCRATCHPAD (Work History & Analysis) ---
