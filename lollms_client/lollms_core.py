@@ -287,6 +287,19 @@ class LollmsClient():
         else:
             return None
 
+    def get_model_name(self):
+        if self.binding:
+            return self.binding.model_name
+        else:
+            return None
+
+    def set_model_name(self, model_name)->bool:
+        if self.binding:
+            self.binding.model_name = model_name
+            return True
+        else:
+            return False
+
     def update_tts_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
         """Update the TTS binding with a new configuration."""
         self.tts = self.tts_binding_manager.create_binding(
@@ -521,6 +534,57 @@ class LollmsClient():
             )
         raise RuntimeError("LLM binding not initialized.")
 
+    def generate_from_messages(self,
+                     messages: List[Dict],
+                     n_predict: Optional[int] = None,
+                     stream: Optional[bool] = None,
+                     temperature: Optional[float] = None,
+                     top_k: Optional[int] = None,
+                     top_p: Optional[float] = None,
+                     repeat_penalty: Optional[float] = None,
+                     repeat_last_n: Optional[int] = None,
+                     seed: Optional[int] = None,
+                     n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     **kwargs
+                     ) -> Union[str, dict]:
+        """
+        Generate text using the active LLM binding, using instance defaults if parameters are not provided.
+
+        Args:
+            messages (List[Dict]): A openai compatible list of messages
+            n_predict (Optional[int]): Maximum number of tokens to generate. Uses instance default if None.
+            stream (Optional[bool]): Whether to stream the output. Uses instance default if None.
+            temperature (Optional[float]): Sampling temperature. Uses instance default if None.
+            top_k (Optional[int]): Top-k sampling parameter. Uses instance default if None.
+            top_p (Optional[float]): Top-p sampling parameter. Uses instance default if None.
+            repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
+            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
+            seed (Optional[int]): Random seed for generation. Uses instance default if None.
+            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
+            ctx_size (int | None): Context size override for this generation.
+            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+
+        Returns:
+            Union[str, dict]: Generated text or error dictionary if failed.
+        """
+        if self.binding:
+            return self.binding.generate_from_messages(
+                messages=messages,
+                n_predict=n_predict if n_predict is not None else self.default_n_predict,
+                stream=stream if stream is not None else self.default_stream,
+                temperature=temperature if temperature is not None else self.default_temperature,
+                top_k=top_k if top_k is not None else self.default_top_k,
+                top_p=top_p if top_p is not None else self.default_top_p,
+                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.default_repeat_penalty,
+                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.default_repeat_last_n,
+                seed=seed if seed is not None else self.default_seed,
+                n_threads=n_threads if n_threads is not None else self.default_n_threads,
+                ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size,
+                streaming_callback=streaming_callback if streaming_callback is not None else self.default_streaming_callback,
+            )
+        raise RuntimeError("LLM binding not initialized.")
 
     def chat(self,
              discussion: LollmsDiscussion,
