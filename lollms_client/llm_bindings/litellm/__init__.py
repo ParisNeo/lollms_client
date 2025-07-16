@@ -110,6 +110,25 @@ class LiteLLMBinding(LollmsLLMBinding):
 
         return self._perform_generation(messages, n_predict, is_streaming, temperature, top_p, repeat_penalty, seed, streaming_callback)
 
+    def generate_from_messages(self,
+                     messages: List[Dict],
+                     n_predict: Optional[int] = None,
+                     stream: Optional[bool] = None,
+                     temperature: Optional[float] = None,
+                     top_k: Optional[int] = None,
+                     top_p: Optional[float] = None,
+                     repeat_penalty: Optional[float] = None,
+                     repeat_last_n: Optional[int] = None,
+                     seed: Optional[int] = None,
+                     n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     **kwargs
+                     ) -> Union[str, dict]:
+        is_streaming = stream if stream is not None else (streaming_callback is not None)
+        return self._perform_generation(messages, n_predict, is_streaming, temperature, top_p, repeat_penalty, seed, streaming_callback)
+        
+
     def chat(self, discussion: LollmsDiscussion, branch_tip_id: Optional[str] = None, n_predict: Optional[int] = None, stream: Optional[bool] = None, temperature: float = 0.7, top_p: float = 0.9, repeat_penalty: float = 1.1, seed: Optional[int] = None, streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None, **kwargs) -> Union[str, dict]:
         is_streaming = stream if stream is not None else (streaming_callback is not None)
         messages = discussion.export("openai_chat", branch_tip_id)
@@ -178,9 +197,9 @@ class LiteLLMBinding(LollmsLLMBinding):
                 entries.append({
                     "category": "api", "datasets": "unknown", "icon": get_icon_path(model_name),
                     "license": "unknown", "model_creator": model_info.get('owned_by', 'unknown'),
-                    "name": model_name, "provider": "litellm", "rank": "1.0", "type": "api",
+                    "model_name": model_name, "provider": "litellm", "rank": "1.0", "type": "api",
                     "variants": [{
-                        "name": model_name, "size": context_size,
+                        "model_name": model_name, "size": context_size,
                         "input_cost_per_token": model_info.get('input_cost_per_token', 0),
                         "output_cost_per_token": model_info.get('output_cost_per_token', 0),
                         "max_output_tokens": model_info.get('max_output_tokens', 0),
