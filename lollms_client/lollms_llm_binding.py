@@ -6,8 +6,8 @@ from typing import Optional, Callable, List, Union
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT
 import importlib
 from pathlib import Path
-from typing import Optional
-from ascii_colors import trace_exception
+from typing import Optional, Dict, List
+from ascii_colors import trace_exception, ASCIIColors
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
 import re
@@ -73,7 +73,45 @@ class LollmsLLMBinding(ABC):
             Union[str, dict]: Generated text or error dictionary if failed.
         """
         pass
-    
+
+    def generate_from_messages(self,
+                     messages: List[Dict],
+                     n_predict: Optional[int] = None,
+                     stream: Optional[bool] = None,
+                     temperature: Optional[float] = None,
+                     top_k: Optional[int] = None,
+                     top_p: Optional[float] = None,
+                     repeat_penalty: Optional[float] = None,
+                     repeat_last_n: Optional[int] = None,
+                     seed: Optional[int] = None,
+                     n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     **kwargs
+                     ) -> Union[str, dict]:
+        """
+        Generate text using the active LLM binding, using instance defaults if parameters are not provided.
+
+        Args:
+            messages (List[Dict]): A openai compatible list of messages
+            n_predict (Optional[int]): Maximum number of tokens to generate. Uses instance default if None.
+            stream (Optional[bool]): Whether to stream the output. Uses instance default if None.
+            temperature (Optional[float]): Sampling temperature. Uses instance default if None.
+            top_k (Optional[int]): Top-k sampling parameter. Uses instance default if None.
+            top_p (Optional[float]): Top-p sampling parameter. Uses instance default if None.
+            repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
+            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
+            seed (Optional[int]): Random seed for generation. Uses instance default if None.
+            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
+            ctx_size (int | None): Context size override for this generation.
+            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+
+        Returns:
+            Union[str, dict]: Generated text or error dictionary if failed.
+        """
+        ASCIIColors.red("This binding does not support generate_from_messages")
+
+
     @abstractmethod
     def chat(self,
              discussion: LollmsDiscussion,
