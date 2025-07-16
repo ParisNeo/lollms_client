@@ -258,7 +258,77 @@ class OllamaBinding(LollmsLLMBinding):
             error_message = f"An unexpected error occurred: {str(ex)}"
             trace_exception(ex)
             return {"status": False, "error": error_message}
+
+    def generate_from_messages(self,
+                     messages: List[Dict],
+                     n_predict: Optional[int] = None,
+                     stream: Optional[bool] = None,
+                     temperature: Optional[float] = None,
+                     top_k: Optional[int] = None,
+                     top_p: Optional[float] = None,
+                     repeat_penalty: Optional[float] = None,
+                     repeat_last_n: Optional[int] = None,
+                     seed: Optional[int] = None,
+                     n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     **kwargs
+                     ) -> Union[str, dict]:
+        if not self.ollama_client:
+             return {"status": False, "error": "Ollama client not initialized."}
+
+        options = {}
+        if n_predict is not None: options['num_predict'] = n_predict
+        if temperature is not None: options['temperature'] = float(temperature)
+        if top_k is not None: options['top_k'] = top_k
+        if top_p is not None: options['top_p'] = top_p
+        if repeat_penalty is not None: options['repeat_penalty'] = repeat_penalty
+        if repeat_last_n is not None: options['repeat_last_n'] = repeat_last_n
+        if seed is not None: options['seed'] = seed
+        if n_threads is not None: options['num_thread'] = n_threads
+        if ctx_size is not None: options['num_ctx'] = ctx_size
+        
+        full_response_text = ""
+
+        try:
+            if stream:
+                response_stream = self.ollama_client.chat(
+                    model=self.model_name,
+                    messages=messages,
+                    stream=True,
+                    options=options if options else None
+                )
+                for chunk_dict in response_stream:
+                    chunk_content = chunk_dict.get('message', {}).get('content', '')
+                    if chunk_content: # Ensure there is content to process
+                        full_response_text += chunk_content
+                        if streaming_callback:
+                            if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                break # Callback requested stop
+                return full_response_text
+            else: # Not streaming
+                response_dict = self.ollama_client.chat(
+                    model=self.model_name,
+                    messages=messages,
+                    stream=False,
+                    options=options if options else None
+                )
+                return response_dict.get('message', {}).get('content', '')
+
+        except ollama.ResponseError as e:
+            error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
+            ASCIIColors.error(error_message)
+            return {"status": False, "error": error_message, "status_code": e.status_code}
+        except ollama.RequestError as e: # Covers connection errors, timeouts during request
+            error_message = f"Ollama API RequestError: {str(e)}"
+            ASCIIColors.error(error_message)
+            return {"status": False, "error": error_message}
+        except Exception as ex:
+            error_message = f"An unexpected error occurred: {str(ex)}"
+            trace_exception(ex)
+            return {"status": False, "error": error_message}
     
+
     def chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
