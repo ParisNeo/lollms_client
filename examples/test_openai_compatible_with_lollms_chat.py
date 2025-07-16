@@ -4,6 +4,7 @@ lc = LollmsClient("openai","http://localhost:9642/v1/", service_key="lollms_zXQd
 models = lc.listModels()
 print(f"Found models:\n{models}")
 
+# format is: binding name/model name.
 lc.set_model_name("litellm/mistralsmall-22b")
 
 res = lc.generate_text("Describe this image",images=[
