@@ -7,6 +7,6 @@ print(f"Found models:\n{models}")
 lc.set_model_name("litellm/mistralsmall-22b")
 
 res = lc.generate_text("Describe this image",images=[
-    r"C:\Users\sa226037\Pictures\Charles_de_Gaulle-1963.jpg"
+    r"C:\Users\Pictures\Charles_de_Gaulle-1963.jpg"
 ])
 print(res)
