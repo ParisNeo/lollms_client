@@ -372,6 +372,7 @@ class LollmsDiscussion:
         object.__setattr__(self, 'autosave', autosave)
         object.__setattr__(self, 'max_context_size', max_context_size)
         object.__setattr__(self, 'scratchpad', "")
+        object.__setattr__(self, 'images', [])
         
         # Internal state
         object.__setattr__(self, '_session', None)
@@ -1047,6 +1048,61 @@ class LollmsDiscussion:
         
         self.touch()
         print(f"[INFO] Discussion auto-pruned. {len(messages_to_prune)} messages summarized. History preserved.")
+
+    def count_discussion_tokens(self, format_type: str, branch_tip_id: Optional[str] = None) -> int:
+        """Counts the number of tokens in the exported discussion content.
+
+        This method exports the discussion in the specified format and then uses
+        the lollmsClient's tokenizer to count the tokens in the resulting text.
+
+        Args:
+            format_type: The target format (e.g., "lollms_text", "openai_chat").
+            branch_tip_id: The ID of the message to use as the end of the context.
+                           Defaults to the active branch ID.
+
+        Returns:
+            The total number of tokens.
+        """
+        exported_content = self.export(format_type, branch_tip_id)
+        
+        text_to_count = ""
+        if isinstance(exported_content, str):
+            text_to_count = exported_content
+        elif isinstance(exported_content, list):
+            # Handle list of dicts (OpenAI/Ollama format)
+            full_content = []
+            for message in exported_content:
+                content = message.get("content")
+                if isinstance(content, str):
+                    full_content.append(content)
+                elif isinstance(content, list): # Handle OpenAI content parts
+                    for part in content:
+                        if part.get("type") == "text":
+                            full_content.append(part.get("text", ""))
+            text_to_count = "\n".join(full_content)
+
+        return self.lollmsClient.count_tokens(text_to_count)
+
+    def get_context_status(self, branch_tip_id: Optional[str] = None) -> Dict[str, Optional[int]]:
+        """Returns the current token count and the maximum context size.
+
+        This provides a snapshot of the context usage, taking into account
+        any non-destructive pruning that has occurred. The token count is
+        based on the "lollms_text" export format, which is the format used
+        for pruning calculations.
+
+        Args:
+            branch_tip_id: The ID of the message branch to measure. Defaults
+                           to the active branch.
+
+        Returns:
+            A dictionary with 'current_tokens' and 'max_tokens'.
+        """
+        current_tokens = self.count_discussion_tokens("lollms_text", branch_tip_id)
+        return {
+            "current_tokens": current_tokens,
+            "max_tokens": self.max_context_size
+        }
 
     def switch_to_branch(self, branch_id):
         self.active_branch_id = branch_id

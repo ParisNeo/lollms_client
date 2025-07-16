@@ -280,6 +280,13 @@ class LollmsClient():
             available = self.binding_manager.get_available_bindings()
             raise ValueError(f"Failed to update LLM binding: {binding_name}. Available: {available}")
 
+    def get_ctx_size(self, model_name=None):
+        if self.binding:
+            ctx_size = self.binding.get_ctx_size(model_name)
+            return ctx_size if ctx_size else self.default_ctx_size
+        else:
+            return None
+
     def update_tts_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
         """Update the TTS binding with a new configuration."""
         self.tts = self.tts_binding_manager.create_binding(

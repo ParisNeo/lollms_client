@@ -115,8 +115,9 @@ class LollmsLLMBinding(ABC):
         """
         pass
 
-    def get_ctx_size(self, model_name):
-        return 32000
+    def get_ctx_size(self, model_name=None):
+        # if model_name is none use current model name
+        return None
 
 
     @abstractmethod
