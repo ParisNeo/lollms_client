@@ -229,6 +229,66 @@ class OpenAIBinding(LollmsLLMBinding):
 
         return output
     
+    def generate_from_messages(self,
+                     messages: List[Dict],
+                     n_predict: Optional[int] = None,
+                     stream: Optional[bool] = None,
+                     temperature: Optional[float] = None,
+                     top_k: Optional[int] = None,
+                     top_p: Optional[float] = None,
+                     repeat_penalty: Optional[float] = None,
+                     repeat_last_n: Optional[int] = None,
+                     seed: Optional[int] = None,
+                     n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     **kwargs
+                     ) -> Union[str, dict]:
+        # Build the request parameters
+        params = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": n_predict,
+            "n": 1,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": repeat_penalty,
+            "stream": stream
+        }
+        # Add seed if available, as it's supported by newer OpenAI models
+        if seed is not None:
+            params["seed"] = seed
+
+        # Remove None values, as the API expects them to be absent
+        params = {k: v for k, v in params.items() if v is not None}
+        
+        output = ""
+        # 2. Call the API
+        try:
+            completion = self.client.chat.completions.create(**params)
+
+            if stream:
+                for chunk in completion:
+                    # The streaming response for chat has a different structure
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        word = delta.content
+                        if streaming_callback is not None:
+                            if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                                break
+                        output += word
+            else:
+                output = completion.choices[0].message.content
+        
+        except Exception as e:
+            # Handle API errors gracefully
+            error_message = f"An error occurred with the OpenAI API: {e}"
+            if streaming_callback:
+                streaming_callback(error_message, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": error_message}
+            
+        return output
+    
     def chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
@@ -457,6 +517,15 @@ class OpenAIBinding(LollmsLLMBinding):
                         "context_length": context_length,
                         "max_generation": max_generation,
                     })
+                else:
+                    models_info.append({
+                        "model_name": model_id,
+                        "owned_by": getattr(model, "owned_by", "N/A"),
+                        "created": getattr(model, "created", "N/A"),
+                        "context_length": None,
+                        "max_generation": None,
+                    })
+                    
         except Exception as e:
             print(f"Failed to list models: {e}")
 
