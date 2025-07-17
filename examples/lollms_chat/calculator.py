@@ -1,4 +1,4 @@
-  from lollms_client import LollmsClient
+from lollms_client import LollmsClient
 import json
 import math  # Import the math module for calculations
 
