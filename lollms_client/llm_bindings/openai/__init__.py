@@ -175,14 +175,25 @@ class OpenAIBinding(LollmsLLMBinding):
 
         # Generate text using the OpenAI API
         if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
-            chat_completion = self.client.chat.completions.create(
-                model=self.model_name,  # Choose the engine according to your OpenAI plan
-                messages=messages,
-                max_tokens=n_predict,  # Adjust the desired length of the generated response
-                n=1,  # Specify the number of responses you want
-                temperature=temperature,  # Adjust the temperature for more or less randomness in the output
-                stream=stream
-            )
+            try:
+                chat_completion = self.client.chat.completions.create(
+                    model=self.model_name,  # Choose the engine according to your OpenAI plan
+                    messages=messages,
+                    max_tokens=n_predict,  # Adjust the desired length of the generated response
+                    n=1,  # Specify the number of responses you want
+                    temperature=temperature,  # Adjust the temperature for more or less randomness in the output
+                    stream=stream
+                )
+            except Exception as ex:
+                # exception for new openai models
+                chat_completion = self.client.chat.completions.create(
+                    model=self.model_name,  # Choose the engine according to your OpenAI plan
+                    messages=messages,
+                    max_completion_tokens=n_predict,  # Adjust the desired length of the generated response
+                    n=1,  # Specify the number of responses you want
+                    temperature=1,  # Adjust the temperature for more or less randomness in the output
+                    stream=stream
+                )
 
             if stream:
                 for resp in chat_completion:
@@ -265,8 +276,17 @@ class OpenAIBinding(LollmsLLMBinding):
         output = ""
         # 2. Call the API
         try:
-            completion = self.client.chat.completions.create(**params)
-
+            try:
+                completion = self.client.chat.completions.create(**params)
+            except Exception as ex:
+                # exception for new openai models
+                params["max_completion_tokens"]=params["max_tokens"]
+                params["temperature"]=1
+                del params["max_tokens"]
+                del params["top_p"]
+                del params["frequency_penalty"]
+                
+                completion = self.client.chat.completions.create(**params)
             if stream:
                 for chunk in completion:
                     # The streaming response for chat has a different structure
@@ -349,8 +369,18 @@ class OpenAIBinding(LollmsLLMBinding):
         try:
             # Check if we should use the chat completions or legacy completions endpoint
             if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
-                completion = self.client.chat.completions.create(**params)
-
+                try:
+                    completion = self.client.chat.completions.create(**params)
+                except Exception as ex:
+                    # exception for new openai models
+                    params["max_completion_tokens"]=params["max_tokens"]
+                    params["temperature"]=1
+                    del params["max_tokens"]
+                    del params["top_p"]
+                    del params["frequency_penalty"]
+                    
+                    completion = self.client.chat.completions.create(**params)
+                    
                 if stream:
                     for chunk in completion:
                         # The streaming response for chat has a different structure
