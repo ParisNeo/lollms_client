@@ -276,7 +276,6 @@ if __name__ == '__main__':
         binding.load_model("meta-llama/llama-3-8b-instruct:free") # Use the free tier on OpenRouter
         full_streamed_text = ""
         def stream_callback(chunk: str, msg_type: int):
-            nonlocal full_streamed_text
             ASCIIColors.green(chunk, end="", flush=True)
             full_streamed_text += chunk
             return True
