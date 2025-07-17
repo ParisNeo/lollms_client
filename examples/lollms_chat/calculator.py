@@ -1,3 +1,7 @@
+# This is a simple example of a calculator using lollms_chat. don't expect this to be perfect as LLMs are very bad in computing 
+# this can be used for very simple calculations. don't expect it to be accurate to compute sqrt(35) or something
+# it is just for the purpose of experimentation as even the best models in the world are not capable of doing accurate calculations yet without a calculator
+
 from lollms_client import LollmsClient
 import json
 import math  # Import the math module for calculations
