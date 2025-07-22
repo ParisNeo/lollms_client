@@ -127,6 +127,7 @@ def create_dynamic_models(
         __abstract__ = True
         id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
         system_prompt = Column(EncryptedText, nullable=True)
+        data_zone = Column(EncryptedText, nullable=True) # New field for persistent data
         participants = Column(JSON, nullable=True, default=dict)
         active_branch_id = Column(String, nullable=True)
         discussion_metadata = Column(JSON, nullable=True, default=dict)
@@ -223,6 +224,10 @@ class LollmsDataManager:
                 if 'pruning_point_id' not in columns:
                     print("  -> Upgrading 'discussions' table: Adding 'pruning_point_id' column.")
                     connection.execute(text("ALTER TABLE discussions ADD COLUMN pruning_point_id VARCHAR"))
+
+                if 'data_zone' not in columns:
+                    print("  -> Upgrading 'discussions' table: Adding 'data_zone' column.")
+                    connection.execute(text("ALTER TABLE discussions ADD COLUMN data_zone TEXT"))
                 
                 print("Database schema is up to date.")
                 # This is important to apply the ALTER TABLE statements
@@ -484,6 +489,7 @@ class LollmsDiscussion:
         proxy = SimpleNamespace()
         proxy.id = id or str(uuid.uuid4())
         proxy.system_prompt = None
+        proxy.data_zone = None
         proxy.participants = {}
         proxy.active_branch_id = None
         proxy.discussion_metadata = {}
@@ -645,6 +651,17 @@ class LollmsDiscussion:
         if personality is not None:
             object.__setattr__(self, '_system_prompt', personality.system_prompt)
             
+        # Determine effective MCPs by combining personality defaults and turn-specific overrides
+        effective_use_mcps = use_mcps
+        if personality and hasattr(personality, 'active_mcps') and personality.active_mcps:
+            # If the personality has MCPs, we use them as a base.
+            if effective_use_mcps in [None, False]:
+                effective_use_mcps = personality.active_mcps
+            # If the user also specified MCPs for this turn, we merge them.
+            elif isinstance(effective_use_mcps, list):
+                effective_use_mcps = list(set(effective_use_mcps + personality.active_mcps))
+            # If effective_use_mcps is True, it means "use all available tools", so we don't need to change it.
+            
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
 
@@ -669,7 +686,7 @@ class LollmsDiscussion:
             images = user_msg.images
 
         # Step 2: Determine if this is a simple chat or a complex agentic turn.
-        is_agentic_turn = (use_mcps is not None and use_mcps) or (use_data_store is not None and use_data_store)
+        is_agentic_turn = (effective_use_mcps is not None and effective_use_mcps) or (use_data_store is not None and use_data_store)
         
         start_time = datetime.now()
         
@@ -691,7 +708,7 @@ class LollmsDiscussion:
 
             agent_result = self.lollmsClient.generate_with_mcp_rag(
                 prompt=prompt_for_agent,
-                use_mcps=use_mcps,
+                use_mcps=effective_use_mcps,
                 use_data_store=use_data_store,
                 max_reasoning_steps=max_reasoning_steps,
                 images=images,
@@ -892,7 +909,13 @@ class LollmsDiscussion:
             return "" if format_type == "lollms_text" else []
 
         branch = self.get_branch(branch_tip_id)
-        full_system_prompt = self._system_prompt # Simplified for clarity
+        
+        # Combine system prompt and the new data_zone if it exists
+        full_system_prompt = (self._system_prompt or "").strip()
+        if hasattr(self, 'data_zone') and self.data_zone:
+            data_zone_text = f"\n\n--- data ---\n{self.data_zone.strip()}"
+            full_system_prompt = (full_system_prompt + data_zone_text).strip()
+
         participants = self.participants or {}
 
         def get_full_content(msg: 'LollmsMessage') -> str:

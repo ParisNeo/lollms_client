@@ -18,8 +18,9 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 *   🔌 **Versatile Binding System:** Seamlessly switch between different LLM backends (LoLLMs, Ollama, OpenAI, Llama.cpp, Transformers, vLLM, OpenLLM) without major code changes.
 *   🗣️ **Multimodal Support:** Interact with models capable of processing images and generate various outputs like speech (TTS) and images (TTI).
 *   🤖 **Function Calling with MCP:** Empowers LLMs to use external tools and functions through the Model Context Protocol (MCP), with built-in support for local Python tool execution via `local_mcp` binding and its default tools (file I/O, internet search, Python interpreter, image generation).
+*   🎭 **Personalities as Agents:** Personalities can now define their own set of required tools (MCPs), turning them into self-contained, ready-to-use agents.
 *   🚀 **Streaming & Callbacks:** Efficiently handle real-time text generation with customizable callback functions, including during MCP interactions.
-*   💬 **Discussion Management:** Utilities to easily manage and format conversation histories for chat applications.
+*   💬 **Discussion Management:** Utilities to easily manage and format conversation histories, including a persistent `data_zone` for context that is always present in the system prompt.
 *   ⚙️ **Configuration Management:** Flexible ways to configure bindings and generation parameters.
 *   🧩 **Extensible:** Designed to easily incorporate new LLM backends and modality services, including custom MCP toolsets.
 *   📝 **High-Level Operations:** Includes convenience methods for complex tasks like sequential summarization and deep text analysis directly within `LollmsClient`.
@@ -137,6 +138,38 @@ except Exception as e:
     trace_exception(e) # Assuming you have trace_exception utility
 ```
 For a comprehensive guide on function calling and setting up tools, please refer to the [Usage Guide (DOC_USE.md)](DOC_USE.md).
+
+### 🎭 Personalities as Self-Contained Agents
+
+A powerful feature of `lollms-client` is the ability to define personalities that are not just conversational styles, but fully-fledged agents with their own tools. By including an `active_mcps` list in a personality's definition, you specify which tools should be enabled by default whenever that personality is used.
+
+**Example Personality Definition (conceptual):**
+
+```python
+# In your application logic where you might define personalities
+from lollms_client import LollmsPersonality
+
+# This personality is designed to be a research assistant
+researcher_personality = LollmsPersonality(
+    name="Researcher_Bot",
+    author="My_App",
+    category="Research",
+    description="An AI assistant that can search the web and write files.",
+    system_prompt="You are a helpful research assistant. Use your tools to find information and save it.",
+    # This is the new part: specify the tools this personality needs.
+    active_mcps=["internet_search", "file_writer"] 
+)
+
+# How it works in LollmsDiscussion.chat()
+# discussion.chat(
+#     "Find the latest news on AI and save it to news.txt", 
+#     personality=researcher_personality
+# )
+# This call will automatically enable 'internet_search' and 'file_writer'
+# for the agentic turn, without needing to specify `use_mcps` in the chat call itself.
+```
+
+This simplifies agentic calls and makes personalities much more portable and powerful. The tools specified in `use_mcps` during a `chat()` call will be *added* to the personality's default tools for that specific turn.
 
 ### 🤖 Advanced Agentic Generation with RAG: `generate_with_mcp_rag`
 
@@ -571,3 +604,132 @@ This project is licensed under the **Apache 2.0 License**. See the [LICENSE](LIC
 ## Changelog
 
 For a list of changes and updates, please refer to the [CHANGELOG.md](CHANGELOG.md) file.
+```
+
+---
+### Phase 2: Update `lollms_discussion.md`
+
+I will improve the documentation for the `LollmsDiscussion` class, explaining the `chat` method's new behavior regarding personality-based tool activation.
+
+`[UPDATE] docs/md/lollms_discussion.md`
+```markdown
+# LollmsDiscussion Class
+
+The `LollmsDiscussion` class is a cornerstone of the `lollms-client` library, designed to represent and manage a single conversation. It provides a robust interface for handling message history, conversation branching, context formatting, and persistence.
+
+## Overview
+
+A `LollmsDiscussion` can be either **in-memory** or **database-backed**, offering flexibility for different use cases.
+
+-   **In-Memory:** Ideal for temporary or transient conversations. The discussion exists only for the duration of the application's runtime.
+-   **Database-Backed:** Provides persistence by saving the entire conversation, including all branches and metadata, to a database file (e.g., SQLite). This is perfect for applications that need to retain user chat history.
+
+## Key Features
+
+-   **Message Management:** Add user and AI messages, which are automatically linked to form a conversation tree.
+-   **Branching:** The conversation is a tree, not a simple list. This allows for exploring different conversational paths from any point. You can regenerate an AI response, and it will create a new branch.
+-   **Context Exporting:** The `export()` method formats the conversation history for various LLM backends (`openai_chat`, `ollama_chat`, `lollms_text`, `markdown`), ensuring compatibility.
+-   **Automatic Pruning:** To prevent exceeding the model's context window, it can automatically summarize older parts of the conversation without losing the original data.
+-   **Persistent Data Zone:** A special field to hold context that is always included in the system prompt, separate from the main conversation flow.
+
+## Creating a Discussion
+
+The recommended way to create a discussion is using the `LollmsDiscussion.create_new()` class method.
+
+```python
+from lollms_client import LollmsClient, LollmsDataManager, LollmsDiscussion
+
+# For an in-memory discussion (lost when the app closes)
+lc = LollmsClient(binding_name="ollama", model_name="llama3")
+discussion = LollmsDiscussion.create_new(lollms_client=lc, id="my-temp-discussion")
+
+# For a persistent, database-backed discussion
+# This will create a 'discussions.db' file if it doesn't exist
+db_manager = LollmsDataManager('sqlite:///discussions.db')
+discussion_db = LollmsDiscussion.create_new(
+    lollms_client=lc, 
+    db_manager=db_manager,
+    discussion_metadata={"title": "My First DB Chat"}
+)
+```
+
+## Core Properties
+
+### `data_zone`
+
+The `data_zone` is a string property where you can store persistent information that should always be visible to the AI as part of its system instructions. This is incredibly useful for providing context that doesn't change, such as user profiles, complex instructions, or data that the AI should always reference.
+
+The content of `data_zone` is automatically appended to the system prompt during context export.
+
+#### Example: Using the Data Zone
+
+Imagine you are building a Python coding assistant. You can use the `data_zone` to hold the current state of a script the user is working on.
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion
+
+lc = LollmsClient(binding_name="ollama", model_name="codellama")
+discussion = LollmsDiscussion.create_new(lollms_client=lc)
+
+# Set the system prompt and initial data_zone
+discussion.system_prompt = "You are a Python expert. Help the user with their code."
+discussion.data_zone = "# Current script content:\n\nimport os\n\ndef list_files(path):\n    pass"
+
+# The user asks for help
+user_prompt = "Flesh out the list_files function to print all files in the given path."
+
+# When you generate a response, the AI will see the system prompt AND the data_zone
+# The effective system prompt becomes:
+# """
+# You are a Python expert. Help the user with their code.
+#
+# --- data ---
+# # Current script content:
+#
+# import os
+#
+# def list_files(path):
+#     pass
+# """
+response = discussion.chat(user_prompt)
+print(response['ai_message'].content)
+
+# The calling application can then parse the AI's response and update the data_zone
+# for the next turn.
+updated_code = "# ... updated code from AI ...\nimport os\n\ndef list_files(path):\n    for f in os.listdir(path):\n        print(f)"
+discussion.data_zone = updated_code
+discussion.commit() # If DB-backed
+```
+
+### Other Important Properties
+
+-   `id`: The unique identifier for the discussion.
+-   `system_prompt`: The main system prompt defining the AI's persona and core instructions.
+-   `metadata`: A dictionary for storing any custom metadata, like a title.
+-   `active_branch_id`: The ID of the message at the "tip" of the current conversation branch.
+-   `messages`: A list of all `LollmsMessage` objects in the discussion.
+
+## Main Methods
+
+### `chat()`
+The `chat()` method is the primary way to interact with the discussion. It handles a full user-to-AI turn, including invoking the advanced agentic capabilities of the `LollmsClient`.
+
+#### Personalities and Tool Usage (`use_mcps`)
+
+The `chat` method intelligently handles tool activation (MCPs) when a `LollmsPersonality` is provided. This allows personalities to be configured as self-contained agents with their own default tools.
+
+Here’s how the `use_mcps` parameter interacts with a personality's `active_mcps` list:
+
+1.  **Personality has tools, `use_mcps` is not set:** The agent will use the tools defined in `personality.active_mcps`.
+2.  **Personality has tools, `use_mcps` is also set:** The agent will use a *combination* of tools from both the personality and the `use_mcps` parameter for that specific turn. Duplicates are automatically handled. This allows you to augment a personality's default tools on the fly.
+3.  **Personality has no tools, `use_mcps` is set:** The agent will use only the tools specified in the `use_mcps` parameter.
+4.  **Neither are set:** The agentic turn is not triggered (unless `use_data_store` is active), and a simple chat generation occurs.
+
+This mechanism makes it easy to create powerful, reusable agents. For example, a "Code Writer" personality could come bundled with `file_reader` and `file_writer` tools, while a "Research Assistant" could have `internet_search` enabled by default.
+
+### Other Methods
+-   `add_message(sender, content, ...)`: Adds a new message.
+-   `export(format_type, ...)`: Exports the discussion to a specific format.
+-   `commit()`: Saves changes to the database (if DB-backed).
+-   `summarize_and_prune()`: Automatically handles context window limits.
+-   `count_discussion_tokens()`: Counts the tokens for a given format.
