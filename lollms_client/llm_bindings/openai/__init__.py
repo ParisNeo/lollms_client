@@ -484,7 +484,7 @@ class OpenAIBinding(LollmsLLMBinding):
             list: The embedding vector as a list of floats, or an empty list on failure.
         """
         # Determine the embedding model, prioritizing kwargs, with a default
-        embedding_model = kwargs.get("model", "text-embedding-ada-002")
+        embedding_model = kwargs.get("model", self.model_name)
         
         try:
             # The OpenAI API expects the input to be a list of strings
