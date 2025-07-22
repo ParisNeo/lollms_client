@@ -472,16 +472,39 @@ class OpenAIBinding(LollmsLLMBinding):
         
     def embed(self, text: str, **kwargs) -> list:
         """
-        Get embeddings for the input text using OpenAI API
-        
+        Get embeddings for the input text using OpenAI API.
+
         Args:
-            text (str or List[str]): Input text to embed
-            **kwargs: Additional arguments like model, truncate, options, keep_alive
-        
+            text (str): Input text to embed.
+            **kwargs: Additional arguments. The 'model' argument can be used 
+                      to specify the embedding model (e.g., "text-embedding-3-small").
+                      Defaults to "text-embedding-ada-002".
+
         Returns:
-            dict: Response containing embeddings
+            list: The embedding vector as a list of floats, or an empty list on failure.
         """
-        pass    
+        # Determine the embedding model, prioritizing kwargs, with a default
+        embedding_model = kwargs.get("model", "text-embedding-ada-002")
+        
+        try:
+            # The OpenAI API expects the input to be a list of strings
+            response = self.client.embeddings.create(
+                model=embedding_model,
+                input=[text]  # Wrap the single text string in a list
+            )
+            
+            # Extract the embedding from the response
+            if response.data and len(response.data) > 0:
+                return response.data[0].embedding
+            else:
+                ASCIIColors.warning("OpenAI API returned no data for the embedding request.")
+                return []
+                
+        except Exception as e:
+            ASCIIColors.error(f"Failed to generate embeddings using OpenAI API: {e}")
+            trace_exception(e)
+            return []
+
     def get_model_info(self) -> dict:
         """
         Return information about the current OpenAI model.
