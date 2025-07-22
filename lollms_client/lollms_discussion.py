@@ -31,6 +31,7 @@ if False:
 
 from lollms_client.lollms_utilities import build_image_dicts, robust_json_parser
 from ascii_colors import ASCIIColors, trace_exception
+from .lollms_types import MSG_TYPE
 
 class EncryptedString(TypeDecorator):
     """A SQLAlchemy TypeDecorator for field-level database encryption.
@@ -648,32 +649,91 @@ class LollmsDiscussion:
             A dictionary with 'user_message' and 'ai_message' LollmsMessage objects,
             where the 'ai_message' will contain rich metadata if an agentic turn was used.
         """
+        callback = kwargs.get("streaming_callback")
+
         if personality is not None:
             object.__setattr__(self, '_system_prompt', personality.system_prompt)
+
+            # --- New Data Source Handling Logic ---
+            if hasattr(personality, 'data_source') and personality.data_source is not None:
+                if isinstance(personality.data_source, str):
+                    # --- Static Data Source ---
+                    if callback:
+                        callback("Loading static personality data...", MSG_TYPE.MSG_TYPE_STEP, {"id": "static_data_loading"})
+                    current_data_zone = self.data_zone or ""
+                    self.data_zone = (current_data_zone + "\n\n--- Personality Static Data ---\n" + personality.data_source).strip()
+
+                elif callable(personality.data_source):
+                    # --- Dynamic Data Source ---
+                    qg_id = None
+                    if callback:
+                        qg_id = callback("Generating query for dynamic personality data...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_query_gen"})
+
+                    context_for_query = self.export('markdown')
+                    query_prompt = (
+                        "You are an expert query generator. Based on the current conversation, formulate a concise and specific query to retrieve relevant information from a knowledge base. "
+                        "The query will be used to fetch data that will help you answer the user's latest request.\n\n"
+                        f"--- Conversation History ---\n{context_for_query}\n\n"
+                        "--- Instructions ---\n"
+                        "Generate a single query string."
+                    )
+                    
+                    try:
+                        query_json = self.lollmsClient.generate_structured_content(
+                            prompt=query_prompt,
+                            output_format={"query": "Your generated search query here."},
+                            system_prompt="You are an AI assistant that generates search queries in JSON format.",
+                            temperature=0.0
+                        )
+
+                        if not query_json or "query" not in query_json:
+                            if callback:
+                                callback("Failed to generate data query.", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": qg_id})
+                        else:
+                            generated_query = query_json["query"]
+                            if callback:
+                                callback(f"Generated query: '{generated_query}'", MSG_TYPE.MSG_TYPE_STEP_END, {"id": qg_id, "query": generated_query})
+                            
+                            dr_id = None
+                            if callback:
+                                dr_id = callback("Retrieving dynamic data from personality source...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_retrieval"})
+                            
+                            try:
+                                retrieved_data = personality.data_source(generated_query)
+                                if callback:
+                                    callback(f"Retrieved data successfully.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id, "data_snippet": retrieved_data[:200]})
+                                
+                                current_data_zone = self.data_zone or ""
+                                self.data_zone = (current_data_zone + "\n\n--- Retrieved Dynamic Data ---\n" + retrieved_data).strip()
+
+                            except Exception as e:
+                                trace_exception(e)
+                                if callback:
+                                    callback(f"Error retrieving dynamic data: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": dr_id})
+                    except Exception as e:
+                        trace_exception(e)
+                        if callback:
+                            callback(f"An error occurred during query generation: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": qg_id})
             
         # Determine effective MCPs by combining personality defaults and turn-specific overrides
         effective_use_mcps = use_mcps
         if personality and hasattr(personality, 'active_mcps') and personality.active_mcps:
-            # If the personality has MCPs, we use them as a base.
             if effective_use_mcps in [None, False]:
                 effective_use_mcps = personality.active_mcps
-            # If the user also specified MCPs for this turn, we merge them.
             elif isinstance(effective_use_mcps, list):
                 effective_use_mcps = list(set(effective_use_mcps + personality.active_mcps))
-            # If effective_use_mcps is True, it means "use all available tools", so we don't need to change it.
             
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
 
         # Step 1: Add user message, now including any images.
         if add_user_message:
-            # Pass kwargs through to capture images and other potential message attributes
             user_msg = self.add_message(
                 sender="user", 
                 sender_type="user", 
                 content=user_message,
                 images=images,
-                **kwargs # Use kwargs to allow other fields to be set from the caller
+                **kwargs
             )
         else: # Regeneration logic
             if self.active_branch_id not in self._message_index:
@@ -682,10 +742,8 @@ class LollmsDiscussion:
             if user_msg_orm.sender_type != 'user':
                 raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
             user_msg = LollmsMessage(self, user_msg_orm)
-            # For regeneration, we use the images from the original user message
             images = user_msg.images
 
-        # Step 2: Determine if this is a simple chat or a complex agentic turn.
         is_agentic_turn = (effective_use_mcps is not None and effective_use_mcps) or (use_data_store is not None and use_data_store)
         
         start_time = datetime.now()
@@ -695,16 +753,10 @@ class LollmsDiscussion:
         final_raw_response = ""
         final_content = ""
 
-        # Step 3: Execute the appropriate generation logic.
         if is_agentic_turn:
-            # --- AGENTIC TURN ---
             prompt_for_agent = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
             if debug:
-                ASCIIColors.cyan("\n" + "="*50)
-                ASCIIColors.cyan("--- DEBUG: AGENTIC TURN TRIGGERED ---")
-                ASCIIColors.cyan(f"--- PROMPT FOR AGENT (from discussion history) ---")
-                ASCIIColors.magenta(prompt_for_agent)
-                ASCIIColors.cyan("="*50 + "\n")
+                ASCIIColors.cyan("\n" + "="*50 + "\n--- DEBUG: AGENTIC TURN TRIGGERED ---\n" + f"--- PROMPT FOR AGENT (from discussion history) ---\n{prompt_for_agent}\n" + "="*50 + "\n")
 
             agent_result = self.lollmsClient.generate_with_mcp_rag(
                 prompt=prompt_for_agent,
@@ -713,61 +765,44 @@ class LollmsDiscussion:
                 max_reasoning_steps=max_reasoning_steps,
                 images=images,
                 system_prompt = self._system_prompt,
-                debug=debug, # Pass the debug flag down
+                debug=debug,
                 **kwargs
             )
             final_content = agent_result.get("final_answer", "The agent did not produce a final answer.")
             final_scratchpad = agent_result.get("final_scratchpad", "")
             final_raw_response = json.dumps(agent_result, indent=2)
-
         else:
-            # --- SIMPLE CHAT TURN ---
             if debug:
                 prompt_for_chat = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
-                ASCIIColors.cyan("\n" + "="*50)
-                ASCIIColors.cyan("--- DEBUG: SIMPLE CHAT PROMPT ---")
-                ASCIIColors.magenta(prompt_for_chat)
-                ASCIIColors.cyan("="*50 + "\n")
+                ASCIIColors.cyan("\n" + "="*50 + f"\n--- DEBUG: SIMPLE CHAT PROMPT ---\n{prompt_for_chat}\n" + "="*50 + "\n")
 
-            # For simple chat, we also need to consider images if the model is multi-modal
             final_raw_response = self.lollmsClient.chat(self, images=images, **kwargs) or ""
             
             if debug:
-                ASCIIColors.cyan("\n" + "="*50)
-                ASCIIColors.cyan("--- DEBUG: RAW SIMPLE CHAT RESPONSE ---")
-                ASCIIColors.magenta(final_raw_response)
-                ASCIIColors.cyan("="*50 + "\n")
+                ASCIIColors.cyan("\n" + "="*50 + f"\n--- DEBUG: RAW SIMPLE CHAT RESPONSE ---\n{final_raw_response}\n" + "="*50 + "\n")
 
             if isinstance(final_raw_response, dict) and final_raw_response.get("status") == "error":
                 raise Exception(final_raw_response.get("message", "Unknown error from lollmsClient.chat"))
             else:
                 final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
+            final_scratchpad = None
 
-            final_scratchpad = None # No agentic scratchpad in a simple turn
-
-        # Step 4: Post-generation processing and statistics.
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
         token_count = self.lollmsClient.count_tokens(final_content)
         tok_per_sec = (token_count / duration) if duration > 0 else 0
 
-        # Step 5: Collect metadata from the agentic turn for storage.
         message_meta = {}
         if is_agentic_turn and isinstance(agent_result, dict):
-            if "tool_calls" in agent_result:
-                message_meta["tool_calls"] = agent_result["tool_calls"]
-            if "sources" in agent_result:
-                message_meta["sources"] = agent_result["sources"]
-            if agent_result.get("clarification_required", False):
-                message_meta["clarification_required"] = True
+            if "tool_calls" in agent_result: message_meta["tool_calls"] = agent_result["tool_calls"]
+            if "sources" in agent_result: message_meta["sources"] = agent_result["sources"]
+            if agent_result.get("clarification_required", False): message_meta["clarification_required"] = True
 
-        # Step 6: Add the final AI message to the discussion.
         ai_message_obj = self.add_message(
             sender=personality.name if personality else "assistant",
             sender_type="assistant",
             content=final_content,
             raw_content=final_raw_response,
-            # Store the agent's full reasoning log in the message's dedicated scratchpad field
             scratchpad=final_scratchpad,
             tokens=token_count,
             generation_speed=tok_per_sec,

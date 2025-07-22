@@ -23,6 +23,7 @@ class LollmsPersonality:
         system_prompt: str,        
         icon: Optional[str] = None,  # Base64 encoded image string
         active_mcps: Optional[List[str]] = None, # The list of MCPs to activate with this personality
+        data_source: Optional[Union[str, Callable[[str], str]]] = None, # Static string data or a callable for dynamic data retrieval
 
 
         # RAG - Data Files and Application-provided Callbacks
@@ -48,6 +49,7 @@ class LollmsPersonality:
             icon: An optional base64 encoded string for a display icon.
             system_prompt: The core system prompt that defines the AI's behavior.
             active_mcps: An optional list of MCP (tool) names to be automatically activated with this personality.
+            data_source: A source of knowledge. Can be a static string or a callable function that takes a query and returns a string.
             data_files: A list of file paths to be used as a knowledge base for RAG.
             vectorize_chunk_callback: A function provided by the host app to vectorize and store a text chunk.
             is_vectorized_callback: A function provided by the host app to check if a chunk is already vectorized.
@@ -62,6 +64,7 @@ class LollmsPersonality:
         self.icon = icon
         self.system_prompt = system_prompt
         self.active_mcps = active_mcps or []
+        self.data_source = data_source
         self.data_files = [Path(f) for f in data_files] if data_files else []
         
         # RAG Callbacks provided by the host application
@@ -181,6 +184,7 @@ class LollmsPersonality:
             "description": self.description,
             "system_prompt": self.system_prompt,
             "active_mcps": self.active_mcps,
+            "has_data_source": self.data_source is not None,
             "data_files": [str(p) for p in self.data_files],
             "has_script": self.script is not None
         }

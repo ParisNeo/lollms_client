@@ -2008,7 +2008,7 @@ Do not split the code in multiple tags.
         self,
         prompt,
         output_format,
-        extra_system_prompt=None,
+        system_prompt=None,
         **kwargs
     ):
         """
@@ -2025,7 +2025,7 @@ Do not split the code in multiple tags.
                 A Python dictionary or a JSON string representing the desired output 
                 structure. This will be used as a template for the LLM.
                 Example: {"name": "string", "age": "integer", "city": "string"}
-            extra_system_prompt (str, optional): 
+            system_prompt (str, optional): 
                 Additional instructions for the system prompt, to be appended to the 
                 main instructions. Defaults to None.
             **kwargs: 
@@ -2048,7 +2048,7 @@ Do not split the code in multiple tags.
             raise TypeError("output_format must be a dict or a JSON string.")
 
         # 2. Construct a specialized system prompt for structured data generation
-        system_prompt = (
+        full_system_prompt = (
             "You are a highly skilled AI assistant that processes user requests "
             "and returns structured data in JSON format. You must strictly adhere "
             "to the provided JSON template, filling in the values accurately based "
@@ -2056,8 +2056,8 @@ Do not split the code in multiple tags.
             "outside of the final JSON code block. Your entire response must be a single "
             "valid JSON object within a markdown code block."
         )
-        if extra_system_prompt:
-            system_prompt += f"\n\nAdditional instructions:\n{extra_system_prompt}"
+        if system_prompt:
+            system_prompt += f"\n\nAdditional instructions:\n{system_prompt}"
 
         # 3. Call the underlying generate_code method with JSON-specific settings
         if kwargs.get('debug'):
@@ -2065,7 +2065,7 @@ Do not split the code in multiple tags.
 
         json_string = self.generate_code(
             prompt=prompt,
-            system_prompt=system_prompt,
+            system_prompt=full_system_prompt,
             template=template_str,
             language="json",
             code_tag_format="markdown", # Sticking to markdown is generally more reliable
@@ -2083,7 +2083,7 @@ Do not split the code in multiple tags.
 
         try:
             # Use the provided robust parser
-            parsed_json = self.robust_json_parser(json_string)
+            parsed_json = robust_json_parser(json_string)
             
             if parsed_json is None:
                 ASCIIColors.warning("Failed to robustly parse the generated JSON.")

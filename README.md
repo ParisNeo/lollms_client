@@ -18,8 +18,9 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 *   🔌 **Versatile Binding System:** Seamlessly switch between different LLM backends (LoLLMs, Ollama, OpenAI, Llama.cpp, Transformers, vLLM, OpenLLM) without major code changes.
 *   🗣️ **Multimodal Support:** Interact with models capable of processing images and generate various outputs like speech (TTS) and images (TTI).
 *   🤖 **Function Calling with MCP:** Empowers LLMs to use external tools and functions through the Model Context Protocol (MCP), with built-in support for local Python tool execution via `local_mcp` binding and its default tools (file I/O, internet search, Python interpreter, image generation).
-*   🎭 **Personalities as Agents:** Personalities can now define their own set of required tools (MCPs), turning them into self-contained, ready-to-use agents.
+*   🎭 **Personalities as Agents:** Personalities can now define their own set of required tools (MCPs) and have access to static or dynamic knowledge bases (`data_source`), turning them into self-contained, ready-to-use agents.
 *   🚀 **Streaming & Callbacks:** Efficiently handle real-time text generation with customizable callback functions, including during MCP interactions.
+*   📝 **Advanced Structured Content Generation:** Reliably generate structured JSON output from natural language prompts using the `generate_structured_content` helper method.
 *   💬 **Discussion Management:** Utilities to easily manage and format conversation histories, including a persistent `data_zone` for context that is always present in the system prompt.
 *   ⚙️ **Configuration Management:** Flexible ways to configure bindings and generation parameters.
 *   🧩 **Extensible:** Designed to easily incorporate new LLM backends and modality services, including custom MCP toolsets.
@@ -90,187 +91,173 @@ except Exception as e:
 
 ```
 
-### Function Calling with MCP
+### Advanced Structured Content Generation
 
-`lollms-client` supports robust function calling via the Model Context Protocol (MCP), allowing LLMs to interact with your custom Python tools or pre-defined utilities.
-
-```python
-from lollms_client import LollmsClient, MSG_TYPE
-from ascii_colors import ASCIIColors
-import json # For pretty printing results
-
-# Example callback for MCP streaming
-def mcp_stream_callback(chunk: str, msg_type: MSG_TYPE, metadata: dict = None, turn_history: list = None) -> bool:
-    if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:  ASCIIColors.success(chunk, end="", flush=True) # LLM's final answer or thought process
-    elif msg_type == MSG_TYPE.MSG_TYPE_STEP_START: ASCIIColors.info(f"\n>> MCP Step Start: {metadata.get('tool_name', chunk)}", flush=True)
-    elif msg_type == MSG_TYPE.MSG_TYPE_STEP_END: ASCIIColors.success(f"\n<< MCP Step End: {metadata.get('tool_name', chunk)} -> Result: {json.dumps(metadata.get('result', ''))}", flush=True)
-    elif msg_type == MSG_TYPE.MSG_TYPE_INFO and metadata and metadata.get("type") == "tool_call_request": ASCIIColors.info(f"\nAI requests: {metadata.get('name')}({metadata.get('params')})", flush=True)
-    return True
-
-try:
-    # Initialize LollmsClient with an LLM binding and the local_mcp binding
-    lc = LollmsClient(
-        binding_name="ollama", model_name="mistral", # Example LLM
-        mcp_binding_name="local_mcp" # Enables default tools (file_writer, internet_search, etc.)
-                                     # or custom tools if mcp_binding_config.tools_folder_path is set.
-    )
-
-    user_query = "What were the main AI headlines last week and write a summary to 'ai_news.txt'?"
-    ASCIIColors.blue(f"User Query: {user_query}")
-    ASCIIColors.yellow("AI Processing with MCP (streaming):")
-
-    mcp_result = lc.generate_with_mcp(
-        prompt=user_query,
-        streaming_callback=mcp_stream_callback
-    )
-    print("\n--- End of MCP Interaction ---")
-
-    if mcp_result.get("error"):
-        ASCIIColors.error(f"MCP Error: {mcp_result['error']}")
-    else:
-        ASCIIColors.cyan(f"\nFinal Answer from AI: {mcp_result.get('final_answer', 'N/A')}")
-        ASCIIColors.magenta("\nTool Calls Made:")
-        for tc in mcp_result.get("tool_calls", []):
-            print(f"  - Tool: {tc.get('name')}, Params: {tc.get('params')}, Result (first 50 chars): {str(tc.get('result'))[:50]}...")
-
-except Exception as e:
-    ASCIIColors.error(f"An error occurred in MCP example: {e}")
-    trace_exception(e) # Assuming you have trace_exception utility
-```
-For a comprehensive guide on function calling and setting up tools, please refer to the [Usage Guide (DOC_USE.md)](DOC_USE.md).
-
-### 🎭 Personalities as Self-Contained Agents
-
-A powerful feature of `lollms-client` is the ability to define personalities that are not just conversational styles, but fully-fledged agents with their own tools. By including an `active_mcps` list in a personality's definition, you specify which tools should be enabled by default whenever that personality is used.
-
-**Example Personality Definition (conceptual):**
+The `generate_structured_content` method is a powerful utility for forcing an LLM's output into a specific JSON format. It's ideal for extracting information, getting consistent tool parameters, or any task requiring reliable, machine-readable output.
 
 ```python
-# In your application logic where you might define personalities
-from lollms_client import LollmsPersonality
-
-# This personality is designed to be a research assistant
-researcher_personality = LollmsPersonality(
-    name="Researcher_Bot",
-    author="My_App",
-    category="Research",
-    description="An AI assistant that can search the web and write files.",
-    system_prompt="You are a helpful research assistant. Use your tools to find information and save it.",
-    # This is the new part: specify the tools this personality needs.
-    active_mcps=["internet_search", "file_writer"] 
-)
-
-# How it works in LollmsDiscussion.chat()
-# discussion.chat(
-#     "Find the latest news on AI and save it to news.txt", 
-#     personality=researcher_personality
-# )
-# This call will automatically enable 'internet_search' and 'file_writer'
-# for the agentic turn, without needing to specify `use_mcps` in the chat call itself.
-```
-
-This simplifies agentic calls and makes personalities much more portable and powerful. The tools specified in `use_mcps` during a `chat()` call will be *added* to the personality's default tools for that specific turn.
-
-### 🤖 Advanced Agentic Generation with RAG: `generate_with_mcp_rag`
-
-For more complex tasks, `generate_with_mcp_rag` provides a powerful, built-in agent that uses a ReAct-style (Reason, Act) loop. This agent can reason about a user's request, use tools (MCP), retrieve information from knowledge bases (RAG), and adapt its plan based on the results of its actions.
-
-**Key Agent Capabilities:**
-
-*   **Observe-Think-Act Loop:** The agent iteratively reviews its progress, thinks about the next logical step, and takes an action (like calling a tool).
-*   **Tool Integration (MCP):** Can use any available MCP tools, such as searching the web or executing code.
-*   **Retrieval-Augmented Generation (RAG):** You can provide one or more "data stores" (knowledge bases). The agent gains a `research::{store_name}` tool to query these stores for relevant information.
-*   **In-Memory Code Generation:** The agent has a special `generate_code` tool. This allows it to first write a piece of code (e.g., a complex Python script) and then pass that code to another tool (e.g., `python_code_interpreter`) in a subsequent step.
-*   **Stateful Progress Tracking:** Designed for rich UI experiences, it emits `step_start` and `step_end` events with unique IDs via the streaming callback. This allows an application to track the agent's individual thoughts and long-running tool calls in real-time.
-*   **Self-Correction:** Includes a `refactor_scratchpad` tool for the agent to clean up its own thought process if it becomes cluttered.
-
-Here is an example of using the agent to answer a question by first performing RAG on a custom knowledge base and then using the retrieved information to generate and execute code.
-
-```python
+from lollms_client import LollmsClient
 import json
-from lollms_client import LollmsClient, MSG_TYPE
-from ascii_colors import ASCIIColors
 
-# 1. Define a mock RAG data store and retrieval function
-project_notes = {
-    "project_phoenix_details": "Project Phoenix has a current budget of $500,000 and an expected quarterly growth rate of 15%."
+lc = LollmsClient(binding_name="ollama", model_name="llama3")
+
+text_block = "John Doe is a 34-year-old software engineer from New York. He loves hiking and Python programming."
+
+# Define the exact JSON structure you want
+output_template = {
+    "full_name": "string",
+    "age": "integer",
+    "profession": "string",
+    "city": "string",
+    "hobbies": ["list", "of", "strings"]
 }
 
-def retrieve_from_notes(query: str, top_k: int = 1, min_similarity: float = 0.5):
-    """A simple keyword-based retriever for our mock data store."""
-    results = []
-    for key, text in project_notes.items():
-        if query.lower() in text.lower():
-            results.append({"source": key, "content": text})
-    return results[:top_k]
+# Generate the structured data
+extracted_data = lc.generate_structured_content(
+    prompt=f"Extract the relevant information from the following text:\n\n{text_block}",
+    output_format=output_template
+)
 
-# 2. Define a detailed streaming callback to visualize the agent's process
-def agent_streaming_callback(chunk: str, msg_type: MSG_TYPE, params: dict = None, metadata: list = None) -> bool:
+if extracted_data:
+    print(json.dumps(extracted_data, indent=2))
+# Expected output:
+# {
+#   "full_name": "John Doe",
+#   "age": 34,
+#   "profession": "software engineer",
+#   "city": "New York",
+#   "hobbies": ["hiking", "Python programming"]
+# }
+```
+
+### Putting It All Together: An Advanced Agentic Example
+
+Let's create a **Python Coder Agent**. This agent will use a set of coding rules from a local file as its knowledge base and will be equipped with a tool to execute the code it writes. This demonstrates the synergy between `LollmsPersonality` (with `data_source` and `active_mcps`), `LollmsDiscussion`, and the MCP system.
+
+#### Step 1: Create the Knowledge Base (`coding_rules.txt`)
+
+Create a simple text file with the rules our agent must follow.
+
+```text
+# File: coding_rules.txt
+
+1.  All Python functions must include a Google-style docstring.
+2.  Use type hints for all function parameters and return values.
+3.  The main execution block should be protected by `if __name__ == "__main__":`.
+4.  After defining a function, add a simple example of its usage inside the main block.
+5.  Print the output of the example usage to the console.
+```
+
+#### Step 2: The Main Script (`agent_example.py`)
+
+This script will define the personality, initialize the client, and run the agent.
+
+```python
+from pathlib import Path
+from lollms_client import LollmsClient, LollmsPersonality, LollmsDiscussion, MSG_TYPE
+from ascii_colors import ASCIIColors
+import json
+
+# A detailed callback to visualize the agent's process
+def agent_callback(chunk: str, msg_type: MSG_TYPE, params: dict = None, **kwargs) -> bool:
     if not params: params = {}
-    msg_id = params.get("id", "")
     
-    if msg_type == MSG_TYPE.MSG_TYPE_STEP_START:
-        ASCIIColors.yellow(f"\n>> Agent Step Start [ID: {msg_id}]: {chunk}")
+    if msg_type == MSG_TYPE.MSG_TYPE_STEP:
+        ASCIIColors.yellow(f"\n>> Agent Step: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_STEP_START:
+        ASCIIColors.yellow(f"\n>> Agent Step Start: {chunk}")
     elif msg_type == MSG_TYPE.MSG_TYPE_STEP_END:
-        ASCIIColors.green(f"<< Agent Step End [ID: {msg_id}]: {chunk}")
-        if params.get('result'):
-            ASCIIColors.cyan(f"   Result: {json.dumps(params['result'], indent=2)}")
+        result = params.get('result', '')
+        ASCIIColors.green(f"<< Agent Step End: {chunk} -> Result: {json.dumps(result)[:150]}...")
     elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT:
-        ASCIIColors.magenta(f"\n🤔 Agent Thought: {chunk}")
+        ASCIIColors.magenta(f"🤔 Agent Thought: {chunk}")
     elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
-        ASCIIColors.blue(f"\n🛠️  Agent Action: {chunk}")
+        ASCIIColors.blue(f"🛠️  Agent Action: {chunk}")
     elif msg_type == MSG_TYPE.MSG_TYPE_OBSERVATION:
-        ASCIIColors.cyan(f"\n👀 Agent Observation: {chunk}")
+        ASCIIColors.cyan(f"👀 Agent Observation: {chunk}")
     elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
         print(chunk, end="", flush=True) # Final answer stream
     return True
 
 try:
-    # 3. Initialize LollmsClient with an LLM and local tools enabled
-    lc = LollmsClient(
-        binding_name="ollama",          # Use Ollama
-        model_name="llama3",            # Or any capable model like mistral, gemma, etc.
-        mcp_binding_name="local_mcp"    # Enable local tools like python_code_interpreter
+    # --- 1. Load the knowledge base from the file ---
+    rules_path = Path("coding_rules.txt")
+    if not rules_path.exists():
+        raise FileNotFoundError("Please create the 'coding_rules.txt' file.")
+    coding_rules = rules_path.read_text()
+
+    # --- 2. Define the Coder Agent Personality ---
+    coder_personality = LollmsPersonality(
+        name="Python Coder Agent",
+        author="lollms-client",
+        category="Coding",
+        description="An agent that writes and executes Python code according to specific rules.",
+        system_prompt=(
+            "You are an expert Python programmer. Your task is to write clean, executable Python code based on the user's request. "
+            "You MUST strictly follow all rules provided in the 'Personality Static Data' section. "
+            "First, think about the plan. Then, use the `python_code_interpreter` tool to write and execute the code. "
+            "Finally, present the code and its output to the user."
+        ),
+        # A) Attach the static knowledge base
+        data_source=coding_rules,
+        # B) Equip the agent with a code execution tool
+        active_mcps=["python_code_interpreter"]
     )
 
-    # 4. Define the user prompt and the RAG data store
-    prompt = "Based on my notes about Project Phoenix, write and run a Python script to calculate its projected budget after two quarters."
+    # --- 3. Initialize the Client and Discussion ---
+    lc = LollmsClient(
+        binding_name="ollama",          # Or any capable model binding
+        model_name="codellama",         # A code-specialized model is recommended
+        mcp_binding_name="local_mcp"    # Enable the local tool execution engine
+    )
+    discussion = LollmsDiscussion.create_new(lollms_client=lc)
     
-    rag_data_store = {
-        "project_notes": {"callable": retrieve_from_notes}
-    }
+    # --- 4. The User's Request ---
+    user_prompt = "Write a Python function that takes two numbers and returns their sum."
 
-    ASCIIColors.yellow(f"User Prompt: {prompt}")
+    ASCIIColors.yellow(f"User Prompt: {user_prompt}")
     print("\n" + "="*50 + "\nAgent is now running...\n" + "="*50)
 
-    # 5. Run the agent
-    agent_output = lc.generate_with_mcp_rag(
-        prompt=prompt,
-        use_data_store=rag_data_store,
-        use_mcps=["python_code_interpreter"], # Make specific tools available
-        streaming_callback=agent_streaming_callback,
-        max_reasoning_steps=5
+    # --- 5. Run the Agentic Chat Turn ---
+    response = discussion.chat(
+        user_message=user_prompt,
+        personality=coder_personality,
+        streaming_callback=agent_callback
     )
 
-    print("\n" + "="*50 + "\nAgent finished.\n" + "="*50)
-
-    # 6. Print the final results
-    if agent_output.get("error"):
-        ASCIIColors.error(f"\nAgent Error: {agent_output['error']}")
-    else:
-        ASCIIColors.green("\n--- Final Answer ---")
-        print(agent_output.get("final_answer"))
-        
-        ASCIIColors.magenta("\n--- Tool Calls ---")
-        print(json.dumps(agent_output.get("tool_calls", []), indent=2))
-
-        ASCIIColors.cyan("\n--- RAG Sources ---")
-        print(json.dumps(agent_output.get("sources", []), indent=2))
+    print("\n\n" + "="*50 + "\nAgent finished.\n" + "="*50)
+    
+    # --- 6. Inspect the results ---
+    ai_message = response['ai_message']
+    ASCIIColors.green("\n--- Final Answer from Agent ---")
+    print(ai_message.content)
+    
+    ASCIIColors.magenta("\n--- Tool Calls Made ---")
+    print(json.dumps(ai_message.metadata.get("tool_calls", []), indent=2))
 
 except Exception as e:
-    ASCIIColors.red(f"\nAn unexpected error occurred: {e}")
+    trace_exception(e)
 
 ```
+
+#### Step 3: What Happens Under the Hood
+
+When you run `agent_example.py`, a sophisticated process unfolds:
+
+1.  **Initialization:** The `LollmsDiscussion.chat()` method is called with the `coder_personality`.
+2.  **Knowledge Injection:** The `chat` method sees that `personality.data_source` is a string. It automatically takes the content of `coding_rules.txt` and injects it into the `discussion.data_zone`.
+3.  **Tool Activation:** The method also sees `personality.active_mcps`. It enables the `python_code_interpreter` tool for this turn.
+4.  **Context Assembly:** The `LollmsClient` assembles a rich prompt for the LLM that includes:
+    *   The personality's `system_prompt`.
+    *   The content of `coding_rules.txt` (from the `data_zone`).
+    *   The list of available tools (including `python_code_interpreter`).
+    *   The user's request ("Write a function...").
+5.  **Reason and Act:** The LLM, now fully briefed, reasons that it needs to use the `python_code_interpreter` tool. It formulates the Python code *according to the rules it was given*.
+6.  **Tool Execution:** The `local_mcp` binding receives the code and executes it in a secure local environment. It captures any output (`stdout`, `stderr`) and results.
+7.  **Observation:** The execution results are sent back to the LLM as an "observation."
+8.  **Final Synthesis:** The LLM now has the user's request, the rules, the code it wrote, and the code's output. It synthesizes all of this into a final, comprehensive answer for the user.
+
+This example showcases how `lollms-client` allows you to build powerful, knowledgeable, and capable agents by simply composing personalities with data and tools.
 
 ## Documentation
 
@@ -607,9 +594,7 @@ For a list of changes and updates, please refer to the [CHANGELOG.md](CHANGELOG.
 ```
 
 ---
-### Phase 2: Update `lollms_discussion.md`
-
-I will improve the documentation for the `LollmsDiscussion` class, explaining the `chat` method's new behavior regarding personality-based tool activation.
+### Phase 2: Update `docs/md/lollms_discussion.md`
 
 `[UPDATE] docs/md/lollms_discussion.md`
 ```markdown
@@ -659,7 +644,7 @@ discussion_db = LollmsDiscussion.create_new(
 
 The `data_zone` is a string property where you can store persistent information that should always be visible to the AI as part of its system instructions. This is incredibly useful for providing context that doesn't change, such as user profiles, complex instructions, or data that the AI should always reference.
 
-The content of `data_zone` is automatically appended to the system prompt during context export.
+The content of `data_zone` is automatically appended to the system prompt during context export. This is also where data from a personality's `data_source` is loaded before generation.
 
 #### Example: Using the Data Zone
 
@@ -714,18 +699,29 @@ discussion.commit() # If DB-backed
 ### `chat()`
 The `chat()` method is the primary way to interact with the discussion. It handles a full user-to-AI turn, including invoking the advanced agentic capabilities of the `LollmsClient`.
 
-#### Personalities and Tool Usage (`use_mcps`)
+#### Personalities, Tools, and Data Sources
 
-The `chat` method intelligently handles tool activation (MCPs) when a `LollmsPersonality` is provided. This allows personalities to be configured as self-contained agents with their own default tools.
+The `chat` method intelligently handles tool activation and data loading when a `LollmsPersonality` is provided. This allows personalities to be configured as self-contained agents with their own default tools and knowledge bases.
 
-Here’s how the `use_mcps` parameter interacts with a personality's `active_mcps` list:
+**Tool Activation (`use_mcps`):**
 
 1.  **Personality has tools, `use_mcps` is not set:** The agent will use the tools defined in `personality.active_mcps`.
 2.  **Personality has tools, `use_mcps` is also set:** The agent will use a *combination* of tools from both the personality and the `use_mcps` parameter for that specific turn. Duplicates are automatically handled. This allows you to augment a personality's default tools on the fly.
 3.  **Personality has no tools, `use_mcps` is set:** The agent will use only the tools specified in the `use_mcps` parameter.
-4.  **Neither are set:** The agentic turn is not triggered (unless `use_data_store` is active), and a simple chat generation occurs.
+4.  **Neither are set:** The agentic turn is not triggered (unless a data store is used), and a simple chat generation occurs.
 
-This mechanism makes it easy to create powerful, reusable agents. For example, a "Code Writer" personality could come bundled with `file_reader` and `file_writer` tools, while a "Research Assistant" could have `internet_search` enabled by default.
+**Knowledge Loading (`data_source`):**
+
+Before generation, the `chat` method checks for `personality.data_source`:
+
+-   **If it's a `str` (static data):** The string is appended to the `discussion.data_zone`, making it part of the system context for the current turn.
+-   **If it's a `Callable` (dynamic data):**
+    1.  The AI first generates a query based on the current conversation.
+    2.  The `chat` method calls your function with this query.
+    3.  The returned string is appended to the `discussion.data_zone`.
+    4.  The final response generation proceeds with this newly added context.
+
+This makes it easy to create powerful, reusable agents. For a complete, runnable example of building a **Python Coder Agent** that uses both `active_mcps` and a static `data_source`, **please see the "Putting It All Together" section in the main `README.md` file.**
 
 ### Other Methods
 -   `add_message(sender, content, ...)`: Adds a new message.
