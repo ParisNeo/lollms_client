@@ -1170,14 +1170,20 @@ class LollmsDiscussion:
             if self.metadata is None:
                 self.metadata = {}
             discussion = self.export("markdown")[0:1000]
-            prompt = f"""You are a title builder. Your oibjective is to build a title for the following discussion:
+            system_prompt="You are a title builder out of a discussion."
+            prompt = f"""Build a title for the following discussion:
 {discussion}
 ...
 """
-            template = """{
-    "title": "An short but comprehensive discussion title"
-}"""
-            infos = self.lollmsClient.generate_code(prompt = prompt, template = template)
+            title_generation_schema = {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short, catchy title for the discussion."},
+                },
+                "required": ["title"],
+                "description": "JSON object as title of the discussion."
+            }
+            infos = self.lollmsClient.generate_structured_content(prompt = prompt, system_prompt=system_prompt, schema = title_generation_schema)
             discussion_title = robust_json_parser(infos)["title"]
             new_metadata = (self.metadata or {}).copy()
             new_metadata['title'] = discussion_title
