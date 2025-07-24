@@ -128,7 +128,10 @@ def create_dynamic_models(
         __abstract__ = True
         id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
         system_prompt = Column(EncryptedText, nullable=True)
-        data_zone = Column(EncryptedText, nullable=True) # New field for persistent data
+        user_data_zone = Column(EncryptedText, nullable=True) # New field for persistent data
+        discussion_data_zone = Column(EncryptedText, nullable=True) # New field for persistent data
+        personality_data_zone = Column(EncryptedText, nullable=True) # New field for persistent data
+        
         participants = Column(JSON, nullable=True, default=dict)
         active_branch_id = Column(String, nullable=True)
         discussion_metadata = Column(JSON, nullable=True, default=dict)
@@ -226,9 +229,21 @@ class LollmsDataManager:
                     print("  -> Upgrading 'discussions' table: Adding 'pruning_point_id' column.")
                     connection.execute(text("ALTER TABLE discussions ADD COLUMN pruning_point_id VARCHAR"))
 
-                if 'data_zone' not in columns:
-                    print("  -> Upgrading 'discussions' table: Adding 'data_zone' column.")
-                    connection.execute(text("ALTER TABLE discussions ADD COLUMN data_zone TEXT"))
+                if 'data_zone' in columns:
+                    print("  -> Upgrading 'discussions' table: Removing 'data_zone' column.")
+                    connection.execute(text("ALTER TABLE discussions DROP COLUMN data_zone"))
+
+                if 'user_data_zone' not in columns:
+                    print("  -> Upgrading 'discussions' table: Adding 'user_data_zone' column.")
+                    connection.execute(text("ALTER TABLE discussions ADD COLUMN user_data_zone TEXT"))
+
+                if 'discussion_data_zone' not in columns:
+                    print("  -> Upgrading 'discussions' table: Adding 'discussion_data_zone' column.")
+                    connection.execute(text("ALTER TABLE discussions ADD COLUMN discussion_data_zone TEXT"))
+
+                if 'personality_data_zone' not in columns:
+                    print("  -> Upgrading 'discussions' table: Adding 'personality_data_zone' column.")
+                    connection.execute(text("ALTER TABLE discussions ADD COLUMN personality_data_zone TEXT"))
                 
                 print("Database schema is up to date.")
                 # This is important to apply the ALTER TABLE statements
@@ -388,7 +403,6 @@ class LollmsDiscussion:
         object.__setattr__(self, '_is_db_backed', db_manager is not None)
         
         object.__setattr__(self, '_system_prompt', None)
-        
         if self._is_db_backed:
             if not db_discussion_obj and not discussion_id:
                 raise ValueError("Either discussion_id or db_discussion_obj must be provided for DB-backed discussions.")
@@ -490,7 +504,9 @@ class LollmsDiscussion:
         proxy = SimpleNamespace()
         proxy.id = id or str(uuid.uuid4())
         proxy.system_prompt = None
-        proxy.data_zone = None
+        proxy.user_data_zone = None
+        proxy.discussion_data_zone = None
+        proxy.personality_data_zone = None
         proxy.participants = {}
         proxy.active_branch_id = None
         proxy.discussion_metadata = {}
@@ -601,7 +617,13 @@ class LollmsDiscussion:
             
         return [LollmsMessage(self, orm) for orm in reversed(branch_orms)]
 
-
+    def get_full_data_zone(self):
+        current_data_zone = "-- User Data Zone --\n" + self.user_data_zone if self.user_data_zone else ""
+        current_data_zone += "-- Discussion Data Zone --\n" + self.discussion_data_zone if self.discussion_data_zone else ""
+        current_data_zone += "-- Personality Data Zone --\n" + self.personality_data_zone if self.personality_data_zone else ""
+        return current_data_zone
+    
+    
     def chat(
         self,
         user_message: str,
@@ -650,7 +672,7 @@ class LollmsDiscussion:
             where the 'ai_message' will contain rich metadata if an agentic turn was used.
         """
         callback = kwargs.get("streaming_callback")
-
+        # extract personality data
         if personality is not None:
             object.__setattr__(self, '_system_prompt', personality.system_prompt)
 
@@ -660,8 +682,8 @@ class LollmsDiscussion:
                     # --- Static Data Source ---
                     if callback:
                         callback("Loading static personality data...", MSG_TYPE.MSG_TYPE_STEP, {"id": "static_data_loading"})
-                    current_data_zone = self.data_zone or ""
-                    self.data_zone = (current_data_zone + "\n\n--- Personality Static Data ---\n" + personality.data_source).strip()
+                    if personality.data_source:
+                        self.personality_data_zone = personality.data_source.strip()
 
                 elif callable(personality.data_source):
                     # --- Dynamic Data Source ---
@@ -703,8 +725,9 @@ class LollmsDiscussion:
                                 if callback:
                                     callback(f"Retrieved data successfully.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id, "data_snippet": retrieved_data[:200]})
                                 
-                                current_data_zone = self.data_zone or ""
-                                self.data_zone = (current_data_zone + "\n\n--- Retrieved Dynamic Data ---\n" + retrieved_data).strip()
+                                
+                                if retrieved_data:
+                                    self.personality_data_zone = retrieved_data.strip()
 
                             except Exception as e:
                                 trace_exception(e)
@@ -714,7 +737,7 @@ class LollmsDiscussion:
                         trace_exception(e)
                         if callback:
                             callback(f"An error occurred during query generation: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": qg_id})
-            
+
         # Determine effective MCPs by combining personality defaults and turn-specific overrides
         effective_use_mcps = use_mcps
         if personality and hasattr(personality, 'active_mcps') and personality.active_mcps:
@@ -947,9 +970,9 @@ class LollmsDiscussion:
         
         # Combine system prompt and the new data_zone if it exists
         full_system_prompt = (self._system_prompt or "").strip()
-        if hasattr(self, 'data_zone') and self.data_zone:
-            data_zone_text = f"\n\n--- data ---\n{self.data_zone.strip()}"
-            full_system_prompt = (full_system_prompt + data_zone_text).strip()
+        current_data_zone = self.get_full_data_zone()
+        if current_data_zone:
+            full_system_prompt = (full_system_prompt + current_data_zone.strip()).strip()
 
         participants = self.participants or {}
 
