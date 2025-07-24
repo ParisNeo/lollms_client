@@ -1184,7 +1184,7 @@ class LollmsDiscussion:
                 "description": "JSON object as title of the discussion."
             }
             infos = self.lollmsClient.generate_structured_content(prompt = prompt, system_prompt=system_prompt, schema = title_generation_schema)
-            discussion_title = robust_json_parser(infos)["title"]
+            discussion_title = infos["title"]
             new_metadata = (self.metadata or {}).copy()
             new_metadata['title'] = discussion_title
             
