@@ -689,7 +689,7 @@ class LollmsClient():
                         template=None,
                         language="json",
                         code_tag_format="markdown", # or "html"
-                        max_size = None,
+                        n_predict = None,
                         temperature = None,
                         top_k = None,
                         top_p=None,
@@ -732,7 +732,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
             prompt,
             images=images,
             system_prompt=system_prompt,
-            n_predict=max_size,
+            n_predict=n_predict,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
@@ -1395,80 +1395,6 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         )
         new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
         return self.remove_thinking_blocks(new_scratchpad_text).strip()
-    def generate_structured_content(
-        self,
-        prompt: str,
-        template: Union[dict, list],
-        system_prompt: Optional[str] = None,
-        images: Optional[List[str]] = None,
-        max_retries: int = 3,
-        **kwargs
-    ) -> Union[dict, list, None]:
-        """
-        Generates structured content (JSON) from a prompt, ensuring it matches a given template.
-
-        This method repeatedly calls the LLM until a valid JSON object that can be parsed
-        and somewhat matches the template is returned, or until max_retries is reached.
-
-        Args:
-            prompt (str): The main prompt to guide the LLM.
-            template (Union[dict, list]): A Python dict or list representing the desired JSON structure.
-            system_prompt (Optional[str], optional): An optional system prompt. Defaults to None.
-            images (Optional[List[str]], optional): A list of image paths for multimodal prompts. Defaults to None.
-            max_retries (int, optional): The maximum number of times to retry generation if parsing fails. Defaults to 3.
-            **kwargs: Additional keyword arguments to pass to the underlying generate_text method.
-
-        Returns:
-            Union[dict, list, None]: The parsed JSON object (as a Python dict or list), or None if it fails after all retries.
-        """
-        template_str = json.dumps(template, indent=4)
-        
-        if not system_prompt:
-            system_prompt = "You are a highly intelligent AI assistant that excels at generating structured data in JSON format."
-        
-        final_system_prompt = (
-            f"{system_prompt}\n\n"
-            "You MUST generate a response that is a single, valid JSON object matching the structure of the template provided by the user. "
-            "Your entire response should be enclosed in a single ```json markdown code block. "
-            "Do not include any other text, explanations, or apologies outside of the JSON code block.\n"
-            f"Here is the JSON template you must follow:\n{template_str}"
-        )
-
-        current_prompt = prompt
-        for attempt in range(max_retries):
-            raw_llm_output = self.generate_text(
-                prompt=current_prompt,
-                system_prompt=final_system_prompt,
-                images=images,
-                **kwargs
-            )
-            
-            if not raw_llm_output:
-                ASCIIColors.warning(f"Structured content generation failed (Attempt {attempt + 1}/{max_retries}): LLM returned an empty response.")
-                current_prompt = f"You previously returned an empty response. Please try again and adhere strictly to the JSON format. \nOriginal prompt was: {prompt}"
-                continue
-
-            try:
-                # Use robust_json_parser which handles cleanup of markdown tags, comments, etc.
-                parsed_json = robust_json_parser(raw_llm_output)
-                # Optional: Add validation against the template's structure here if needed
-                return parsed_json
-            except (ValueError, json.JSONDecodeError) as e:
-                ASCIIColors.warning(f"Structured content parsing failed (Attempt {attempt + 1}/{max_retries}). Error: {e}")
-                trace_exception(e)
-                # Prepare for retry with more explicit instructions
-                current_prompt = (
-                    "Your previous response could not be parsed as valid JSON. Please review the error and the required template and try again. "
-                    "Ensure your entire output is a single, clean JSON object inside a ```json code block.\n\n"
-                    f"--- PARSING ERROR ---\n{str(e)}\n\n"
-                    f"--- YOUR PREVIOUS INVALID RESPONSE ---\n{raw_llm_output}\n\n"
-                    f"--- REQUIRED JSON TEMPLATE ---\n{template_str}\n\n"
-                    f"--- ORIGINAL PROMPT ---\n{prompt}"
-                )
-
-        ASCIIColors.error("Failed to generate valid structured content after multiple retries.")
-        return None
-
     def _synthesize_knowledge(
         self,
         previous_scratchpad: str,
@@ -1892,20 +1818,20 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         }
     def generate_code(
                         self,
-                        prompt,
+                        prompt:str,
                         images=[],
-                        system_prompt=None,
-                        template=None,
+                        system_prompt:str|None=None,
+                        template:str|None=None,
                         language="json",
                         code_tag_format="markdown", # or "html"
-                        max_size = None,
-                        temperature = None,
-                        top_k = None,
-                        top_p=None,
-                        repeat_penalty=None,
-                        repeat_last_n=None,
+                        n_predict:int|None = None,
+                        temperature:float|None = None,
+                        top_k:int|None= None,
+                        top_p:float|None=None,
+                        repeat_penalty:float|None=None,
+                        repeat_last_n:int|None=None,
                         callback=None,
-                        debug=False ):
+                        debug:bool=False ):
         """
         Generates a single code block based on a prompt.
         Uses the underlying LLM binding via `generate_text`.
@@ -1915,24 +1841,20 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             system_prompt = f"""Act as a code generation assistant that generates code from user prompt."""
 
         if template:
-            system_prompt += "Here is a template of the answer:\n"
+            if language in ["json","yaml","xml"]:
+                system_prompt += f"\nMake sure the generated context follows the following schema:\n```{language}\n{template}\n```\n"
+            else:
+                system_prompt += f"\nHere is a template of the answer:\n```{language}\n{template}\n```\n"
+            
             if code_tag_format=="markdown":
-                system_prompt += f"""You must answer with the code placed inside the markdown code tag like this:
+                system_prompt += f"""You must answer with the code placed inside the markdown code tag:
 ```{language}
-{template}
 ```
-{"Make sure you fill all fields and to use the exact same keys as the template." if language in ["json","yaml","xml"] else ""}
-The code tag is mandatory.
-Don't forget encapsulate the code inside a markdown code tag. This is mandatory.
 """
             elif code_tag_format=="html":
-                system_prompt +=f"""You must answer with the code placed inside the html code tag like this:
+                system_prompt +=f"""You must answer with the code placed inside the html code tag:
 <code language="{language}">
-{template}
 </code>
-{"Make sure you fill all fields and to use the exact same keys as the template." if language in ["json","yaml","xml"] else ""}
-The code tag is mandatory.
-Don't forget encapsulate the code inside a html code tag. This is mandatory.
 """
         system_prompt += f"""You must return a single code tag.
 Do not split the code in multiple tags.
@@ -1942,7 +1864,7 @@ Do not split the code in multiple tags.
             prompt,
             images=images,
             system_prompt=system_prompt,
-            n_predict=max_size,
+            n_predict=n_predict,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
@@ -1973,7 +1895,7 @@ Do not split the code in multiple tags.
                 continuation_response = self.generate_text(
                     continuation_prompt,
                     images=images, # Resend images if needed for context
-                    n_predict=max_size, # Allow space for continuation
+                    n_predict=n_predict, # Allow space for continuation
                     temperature=temperature, # Use same parameters
                     top_k=top_k,
                     top_p=top_p,
@@ -2007,12 +1929,13 @@ Do not split the code in multiple tags.
     def generate_structured_content(
         self,
         prompt,
-        output_format,
+        images=[],
+        schema={},
         system_prompt=None,
         **kwargs
     ):
         """
-        Generates structured data (a dict) from a prompt using a JSON template.
+        Generates structured data (a dict) from a prompt using a JSON schema.
 
         This method is a high-level wrapper around `generate_code`, specializing it 
         for JSON output. It ensures the LLM sticks to a predefined structure,
@@ -2021,43 +1944,39 @@ Do not split the code in multiple tags.
         Args:
             prompt (str): 
                 The user's request (e.g., "Extract the name, age, and city of the person described").
-            output_format (dict or str): 
+            schema (dict or str): 
                 A Python dictionary or a JSON string representing the desired output 
-                structure. This will be used as a template for the LLM.
+                structure. This will be used as a schema for the LLM.
                 Example: {"name": "string", "age": "integer", "city": "string"}
             system_prompt (str, optional): 
                 Additional instructions for the system prompt, to be appended to the 
                 main instructions. Defaults to None.
             **kwargs: 
                 Additional keyword arguments to be passed directly to the 
-                `generate_code` method (e.g., temperature, max_size, top_k, debug).
+                `generate_code` method (e.g., temperature, n_predict, top_k, debug).
 
         Returns:
             dict: The parsed JSON data as a Python dictionary, or None if
                 generation or parsing fails.
         """
-        # 1. Validate and prepare the template string from the output_format
-        if isinstance(output_format, dict):
-            # Convert the dictionary to a nicely formatted JSON string for the template
-            template_str = json.dumps(output_format, indent=2)
-        elif isinstance(output_format, str):
-            # Assume it's already a valid JSON string template
-            template_str = output_format
+        # 1. Validate and prepare the schema string from the schema
+        if isinstance(schema, dict):
+            # Convert the dictionary to a nicely formatted JSON string for the schema
+            schema_str = json.dumps(schema, indent=2)
+        elif isinstance(schema, str):
+            # Assume it's already a valid JSON string schema
+            schema_str = schema
         else:
             # It's good practice to fail early for invalid input types
-            raise TypeError("output_format must be a dict or a JSON string.")
-
+            raise TypeError("schema must be a dict or a JSON string.")
         # 2. Construct a specialized system prompt for structured data generation
         full_system_prompt = (
-            "You are a highly skilled AI assistant that processes user requests "
-            "and returns structured data in JSON format. You must strictly adhere "
-            "to the provided JSON template, filling in the values accurately based "
-            "on the user's prompt. Do not add any commentary, explanations, or text "
-            "outside of the final JSON code block. Your entire response must be a single "
-            "valid JSON object within a markdown code block."
+            "Your objective is to build a json structured output based on the user's request and the provided schema."
+            "Your entire response must be a single valid JSON object within a markdown code block."
+            "do not use tabs in your response."
         )
         if system_prompt:
-            system_prompt += f"\n\nAdditional instructions:\n{system_prompt}"
+            full_system_prompt = f"{system_prompt}\n\n{full_system_prompt}"
 
         # 3. Call the underlying generate_code method with JSON-specific settings
         if kwargs.get('debug'):
@@ -2065,8 +1984,9 @@ Do not split the code in multiple tags.
 
         json_string = self.generate_code(
             prompt=prompt,
+            images=images,
             system_prompt=full_system_prompt,
-            template=template_str,
+            template=schema_str,
             language="json",
             code_tag_format="markdown", # Sticking to markdown is generally more reliable
             **kwargs # Pass other params like temperature, top_k, etc.
@@ -2092,6 +2012,7 @@ Do not split the code in multiple tags.
             return parsed_json
 
         except Exception as e:
+            trace_exception(e)
             ASCIIColors.error(f"An unexpected error occurred during JSON parsing: {e}")
             return None
 
@@ -2312,7 +2233,7 @@ Do not split the code in multiple tags.
             language="json",
             template=template,
             code_tag_format="markdown",
-            max_size=max_answer_length,
+            n_predict=max_answer_length,
             callback=callback
         )
 
@@ -2407,7 +2328,7 @@ Do not split the code in multiple tags.
             template=template,
             language="json",
             code_tag_format="markdown",
-            max_size=max_answer_length,
+            n_predict=max_answer_length,
             callback=callback
         )
 
@@ -2478,7 +2399,7 @@ Do not split the code in multiple tags.
             template=template,
             language="json",
             code_tag_format="markdown",
-            max_size=max_answer_length,
+            n_predict=max_answer_length,
             callback=callback
         )
 
