@@ -1,7 +1,7 @@
 from lollms_client import LollmsClient
 
 # Initialize the LollmsClient instance
-#lc = LollmsClient("lollms")
+#lc = LollmsClient("lollms", service_key="your service key")
 #lc = LollmsClient("ollama", model_name="mistral-nemo:latest")
 lc = LollmsClient("llamacpp", models_path=r"E:\drumber", model_name="llava-v1.6-mistral-7b.Q3_K_XS.gguf")
 # Generate Text
