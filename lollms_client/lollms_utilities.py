@@ -93,10 +93,18 @@ def robust_json_parser(json_string: str) -> dict:
         ValueError: If parsing fails after all correction attempts.
     """
 
-    # STEP 0: Remove code block wrappers if present (e.g., ```json ... ```)
+
+    # STEP 0: Attempt to parse directly
+    try:
+        return json.loads(json_string)
+    except json.JSONDecodeError as e:
+        trace_exception(e)
+        pass
+    
+    # STEP 1: Remove code block wrappers if present (e.g., ```json ... ```)
     json_string = re.sub(r"^```(?:json)?\s*|\s*```$", '', json_string.strip())
 
-    # STEP 1: Attempt to parse directly
+    # STEP 2: Attempt to parse directly
     try:
         return json.loads(json_string)
     except json.JSONDecodeError:
