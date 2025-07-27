@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Optional, Callable, List, Union, Dict, Any, Set
 import base64
+from lollms_client.lollms_discussion import LollmsDiscussion
 import requests # For HTTP client
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
 from lollms_client.lollms_types import MSG_TYPE, ELF_COMPLETION_FORMAT
