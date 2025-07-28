@@ -128,9 +128,10 @@ def create_dynamic_models(
         __abstract__ = True
         id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
         system_prompt = Column(EncryptedText, nullable=True)
-        user_data_zone = Column(EncryptedText, nullable=True) # New field for persistent data
-        discussion_data_zone = Column(EncryptedText, nullable=True) # New field for persistent data
-        personality_data_zone = Column(EncryptedText, nullable=True) # New field for persistent data
+        user_data_zone = Column(EncryptedText, nullable=True) # Field for persistent user-specific data
+        discussion_data_zone = Column(EncryptedText, nullable=True) # Field for persistent discussion-specific data
+        personality_data_zone = Column(EncryptedText, nullable=True) # Field for persistent personality-specific data
+        memory = Column(EncryptedText, nullable=True) # New field for long-term memory across discussions
         
         participants = Column(JSON, nullable=True, default=dict)
         active_branch_id = Column(String, nullable=True)
@@ -216,8 +217,6 @@ class LollmsDataManager:
             with self.engine.connect() as connection:
                 print("Checking for database schema upgrades...")
                 
-                # --- THIS IS THE FIX ---
-                # We must wrap raw SQL strings in the `text()` function for direct execution.
                 cursor = connection.execute(text("PRAGMA table_info(discussions)"))
                 columns = [row[1] for row in cursor.fetchall()]
                 
@@ -244,9 +243,12 @@ class LollmsDataManager:
                 if 'personality_data_zone' not in columns:
                     print("  -> Upgrading 'discussions' table: Adding 'personality_data_zone' column.")
                     connection.execute(text("ALTER TABLE discussions ADD COLUMN personality_data_zone TEXT"))
+
+                if 'memory' not in columns:
+                    print("  -> Upgrading 'discussions' table: Adding 'memory' column.")
+                    connection.execute(text("ALTER TABLE discussions ADD COLUMN memory TEXT"))
                 
                 print("Database schema is up to date.")
-                # This is important to apply the ALTER TABLE statements
                 connection.commit() 
 
         except Exception as e:
@@ -507,6 +509,7 @@ class LollmsDiscussion:
         proxy.user_data_zone = None
         proxy.discussion_data_zone = None
         proxy.personality_data_zone = None
+        proxy.memory = None
         proxy.participants = {}
         proxy.active_branch_id = None
         proxy.discussion_metadata = {}
@@ -618,10 +621,20 @@ class LollmsDiscussion:
         return [LollmsMessage(self, orm) for orm in reversed(branch_orms)]
 
     def get_full_data_zone(self):
-        current_data_zone = "-- User Data Zone --\n" + self.user_data_zone if self.user_data_zone else ""
-        current_data_zone += "-- Discussion Data Zone --\n" + self.discussion_data_zone if self.discussion_data_zone else ""
-        current_data_zone += "-- Personality Data Zone --\n" + self.personality_data_zone if self.personality_data_zone else ""
-        return current_data_zone
+        """Assembles all data zones into a single, formatted string for the prompt."""
+        parts = []
+        # If memory is not empty, add it to the list of zones.
+        if self.memory and self.memory.strip():
+            parts.append(f"-- Memory --\n{self.memory.strip()}")
+        if self.user_data_zone and self.user_data_zone.strip():
+            parts.append(f"-- User Data Zone --\n{self.user_data_zone.strip()}")
+        if self.discussion_data_zone and self.discussion_data_zone.strip():
+            parts.append(f"-- Discussion Data Zone --\n{self.discussion_data_zone.strip()}")
+        if self.personality_data_zone and self.personality_data_zone.strip():
+            parts.append(f"-- Personality Data Zone --\n{self.personality_data_zone.strip()}")
+        
+        # Join the zones with double newlines for clear separation in the prompt.
+        return "\n\n".join(parts)
     
     
     def chat(
@@ -968,11 +981,19 @@ class LollmsDiscussion:
 
         branch = self.get_branch(branch_tip_id)
         
-        # Combine system prompt and the new data_zone if it exists
-        full_system_prompt = (self._system_prompt or "").strip()
-        current_data_zone = self.get_full_data_zone()
-        if current_data_zone:
-            full_system_prompt = (full_system_prompt + current_data_zone.strip()).strip()
+        # Combine system prompt and data zones
+        system_prompt_part = (self._system_prompt or "").strip()
+        data_zone_part = self.get_full_data_zone() # This now returns a clean, multi-part block or an empty string
+        full_system_prompt = ""
+
+        # Combine them intelligently
+        if system_prompt_part and data_zone_part:
+            full_system_prompt = f"{system_prompt_part}\n\n{data_zone_part}"
+        elif system_prompt_part:
+            full_system_prompt = system_prompt_part
+        else:
+            full_system_prompt = data_zone_part
+
 
         participants = self.participants or {}
 
@@ -1130,6 +1151,73 @@ class LollmsDiscussion:
         self.touch()
         print(f"[INFO] Discussion auto-pruned. {len(messages_to_prune)} messages summarized. History preserved.")
 
+    def memorize(self, branch_tip_id: Optional[str] = None):
+        """
+        Analyzes the current discussion, extracts key information suitable for long-term
+        memory, and appends it to the discussion's 'memory' field.
+
+        This is intended to build a persistent knowledge base about user preferences,
+        facts, and context that can be useful across different future discussions.
+
+        Args:
+            branch_tip_id: The ID of the message to use as the end of the context
+                           for memory extraction. Defaults to the active branch.
+        """
+        try:
+            # 1. Get the current conversation context
+            discussion_context = self.export("markdown", branch_tip_id=branch_tip_id)
+            if not discussion_context.strip():
+                print("[INFO] Memorize: Discussion is empty, nothing to memorize.")
+                return
+
+            # 2. Formulate the prompt for the LLM
+            system_prompt = (
+                "You are a Memory Extractor AI. Your task is to analyze a conversation "
+                "and extract only the most critical pieces of information that would be "
+                "valuable for a future, unrelated conversation with the same user. "
+                "Focus on: \n"
+                "- Explicit user preferences, goals, or facts about themselves.\n"
+                "- Key decisions or conclusions reached.\n"
+                "- Important entities, projects, or topics mentioned that are likely to recur.\n"
+                "Format the output as a concise list of bullet points. Be brief and factual. "
+                "If no new, significant long-term information is present, output the single word: 'NOTHING'."
+            )
+            
+            prompt = (
+                "Analyze the following discussion and extract key information for long-term memory:\n\n"
+                f"--- Conversation ---\n{discussion_context}\n\n"
+                "--- Extracted Memory Points (as a bulleted list) ---"
+            )
+
+            # 3. Call the LLM to extract information
+            print("[INFO] Memorize: Extracting key information from discussion...")
+            extracted_info = self.lollmsClient.generate_text(
+                prompt,
+                system_prompt=system_prompt,
+                n_predict=512, # A reasonable length for a summary
+                temperature=0.1, # Low temperature for factual extraction
+                top_k=10,
+            )
+
+            # 4. Process and append the information
+            if extracted_info and "NOTHING" not in extracted_info.upper():
+                new_memory_entry = extracted_info.strip()
+                
+                # Format with a timestamp for context
+                timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                formatted_entry = f"\n\n--- Memory entry from {timestamp} ---\n{new_memory_entry}"
+
+                current_memory = self.memory or ""
+                self.memory = (current_memory + formatted_entry).strip()
+                self.touch() # Mark as updated and save if autosave is on
+                print(f"[INFO] Memorize: New information added to long-term memory.")
+            else:
+                print("[INFO] Memorize: No new significant information found to add to memory.")
+                
+        except Exception as e:
+            trace_exception(e)
+            print(f"[ERROR] Memorize: Failed to extract memory. {e}")
+
     def count_discussion_tokens(self, format_type: str, branch_tip_id: Optional[str] = None) -> int:
         """Counts the number of tokens in the exported discussion content.
 
@@ -1164,27 +1252,134 @@ class LollmsDiscussion:
 
         return self.lollmsClient.count_tokens(text_to_count)
 
-    def get_context_status(self, branch_tip_id: Optional[str] = None) -> Dict[str, Optional[int]]:
-        """Returns the current token count and the maximum context size.
+    def get_context_status(self, branch_tip_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Returns a detailed breakdown of the context size and its components.
 
-        This provides a snapshot of the context usage, taking into account
-        any non-destructive pruning that has occurred. The token count is
-        based on the "lollms_text" export format, which is the format used
-        for pruning calculations.
+        This provides a comprehensive snapshot of the context usage, including the
+        content and token count for each part of the prompt (system prompt, data zones,
+        pruning summary, and message history). The token counts are based on the
+        "lollms_text" export format, which is the format used for pruning calculations.
 
         Args:
             branch_tip_id: The ID of the message branch to measure. Defaults
                            to the active branch.
 
         Returns:
-            A dictionary with 'current_tokens' and 'max_tokens'.
+            A dictionary with a detailed breakdown:
+            {
+                "max_tokens": int | None,
+                "current_tokens": int,
+                "zones": {
+                    "system_prompt": {"content": str, "tokens": int},
+                    "memory": {"content": str, "tokens": int},
+                    "user_data_zone": {"content": str, "tokens": int},
+                    "discussion_data_zone": {"content": str, "tokens": int},
+                    "personality_data_zone": {"content": str, "tokens": int},
+                    "pruning_summary": {"content": str, "tokens": int},
+                    "message_history": {"content": str, "tokens": int, "message_count": int}
+                }
+            }
+            Zones are only included if they contain content.
         """
-        current_tokens = self.count_discussion_tokens("lollms_text", branch_tip_id)
-        return {
-            "current_tokens": current_tokens,
-            "max_tokens": self.max_context_size
+        result = {
+            "max_tokens": self.max_context_size,
+            "current_tokens": 0,
+            "zones": {}
+        }
+        total_tokens = 0
+
+        # 1. System Prompt
+        system_prompt_text = (self._system_prompt or "").strip()
+        if system_prompt_text:
+            # We count tokens for the full block as it would appear in the prompt
+            full_block = f"!@>system:\n{system_prompt_text}\n"
+            tokens = self.lollmsClient.count_tokens(full_block)
+            result["zones"]["system_prompt"] = {
+                "content": system_prompt_text,
+                "tokens": tokens
+            }
+            total_tokens += tokens
+            
+        # 2. All Data Zones
+        zones_to_process = {
+            "memory": self.memory,
+            "user_data_zone": self.user_data_zone,
+            "discussion_data_zone": self.discussion_data_zone,
+            "personality_data_zone": self.personality_data_zone,
         }
 
+        for name, content in zones_to_process.items():
+            content_text = (content or "").strip()
+            if content_text:
+                # Mimic the formatting from get_full_data_zone for accurate token counting
+                header = f"-- {name.replace('_', ' ').title()} --\n"
+                full_block = f"{header}{content_text}"
+                # In lollms_text format, zones are part of the system message, so we add separators
+                # This counts the standalone block.
+                tokens = self.lollmsClient.count_tokens(full_block)
+                result["zones"][name] = {
+                    "content": content_text,
+                    "tokens": tokens
+                }
+                # Note: The 'export' method combines these into one system prompt.
+                # For this breakdown, we count them separately. The total will be a close approximation.
+
+        # 3. Pruning Summary
+        pruning_summary_text = (self.pruning_summary or "").strip()
+        if pruning_summary_text and self.pruning_point_id:
+            full_block = f"!@>system:\n--- Conversation Summary ---\n{pruning_summary_text}\n"
+            tokens = self.lollmsClient.count_tokens(full_block)
+            result["zones"]["pruning_summary"] = {
+                "content": pruning_summary_text,
+                "tokens": tokens
+            }
+            total_tokens += tokens
+        
+        # 4. Message History
+        branch_tip_id = branch_tip_id or self.active_branch_id
+        messages_text = ""
+        message_count = 0
+        if branch_tip_id:
+            branch = self.get_branch(branch_tip_id)
+            messages_to_render = branch
+            
+            # Adjust for pruning to get the active set of messages
+            if self.pruning_summary and self.pruning_point_id:
+                pruning_index = -1
+                for i, msg in enumerate(branch):
+                    if msg.id == self.pruning_point_id:
+                        pruning_index = i
+                        break
+                if pruning_index != -1:
+                    messages_to_render = branch[pruning_index:]
+
+            message_parts = []
+            for msg in messages_to_render:
+                sender_str = msg.sender.replace(':', '').replace('!@>', '')
+                content = msg.content.strip()
+                if msg.images:
+                    content += f"\n({len(msg.images)} image(s) attached)"
+                msg_text = f"!@>{sender_str}:\n{content}\n"
+                message_parts.append(msg_text)
+            
+            messages_text = "".join(message_parts)
+            message_count = len(messages_to_render)
+
+        if messages_text:
+            tokens = self.lollmsClient.count_tokens(messages_text)
+            result["zones"]["message_history"] = {
+                "content": messages_text,
+                "tokens": tokens,
+                "message_count": message_count
+            }
+            total_tokens += tokens
+
+        # Finalize the total count. This re-calculates based on the actual export format
+        # for maximum accuracy, as combining zones can slightly change tokenization.
+        result["current_tokens"] = self.count_discussion_tokens("lollms_text", branch_tip_id)
+
+        return result
     def switch_to_branch(self, branch_id):
         self.active_branch_id = branch_id
 

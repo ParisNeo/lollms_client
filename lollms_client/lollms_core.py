@@ -2962,6 +2962,112 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         return final_output
 
 
+    def summarize(
+        self,
+        text_to_summarize: str,
+        contextual_prompt: Optional[str] = None,
+        chunk_size_tokens: int = 1500,
+        overlap_tokens: int = 250,
+        streaming_callback: Optional[Callable] = None,
+        **kwargs
+    ) -> str:
+        """
+        Summarizes a long text that may not fit into the model's context window.
+
+        This method works in two stages:
+        1.  **Chunk & Summarize:** It breaks the text into overlapping chunks and summarizes each one individually.
+        2.  **Synthesize:** It then takes all the chunk summaries and performs a final summarization pass to create a single, coherent, and comprehensive summary.
+
+        Args:
+            text_to_summarize (str): The long text content to be summarized.
+            contextual_prompt (Optional[str], optional): A specific instruction to guide the summary's focus. 
+                                                       For example, "Summarize the text focusing on the financial implications."
+                                                       Defaults to None.
+            chunk_size_tokens (int, optional): The number of tokens in each text chunk. This should be well
+                                             within the model's context limit to allow space for prompts.
+                                             Defaults to 1500.
+            overlap_tokens (int, optional): The number of tokens to overlap between chunks to ensure context
+                                          is not lost at the boundaries. Defaults to 250.
+            streaming_callback (Optional[Callable], optional): A callback function to receive real-time updates
+                                                             on the process (e.g., which chunk is being processed).
+                                                             Defaults to None.
+            **kwargs: Additional keyword arguments to be passed to the generation method (e.g., temperature, top_p).
+
+        Returns:
+            str: The final, comprehensive summary of the text.
+        """
+        if not text_to_summarize.strip():
+            return ""
+
+        # Use the binding's tokenizer for accurate chunking
+        tokens = self.binding.tokenize(text_to_summarize)
+        
+        if len(tokens) <= chunk_size_tokens:
+            if streaming_callback:
+                streaming_callback("Text is short enough for a single summary.", MSG_TYPE.MSG_TYPE_STEP)
+            
+            prompt_objective = contextual_prompt or "Provide a comprehensive summary of the following text."
+            final_prompt = f"{prompt_objective}\n\n--- Text to Summarize ---\n{text_to_summarize}"
+            
+            return self.generate_text(final_prompt, **kwargs)
+
+        # --- Stage 1: Chunking and Independent Summarization ---
+        chunks = []
+        step = chunk_size_tokens - overlap_tokens
+        for i in range(0, len(tokens), step):
+            chunk_tokens = tokens[i:i + chunk_size_tokens]
+            chunk_text = self.binding.detokenize(chunk_tokens)
+            chunks.append(chunk_text)
+
+        chunk_summaries = []
+        
+        # Define the prompt for summarizing each chunk
+        summarization_objective = contextual_prompt or "Summarize the key points of the following text excerpt."
+        chunk_summary_prompt_template = f"{summarization_objective}\n\n--- Text Excerpt ---\n{{chunk_text}}"
+
+        for i, chunk in enumerate(chunks):
+            if streaming_callback:
+                streaming_callback(f"Summarizing chunk {i + 1} of {len(chunks)}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"chunk_{i+1}"})
+
+            prompt = chunk_summary_prompt_template.format(chunk_text=chunk)
+            
+            try:
+                # Generate summary for the current chunk
+                chunk_summary = self.generate_text(prompt, **kwargs)
+                chunk_summaries.append(chunk_summary)
+                if streaming_callback:
+                    streaming_callback(f"Chunk {i + 1} summarized.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"chunk_{i+1}", "summary_snippet": chunk_summary[:100]})
+            except Exception as e:
+                trace_exception(e)
+                if streaming_callback:
+                    streaming_callback(f"Failed to summarize chunk {i+1}: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION)
+                # Still add a placeholder to not break the chain
+                chunk_summaries.append(f"[Error summarizing chunk {i+1}]")
+
+        # --- Stage 2: Final Synthesis of All Chunk Summaries ---
+        if streaming_callback:
+            streaming_callback("Synthesizing all chunk summaries into a final version...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "final_synthesis"})
+
+        combined_summaries = "\n\n---\n\n".join(chunk_summaries)
+        
+        # Define the prompt for the final synthesis
+        synthesis_objective = contextual_prompt or "Create a single, final, coherent, and comprehensive summary."
+        final_synthesis_prompt = (
+            "You are a master synthesizer. You will be given a series of partial summaries from a long document. "
+            f"Your task is to synthesize them into one high-quality summary. {synthesis_objective}\n\n"
+            "Please remove any redundancy and ensure a smooth, logical flow.\n\n"
+            "--- Collection of Summaries ---\n"
+            f"{combined_summaries}\n\n"
+            "--- Final Comprehensive Summary ---"
+        )
+
+        final_summary = self.generate_text(final_synthesis_prompt, **kwargs)
+        
+        if streaming_callback:
+            streaming_callback("Final summary synthesized.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "final_synthesis"})
+
+        return final_summary.strip()
+
 def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators=True):
     """
     Chunks text based on token count.

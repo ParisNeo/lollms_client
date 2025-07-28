@@ -20,8 +20,12 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 *   🤖 **Function Calling with MCP:** Empowers LLMs to use external tools and functions through the Model Context Protocol (MCP), with built-in support for local Python tool execution via `local_mcp` binding and its default tools (file I/O, internet search, Python interpreter, image generation).
 *   🎭 **Personalities as Agents:** Personalities can now define their own set of required tools (MCPs) and have access to static or dynamic knowledge bases (`data_source`), turning them into self-contained, ready-to-use agents.
 *   🚀 **Streaming & Callbacks:** Efficiently handle real-time text generation with customizable callback functions, including during MCP interactions.
+*   📑 **Sequential Summarization:** A `summarize` method to process and summarize texts that exceed the model's context window.
 *   📝 **Advanced Structured Content Generation:** Reliably generate structured JSON output from natural language prompts using the `generate_structured_content` helper method.
-*   💬 **Discussion Management:** Utilities to easily manage and format conversation histories, including a persistent `data_zone` for context that is always present in the system prompt.
+*   💬 **Advanced Discussion Management:** Robustly manage conversation histories with `LollmsDiscussion`, featuring branching, context exporting, and automatic pruning.
+*   🧠 **Persistent Memory & Data Zones:** `LollmsDiscussion` now supports multiple, distinct data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field. This allows for sophisticated context layering and state management.
+*   ✍️ **Automatic Memorization:** A new `memorize()` method allows the AI to analyze a conversation and extract key facts, appending them to the long-term `memory` for recall in future sessions.
+*   📊 **Detailed Context Analysis:** The `get_context_status()` method now provides a rich, detailed breakdown of the prompt context, showing the content and token count for each individual component (system prompt, data zones, message history).
 *   ⚙️ **Configuration Management:** Flexible ways to configure bindings and generation parameters.
 *   🧩 **Extensible:** Designed to easily incorporate new LLM backends and modality services, including custom MCP toolsets.
 *   📝 **High-Level Operations:** Includes convenience methods for complex tasks like sequential summarization and deep text analysis directly within `LollmsClient`.
@@ -154,7 +158,7 @@ This script will define the personality, initialize the client, and run the agen
 
 ```python
 from pathlib import Path
-from lollms_client import LollmsClient, LollmsPersonality, LollmsDiscussion, MSG_TYPE
+from lollms_client import LollmsClient, LollmsPersonality, LollmsDiscussion, MSG_TYPE, trace_exception
 from ascii_colors import ASCIIColors
 import json
 
@@ -245,11 +249,11 @@ except Exception as e:
 When you run `agent_example.py`, a sophisticated process unfolds:
 
 1.  **Initialization:** The `LollmsDiscussion.chat()` method is called with the `coder_personality`.
-2.  **Knowledge Injection:** The `chat` method sees that `personality.data_source` is a string. It automatically takes the content of `coding_rules.txt` and injects it into the `discussion.data_zone`.
+2.  **Knowledge Injection:** The `chat` method sees that `personality.data_source` is a string. It automatically takes the content of `coding_rules.txt` and injects it into the discussion's data zones.
 3.  **Tool Activation:** The method also sees `personality.active_mcps`. It enables the `python_code_interpreter` tool for this turn.
 4.  **Context Assembly:** The `LollmsClient` assembles a rich prompt for the LLM that includes:
     *   The personality's `system_prompt`.
-    *   The content of `coding_rules.txt` (from the `data_zone`).
+    *   The content of `coding_rules.txt` (from the data zones).
     *   The list of available tools (including `python_code_interpreter`).
     *   The user's request ("Write a function...").
 5.  **Reason and Act:** The LLM, now fully briefed, reasons that it needs to use the `python_code_interpreter` tool. It formulates the Python code *according to the rules it was given*.
@@ -258,6 +262,90 @@ When you run `agent_example.py`, a sophisticated process unfolds:
 8.  **Final Synthesis:** The LLM now has the user's request, the rules, the code it wrote, and the code's output. It synthesizes all of this into a final, comprehensive answer for the user.
 
 This example showcases how `lollms-client` allows you to build powerful, knowledgeable, and capable agents by simply composing personalities with data and tools.
+
+### Building Stateful Agents with Memory and Data Zones
+
+The latest version of `LollmsDiscussion` introduces powerful features for creating agents that can remember information across conversations. This is achieved through structured data zones and a new `memorize()` method.
+
+Let's build a "Personal Assistant" agent that learns about the user over time.
+
+```python
+from lollms_client import LollmsClient, LollmsDataManager, LollmsDiscussion, MSG_TYPE
+from ascii_colors import ASCIIColors
+import json
+
+# --- 1. Setup a persistent database for our discussion ---
+db_manager = LollmsDataManager('sqlite:///my_assistant.db')
+lc = LollmsClient(binding_name="ollama", model_name="llama3")
+
+# Try to load an existing discussion or create a new one
+discussion_id = "user_assistant_chat_1"
+discussion = db_manager.get_discussion(lc, discussion_id)
+if not discussion:
+    ASCIIColors.yellow("Creating a new discussion...")
+    discussion = LollmsDiscussion.create_new(
+        lollms_client=lc,
+        db_manager=db_manager,
+        id=discussion_id,
+        autosave=True # Important for persistence
+    )
+    # Let's preset some user data
+    discussion.user_data_zone = "User's Name: Alex\nUser's Goal: Learn about AI development."
+    discussion.commit()
+else:
+    ASCIIColors.green("Loaded existing discussion.")
+
+
+def run_chat_turn(prompt: str):
+    """Helper function to run a single chat turn and print details."""
+    ASCIIColors.cyan(f"\n> User: {prompt}")
+
+    # --- A. Check context status BEFORE the turn ---
+    ASCIIColors.magenta("\n--- Context Status (Before Generation) ---")
+    status = discussion.get_context_status()
+    print(f"Max Tokens: {status.get('max_tokens')}, Current Approx. Tokens: {status.get('current_tokens')}")
+    for zone, data in status.get('zones', {}).items():
+        print(f"  - Zone: {zone}, Tokens: {data['tokens']}")
+        # print(f"    Content: {data['content'][:80]}...") # Uncomment for more detail
+    print("------------------------------------------")
+
+    # --- B. Run the chat ---
+    ASCIIColors.green("\n< Assistant:")
+    response = discussion.chat(
+        user_message=prompt,
+        streaming_callback=lambda chunk, type, **k: print(chunk, end="", flush=True) if type==MSG_TYPE.MSG_TYPE_CHUNK else None
+    )
+    print() # Newline after stream
+
+    # --- C. Trigger memorization ---
+    ASCIIColors.yellow("\nTriggering memorization process...")
+    discussion.memorize()
+    discussion.commit() # Save the new memory to the DB
+    ASCIIColors.yellow("Memorization complete.")
+
+# --- Run a few turns ---
+run_chat_turn("Hi there! Can you recommend a good Python library for building web APIs?")
+run_chat_turn("That sounds great. By the way, my favorite programming language is Rust, I find its safety features amazing.")
+run_chat_turn("What was my favorite programming language again?")
+
+# --- Final Inspection ---
+ASCIIColors.magenta("\n--- Final Context Status ---")
+status = discussion.get_context_status()
+print(f"Max Tokens: {status.get('max_tokens')}, Current Approx. Tokens: {status.get('current_tokens')}")
+for zone, data in status.get('zones', {}).items():
+    print(f"  - Zone: {zone}, Tokens: {data['tokens']}")
+    print(f"    Content: {data['content'][:150].replace(chr(10), ' ')}...")
+print("------------------------------------------")
+
+```
+
+#### How it Works:
+
+1.  **Persistence:** The `LollmsDataManager` and `autosave=True` ensure that all changes to the discussion, including the data zones and memory, are saved to the `my_assistant.db` file. When you re-run the script, it loads the previous state.
+2.  **`user_data_zone`:** We pre-filled this zone with basic user info. This context is provided to the AI in every turn.
+3.  **`get_context_status()`:** Before each generation, we call this method to get a detailed breakdown of the prompt. This is excellent for debugging and understanding how the context window is being used.
+4.  **`memorize()`:** After the user mentions their favorite language, `memorize()` is called. The LLM analyzes the last turn, identifies this new, important fact ("user's favorite language is Rust"), and appends it to the `discussion.memory` field.
+5.  **Recall:** In the final turn, when asked to recall the favorite language, the AI has access to the `memory` zone and can correctly answer "Rust", even if that information had scrolled out of the recent conversation history. This demonstrates true long-term memory.
 
 ## Documentation
 
@@ -301,8 +389,8 @@ graph LR
 *   **LLM Bindings**: These are plugins that allow `LollmsClient` to communicate with different LLM backends. You choose a binding (e.g., `"ollama"`, `"lollms"`, `"pythonllamacpp"`) when you initialize `LollmsClient`.
 *   **🔧 MCP Bindings**: Enable tool use and function calling. `lollms-client` includes `local_mcp` for executing Python tools. It discovers tools from a specified folder (or uses its default set), each defined by a `.py` script and a `.mcp.json` metadata file.
 *   **Modality Bindings**: Similar to LLM bindings, but for services like Text-to-Speech (`tts`), Text-to-Image (`tti`), etc.
-*   **High-Level Operations**: Methods directly on `LollmsClient` (e.g., `sequential_summarize`, `deep_analyze`, `generate_code`, `yes_no`) for performing complex, multi-step AI tasks.
-*   **`LollmsDiscussion`**: Helps manage and format conversation histories for chat applications.
+*   **High-Level Operations**: Methods directly on `LollmsClient` (e.g., `sequential_summarize`, `summarize`, `deep_analyze`, `generate_code`, `yes_no`) for performing complex, multi-step AI tasks.
+*   **`LollmsDiscussion`**: Helps manage and format conversation histories. Now includes sophisticated context layering through multiple data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field for stateful, multi-session interactions.
 
 ## Examples
 
@@ -580,6 +668,58 @@ response = lc.generate_text("Write a short story about a robot who discovers mus
 print(response)
 ```
 
+### Sequential Summarization for Long Texts
+
+When dealing with a document, article, or transcript that is too large to fit into a model's context window, the `summarize` method is the solution. It intelligently chunks the text, summarizes each piece, and then synthesizes those summaries into a final, coherent output.
+
+```python
+from lollms_client import LollmsClient, MSG_TYPE, LollmsPersonality
+from ascii_colors import ASCIIColors
+
+# --- A very long text (imagine this is 10,000+ tokens) ---
+long_text = """
+The history of computing is a fascinating journey from mechanical contraptions to the powerful devices we use today. 
+It began with devices like the abacus, used for arithmetic tasks. In the 19th century, Charles Babbage conceived 
+the Analytical Engine, a mechanical computer that was never fully built but laid the groundwork for modern computing. 
+...
+(many, many paragraphs later)
+...
+Today, quantum computing promises to revolutionize the field once again, tackling problems currently intractable 
+for even the most powerful supercomputers. Researchers are exploring qubits and quantum entanglement to create 
+machines that will redefine what is computationally possible, impacting fields from medicine to materials science.
+""" * 50 # Simulate a very long text
+
+# --- Callback to see the process in action ---
+def summary_callback(chunk: str, msg_type: MSG_TYPE, params: dict = None, **kwargs):
+    if msg_type in [MSG_TYPE.MSG_TYPE_STEP_START, MSG_TYPE.MSG_TYPE_STEP_END]:
+        ASCIIColors.yellow(f">> {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_STEP:
+        ASCIIColors.cyan(f"   {chunk}")
+    return True
+
+try:
+    lc = LollmsClient(binding_name="ollama", model_name="llama3")
+
+    # The contextual prompt guides the focus of the summary
+    context_prompt = "Summarize the text, focusing on the key technological milestones and their inventors."
+
+    ASCIIColors.blue("--- Starting Sequential Summarization ---")
+    
+    final_summary = lc.summarize(
+        text_to_summarize=long_text,
+        contextual_prompt=context_prompt,
+        chunk_size_tokens=1000, # Adjust based on your model's context size
+        overlap_tokens=200,
+        streaming_callback=summary_callback,
+        temperature=0.1 # Good for factual summarization
+    )
+    
+    ASCIIColors.blue("\n--- Final Comprehensive Summary ---")
+    ASCIIColors.green(final_summary)
+
+except Exception as e:
+    print(f"An error occurred: {e}")
+```
 ## Contributing
 
 Contributions are welcome! Whether it's bug reports, feature suggestions, documentation improvements, or new bindings, please feel free to open an issue or submit a pull request on our [GitHub repository](https://github.com/ParisNeo/lollms_client).
@@ -596,7 +736,6 @@ For a list of changes and updates, please refer to the [CHANGELOG.md](CHANGELOG.
 ---
 ### Phase 2: Update `docs/md/lollms_discussion.md`
 
-`[UPDATE] docs/md/lollms_discussion.md`
 ```markdown
 # LollmsDiscussion Class
 
@@ -615,7 +754,7 @@ A `LollmsDiscussion` can be either **in-memory** or **database-backed**, offerin
 -   **Branching:** The conversation is a tree, not a simple list. This allows for exploring different conversational paths from any point. You can regenerate an AI response, and it will create a new branch.
 -   **Context Exporting:** The `export()` method formats the conversation history for various LLM backends (`openai_chat`, `ollama_chat`, `lollms_text`, `markdown`), ensuring compatibility.
 -   **Automatic Pruning:** To prevent exceeding the model's context window, it can automatically summarize older parts of the conversation without losing the original data.
--   **Persistent Data Zone:** A special field to hold context that is always included in the system prompt, separate from the main conversation flow.
+-   **Sophisticated Context Layering:** Manage conversation state with multiple, distinct data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field, allowing for rich and persistent context.
 
 ## Creating a Discussion
 
@@ -640,56 +779,61 @@ discussion_db = LollmsDiscussion.create_new(
 
 ## Core Properties
 
-### `data_zone`
+### Data and Memory Zones
 
-The `data_zone` is a string property where you can store persistent information that should always be visible to the AI as part of its system instructions. This is incredibly useful for providing context that doesn't change, such as user profiles, complex instructions, or data that the AI should always reference.
+`LollmsDiscussion` moves beyond a single `data_zone` to a more structured system of context layers. These string properties allow you to inject specific, persistent information into the AI's system prompt, separate from the main conversational flow. The content of all non-empty zones is automatically formatted and included in the prompt.
 
-The content of `data_zone` is automatically appended to the system prompt during context export. This is also where data from a personality's `data_source` is loaded before generation.
+#### `system_prompt`
+The main instruction set for the AI's persona and core task. It's the foundation of the prompt.
+- **Purpose:** Defines who the AI is and what its primary goal is.
+- **Example:** `"You are a helpful and friendly assistant."`
 
-#### Example: Using the Data Zone
+#### `memory`
+A special zone for storing long-term, cross-discussion information about the user or topics. It is designed to be built up over time.
+- **Purpose:** To give the AI a persistent memory that survives across different chat sessions.
+- **Example:** `"User's name is Alex.\nUser's favorite programming language is Rust."`
 
-Imagine you are building a Python coding assistant. You can use the `data_zone` to hold the current state of a script the user is working on.
+#### `user_data_zone`
+Holds information specific to the current user that might be relevant for the session.
+- **Purpose:** Storing user preferences, profile details, or session-specific goals.
+-- **Example:** `"Current project: API development.\nUser is a beginner in Python."`
 
-```python
-from lollms_client import LollmsClient, LollmsDiscussion
+#### `discussion_data_zone`
+Contains context relevant only to the current discussion.
+- **Purpose:** Holding summaries, state information, or data relevant to the current conversation topic that needs to be kept in front of the AI.
+- **Example:** `"The user has already tried libraries A and B and found them too complex."`
 
-lc = LollmsClient(binding_name="ollama", model_name="codellama")
-discussion = LollmsDiscussion.create_new(lollms_client=lc)
+#### `personality_data_zone`
+This is where static or dynamic knowledge from a `LollmsPersonality`'s `data_source` is loaded.
+- **Purpose:** To provide personalities with their own built-in knowledge bases or rulesets.
+- **Example:** `"Rule 1: All code must be documented.\nRule 2: Use type hints."`
 
-# Set the system prompt and initial data_zone
-discussion.system_prompt = "You are a Python expert. Help the user with their code."
-discussion.data_zone = "# Current script content:\n\nimport os\n\ndef list_files(path):\n    pass"
+#### Example: How Zones are Combined
 
-# The user asks for help
-user_prompt = "Flesh out the list_files function to print all files in the given path."
+The `export()` method intelligently combines these zones. If all zones were filled, the effective system prompt would look something like this:
 
-# When you generate a response, the AI will see the system prompt AND the data_zone
-# The effective system prompt becomes:
-# """
-# You are a Python expert. Help the user with their code.
-#
-# --- data ---
-# # Current script content:
-#
-# import os
-#
-# def list_files(path):
-#     pass
-# """
-response = discussion.chat(user_prompt)
-print(response['ai_message'].content)
-
-# The calling application can then parse the AI's response and update the data_zone
-# for the next turn.
-updated_code = "# ... updated code from AI ...\nimport os\n\ndef list_files(path):\n    for f in os.listdir(path):\n        print(f)"
-discussion.data_zone = updated_code
-discussion.commit() # If DB-backed
 ```
+!@>system:
+You are a helpful and friendly assistant.
 
+-- Memory --
+User's name is Alex.
+User's favorite programming language is Rust.
+
+-- User Data Zone --
+Current project: API development.
+User is a beginner in Python.
+
+-- Discussion Data Zone --
+The user has already tried libraries A and B and found them too complex.
+
+-- Personality Data Zone --
+Rule 1: All code must be documented.
+Rule 2: Use type hints.
+```
 ### Other Important Properties
 
 -   `id`: The unique identifier for the discussion.
--   `system_prompt`: The main system prompt defining the AI's persona and core instructions.
 -   `metadata`: A dictionary for storing any custom metadata, like a title.
 -   `active_branch_id`: The ID of the message at the "tip" of the current conversation branch.
 -   `messages`: A list of all `LollmsMessage` objects in the discussion.
@@ -714,14 +858,71 @@ The `chat` method intelligently handles tool activation and data loading when a 
 
 Before generation, the `chat` method checks for `personality.data_source`:
 
--   **If it's a `str` (static data):** The string is appended to the `discussion.data_zone`, making it part of the system context for the current turn.
+-   **If it's a `str` (static data):** The string is loaded into the `discussion.personality_data_zone`, making it part of the system context for the current turn.
 -   **If it's a `Callable` (dynamic data):**
     1.  The AI first generates a query based on the current conversation.
     2.  The `chat` method calls your function with this query.
-    3.  The returned string is appended to the `discussion.data_zone`.
+    3.  The returned string is loaded into the `discussion.personality_data_zone`.
     4.  The final response generation proceeds with this newly added context.
 
 This makes it easy to create powerful, reusable agents. For a complete, runnable example of building a **Python Coder Agent** that uses both `active_mcps` and a static `data_source`, **please see the "Putting It All Together" section in the main `README.md` file.**
+
+### New Methods for State and Context Management
+
+#### `memorize()`
+This method empowers the AI to build its own long-term memory. It analyzes the current conversation, extracts key facts or preferences, and appends them to the `memory` data zone.
+
+- **How it works:** It uses the LLM itself to summarize the most important, long-term takeaways from the recent conversation.
+- **Use Case:** Perfect for creating assistants that learn about the user over time, remembering their name, preferences, or past projects without the user needing to repeat themselves.
+
+```python
+# User has just said: "My company is called 'Innovatech'."
+discussion.chat("My company is called 'Innovatech'.")
+
+# Now, trigger memorization
+discussion.memorize() 
+discussion.commit() # Save the updated memory to the database
+
+# The discussion.memory field might now contain:
+# "... previous memory ...
+#
+# --- Memory entry from 2024-06-27 10:30:00 UTC ---
+# - User's company is named 'Innovatech'."
+```
+
+#### `get_context_status()`
+Provides a detailed, real-time breakdown of the current prompt context, showing exactly what will be sent to the model and how many tokens each part occupies.
+
+- **Return Value:** A dictionary containing the `max_tokens`, `current_tokens`, and a `zones` dictionary with the content and token count for each component.
+- **Use Case:** Essential for debugging context issues, understanding token usage, and visualizing how different data zones contribute to the final prompt.
+
+```python
+import json
+
+status = discussion.get_context_status()
+print(json.dumps(status, indent=2))
+
+# Expected Output Structure:
+# {
+#   "max_tokens": 8192,
+#   "current_tokens": 521,
+#   "zones": {
+#     "system_prompt": {
+#       "content": "You are a helpful assistant.",
+#       "tokens": 12
+#     },
+#     "memory": {
+#       "content": "User's favorite color is blue.",
+#       "tokens": 15
+#     },
+#     "message_history": {
+#       "content": "!@>user:\nHi there!\n!@>assistant:\nHello! How can I help?\n",
+#       "tokens": 494,
+#       "message_count": 2
+#     }
+#   }
+# }
+```
 
 ### Other Methods
 -   `add_message(sender, content, ...)`: Adds a new message.
