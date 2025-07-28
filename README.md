@@ -265,9 +265,22 @@ This example showcases how `lollms-client` allows you to build powerful, knowled
 
 ### Building Stateful Agents with Memory and Data Zones
 
-The latest version of `LollmsDiscussion` introduces powerful features for creating agents that can remember information across conversations. This is achieved through structured data zones and a new `memorize()` method.
+The `LollmsDiscussion` class provides a sophisticated system for creating stateful agents that can remember information across conversations. This is achieved through a layered system of "context zones" that are automatically combined into the AI's system prompt.
 
-Let's build a "Personal Assistant" agent that learns about the user over time.
+#### Understanding the Context Zones
+
+The AI's context is more than just chat history. It's built from several distinct components, each with a specific purpose:
+
+*   **`system_prompt`**: The foundational layer defining the AI's core identity, persona, and primary instructions.
+*   **`memory`**: The AI's long-term, persistent memory. It stores key facts about the user or topics, built up over time using the `memorize()` method.
+*   **`user_data_zone`**: Holds session-specific information about the user's current state or goals (e.g., "User is currently working on 'file.py'").
+*   **`discussion_data_zone`**: Contains state or meta-information about the current conversational task (e.g., "Step 1 of the plan is complete").
+*   **`personality_data_zone`**: A knowledge base or set of rules automatically injected from a `LollmsPersonality`'s `data_source`.
+*   **`pruning_summary`**: An automatic, AI-generated summary of the oldest messages in a very long chat, used to conserve tokens without losing the gist of the early conversation.
+
+The `get_context_status()` method is your window into this system, showing you exactly how these zones are combined and how many tokens they consume.
+
+Let's see this in action with a "Personal Assistant" agent that learns about the user over time.
 
 ```python
 from lollms_client import LollmsClient, LollmsDataManager, LollmsDiscussion, MSG_TYPE
@@ -289,7 +302,8 @@ if not discussion:
         id=discussion_id,
         autosave=True # Important for persistence
     )
-    # Let's preset some user data
+    # Let's preset some data in different zones
+    discussion.system_prompt = "You are a helpful Personal Assistant."
     discussion.user_data_zone = "User's Name: Alex\nUser's Goal: Learn about AI development."
     discussion.commit()
 else:
@@ -300,13 +314,24 @@ def run_chat_turn(prompt: str):
     """Helper function to run a single chat turn and print details."""
     ASCIIColors.cyan(f"\n> User: {prompt}")
 
-    # --- A. Check context status BEFORE the turn ---
+    # --- A. Check context status BEFORE the turn using get_context_status() ---
     ASCIIColors.magenta("\n--- Context Status (Before Generation) ---")
     status = discussion.get_context_status()
-    print(f"Max Tokens: {status.get('max_tokens')}, Current Approx. Tokens: {status.get('current_tokens')}")
-    for zone, data in status.get('zones', {}).items():
-        print(f"  - Zone: {zone}, Tokens: {data['tokens']}")
-        # print(f"    Content: {data['content'][:80]}...") # Uncomment for more detail
+    print(f"Max Tokens: {status.get('max_tokens')}, Current Tokens: {status.get('current_tokens')}")
+    
+    # Print the system context details
+    if 'system_context' in status['zones']:
+        sys_ctx = status['zones']['system_context']
+        print(f"  - System Context Tokens: {sys_ctx['tokens']}")
+        # The 'breakdown' shows the individual zones that were combined
+        for name, content in sys_ctx.get('breakdown', {}).items():
+            print(f"    -> Contains '{name}': {content.split(chr(10))[0]}...")
+
+    # Print the message history details
+    if 'message_history' in status['zones']:
+        msg_hist = status['zones']['message_history']
+        print(f"  - Message History Tokens: {msg_hist['tokens']} ({msg_hist['message_count']} messages)")
+
     print("------------------------------------------")
 
     # --- B. Run the chat ---
@@ -317,7 +342,7 @@ def run_chat_turn(prompt: str):
     )
     print() # Newline after stream
 
-    # --- C. Trigger memorization ---
+    # --- C. Trigger memorization to update the 'memory' zone ---
     ASCIIColors.yellow("\nTriggering memorization process...")
     discussion.memorize()
     discussion.commit() # Save the new memory to the DB
@@ -328,24 +353,30 @@ run_chat_turn("Hi there! Can you recommend a good Python library for building we
 run_chat_turn("That sounds great. By the way, my favorite programming language is Rust, I find its safety features amazing.")
 run_chat_turn("What was my favorite programming language again?")
 
-# --- Final Inspection ---
+# --- Final Inspection of Memory ---
 ASCIIColors.magenta("\n--- Final Context Status ---")
 status = discussion.get_context_status()
-print(f"Max Tokens: {status.get('max_tokens')}, Current Approx. Tokens: {status.get('current_tokens')}")
-for zone, data in status.get('zones', {}).items():
-    print(f"  - Zone: {zone}, Tokens: {data['tokens']}")
-    print(f"    Content: {data['content'][:150].replace(chr(10), ' ')}...")
+print(f"Max Tokens: {status.get('max_tokens')}, Current Tokens: {status.get('current_tokens')}")
+if 'system_context' in status['zones']:
+    sys_ctx = status['zones']['system_context']
+    print(f"  - System Context Tokens: {sys_ctx['tokens']}")
+    for name, content in sys_ctx.get('breakdown', {}).items():
+        # Print the full content of the memory zone to verify it was updated
+        if name == 'memory':
+            ASCIIColors.yellow(f"    -> Full '{name}' content:\n{content}")
+        else:
+            print(f"    -> Contains '{name}': {content.split(chr(10))[0]}...")
 print("------------------------------------------")
 
 ```
 
 #### How it Works:
 
-1.  **Persistence:** The `LollmsDataManager` and `autosave=True` ensure that all changes to the discussion, including the data zones and memory, are saved to the `my_assistant.db` file. When you re-run the script, it loads the previous state.
-2.  **`user_data_zone`:** We pre-filled this zone with basic user info. This context is provided to the AI in every turn.
-3.  **`get_context_status()`:** Before each generation, we call this method to get a detailed breakdown of the prompt. This is excellent for debugging and understanding how the context window is being used.
-4.  **`memorize()`:** After the user mentions their favorite language, `memorize()` is called. The LLM analyzes the last turn, identifies this new, important fact ("user's favorite language is Rust"), and appends it to the `discussion.memory` field.
-5.  **Recall:** In the final turn, when asked to recall the favorite language, the AI has access to the `memory` zone and can correctly answer "Rust", even if that information had scrolled out of the recent conversation history. This demonstrates true long-term memory.
+1.  **Persistence & Initialization:** The `LollmsDataManager` saves and loads the discussion. We initialize the `system_prompt` and `user_data_zone` to provide initial context.
+2.  **`get_context_status()`:** Before each generation, we call this method. The output shows a `system_context` block with a token count for all combined zones and a `breakdown` field that lets us see the content of each individual zone that contributed to it.
+3.  **`memorize()`:** After the user mentions their favorite language, `memorize()` is called. The LLM analyzes the last turn, identifies this new, important fact, and appends it to the `discussion.memory` zone.
+4.  **Recall:** In the final turn, when asked to recall the favorite language, the AI has access to the updated `memory` content within its system context and can correctly answer "Rust". This demonstrates true long-term, stateful memory.
+
 
 ## Documentation
 
@@ -891,33 +922,54 @@ discussion.commit() # Save the updated memory to the database
 ```
 
 #### `get_context_status()`
-Provides a detailed, real-time breakdown of the current prompt context, showing exactly what will be sent to the model and how many tokens each part occupies.
 
-- **Return Value:** A dictionary containing the `max_tokens`, `current_tokens`, and a `zones` dictionary with the content and token count for each component.
-- **Use Case:** Essential for debugging context issues, understanding token usage, and visualizing how different data zones contribute to the final prompt.
+Provides a detailed, real-time breakdown of the current prompt context, showing exactly what will be sent to the model and how many tokens each major component occupies. This is crucial for debugging context issues and understanding token usage.
+
+The method accurately reflects the structure of the `lollms_text` format, where all system-level instructions (the main prompt, all data zones, and the pruning summary) are combined into a single system block.
+
+-   **Return Value:** A dictionary containing:
+    -   `max_tokens`: The configured maximum token limit for the discussion.
+    -   `current_tokens`: The total, most accurate token count for the entire prompt, calculated using the same logic as the `chat()` method.
+    -   `zones`: A dictionary with up to two keys:
+        -   **`system_context`**: Present if there is any system-level content. It contains:
+            -   `tokens`: The total token count for the **entire combined system block** (e.g., `!@>system:\n...\n`).
+            -   `content`: The full string content of the system block, showing exactly how all zones are merged.
+            -   `breakdown`: A sub-dictionary showing the raw text of each individual component (e.g., `system_prompt`, `memory`, `user_data_zone`) that was used to build the `content`.
+        -   **`message_history`**: Present if there are messages in the branch. It contains:
+            -   `tokens`: The total token count for the message history part of the prompt.
+            -   `content`: The full string of the formatted message history.
+            -   `message_count`: The number of messages included in the history.
+
+-   **Use Case:** Essential for debugging context issues, visualizing how different data zones contribute to the final prompt, and monitoring token consumption.
 
 ```python
 import json
+
+# Assuming 'discussion' is an LollmsDiscussion object with some data
+discussion.system_prompt = "You are a helpful AI."
+discussion.user_data_zone = "User is named Bob."
+discussion.add_message(sender="user", content="Hello!")
+discussion.add_message(sender="assistant", content="Hi Bob!")
 
 status = discussion.get_context_status()
 print(json.dumps(status, indent=2))
 
 # Expected Output Structure:
 # {
-#   "max_tokens": 8192,
-#   "current_tokens": 521,
+#   "max_tokens": null,
+#   "current_tokens": 46,
 #   "zones": {
-#     "system_prompt": {
-#       "content": "You are a helpful assistant.",
-#       "tokens": 12
-#     },
-#     "memory": {
-#       "content": "User's favorite color is blue.",
-#       "tokens": 15
+#     "system_context": {
+#       "content": "You are a helpful AI.\n\n-- User Data Zone --\nUser is named Bob.",
+#       "tokens": 25,
+#       "breakdown": {
+#         "system_prompt": "You are a helpful AI.",
+#         "user_data_zone": "User is named Bob."
+#       }
 #     },
 #     "message_history": {
-#       "content": "!@>user:\nHi there!\n!@>assistant:\nHello! How can I help?\n",
-#       "tokens": 494,
+#       "content": "!@>user:\nHello!\n!@>assistant:\nHi Bob!\n",
+#       "tokens": 21,
 #       "message_count": 2
 #     }
 #   }

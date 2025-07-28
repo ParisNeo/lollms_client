@@ -352,8 +352,11 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
 
     def load_model(self, model_name_or_path: str) -> bool:
-        resolved_model_path = self._resolve_model_path(model_name_or_path)
-        
+        try:
+            resolved_model_path = self._resolve_model_path(model_name_or_path)
+        except Exception as ex:
+            trace_exception(ex)
+            return False
         # Determine the clip_model_path for this server instance
         # Priority: 1. Explicit `clip_model_path` from init (if exists) 2. Auto-detection
         final_clip_model_path: Optional[Path] = None

@@ -1251,19 +1251,16 @@ class LollmsDiscussion:
             text_to_count = "\n".join(full_content)
 
         return self.lollmsClient.count_tokens(text_to_count)
-
     def get_context_status(self, branch_tip_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Returns a detailed breakdown of the context size and its components.
 
-        This provides a comprehensive snapshot of the context usage, including the
-        content and token count for each part of the prompt (system prompt, data zones,
-        pruning summary, and message history). The token counts are based on the
-        "lollms_text" export format, which is the format used for pruning calculations.
+        This provides a comprehensive snapshot of the context usage. It accurately calculates
+        the token count of the combined system context (prompt, all data zones, summary)
+        and the message history, reflecting how the `lollms_text` export format works.
 
         Args:
-            branch_tip_id: The ID of the message branch to measure. Defaults
-                           to the active branch.
+            branch_tip_id: The ID of the message branch to measure. Defaults to the active branch.
 
         Returns:
             A dictionary with a detailed breakdown:
@@ -1271,72 +1268,71 @@ class LollmsDiscussion:
                 "max_tokens": int | None,
                 "current_tokens": int,
                 "zones": {
-                    "system_prompt": {"content": str, "tokens": int},
-                    "memory": {"content": str, "tokens": int},
-                    "user_data_zone": {"content": str, "tokens": int},
-                    "discussion_data_zone": {"content": str, "tokens": int},
-                    "personality_data_zone": {"content": str, "tokens": int},
-                    "pruning_summary": {"content": str, "tokens": int},
-                    "message_history": {"content": str, "tokens": int, "message_count": int}
+                    "system_context": {
+                        "content": str,
+                        "tokens": int,
+                        "breakdown": {
+                            "system_prompt": str,
+                            "memory": str,
+                            ...
+                        }
+                    },
+                    "message_history": {
+                        "content": str,
+                        "tokens": int,
+                        "message_count": int
+                    }
                 }
             }
-            Zones are only included if they contain content.
+            Zones and breakdown components are only included if they contain content.
         """
         result = {
             "max_tokens": self.max_context_size,
             "current_tokens": 0,
             "zones": {}
         }
-        total_tokens = 0
 
-        # 1. System Prompt
+        # --- 1. Assemble and Tokenize the Entire System Context Block ---
         system_prompt_text = (self._system_prompt or "").strip()
-        if system_prompt_text:
-            # We count tokens for the full block as it would appear in the prompt
-            full_block = f"!@>system:\n{system_prompt_text}\n"
-            tokens = self.lollmsClient.count_tokens(full_block)
-            result["zones"]["system_prompt"] = {
-                "content": system_prompt_text,
-                "tokens": tokens
-            }
-            total_tokens += tokens
-            
-        # 2. All Data Zones
-        zones_to_process = {
-            "memory": self.memory,
-            "user_data_zone": self.user_data_zone,
-            "discussion_data_zone": self.discussion_data_zone,
-            "personality_data_zone": self.personality_data_zone,
-        }
-
-        for name, content in zones_to_process.items():
-            content_text = (content or "").strip()
-            if content_text:
-                # Mimic the formatting from get_full_data_zone for accurate token counting
-                header = f"-- {name.replace('_', ' ').title()} --\n"
-                full_block = f"{header}{content_text}"
-                # In lollms_text format, zones are part of the system message, so we add separators
-                # This counts the standalone block.
-                tokens = self.lollmsClient.count_tokens(full_block)
-                result["zones"][name] = {
-                    "content": content_text,
-                    "tokens": tokens
-                }
-                # Note: The 'export' method combines these into one system prompt.
-                # For this breakdown, we count them separately. The total will be a close approximation.
-
-        # 3. Pruning Summary
-        pruning_summary_text = (self.pruning_summary or "").strip()
-        if pruning_summary_text and self.pruning_point_id:
-            full_block = f"!@>system:\n--- Conversation Summary ---\n{pruning_summary_text}\n"
-            tokens = self.lollmsClient.count_tokens(full_block)
-            result["zones"]["pruning_summary"] = {
-                "content": pruning_summary_text,
-                "tokens": tokens
-            }
-            total_tokens += tokens
+        data_zone_text = self.get_full_data_zone() # This already formats all zones correctly
         
-        # 4. Message History
+        pruning_summary_text = ""
+        if self.pruning_summary and self.pruning_point_id:
+            pruning_summary_text = f"--- Conversation Summary ---\n{self.pruning_summary.strip()}"
+
+        # Combine all parts that go into the system block, separated by newlines
+        full_system_content_parts = [
+            part for part in [system_prompt_text, data_zone_text, pruning_summary_text] if part
+        ]
+        full_system_content = "\n\n".join(full_system_content_parts).strip()
+
+        if full_system_content:
+            # Create the final system block as it would be exported
+            system_block = f"!@>system:\n{full_system_content}\n"
+            system_tokens = self.lollmsClient.count_tokens(system_block)
+            
+            # Create the breakdown for user visibility
+            breakdown = {}
+            if system_prompt_text:
+                breakdown["system_prompt"] = system_prompt_text
+            if self.memory and self.memory.strip():
+                breakdown["memory"] = self.memory.strip()
+            if self.user_data_zone and self.user_data_zone.strip():
+                breakdown["user_data_zone"] = self.user_data_zone.strip()
+            if self.discussion_data_zone and self.discussion_data_zone.strip():
+                breakdown["discussion_data_zone"] = self.discussion_data_zone.strip()
+            if self.personality_data_zone and self.personality_data_zone.strip():
+                breakdown["personality_data_zone"] = self.personality_data_zone.strip()
+            if self.pruning_summary and self.pruning_summary.strip():
+                breakdown["pruning_summary"] = self.pruning_summary.strip()
+
+            result["zones"]["system_context"] = {
+                "content": full_system_content,
+                "tokens": system_tokens,
+                "breakdown": breakdown
+            }
+
+        # --- 2. Assemble and Tokenize the Message History Block ---
         branch_tip_id = branch_tip_id or self.active_branch_id
         messages_text = ""
         message_count = 0
@@ -1373,10 +1369,10 @@ class LollmsDiscussion:
                 "tokens": tokens,
                 "message_count": message_count
             }
-            total_tokens += tokens
 
-        # Finalize the total count. This re-calculates based on the actual export format
-        # for maximum accuracy, as combining zones can slightly change tokenization.
+        # --- 3. Finalize the Total Count ---
+        # This remains the most accurate way to get the final count, as it uses the
+        # exact same export logic as the chat method.
         result["current_tokens"] = self.count_discussion_tokens("lollms_text", branch_tip_id)
 
         return result
