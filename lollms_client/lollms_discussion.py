@@ -1180,6 +1180,7 @@ class LollmsDiscussion:
                 "- Key decisions or conclusions reached.\n"
                 "- Important entities, projects, or topics mentioned that are likely to recur.\n"
                 "Format the output as a concise list of bullet points. Be brief and factual. "
+                "Do not repeat information that is already in the User Data Zone or the Memory"
                 "If no new, significant long-term information is present, output the single word: 'NOTHING'."
             )
             
