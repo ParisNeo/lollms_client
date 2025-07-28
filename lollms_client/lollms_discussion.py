@@ -1273,8 +1273,8 @@ class LollmsDiscussion:
                         "content": str,
                         "tokens": int,
                         "breakdown": {
-                            "system_prompt": str,
-                            "memory": str,
+                            "system_prompt": {"content": str, "tokens": int},
+                            "memory": {"content": str, "tokens": int},
                             ...
                         }
                     },
@@ -1292,40 +1292,66 @@ class LollmsDiscussion:
             "current_tokens": 0,
             "zones": {}
         }
+        tokenizer = self.lollmsClient.count_tokens
 
         # --- 1. Assemble and Tokenize the Entire System Context Block ---
         system_prompt_text = (self._system_prompt or "").strip()
-        data_zone_text = self.get_full_data_zone() # This already formats all zones correctly
-        
-        pruning_summary_text = ""
-        if self.pruning_summary and self.pruning_point_id:
-            pruning_summary_text = f"--- Conversation Summary ---\n{self.pruning_summary.strip()}"
+        data_zone_text = self.get_full_data_zone()
+        pruning_summary_content = (self.pruning_summary or "").strip()
 
-        # Combine all parts that go into the system block, separated by newlines
+        pruning_summary_block = ""
+        if pruning_summary_content and self.pruning_point_id:
+            pruning_summary_block = f"--- Conversation Summary ---\n{pruning_summary_content}"
+
         full_system_content_parts = [
-            part for part in [system_prompt_text, data_zone_text, pruning_summary_text] if part
+            part for part in [system_prompt_text, data_zone_text, pruning_summary_block] if part
         ]
         full_system_content = "\n\n".join(full_system_content_parts).strip()
 
         if full_system_content:
-            # Create the final system block as it would be exported
             system_block = f"!@>system:\n{full_system_content}\n"
-            system_tokens = self.lollmsClient.count_tokens(system_block)
+            system_tokens = tokenizer(system_block)
             
-            # Create the breakdown for user visibility
             breakdown = {}
             if system_prompt_text:
-                breakdown["system_prompt"] = system_prompt_text
-            if self.memory and self.memory.strip():
-                breakdown["memory"] = self.memory.strip()
-            if self.user_data_zone and self.user_data_zone.strip():
-                breakdown["user_data_zone"] = self.user_data_zone.strip()
-            if self.discussion_data_zone and self.discussion_data_zone.strip():
-                breakdown["discussion_data_zone"] = self.discussion_data_zone.strip()
-            if self.personality_data_zone and self.personality_data_zone.strip():
-                breakdown["personality_data_zone"] = self.personality_data_zone.strip()
-            if self.pruning_summary and self.pruning_summary.strip():
-                breakdown["pruning_summary"] = self.pruning_summary.strip()
+                breakdown["system_prompt"] = {
+                    "content": system_prompt_text,
+                    "tokens": tokenizer(system_prompt_text)
+                }
+
+            memory_text = (self.memory or "").strip()
+            if memory_text:
+                breakdown["memory"] = {
+                    "content": memory_text,
+                    "tokens": tokenizer(memory_text)
+                }
+
+            user_data_text = (self.user_data_zone or "").strip()
+            if user_data_text:
+                breakdown["user_data_zone"] = {
+                    "content": user_data_text,
+                    "tokens": tokenizer(user_data_text)
+                }
+            
+            discussion_data_text = (self.discussion_data_zone or "").strip()
+            if discussion_data_text:
+                breakdown["discussion_data_zone"] = {
+                    "content": discussion_data_text,
+                    "tokens": tokenizer(discussion_data_text)
+                }
+
+            personality_data_text = (self.personality_data_zone or "").strip()
+            if personality_data_text:
+                breakdown["personality_data_zone"] = {
+                    "content": personality_data_text,
+                    "tokens": tokenizer(personality_data_text)
+                }
+
+            if pruning_summary_content:
+                breakdown["pruning_summary"] = {
+                    "content": pruning_summary_content,
+                    "tokens": tokenizer(pruning_summary_content)
+                }
 
             result["zones"]["system_context"] = {
                 "content": full_system_content,
@@ -1341,7 +1367,6 @@ class LollmsDiscussion:
             branch = self.get_branch(branch_tip_id)
             messages_to_render = branch
             
-            # Adjust for pruning to get the active set of messages
             if self.pruning_summary and self.pruning_point_id:
                 pruning_index = -1
                 for i, msg in enumerate(branch):
@@ -1364,7 +1389,7 @@ class LollmsDiscussion:
             message_count = len(messages_to_render)
 
         if messages_text:
-            tokens = self.lollmsClient.count_tokens(messages_text)
+            tokens = tokenizer(messages_text)
             result["zones"]["message_history"] = {
                 "content": messages_text,
                 "tokens": tokens,
@@ -1372,11 +1397,10 @@ class LollmsDiscussion:
             }
 
         # --- 3. Finalize the Total Count ---
-        # This remains the most accurate way to get the final count, as it uses the
-        # exact same export logic as the chat method.
         result["current_tokens"] = self.count_discussion_tokens("lollms_text", branch_tip_id)
 
         return result
+    
     def switch_to_branch(self, branch_id):
         self.active_branch_id = branch_id
 

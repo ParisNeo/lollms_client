@@ -147,9 +147,6 @@ class LollmsClient():
             available = self.binding_manager.get_available_bindings()
             raise ValueError(f"Failed to create LLM binding: {binding_name}. Available: {available}")
 
-        # Determine the effective host address (use LLM binding's if initial was None)
-        effective_host_address = self.host_address
-
         # --- Modality Binding Setup ---
         self.tts_binding_manager = LollmsTTSBindingManager(tts_bindings_dir)
         self.tti_binding_manager = LollmsTTIBindingManager(tti_bindings_dir)
@@ -2961,7 +2958,6 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         callback("Deep analysis complete.", MSG_TYPE.MSG_TYPE_STEP_END)
         return final_output
 
-
     def summarize(
         self,
         text_to_summarize: str,
@@ -2990,6 +2986,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                                           is not lost at the boundaries. Defaults to 250.
             streaming_callback (Optional[Callable], optional): A callback function to receive real-time updates
                                                              on the process (e.g., which chunk is being processed).
+                                                             It receives a message, a message type, and optional metadata.
                                                              Defaults to None.
             **kwargs: Additional keyword arguments to be passed to the generation method (e.g., temperature, top_p).
 
@@ -3004,12 +3001,17 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         
         if len(tokens) <= chunk_size_tokens:
             if streaming_callback:
-                streaming_callback("Text is short enough for a single summary.", MSG_TYPE.MSG_TYPE_STEP)
+                streaming_callback("Text is short enough for a single summary.", MSG_TYPE.MSG_TYPE_STEP, {"progress": 0})
             
             prompt_objective = contextual_prompt or "Provide a comprehensive summary of the following text."
             final_prompt = f"{prompt_objective}\n\n--- Text to Summarize ---\n{text_to_summarize}"
             
-            return self.generate_text(final_prompt, **kwargs)
+            summary = self.generate_text(final_prompt, **kwargs)
+            
+            if streaming_callback:
+                streaming_callback("Summary generated.", MSG_TYPE.MSG_TYPE_STEP, {"progress": 100})
+            
+            return summary
 
         # --- Stage 1: Chunking and Independent Summarization ---
         chunks = []
@@ -3021,13 +3023,21 @@ Provide the final aggregated answer in {output_format} format, directly addressi
 
         chunk_summaries = []
         
+        # Total steps include each chunk plus the final synthesis step
+        total_steps = len(chunks) + 1
+        
         # Define the prompt for summarizing each chunk
         summarization_objective = contextual_prompt or "Summarize the key points of the following text excerpt."
         chunk_summary_prompt_template = f"{summarization_objective}\n\n--- Text Excerpt ---\n{{chunk_text}}"
 
         for i, chunk in enumerate(chunks):
+            progress_before = (i / total_steps) * 100
             if streaming_callback:
-                streaming_callback(f"Summarizing chunk {i + 1} of {len(chunks)}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"chunk_{i+1}"})
+                streaming_callback(
+                    f"Summarizing chunk {i + 1} of {len(chunks)}...", 
+                    MSG_TYPE.MSG_TYPE_STEP_START, 
+                    {"id": f"chunk_{i+1}", "progress": progress_before}
+                )
 
             prompt = chunk_summary_prompt_template.format(chunk_text=chunk)
             
@@ -3035,8 +3045,14 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 # Generate summary for the current chunk
                 chunk_summary = self.generate_text(prompt, **kwargs)
                 chunk_summaries.append(chunk_summary)
+                
+                progress_after = ((i + 1) / total_steps) * 100
                 if streaming_callback:
-                    streaming_callback(f"Chunk {i + 1} summarized.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": f"chunk_{i+1}", "summary_snippet": chunk_summary[:100]})
+                    streaming_callback(
+                        f"Chunk {i + 1} summarized. Progress: {progress_after:.0f}%", 
+                        MSG_TYPE.MSG_TYPE_STEP_END, 
+                        {"id": f"chunk_{i+1}", "summary_snippet": chunk_summary[:100], "progress": progress_after}
+                    )
             except Exception as e:
                 trace_exception(e)
                 if streaming_callback:
@@ -3045,8 +3061,13 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 chunk_summaries.append(f"[Error summarizing chunk {i+1}]")
 
         # --- Stage 2: Final Synthesis of All Chunk Summaries ---
+        progress_before_synthesis = (len(chunks) / total_steps) * 100
         if streaming_callback:
-            streaming_callback("Synthesizing all chunk summaries into a final version...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "final_synthesis"})
+            streaming_callback(
+                "Synthesizing all chunk summaries into a final version...", 
+                MSG_TYPE.MSG_TYPE_STEP_START, 
+                {"id": "final_synthesis", "progress": progress_before_synthesis}
+            )
 
         combined_summaries = "\n\n---\n\n".join(chunk_summaries)
         
@@ -3064,7 +3085,11 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         final_summary = self.generate_text(final_synthesis_prompt, **kwargs)
         
         if streaming_callback:
-            streaming_callback("Final summary synthesized.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "final_synthesis"})
+            streaming_callback(
+                "Final summary synthesized.", 
+                MSG_TYPE.MSG_TYPE_STEP_END, 
+                {"id": "final_synthesis", "progress": 100}
+            )
 
         return final_summary.strip()
 
