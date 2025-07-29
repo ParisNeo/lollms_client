@@ -1574,25 +1574,25 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         
         # Add the new put_code_in_buffer tool definition
         available_tools.append({
-            "name": "put_code_in_buffer",
+            "name": "local_tools::put_code_in_buffer",
             "description": """Generates and stores code into a buffer to be used by another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use put_code_in_buffer. put_code_in_buffer do not execute the code nor does it audit it.""",
             "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}, "language": {"type": "string", "description": "The programming language of the generated code. By default it uses python."}}, "required": ["prompt"]}
         })
         available_tools.append({
-            "name": "view_generated_code",
+            "name": "local_tools::view_generated_code",
             "description": """Views the code that was generated and stored to the buffer. You need to have a valid uuid of the generated code.""",
             "input_schema": {"type": "object", "properties": {"code_id": {"type": "string", "description": "The case sensitive uuid of the generated code."}}, "required": ["uuid"]}
         })
         # Add the new refactor_scratchpad tool definition
         available_tools.append({
-            "name": "refactor_scratchpad",
+            "name": "local_tools::refactor_scratchpad",
             "description": "Rewrites the scratchpad content to clean it and reorganize it. Only use if the scratchpad is messy or contains too much information compared to what you need.",
             "input_schema": {"type": "object", "properties": {}}
         })
 
         formatted_tools_list = "\n".join([f"**{t['name']}**:\n{t['description']}\ninput schema:\n{json.dumps(t['input_schema'])}" for t in available_tools])
-        formatted_tools_list += "\n**request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent. this tool has no parameters."
-        formatted_tools_list += "\n**final_answer**:\nUse when you are ready to respond to the user. this tool has no parameters."
+        formatted_tools_list += "\n**local_tools::request_clarification**:\nUse if the user's request is ambiguous and you can not infer a clear idea of his intent. this tool has no parameters."
+        formatted_tools_list += "\n**local_tools::final_answer**:\nUse when you are ready to respond to the user. this tool has no parameters."
 
         if discovery_step_id: log_event(f"**Discovering tools** found {len(available_tools)} tools",MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id)
 
@@ -1618,15 +1618,16 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
     - Does the latest observation completely fulfill the user's original request?
     - If YES, your next action MUST be to use the `final_answer` tool.
     - If NO, what is the single next logical step needed? This may involve writing code first with `put_code_in_buffer`, then using another tool.
-    - If you are stuck or the request is ambiguous, use `request_clarification`.
+    - If you are stuck or the request is ambiguous, use `local_tools::request_clarification`.
 3.  **ACT:** Formulate your decision as a JSON object.
+** Important ** Always use this format alias::tool_name to call the tool
 """
                 action_template = {
                     "thought": "My detailed analysis of the last observation and my reasoning for the next action and how it integrates with my global plan.",
                     "action": {
-                        "tool_name": "The single tool to use (e.g., 'put_code_in_buffer', 'time_machine::get_current_time', 'final_answer').",
+                        "tool_name": "The single tool to use (e.g., 'local_tools::put_code_in_buffer', 'local_tools::final_answer').",
                         "tool_params": {"param1": "value1"},
-                        "clarification_question": "(string, ONLY if tool_name is 'request_clarification')"
+                        "clarification_question": "(string, ONLY if tool_name is 'local_tools::request_clarification')"
                     }
                 }
                 if debug: log_prompt(reasoning_prompt_template, f"REASONING PROMPT (Step {i+1})")
@@ -1664,18 +1665,18 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     break
                 
                 # --- Handle special, non-executing tools ---
-                if tool_name == "request_clarification":
+                if tool_name == "local_tools::request_clarification":
                     # Handle clarification...
                     return {"final_answer": action.get("clarification_question", "Could you please provide more details?"), "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": True, "error": None}
 
-                if tool_name == "final_answer":
+                if tool_name == "local_tools::final_answer":
                     current_scratchpad += f"\n\n### Step {i+1}: Action\n- **Action:** Decided to formulate the final answer."
                     log_event("**Action**: Formulate final answer.", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                     if reasoning_step_id: log_event(f"**Reasoning Step {i+1}/{max_reasoning_steps}**",MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
                     break
 
                 # --- Handle the `put_code_in_buffer` tool specifically ---
-                if tool_name == 'put_code_in_buffer':
+                if tool_name == 'local_tools::put_code_in_buffer':
                     code_gen_id = log_event(f"Generating code...", MSG_TYPE.MSG_TYPE_STEP_START, metadata={"name": "put_code_in_buffer", "id": "gencode"})
                     code_prompt = tool_params.get("prompt", "Generate the requested code.")
                     
@@ -1694,7 +1695,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     if code_gen_id: log_event(f"Generating code...", MSG_TYPE.MSG_TYPE_TOOL_CALL, metadata={"id": code_gen_id, "result": tool_result})
                     if reasoning_step_id: log_event(f"**Reasoning Step {i+1}/{max_reasoning_steps}**", MSG_TYPE.MSG_TYPE_STEP_END, event_id= reasoning_step_id)
                     continue # Go to the next reasoning step immediately
-                if tool_name == 'view_generated_code':
+                if tool_name == 'local_tools::view_generated_code':
                     code_id = tool_params.get("code_id")
                     if code_id:
                         tool_result = {"status": "success", "code_id": code_id, "generated_code":generated_code_store[code_uuid]}
@@ -1704,7 +1705,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
                     log_event(f"Result from `{tool_name}`:\n```\n{generated_code_store[code_uuid]}\n```\n", MSG_TYPE.MSG_TYPE_TOOL_CALL, metadata={"id": code_gen_id, "result": tool_result})
                     continue
-                if tool_name == 'refactor_scratchpad':
+                if tool_name == 'local_tools::refactor_scratchpad':
                     scratchpad_cleaning_prompt = f"""Enhance this scratchpad content to be more organized and comprehensive. Keep relevant experience information and remove any useless redundancies. Try to log learned things from the context so that you won't make the same mistakes again. Do not remove the main objective information or any crucial information that may be useful for the next iterations. Answer directly with the new scratchpad content without any comments.
 --- YOUR INTERNAL SCRATCHPAD (Work History & Analysis) ---
 {current_scratchpad}
