@@ -2962,8 +2962,8 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         self,
         text_to_summarize: str,
         contextual_prompt: Optional[str] = None,
-        chunk_size_tokens: int = 1500,
-        overlap_tokens: int = 250,
+        chunk_size_tokens: int|None = None,
+        overlap_tokens: int = 0,
         streaming_callback: Optional[Callable] = None,
         **kwargs
     ) -> str:
@@ -2998,6 +2998,8 @@ Provide the final aggregated answer in {output_format} format, directly addressi
 
         # Use the binding's tokenizer for accurate chunking
         tokens = self.binding.tokenize(text_to_summarize)
+        if chunk_size_tokens is None:
+            chunk_size_tokens = self.default_ctx_size//2
         
         if len(tokens) <= chunk_size_tokens:
             if streaming_callback:
@@ -3028,7 +3030,11 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         
         # Define the prompt for summarizing each chunk
         summarization_objective = contextual_prompt or "Summarize the key points of the following text excerpt."
-        chunk_summary_prompt_template = f"{summarization_objective}\n\n--- Text Excerpt ---\n{{chunk_text}}"
+        system_prompt = f"You are a sequential document summary agent.\nThe process is done in two phases:\n** Phase1 : ** sequencially extracting information from the text chunks and adding them to the scratchpad.\n** Phase2: ** synthesizing a comprehensive summary given the objective formatting instructions if applicable.\nWe are now performing ** Phase 1 **, and we are processing chunk number {{chunk_id}}. Your job is to perform chunk summary given previous chunks summaries placed in scratchpad.\nAdd the information to the scratchpad while strictly adhering to the Global objective extraction instructions:\n-- Sequencial Scratchpad --\n{{scratchpad}}\n-- Important --\nRespond only with the chunk summary taking into consideration the previous context for continuity.\nStrictly adhere to the Global objective content for the extraction phase.\nDo not add comments.\n"
+        if "system_prompt" in kwargs:
+            system_prompt += kwargs["system_prompt"]
+            del kwargs["system_prompt"]
+        chunk_summary_prompt_template = f"--- Global objective ---\n{summarization_objective}\n\n--- Text Excerpt ---\n{{chunk_text}}"
 
         for i, chunk in enumerate(chunks):
             progress_before = (i / total_steps) * 100
@@ -3040,10 +3046,10 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 )
 
             prompt = chunk_summary_prompt_template.format(chunk_text=chunk)
-            
+            processed_system_prompt = system_prompt.format(chunk_id=i,scratchpad="\n\n---\n\n".join(chunk_summaries))
             try:
                 # Generate summary for the current chunk
-                chunk_summary = self.generate_text(prompt, **kwargs)
+                chunk_summary = self.generate_text(prompt, system_prompt=processed_system_prompt, **kwargs)
                 chunk_summaries.append(chunk_summary)
                 
                 progress_after = ((i + 1) / total_steps) * 100
@@ -3073,16 +3079,16 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         
         # Define the prompt for the final synthesis
         synthesis_objective = contextual_prompt or "Create a single, final, coherent, and comprehensive summary."
+        system_prompt = f"You are a sequential document summary agent.\nThe process is done in two phases:\n** Phase1 : ** sequencially extracting information from the text chunks and adding them to the scratchpad.\n** Phase2: ** synthesizing a comprehensive summary given the objective formatting instructions if applicable.\nWe are now performing ** Phase 2 **. Your job is to perform final synthesis from the  scratchpad chunks summaries.\nStrictly adhere to the Global objective content for the formatting phase.\nDo not add comments.\n"
         final_synthesis_prompt = (
-            "You are a master synthesizer. You will be given a series of partial summaries from a long document. "
-            f"Your task is to synthesize them into one high-quality summary. {synthesis_objective}\n\n"
+            f"--- Global objective ---\n{synthesis_objective}\n\n"
             "Please remove any redundancy and ensure a smooth, logical flow.\n\n"
-            "--- Collection of Summaries ---\n"
+            "--- Scratchpad ---\n"
             f"{combined_summaries}\n\n"
             "--- Final Comprehensive Summary ---"
         )
 
-        final_summary = self.generate_text(final_synthesis_prompt, **kwargs)
+        final_summary = self.generate_text(final_synthesis_prompt, system_prompt=system_prompt, **kwargs)
         
         if streaming_callback:
             streaming_callback(
