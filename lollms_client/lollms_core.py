@@ -2959,9 +2959,9 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         callback("Deep analysis complete.", MSG_TYPE.MSG_TYPE_STEP_END)
         return final_output
 
-    def summarize(
+    def long_context_processing(
         self,
-        text_to_summarize: str,
+        text_to_process: str,
         contextual_prompt: Optional[str] = None,
         chunk_size_tokens: int|None = None,
         overlap_tokens: int = 0,
@@ -2976,7 +2976,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         2.  **Synthesize:** It then takes all the chunk summaries and performs a final summarization pass to create a single, coherent, and comprehensive summary.
 
         Args:
-            text_to_summarize (str): The long text content to be summarized.
+            text_to_process (str): The long text content to be summarized.
             contextual_prompt (Optional[str], optional): A specific instruction to guide the summary's focus. 
                                                        For example, "Summarize the text focusing on the financial implications."
                                                        Defaults to None.
@@ -2994,27 +2994,37 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         Returns:
             str: The final, comprehensive summary of the text.
         """
-        if not text_to_summarize.strip():
+        if not text_to_process.strip():
             return ""
 
         # Use the binding's tokenizer for accurate chunking
-        tokens = self.binding.tokenize(text_to_summarize)
+        tokens = self.binding.tokenize(text_to_process)
         if chunk_size_tokens is None:
             chunk_size_tokens = self.default_ctx_size//2
         
         if len(tokens) <= chunk_size_tokens:
             if streaming_callback:
-                streaming_callback("Text is short enough for a single summary.", MSG_TYPE.MSG_TYPE_STEP, {"progress": 0})
+                streaming_callback("Text is short enough for a single process.", MSG_TYPE.MSG_TYPE_STEP, {"progress": 0})
+            system_prompt = ("You are a content processor expert.\n"
+                            "You perform tasks on the content as requested by the user.\n\n"
+                            "--- Content ---\n"
+                            f"{text_to_process}\n\n"
+                            "** Important **\n"
+                            "Strictly adhere to the user prompt.\n"
+                            "Do not add comments unless asked to do so.\n"
+                            )
+            if "system_prompt" in kwargs:
+                system_prompt += "-- Extra instructions --\n"+ kwargs["system_prompt"] +"\n"
+                del kwargs["system_prompt"]            
+            prompt_objective = contextual_prompt or "Provide a comprehensive summary of the content."
+            final_prompt = f"{prompt_objective}"
             
-            prompt_objective = contextual_prompt or "Provide a comprehensive summary of the following text."
-            final_prompt = f"{prompt_objective}\n\n--- Text to Summarize ---\n{text_to_summarize}"
-            
-            summary = self.generate_text(final_prompt, **kwargs)
+            processed_output = self.generate_text(final_prompt, system_prompt=system_prompt, **kwargs)
             
             if streaming_callback:
-                streaming_callback("Summary generated.", MSG_TYPE.MSG_TYPE_STEP, {"progress": 100})
+                streaming_callback("Content processed.", MSG_TYPE.MSG_TYPE_STEP, {"progress": 100})
             
-            return summary
+            return processed_output
 
         # --- Stage 1: Chunking and Independent Summarization ---
         chunks = []
@@ -3031,9 +3041,24 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         
         # Define the prompt for summarizing each chunk
         summarization_objective = contextual_prompt or "Summarize the key points of the following text excerpt."
-        system_prompt = f"You are a sequential document summary agent.\nThe process is done in two phases:\n** Phase1 : ** sequencially extracting information from the text chunks and adding them to the scratchpad.\n** Phase2: ** synthesizing a comprehensive summary given the objective formatting instructions if applicable.\nWe are now performing ** Phase 1 **, and we are processing chunk number {{chunk_id}}. Your job is to perform chunk summary given previous chunks summaries placed in scratchpad.\nAdd the information to the scratchpad while strictly adhering to the Global objective extraction instructions:\n-- Sequencial Scratchpad --\n{{scratchpad}}\n-- Important --\nRespond only with the chunk summary taking into consideration the previous context for continuity.\nStrictly adhere to the Global objective content for the extraction phase.\nDo not add comments.\n"
+        system_prompt = ("You are a sequential document processing agent.\n"
+                         "The process is done in two phases:\n"
+                         "** Phase1 : **\n"
+                         "Sequencially extracting information from the text chunks and adding them to the scratchpad.\n"
+                         "** Phase2: **\n"
+                         "Synthesizing a comprehensive Response using the scratchpad content given the objective formatting instructions if applicable.\n"
+                         "We are now performing ** Phase 1 **, and we are processing chunk number {{chunk_id}}.\n"
+                         "Your job is to extract information from the current chunk given previous chunks extracted information placed in scratchpad as well as the current chunk content.\n"
+                         "Add the information to the scratchpad while strictly adhering to the Global objective extraction instructions:\n"
+                         "-- Sequencial Scratchpad --\n"
+                         "{{scratchpad}}\n"
+                         "** Important **\n"
+                         "Respond only with the extracted information from the current chunk without repeating things that are already in the scratchpad.\n"
+                         "Strictly adhere to the Global objective content for the extraction phase.\n"
+                         "Do not add comments.\n"
+                        )
         if "system_prompt" in kwargs:
-            system_prompt += kwargs["system_prompt"]
+            system_prompt += "-- Extra instructions --\n"+ kwargs["system_prompt"] +"\n"
             del kwargs["system_prompt"]
         chunk_summary_prompt_template = f"--- Global objective ---\n{summarization_objective}\n\n--- Text Excerpt ---\n{{chunk_text}}"
 
@@ -3041,7 +3066,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             progress_before = (i / total_steps) * 100
             if streaming_callback:
                 streaming_callback(
-                    f"Summarizing chunk {i + 1} of {len(chunks)}...", 
+                    f"Processing chunk {i + 1} of {len(chunks)}...", 
                     MSG_TYPE.MSG_TYPE_STEP_START, 
                     {"id": f"chunk_{i+1}", "progress": progress_before}
                 )
@@ -3056,22 +3081,22 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 progress_after = ((i + 1) / total_steps) * 100
                 if streaming_callback:
                     streaming_callback(
-                        f"Chunk {i + 1} summarized. Progress: {progress_after:.0f}%", 
+                        f"Chunk {i + 1} processed. Progress: {progress_after:.0f}%", 
                         MSG_TYPE.MSG_TYPE_STEP_END, 
-                        {"id": f"chunk_{i+1}", "summary_snippet": chunk_summary[:100], "progress": progress_after}
+                        {"id": f"chunk_{i+1}", "output_snippet": chunk_summary[:100], "progress": progress_after}
                     )
             except Exception as e:
                 trace_exception(e)
                 if streaming_callback:
-                    streaming_callback(f"Failed to summarize chunk {i+1}: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION)
+                    streaming_callback(f"Failed to process chunk {i+1}: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION)
                 # Still add a placeholder to not break the chain
-                chunk_summaries.append(f"[Error summarizing chunk {i+1}]")
+                chunk_summaries.append(f"[Error processing chunk {i+1}]")
 
         # --- Stage 2: Final Synthesis of All Chunk Summaries ---
         progress_before_synthesis = (len(chunks) / total_steps) * 100
         if streaming_callback:
             streaming_callback(
-                "Synthesizing all chunk summaries into a final version...", 
+                "Processing the scratchpad content into a final version...", 
                 MSG_TYPE.MSG_TYPE_STEP_START, 
                 {"id": "final_synthesis", "progress": progress_before_synthesis}
             )
@@ -3080,16 +3105,29 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         
         # Define the prompt for the final synthesis
         synthesis_objective = contextual_prompt or "Create a single, final, coherent, and comprehensive summary."
-        system_prompt = f"You are a sequential document summary agent.\nThe process is done in two phases:\n** Phase1 : ** sequencially extracting information from the text chunks and adding them to the scratchpad.\n** Phase2: ** synthesizing a comprehensive summary given the objective formatting instructions if applicable.\nWe are now performing ** Phase 2 **. Your job is to perform final synthesis from the  scratchpad chunks summaries.\nStrictly adhere to the Global objective content for the formatting phase.\nDo not add comments.\n"
+        system_prompt = ("You are a sequential document processing agent.\n"
+                         "The process is done in two phases:\n"
+                         "** Phase1 : **\n"
+                         "Sequencially extracting information from the text chunks and adding them to the scratchpad.\n"
+                         "** Phase2: **\n"
+                         "Synthesizing a comprehensive Response using the scratchpad content given the objective formatting instructions if applicable.\n"
+                         "\n"
+                         "We are now performing ** Phase 2 **.\n"
+                         "Your job is to use the extracted information to fulfill the user prompt objectives.\n"
+                         "Make sure you respect the user formatting if provided and if not, then use markdown output format."
+                         "-- Sequencial Scratchpad --\n"
+                         f"{combined_summaries}\n"
+                         "** Important **\n"
+                         "Respond only with the requested task without extra comments unless told to.\n"
+                         "Strictly adhere to the Global objective content for the extraction phase.\n"
+                         "Do not add comments.\n"
+                        )
         final_synthesis_prompt = (
             f"--- Global objective ---\n{synthesis_objective}\n\n"
-            "Please remove any redundancy and ensure a smooth, logical flow.\n\n"
-            "--- Scratchpad ---\n"
-            f"{combined_summaries}\n\n"
-            "--- Final Comprehensive Summary ---"
+            "--- Final Response ---"
         )
 
-        final_summary = self.generate_text(final_synthesis_prompt, system_prompt=system_prompt, **kwargs)
+        final_answer = self.generate_text(final_synthesis_prompt, system_prompt=system_prompt, **kwargs)
         
         if streaming_callback:
             streaming_callback(
@@ -3098,7 +3136,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 {"id": "final_synthesis", "progress": 100}
             )
 
-        return final_summary.strip()
+        return final_answer.strip()
 
 def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators=True):
     """
