@@ -17,6 +17,7 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 
 *   🔌 **Versatile Binding System:** Seamlessly switch between different LLM backends (LoLLMs, Ollama, OpenAI, Llama.cpp, Transformers, vLLM, OpenLLM) without major code changes.
 *   🗣️ **Multimodal Support:** Interact with models capable of processing images and generate various outputs like speech (TTS) and images (TTI).
+*   🖼️ **Selective Image Activation:** Control which images in a message are active and sent to the model, allowing for fine-grained multimodal context management without deleting the original data.
 *   🤖 **Function Calling with MCP:** Empowers LLMs to use external tools and functions through the Model Context Protocol (MCP), with built-in support for local Python tool execution via `local_mcp` binding and its default tools (file I/O, internet search, Python interpreter, image generation).
 *   🎭 **Personalities as Agents:** Personalities can now define their own set of required tools (MCPs) and have access to static or dynamic knowledge bases (`data_source`), turning them into self-contained, ready-to-use agents.
 *   🚀 **Streaming & Callbacks:** Efficiently handle real-time text generation with customizable callback functions, including during MCP interactions.
@@ -377,6 +378,64 @@ print("------------------------------------------")
 3.  **`memorize()`:** After the user mentions their favorite language, `memorize()` is called. The LLM analyzes the last turn, identifies this new, important fact, and appends it to the `discussion.memory` zone.
 4.  **Recall:** In the final turn, when asked to recall the favorite language, the AI has access to the updated `memory` content within its system context and can correctly answer "Rust". This demonstrates true long-term, stateful memory.
 
+### Managing Multimodal Context: Activating and Deactivating Images
+
+When working with multimodal models, you can now control which images in a message are active and sent to the model. This is useful for focusing the AI's attention, saving tokens on expensive vision models, or allowing a user to correct which images are relevant.
+
+This is managed at the `LollmsMessage` level using the `toggle_image_activation()` method.
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from ascii_colors import ASCIIColors
+import base64
+from pathlib import Path
+
+# Helper to create a dummy image b64 string
+def create_dummy_image(text):
+    from PIL import Image, ImageDraw
+    img = Image.new('RGB', (100, 30), color = (73, 109, 137))
+    d = ImageDraw.Draw(img)
+    d.text((10,10), text, fill=(255,255,0))
+    buffer = Path("temp_img.png")
+    img.save(buffer, "PNG")
+    b64 = base64.b64encode(buffer.read_bytes()).decode('utf-8')
+    buffer.unlink()
+    return b64
+
+# --- 1. Setup ---
+lc = LollmsClient(binding_name="ollama", model_name="llava")
+discussion = LollmsDiscussion.create_new(lollms_client=lc)
+
+# --- 2. Add a message with multiple images ---
+img1_b64 = create_dummy_image("Image 1")
+img2_b64 = create_dummy_image("Image 2: Cat")
+img3_b64 = create_dummy_image("Image 3")
+
+discussion.add_message(
+    sender="user", 
+    content="What is in the second image?", 
+    images=[img1_b64, img2_b64, img3_b64]
+)
+user_message = discussion.get_messages()[-1]
+
+# --- 3. Check the initial state ---
+ASCIIColors.magenta("--- Initial State (All 3 Images Active) ---")
+status_before = discussion.get_context_status()
+print(f"Message History Text:\n{status_before['zones']['message_history']['content']}")
+
+# --- 4. Deactivate irrelevant images ---
+ASCIIColors.magenta("\n--- Deactivating images 1 and 3 ---")
+user_message.toggle_image_activation(index=0, active=False) # Deactivate first image
+user_message.toggle_image_activation(index=2, active=False) # Deactivate third image
+
+# --- 5. Check the new state ---
+ASCIIColors.magenta("\n--- New State (Only Image 2 is Active) ---")
+status_after = discussion.get_context_status()
+print(f"Message History Text:\n{status_after['zones']['message_history']['content']}")
+
+ASCIIColors.green("\nNotice the message now says '(1 image(s) attached)' instead of 3.")
+ASCIIColors.green("Only the active image will be sent to the multimodal LLM.")
+```
 
 ## Documentation
 
@@ -757,7 +816,7 @@ Contributions are welcome! Whether it's bug reports, feature suggestions, docume
 
 ## License
 
-This project is licensed under the **Apache 2.0 License**. See the [LICENSE](LICENSE) file for details (assuming you have a LICENSE file, if not, state "Apache 2.0 License").
+This project is licensed under the **Apache 2.0 License**. See the [LICENSE](LICENSE) file for details.
 
 ## Changelog
 
@@ -766,6 +825,8 @@ For a list of changes and updates, please refer to the [CHANGELOG.md](CHANGELOG.
 
 ---
 ### Phase 2: Update `docs/md/lollms_discussion.md`
+
+This more detailed document gets a new top-level section for the image management feature, providing a deeper explanation and a clear example.
 
 ```markdown
 # LollmsDiscussion Class
@@ -786,6 +847,9 @@ A `LollmsDiscussion` can be either **in-memory** or **database-backed**, offerin
 -   **Context Exporting:** The `export()` method formats the conversation history for various LLM backends (`openai_chat`, `ollama_chat`, `lollms_text`, `markdown`), ensuring compatibility.
 -   **Automatic Pruning:** To prevent exceeding the model's context window, it can automatically summarize older parts of the conversation without losing the original data.
 -   **Sophisticated Context Layering:** Manage conversation state with multiple, distinct data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field, allowing for rich and persistent context.
+-   **Stateful Memory:** Empower the AI to build a long-term memory of key facts using the `memorize()` method.
+-   **Context Inspection:** Get a detailed breakdown of the prompt context and token usage with `get_context_status()`.
+-   **Selective Image Activation:** Finely control which images in a message are sent to a multimodal model.
 
 ## Creating a Discussion
 
@@ -820,14 +884,14 @@ The main instruction set for the AI's persona and core task. It's the foundation
 - **Example:** `"You are a helpful and friendly assistant."`
 
 #### `memory`
-A special zone for storing long-term, cross-discussion information about the user or topics. It is designed to be built up over time.
+A special zone for storing long-term, cross-discussion information about the user or topics. It is designed to be built up over time using the `memorize()` method.
 - **Purpose:** To give the AI a persistent memory that survives across different chat sessions.
 - **Example:** `"User's name is Alex.\nUser's favorite programming language is Rust."`
 
 #### `user_data_zone`
 Holds information specific to the current user that might be relevant for the session.
 - **Purpose:** Storing user preferences, profile details, or session-specific goals.
--- **Example:** `"Current project: API development.\nUser is a beginner in Python."`
+- **Example:** `"Current project: API development.\nUser is a beginner in Python."`
 
 #### `discussion_data_zone`
 Contains context relevant only to the current discussion.
@@ -868,6 +932,80 @@ Rule 2: Use type hints.
 -   `metadata`: A dictionary for storing any custom metadata, like a title.
 -   `active_branch_id`: The ID of the message at the "tip" of the current conversation branch.
 -   `messages`: A list of all `LollmsMessage` objects in the discussion.
+
+## Multimodal Message Management
+
+Beyond text, `LollmsDiscussion` provides fine-grained control over multimodal inputs, specifically images. You can non-destructively activate or deactivate images within a message, which is useful for:
+
+-   **Focusing the AI's attention** on only the most relevant images for a specific query.
+-   **Saving costs and time** by not processing unnecessary images with expensive vision models.
+-   **Correcting context** if an initial query was ambiguous.
+
+This functionality is handled at the `LollmsMessage` level and is fully integrated into the `export`, `chat`, and `get_context_status` methods.
+
+### The `LollmsMessage` API for Images
+
+When you retrieve a message object from a discussion (e.g., `msg = discussion.get_messages()[-1]`), you can use these methods:
+
+-   `msg.toggle_image_activation(index, active=None)`: The primary method for changing an image's state.
+    -   `index`: The zero-based index of the image in the message's `images` list.
+    -   `active`: If set to `True` or `False`, it explicitly sets the image's state. If left as `None`, it toggles the current state (active becomes inactive, and vice-versa).
+-   `msg.get_active_images()`: Returns a list of base64 strings for *only* the currently active images. This is the method used internally by the export process.
+
+This system is fully **backwards-compatible**. If you load a discussion from an older database where messages don't have an `active_images` field, all images are considered active by default.
+
+### Example in Action
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion
+from ascii_colors import ASCIIColors
+import base64
+from pathlib import Path
+
+# Helper to create a dummy image b64 string
+def create_dummy_image(text):
+    from PIL import Image, ImageDraw
+    img = Image.new('RGB', (100, 30), color = (73, 109, 137))
+    d = ImageDraw.Draw(img)
+    d.text((10,10), text, fill=(255,255,0))
+    buffer = Path("temp_img.png")
+    img.save(buffer, "PNG")
+    b64 = base64.b64encode(buffer.read_bytes()).decode('utf-8')
+    buffer.unlink()
+    return b64
+
+# 1. Setup
+lc = LollmsClient(binding_name="ollama", model_name="llava")
+discussion = LollmsDiscussion.create_new(lollms_client=lc)
+
+# 2. Add a message with three images
+img1_b64 = create_dummy_image("Image 1")
+img2_b64 = create_dummy_image("Image 2: Cat")
+img3_b64 = create_dummy_image("Image 3")
+discussion.add_message(
+    sender="user", 
+    content="What is in the second image?", 
+    images=[img1_b64, img2_b64, img3_b64]
+)
+
+# 3. Get the message object and check initial state
+user_message = discussion.get_messages()[-1]
+ASCIIColors.magenta("--- Initial Export (All Images Active) ---")
+initial_export = discussion.export("markdown")
+print(initial_export)
+
+# 4. Deactivate the first and third images
+ASCIIColors.magenta("\n--- Deactivating irrelevant images ---")
+user_message.toggle_image_activation(index=0, active=False)
+user_message.toggle_image_activation(index=2, active=False)
+print("Images at index 0 and 2 are now inactive.")
+
+# 5. Check the export again to see the result
+ASCIIColors.magenta("\n--- New Export (Only One Image Active) ---")
+focused_export = discussion.export("markdown")
+print(focused_export)
+```
+When you run this, you'll see the markdown output for the first export references three images, while the second export only references the one remaining active image. The `chat()` method will behave the same way, only sending the active image(s) to the model.
 
 ## Main Methods
 

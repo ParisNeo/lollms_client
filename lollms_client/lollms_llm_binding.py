@@ -10,6 +10,7 @@ from typing import Optional, Dict, List
 from ascii_colors import trace_exception, ASCIIColors
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
+from lollms_client.lollms_utilities import ImageTokenizer
 import re
 class LollmsLLMBinding(ABC):
     """Abstract base class for all LOLLMS LLM bindings"""
@@ -197,6 +198,22 @@ class LollmsLLMBinding(ABC):
         """        
         pass
 
+    def count_image_tokens(self, image: str) -> int:
+        """
+        Estimate the number of tokens for an image using ImageTokenizer based on self.model_name.
+
+        Args:
+            image (str): Image to count tokens from. Either base64 string, path to image file, or URL.
+
+        Returns:
+            int: Estimated number of tokens for the image. Returns -1 on error.
+        """
+        try:
+            # Delegate token counting to ImageTokenizer
+            return ImageTokenizer(self.model_name).count_image_tokens(image)
+        except Exception as e:
+            ASCIIColors.warning(f"Could not estimate image tokens: {e}")
+            return -1
     @abstractmethod
     def embed(self, text: str, **kwargs) -> list:
         """

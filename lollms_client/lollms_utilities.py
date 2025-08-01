@@ -354,3 +354,136 @@ def process_ai_output(output, images, output_folder):
 
     return output
 
+import os
+import base64
+import requests
+from PIL import Image
+from io import BytesIO
+import math
+
+class ASCIIColors:
+    @staticmethod
+    def warning(message):
+        print(f"Warning: {message}")
+
+class ImageTokenizer:
+    def __init__(self, model_name: str):
+        self.model_name = model_name.lower()
+
+    def count_image_tokens(self, image: str) -> int:
+        """
+        Estimate the number of tokens for an image based on the model specified in self.model_name.
+
+        Args:
+            image (str): Image to count tokens from. Either base64 string, path to image file, or URL.
+
+        Returns:
+            int: Estimated number of tokens for the image. Returns -1 on error.
+        """
+        try:
+            # Load image and get dimensions
+            img = self._load_image(image)
+            if img is None:
+                return -1
+            width, height = img.size
+
+            # Model-specific token counting
+            if "phi-3-vision" in self.model_name:
+                # Phi-3-vision: 144 tokens per 336x336 patch
+                patch_size = 336
+                patches_x = math.ceil(width / patch_size)
+                patches_y = math.ceil(height / patch_size)
+                total_patches = patches_x * patches_y
+                return total_patches * 144
+
+            elif "gpt-4o" in self.model_name:
+                # GPT-4o: Estimate ~100 tokens per 224x224 patch (based on industry standards)
+                patch_size = 224
+                patches_x = math.ceil(width / patch_size)
+                patches_y = math.ceil(height / patch_size)
+                total_patches = patches_x * patches_y
+                return total_patches * 100
+
+            elif "claude" in self.model_name:
+                # Claude: Estimate ~150 tokens per 336x336 patch (based on similar models)
+                patch_size = 336
+                patches_x = math.ceil(width / patch_size)
+                patches_y = math.ceil(height / patch_size)
+                total_patches = patches_x * patches_y
+                return total_patches * 150
+
+            elif "gemini" in self.model_name:
+                # Gemini: Estimate ~128 tokens per 256x256 patch (based on industry standards)
+                patch_size = 256
+                patches_x = math.ceil(width / patch_size)
+                patches_y = math.ceil(height / patch_size)
+                total_patches = patches_x * patches_y
+                return total_patches * 128
+
+            elif "mistral" in self.model_name or "mixtral" in self.model_name:
+                # Mistral: Estimate ~120 tokens per 336x336 patch (based on similar models)
+                patch_size = 336
+                patches_x = math.ceil(width / patch_size)
+                patches_y = math.ceil(height / patch_size)
+                total_patches = patches_x * patches_y
+                return total_patches * 120
+
+            elif "llama" in self.model_name:
+                # Llama multimodal: Estimate ~100 tokens per 224x224 patch (based on CLIP-like models)
+                patch_size = 224
+                patches_x = math.ceil(width / patch_size)
+                patches_y = math.ceil(height / patch_size)
+                total_patches = patches_x * patches_y
+                return total_patches * 100
+
+            else:
+                # Fallback: Original byte-based estimation for unsupported models
+                CONSTANT = 0.5
+                if image.startswith("http://") or image.startswith("https://"):
+                    response = requests.get(image)
+                    response.raise_for_status()
+                    img_bytes = response.content
+                    size = len(img_bytes)
+                elif os.path.isfile(image):
+                    size = os.path.getsize(image)
+                elif image.startswith("data:image"):
+                    header, b64data = image.split(",", 1)
+                    img_bytes = base64.b64decode(b64data)
+                    size = len(img_bytes)
+                else:
+                    img_bytes = base64.b64decode(image)
+                    size = len(img_bytes)
+                return int(size * CONSTANT)
+
+        except Exception as e:
+            ASCIIColors.warning(f"Could not estimate image tokens: {e}")
+            return -1
+
+    def _load_image(self, image: str) -> Image.Image:
+        """
+        Load an image from a URL, file path, or base64 string and return a PIL Image object.
+
+        Args:
+            image (str): Image source (URL, file path, or base64 string).
+
+        Returns:
+            Image.Image: PIL Image object, or None if loading fails.
+        """
+        try:
+            if image.startswith("http://") or image.startswith("https://"):
+                response = requests.get(image)
+                response.raise_for_status()
+                img_bytes = response.content
+                return Image.open(BytesIO(img_bytes))
+            elif os.path.isfile(image):
+                return Image.open(image)
+            elif image.startswith("data:image"):
+                header, b64data = image.split(",", 1)
+                img_bytes = base64.b64decode(b64data)
+                return Image.open(BytesIO(img_bytes))
+            else:
+                img_bytes = base64.b64decode(image)
+                return Image.open(BytesIO(img_bytes))
+        except Exception as e:
+            ASCIIColors.warning(f"Could not load image: {e}")
+            return None

@@ -168,6 +168,7 @@ def create_dynamic_models(
 
         message_metadata = Column(JSON, nullable=True, default=dict)
         images = Column(JSON, nullable=True, default=list)
+        active_images = Column(JSON, nullable=True, default=list) # New: List of booleans for image activation state
         created_at = Column(DateTime, default=datetime.utcnow)
 
         @declared_attr
@@ -217,8 +218,9 @@ class LollmsDataManager:
             with self.engine.connect() as connection:
                 print("Checking for database schema upgrades...")
                 
+                # Discussions table migration
                 cursor = connection.execute(text("PRAGMA table_info(discussions)"))
-                columns = [row[1] for row in cursor.fetchall()]
+                columns = {row[1] for row in cursor.fetchall()}
                 
                 if 'pruning_summary' not in columns:
                     print("  -> Upgrading 'discussions' table: Adding 'pruning_summary' column.")
@@ -247,7 +249,15 @@ class LollmsDataManager:
                 if 'memory' not in columns:
                     print("  -> Upgrading 'discussions' table: Adding 'memory' column.")
                     connection.execute(text("ALTER TABLE discussions ADD COLUMN memory TEXT"))
-                
+
+                # Messages table migration
+                cursor = connection.execute(text("PRAGMA table_info(messages)"))
+                columns = {row[1] for row in cursor.fetchall()}
+
+                if 'active_images' not in columns:
+                    print("  -> Upgrading 'messages' table: Adding 'active_images' column.")
+                    connection.execute(text("ALTER TABLE messages ADD COLUMN active_images TEXT"))
+
                 print("Database schema is up to date.")
                 connection.commit() 
 
@@ -356,6 +366,51 @@ class LollmsMessage:
     def __repr__(self) -> str:
         """Provides a developer-friendly representation of the message."""
         return f"<LollmsMessage id={self.id} sender='{self.sender}'>"
+
+    def get_active_images(self) -> List[str]:
+        """
+        Returns a list of base64 strings for only the active images.
+        This is backwards-compatible with messages created before this feature.
+        """
+        if not self.images:
+            return []
+        
+        # Retrocompatibility: if active_images is not set, all images are active.
+        if self.active_images is None or not isinstance(self.active_images, list):
+            return self.images
+
+        # Filter images based on the active_images flag list
+        return [
+            img for i, img in enumerate(self.images) 
+            if i < len(self.active_images) and self.active_images[i]
+        ]
+
+    def toggle_image_activation(self, index: int, active: Optional[bool] = None):
+        """
+        Toggles or sets the activation status of an image at a given index.
+        This change is committed to the database if the discussion is DB-backed.
+        
+        Args:
+            index: The index of the image in the 'images' list.
+            active: If provided, sets the status to this boolean. If None, toggles the current status.
+        """
+        if not self.images or index >= len(self.images):
+            raise IndexError("Image index out of range.")
+
+        # Initialize active_images if it's missing or mismatched
+        if self.active_images is None or not isinstance(self.active_images, list) or len(self.active_images) != len(self.images):
+            new_active_images = [True] * len(self.images)
+        else:
+            new_active_images = self.active_images.copy()
+
+        if active is None:
+            new_active_images[index] = not new_active_images[index]
+        else:
+            new_active_images[index] = bool(active) # Ensure it's a boolean
+        
+        self.active_images = new_active_images
+        if self._discussion._is_db_backed:
+            self._discussion.commit()
     
     def set_metadata_item(self, itemname:str, item_value, discussion):
         new_metadata = (self.metadata or {}).copy()
@@ -489,8 +544,9 @@ class LollmsDiscussion:
     def __setattr__(self, name: str, value: Any):
         """Proxies attribute setting to the underlying discussion object."""
         internal_attrs = [
-            'lollmsClient', 'db_manager', 'autosave', 'max_context_size', 'scratchpad',
-            '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db', '_is_db_backed'
+            'lollmsClient', 'db_manager', 'autosave', 'max_context_size', 'scratchpad', 'images',
+            '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db', '_is_db_backed',
+            '_system_prompt'
         ]
         if name in internal_attrs:
             object.__setattr__(self, name, value)
@@ -572,6 +628,10 @@ class LollmsDiscussion:
         msg_id = kwargs.get('id', str(uuid.uuid4()))
         parent_id = kwargs.get('parent_id', self.active_branch_id)
         
+        # New: Automatically initialize active_images if images are provided
+        if 'images' in kwargs and kwargs['images'] and 'active_images' not in kwargs:
+            kwargs['active_images'] = [True] * len(kwargs['images'])
+
         message_data = {
             'id': msg_id,
             'parent_id': parent_id,
@@ -977,7 +1037,11 @@ class LollmsDiscussion:
         """
         branch_tip_id = branch_tip_id or self.active_branch_id
         if not branch_tip_id and format_type in ["lollms_text", "openai_chat", "ollama_chat", "markdown"]:
-            return "" if format_type == "lollms_text" else []
+            if format_type in ["lollms_text", "markdown"]:
+                return ""
+            else:
+                return []
+
 
         branch = self.get_branch(branch_tip_id)
         
@@ -1038,8 +1102,11 @@ class LollmsDiscussion:
             for msg in reversed(messages_to_render):
                 sender_str = msg.sender.replace(':', '').replace('!@>', '')
                 content = get_full_content(msg)
-                if msg.images:
-                    content += f"\n({len(msg.images)} image(s) attached)"
+                
+                active_images = msg.get_active_images()
+                if active_images:
+                    content += f"\n({len(active_images)} image(s) attached)"
+
                 msg_text = f"!@>{sender_str}:\n{content}\n"
                 msg_tokens = self.lollmsClient.count_tokens(msg_text)
 
@@ -1066,9 +1133,9 @@ class LollmsDiscussion:
             else:
                 role = participants.get(msg.sender, "assistant")
 
-            content, images = get_full_content(msg), msg.images or []
-            images = build_image_dicts(images)        
-
+            content = get_full_content(msg)
+            active_images_b64 = msg.get_active_images()
+            images = build_image_dicts(active_images_b64)
 
             if format_type == "openai_chat":
                 if images:
@@ -1380,8 +1447,10 @@ class LollmsDiscussion:
             for msg in messages_to_render:
                 sender_str = msg.sender.replace(':', '').replace('!@>', '')
                 content = msg.content.strip()
-                if msg.images:
-                    content += f"\n({len(msg.images)} image(s) attached)"
+
+                active_images = msg.get_active_images()
+                if active_images:
+                    content += f"\n({len(active_images)} image(s) attached)"
                 msg_text = f"!@>{sender_str}:\n{content}\n"
                 message_parts.append(msg_text)
             

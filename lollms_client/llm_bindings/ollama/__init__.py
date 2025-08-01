@@ -11,6 +11,7 @@ from typing import Optional, Callable, List, Union, Dict
 
 from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
+from lollms_client.lollms_utilities import ImageTokenizer
 pm.ensure_packages(["ollama","pillow","tiktoken"])
 
 
@@ -468,6 +469,24 @@ class OllamaBinding(LollmsLLMBinding):
             return -1
         #return count_tokens_ollama(text, self.model_name, self.ollama_client)
         return len(self.tokenize(text))
+
+    def count_image_tokens(self, image: str) -> int:
+        """
+        Estimate the number of tokens for an image using ImageTokenizer based on self.model_name.
+
+        Args:
+            image (str): Image to count tokens from. Either base64 string, path to image file, or URL.
+
+        Returns:
+            int: Estimated number of tokens for the image. Returns -1 on error.
+        """
+        try:
+            # Delegate token counting to ImageTokenizer
+            return ImageTokenizer(self.model_name).count_image_tokens(image)
+        except Exception as e:
+            ASCIIColors.warning(f"Could not estimate image tokens: {e}")
+            return -1
+
     def embed(self, text: str, **kwargs) -> List[float]:
         """
         Get embeddings for the input text using Ollama API.
