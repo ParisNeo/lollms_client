@@ -430,7 +430,21 @@ class LollmsClient():
         if self.binding:
             return self.binding.count_tokens(text)
         raise RuntimeError("LLM binding not initialized.")
-    
+
+    def count_image_tokens(self, image: str) -> int:
+        """
+        Estimate the number of tokens for an image using ImageTokenizer based on self.model_name.
+
+        Args:
+            image (str): Image to count tokens from. Either base64 string, path to image file, or URL.
+
+        Returns:
+            int: Estimated number of tokens for the image. Returns -1 on error.
+        """
+        if self.binding:
+            return self.binding.count_image_tokens(image)
+        raise RuntimeError("LLM binding not initialized.")
+
     def get_model_details(self) -> dict:
         """
         Get model information from the active LLM binding.

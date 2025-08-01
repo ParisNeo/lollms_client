@@ -1326,6 +1326,7 @@ class LollmsDiscussion:
         This provides a comprehensive snapshot of the context usage. It accurately calculates
         the token count of the combined system context (prompt, all data zones, summary)
         and the message history, reflecting how the `lollms_text` export format works.
+        It also includes the token count for any active images in the message history.
 
         Args:
             branch_tip_id: The ID of the message branch to measure. Defaults to the active branch.
@@ -1348,7 +1349,12 @@ class LollmsDiscussion:
                     "message_history": {
                         "content": str,
                         "tokens": int,
-                        "message_count": int
+                        "message_count": int,
+                        "breakdown": {
+                            "text_tokens": int,
+                            "image_tokens": int,
+                            "image_details": [{"message_id": str, "index": int, "tokens": int}]
+                        }
                     }
                 }
             }
@@ -1360,8 +1366,10 @@ class LollmsDiscussion:
             "zones": {}
         }
         tokenizer = self.lollmsClient.count_tokens
+        tokenizer_images = self.lollmsClient.count_image_tokens
 
         # --- 1. Assemble and Tokenize the Entire System Context Block ---
+        system_context_tokens = 0
         system_prompt_text = (self._system_prompt or "").strip()
         data_zone_text = self.get_full_data_zone()
         pruning_summary_content = (self.pruning_summary or "").strip()
@@ -1377,7 +1385,7 @@ class LollmsDiscussion:
 
         if full_system_content:
             system_block = f"!@>system:\n{full_system_content}\n"
-            system_tokens = tokenizer(system_block)
+            system_context_tokens = tokenizer(system_block)
             
             breakdown = {}
             if system_prompt_text:
@@ -1422,14 +1430,18 @@ class LollmsDiscussion:
 
             result["zones"]["system_context"] = {
                 "content": full_system_content,
-                "tokens": system_tokens,
+                "tokens": system_context_tokens,
                 "breakdown": breakdown
             }
 
-        # --- 2. Assemble and Tokenize the Message History Block ---
+        # --- 2. Assemble and Tokenize the Message History Block (with images) ---
         branch_tip_id = branch_tip_id or self.active_branch_id
         messages_text = ""
         message_count = 0
+        history_text_tokens = 0
+        total_image_tokens = 0
+        image_details_list = []
+        
         if branch_tip_id:
             branch = self.get_branch(branch_tip_id)
             messages_to_render = branch
@@ -1451,22 +1463,34 @@ class LollmsDiscussion:
                 active_images = msg.get_active_images()
                 if active_images:
                     content += f"\n({len(active_images)} image(s) attached)"
+                    # Count image tokens
+                    for i, image_b64 in enumerate(active_images):
+                        tokens = tokenizer_images(image_b64)
+                        if tokens > 0:
+                            total_image_tokens += tokens
+                            image_details_list.append({"message_id": msg.id, "index": i, "tokens": tokens})
+
                 msg_text = f"!@>{sender_str}:\n{content}\n"
                 message_parts.append(msg_text)
             
             messages_text = "".join(message_parts)
             message_count = len(messages_to_render)
 
-        if messages_text:
-            tokens = tokenizer(messages_text)
+        if messages_text or total_image_tokens > 0:
+            history_text_tokens = tokenizer(messages_text)
             result["zones"]["message_history"] = {
                 "content": messages_text,
-                "tokens": tokens,
-                "message_count": message_count
+                "tokens": history_text_tokens + total_image_tokens,
+                "message_count": message_count,
+                "breakdown": {
+                    "text_tokens": history_text_tokens,
+                    "image_tokens": total_image_tokens,
+                    "image_details": image_details_list
+                }
             }
 
         # --- 3. Finalize the Total Count ---
-        result["current_tokens"] = self.count_discussion_tokens("lollms_text", branch_tip_id)
+        result["current_tokens"] = system_context_tokens + history_text_tokens + total_image_tokens
 
         return result
     

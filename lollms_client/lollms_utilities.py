@@ -435,10 +435,13 @@ class ImageTokenizer:
                 patches_y = math.ceil(height / patch_size)
                 total_patches = patches_x * patches_y
                 return total_patches * 100
+            elif "gemma" in self.model_name:
+                # Gemma: Fixed 256 tokens for images normalized to 896x896
+                return 256
 
             else:
                 # Fallback: Original byte-based estimation for unsupported models
-                CONSTANT = 0.5
+                CONSTANT = 128/(512*512)
                 if image.startswith("http://") or image.startswith("https://"):
                     response = requests.get(image)
                     response.raise_for_status()
