@@ -1681,8 +1681,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 # --- Handle special, non-executing tools ---
                 if tool_name == "local_tools::request_clarification":
                     # Handle clarification...
-                    return {"final_answer": action.get("clarification_question", "Could you please provide more details?"), "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": True, "error": None}
-
+                    if isinstance(action, dict):
+                        return {"final_answer": action.get("clarification_question", "Could you please provide more details?"), "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": True, "error": None}
+                    elif isinstance(action, str):  
+                        return {"final_answer": action, "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": True, "error": None}
+                    else:
+                        return {"final_answer": "Could you please provide more details?", "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": True, "error": None}
                 if tool_name == "local_tools::final_answer":
                     current_scratchpad += f"\n\n### Step {i+1}: Action\n- **Action:** Decided to formulate the final answer."
                     log_event("**Action**: Formulate final answer.", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)

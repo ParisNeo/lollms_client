@@ -496,14 +496,29 @@ class LollmsDiscussion:
         else:
             self._create_in_memory_proxy(id=discussion_id)
         
-        # **FIX**: Properly initialize internal state from the db_discussion object.
         object.__setattr__(self, '_system_prompt', getattr(self._db_discussion, 'system_prompt', None))
 
-        # Load discussion-level images from metadata if they exist
+        # --- THE FIX IS HERE: Load discussion-level images from metadata ---
         metadata = getattr(self._db_discussion, 'discussion_metadata', {}) or {}
         image_data = metadata.get("discussion_images", {})
-        object.__setattr__(self, 'images', image_data.get('data', []))
-        object.__setattr__(self, 'active_images', image_data.get('active', []))
+        
+        images_list = []
+        active_list = []
+        
+        if isinstance(image_data, dict) and 'data' in image_data:
+            # New format: {'data': [...], 'active': [...]}
+            images_list = image_data.get('data', [])
+            active_list = image_data.get('active', [])
+        else:
+            # Covers case where image_data is None, empty dict, or a legacy list
+            # We will rely on migration logic in `get_user_discussion` to fix the DB format
+            # For now, we just don't crash and load empty lists.
+            images_list = []
+            active_list = []
+            
+        object.__setattr__(self, 'images', images_list)
+        object.__setattr__(self, 'active_images', active_list)
+        # --- END FIX ---
 
         self._rebuild_message_index()
 
@@ -588,7 +603,6 @@ class LollmsDiscussion:
             # If it's an internal attribute, set it directly on the wrapper object.
             object.__setattr__(self, name, value)
         else:
-            # **FIX STARTS HERE**
             # If we are setting 'system_prompt', we must update BOTH the internal
             # _system_prompt variable AND the underlying data object.
             if name == 'system_prompt':
@@ -631,10 +645,10 @@ class LollmsDiscussion:
 
     def touch(self):
         """Marks the discussion as updated, persists images, and saves if autosave is on."""
-        # **FIX**: Persist in-memory discussion images to the metadata field before saving.
+        # Persist in-memory discussion images to the metadata field before saving.
         # This works for both DB-backed and in-memory discussions.
         metadata = (getattr(self._db_discussion, 'discussion_metadata', {}) or {}).copy()
-        if self.images or "discussion_images" in metadata: # Only update if needed
+        if self.images or "discussion_images" in metadata:  # Only update if needed
             metadata["discussion_images"] = {
                 "data": self.images,
                 "active": self.active_images
@@ -689,12 +703,9 @@ class LollmsDiscussion:
         if 'images' in kwargs and kwargs['images'] and 'active_images' not in kwargs:
             kwargs['active_images'] = [True] * len(kwargs['images'])
         
-        # **FIX 2**: Ensure 'images' and 'active_images' have default values if not provided.
         kwargs.setdefault('images', [])
         kwargs.setdefault('active_images', [])
 
-        # FIX 1: Ensure sender_type is always set.
-        # Default to 'user' if sender is 'user', otherwise 'assistant'.
         if 'sender_type' not in kwargs:
             if kwargs.get('sender') == 'user':
                 kwargs['sender_type'] = 'user'
@@ -1031,7 +1042,6 @@ class LollmsDiscussion:
             if self._is_db_backed:
                 self._messages_to_delete_from_db.add(last_message_id)
             
-            # **THE FIX IS HERE**
             self.active_branch_id = parent_id
             # We now pass the parent ID as the tip, because that's what we want to generate from
             return self.chat(user_message="", add_user_message=False, branch_tip_id=parent_id, **kwargs)
@@ -1618,7 +1628,6 @@ class LollmsDiscussion:
                 }
             }
         
-        # **THE FIX IS HERE**
         # Calculate discussion-level image tokens separately and add them to the total.
         active_discussion_b64 = [
             img for i, img in enumerate(self.images or [])
@@ -1805,4 +1814,23 @@ class LollmsDiscussion:
         else:
             self.active_images[index] = bool(active)
         
+        self.touch()
+
+    def remove_discussion_image(self, index: int):
+        """
+        Removes a discussion-level image at a given index.
+        The change is persisted to the database on the next commit.
+
+        Args:
+            index: The index of the image in the discussion's 'images' list.
+        """
+        if not self.images or index >= len(self.images):
+            raise IndexError("Discussion image index out of range.")
+
+        # Ensure active_images list is in sync before modification
+        if len(self.active_images) != len(self.images):
+            self.active_images = [True] * len(self.images)
+
+        del self.images[index]
+        del self.active_images[index]
         self.touch()
