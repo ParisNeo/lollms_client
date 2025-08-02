@@ -367,6 +367,28 @@ class LollmsMessage:
         """Provides a developer-friendly representation of the message."""
         return f"<LollmsMessage id={self.id} sender='{self.sender}'>"
 
+    def get_all_images(self) -> List[Dict[str, Union[str, bool]]]:
+        """
+        Returns a list of all images associated with this message, including their activation status.
+        
+        Returns:
+            A list of dictionaries, where each dictionary represents an image.
+            Example: [{"data": "base64_string", "active": True}]
+        """
+        if not self.images:
+            return []
+        
+        # Retrocompatibility: if active_images is not set or mismatched, assume all are active.
+        if self.active_images is None or not isinstance(self.active_images, list) or len(self.active_images) != len(self.images):
+            active_flags = [True] * len(self.images)
+        else:
+            active_flags = self.active_images
+
+        return [
+            {"data": img_data, "active": active_flags[i]}
+            for i, img_data in enumerate(self.images)
+        ]
+
     def get_active_images(self) -> List[str]:
         """
         Returns a list of base64 strings for only the active images.
@@ -450,7 +472,6 @@ class LollmsDiscussion:
         object.__setattr__(self, 'autosave', autosave)
         object.__setattr__(self, 'max_context_size', max_context_size)
         object.__setattr__(self, 'scratchpad', "")
-        object.__setattr__(self, 'images', [])
         
         # Internal state
         object.__setattr__(self, '_session', None)
@@ -459,7 +480,6 @@ class LollmsDiscussion:
         object.__setattr__(self, '_messages_to_delete_from_db', set())
         object.__setattr__(self, '_is_db_backed', db_manager is not None)
         
-        object.__setattr__(self, '_system_prompt', None)
         if self._is_db_backed:
             if not db_discussion_obj and not discussion_id:
                 raise ValueError("Either discussion_id or db_discussion_obj must be provided for DB-backed discussions.")
@@ -476,6 +496,15 @@ class LollmsDiscussion:
         else:
             self._create_in_memory_proxy(id=discussion_id)
         
+        # **FIX**: Properly initialize internal state from the db_discussion object.
+        object.__setattr__(self, '_system_prompt', getattr(self._db_discussion, 'system_prompt', None))
+
+        # Load discussion-level images from metadata if they exist
+        metadata = getattr(self._db_discussion, 'discussion_metadata', {}) or {}
+        image_data = metadata.get("discussion_images", {})
+        object.__setattr__(self, 'images', image_data.get('data', []))
+        object.__setattr__(self, 'active_images', image_data.get('active', []))
+
         self._rebuild_message_index()
 
     @classmethod
@@ -542,19 +571,37 @@ class LollmsDiscussion:
         return getattr(self._db_discussion, name)
 
     def __setattr__(self, name: str, value: Any):
-        """Proxies attribute setting to the underlying discussion object."""
+        """
+        Proxies attribute setting to the underlying discussion object, while
+        keeping internal state like _system_prompt in sync.
+        """
+        # A list of attributes that are internal to the LollmsDiscussion wrapper
+        # and should not be proxied to the underlying data object.
         internal_attrs = [
-            'lollmsClient', 'db_manager', 'autosave', 'max_context_size', 'scratchpad', 'images',
-            '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db', '_is_db_backed',
-            '_system_prompt'
+            'lollmsClient', 'db_manager', 'autosave', 'max_context_size', 'scratchpad',
+            'images', 'active_images',
+            '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db',
+            '_is_db_backed', '_system_prompt'
         ]
+        
         if name in internal_attrs:
+            # If it's an internal attribute, set it directly on the wrapper object.
             object.__setattr__(self, name, value)
         else:
+            # **FIX STARTS HERE**
+            # If we are setting 'system_prompt', we must update BOTH the internal
+            # _system_prompt variable AND the underlying data object.
+            if name == 'system_prompt':
+                object.__setattr__(self, '_system_prompt', value)
+            
+            # If the attribute is 'metadata', proxy it to the correct column name.
             if name == 'metadata':
                 setattr(self._db_discussion, 'discussion_metadata', value)
             else:
+                # For all other attributes, proxy them directly to the underlying object.
                 setattr(self._db_discussion, name, value)
+            
+            # Mark the discussion as dirty to trigger a save.
             self.touch()
     
     def _create_in_memory_proxy(self, id: Optional[str] = None):
@@ -583,7 +630,17 @@ class LollmsDiscussion:
         self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
 
     def touch(self):
-        """Marks the discussion as updated and saves it if autosave is enabled."""
+        """Marks the discussion as updated, persists images, and saves if autosave is on."""
+        # **FIX**: Persist in-memory discussion images to the metadata field before saving.
+        # This works for both DB-backed and in-memory discussions.
+        metadata = (getattr(self._db_discussion, 'discussion_metadata', {}) or {}).copy()
+        if self.images or "discussion_images" in metadata: # Only update if needed
+            metadata["discussion_images"] = {
+                "data": self.images,
+                "active": self.active_images
+            }
+            setattr(self._db_discussion, 'discussion_metadata', metadata)
+
         setattr(self._db_discussion, 'updated_at', datetime.utcnow())
         if self._is_db_backed and self.autosave:
             self.commit()
@@ -631,6 +688,19 @@ class LollmsDiscussion:
         # New: Automatically initialize active_images if images are provided
         if 'images' in kwargs and kwargs['images'] and 'active_images' not in kwargs:
             kwargs['active_images'] = [True] * len(kwargs['images'])
+        
+        # **FIX 2**: Ensure 'images' and 'active_images' have default values if not provided.
+        kwargs.setdefault('images', [])
+        kwargs.setdefault('active_images', [])
+
+        # FIX 1: Ensure sender_type is always set.
+        # Default to 'user' if sender is 'user', otherwise 'assistant'.
+        if 'sender_type' not in kwargs:
+            if kwargs.get('sender') == 'user':
+                kwargs['sender_type'] = 'user'
+            else:
+                kwargs['sender_type'] = 'assistant'
+
 
         message_data = {
             'id': msg_id,
@@ -658,7 +728,7 @@ class LollmsDiscussion:
         self.active_branch_id = msg_id
         self.touch()
         return LollmsMessage(self, new_msg_orm)
-        
+    
     def get_branch(self, leaf_id: Optional[str]) -> List[LollmsMessage]:
         """Traces a branch of the conversation from a leaf message back to the root.
 
@@ -679,6 +749,20 @@ class LollmsDiscussion:
             current_id = msg_orm.parent_id
             
         return [LollmsMessage(self, orm) for orm in reversed(branch_orms)]
+
+    def get_message(self, message_id: str) -> Optional['LollmsMessage']:
+        """Retrieves a single message by its ID.
+
+        Args:
+            message_id: The unique ID of the message to retrieve.
+
+        Returns:
+            An LollmsMessage instance if found, otherwise None.
+        """
+        db_message = self._message_index.get(message_id)
+        if db_message:
+            return LollmsMessage(self, db_message)
+        return None
 
     def get_full_data_zone(self):
         """Assembles all data zones into a single, formatted string for the prompt."""
@@ -929,8 +1013,9 @@ class LollmsDiscussion:
             if len(self._message_index)>0:
                 ASCIIColors.warning("No active message to regenerate from.\n")
                 ASCIIColors.warning(f"Using last available message:{list(self._message_index.keys())[-1]}\n")
-            else:
+                # Fix for when branch_tip_id is not provided
                 branch_tip_id = list(self._message_index.keys())[-1]
+            else:
                 raise ValueError("No active message to regenerate from.")
         
         last_message_orm = self._message_index[self.active_branch_id]
@@ -946,6 +1031,12 @@ class LollmsDiscussion:
             if self._is_db_backed:
                 self._messages_to_delete_from_db.add(last_message_id)
             
+            # **THE FIX IS HERE**
+            self.active_branch_id = parent_id
+            # We now pass the parent ID as the tip, because that's what we want to generate from
+            return self.chat(user_message="", add_user_message=False, branch_tip_id=parent_id, **kwargs)
+
+        # If the last message is a user message, we can just call chat on it
         return self.chat(user_message="", add_user_message=False, branch_tip_id=branch_tip_id, **kwargs)
     
     def delete_branch(self, message_id: str):
@@ -1018,7 +1109,7 @@ class LollmsDiscussion:
 
         This method can format the conversation for different backends like OpenAI,
         Ollama, or the native `lollms_text` format. It intelligently handles
-        context limits and non-destructive pruning summaries.
+        context limits, non-destructive pruning summaries, and discussion-level images.
 
         Args:
             format_type: The target format. Can be "lollms_text", "openai_chat",
@@ -1121,11 +1212,49 @@ class LollmsDiscussion:
 
         # --- OPENAI & OLLAMA CHAT FORMATS ---
         messages = []
-        if full_system_prompt:
-            if format_type == "markdown":
-                messages.append(f"system: {full_system_prompt}")
-            else:
-                messages.append({"role": "system", "content": full_system_prompt})
+        # Get active discussion-level images
+        active_discussion_b64 = [
+            img for i, img in enumerate(self.images or [])
+            if i < len(self.active_images or []) and self.active_images[i]
+        ]
+        # Handle system message, which can now contain text and/or discussion-level images
+        if full_system_prompt or (active_discussion_b64 and format_type in ["openai_chat", "ollama_chat", "markdown"]):
+            discussion_level_images = build_image_dicts(active_discussion_b64)
+
+            if format_type == "openai_chat":
+                content_parts = []
+                if full_system_prompt:
+                    content_parts.append({"type": "text", "text": full_system_prompt})
+                for img in discussion_level_images:
+                    img_data = img['data']
+                    url = f"data:image/jpeg;base64,{img_data}" if img['type'] == 'base64' else img_data
+                    content_parts.append({"type": "image_url", "image_url": {"url": url, "detail": "auto"}})
+                if content_parts:
+                    messages.append({"role": "system", "content": content_parts})
+
+            elif format_type == "ollama_chat":
+                system_message_dict = {"role": "system", "content": full_system_prompt or ""}
+                base64_images = [img['data'] for img in discussion_level_images if img['type'] == 'base64']
+                if base64_images:
+                    system_message_dict["images"] = base64_images
+                messages.append(system_message_dict)
+
+            elif format_type == "markdown":
+                system_md_parts = []
+                if full_system_prompt:
+                    system_md_parts.append(f"system: {full_system_prompt}")
+
+                for img in discussion_level_images:
+                    img_data = img['data']
+                    url = f"![Image](data:image/jpeg;base64,{img_data})" if img['type'] == 'base64' else f"![Image]({img_data})"
+                    system_md_parts.append(f"\n{url}\n")
+                
+                if system_md_parts:
+                    messages.append("".join(system_md_parts))
+
+            else: # Fallback for any other potential format
+                if full_system_prompt:
+                    messages.append({"role": "system", "content": full_system_prompt})
 
         for msg in branch:
             if msg.sender_type == 'user':
@@ -1488,12 +1617,96 @@ class LollmsDiscussion:
                     "image_details": image_details_list
                 }
             }
+        
+        # **THE FIX IS HERE**
+        # Calculate discussion-level image tokens separately and add them to the total.
+        active_discussion_b64 = [
+            img for i, img in enumerate(self.images or [])
+            if i < len(self.active_images or []) and self.active_images[i]
+        ]
+        discussion_image_tokens = sum(tokenizer_images(img) for img in active_discussion_b64)
+        
+        # Add a new zone for discussion images for clarity
+        if discussion_image_tokens > 0:
+            result["zones"]["discussion_images"] = {
+                "tokens": discussion_image_tokens,
+                "image_count": len(active_discussion_b64)
+            }
+
 
         # --- 3. Finalize the Total Count ---
-        result["current_tokens"] = system_context_tokens + history_text_tokens + total_image_tokens
+        # Sum up the tokens from all calculated zones
+        total_tokens = 0
+        for zone in result["zones"].values():
+            total_tokens += zone.get("tokens", 0)
+        
+        result["current_tokens"] = total_tokens
 
         return result
     
+    def get_all_images(self, branch_tip_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Retrieves all images from all messages in the specified or active branch.
+
+        Each image is returned as a dictionary containing its data, its active status,
+        the ID of the message it belongs to, and its index within that message.
+
+        Args:
+            branch_tip_id: The ID of the leaf message of the desired branch.
+                           If None, the active branch's leaf is used.
+
+        Returns:
+            A list of dictionaries, each representing an image in the discussion branch.
+            Example: [{"message_id": "...", "index": 0, "data": "...", "active": True}]
+        """
+        all_discussion_images = []
+        branch = self.get_branch(branch_tip_id or self.active_branch_id)
+
+        if not branch:
+            return []
+
+        for message in branch:
+            message_images = message.get_all_images() # This returns [{"data":..., "active":...}]
+            for i, img_info in enumerate(message_images):
+                all_discussion_images.append({
+                    "message_id": message.id,
+                    "index": i,
+                    "data": img_info["data"],
+                    "active": img_info["active"]
+                })
+        
+        return all_discussion_images
+
+    def get_active_images(self, branch_tip_id: Optional[str] = None) -> List[str]:
+        """
+        Retrieves all *active* images from the discussion and from all messages
+        in the specified or active branch.
+
+        This method aggregates the active images from the discussion level and
+        from each message's `get_active_images` call into a single flat list.
+
+        Args:
+            branch_tip_id: The ID of the leaf message of the desired branch.
+                           If None, the active branch's leaf is used.
+
+        Returns:
+            A flat list of base64-encoded strings for all active images.
+        """
+        # Start with active discussion-level images
+        active_discussion_images = [
+            img for i, img in enumerate(self.images or [])
+            if i < len(self.active_images or []) and self.active_images[i]
+        ]
+        
+        branch = self.get_branch(branch_tip_id or self.active_branch_id)
+        if not branch:
+            return active_discussion_images
+
+        for message in branch:
+            active_discussion_images.extend(message.get_active_images())
+
+        return active_discussion_images
+
     def switch_to_branch(self, branch_id):
         self.active_branch_id = branch_id
 
@@ -1531,3 +1744,65 @@ class LollmsDiscussion:
         new_metadata[itemname] = item_value
         self.metadata = new_metadata
         self.commit()
+
+    def add_discussion_image(self, image_b64: str):
+        """
+        Adds an image at the discussion level and marks it as active.
+
+        This image is not tied to a specific message but is considered part of the
+        overall discussion context. It will be included with the system prompt
+        when exporting the conversation for multi-modal models. The change is
+        persisted to the database on the next commit.
+
+        Args:
+            image_b64: A base64-encoded string of the image to add.
+        """
+        self.images.append(image_b64)
+        self.active_images.append(True)
+        self.touch()
+
+    def get_discussion_images(self) -> List[Dict[str, Union[str, bool]]]:
+        """
+        Returns a list of all images attached to the discussion, including their
+        activation status.
+
+        Returns:
+            A list of dictionaries, where each dictionary represents an image.
+            Example: [{"data": "base64_string", "active": True}]
+        """
+        if not self.images:
+            return []
+
+        # Ensure active_images list is in sync, default to True if not
+        if len(self.active_images) != len(self.images):
+            active_flags = [True] * len(self.images)
+        else:
+            active_flags = self.active_images
+
+        return [
+            {"data": img_data, "active": active_flags[i]}
+            for i, img_data in enumerate(self.images)
+        ]
+
+    def toggle_discussion_image_activation(self, index: int, active: Optional[bool] = None):
+        """
+        Toggles or sets the activation status of a discussion-level image at a given index.
+        The change is persisted to the database on the next commit.
+
+        Args:
+            index: The index of the image in the discussion's 'images' list.
+            active: If provided, sets the status to this boolean. If None, toggles the current status.
+        """
+        if not self.images or index >= len(self.images):
+            raise IndexError("Discussion image index out of range.")
+
+        # Ensure active_images list is in sync before modification
+        if len(self.active_images) != len(self.images):
+            self.active_images = [True] * len(self.images)
+
+        if active is None:
+            self.active_images[index] = not self.active_images[index]
+        else:
+            self.active_images[index] = bool(active)
+        
+        self.touch()
