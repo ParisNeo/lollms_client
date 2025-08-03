@@ -3012,11 +3012,14 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         Returns:
             str: The final, comprehensive summary of the text.
         """
-        if not text_to_process.strip():
+        if not text_to_process and len(kwargs.get("images",[]))==0:
             return ""
-
-        # Use the binding's tokenizer for accurate chunking
-        tokens = self.binding.tokenize(text_to_process)
+        if not text_to_process:
+            text_to_process=""
+            tokens = []
+        else:
+            # Use the binding's tokenizer for accurate chunking
+            tokens = self.binding.tokenize(text_to_process)
         if chunk_size_tokens is None:
             chunk_size_tokens = self.default_ctx_size//2
         
