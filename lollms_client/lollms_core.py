@@ -1589,7 +1589,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         # Add the new put_code_in_buffer tool definition
         available_tools.append({
             "name": "local_tools::put_code_in_buffer",
-            "description": """Generates and stores code into a buffer to be used by another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use put_code_in_buffer. put_code_in_buffer do not execute the code nor does it audit it.""",
+            "description": """Generates and stores code into a buffer to be used by another tool. Never put code into a tool directly, first call this to generate the code and then paste the uuid in the tool that requires code. Only use this for generating code to be sent to another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use put_code_in_buffer. put_code_in_buffer do not execute the code nor does it audit it.""",
             "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}, "language": {"type": "string", "description": "The programming language of the generated code. By default it uses python."}}, "required": ["prompt"]}
         })
         available_tools.append({
