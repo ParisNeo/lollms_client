@@ -1586,10 +1586,10 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
                 })
         
-        # Add the new put_code_in_buffer tool definition
+        # Add the new prepare_code tool definition
         available_tools.append({
-            "name": "local_tools::put_code_in_buffer",
-            "description": """Generates and stores code into a buffer to be used by another tool. Never put code into a tool directly, first call this to generate the code and then paste the uuid in the tool that requires code. Only use this for generating code to be sent to another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use put_code_in_buffer. put_code_in_buffer do not execute the code nor does it audit it.""",
+            "name": "local_tools::prepare_code",
+            "description": """Generates and stores code into a buffer to be used by another tool. Never put code into a tool directly, first call this to generate the code and then paste the uuid in the tool that requires code. Only use this for generating code to be sent to another tool. You can put the uuid of the generated code into the fields that require long code among the tools. If no tool requires code as input do not use prepare_code. prepare_code do not execute the code nor does it audit it.""",
             "input_schema": {"type": "object", "properties": {"prompt": {"type": "string", "description": "A detailed natural language description of the code's purpose and requirements."}, "language": {"type": "string", "description": "The programming language of the generated code. By default it uses python."}}, "required": ["prompt"]}
         })
         available_tools.append({
@@ -1631,7 +1631,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 2.  **THINK:**
     - Does the latest observation completely fulfill the user's original request?
     - If YES, your next action MUST be to use the `final_answer` tool.
-    - If NO, what is the single next logical step needed? This may involve writing code first with `put_code_in_buffer`, then using another tool.
+    - If NO, what is the single next logical step needed? This may involve writing code first with `prepare_code`, then using another tool.
     - If you are stuck or the request is ambiguous, use `local_tools::request_clarification`.
 3.  **ACT:** Formulate your decision as a JSON object.
 ** Important ** Always use this format alias::tool_name to call the tool
@@ -1639,7 +1639,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 action_template = {
                     "thought": "My detailed analysis of the last observation and my reasoning for the next action and how it integrates with my global plan.",
                     "action": {
-                        "tool_name": "The single tool to use (e.g., 'local_tools::put_code_in_buffer', 'local_tools::final_answer').",
+                        "tool_name": "The single tool to use (e.g., 'local_tools::prepare_code', 'local_tools::final_answer').",
                         "tool_params": {"param1": "value1"},
                         "clarification_question": "(string, ONLY if tool_name is 'local_tools::request_clarification')"
                     }
@@ -1693,20 +1693,20 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     if reasoning_step_id: log_event(f"**Reasoning Step {i+1}/{max_reasoning_steps}**",MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
                     break
 
-                # --- Handle the `put_code_in_buffer` tool specifically ---
-                if tool_name == 'local_tools::put_code_in_buffer':
-                    code_gen_id = log_event(f"Generating code...", MSG_TYPE.MSG_TYPE_STEP_START, metadata={"name": "put_code_in_buffer", "id": "gencode"})
+                # --- Handle the `prepare_code` tool specifically ---
+                if tool_name == 'local_tools::prepare_code':
+                    code_gen_id = log_event(f"Generating code...", MSG_TYPE.MSG_TYPE_STEP_START, metadata={"name": "prepare_code", "id": "gencode"})
                     code_prompt = tool_params.get("prompt", "Generate the requested code.")
                     
                     # Use a specific system prompt to get raw code
                     code_generation_system_prompt = "You are a code generation assistant. Generate ONLY the raw code based on the user's request. Do not add any explanations, markdown code fences, or other text outside of the code itself."
-                    generated_code = self.generate_code(prompt=code_prompt, system_prompt=code_generation_system_prompt + "\n----\n" + reasoning_prompt_template, **llm_generation_kwargs)
+                    generated_code = self.generate_code(prompt=code_prompt, system_prompt=code_generation_system_prompt, **llm_generation_kwargs)
                     
                     code_uuid = str(uuid.uuid4())
                     generated_code_store[code_uuid] = generated_code
                     
                     tool_result = {"status": "success", "code_id": code_uuid, "summary": f"Code generated successfully. Use this ID in the next tool call that requires code."}
-                    tool_calls_this_turn.append({"name": "put_code_in_buffer", "params": tool_params, "result": tool_result})
+                    tool_calls_this_turn.append({"name": "prepare_code", "params": tool_params, "result": tool_result})
                     observation_text = f"```json\n{json.dumps(tool_result, indent=2)}\n```"
                     current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
                     log_event(f"Code generated with ID: {code_uuid}", MSG_TYPE.MSG_TYPE_OBSERVATION)
