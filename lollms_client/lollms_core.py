@@ -65,8 +65,8 @@ class LollmsClient():
                  # General Parameters (mostly defaults for LLM generation)
                  service_key: Optional[str] = None, # Shared service key/client_id
                  verify_ssl_certificate: bool = True,
-                 ctx_size: Optional[int] = 8192,
-                 n_predict: Optional[int] = 4096,
+                 ctx_size: Optional[int|None] = None,
+                 n_predict: Optional[int|None] = None,
                  stream: bool = False,
                  temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
                  top_k: int = 40,          # Ollama default is 40
@@ -277,7 +277,7 @@ class LollmsClient():
             available = self.binding_manager.get_available_bindings()
             raise ValueError(f"Failed to update LLM binding: {binding_name}. Available: {available}")
 
-    def get_ctx_size(self, model_name=None):
+    def get_ctx_size(self, model_name:str|None=None):
         if self.binding:
             ctx_size = self.binding.get_ctx_size(model_name)
             return ctx_size if ctx_size else self.default_ctx_size
@@ -524,11 +524,23 @@ class LollmsClient():
             Union[str, dict]: Generated text or error dictionary if failed.
         """
         if self.binding:
+            
+            ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size if self.default_ctx_size else None
+            if ctx_size is None:
+                ctx_size = self.binding.get_ctx_size()
+                if ctx_size is None:
+                    ctx_size = 1024*8 # 1028*8= 8192 tokens, a common default for many models
+            nb_input_tokens = self.count_tokens(prompt)+ (sum([self.count_image_tokens(image) for image in images]) if images else 0)
+            if kwargs.get("debug", False):
+                ASCIIColors.magenta(f"Generating text using these parameters:")
+                ASCIIColors.magenta(f"ctx_size : {ctx_size}")
+                ASCIIColors.magenta(f"nb_input_tokens : {nb_input_tokens}")
+            
             return self.binding.generate_text(
                 prompt=prompt,
                 images=images,
                 system_prompt=system_prompt,
-                n_predict=n_predict if n_predict is not None else self.default_n_predict,
+                n_predict=n_predict if n_predict else self.default_n_predict if self.default_n_predict else ctx_size - nb_input_tokens,
                 stream=stream if stream is not None else self.default_stream,
                 temperature=temperature if temperature is not None else self.default_temperature,
                 top_k=top_k if top_k is not None else self.default_top_k,
@@ -3025,7 +3037,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         
         if len(tokens) <= chunk_size_tokens:
             if streaming_callback:
-                streaming_callback("Text is short enough for a single process.", MSG_TYPE.MSG_TYPE_STEP, {"progress": 0})
+                streaming_callback("Text is short enough for a single pass.", MSG_TYPE.MSG_TYPE_STEP, {"progress": 0})
             system_prompt = ("You are a content processor expert.\n"
                             "You perform tasks on the content as requested by the user.\n\n"
                             "--- Content ---\n"

@@ -154,7 +154,7 @@ class LollmsLLMBinding(ABC):
         """
         pass
 
-    def get_ctx_size(self, model_name=None):
+    def get_ctx_size(self, model_name:str|None=None):
         # if model_name is none use current model name
         return None
 

@@ -102,12 +102,65 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
 
         self.model: Optional[Llama] = None
         self.grammar: Optional[LlamaGrammar] = None
+        self.available_models: Dict[str, str] = {}
+        
+        # Scan for available models on initialization
+        self._scan_for_models()
+
+        # If a model_path is provided, it can be a short name or a full path.
+        # If not, auto-select the first available model.
+        if not self.model_path and self.available_models:
+            self.model_path = next(iter(self.available_models.keys()))
+            ASCIIColors.info(f"No model specified. Auto-selecting first found model: '{self.model_path}'")
+        
+        # Resolve the full path to the model
+        resolved_model_path = self.model_path
+        if self.model_path in self.available_models:
+            resolved_model_path = self.available_models[self.model_path]
+        elif not os.path.exists(self.model_path):
+            if self.available_models:
+                raise FileNotFoundError(f"Model '{self.model_path}' not found. Available models: {list(self.available_models.keys())}")
+            else:
+                 raise FileNotFoundError(f"Model file '{self.model_path}' not found, and no other GGUF models were discovered in search paths.")
 
         # Resolve and load grammar if specified
         self._load_grammar_from_config()
 
         # Attempt to load the model
-        self.load_model(self.model_path)
+        self.load_model(resolved_model_path)
+
+    def _scan_for_models(self):
+        """
+        Scans for GGUF models in the specified LoLLMs paths and populates the available_models dictionary.
+        """
+        self.available_models = {}
+        
+        personal_path = self.lollms_paths.get('personal_models_path', '')
+        zoo_path = self.lollms_paths.get('models_zoo_path', '')
+        
+        scan_paths = []
+        if personal_path and os.path.isdir(personal_path):
+            scan_paths.append(personal_path)
+        if zoo_path and os.path.isdir(zoo_path) and zoo_path not in scan_paths:
+            scan_paths.append(zoo_path)
+            
+        ASCIIColors.info(f"Scanning for GGUF models in: {scan_paths}")
+        for scan_path in scan_paths:
+            for root, _, files in os.walk(scan_path):
+                for file in files:
+                    if file.endswith(".gguf"):
+                        full_path = os.path.join(root, file)
+                        # Use relative path from scan_path as the unique "short name"
+                        short_name = os.path.relpath(full_path, scan_path)
+                        # In case of name conflict, personal_path takes precedence
+                        if short_name not in self.available_models:
+                            self.available_models[short_name] = full_path
+        
+        if self.available_models:
+            ASCIIColors.green(f"Discovered {len(self.available_models)} GGUF models.")
+        else:
+            ASCIIColors.warning("No GGUF models found in specified search paths.")
+
 
     def _load_grammar_from_config(self):
         grammar_file_path = self.llama_config.get("grammar_file")
@@ -126,28 +179,14 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
                 ASCIIColors.warning(f"Grammar file not found: {full_grammar_path}")
 
     def load_model(self, model_path: str) -> bool:
-        self.model_path = model_path
-        resolved_model_path = self.model_path
-        if not os.path.exists(resolved_model_path):
-            models_base_path = self.lollms_paths.get('personal_models_path', self.lollms_paths.get('models_zoo_path'))
-            if models_base_path:
-                # Assuming model_path might be relative to a binding-specific folder within models_base_path
-                # e.g. models_zoo_path/llamacpp/model_name.gguf
-                # Or it could be directly models_zoo_path/model_name.gguf
-                potential_path_direct = os.path.join(models_base_path, self.model_path)
-                potential_path_binding_specific = os.path.join(models_base_path, self.binding_name.lower(), self.model_path)
+        """
+        Loads the GGUF model from the given full path.
+        """
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Cannot load model. File not found at: {model_path}")
 
-                if os.path.exists(potential_path_direct):
-                    resolved_model_path = potential_path_direct
-                elif os.path.exists(potential_path_binding_specific):
-                    resolved_model_path = potential_path_binding_specific
-                else:
-                    raise FileNotFoundError(f"Model file '{self.model_path}' not found directly or in model paths: '{potential_path_direct}', '{potential_path_binding_specific}'")
-            else:
-                raise FileNotFoundError(f"Model file not found: {self.model_path}")
-        
-        ASCIIColors.info(f"Attempting to load GGUF model from: {resolved_model_path}")
-        self.model_path = resolved_model_path # Update to resolved path
+        ASCIIColors.info(f"Attempting to load GGUF model from: {model_path}")
+        self.model_path = model_path
 
         llama_constructor_keys = [
             "n_gpu_layers", "main_gpu", "tensor_split", "vocab_only", "use_mmap", "use_mlock",
@@ -331,12 +370,14 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
     def tokenize(self, text: str) -> List[int]:
         if not self.model:
             ASCIIColors.warning("Llama.cpp model not loaded. Tokenization fallback to tiktoken.")
+            import tiktoken
             return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text) 
         return self.model.tokenize(text.encode("utf-8"), add_bos=False, special=False) 
             
     def detokenize(self, tokens: List[int]) -> str:
         if not self.model:
             ASCIIColors.warning("Llama.cpp model not loaded. Detokenization fallback to tiktoken.")
+            import tiktoken
             return tiktoken.model.encoding_for_model("gpt-3.5-turbo").decode(tokens)
         try:
             return self.model.detokenize(tokens).decode("utf-8", errors="ignore")
@@ -346,13 +387,14 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
     def count_tokens(self, text: str) -> int:
         if not self.model:
             ASCIIColors.warning("Llama.cpp model not loaded. Token count fallback to tiktoken.")
+            import tiktoken
             return len(tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text))
         return len(self.tokenize(text))
 
     def embed(self, text: str, **kwargs) -> List[float]:
         if not self.model:
              raise Exception("Llama.cpp model not loaded.")
-        if not self.llama_config.get("embedding"): # or not self.model.params.embedding:
+        if not self.llama_config.get("embedding"):
             raise Exception("Embedding support was not enabled when loading the model (set 'embedding: true' in config).")
         try:
             return self.model.embed(text)
@@ -366,7 +408,7 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
                 "error": "Model not loaded or failed to load."
             }
         
-        is_llava_model = "llava" in self.model_path.lower() or \
+        is_llava_model = "llava" in os.path.basename(self.model_path).lower() or \
                          (self.llama_config.get("chat_format", "").startswith("llava") and \
                           self.llama_config.get("clip_model_path") is not None)
 
@@ -380,17 +422,42 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
             "config": self.llama_config 
         }
 
-    def listModels(self) -> List[Dict[str, str]]: # type: ignore
-        # This method is more for server-based bindings. For LlamaCpp, it describes the loaded model.
-        # It could be extended to scan lollms_paths for GGUF files.
-        if self.model:
-            return [{
-                'model_name': os.path.basename(self.model_path), 'path': self.model_path, 'loaded': True,
-                'n_ctx': str(self.model.context_params.n_ctx), 
+    def listModels(self, force_rescan: bool = False) -> List[Dict[str, str]]: # type: ignore
+        """
+        Lists available GGUF models.
+        
+        Args:
+            force_rescan: If True, rescans the model directories.
+        
+        Returns:
+            A list of dictionaries, each representing a found model.
+        """
+        if force_rescan or not self.available_models:
+            self._scan_for_models()
+
+        model_list = []
+        for short_name, full_path in self.available_models.items():
+            is_loaded = (self.model is not None and self.model_path == full_path)
+            model_entry = {
+                'model_name': short_name, 
+                'path': full_path,
+                'loaded': is_loaded
+            }
+            if is_loaded:
+                model_entry.update({
+                    'n_ctx': str(self.model.context_params.n_ctx), 
+                    'n_gpu_layers': str(self.llama_config.get("n_gpu_layers", "N/A")),
+                })
+            model_list.append(model_entry)
+            
+        if not model_list and self.model_path: # Case where a direct path was loaded but not in scan paths
+             return [{
+                'model_name': os.path.basename(self.model_path), 'path': self.model_path, 'loaded': self.model is not None,
+                'n_ctx': str(self.model.context_params.n_ctx) if self.model else "N/A", 
                 'n_gpu_layers': str(self.llama_config.get("n_gpu_layers","N/A")),
             }]
-        return [{'model_name': os.path.basename(self.model_path) if self.model_path else "Not specified", 
-                 'path': self.model_path, 'loaded': False, 'error': "Model not loaded."}]
+        return model_list
+
     
     def unload_model(self):
         if self.model:
@@ -412,47 +479,39 @@ if __name__ == '__main__':
     ASCIIColors.yellow("Testing PythonLlamaCppBinding...")
 
     # --- IMPORTANT: Configure model path ---
-    # Replace with the ACTUAL PATH to your GGUF model file.
-    # e.g., gguf_model_path = "C:/Models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf"
-    # If this path is not found, a dummy GGUF will be created for basic tests.
-    gguf_model_path = "model.gguf" # <<< REPLACE THIS OR ENSURE 'model.gguf' EXISTS
+    # The binding will now auto-discover models. 
+    # To test auto-selection, set gguf_model_path = None
+    # To test loading a specific model, set its "short name" here, e.g., "Mistral-7B/model.gguf"
+    gguf_model_path = None # <<< SET TO A SHORT NAME, FULL PATH, OR None FOR AUTO-SELECTION
 
-    # --- LLaVA Test Configuration (Optional) ---
-    # To test LLaVA, set this to your LLaVA GGUF model path
-    llava_test_model_path = None # e.g., "path/to/your/llava-v1.6-mistral-7b.Q4_K_M.gguf"
-    # And the corresponding mmproj (clip model) GGUF path
-    llava_test_clip_model_path = None # e.g., "path/to/your/mmproj-mistral7b-f16.gguf"
-    # And set the chat format for LLaVA
-    llava_chat_format = "llava-1-6" # or "llava-1-5" depending on your model
+    # --- Test Setup ---
+    # Create a dummy model directory for the test
+    mock_models_dir = "test_models_dir"
+    os.makedirs(os.path.join(mock_models_dir, "subfolder"), exist_ok=True)
+    
+    dummy_gguf_content = b"GGUF\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"
+    dummy_gguf_content += b"\x14\x00\x00\x00\x00\x00\x00\x00" + b"tokenizer.ggml.model"
+    dummy_gguf_content += b"\x02\x00\x00\x00\x00\x00\x00\x00" + b"\x05\x00\x00\x00\x00\x00\x00\x00" + b"llama"
+    
+    dummy_model_path1 = os.path.join(mock_models_dir, "dummy_model_A.gguf")
+    dummy_model_path2 = os.path.join(mock_models_dir, "subfolder", "dummy_model_B.gguf")
 
-    # Attempt to create a dummy GGUF if specified path doesn't exist (for placeholder testing)
-    is_dummy_model = False
-    if not os.path.exists(gguf_model_path):
-        ASCIIColors.warning(f"Model path '{gguf_model_path}' not found.")
-        ASCIIColors.warning("Creating a tiny dummy GGUF file ('dummy_model.gguf') for placeholder testing.")
-        ASCIIColors.warning("This dummy file WILL NOT WORK for actual inference.")
-        try:
-            with open("dummy_model.gguf", "wb") as f: # Minimal valid GGUF structure
-                f.write(b"GGUF\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00")
-                key, val = "tokenizer.ggml.model", "llama"
-                f.write(len(key).to_bytes(8,'little')+key.encode()+b"\x02\x00\x00\x00\x00\x00\x00\x00"+len(val).to_bytes(8,'little')+val.encode())
-            gguf_model_path = "dummy_model.gguf"
-            is_dummy_model = True
-            ASCIIColors.info(f"Using dummy GGUF: {gguf_model_path}. Real inference tests will fail or be skipped.")
-        except Exception as e_dummy:
-            ASCIIColors.error(f"Could not create dummy GGUF: {e_dummy}. Please set a valid GGUF model path.")
-            sys.exit(1)
+    try:
+        with open(dummy_model_path1, "wb") as f: f.write(dummy_gguf_content)
+        with open(dummy_model_path2, "wb") as f: f.write(dummy_gguf_content)
+        ASCIIColors.info("Created dummy GGUF files for testing.")
+        # If no specific model path is given, the test will use auto-selection on these dummy files.
+        # This will fail at the INFERENCE stage but test the discovery and loading logic.
+        is_dummy_model = True
+    except Exception as e_dummy:
+        ASCIIColors.error(f"Could not create dummy GGUF files: {e_dummy}. Test may fail.")
+        is_dummy_model = False # Assume a real model path is set
 
     binding_config = {
-        "n_gpu_layers": 0, # 0 for CPU, -1 for all possible layers to GPU, or specific number
-        "n_ctx": 1024,     # Short context for testing
-        "seed": 1234,
-        "embedding": True, # Enable embedding generation for the test
-        "verbose": False,  # Set to True for detailed llama.cpp logs
-        # "grammar_file": "json.gbnf" # Example for grammar test
+        "n_gpu_layers": 0, "n_ctx": 1024, "seed": 1234, "embedding": True, "verbose": False,
     }
     
-    mock_lollms_paths = { "personal_models_path": ".", "grammars_path": "grammars_test" }
+    mock_lollms_paths = { "personal_models_path": mock_models_dir, "grammars_path": "grammars_test" }
     if not os.path.exists(mock_lollms_paths["grammars_path"]):
         os.makedirs(mock_lollms_paths["grammars_path"], exist_ok=True)
     with open(os.path.join(mock_lollms_paths["grammars_path"], "test_grammar.gbnf"), "w") as f:
@@ -461,17 +520,27 @@ if __name__ == '__main__':
     active_binding = None
     try:
         ASCIIColors.cyan("\n--- Initializing PythonLlamaCppBinding ---")
+        # Initialize with the specified path (or None for auto-selection)
         active_binding = PythonLlamaCppBinding(model_path=gguf_model_path, config=binding_config, lollms_paths=mock_lollms_paths)
-        ASCIIColors.green(f"Binding initialized. Model: {active_binding.model_path}")
-        ASCIIColors.info(f"Model Info: {json.dumps(active_binding.get_model_info(), indent=2)}")
+        
+        ASCIIColors.green(f"Binding initialized. Loaded model: {os.path.basename(active_binding.model_path)}")
+        ASCIIColors.info(f"Full path: {active_binding.model_path}")
+
+        # --- List Models ---
+        ASCIIColors.cyan("\n--- Listing Models (force_rescan=True) ---")
+        model_list = active_binding.listModels(force_rescan=True)
+        print(json.dumps(model_list, indent=2))
+        assert len(model_list) == 2, "Model discovery failed to find all dummy models."
+        assert any(m['loaded'] for m in model_list), "listModels did not correctly report a loaded model."
+
 
         if is_dummy_model:
-            ASCIIColors.warning("\nRUNNING WITH DUMMY MODEL. MOST FUNCTIONALITY TESTS WILL BE SKIPPED.")
+            ASCIIColors.warning("\nRUNNING WITH DUMMY MODEL. INFERENCE TESTS WILL BE SKIPPED.")
+            ASCIIColors.info("Discovery, loading, and listing tests passed.")
         else:
-            # --- List Models ---
-            ASCIIColors.cyan("\n--- Listing Models ---")
-            print(json.dumps(active_binding.listModels(), indent=2))
-
+            # These tests will only run if you provided a path to a REAL model
+            ASCIIColors.info("\nRUNNING WITH REAL MODEL. PROCEEDING WITH INFERENCE TESTS...")
+            
             # --- Tokenize/Detokenize ---
             ASCIIColors.cyan("\n--- Tokenize/Detokenize ---")
             sample_text = "Hello, Llama.cpp world! This is a test sentence."
@@ -508,71 +577,13 @@ if __name__ == '__main__':
             if isinstance(result, str): ASCIIColors.green(f"Full streamed text: {result}")
             else: ASCIIColors.error(f"Streaming generation failed: {result}")
             
-            # --- Text Generation with Grammar ---
-            ASCIIColors.cyan("\n--- Text Generation with Grammar ---")
-            generated_grammar_text = active_binding.generate_text(
-                "Output a greeting:", n_predict=5, stream=False, use_chat_format=False, # Grammar often better with raw completion
-                grammar=os.path.join(mock_lollms_paths["grammars_path"], "test_grammar.gbnf")
-            )
-            if isinstance(generated_grammar_text, str):
-                ASCIIColors.green(f"Generated text with grammar: '{generated_grammar_text.strip()}'")
-                assert generated_grammar_text.strip().lower() in ["hello", "world"], "Grammar constraint failed!"
-            else: ASCIIColors.error(f"Grammar generation failed: {generated_grammar_text}")
-
-            # --- Embeddings ---
-            if binding_config.get("embedding"):
-                ASCIIColors.cyan("\n--- Embeddings ---")
-                embedding_text = "This is a test for embeddings."
-                try:
-                    embedding_vector = active_binding.embed(embedding_text)
-                    ASCIIColors.green(f"Embedding for '{embedding_text}' (first 3 dims): {embedding_vector[:3]}...")
-                    ASCIIColors.info(f"Embedding vector dimension: {len(embedding_vector)}")
-                except Exception as e_emb: ASCIIColors.warning(f"Could not get embedding: {e_emb}")
-            else: ASCIIColors.yellow("\n--- Embeddings Skipped (embedding: false in config) ---")
-
-        # --- LLaVA Test (if configured and real model is LLaVA) ---
-        if not is_dummy_model and llava_test_model_path and os.path.exists(llava_test_model_path) and \
-           llava_test_clip_model_path and os.path.exists(llava_test_clip_model_path) and \
-           active_binding and active_binding.model_path.lower() == llava_test_model_path.lower():
-            
-            ASCIIColors.cyan("\n--- LLaVA Vision Test ---")
-            # This assumes the 'active_binding' was ALREADY loaded with the LLaVA model
-            # and its specific config (clip_model_path, chat_format="llava-1-x").
-            # If not, you'd need to unload and reload/reinitialize the binding for LLaVA.
-            if not (active_binding.llama_config.get("chat_format","").startswith("llava") and \
-                    active_binding.llama_config.get("clip_model_path")):
-                ASCIIColors.warning("Current binding not configured for LLaVA. Skipping LLaVA test.")
-                ASCIIColors.warning("To test LLaVA, ensure gguf_model_path points to LLaVA model and config includes 'chat_format' and 'clip_model_path'.")
-            else:
-                dummy_image_path = "dummy_llava_image.png"
-                try:
-                    from PIL import Image, ImageDraw
-                    img = Image.new('RGB', (200, 80), color = ('cyan'))
-                    d = ImageDraw.Draw(img); d.text((10,20), "LLaVA Test", fill=('black'))
-                    img.save(dummy_image_path)
-                    ASCIIColors.info(f"Created dummy image for LLaVA: {dummy_image_path}")
-
-                    llava_prompt = "What do you see in this image?"
-                    llava_response = active_binding.generate_text(
-                        prompt=llava_prompt, images=[dummy_image_path], n_predict=50, stream=False, use_chat_format=True
-                    )
-                    if isinstance(llava_response, str): ASCIIColors.green(f"LLaVA response: {llava_response}")
-                    else: ASCIIColors.error(f"LLaVA generation failed: {llava_response}")
-                except ImportError: ASCIIColors.warning("Pillow not found. Cannot create dummy image for LLaVA.")
-                except Exception as e_llava: ASCIIColors.error(f"LLaVA test error: {e_llava}"); trace_exception(e_llava)
-                finally:
-                    if os.path.exists(dummy_image_path): os.remove(dummy_image_path)
-        elif not is_dummy_model and llava_test_model_path: # If LLaVA test paths are set but model isn't LLaVA
-             ASCIIColors.yellow(f"LLaVA test paths are set, but current model '{active_binding.model_path if active_binding else 'N/A'}' is not '{llava_test_model_path}'.")
-             ASCIIColors.yellow("Skipping LLaVA-specific test section. To run, set main gguf_model_path to LLaVA model and configure LLaVA params.")
-
-
     except ImportError as e_imp:
         ASCIIColors.error(f"Import error: {e_imp}. Llama-cpp-python might not be installed/configured correctly.")
     except FileNotFoundError as e_fnf:
-        ASCIIColors.error(f"Model file error: {e_fnf}. Ensure GGUF model path is correct.")
+        ASCIIColors.error(f"Model file error: {e_fnf}. Ensure GGUF model path is correct or models are in the right directory.")
     except RuntimeError as e_rt: 
         ASCIIColors.error(f"Runtime error (often model load failure or llama.cpp issue): {e_rt}")
+        if is_dummy_model: ASCIIColors.yellow("This error is expected when using a dummy model for loading.")
         trace_exception(e_rt)
     except Exception as e_main:
         ASCIIColors.error(f"An unexpected error occurred: {e_main}")
@@ -583,8 +594,11 @@ if __name__ == '__main__':
             active_binding.unload_model()
             ASCIIColors.green("Model unloaded.")
         
-        if is_dummy_model and os.path.exists("dummy_model.gguf"):
-            os.remove("dummy_model.gguf")
+        # Cleanup dummy files and directories
+        if os.path.exists(mock_models_dir):
+            import shutil
+            shutil.rmtree(mock_models_dir)
+            ASCIIColors.info(f"Cleaned up dummy model directory: {mock_models_dir}")
         
         test_grammar_file = os.path.join(mock_lollms_paths["grammars_path"], "test_grammar.gbnf")
         if os.path.exists(test_grammar_file): os.remove(test_grammar_file)

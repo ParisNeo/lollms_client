@@ -272,8 +272,22 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         if llama_cpp_binaries is None: raise ImportError("llama-cpp-binaries package is required but not found.")
 
         self.models_path = Path(models_path)
-        self.user_provided_model_name = model_name # Store the name/path user gave
-        
+        self.user_provided_model_name = model_name  # Store the name/path user gave
+        self._model_path_map: Dict[str, Path] = {}  # Maps unique name to full Path
+
+        # Initial scan for available models
+        self._scan_models()
+
+        # Determine the model to load
+        effective_model_to_load = model_name
+        if not effective_model_to_load and self._model_path_map:
+            # If no model was specified and we have models, pick the first one
+            # Sorting ensures a deterministic choice
+            first_model_name = sorted(self._model_path_map.keys())[0]
+            effective_model_to_load = first_model_name
+            ASCIIColors.info(f"No model was specified. Automatically selecting the first available model: '{effective_model_to_load}'")
+            self.user_provided_model_name = effective_model_to_load  # Update for get_model_info etc.
+
         # Initial hint for clip_model_path, resolved fully in load_model
         self.clip_model_path: Optional[Path] = None
         if clip_model_name:
@@ -294,8 +308,12 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         self.port: Optional[int] = None
         self.server_key: Optional[tuple] = None
 
-        if not self.load_model(self.user_provided_model_name):
-            ASCIIColors.error(f"Initial model load for '{self.user_provided_model_name}' failed. Binding may not be functional.")
+        # Now, attempt to load the selected model
+        if effective_model_to_load:
+            if not self.load_model(effective_model_to_load):
+                ASCIIColors.error(f"Initial model load for '{effective_model_to_load}' failed. Binding may not be functional.")
+        else:
+            ASCIIColors.warning("No models found in the models path. The binding will be idle until a model is loaded.")
 
     def _get_server_binary_path(self) -> Path:
         custom_path_str = self.server_args.get("llama_server_binary_path")
@@ -313,16 +331,41 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         raise FileNotFoundError("Llama.cpp server binary not found. Ensure 'llama-cpp-binaries' or 'llama-cpp-python[server]' is installed or provide 'llama_server_binary_path'.")
 
     def _resolve_model_path(self, model_name_or_path: str) -> Path:
+        """
+        Resolves a model name or path to a full Path object.
+        It prioritizes the internal map, then checks for absolute/relative paths,
+        and rescans the models directory as a fallback.
+        """
+        # 1. Check if the provided name is a key in our map
+        if model_name_or_path in self._model_path_map:
+            resolved_path = self._model_path_map[model_name_or_path]
+            ASCIIColors.info(f"Resolved model name '{model_name_or_path}' to path: {resolved_path}")
+            return resolved_path
+
+        # 2. If not in map, treat it as a potential path (absolute or relative to models_path)
         model_p = Path(model_name_or_path)
         if model_p.is_absolute():
-            if model_p.exists(): return model_p
-            else: raise FileNotFoundError(f"Absolute model path specified but not found: {model_p}")
-        
+            if model_p.exists() and model_p.is_file():
+                return model_p
+
         path_in_models_dir = self.models_path / model_name_or_path
         if path_in_models_dir.exists() and path_in_models_dir.is_file():
-            ASCIIColors.info(f"Found model at: {path_in_models_dir}"); return path_in_models_dir
-        
-        raise FileNotFoundError(f"Model '{model_name_or_path}' not found as absolute path or within '{self.models_path}'.")
+            ASCIIColors.info(f"Found model at relative path: {path_in_models_dir}")
+            return path_in_models_dir
+
+        # 3. As a fallback, rescan the models directory in case the file was just added
+        ASCIIColors.info("Model not found in cache, rescanning directory...")
+        self._scan_models()
+        if model_name_or_path in self._model_path_map:
+            resolved_path = self._model_path_map[model_name_or_path]
+            ASCIIColors.info(f"Found model '{model_name_or_path}' after rescan: {resolved_path}")
+            return resolved_path
+
+        # Final check for absolute path after rescan
+        if model_p.is_absolute() and model_p.exists() and model_p.is_file():
+            return model_p
+
+        raise FileNotFoundError(f"Model '{model_name_or_path}' not found in the map, as an absolute path, or within '{self.models_path}'.")
 
     def _find_available_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -352,6 +395,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
 
     def load_model(self, model_name_or_path: str) -> bool:
+        self.user_provided_model_name = model_name_or_path # Keep track of the selected model name
         try:
             resolved_model_path = self._resolve_model_path(model_name_or_path)
         except Exception as ex:
@@ -805,19 +849,54 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             info["supports_structured_output"] = self.server_args.get("grammar_string") is not None
         return info
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def _scan_models(self):
+        """
+        Scans the models_path for GGUF files and populates the model map.
+        Handles duplicate filenames by prefixing them with their parent directory path.
+        """
+        self._model_path_map = {}
+        if not self.models_path.exists() or not self.models_path.is_dir():
+            ASCIIColors.warning(f"Models path does not exist or is not a directory: {self.models_path}")
+            return
+
+        all_paths = list(self.models_path.rglob("*.gguf"))
+        filenames_count = {}
+        for path in all_paths:
+            if path.is_file():
+                filenames_count[path.name] = filenames_count.get(path.name, 0) + 1
+
+        for model_file in all_paths:
+            if model_file.is_file():
+                # On Windows, path separators can be tricky. Convert to generic format.
+                relative_path_str = str(model_file.relative_to(self.models_path).as_posix())
+                if filenames_count[model_file.name] > 1:
+                    # Duplicate filename, use relative path as the unique name
+                    unique_name = relative_path_str
+                else:
+                    # Unique filename, use the name itself
+                    unique_name = model_file.name
+                
+                self._model_path_map[unique_name] = model_file
+        
+        ASCIIColors.info(f"Scanned {len(self._model_path_map)} models from {self.models_path}.")
+
+    def listModels(self) -> List[Dict[str, Any]]:
+        """
+        Lists all available GGUF models, rescanning the directory first.
+        """
+        self._scan_models()  # Always rescan when asked for the list
+
         models_found = []
-        unique_models = set()
-        if self.models_path.exists() and self.models_path.is_dir():
-            for model_file in self.models_path.rglob("*.gguf"):
-                if model_file.is_file() and model_file.name not in unique_models:
-                    models_found.append({
-                        'model_name': model_file.name,
-                        'path_hint': str(model_file.relative_to(self.models_path.parent) if model_file.is_relative_to(self.models_path.parent) else model_file),
-                        'size_gb': f"{model_file.stat().st_size / (1024**3):.2f} GB"
-                    })
-                    unique_models.add(model_file.name)
-        return models_found
+        for unique_name, model_path in self._model_path_map.items():
+            models_found.append({
+                'name': unique_name,  # The unique name for selection
+                'model_name': model_path.name, # The original filename for display
+                'path': str(model_path),  # The full path
+                'size': model_path.stat().st_size
+            })
+        
+        # Sort the list alphabetically by the unique name for consistent ordering
+        return sorted(models_found, key=lambda x: x['name'])
     
     def __del__(self):
         self.unload_model()
@@ -872,17 +951,21 @@ if __name__ == '__main__':
     try:
         if primary_model_available:
             ASCIIColors.cyan("\n--- Initializing First LlamaCppServerBinding Instance ---")
+            # Test default model selection by passing model_name=None
+            ASCIIColors.info("Testing default model selection (model_name=None)")
             active_binding1 = LlamaCppServerBinding(
-                model_name=model_name_str, models_path=str(models_path), config=binding_config
+                model_name=None, models_path=str(models_path), config=binding_config
             )
             if not active_binding1.server_process or not active_binding1.server_process.is_healthy:
                 raise RuntimeError("Server for binding1 failed to start or become healthy.")
-            ASCIIColors.green(f"Binding1 initialized. Server for '{active_binding1.current_model_path.name}' running on port {active_binding1.port}.")
+            ASCIIColors.green(f"Binding1 initialized with default model. Server for '{active_binding1.current_model_path.name}' running on port {active_binding1.port}.")
             ASCIIColors.info(f"Binding1 Model Info: {json.dumps(active_binding1.get_model_info(), indent=2)}")
 
-            ASCIIColors.cyan("\n--- Initializing Second LlamaCppServerBinding Instance (Same Model) ---")
+            ASCIIColors.cyan("\n--- Initializing Second LlamaCppServerBinding Instance (Same Model, explicit name) ---")
+            # Load the same model explicitly now
+            model_to_load_explicitly = active_binding1.user_provided_model_name
             active_binding2 = LlamaCppServerBinding(
-                model_name=model_name_str, models_path=str(models_path), config=binding_config # Same model and config
+                model_name=model_to_load_explicitly, models_path=str(models_path), config=binding_config
             )
             if not active_binding2.server_process or not active_binding2.server_process.is_healthy:
                 raise RuntimeError("Server for binding2 failed to start or become healthy (should reuse).")
@@ -896,9 +979,30 @@ if __name__ == '__main__':
             
             # --- List Models (scans configured directories) ---
             ASCIIColors.cyan("\n--- Listing Models (from search paths, using binding1) ---")
+            # Create a dummy duplicate model to test unique naming
+            duplicate_folder = models_path / "subdir"
+            duplicate_folder.mkdir(exist_ok=True)
+            duplicate_model_path = duplicate_folder / test_model_path.name
+            import shutil
+            shutil.copy(test_model_path, duplicate_model_path)
+            ASCIIColors.info(f"Created a duplicate model for testing: {duplicate_model_path}")
+            
             listed_models = active_binding1.listModels()
-            if listed_models: ASCIIColors.green(f"Found {len(listed_models)} GGUF files. First 5: {listed_models[:5]}")
+            if listed_models: 
+                ASCIIColors.green(f"Found {len(listed_models)} GGUF files.")
+                pprint.pprint(listed_models)
+                # Check if the duplicate was handled
+                names = [m['name'] for m in listed_models]
+                if test_model_path.name in names and f"subdir/{test_model_path.name}" in names:
+                    ASCIIColors.green("SUCCESS: Duplicate model names were correctly handled.")
+                else:
+                    ASCIIColors.error("FAILURE: Duplicate model names were not handled correctly.")
             else: ASCIIColors.warning("No GGUF models found in search paths.")
+            
+            # Clean up dummy duplicate
+            duplicate_model_path.unlink()
+            duplicate_folder.rmdir()
+
 
             # --- Tokenize/Detokenize ---
             ASCIIColors.cyan("\n--- Tokenize/Detokenize (using binding1) ---")
@@ -913,16 +1017,16 @@ if __name__ == '__main__':
             # --- Text Generation (Non-Streaming, Chat API, binding1) ---
             ASCIIColors.cyan("\n--- Text Generation (Non-Streaming, Chat API, binding1) ---")
             prompt_text = "What is the capital of Germany?"
-            generated_text = active_binding1.generate_text(prompt_text, system_prompt="Concise expert.", n_predict=20, stream=False, use_chat_format_override=True)
+            generated_text = active_binding1.generate_text(prompt_text, system_prompt="Concise expert.", n_predict=20, stream=False)
             if isinstance(generated_text, str): ASCIIColors.green(f"Generated text (binding1): {generated_text}")
             else: ASCIIColors.error(f"Generation failed (binding1): {generated_text}")
 
             # --- Text Generation (Streaming, Completion API, binding2) ---
-            ASCIIColors.cyan("\n--- Text Generation (Streaming, Completion API, binding2) ---")
+            ASCIIColors.cyan("\n--- Text Generation (Streaming, Chat API, binding2) ---")
             full_streamed_text = "" # Reset global
             def stream_callback(chunk: str, msg_type: int): global full_streamed_text; ASCIIColors.green(f"{chunk}", end="", flush=True); full_streamed_text += chunk; return True
             
-            result_b2 = active_binding2.generate_text(prompt_text, system_prompt="Concise expert.", n_predict=30, stream=True, streaming_callback=stream_callback, use_chat_format_override=False)
+            result_b2 = active_binding2.generate_text(prompt_text, system_prompt="Concise expert.", n_predict=30, stream=True, streaming_callback=stream_callback)
             print("\n--- End of Stream (binding2) ---")
             if isinstance(result_b2, str): ASCIIColors.green(f"Full streamed text (binding2): {result_b2}")
             else: ASCIIColors.error(f"Streaming generation failed (binding2): {result_b2}")
@@ -957,9 +1061,9 @@ if __name__ == '__main__':
                 # llava_binding_config["chat_template"] = "llava-1.5" 
                 
                 active_binding_llava = LlamaCppServerBinding(
-                    model_name=str(llava_model_path), # Pass full path for clarity in test
+                    model_name=str(llava_model_path.name), # Pass filename, let it resolve
                     models_path=str(models_path), 
-                    clip_model_name=str(llava_clip_path_actual), # Pass full path for clip
+                    clip_model_name=str(llava_clip_path_actual.name), # Pass filename for clip
                     config=llava_binding_config
                 )
                 if not active_binding_llava.server_process or not active_binding_llava.server_process.is_healthy:
@@ -970,7 +1074,7 @@ if __name__ == '__main__':
 
                 llava_prompt = "Describe this image."
                 llava_response = active_binding_llava.generate_text(
-                    prompt=llava_prompt, images=[str(dummy_image_path)], n_predict=40, stream=False, use_chat_format_override=True
+                    prompt=llava_prompt, images=[str(dummy_image_path)], n_predict=40, stream=False
                 )
                 if isinstance(llava_response, str): ASCIIColors.green(f"LLaVA response: {llava_response}")
                 else: ASCIIColors.error(f"LLaVA generation failed: {llava_response}")
@@ -986,7 +1090,7 @@ if __name__ == '__main__':
             # --- Test changing model (using binding1 to load a different or same model) ---
             ASCIIColors.cyan("\n--- Testing Model Change (binding1 reloads its model) ---")
             # For a real change, use a different model name if available. Here, we reload the same.
-            reload_success = active_binding1.load_model(model_name_str) # Reload original model
+            reload_success = active_binding1.load_model(active_binding1.user_provided_model_name) # Reload original model
             if reload_success and active_binding1.server_process and active_binding1.server_process.is_healthy:
                 ASCIIColors.green(f"Model reloaded/re-confirmed successfully by binding1. Server on port {active_binding1.port}.")
                 reloaded_gen = active_binding1.generate_text("Ping", n_predict=5, stream=False)
