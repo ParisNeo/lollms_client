@@ -9,6 +9,7 @@ from lollms_client.lollms_discussion import LollmsDiscussion
 from typing import Optional, Callable, List, Union
 from ascii_colors import ASCIIColors, trace_exception
 from typing import List, Dict
+import math
 
 import pipmaster as pm
 
@@ -56,189 +57,154 @@ class OpenAIBinding(LollmsLLMBinding):
         self.client = openai.OpenAI(api_key=self.service_key, base_url=None if host_address is None else host_address if len(host_address)>0 else None)
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
-    
-    def generate_text(self,
-                     prompt: str,
-                     images: Optional[List[str]] = None,
-                     system_prompt: str = "",
-                     n_predict: Optional[int] = None,
-                     stream: Optional[bool] = None,
-                     temperature: float = 0.7, 
-                     top_k: int = 40,          
-                     top_p: float = 0.9,       
-                     repeat_penalty: float = 1.1, 
-                     repeat_last_n: int = 64, 
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     split:Optional[bool]=False, # put to true if the prompt is a discussion
-                     user_keyword:Optional[str]="!@>user:",
-                     ai_keyword:Optional[str]="!@>assistant:",
-                     ) -> Union[str, dict]:
-        """
-        Generate text using the active LLM binding, using instance defaults if parameters are not provided.
+    def _build_openai_params(self, messages: list, **kwargs) -> dict:
+        model = kwargs.get("model", self.model_name)
+        if "n_predict" in kwargs:
+            kwargs["max_tokens"] = kwargs.pop("n_predict")
 
-        Args:
-            prompt (str): The input prompt for text generation.
-            images (Optional[List[str]]): List of image file paths for multimodal generation.
-            n_predict (Optional[int]): Maximum number of tokens to generate. Uses instance default if None.
-            stream (Optional[bool]): Whether to stream the output. Uses instance default if None.
-            temperature (Optional[float]): Sampling temperature. Uses instance default if None.
-            top_k (Optional[int]): Top-k sampling parameter. Uses instance default if None.
-            top_p (Optional[float]): Top-p sampling parameter. Uses instance default if None.
-            repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
-            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
-            seed (Optional[int]): Random seed for generation. Uses instance default if None.
-            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
-            ctx_size (int | None): Context size override for this generation.
-            streaming_callback (Optional[Callable[[str, str], None]]): Callback function for streaming output.
-                - First parameter (str): The chunk of text received.
-                - Second parameter (str): The message type (e.g., MSG_TYPE.MSG_TYPE_CHUNK).
-            split:Optional[bool]: put to true if the prompt is a discussion
-            user_keyword:Optional[str]: when splitting we use this to extract user prompt 
-            ai_keyword:Optional[str]": when splitting we use this to extract ai prompt
-
-        Returns:
-            Union[str, dict]: Generated text or error dictionary if failed.
-        """
-        count = 0
-        output = ""
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt or "You are a helpful assistant.",
-            }
+        restricted_families = [
+            "gpt-5",
+            "gpt-4o",
+            "o1",
+            "o3",
+            "o4"
         ]
 
-        # Prepare messages based on whether images are provided
+        allowed_params = {
+            "model", "messages", "temperature", "top_p", "n",
+            "stop", "max_tokens", "presence_penalty", "frequency_penalty",
+            "logit_bias", "stream", "user", "max_completion_tokens"
+        }
+
+        params = {
+            "model": model,
+            "messages": messages,
+        }
+
+        for k, v in kwargs.items():
+            if k in allowed_params and v is not None:
+                params[k] = v
+            else:
+                if v is not None:
+                    ASCIIColors.warning(f"Removed unsupported OpenAI param '{k}'")
+
+        model_lower = model.lower()
+        if any(fam in model_lower for fam in restricted_families):
+            if "temperature" in params and params["temperature"] != 1:
+                ASCIIColors.warning(f"{model} does not support temperature != 1. Overriding to 1.")
+                params["temperature"] = 1
+            if "top_p" in params:
+                ASCIIColors.warning(f"{model} does not support top_p. Removing it.")
+                params.pop("top_p")
+
+        return params
+
+
+
+
+
+    
+    def generate_text(self,
+                    prompt: str,
+                    images: Optional[List[str]] = None,
+                    system_prompt: str = "",
+                    n_predict: Optional[int] = None,
+                    stream: Optional[bool] = None,
+                    temperature: float = 0.7, 
+                    top_k: int = 40,          
+                    top_p: float = 0.9,       
+                    repeat_penalty: float = 1.1, 
+                    repeat_last_n: int = 64, 
+                    seed: Optional[int] = None,
+                    n_threads: Optional[int] = None,
+                    ctx_size: int | None = None,
+                    streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                    split: Optional[bool] = False,
+                    user_keyword: Optional[str] = "!@>user:",
+                    ai_keyword: Optional[str] = "!@>assistant:"
+                    ) -> Union[str, dict]:
+
+        count = 0
+        output = ""
+        messages = [{"role": "system", "content": system_prompt or "You are a helpful assistant."}]
+
         if images:
             if split:
-                messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
-                if images:
-                    messages[-1]["content"] = [
-                        {
-                            "type": "text",
-                            "text": messages[-1]["content"]
-                        }
-                    ]+[
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{encode_image(image_path)}"
-                            }
-                        }
-                        for image_path in images
-                    ]
+                messages += self.split_discussion(prompt, user_keyword=user_keyword, ai_keyword=ai_keyword)
+                messages[-1]["content"] = [{"type": "text", "text": messages[-1]["content"]}] + [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(path)}"}}
+                    for path in images
+                ]
             else:
                 messages.append({
-                        'role': 'user', 
-                        'content': [
-                                        {
-                                            "type": "text",
-                                            "text": prompt
-                                        }
-                                    ] + [
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {
-                                                "url": f"data:image/jpeg;base64,{encode_image(image_path)}"
-                                            }
-                                        }
-                                        for image_path in images
-                                    ]
-                    }
-                )
-            
+                    'role': 'user',
+                    'content': [{"type": "text", "text": prompt}] + [
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(path)}"}}
+                        for path in images
+                    ]
+                })
         else:
-            
             if split:
-                messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
-                if images:
-                    messages[-1]["content"] = [
-                        {
-                            "type": "text",
-                            "text": messages[-1]["content"]
-                        }
-                    ]
+                messages += self.split_discussion(prompt, user_keyword=user_keyword, ai_keyword=ai_keyword)
             else:
-                messages.append({
-                        'role': 'user', 
-                        'content': [
-                                        {
-                                            "type": "text",
-                                            "text": prompt
-                                        }
-                                    ]
-                    }
-                )
+                messages.append({'role': 'user', 'content': [{"type": "text", "text": prompt}]})
 
-        # Generate text using the OpenAI API
-        if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
-            try:
-                chat_completion = self.client.chat.completions.create(
-                    model=self.model_name,  # Choose the engine according to your OpenAI plan
-                    messages=messages,
-                    max_tokens=n_predict,  # Adjust the desired length of the generated response
-                    n=1,  # Specify the number of responses you want
-                    temperature=temperature,  # Adjust the temperature for more or less randomness in the output
-                    stream=stream
-                )
-            except Exception as ex:
-                # exception for new openai models
-                chat_completion = self.client.chat.completions.create(
-                    model=self.model_name,  # Choose the engine according to your OpenAI plan
-                    messages=messages,
-                    max_completion_tokens=n_predict,  # Adjust the desired length of the generated response
-                    n=1,  # Specify the number of responses you want
-                    temperature=1,  # Adjust the temperature for more or less randomness in the output
-                    stream=stream
-                )
+        try:
+            if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
+                params = self._build_openai_params(messages=messages,
+                                                n_predict=n_predict,
+                                                stream=stream,
+                                                temperature=temperature,
+                                                top_p=top_p,
+                                                repeat_penalty=repeat_penalty,
+                                                seed=seed)
+                chat_completion = self.client.chat.completions.create(**params)
 
-            if stream:
-                for resp in chat_completion:
-                    if count >= n_predict:
-                        break
-                    try:
-                        word = resp.choices[0].delta.content
-                    except Exception as ex:
-                        word = ""
-                    if streaming_callback is not None:
-                        if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                if stream:
+                    for resp in chat_completion:
+                        if count >= (n_predict or float('inf')):
                             break
-                    if word:
-                        output += word
-                        count += 1
-            else:
-                output = chat_completion.choices[0].message.content
-        else:
-            completion = self.client.completions.create(
-                model=self.model_name,  # Choose the engine according to your OpenAI plan
-                prompt=prompt,
-                max_tokens=n_predict,  # Adjust the desired length of the generated response
-                n=1,  # Specify the number of responses you want
-                temperature=temperature,  # Adjust the temperature for more or less randomness in the output
-                stream=stream
-            )
-
-            if stream:
-                for resp in completion:
-                    if count >= n_predict:
-                        break
-                    try:
-                        word = resp.choices[0].text
-                    except Exception as ex:
-                        word = ""
-                    if streaming_callback is not None:
-                        if not streaming_callback(word, "MSG_TYPE_CHUNK"):
+                        word = getattr(resp.choices[0].delta, "content", "") or ""
+                        if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
                             break
-                    if word:
-                        output += word
-                        count += 1
+                        if word:
+                            output += word
+                            count += 1
+                else:
+                    output = chat_completion.choices[0].message.content
+
             else:
-                output = completion.choices[0].text
+                params = self._build_openai_params(prompt=prompt,
+                                                n_predict=n_predict,
+                                                stream=stream,
+                                                temperature=temperature,
+                                                top_p=top_p,
+                                                repeat_penalty=repeat_penalty,
+                                                seed=seed)
+                completion = self.client.completions.create(**params)
+
+                if stream:
+                    for resp in completion:
+                        if count >= (n_predict or float('inf')):
+                            break
+                        word = getattr(resp.choices[0], "text", "") or ""
+                        if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                            break
+                        if word:
+                            output += word
+                            count += 1
+                else:
+                    output = completion.choices[0].text
+
+        except Exception as e:
+            err_msg = f"An error occurred with the OpenAI API: {e}"
+            if streaming_callback:
+                streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": err_msg}
 
         return output
+
+
     
     def generate_from_messages(self,
                      messages: List[Dict],
@@ -308,155 +274,163 @@ class OpenAIBinding(LollmsLLMBinding):
             return {"status": "error", "message": error_message}
             
         return output
-    
-    def chat(self,
-             discussion: LollmsDiscussion,
-             branch_tip_id: Optional[str] = None,
-             n_predict: Optional[int] = None,
-             stream: Optional[bool] = None,
-             temperature: float = 0.7,
-             top_k: int = 40,
-             top_p: float = 0.9,
-             repeat_penalty: float = 1.1,
-             repeat_last_n: int = 64,
-             seed: Optional[int] = None,
-             n_threads: Optional[int] = None,
-             ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
-             ) -> Union[str, dict]:
-        """
-        Conduct a chat session with the OpenAI model using a LollmsDiscussion object.
-
-        Args:
-            discussion (LollmsDiscussion): The discussion object containing the conversation history.
-            branch_tip_id (Optional[str]): The ID of the message to use as the tip of the conversation branch. Defaults to the active branch.
-            n_predict (Optional[int]): Maximum number of tokens to generate.
-            stream (Optional[bool]): Whether to stream the output.
-            temperature (float): Sampling temperature.
-            top_k (int): Top-k sampling parameter (Note: not all OpenAI models use this).
-            top_p (float): Top-p sampling parameter.
-            repeat_penalty (float): Frequency penalty for repeated tokens.
-            seed (Optional[int]): Random seed for generation.
-            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
-
-        Returns:
-            Union[str, dict]: The generated text or an error dictionary.
-        """
-        # 1. Export the discussion to the OpenAI chat format
-        # This handles system prompts, user/assistant roles, and multi-modal content automatically.
-        messages = discussion.export("openai_chat", branch_tip_id)
-
-        # Build the request parameters
-        params = {
-            "model": self.model_name,
-            "messages": messages,
-            "max_tokens": n_predict,
-            "n": 1,
-            "temperature": temperature,
-            "top_p": top_p,
-            "frequency_penalty": repeat_penalty,
-            "stream": stream
-        }
-        # Add seed if available, as it's supported by newer OpenAI models
-        if seed is not None:
-            params["seed"] = seed
-
-        # Remove None values, as the API expects them to be absent
-        params = {k: v for k, v in params.items() if v is not None}
         
+    def chat(self,
+            discussion: LollmsDiscussion,
+            branch_tip_id: Optional[str] = None,
+            n_predict: Optional[int] = None,
+            stream: Optional[bool] = None,
+            temperature: float = 0.7,
+            top_k: int = 40,
+            top_p: float = 0.9,
+            repeat_penalty: float = 1.1,
+            repeat_last_n: int = 64,
+            seed: Optional[int] = None,
+            n_threads: Optional[int] = None,
+            ctx_size: Optional[int] = None,
+            streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+            ) -> Union[str, dict]:
+
+        messages = discussion.export("openai_chat", branch_tip_id)
+        params = self._build_openai_params(messages=messages,
+                                        n_predict=n_predict,
+                                        stream=stream,
+                                        temperature=temperature,
+                                        top_p=top_p,
+                                        repeat_penalty=repeat_penalty,
+                                        seed=seed)
+
         output = ""
-        # 2. Call the API
         try:
-            # Check if we should use the chat completions or legacy completions endpoint
             if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
-                try:
-                    completion = self.client.chat.completions.create(**params)
-                except Exception as ex:
-                    # exception for new openai models
-                    params["max_completion_tokens"]=params["max_tokens"]
-                    params["temperature"]=1
-                    del params["max_tokens"]
-                    del params["top_p"]
-                    del params["frequency_penalty"]
-                    
-                    completion = self.client.chat.completions.create(**params)
-                    
+                completion = self.client.chat.completions.create(**params)
                 if stream:
                     for chunk in completion:
-                        # The streaming response for chat has a different structure
                         delta = chunk.choices[0].delta
                         if delta.content:
                             word = delta.content
-                            if streaming_callback is not None:
-                                if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                                    break
+                            if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                                break
                             output += word
                 else:
                     output = completion.choices[0].message.content
-
-            else: # Fallback to legacy completion format (not recommended for chat)
-                # We need to format the messages list into a single string prompt
+            else:
                 legacy_prompt = discussion.export("openai_completion", branch_tip_id)
-                legacy_params = {
-                    "model": self.model_name,
-                    "prompt": legacy_prompt,
-                    "max_tokens": n_predict,
-                    "n": 1,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "frequency_penalty": repeat_penalty,
-                    "stream": stream
-                }
+                legacy_params = self._build_openai_params(prompt=legacy_prompt,
+                                                        n_predict=n_predict,
+                                                        stream=stream,
+                                                        temperature=temperature,
+                                                        top_p=top_p,
+                                                        repeat_penalty=repeat_penalty,
+                                                        seed=seed)
                 completion = self.client.completions.create(**legacy_params)
-
                 if stream:
                     for chunk in completion:
                         word = chunk.choices[0].text
-                        if streaming_callback is not None:
-                            if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
+                        if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                            break
                         output += word
                 else:
                     output = completion.choices[0].text
-        
+
         except Exception as e:
-            # Handle API errors gracefully
-            error_message = f"An error occurred with the OpenAI API: {e}"
+            err = f"An error occurred with the OpenAI API: {e}"
             if streaming_callback:
-                streaming_callback(error_message, MSG_TYPE.MSG_TYPE_EXCEPTION)
-            return {"status": "error", "message": error_message}
-            
-        return output    
-    def tokenize(self, text: str) -> list:
+                streaming_callback(err, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": err}
+
+        return output
+
+    def _get_encoding(self, model_name: str | None = None):
         """
-        Tokenize the input text into a list of characters.
+        Get the tiktoken encoding for a given model.
+        Falls back to 'cl100k_base' if model is unknown.
+        """
+        if model_name is None:
+            model_name = self.model_name
+        try:
+            return tiktoken.encoding_for_model(model_name)
+        except KeyError:
+            return tiktoken.get_encoding("cl100k_base")
+
+    def tokenize(self, text: str) -> list[int]:
+        """
+        Tokenize text into a list of token IDs.
 
         Args:
             text (str): The text to tokenize.
 
         Returns:
-            list: List of individual characters.
+            list[int]: List of token IDs.
         """
-        try:
-            return tiktoken.model.encoding_for_model(self.model_name).encode(text)
-        except:
-            return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text)
-            
-    def detokenize(self, tokens: list) -> str:
+        encoding = self._get_encoding()
+        return encoding.encode(text)
+
+    def detokenize(self, tokens: list[int]) -> str:
         """
-        Convert a list of tokens back to text.
+        Convert a list of token IDs back to text.
 
         Args:
-            tokens (list): List of tokens (characters) to detokenize.
+            tokens (list[int]): List of tokens.
 
         Returns:
-            str: Detokenized text.
+            str: The decoded text.
         """
-        try:
-            return tiktoken.model.encoding_for_model(self.model_name).decode(tokens)
-        except:
-            return tiktoken.model.encoding_for_model("gpt-3.5-turbo").decode(tokens)
+        encoding = self._get_encoding()
+        return encoding.decode(tokens)
 
+    def get_input_tokens_price(self, model_name: str | None = None) -> float:
+        """
+        Get the price per input token for a given model (USD).
+
+        Args:
+            model_name (str | None): Model name. Defaults to self.model_name.
+
+        Returns:
+            float: Price per input token in USD.
+        """
+        if model_name is None:
+            model_name = self.model_name
+
+        price_map = {
+            "gpt-4o": 5e-6,
+            "gpt-4o-mini": 1.5e-6,
+            "gpt-3.5-turbo": 1.5e-6,
+            "o1": 15e-6,
+            "o3": 15e-6,
+        }
+
+        for key, price in price_map.items():
+            if model_name.lower().startswith(key):
+                return price
+        return 0.0  # Unknown → treat as free
+
+    def get_output_tokens_price(self, model_name: str | None = None) -> float:
+        """
+        Get the price per output token for a given model (USD).
+
+        Args:
+            model_name (str | None): Model name. Defaults to self.model_name.
+
+        Returns:
+            float: Price per output token in USD.
+        """
+        if model_name is None:
+            model_name = self.model_name
+
+        price_map = {
+            "gpt-4o": 15e-6,
+            "gpt-4o-mini": 6e-6,
+            "gpt-3.5-turbo": 2e-6,
+            "o1": 60e-6,
+            "o3": 60e-6,
+        }
+
+        for key, price in price_map.items():
+            if model_name.lower().startswith(key):
+                return price
+        return 0.0
+    
     def count_tokens(self, text: str) -> int:
         """
         Count tokens from a text.
@@ -470,40 +444,112 @@ class OpenAIBinding(LollmsLLMBinding):
         return len(self.tokenize(text))
 
         
-    def embed(self, text: str, **kwargs) -> list:
+
+    def embed(self, text: str | list[str], normalize: bool = False, **kwargs) -> list:
         """
-        Get embeddings for the input text using OpenAI API.
+        Get embeddings for input text(s) using OpenAI API.
 
         Args:
-            text (str): Input text to embed.
+            text (str | list[str]): Input text or list of texts to embed.
+            normalize (bool): Whether to normalize the resulting vector(s) to unit length.
             **kwargs: Additional arguments. The 'model' argument can be used 
-                      to specify the embedding model (e.g., "text-embedding-3-small").
-                      Defaults to "text-embedding-ada-002".
+                    to specify the embedding model (e.g., "text-embedding-3-small").
+                    Defaults to "text-embedding-3-small".
 
         Returns:
-            list: The embedding vector as a list of floats, or an empty list on failure.
+            list: A single embedding vector (list of floats) if input is str,
+                or a list of embedding vectors if input is list[str].
+                Returns empty list on failure.
         """
-        # Determine the embedding model, prioritizing kwargs, with a default
+        # Determine the embedding model
         embedding_model = kwargs.get("model", self.model_name)
-        
+        if not embedding_model.startswith("text-embedding"):
+            embedding_model = "text-embedding-3-small"
+
+        # Ensure input is a list of strings
+        is_single_input = isinstance(text, str)
+        input_texts = [text] if is_single_input else text
+
+        # Optional safety: truncate if too many tokens for embedding model
+        max_tokens_map = {
+            "text-embedding-3-small": 8191,
+            "text-embedding-3-large": 8191,
+            "text-embedding-ada-002": 8191
+        }
+        max_tokens = max_tokens_map.get(embedding_model, None)
+        if max_tokens is not None:
+            input_texts = [
+                self.detokenize(self.tokenize(t)[:max_tokens])
+                for t in input_texts
+            ]
+
         try:
-            # The OpenAI API expects the input to be a list of strings
             response = self.client.embeddings.create(
                 model=embedding_model,
-                input=[text]  # Wrap the single text string in a list
+                input=input_texts
             )
-            
-            # Extract the embedding from the response
-            if response.data and len(response.data) > 0:
-                return response.data[0].embedding
-            else:
-                ASCIIColors.warning("OpenAI API returned no data for the embedding request.")
+
+            if not response.data:
+                ASCIIColors.warning(f"OpenAI API returned no data for the embedding request (model: {embedding_model}).")
                 return []
-                
+
+            embeddings = [item.embedding for item in response.data]
+
+            # Normalize if requested
+            if normalize:
+                embeddings = [
+                    [v / math.sqrt(sum(x*x for x in emb)) for v in emb]
+                    for emb in embeddings
+                ]
+
+            return embeddings[0] if is_single_input else embeddings
+
         except Exception as e:
-            ASCIIColors.error(f"Failed to generate embeddings using OpenAI API: {e}")
+            ASCIIColors.error(f"Failed to generate embeddings using model '{embedding_model}': {e}")
             trace_exception(e)
             return []
+
+
+    def get_ctx_size(self, model_name: str | None = None) -> int:
+        """
+        Get the context size for a given model.
+        If model_name is None, use the instance's model_name.
+
+        Args:
+            model_name (str | None): The model name to check.
+
+        Returns:
+            int: The context window size in tokens.
+        """
+        if model_name is None:
+            model_name = self.model_name
+
+        # Default context sizes (update as needed)
+        context_map = {
+            # GPT-4 family
+            "gpt-4": 8192,
+            "gpt-4-32k": 32768,
+            "gpt-4o": 128000,
+            "gpt-4o-mini": 128000,
+            # GPT-3.5 family
+            "gpt-3.5-turbo": 16385,
+            "gpt-3.5-turbo-16k": 16385,
+            # GPT-5 and o-series
+            "gpt-5": 200000,
+            "o1": 200000,
+            "o3": 200000,
+            "o4": 200000,
+        }
+
+        # Try to find the best match
+        model_name_lower = model_name.lower()
+        for key, size in context_map.items():
+            if model_name_lower.startswith(key):
+                return size
+
+        # Fallback: default safe value
+        return 8192
+
 
     def get_model_info(self) -> dict:
         """
