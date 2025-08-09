@@ -158,7 +158,20 @@ class OpenAIBinding(LollmsLLMBinding):
                                                 top_p=top_p,
                                                 repeat_penalty=repeat_penalty,
                                                 seed=seed)
-                chat_completion = self.client.chat.completions.create(**params)
+                try:
+                    chat_completion = self.client.chat.completions.create(**params)
+                except Exception as ex:
+                    # exception for new openai models
+                    params["max_completion_tokens"]=params["max_tokens"]
+                    params["temperature"]=1
+                    try: del params["max_tokens"] 
+                    except Exception: pass
+                    try: del params["top_p"]
+                    except Exception: pass
+                    try: del params["frequency_penalty"]
+                    except Exception: pass
+                    
+                    chat_completion = self.client.chat.completions.create(**params)                
 
                 if stream:
                     for resp in chat_completion:
@@ -181,7 +194,21 @@ class OpenAIBinding(LollmsLLMBinding):
                                                 top_p=top_p,
                                                 repeat_penalty=repeat_penalty,
                                                 seed=seed)
-                completion = self.client.completions.create(**params)
+                try:
+                    completion =  self.client.completions.create(**params)
+                except Exception as ex:
+                    # exception for new openai models
+                    params["max_completion_tokens"]=params["max_tokens"]
+                    params["temperature"]=1
+                    try: del params["max_tokens"] 
+                    except Exception: pass
+                    try: del params["top_p"]
+                    except Exception: pass
+                    try: del params["frequency_penalty"]
+                    except Exception: pass
+
+                    
+                    completion =  self.client.completions.create(**params)                
 
                 if stream:
                     for resp in completion:
@@ -197,6 +224,7 @@ class OpenAIBinding(LollmsLLMBinding):
                     output = completion.choices[0].text
 
         except Exception as e:
+            trace_exception(e)
             err_msg = f"An error occurred with the OpenAI API: {e}"
             if streaming_callback:
                 streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
@@ -248,9 +276,13 @@ class OpenAIBinding(LollmsLLMBinding):
                 # exception for new openai models
                 params["max_completion_tokens"]=params["max_tokens"]
                 params["temperature"]=1
-                del params["max_tokens"]
-                del params["top_p"]
-                del params["frequency_penalty"]
+                try: del params["max_tokens"] 
+                except Exception: pass
+                try: del params["top_p"]
+                except Exception: pass
+                try: del params["frequency_penalty"]
+                except Exception: pass
+
                 
                 completion = self.client.chat.completions.create(**params)
             if stream:
