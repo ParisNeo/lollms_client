@@ -29,7 +29,7 @@ class OpenRouterBinding(LollmsLLMBinding):
 
     def __init__(self,
                  model_name: str = "google/gemini-flash-1.5", # A good, fast default
-                 open_router_api_key: str = None,
+                 service_key: str|None = None,
                  **kwargs
                  ):
         """
@@ -37,11 +37,11 @@ class OpenRouterBinding(LollmsLLMBinding):
 
         Args:
             model_name (str): The name of the model to use from OpenRouter (e.g., 'anthropic/claude-3-haiku-20240307').
-            open_router_api_key (str): The API key for the OpenRouter service.
+            service_key (str): The API key for the OpenRouter service.
         """
         super().__init__(binding_name=BindingName)
         self.model_name = model_name
-        self.api_key = open_router_api_key or os.getenv("OPENROUTER_API_KEY")
+        self.api_key = service_key or os.getenv("OPENROUTER_API_KEY")
 
         if not self.api_key:
             raise ValueError("OpenRouter API key is required. Set it via 'open_router_api_key' or OPENROUTER_API_KEY env var.")
@@ -84,17 +84,50 @@ class OpenRouterBinding(LollmsLLMBinding):
                 history.append({'role': role, 'content': msg.content})
         return history
 
-    def generate_text(self, prompt: str, **kwargs) -> Union[str, dict]:
+    def generate_text(self,
+                    prompt: str,
+                    images: Optional[List[str]] = None,
+                    system_prompt: str = "",
+                    n_predict: Optional[int] = None,
+                    stream: Optional[bool] = None,
+                    temperature: float = 0.7,  # Ollama default is 0.8, common default 0.7
+                    top_k: int = 40,          # Ollama default is 40
+                    top_p: float = 0.9,       # Ollama default is 0.9
+                    repeat_penalty: float = 1.1,  # Ollama default is 1.1
+                    repeat_last_n: int = 64,  # Ollama default is 64
+                    seed: Optional[int] = None,
+                    n_threads: Optional[int] = None,
+                    ctx_size: int | None = None,
+                    streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                    split: Optional[bool] = False,  # put to true if the prompt is a discussion
+                    user_keyword: Optional[str] = "!@>user:",
+                    ai_keyword: Optional[str] = "!@>assistant:",
+                    **kwargs
+                    ) -> Union[str, dict]:
         """
         Generate text using OpenRouter. This is a wrapper around the chat method.
         """
-        temp_discussion = LollmsDiscussion.from_messages([
-            LollmsMessage.new_message(sender_type="user", content=prompt)
-        ])
-        if kwargs.get("system_prompt"):
-            temp_discussion.system_prompt = kwargs.get("system_prompt")
+        temp_discussion = LollmsDiscussion(None)
+        temp_discussion.add_message(sender="user", content=prompt, images=images or [])
+        if system_prompt:
+            temp_discussion.system_prompt = system_prompt
         
-        return self.chat(temp_discussion, **kwargs)
+        return self.chat(temp_discussion, 
+                        n_predict=n_predict,
+                        stream=stream,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        repeat_penalty=repeat_penalty,
+                        repeat_last_n=repeat_last_n,
+                        seed=seed,
+                        n_threads=n_threads,
+                        ctx_size=ctx_size,
+                        streaming_callback=streaming_callback,
+                        split=split,
+                        user_keyword=user_keyword,
+                        ai_keyword=ai_keyword,
+                        **kwargs)
 
     def chat(self,
              discussion: LollmsDiscussion,

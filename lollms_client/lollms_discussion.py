@@ -1836,3 +1836,8 @@ class LollmsDiscussion:
         del self.images[index]
         del self.active_images[index]
         self.touch()
+        
+    @property
+    def system_prompt(self) -> str:
+        """Returns the system prompt for this discussion."""
+        return self._system_prompt

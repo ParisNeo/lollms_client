@@ -119,8 +119,6 @@ _server_registry_lock = threading.Lock()
 
 BindingName = "LlamaCppServerBinding"
 DEFAULT_LLAMACPP_SERVER_HOST = "127.0.0.1"
-# Port is now dynamic, this constant is less critical for direct use but good for reference.
-# DEFAULT_LLAMACPP_SERVER_PORT = 9641
 
 class LlamaCppServerProcess:
     def __init__(self, model_path: Union[str, Path], clip_model_path: Optional[Union[str, Path]] = None, server_binary_path: Optional[Union[str, Path]]=None, server_args: Dict[str, Any]={}):
@@ -266,54 +264,34 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         "parallel_slots": 4, # Default parallel slots for server
     }
 
-    def __init__(self, model_name: str, models_path: str, clip_model_name: Optional[str] = None,
+    def __init__(self, model_name: Optional[str], models_path: str, clip_model_name: Optional[str] = None,
                  config: Optional[Dict[str, Any]] = None, default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat, **kwargs):
         super().__init__(binding_name=BindingName)
         if llama_cpp_binaries is None: raise ImportError("llama-cpp-binaries package is required but not found.")
 
         self.models_path = Path(models_path)
-        self.user_provided_model_name = model_name  # Store the name/path user gave
+        # Store initial preferences, but do not load/start server yet.
+        self.initial_model_name_preference: Optional[str] = model_name
+        self.user_provided_model_name: Optional[str] = model_name # Tracks the latest requested model
+        self.initial_clip_model_name_preference: Optional[str] = clip_model_name
+        
         self._model_path_map: Dict[str, Path] = {}  # Maps unique name to full Path
 
-        # Initial scan for available models
+        # Initial scan for available models (to populate listModels)
         self._scan_models()
 
-        # Determine the model to load
-        effective_model_to_load = model_name
-        if not effective_model_to_load and self._model_path_map:
-            # If no model was specified and we have models, pick the first one
-            # Sorting ensures a deterministic choice
-            first_model_name = sorted(self._model_path_map.keys())[0]
-            effective_model_to_load = first_model_name
-            ASCIIColors.info(f"No model was specified. Automatically selecting the first available model: '{effective_model_to_load}'")
-            self.user_provided_model_name = effective_model_to_load  # Update for get_model_info etc.
-
-        # Initial hint for clip_model_path, resolved fully in load_model
-        self.clip_model_path: Optional[Path] = None
-        if clip_model_name:
-            p_clip = Path(clip_model_name)
-            if p_clip.is_absolute() and p_clip.exists():
-                self.clip_model_path = p_clip
-            elif (self.models_path / clip_model_name).exists(): # Relative to models_path
-                self.clip_model_path = self.models_path / clip_model_name
-            else:
-                ASCIIColors.warning(f"Specified clip_model_name '{clip_model_name}' not found. Will rely on auto-detection if applicable.")
-        
         self.default_completion_format = default_completion_format
         self.server_args = {**self.DEFAULT_SERVER_ARGS, **(config or {}), **kwargs}
         self.server_binary_path = self._get_server_binary_path()
         
-        self.current_model_path: Optional[Path] = None # Actual resolved path of loaded model
+        # Current state of the loaded model and server
+        self.current_model_path: Optional[Path] = None 
+        self.clip_model_path: Optional[Path] = None # Actual resolved path of loaded clip model
         self.server_process: Optional[LlamaCppServerProcess] = None
         self.port: Optional[int] = None
         self.server_key: Optional[tuple] = None
 
-        # Now, attempt to load the selected model
-        if effective_model_to_load:
-            if not self.load_model(effective_model_to_load):
-                ASCIIColors.error(f"Initial model load for '{effective_model_to_load}' failed. Binding may not be functional.")
-        else:
-            ASCIIColors.warning("No models found in the models path. The binding will be idle until a model is loaded.")
+        ASCIIColors.info("LlamaCppServerBinding initialized. Server will start on-demand with first generation call.")
 
     def _get_server_binary_path(self) -> Path:
         custom_path_str = self.server_args.get("llama_server_binary_path")
@@ -384,7 +362,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                         if server_to_stop:
                             try: server_to_stop.shutdown()
                             except Exception as e: ASCIIColors.error(f"Error shutting down server {self.server_key}: {e}")
-                        # else: ASCIIColors.warning(f"Attempted to stop server {self.server_key} but it was not in _active_servers.") # Can be noisy
                 else:
                      ASCIIColors.warning(f"Server key {self.server_key} not in ref counts during release. Might have been shut down already.")
                      _active_servers.pop(self.server_key, None) # Ensure removal
@@ -392,7 +369,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         self.server_process = None
         self.port = None
         self.server_key = None
-
+        self.current_model_path = None # Also clear this binding's model association
+        self.clip_model_path = None # And clip model association
 
     def load_model(self, model_name_or_path: str) -> bool:
         self.user_provided_model_name = model_name_or_path # Keep track of the selected model name
@@ -401,15 +379,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         except Exception as ex:
             trace_exception(ex)
             return False
-        # Determine the clip_model_path for this server instance
-        # Priority: 1. Explicit `clip_model_path` from init (if exists) 2. Auto-detection
+
+        # Determine the final clip_model_path for this server instance
+        # Priority: 1. Explicit `initial_clip_model_name_preference` from __init__ (if valid path)
+        #           2. Auto-detection based on the resolved main model.
         final_clip_model_path: Optional[Path] = None
-        if self.clip_model_path and self.clip_model_path.exists(): # From __init__
-            final_clip_model_path = self.clip_model_path
-            ASCIIColors.info(f"Using explicitly configured LLaVA clip model: {final_clip_model_path}")
-        elif not self.clip_model_path or (self.clip_model_path and not self.clip_model_path.exists()): # if init path was bad or not given
-            if self.clip_model_path and not self.clip_model_path.exists():
-                ASCIIColors.warning(f"Initial clip model path '{self.clip_model_path}' not found. Attempting auto-detection.")
+        if self.initial_clip_model_name_preference:
+            p_clip_pref = Path(self.initial_clip_model_name_preference)
+            if p_clip_pref.is_absolute() and p_clip_pref.exists():
+                final_clip_model_path = p_clip_pref
+                ASCIIColors.info(f"Using explicitly configured LLaVA clip model: {final_clip_model_path}")
+            elif (self.models_path / self.initial_clip_model_name_preference).exists():
+                final_clip_model_path = self.models_path / self.initial_clip_model_name_preference
+                ASCIIColors.info(f"Using explicitly configured LLaVA clip model: {final_clip_model_path} (relative to models path)")
+            else:
+                ASCIIColors.warning(f"Specified initial clip_model_name '{self.initial_clip_model_name_preference}' not found. Attempting auto-detection.")
+
+        if not final_clip_model_path: # If no explicit path was provided or it was invalid, try auto-detection
             base_name = get_gguf_model_base_name(resolved_model_path.stem)
             potential_paths = [
                 resolved_model_path.parent / f"{base_name}.mmproj",
@@ -427,9 +413,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         final_clip_model_path_str = str(final_clip_model_path) if final_clip_model_path else None
         
         # Server key based on model and essential server configurations (like clip model)
-        # More server_args could be added to the key if they necessitate separate server instances
-        # For example, different n_gpu_layers might require a server restart.
-        # For now, model and clip model are the main differentiators for distinct servers.
         new_server_key = (str(resolved_model_path), final_clip_model_path_str)
 
         with _server_registry_lock:
@@ -503,20 +486,46 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 self._release_server_instance() # Ensure cleanup if start failed
                 return False
 
-
     def unload_model(self):
         if self.server_process:
             ASCIIColors.info(f"Unloading model for binding. Current server: {self.server_key}, port: {self.port}")
             self._release_server_instance() # Handles ref counting and actual shutdown if needed
         else:
             ASCIIColors.info("Unload_model called, but no server process was active for this binding instance.")
-        self.current_model_path = None 
-        self.clip_model_path = None # Also clear the instance's clip path idea
-        # self.port and self.server_key are cleared by _release_server_instance
+
+    def _ensure_server_is_running(self) -> bool:
+        """
+        Checks if the server is healthy. If not, it attempts to load the configured model.
+        Returns True if the server is healthy and ready, False otherwise.
+        """
+        if self.server_process and self.server_process.is_healthy:
+            return True
+
+        ASCIIColors.info("Server is not running. Attempting to start on-demand...")
+        
+        # Determine which model to load
+        model_to_load = self.user_provided_model_name or self.initial_model_name_preference
+        
+        if not model_to_load:
+            # No model specified, try to find one automatically
+            self._scan_models()
+            available_models = self.listModels()
+            if not available_models:
+                ASCIIColors.error("No model specified and no GGUF models found in models path.")
+                return False
+            
+            model_to_load = available_models[0]['name'] # Pick the first one
+            ASCIIColors.info(f"No model was specified. Automatically selecting the first available model: '{model_to_load}'")
+
+        # Now, attempt to load the selected model
+        if self.load_model(model_to_load):
+            return True
+        else:
+            ASCIIColors.error(f"Automatic model load for '{model_to_load}' failed.")
+            return False
 
     def _get_request_url(self, endpoint: str) -> str:
-        if not self.server_process or not self.server_process.is_healthy:
-            raise ConnectionError("Llama.cpp server is not running or not healthy.")
+        # This function now assumes _ensure_server_is_running has been called.
         return f"{self.server_process.base_url}{endpoint}"
 
     def _prepare_generation_payload(self, prompt: str, system_prompt: str = "", n_predict: Optional[int] = None,
@@ -584,48 +593,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                      system_prompt: str = "",
                      n_predict: Optional[int] = None,
                      stream: Optional[bool] = None,
-                     temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
-                     top_k: int = 40,          # Ollama default is 40
-                     top_p: float = 0.9,       # Ollama default is 0.9
-                     repeat_penalty: float = 1.1, # Ollama default is 1.1
-                     repeat_last_n: int = 64,  # Ollama default is 64
+                     temperature: float = 0.7,
+                     top_k: int = 40,
+                     top_p: float = 0.9,
+                     repeat_penalty: float = 1.1,
+                     repeat_last_n: int = 64,
                      seed: Optional[int] = None,
                      n_threads: Optional[int] = None,
                      ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     split:Optional[bool]=False, # put to true if the prompt is a discussion
+                     split:Optional[bool]=False,
                      user_keyword:Optional[str]="!@>user:",
                      ai_keyword:Optional[str]="!@>assistant:", 
                      **generation_kwargs
                      ) -> Union[str, dict]:
-        """
-        Generate text using the active LLM binding, using instance defaults if parameters are not provided.
-
-        Args:
-            prompt (str): The input prompt for text generation.
-            images (Optional[List[str]]): List of image file paths for multimodal generation.
-            n_predict (Optional[int]): Maximum number of tokens to generate. Uses instance default if None.
-            stream (Optional[bool]): Whether to stream the output. Uses instance default if None.
-            temperature (Optional[float]): Sampling temperature. Uses instance default if None.
-            top_k (Optional[int]): Top-k sampling parameter. Uses instance default if None.
-            top_p (Optional[float]): Top-p sampling parameter. Uses instance default if None.
-            repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
-            repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
-            seed (Optional[int]): Random seed for generation. Uses instance default if None.
-            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
-            ctx_size (int | None): Context size override for this generation.
-            streaming_callback (Optional[Callable[[str, str], None]]): Callback function for streaming output.
-                - First parameter (str): The chunk of text received.
-                - Second parameter (str): The message type (e.g., MSG_TYPE.MSG_TYPE_CHUNK).
-            split:Optional[bool]: put to true if the prompt is a discussion
-            user_keyword:Optional[str]: when splitting we use this to extract user prompt 
-            ai_keyword:Optional[str]": when splitting we use this to extract ai prompt
-
-        Returns:
-            Union[str, dict]: Generated text or error dictionary if failed.
-        """
-        if not self.server_process or not self.server_process.is_healthy:
-             return {"status": False, "error": "Llama.cpp server is not running or not healthy."}
+        
+        if not self._ensure_server_is_running():
+            return {"status": False, "error": "Llama.cpp server could not be started. Please check model configuration and logs."}
 
         _use_chat_format = True
         payload = self._prepare_generation_payload(
@@ -642,11 +626,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         endpoint = "/v1/chat/completions" if _use_chat_format else "/completion"
         request_url = self._get_request_url(endpoint)
         
-        # Debug payload (simplified)
-        # debug_payload = {k:v for k,v in payload.items() if k not in ["image_data","messages"] or (k=="messages" and not any("image_url" in part for item in v for part in (item.get("content") if isinstance(item.get("content"),list) else [])))} # Complex filter for brevity
-        # ASCIIColors.debug(f"Request to {request_url} with payload (simplified): {json.dumps(debug_payload, indent=2)[:500]}...")
-
-
         full_response_text = ""
         try:
             response = self.server_process.session.post(request_url, json=payload, stream=stream, timeout=self.server_args.get("generation_timeout", 300))
@@ -699,45 +678,16 @@ class LlamaCppServerBinding(LollmsLLMBinding):
              streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
              **generation_kwargs
              ) -> Union[str, dict]:
-        """
-        Conduct a chat session with the llama.cpp server using a LollmsDiscussion object.
 
-        Args:
-            discussion (LollmsDiscussion): The discussion object containing the conversation history.
-            branch_tip_id (Optional[str]): The ID of the message to use as the tip of the conversation branch. Defaults to the active branch.
-            n_predict (Optional[int]): Maximum number of tokens to generate.
-            stream (Optional[bool]): Whether to stream the output.
-            temperature (float): Sampling temperature.
-            top_k (int): Top-k sampling parameter.
-            top_p (float): Top-p sampling parameter.
-            repeat_penalty (float): Penalty for repeated tokens.
-            repeat_last_n (int): Number of previous tokens to consider for repeat penalty.
-            seed (Optional[int]): Random seed for generation.
-            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
+        if not self._ensure_server_is_running():
+            return {"status": "error", "message": "Llama.cpp server could not be started. Please check model configuration and logs."}
 
-        Returns:
-            Union[str, dict]: The generated text or an error dictionary.
-        """
-        if not self.server_process or not self.server_process.is_healthy:
-            return {"status": "error", "message": "Llama.cpp server is not running or not healthy."}
-
-        # 1. Export the discussion to the OpenAI chat format, which llama.cpp server understands.
-        # This handles system prompts, user/assistant roles, and multi-modal content.
         messages = discussion.export("openai_chat", branch_tip_id)
-
-        # 2. Build the generation payload for the server
         payload = {
-            "messages": messages,
-            "max_tokens": n_predict,
-            "temperature": temperature,
-            "top_k": top_k,
-            "top_p": top_p,
-            "repeat_penalty": repeat_penalty,
-            "seed": seed,
-            "stream": stream,
-            **generation_kwargs # Pass any extra parameters
+            "messages": messages, "max_tokens": n_predict, "temperature": temperature,
+            "top_k": top_k, "top_p": top_p, "repeat_penalty": repeat_penalty,
+            "seed": seed, "stream": stream, **generation_kwargs
         }
-        # Remove None values, as the API expects them to be absent
         payload = {k: v for k, v in payload.items() if v is not None}
         
         endpoint = "/v1/chat/completions"
@@ -745,7 +695,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         full_response_text = ""
 
         try:
-            # 3. Make the request to the server
             response = self.server_process.session.post(request_url, json=payload, stream=stream, timeout=self.server_args.get("generation_timeout", 300))
             response.raise_for_status()
 
@@ -788,14 +737,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             return {"status": "error", "message": error_message}
         
     def tokenize(self, text: str) -> List[int]:
-        if not self.server_process or not self.server_process.is_healthy: raise ConnectionError("Server not running.")
+        if not self._ensure_server_is_running(): return []
         try:
             response = self.server_process.session.post(self._get_request_url("/tokenize"), json={"content": text})
             response.raise_for_status(); return response.json().get("tokens", [])
         except Exception as e: ASCIIColors.error(f"Tokenization error: {e}"); trace_exception(e); return []
 
     def detokenize(self, tokens: List[int]) -> str:
-        if not self.server_process or not self.server_process.is_healthy: raise ConnectionError("Server not running.")
+        if not self._ensure_server_is_running(): return ""
         try:
             response = self.server_process.session.post(self._get_request_url("/detokenize"), json={"tokens": tokens})
             response.raise_for_status(); return response.json().get("content", "")
@@ -804,8 +753,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
     def count_tokens(self, text: str) -> int: return len(self.tokenize(text))
 
     def embed(self, text: str, **kwargs) -> List[float]:
-        if not self.server_process or not self.server_process.is_healthy: raise Exception("Server not running.")
-        if not self.server_args.get("embedding"): raise Exception("Embedding not enabled in server_args.")
+        if not self._ensure_server_is_running(): return []
+        if not self.server_args.get("embedding"): 
+            ASCIIColors.warning("Embedding not enabled in server_args. Please set 'embedding' to True in config."); return []
         try:
             payload = {"input": text}; request_url = self._get_request_url("/v1/embeddings")
             response = self.server_process.session.post(request_url, json=payload)
@@ -819,26 +769,31 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         except requests.exceptions.RequestException as e:
             err_msg = f"Embedding request error: {e}"; 
             if e.response: err_msg += f" - {e.response.text[:200]}"
-            raise Exception(err_msg) from e
-        except Exception as ex: trace_exception(ex); raise Exception(f"Embedding failed: {str(ex)}") from ex
+            ASCIIColors.error(err_msg)
+            return []
+        except Exception as ex: 
+            trace_exception(ex); ASCIIColors.error(f"Embedding failed: {str(ex)}")
+            return []
         
     def get_model_info(self) -> dict:
+        # This method reports the current state without triggering a server start
+        is_loaded = self.server_process is not None and self.server_process.is_healthy
         info = {
             "name": self.binding_name,
             "user_provided_model_name": self.user_provided_model_name,
             "model_path": str(self.current_model_path) if self.current_model_path else "Not loaded",
             "clip_model_path": str(self.clip_model_path) if self.clip_model_path else "N/A",
-            "loaded": self.server_process is not None and self.server_process.is_healthy,
+            "loaded": is_loaded,
             "server_args": self.server_args, "port": self.port if self.port else "N/A",
             "server_key": str(self.server_key) if self.server_key else "N/A",
         }
-        if info["loaded"] and self.server_process:
+        if is_loaded:
             try:
                 props_resp = self.server_process.session.get(self._get_request_url("/props"), timeout=5).json()
                 info.update({
                     "server_n_ctx": props_resp.get("default_generation_settings",{}).get("n_ctx"),
                     "server_chat_format": props_resp.get("chat_format"),
-                    "server_clip_model_from_props": props_resp.get("mmproj"), # Server's view of clip model
+                    "server_clip_model_from_props": props_resp.get("mmproj"),
                 })
             except Exception: pass 
             
@@ -850,10 +805,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         return info
 
     def _scan_models(self):
-        """
-        Scans the models_path for GGUF files and populates the model map.
-        Handles duplicate filenames by prefixing them with their parent directory path.
-        """
         self._model_path_map = {}
         if not self.models_path.exists() or not self.models_path.is_dir():
             ASCIIColors.warning(f"Models path does not exist or is not a directory: {self.models_path}")
@@ -867,144 +818,79 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         for model_file in all_paths:
             if model_file.is_file():
-                # On Windows, path separators can be tricky. Convert to generic format.
                 relative_path_str = str(model_file.relative_to(self.models_path).as_posix())
                 if filenames_count[model_file.name] > 1:
-                    # Duplicate filename, use relative path as the unique name
                     unique_name = relative_path_str
                 else:
-                    # Unique filename, use the name itself
                     unique_name = model_file.name
-                
                 self._model_path_map[unique_name] = model_file
         
         ASCIIColors.info(f"Scanned {len(self._model_path_map)} models from {self.models_path}.")
 
     def listModels(self) -> List[Dict[str, Any]]:
-        """
-        Lists all available GGUF models, rescanning the directory first.
-        """
-        self._scan_models()  # Always rescan when asked for the list
-
+        self._scan_models()
         models_found = []
         for unique_name, model_path in self._model_path_map.items():
             models_found.append({
-                'name': unique_name,  # The unique name for selection
-                'model_name': model_path.name, # The original filename for display
-                'path': str(model_path),  # The full path
-                'size': model_path.stat().st_size
+                'name': unique_name, 'model_name': model_path.name,
+                'path': str(model_path), 'size': model_path.stat().st_size
             })
-        
-        # Sort the list alphabetically by the unique name for consistent ordering
         return sorted(models_found, key=lambda x: x['name'])
     
     def __del__(self):
         self.unload_model()
 
     def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
-        """
-        Retrieves context size for a model from a hardcoded list.
-
-        This method checks if the model name contains a known base model identifier
-        (e.g., 'llama3.1', 'gemma2') to determine its context length. It's intended
-        as a failsafe when the context size cannot be retrieved directly from the
-        Ollama API.
-        """
         if model_name is None:
-            model_name = self.model_name
+            model_name = self.user_provided_model_name or self.initial_model_name_preference
+            if not model_name and self.current_model_path:
+                model_name = self.current_model_path.name
 
-        # Hardcoded context sizes for popular models. More specific names (e.g., 'llama3.1')
-        # should appear, as they will be checked first due to the sorting logic below.
+        if model_name is None: 
+            ASCIIColors.warning("Cannot determine context size without a model name.")
+            return None
+
         known_contexts = {
-            'llama3.1': 131072,   # Llama 3.1 extended context
-            'llama3.2': 131072,   # Llama 3.2 extended context
-            'llama3.3': 131072,   # Assuming similar to 3.1/3.2
-            'llama3': 8192,       # Llama 3 default
-            'llama2': 4096,       # Llama 2 default
-            'mixtral8x22b': 65536, # Mixtral 8x22B default
-            'mixtral': 32768,     # Mixtral 8x7B default
-            'mistral': 32768,     # Mistral 7B v0.2+ default
-            'gemma3': 131072,     # Gemma 3 with 128K context
-            'gemma2': 8192,       # Gemma 2 default
-            'gemma': 8192,        # Gemma default
-            'phi3': 131072,       # Phi-3 variants often use 128K (mini/medium extended)
-            'phi2': 2048,         # Phi-2 default
-            'phi': 2048,          # Phi default (older)
-            'qwen2.5': 131072,    # Qwen2.5 with 128K
-            'qwen2': 32768,       # Qwen2 default for 7B
-            'qwen': 8192,         # Qwen default
-            'codellama': 16384,   # CodeLlama extended
-            'codegemma': 8192,    # CodeGemma default
-            'deepseek-coder-v2': 131072,  # DeepSeek-Coder V2 with 128K
-            'deepseek-coder': 16384,  # DeepSeek-Coder V1 default
-            'deepseek-v2': 131072,    # DeepSeek-V2 with 128K
-            'deepseek-llm': 4096,     # DeepSeek-LLM default
-            'yi1.5': 32768,       # Yi-1.5 with 32K
-            'yi': 4096,           # Yi base default
-            'command-r': 131072,  # Command-R with 128K
-            'wizardlm2': 32768,   # WizardLM2 (Mistral-based)
-            'wizardlm': 16384,    # WizardLM default
-            'zephyr': 65536,      # Zephyr beta (Mistral-based extended)
-            'vicuna': 2048,       # Vicuna default (up to 16K in some variants)
-            'falcon': 2048,       # Falcon default
-            'starcoder': 8192,    # StarCoder default
-            'stablelm': 4096,     # StableLM default
-            'orca2': 4096,        # Orca 2 default
-            'orca': 4096,         # Orca default
-            'dolphin': 32768,     # Dolphin (often Mistral-based)
-            'openhermes': 8192,   # OpenHermes default
+            'llama3.1': 131072, 'llama3.2': 131072, 'llama3.3': 131072, 'llama3': 8192,
+            'llama2': 4096, 'mixtral8x22b': 65536, 'mixtral': 32768, 'mistral': 32768,
+            'gemma3': 131072, 'gemma2': 8192, 'gemma': 8192, 'phi3': 131072, 'phi2': 2048,
+            'phi': 2048, 'qwen2.5': 131072, 'qwen2': 32768, 'qwen': 8192,
+            'codellama': 16384, 'codegemma': 8192, 'deepseek-coder-v2': 131072,
+            'deepseek-coder': 16384, 'deepseek-v2': 131072, 'deepseek-llm': 4096,
+            'yi1.5': 32768, 'yi': 4096, 'command-r': 131072, 'wizardlm2': 32768,
+            'wizardlm': 16384, 'zephyr': 65536, 'vicuna': 2048, 'falcon': 2048,
+            'starcoder': 8192, 'stablelm': 4096, 'orca2': 4096, 'orca': 4096,
+            'dolphin': 32768, 'openhermes': 8192,
         }
-
         normalized_model_name = model_name.lower().strip()
-
-        # Sort keys by length in descending order. This ensures that a more specific
-        # name like 'llama3.1' is checked before a less specific name like 'llama3'.
         sorted_base_models = sorted(known_contexts.keys(), key=len, reverse=True)
 
         for base_name in sorted_base_models:
             if base_name in normalized_model_name:
                 context_size = known_contexts[base_name]
-                ASCIIColors.warning(
-                    f"Using hardcoded context size for model '{model_name}' "
-                    f"based on base name '{base_name}': {context_size}"
-                )
+                ASCIIColors.info(f"Using hardcoded context size for '{model_name}' based on '{base_name}': {context_size}")
                 return context_size
 
         ASCIIColors.warning(f"Context size not found for model '{model_name}' in the hardcoded list.")
         return None
 
 if __name__ == '__main__':
-    global full_streamed_text # Define for the callback
+    global full_streamed_text
     full_streamed_text = ""
     ASCIIColors.yellow("Testing LlamaCppServerBinding...")
 
-    # --- Configuration ---
-    # This should be the NAME of your GGUF model file.
-    # Ensure this model is placed in your models_path directory.
-    # Example: models_path = "E:\\lollms\\models\\gguf" (Windows)
-    #          model_name = "Mistral-Nemo-Instruct-2407-Q2_K.gguf"
-    
-    # For CI/local testing without specific paths, you might download a tiny model
-    # or require user to set environment variables for these.
-    # For this example, replace with your actual paths/model.
     try:
         models_path_str = os.environ.get("LOLLMS_MODELS_PATH", str(Path(__file__).parent / "test_models"))
-        model_name_str = os.environ.get("LOLLMS_TEST_MODEL_GGUF", "tinyllama-1.1b-chat-v1.0.Q2_K.gguf") # A small model
-        llava_model_name_str = os.environ.get("LOLLMS_TEST_LLAVA_MODEL_GGUF", "llava-v1.5-7b.Q2_K.gguf") # Placeholder
-        llava_clip_name_str = os.environ.get("LOLLMS_TEST_LLAVA_CLIP", "mmproj-model2-q4_0.gguf") # Placeholder
-
-        models_path = Path(models_path_str)
-        models_path.mkdir(parents=True, exist_ok=True) # Ensure test_models dir exists
+        model_name_str = os.environ.get("LOLLMS_TEST_MODEL_GGUF", "tinyllama-1.1b-chat-v1.0.Q2_K.gguf")
         
-        # Verify model exists, or skip tests gracefully
+        models_path = Path(models_path_str)
+        models_path.mkdir(parents=True, exist_ok=True)
         test_model_path = models_path / model_name_str
-        if not test_model_path.exists():
-            ASCIIColors.warning(f"Test model {test_model_path} not found. Please place a GGUF model there or set LOLLMS_TEST_MODEL_GGUF and LOLLMS_MODELS_PATH env vars.")
+        
+        primary_model_available = test_model_path.exists()
+        if not primary_model_available:
+            ASCIIColors.warning(f"Test model {test_model_path} not found. Please place a GGUF model there or set env vars.")
             ASCIIColors.warning("Some tests will be skipped.")
-            # sys.exit(1) # Or allow to continue with skips
-            primary_model_available = False
-        else:
-            primary_model_available = True
 
     except Exception as e:
         ASCIIColors.error(f"Error setting up test paths: {e}"); trace_exception(e)
@@ -1017,184 +903,106 @@ if __name__ == '__main__':
 
     active_binding1: Optional[LlamaCppServerBinding] = None
     active_binding2: Optional[LlamaCppServerBinding] = None
-    active_binding_llava: Optional[LlamaCppServerBinding] = None
-
+    
     try:
         if primary_model_available:
-            ASCIIColors.cyan("\n--- Initializing First LlamaCppServerBinding Instance ---")
-            # Test default model selection by passing model_name=None
-            ASCIIColors.info("Testing default model selection (model_name=None)")
+            # --- Test 1: Auto-start server on first generation call ---
+            ASCIIColors.cyan("\n--- Test 1: Auto-start server with specified model name ---")
             active_binding1 = LlamaCppServerBinding(
-                model_name=None, models_path=str(models_path), config=binding_config
+                model_name=model_name_str, models_path=str(models_path), config=binding_config
             )
-            if not active_binding1.server_process or not active_binding1.server_process.is_healthy:
-                raise RuntimeError("Server for binding1 failed to start or become healthy.")
-            ASCIIColors.green(f"Binding1 initialized with default model. Server for '{active_binding1.current_model_path.name}' running on port {active_binding1.port}.")
-            ASCIIColors.info(f"Binding1 Model Info: {json.dumps(active_binding1.get_model_info(), indent=2)}")
+            ASCIIColors.info("Binding1 initialized. No server should be running yet.")
+            ASCIIColors.info(f"Initial model info: {json.dumps(active_binding1.get_model_info(), indent=2)}")
 
-            ASCIIColors.cyan("\n--- Initializing Second LlamaCppServerBinding Instance (Same Model, explicit name) ---")
-            # Load the same model explicitly now
-            model_to_load_explicitly = active_binding1.user_provided_model_name
+            prompt_text = "What is the capital of France?"
+            generated_text = active_binding1.generate_text(prompt_text, system_prompt="Concise expert.", n_predict=20, stream=False)
+            
+            if isinstance(generated_text, str) and "Paris" in generated_text:
+                ASCIIColors.green(f"SUCCESS: Auto-start generation successful. Response: {generated_text}")
+            else:
+                ASCIIColors.error(f"FAILURE: Auto-start generation failed. Response: {generated_text}")
+
+            ASCIIColors.info(f"Model info after auto-start: {json.dumps(active_binding1.get_model_info(), indent=2)}")
+            if not active_binding1.server_process or not active_binding1.server_process.is_healthy:
+                 raise RuntimeError("Server for binding1 did not seem to start correctly.")
+
+            # --- Test 2: Server reuse with a second binding ---
+            ASCIIColors.cyan("\n--- Test 2: Server reuse with a second binding ---")
             active_binding2 = LlamaCppServerBinding(
-                model_name=model_to_load_explicitly, models_path=str(models_path), config=binding_config
+                model_name=model_name_str, models_path=str(models_path), config=binding_config
             )
-            if not active_binding2.server_process or not active_binding2.server_process.is_healthy:
-                raise RuntimeError("Server for binding2 failed to start or become healthy (should reuse).")
-            ASCIIColors.green(f"Binding2 initialized. Server for '{active_binding2.current_model_path.name}' running on port {active_binding2.port}.")
-            ASCIIColors.info(f"Binding2 Model Info: {json.dumps(active_binding2.get_model_info(), indent=2)}")
+            # This call should reuse the server from binding1
+            generated_text_b2 = active_binding2.generate_text("Ping", n_predict=5, stream=False)
+            if isinstance(generated_text_b2, str):
+                ASCIIColors.green(f"SUCCESS: Binding2 generation successful. Response: {generated_text_b2}")
+            else:
+                 ASCIIColors.error(f"FAILURE: Binding2 generation failed. Response: {generated_text_b2}")
 
             if active_binding1.port != active_binding2.port:
-                ASCIIColors.error("ERROR: Bindings for the same model are using different ports! Server sharing failed.")
+                ASCIIColors.error("FAILURE: Bindings for the same model are using different ports! Server sharing failed.")
             else:
-                ASCIIColors.green("SUCCESS: Both bindings use the same server port. Server sharing appears to work.")
+                ASCIIColors.green("SUCCESS: Both bindings use the same server port. Server sharing works.")
+
+            # --- Test 3: Unload and auto-reload ---
+            ASCIIColors.cyan("\n--- Test 3: Unload and auto-reload ---")
+            active_binding1.unload_model()
+            ASCIIColors.info("Binding1 unloaded. Ref count should be 1, server still up for binding2.")
             
-            # --- List Models (scans configured directories) ---
-            ASCIIColors.cyan("\n--- Listing Models (from search paths, using binding1) ---")
-            # Create a dummy duplicate model to test unique naming
-            duplicate_folder = models_path / "subdir"
-            duplicate_folder.mkdir(exist_ok=True)
-            duplicate_model_path = duplicate_folder / test_model_path.name
-            import shutil
-            shutil.copy(test_model_path, duplicate_model_path)
-            ASCIIColors.info(f"Created a duplicate model for testing: {duplicate_model_path}")
-            
-            listed_models = active_binding1.listModels()
-            if listed_models: 
-                ASCIIColors.green(f"Found {len(listed_models)} GGUF files.")
-                pprint.pprint(listed_models)
-                # Check if the duplicate was handled
-                names = [m['name'] for m in listed_models]
-                if test_model_path.name in names and f"subdir/{test_model_path.name}" in names:
-                    ASCIIColors.green("SUCCESS: Duplicate model names were correctly handled.")
+            # The server should still be up because binding2 holds a reference
+            with _server_registry_lock:
+                if not _active_servers:
+                    ASCIIColors.error("FAILURE: Server shut down prematurely while still referenced by binding2.")
                 else:
-                    ASCIIColors.error("FAILURE: Duplicate model names were not handled correctly.")
-            else: ASCIIColors.warning("No GGUF models found in search paths.")
-            
-            # Clean up dummy duplicate
-            duplicate_model_path.unlink()
-            duplicate_folder.rmdir()
+                    ASCIIColors.green("SUCCESS: Server correctly remained active for binding2.")
 
-
-            # --- Tokenize/Detokenize ---
-            ASCIIColors.cyan("\n--- Tokenize/Detokenize (using binding1) ---")
-            sample_text = "Hello, Llama.cpp server world!"
-            tokens = active_binding1.tokenize(sample_text)
-            ASCIIColors.green(f"Tokens for '{sample_text}': {tokens[:10]}...")
-            if tokens:
-                detokenized_text = active_binding1.detokenize(tokens)
-                ASCIIColors.green(f"Detokenized text: {detokenized_text}")
-            else: ASCIIColors.warning("Tokenization returned empty list.")
-
-            # --- Text Generation (Non-Streaming, Chat API, binding1) ---
-            ASCIIColors.cyan("\n--- Text Generation (Non-Streaming, Chat API, binding1) ---")
-            prompt_text = "What is the capital of Germany?"
-            generated_text = active_binding1.generate_text(prompt_text, system_prompt="Concise expert.", n_predict=20, stream=False)
-            if isinstance(generated_text, str): ASCIIColors.green(f"Generated text (binding1): {generated_text}")
-            else: ASCIIColors.error(f"Generation failed (binding1): {generated_text}")
-
-            # --- Text Generation (Streaming, Completion API, binding2) ---
-            ASCIIColors.cyan("\n--- Text Generation (Streaming, Chat API, binding2) ---")
-            full_streamed_text = "" # Reset global
-            def stream_callback(chunk: str, msg_type: int): global full_streamed_text; ASCIIColors.green(f"{chunk}", end="", flush=True); full_streamed_text += chunk; return True
-            
-            result_b2 = active_binding2.generate_text(prompt_text, system_prompt="Concise expert.", n_predict=30, stream=True, streaming_callback=stream_callback)
-            print("\n--- End of Stream (binding2) ---")
-            if isinstance(result_b2, str): ASCIIColors.green(f"Full streamed text (binding2): {result_b2}")
-            else: ASCIIColors.error(f"Streaming generation failed (binding2): {result_b2}")
-
-            # --- Embeddings (binding1) ---
-            if binding_config.get("embedding"):
-                ASCIIColors.cyan("\n--- Embeddings (binding1) ---")
-                try:
-                    embedding_vector = active_binding1.embed("Test embedding.")
-                    ASCIIColors.green(f"Embedding (first 3 dims): {embedding_vector[:3]}... Dim: {len(embedding_vector)}")
-                except Exception as e_emb: ASCIIColors.warning(f"Could not get embedding: {e_emb}")
-            else: ASCIIColors.yellow("\n--- Embeddings Skipped (embedding: false) ---")
-
-        else: # primary_model_available is False
-            ASCIIColors.warning("Primary test model not available. Skipping most tests.")
-
-
-        # --- LLaVA Test (Conceptual - requires a LLaVA model and mmproj) ---
-        ASCIIColors.cyan("\n--- LLaVA Vision Test (if model available) ---")
-        llava_model_path = models_path / llava_model_name_str
-        llava_clip_path_actual = models_path / llava_clip_name_str # Assuming clip is in models_path too
-
-        if llava_model_path.exists() and llava_clip_path_actual.exists():
-            dummy_image_path = models_path / "dummy_llava_image.png"
-            try:
-                from PIL import Image, ImageDraw
-                img = Image.new('RGB', (150, 70), color = ('magenta')); d = ImageDraw.Draw(img); d.text((10,10), "LLaVA Test", fill=('white')); img.save(dummy_image_path)
-                ASCIIColors.info(f"Created dummy image for LLaVA: {dummy_image_path}")
-
-                llava_binding_config = binding_config.copy()
-                # LLaVA might need specific chat template if server doesn't auto-detect well.
-                # llava_binding_config["chat_template"] = "llava-1.5" 
-                
-                active_binding_llava = LlamaCppServerBinding(
-                    model_name=str(llava_model_path.name), # Pass filename, let it resolve
-                    models_path=str(models_path), 
-                    clip_model_name=str(llava_clip_path_actual.name), # Pass filename for clip
-                    config=llava_binding_config
-                )
-                if not active_binding_llava.server_process or not active_binding_llava.server_process.is_healthy:
-                     raise RuntimeError("LLaVA server failed to start or become healthy.")
-                ASCIIColors.green(f"LLaVA Binding initialized. Server for '{active_binding_llava.current_model_path.name}' running on port {active_binding_llava.port}.")
-                ASCIIColors.info(f"LLaVA Binding Model Info: {json.dumps(active_binding_llava.get_model_info(), indent=2)}")
-
-
-                llava_prompt = "Describe this image."
-                llava_response = active_binding_llava.generate_text(
-                    prompt=llava_prompt, images=[str(dummy_image_path)], n_predict=40, stream=False
-                )
-                if isinstance(llava_response, str): ASCIIColors.green(f"LLaVA response: {llava_response}")
-                else: ASCIIColors.error(f"LLaVA generation failed: {llava_response}")
-
-            except ImportError: ASCIIColors.warning("Pillow not found. Cannot create dummy image for LLaVA.")
-            except Exception as e_llava: ASCIIColors.error(f"LLaVA test error: {e_llava}"); trace_exception(e_llava)
-            finally:
-                if dummy_image_path.exists(): dummy_image_path.unlink()
-        else:
-            ASCIIColors.warning(f"LLaVA model '{llava_model_path.name}' or clip model '{llava_clip_path_actual.name}' not found in '{models_path}'. Skipping LLaVA test.")
-        
-        if primary_model_available and active_binding1:
-            # --- Test changing model (using binding1 to load a different or same model) ---
-            ASCIIColors.cyan("\n--- Testing Model Change (binding1 reloads its model) ---")
-            # For a real change, use a different model name if available. Here, we reload the same.
-            reload_success = active_binding1.load_model(active_binding1.user_provided_model_name) # Reload original model
-            if reload_success and active_binding1.server_process and active_binding1.server_process.is_healthy:
-                ASCIIColors.green(f"Model reloaded/re-confirmed successfully by binding1. Server on port {active_binding1.port}.")
-                reloaded_gen = active_binding1.generate_text("Ping", n_predict=5, stream=False)
-                if isinstance(reloaded_gen, str): ASCIIColors.green(f"Post-reload ping (binding1): {reloaded_gen.strip()}")
-                else: ASCIIColors.error(f"Post-reload generation failed (binding1): {reloaded_gen}")
+            # This call should re-acquire a reference to the same server for binding1
+            generated_text_reloaded = active_binding1.generate_text("Test reload", n_predict=5, stream=False)
+            if isinstance(generated_text_reloaded, str):
+                 ASCIIColors.green(f"SUCCESS: Generation after reload successful. Response: {generated_text_reloaded}")
             else:
-                ASCIIColors.error("Failed to reload model or server not healthy after reload attempt by binding1.")
+                 ASCIIColors.error(f"FAILURE: Generation after reload failed. Response: {generated_text_reloaded}")
 
-    except ImportError as e_imp: ASCIIColors.error(f"Import error: {e_imp}.")
-    except FileNotFoundError as e_fnf: ASCIIColors.error(f"File not found error: {e_fnf}.")
-    except ConnectionError as e_conn: ASCIIColors.error(f"Connection error: {e_conn}")
-    except RuntimeError as e_rt:
-        ASCIIColors.error(f"Runtime error: {e_rt}")
-        if active_binding1 and active_binding1.server_process: ASCIIColors.error(f"Binding1 stderr:\n{active_binding1.server_process._stderr_lines[-20:]}")
-        if active_binding2 and active_binding2.server_process: ASCIIColors.error(f"Binding2 stderr:\n{active_binding2.server_process._stderr_lines[-20:]}")
-        if active_binding_llava and active_binding_llava.server_process: ASCIIColors.error(f"LLaVA Binding stderr:\n{active_binding_llava.server_process._stderr_lines[-20:]}")
-    except Exception as e_main: ASCIIColors.error(f"An unexpected error occurred: {e_main}"); trace_exception(e_main)
+            if active_binding1.port != active_binding2.port:
+                ASCIIColors.error("FAILURE: Port mismatch after reload.")
+            else:
+                 ASCIIColors.green("SUCCESS: Correctly re-used same server after reload.")
+
+        else:
+            ASCIIColors.warning("\n--- Primary model not available, skipping most tests ---")
+
+        # --- Test 4: Initialize with model_name=None and auto-find ---
+        ASCIIColors.cyan("\n--- Test 4: Initialize with model_name=None and auto-find ---")
+        unspecified_binding = LlamaCppServerBinding(model_name=None, models_path=str(models_path), config=binding_config)
+        gen_unspec = unspecified_binding.generate_text("Ping", n_predict=5, stream=False)
+        if primary_model_available:
+            if isinstance(gen_unspec, str):
+                ASCIIColors.green(f"SUCCESS: Auto-find generation successful. Response: {gen_unspec}")
+                ASCIIColors.info(f"Model auto-selected: {unspecified_binding.user_provided_model_name}")
+            else:
+                ASCIIColors.error(f"FAILURE: Auto-find generation failed. Response: {gen_unspec}")
+        else: # If no models, this should fail gracefully
+            if isinstance(gen_unspec, dict) and 'error' in gen_unspec:
+                ASCIIColors.green("SUCCESS: Correctly failed to generate when no models are available.")
+            else:
+                ASCIIColors.error(f"FAILURE: Incorrect behavior when no models are available. Response: {gen_unspec}")
+        
+    except Exception as e_main:
+        ASCIIColors.error(f"An unexpected error occurred during testing: {e_main}")
+        trace_exception(e_main)
     finally:
         ASCIIColors.cyan("\n--- Unloading Models and Stopping Servers ---")
         if active_binding1: active_binding1.unload_model(); ASCIIColors.info("Binding1 unloaded.")
         if active_binding2: active_binding2.unload_model(); ASCIIColors.info("Binding2 unloaded.")
-        if active_binding_llava: active_binding_llava.unload_model(); ASCIIColors.info("LLaVA Binding unloaded.")
         
-        # Check if any servers remain (should be none if all bindings unloaded)
         with _server_registry_lock:
             if _active_servers:
-                ASCIIColors.warning(f"Warning: {_active_servers.keys()} servers still in registry after all known bindings unloaded.")
-                for key, server_proc in list(_active_servers.items()): # list() for safe iteration if modifying
+                ASCIIColors.warning(f"Warning: {_active_servers.keys()} servers still in registry after tests.")
+                for key, server_proc in list(_active_servers.items()):
                     ASCIIColors.info(f"Force shutting down stray server: {key}")
                     try: server_proc.shutdown()
                     except Exception as e_shutdown: ASCIIColors.error(f"Error shutting down stray server {key}: {e_shutdown}")
-                    _active_servers.pop(key,None)
-                    _server_ref_counts.pop(key,None)
+                    _active_servers.pop(key, None)
+                    _server_ref_counts.pop(key, None)
             else:
                 ASCIIColors.green("All servers shut down correctly.")
 

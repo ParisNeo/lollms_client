@@ -11,10 +11,10 @@ import pipmaster as pm
 # Ensure the required packages are installed
 pm.ensure_packages(["mistralai", "pillow", "tiktoken"])
 
-from mistralai.client import MistralClient
-from mistralai.models.chat_completion import ChatMessage
+from mistralai import Mistral
 from PIL import Image, ImageDraw
 import tiktoken
+
 
 BindingName = "MistralBinding"
 
@@ -28,7 +28,7 @@ class MistralBinding(LollmsLLMBinding):
 
     def __init__(self,
                  model_name: str = "mistral-large-latest",
-                 mistral_api_key: str = None,
+                 service_key: str|None = None,
                  **kwargs
                  ):
         """
@@ -40,13 +40,13 @@ class MistralBinding(LollmsLLMBinding):
         """
         super().__init__(binding_name=BindingName)
         self.model_name = model_name
-        self.mistral_api_key = mistral_api_key or os.getenv("MISTRAL_API_KEY")
+        self.mistral_api_key = service_key or os.getenv("MISTRAL_API_KEY")
 
         if not self.mistral_api_key:
             raise ValueError("Mistral API key is required. Set it via 'mistral_api_key' or MISTRAL_API_KEY env var.")
 
         try:
-            self.client = MistralClient(api_key=self.mistral_api_key)
+            self.client = Mistral(api_key=self.mistral_api_key)
         except Exception as e:
             ASCIIColors.error(f"Failed to configure Mistral client: {e}")
             self.client = None
@@ -64,35 +64,67 @@ class MistralBinding(LollmsLLMBinding):
         if n_predict is not None: params['max_tokens'] = n_predict
         if seed is not None: params['random_seed'] = seed # Mistral uses 'random_seed'
         return params
+    
 
-    def _prepare_messages(self, discussion: LollmsDiscussion, branch_tip_id: Optional[str] = None) -> List[ChatMessage]:
-        """Prepares the message list for the Mistral API from a LollmsDiscussion."""
+    def _prepare_messages(self, discussion: LollmsDiscussion, branch_tip_id: Optional[str] = None) -> List[Dict[str, any]]:
+        """Prepares the message list for the API from a LollmsDiscussion."""
         history = []
         if discussion.system_prompt:
-            # Mistral prefers the system prompt as the first message with a user/assistant turn.
-            # A lone system message is not ideal. We will prepend it to the first user message.
-            # However, for API consistency, we will treat it as a separate message if it exists.
-            # The official client will likely handle this.
-            history.append(ChatMessage(role="system", content=discussion.system_prompt))
+            history.append({"role": "system", "content": discussion.system_prompt})
 
         for msg in discussion.get_messages(branch_tip_id):
             role = 'user' if msg.sender_type == "user" else 'assistant'
-            # Note: Mistral API currently does not support image inputs via the chat endpoint.
+            # Note: Vision support depends on the specific model being called via OpenRouter.
+            # We will not implement it in this generic binding to avoid complexity,
+            # as different models might expect different formats.
             if msg.content:
-                history.append(ChatMessage(role=role, content=msg.content))
+                history.append({'role': role, 'content': msg.content})
         return history
 
-    def generate_text(self, prompt: str, **kwargs) -> Union[str, dict]:
+    def generate_text(self,
+                    prompt: str,
+                    images: Optional[List[str]] = None,
+                    system_prompt: str = "",
+                    n_predict: Optional[int] = None,
+                    stream: Optional[bool] = None,
+                    temperature: float = 0.7,  # Ollama default is 0.8, common default 0.7
+                    top_k: int = 40,          # Ollama default is 40
+                    top_p: float = 0.9,       # Ollama default is 0.9
+                    repeat_penalty: float = 1.1,  # Ollama default is 1.1
+                    repeat_last_n: int = 64,  # Ollama default is 64
+                    seed: Optional[int] = None,
+                    n_threads: Optional[int] = None,
+                    ctx_size: int | None = None,
+                    streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                    split: Optional[bool] = False,  # put to true if the prompt is a discussion
+                    user_keyword: Optional[str] = "!@>user:",
+                    ai_keyword: Optional[str] = "!@>assistant:",
+                    **kwargs
+                    ) -> Union[str, dict]:
         """
-        Generate text using Mistral. This is a wrapper around the chat method.
+        Generate text using OpenRouter. This is a wrapper around the chat method.
         """
-        temp_discussion = LollmsDiscussion.from_messages([
-            LollmsMessage.new_message(sender_type="user", content=prompt)
-        ])
-        if kwargs.get("system_prompt"):
-            temp_discussion.system_prompt = kwargs.get("system_prompt")
+        temp_discussion = LollmsDiscussion(None)
+        temp_discussion.add_message(sender="user", content=prompt, images=images or [])
+        if system_prompt:
+            temp_discussion.system_prompt = system_prompt
         
-        return self.chat(temp_discussion, **kwargs)
+        return self.chat(temp_discussion, 
+                        n_predict=n_predict,
+                        stream=stream,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        repeat_penalty=repeat_penalty,
+                        repeat_last_n=repeat_last_n,
+                        seed=seed,
+                        n_threads=n_threads,
+                        ctx_size=ctx_size,
+                        streaming_callback=streaming_callback,
+                        split=split,
+                        user_keyword=user_keyword,
+                        ai_keyword=ai_keyword,
+                        **kwargs)
 
     def chat(self,
              discussion: LollmsDiscussion,
@@ -117,7 +149,7 @@ class MistralBinding(LollmsLLMBinding):
 
         try:
             if stream:
-                response = self.client.chat_stream(
+                response = self.client.chat.stream(
                     model=self.model_name,
                     messages=messages,
                     **api_params
@@ -131,7 +163,7 @@ class MistralBinding(LollmsLLMBinding):
                                 break
                 return full_response_text
             else:
-                response = self.client.chat(
+                response = self.client.chat.complete(
                     model=self.model_name,
                     messages=messages,
                     **api_params
@@ -201,7 +233,7 @@ class MistralBinding(LollmsLLMBinding):
             return []
         try:
             ASCIIColors.debug("Listing Mistral models...")
-            models = self.client.list_models()
+            models = self.client.models.list()
             model_info_list = []
             for m in models.data:
                 model_info_list.append({
@@ -264,7 +296,6 @@ if __name__ == '__main__':
         ASCIIColors.cyan("\n--- Text Generation (Streaming) ---")
         full_streamed_text = ""
         def stream_callback(chunk: str, msg_type: int):
-            nonlocal full_streamed_text
             ASCIIColors.green(chunk, end="", flush=True)
             full_streamed_text += chunk
             return True

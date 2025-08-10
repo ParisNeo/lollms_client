@@ -30,7 +30,7 @@ class GroqBinding(LollmsLLMBinding):
 
     def __init__(self,
                  model_name: str = "llama3-8b-8192",
-                 groq_api_key: str = None,
+                 service_key: str|None = None,
                  **kwargs
                  ):
         """
@@ -42,7 +42,7 @@ class GroqBinding(LollmsLLMBinding):
         """
         super().__init__(binding_name=BindingName)
         self.model_name = model_name
-        self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
+        self.groq_api_key = service_key or os.getenv("GROQ_API_KEY")
 
         if not self.groq_api_key:
             raise ValueError("Groq API key is required. Set it via 'groq_api_key' or GROQ_API_KEY env var.")
@@ -258,7 +258,6 @@ if __name__ == '__main__':
         ASCIIColors.cyan("\n--- Text Generation (Streaming) ---")
         full_streamed_text = ""
         def stream_callback(chunk: str, msg_type: int):
-            nonlocal full_streamed_text
             ASCIIColors.green(chunk, end="", flush=True)
             full_streamed_text += chunk
             return True
