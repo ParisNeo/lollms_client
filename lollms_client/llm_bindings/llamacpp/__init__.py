@@ -901,6 +901,77 @@ class LlamaCppServerBinding(LollmsLLMBinding):
     def __del__(self):
         self.unload_model()
 
+    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
+        """
+        Retrieves context size for a model from a hardcoded list.
+
+        This method checks if the model name contains a known base model identifier
+        (e.g., 'llama3.1', 'gemma2') to determine its context length. It's intended
+        as a failsafe when the context size cannot be retrieved directly from the
+        Ollama API.
+        """
+        if model_name is None:
+            model_name = self.model_name
+
+        # Hardcoded context sizes for popular models. More specific names (e.g., 'llama3.1')
+        # should appear, as they will be checked first due to the sorting logic below.
+        known_contexts = {
+            'llama3.1': 131072,   # Llama 3.1 extended context
+            'llama3.2': 131072,   # Llama 3.2 extended context
+            'llama3.3': 131072,   # Assuming similar to 3.1/3.2
+            'llama3': 8192,       # Llama 3 default
+            'llama2': 4096,       # Llama 2 default
+            'mixtral8x22b': 65536, # Mixtral 8x22B default
+            'mixtral': 32768,     # Mixtral 8x7B default
+            'mistral': 32768,     # Mistral 7B v0.2+ default
+            'gemma3': 131072,     # Gemma 3 with 128K context
+            'gemma2': 8192,       # Gemma 2 default
+            'gemma': 8192,        # Gemma default
+            'phi3': 131072,       # Phi-3 variants often use 128K (mini/medium extended)
+            'phi2': 2048,         # Phi-2 default
+            'phi': 2048,          # Phi default (older)
+            'qwen2.5': 131072,    # Qwen2.5 with 128K
+            'qwen2': 32768,       # Qwen2 default for 7B
+            'qwen': 8192,         # Qwen default
+            'codellama': 16384,   # CodeLlama extended
+            'codegemma': 8192,    # CodeGemma default
+            'deepseek-coder-v2': 131072,  # DeepSeek-Coder V2 with 128K
+            'deepseek-coder': 16384,  # DeepSeek-Coder V1 default
+            'deepseek-v2': 131072,    # DeepSeek-V2 with 128K
+            'deepseek-llm': 4096,     # DeepSeek-LLM default
+            'yi1.5': 32768,       # Yi-1.5 with 32K
+            'yi': 4096,           # Yi base default
+            'command-r': 131072,  # Command-R with 128K
+            'wizardlm2': 32768,   # WizardLM2 (Mistral-based)
+            'wizardlm': 16384,    # WizardLM default
+            'zephyr': 65536,      # Zephyr beta (Mistral-based extended)
+            'vicuna': 2048,       # Vicuna default (up to 16K in some variants)
+            'falcon': 2048,       # Falcon default
+            'starcoder': 8192,    # StarCoder default
+            'stablelm': 4096,     # StableLM default
+            'orca2': 4096,        # Orca 2 default
+            'orca': 4096,         # Orca default
+            'dolphin': 32768,     # Dolphin (often Mistral-based)
+            'openhermes': 8192,   # OpenHermes default
+        }
+
+        normalized_model_name = model_name.lower().strip()
+
+        # Sort keys by length in descending order. This ensures that a more specific
+        # name like 'llama3.1' is checked before a less specific name like 'llama3'.
+        sorted_base_models = sorted(known_contexts.keys(), key=len, reverse=True)
+
+        for base_name in sorted_base_models:
+            if base_name in normalized_model_name:
+                context_size = known_contexts[base_name]
+                ASCIIColors.warning(
+                    f"Using hardcoded context size for model '{model_name}' "
+                    f"based on base name '{base_name}': {context_size}"
+                )
+                return context_size
+
+        ASCIIColors.warning(f"Context size not found for model '{model_name}' in the hardcoded list.")
+        return None
 
 if __name__ == '__main__':
     global full_streamed_text # Define for the callback

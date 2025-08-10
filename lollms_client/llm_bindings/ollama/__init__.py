@@ -598,6 +598,94 @@ class OllamaBinding(LollmsLLMBinding):
         ASCIIColors.info(f"Ollama model set to: {model_name}. It will be loaded by the server on first use.")
         return True
 
+    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
+        """
+        Retrieves the context size for an Ollama model.
+        
+        The effective context size is the `num_ctx` parameter if overridden in the Modelfile,
+        otherwise it falls back to the model's default context length from its architecture details.
+        As a final failsafe, uses a hardcoded list of known popular models' context lengths.
+        """
+        if model_name is None:
+            model_name = self.model_name
+            
+        try:
+            info = ollama.show(model_name)
+            
+            # Parse num_ctx from the 'parameters' string (e.g., "PARAMETER num_ctx 4096")
+            parameters = info.get('parameters', '')
+            num_ctx = None
+            for param in parameters.split('\n'):
+                if param.strip().startswith('num_ctx'):
+                    num_ctx = int(param.split()[1])
+                    break
+            
+            if num_ctx is not None:
+                return num_ctx
+            
+            # Fall back to model_info context_length (e.g., 'llama.context_length')
+            model_info = info.get('model_info', {})
+            arch = model_info.get('general.architecture', '')
+            context_key = f'{arch}.context_length' if arch else 'general.context_length'
+            context_length = model_info.get(context_key)
+            
+            if context_length is not None:
+                return int(context_length)
+            
+        except Exception as e:
+            ASCIIColors.warning(f"Error fetching model info: {str(e)}")
+        
+        # Failsafe: Hardcoded context sizes for popular Ollama models
+        known_contexts = {
+            'llama2': 4096,       # Llama 2 default
+            'llama3': 8192,       # Llama 3 default
+            'llama3.1': 131072,   # Llama 3.1 extended context
+            'llama3.2': 131072,   # Llama 3.2 extended context
+            'llama3.3': 131072,   # Assuming similar to 3.1/3.2
+            'mistral': 32768,     # Mistral 7B v0.2+ default
+            'mixtral': 32768,     # Mixtral 8x7B default
+            'mixtral8x22b': 65536, # Mixtral 8x22B default
+            'gemma': 8192,        # Gemma default
+            'gemma2': 8192,       # Gemma 2 default
+            'gemma3': 131072,     # Gemma 3 with 128K context
+            'phi': 2048,          # Phi default (older)
+            'phi2': 2048,         # Phi-2 default
+            'phi3': 131072,       # Phi-3 variants often use 128K (mini/medium extended)
+            'qwen': 8192,         # Qwen default
+            'qwen2': 32768,       # Qwen2 default for 7B
+            'qwen2.5': 131072,    # Qwen2.5 with 128K
+            'codellama': 16384,   # CodeLlama extended
+            'codegemma': 8192,    # CodeGemma default
+            'deepseek-coder': 16384,  # DeepSeek-Coder V1 default
+            'deepseek-coder-v2': 131072,  # DeepSeek-Coder V2 with 128K
+            'deepseek-llm': 4096,     # DeepSeek-LLM default
+            'deepseek-v2': 131072,    # DeepSeek-V2 with 128K
+            'yi': 4096,           # Yi base default
+            'yi1.5': 32768,       # Yi-1.5 with 32K
+            'command-r': 131072,  # Command-R with 128K
+            'vicuna': 2048,       # Vicuna default (up to 16K in some variants)
+            'wizardlm': 16384,    # WizardLM default
+            'wizardlm2': 32768,   # WizardLM2 (Mistral-based)
+            'zephyr': 65536,      # Zephyr beta (Mistral-based extended)
+            'falcon': 2048,       # Falcon default
+            'starcoder': 8192,    # StarCoder default
+            'stablelm': 4096,     # StableLM default
+            'orca': 4096,         # Orca default
+            'orca2': 4096,        # Orca 2 default
+            'dolphin': 32768,     # Dolphin (often Mistral-based)
+            'openhermes': 8192,   # OpenHermes default
+        }
+        
+        # Extract base model name (e.g., 'llama3' from 'llama3:8b-instruct')
+        base_name = model_name.split(':')[0].lower().strip()
+        
+        if base_name in known_contexts:
+            ASCIIColors.warning(f"Using hardcoded context size for model '{model_name}': {known_contexts[base_name]}")
+            return known_contexts[base_name]
+        
+        ASCIIColors.warning(f"Context size not found for model '{model_name}'")
+        return None
+        
 if __name__ == '__main__':
     global full_streamed_text
     # Example Usage (requires an Ollama server running)
