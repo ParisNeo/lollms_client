@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![PyPI version](https://badge.fury.io/py/lollms_client.svg)](https://badge.fury.io/py/lollms_client)
-[![Python Versions](https://img.shields.io/pypi/pyversions/lollms_client.svg)](https://pypi.org/project/lollms_client/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/lollms_client.svg)](https://pypi.org/project/lollms-client/)
 [![Downloads](https://static.pepy.tech/personalized-badge/lollms-client?period=total&units=international_system&left_color=grey&right_color=green&left_text=Downloads)](https://pepy.tech/project/lollms-client)
 [![Documentation - Usage](https://img.shields.io/badge/docs-Usage%20Guide-brightgreen)](DOC_USE.md)
 [![Documentation - Developer](https://img.shields.io/badge/docs-Developer%20Guide-blue)](DOC_DEV.md)
@@ -41,9 +41,13 @@ pip install lollms-client
 
 This will install the core library. Some bindings may require additional dependencies (e.g., `llama-cpp-python`, `torch`, `transformers`, `ollama`, `vllm`). The library attempts to manage these using `pipmaster`, but for complex dependencies (especially those requiring compilation like `llama-cpp-python` with GPU support), manual installation might be preferred.
 
-## Quick Start
+## Core Generation Methods
 
-Here's a very basic example of how to use `LollmsClient` to generate text with a LoLLMs server (ensure one is running at `http://localhost:9600`):
+The `LollmsClient` provides several methods for generating text, catering to different use cases.
+
+### Basic Text Generation (`generate_text`)
+
+This is the most straightforward method for generating a response based on a simple prompt.
 
 ```python
 from lollms_client import LollmsClient, MSG_TYPE
@@ -60,7 +64,7 @@ def simple_streaming_callback(chunk: str, msg_type: MSG_TYPE, params=None, metad
 try:
     # Initialize client to connect to a LoLLMs server
     # For other backends, change 'binding_name' and provide necessary parameters.
-    # See DOC_USE.md for detailed initialization examples.
+    # See below for detailed initialization examples for various bindings.
     lc = LollmsClient(
         binding_name="lollms",
         host_address="http://localhost:9600"
@@ -96,7 +100,50 @@ except Exception as e:
 
 ```
 
-### Advanced Structured Content Generation
+### Generating from Message Lists (`generate_from_messages`)
+
+For more complex conversational interactions, you can provide the LLM with a list of messages, similar to the OpenAI Chat Completion API. This allows you to define roles (system, user, assistant) and build multi-turn conversations programmatically.
+
+```python
+from lollms_client import LollmsClient, MSG_TYPE
+from ascii_colors import ASCIIColors
+
+def streaming_callback_for_messages(chunk: str, msg_type: MSG_TYPE, params=None, metadata=None) -> bool:
+    if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(chunk, end="", flush=True)
+    return True
+
+try:
+    lc = LollmsClient(
+        binding_name="ollama", # Or "openai", "claude", "gemini", etc.
+        model_name="llama3",
+        host_address="http://localhost:11434" # Adjust for your binding
+    )
+
+    # Define the conversation history as a list of messages
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant that specializes in programming."},
+        {"role": "user", "content": "Hello, what's your name?"},
+        {"role": "assistant", "content": "I am an AI assistant created by Google."},
+        {"role": "user", "content": "Can you explain recursion in Python?"}
+    ]
+
+    ASCIIColors.yellow("\nGenerating response from messages:")
+    response_text = lc.generate_from_messages(
+        messages=messages,
+        n_predict=200,
+        stream=True,
+        streaming_callback=streaming_callback_for_messages
+    )
+    print("\n--- End of Message Stream ---")
+    ASCIIColors.cyan(f"\nFull collected response: {response_text[:150]}...")
+
+except Exception as e:
+    ASCIIColors.error(f"Error during message generation: {e}")
+
+```
+
+### Advanced Structured Content Generation (`generate_structured_content`)
 
 The `generate_structured_content` method is a powerful utility for forcing an LLM's output into a specific JSON format. It's ideal for extracting information, getting consistent tool parameters, or any task requiring reliable, machine-readable output.
 
@@ -120,12 +167,12 @@ output_template = {
 # Generate the structured data
 extracted_data = lc.generate_structured_content(
     prompt=f"Extract the relevant information from the following text:\n\n{text_block}",
-    output_format=output_template
+    schema=output_template # Note: parameter is 'schema', not 'output_format'
 )
 
 if extracted_data:
     print(json.dumps(extracted_data, indent=2))
-# Expected output:
+# Expected output (approximate):
 # {
 #   "full_name": "John Doe",
 #   "age": 34,
@@ -135,134 +182,64 @@ if extracted_data:
 # }
 ```
 
-### Putting It All Together: An Advanced Agentic Example
+## Advanced Discussion Management
 
-Let's create a **Python Coder Agent**. This agent will use a set of coding rules from a local file as its knowledge base and will be equipped with a tool to execute the code it writes. This demonstrates the synergy between `LollmsPersonality` (with `data_source` and `active_mcps`), `LollmsDiscussion`, and the MCP system.
+The `LollmsDiscussion` class is a core component for managing conversational state, including message history, long-term memory, and various context zones.
 
-#### Step 1: Create the Knowledge Base (`coding_rules.txt`)
+### Basic Chat with `LollmsDiscussion`
 
-Create a simple text file with the rules our agent must follow.
-
-```text
-# File: coding_rules.txt
-
-1.  All Python functions must include a Google-style docstring.
-2.  Use type hints for all function parameters and return values.
-3.  The main execution block should be protected by `if __name__ == "__main__":`.
-4.  After defining a function, add a simple example of its usage inside the main block.
-5.  Print the output of the example usage to the console.
-```
-
-#### Step 2: The Main Script (`agent_example.py`)
-
-This script will define the personality, initialize the client, and run the agent.
+For general conversational agents that need to maintain context across turns, `LollmsDiscussion` simplifies the process. It automatically handles message formatting, history management, and context window limitations.
 
 ```python
-from pathlib import Path
-from lollms_client import LollmsClient, LollmsPersonality, LollmsDiscussion, MSG_TYPE, trace_exception
+from lollms_client import LollmsClient, LollmsDiscussion, MSG_TYPE
 from ascii_colors import ASCIIColors
-import json
 
-# A detailed callback to visualize the agent's process
-def agent_callback(chunk: str, msg_type: MSG_TYPE, params: dict = None, **kwargs) -> bool:
-    if not params: params = {}
-    
-    if msg_type == MSG_TYPE.MSG_TYPE_STEP:
-        ASCIIColors.yellow(f"\n>> Agent Step: {chunk}")
-    elif msg_type == MSG_TYPE.MSG_TYPE_STEP_START:
-        ASCIIColors.yellow(f"\n>> Agent Step Start: {chunk}")
-    elif msg_type == MSG_TYPE.MSG_TYPE_STEP_END:
-        result = params.get('result', '')
-        ASCIIColors.green(f"<< Agent Step End: {chunk} -> Result: {json.dumps(result)[:150]}...")
-    elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT:
-        ASCIIColors.magenta(f"🤔 Agent Thought: {chunk}")
-    elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
-        ASCIIColors.blue(f"🛠️  Agent Action: {chunk}")
-    elif msg_type == MSG_TYPE.MSG_TYPE_OBSERVATION:
-        ASCIIColors.cyan(f"👀 Agent Observation: {chunk}")
-    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
-        print(chunk, end="", flush=True) # Final answer stream
+# Initialize LollmsClient
+lc = LollmsClient(
+    binding_name="ollama", 
+    model_name="llama3",
+    host_address="http://localhost:11434"
+)
+
+# Create a new discussion. For persistent discussions, pass a db_manager.
+# discussion = LollmsDiscussion.create_new(lollms_client=lc, db_manager=db_manager, autosave=True)
+discussion = LollmsDiscussion.create_new(lollms_client=lc, autosave=False) # In-memory for simplicity here
+
+# Define a simple callback for streaming
+def chat_callback(chunk: str, msg_type: MSG_TYPE, **kwargs) -> bool:
+    if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(chunk, end="", flush=True)
     return True
 
 try:
-    # --- 1. Load the knowledge base from the file ---
-    rules_path = Path("coding_rules.txt")
-    if not rules_path.exists():
-        raise FileNotFoundError("Please create the 'coding_rules.txt' file.")
-    coding_rules = rules_path.read_text()
-
-    # --- 2. Define the Coder Agent Personality ---
-    coder_personality = LollmsPersonality(
-        name="Python Coder Agent",
-        author="lollms-client",
-        category="Coding",
-        description="An agent that writes and executes Python code according to specific rules.",
-        system_prompt=(
-            "You are an expert Python programmer. Your task is to write clean, executable Python code based on the user's request. "
-            "You MUST strictly follow all rules provided in the 'Personality Static Data' section. "
-            "First, think about the plan. Then, use the `python_code_interpreter` tool to write and execute the code. "
-            "Finally, present the code and its output to the user."
-        ),
-        # A) Attach the static knowledge base
-        data_source=coding_rules,
-        # B) Equip the agent with a code execution tool
-        active_mcps=["python_code_interpreter"]
-    )
-
-    # --- 3. Initialize the Client and Discussion ---
-    lc = LollmsClient(
-        binding_name="ollama",          # Or any capable model binding
-        model_name="codellama",         # A code-specialized model is recommended
-        mcp_binding_name="local_mcp"    # Enable the local tool execution engine
-    )
-    discussion = LollmsDiscussion.create_new(lollms_client=lc)
-    
-    # --- 4. The User's Request ---
-    user_prompt = "Write a Python function that takes two numbers and returns their sum."
-
-    ASCIIColors.yellow(f"User Prompt: {user_prompt}")
-    print("\n" + "="*50 + "\nAgent is now running...\n" + "="*50)
-
-    # --- 5. Run the Agentic Chat Turn ---
+    ASCIIColors.cyan("> User: Hello, how are you today?")
     response = discussion.chat(
-        user_message=user_prompt,
-        personality=coder_personality,
-        streaming_callback=agent_callback
+        user_message="Hello, how are you today?",
+        streaming_callback=chat_callback
     )
+    print("\n") # Newline after stream finishes
 
-    print("\n\n" + "="*50 + "\nAgent finished.\n" + "="*50)
-    
-    # --- 6. Inspect the results ---
     ai_message = response['ai_message']
-    ASCIIColors.green("\n--- Final Answer from Agent ---")
-    print(ai_message.content)
-    
-    ASCIIColors.magenta("\n--- Tool Calls Made ---")
-    print(json.dumps(ai_message.metadata.get("tool_calls", []), indent=2))
+    user_message = response['user_message']
+
+    ASCIIColors.green(f"< Assistant (Full): {ai_message.content[:100]}...")
+
+    # Now, continue the conversation
+    ASCIIColors.cyan("\n> User: Can you recommend a good book?")
+    response = discussion.chat(
+        user_message="Can you recommend a good book?",
+        streaming_callback=chat_callback
+    )
+    print("\n")
+
+    # You can inspect the full message history
+    ASCIIColors.magenta("\n--- Discussion History ---")
+    for msg in discussion.get_messages():
+        print(f"[{msg.sender.capitalize()}]: {msg.content[:50]}...")
 
 except Exception as e:
-    trace_exception(e)
-
+    ASCIIColors.error(f"An error occurred during discussion chat: {e}")
 ```
-
-#### Step 3: What Happens Under the Hood
-
-When you run `agent_example.py`, a sophisticated process unfolds:
-
-1.  **Initialization:** The `LollmsDiscussion.chat()` method is called with the `coder_personality`.
-2.  **Knowledge Injection:** The `chat` method sees that `personality.data_source` is a string. It automatically takes the content of `coding_rules.txt` and injects it into the discussion's data zones.
-3.  **Tool Activation:** The method also sees `personality.active_mcps`. It enables the `python_code_interpreter` tool for this turn.
-4.  **Context Assembly:** The `LollmsClient` assembles a rich prompt for the LLM that includes:
-    *   The personality's `system_prompt`.
-    *   The content of `coding_rules.txt` (from the data zones).
-    *   The list of available tools (including `python_code_interpreter`).
-    *   The user's request ("Write a function...").
-5.  **Reason and Act:** The LLM, now fully briefed, reasons that it needs to use the `python_code_interpreter` tool. It formulates the Python code *according to the rules it was given*.
-6.  **Tool Execution:** The `local_mcp` binding receives the code and executes it in a secure local environment. It captures any output (`stdout`, `stderr`) and results.
-7.  **Observation:** The execution results are sent back to the LLM as an "observation."
-8.  **Final Synthesis:** The LLM now has the user's request, the rules, the code it wrote, and the code's output. It synthesizes all of this into a final, comprehensive answer for the user.
-
-This example showcases how `lollms-client` allows you to build powerful, knowledgeable, and capable agents by simply composing personalities with data and tools.
 
 ### Building Stateful Agents with Memory and Data Zones
 
@@ -437,62 +414,134 @@ ASCIIColors.green("\nNotice the message now says '(1 image(s) attached)' instead
 ASCIIColors.green("Only the active image will be sent to the multimodal LLM.")
 ```
 
-## Documentation
+### Putting It All Together: An Advanced Agentic Example
 
-For more in-depth information, please refer to:
+Let's create a **Python Coder Agent**. This agent will use a set of coding rules from a local file as its knowledge base and will be equipped with a tool to execute the code it writes. This demonstrates the synergy between `LollmsPersonality` (with `data_source` and `active_mcps`), `LollmsDiscussion`, and the MCP system.
 
-*   **[Usage Guide (DOC_USE.md)](DOC_USE.md):** Learn how to use `LollmsClient`, different bindings, modality features, function calling with MCP, and high-level operations.
-*   **[Developer Guide (DOC_DEV.md)](DOC_DEV.md):** Understand the architecture, how to create new bindings (LLM, modality, MCP), and contribute to the library.
+#### Step 1: Create the Knowledge Base (`coding_rules.txt`)
 
-## Core Concepts
+Create a simple text file with the rules our agent must follow.
 
-```mermaid
-graph LR
-    A[Your Application] --> LC[LollmsClient];
+```text
+# File: coding_rules.txt
 
-    subgraph LollmsClient_Core
-        LC -- Manages --> LLB[LLM Binding];
-        LC -- Manages --> MCPB[MCP Binding];
-        LC -- Orchestrates --> MCP_Interaction[generate_with_mcp];
-        LC -- Provides --> HighLevelOps["High-Level Ops(summarize, deep_analyze etc.)"];
-        LC -- Provides Access To --> DM[DiscussionManager];
-        LC -- Provides Access To --> ModalityBindings[TTS, TTI, STT etc.];
-    end
-
-    subgraph LLM_Backends
-        LLB --> LollmsServer[LoLLMs Server];
-        LLB --> OllamaServer[Ollama];
-        LLB --> OpenAPIServer[OpenAI API];
-        LLB --> LocalGGUF["Local GGUF<br>(pythonllamacpp / llamacpp server)"];
-        LLB --> LocalHF["Local HuggingFace<br>(transformers / vLLM)"];
-    end
-
-    MCP_Interaction --> MCPB;
-    MCPB --> LocalTools["Local Python Tools<br>(via local_mcp)"];
-    MCPB --> RemoteTools["Remote MCP Tool Servers<br>(Future Potential)"];
-
-
-    ModalityBindings --> ModalityServices["Modality Services<br>(e.g., LoLLMs Server TTS/TTI, local Bark/XTTS)"];
+1.  All Python functions must include a Google-style docstring.
+2.  Use type hints for all function parameters and return values.
+3.  The main execution block should be protected by `if __name__ == "__main__":`.
+4.  After defining a function, add a simple example of its usage inside the main block.
+5.  Print the output of the example usage to the console.
 ```
 
-*   **`LollmsClient`**: The central class for all interactions. It holds the currently active LLM binding, an optional MCP binding, and provides access to modality bindings and high-level operations.
-*   **LLM Bindings**: These are plugins that allow `LollmsClient` to communicate with different LLM backends. You choose a binding (e.g., `"ollama"`, `"lollms"`, `"pythonllamacpp"`) when you initialize `LollmsClient`.
-*   **🔧 MCP Bindings**: Enable tool use and function calling. `lollms-client` includes `local_mcp` for executing Python tools. It discovers tools from a specified folder (or uses its default set), each defined by a `.py` script and a `.mcp.json` metadata file.
-*   **Modality Bindings**: Similar to LLM bindings, but for services like Text-to-Speech (`tts`), Text-to-Image (`tti`), etc.
-*   **High-Level Operations**: Methods directly on `LollmsClient` (e.g., `sequential_summarize`, `summarize`, `deep_analyze`, `generate_code`, `yes_no`) for performing complex, multi-step AI tasks.
-*   **`LollmsDiscussion`**: Helps manage and format conversation histories. Now includes sophisticated context layering through multiple data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field for stateful, multi-session interactions.
+#### Step 2: The Main Script (`agent_example.py`)
 
-## Examples
+This script will define the personality, initialize the client, and run the agent.
 
-The `examples/` directory in this repository contains a rich set of scripts demonstrating various features:
-*   Basic text generation with different bindings.
-*   Streaming and non-streaming examples.
-*   Multimodal generation (text with images).
-*   Using built-in methods for summarization and Q&A.
-*   Implementing and using function calls with **`generate_with_mcp`** and the `local_mcp` binding (see `examples/function_calling_with_local_custom_mcp.py` and `examples/local_mcp.py`).
-*   Text-to-Speech and Text-to-Image generation.
+```python
+from pathlib import Path
+from lollms_client import LollmsClient, LollmsPersonality, LollmsDiscussion, MSG_TYPE, trace_exception
+from ascii_colors import ASCIIColors
+import json
 
-Explore these examples to see `lollms-client` in action!
+# A detailed callback to visualize the agent's process
+def agent_callback(chunk: str, msg_type: MSG_TYPE, params: dict = None, **kwargs) -> bool:
+    if not params: params = {}
+    
+    if msg_type == MSG_TYPE.MSG_TYPE_STEP:
+        ASCIIColors.yellow(f"\n>> Agent Step: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_STEP_START:
+        ASCIIColors.yellow(f"\n>> Agent Step Start: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_STEP_END:
+        result = params.get('result', '')
+        ASCIIColors.green(f"<< Agent Step End: {chunk} -> Result: {json.dumps(result)[:150]}...")
+    elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT:
+        ASCIIColors.magenta(f"🤔 Agent Thought: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
+        ASCIIColors.blue(f"🛠️  Agent Action: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_OBSERVATION:
+        ASCIIColors.cyan(f"👀 Agent Observation: {chunk}")
+    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(chunk, end="", flush=True) # Final answer stream
+    return True
+
+try:
+    # --- 1. Load the knowledge base from the file ---
+    rules_path = Path("coding_rules.txt")
+    if not rules_path.exists():
+        raise FileNotFoundError("Please create the 'coding_rules.txt' file.")
+    coding_rules = rules_path.read_text()
+
+    # --- 2. Define the Coder Agent Personality ---
+    coder_personality = LollmsPersonality(
+        name="Python Coder Agent",
+        author="lollms-client",
+        category="Coding",
+        description="An agent that writes and executes Python code according to specific rules.",
+        system_prompt=(
+            "You are an expert Python programmer. Your task is to write clean, executable Python code based on the user's request. "
+            "You MUST strictly follow all rules provided in the 'Personality Static Data' section. "
+            "First, think about the plan. Then, use the `python_code_interpreter` tool to write and execute the code. "
+            "Finally, present the code and its output to the user."
+        ),
+        # A) Attach the static knowledge base
+        data_source=coding_rules,
+        # B) Equip the agent with a code execution tool
+        active_mcps=["python_code_interpreter"]
+    )
+
+    # --- 3. Initialize the Client and Discussion ---
+    lc = LollmsClient(
+        binding_name="ollama",          # Or any capable model binding
+        model_name="codellama",         # A code-specialized model is recommended
+        mcp_binding_name="local_mcp"    # Enable the local tool execution engine
+    )
+    discussion = LollmsDiscussion.create_new(lollms_client=lc)
+    
+    # --- 4. The User's Request ---
+    user_prompt = "Write a Python function that takes two numbers and returns their sum."
+
+    ASCIIColors.yellow(f"User Prompt: {user_prompt}")
+    print("\n" + "="*50 + "\nAgent is now running...\n" + "="*50)
+
+    # --- 5. Run the Agentic Chat Turn ---
+    response = discussion.chat(
+        user_message=user_prompt,
+        personality=coder_personality,
+        streaming_callback=agent_callback
+    )
+
+    print("\n\n" + "="*50 + "\nAgent finished.\n" + "="*50)
+    
+    # --- 6. Inspect the results ---
+    ai_message = response['ai_message']
+    ASCIIColors.green("\n--- Final Answer from Agent ---")
+    print(ai_message.content)
+    
+    ASCIIColors.magenta("\n--- Tool Calls Made ---")
+    print(json.dumps(ai_message.metadata.get("tool_calls", []), indent=2))
+
+except Exception as e:
+    trace_exception(e)
+
+```
+
+#### Step 3: What Happens Under the Hood
+
+When you run `agent_example.py`, a sophisticated process unfolds:
+
+1.  **Initialization:** The `LollmsDiscussion.chat()` method is called with the `coder_personality`.
+2.  **Knowledge Injection:** The `chat` method sees that `personality.data_source` is a string. It automatically takes the content of `coding_rules.txt` and injects it into the discussion's data zones.
+3.  **Tool Activation:** The method also sees `personality.active_mcps`. It enables the `python_code_interpreter` tool for this turn.
+4.  **Context Assembly:** The `LollmsClient` assembles a rich prompt for the LLM that includes:
+    *   The personality's `system_prompt`.
+    *   The content of `coding_rules.txt` (from the data zones).
+    *   The list of available tools (including `python_code_interpreter`).
+    *   The user's request ("Write a function...").
+5.  **Reason and Act:** The LLM, now fully briefed, reasons that it needs to use the `python_code_interpreter` tool. It formulates the Python code *according to the rules it was given*.
+6.  **Tool Execution:** The `local_mcp` binding receives the code and executes it in a secure local environment. It captures any output (`stdout`, `stderr`) and results.
+7.  **Observation:** The execution results are sent back to the LLM as an "observation."
+8.  **Final Synthesis:** The LLM now has the user's request, the rules, the code it wrote, and the code's output. It synthesizes all of this into a final, comprehensive answer for the user.
+
+This example showcases how `lollms-client` allows you to build powerful, knowledgeable, and capable agents by simply composing personalities with data and tools.
 
 ## Using LoLLMs Client with Different Bindings
 
@@ -758,12 +807,47 @@ response = lc.generate_text("Write a short story about a robot who discovers mus
 print(response)
 ```
 
+### Listing Available Models
+
+You can query the active LLM binding to get a list of models it supports or has available. The exact information returned depends on the binding (e.g., Ollama lists local models, OpenAI lists all its API models).
+
+```python
+from lollms_client import LollmsClient
+from ascii_colors import ASCIIColors
+
+try:
+    # Initialize client for Ollama (or any other binding)
+    lc = LollmsClient(
+        binding_name="ollama",
+        model_name="llama3", # A default model is still required for initialization
+        host_address="http://localhost:11434"
+    )
+
+    ASCIIColors.yellow("\nListing available models for the current binding:")
+    available_models = lc.listModels()
+
+    if isinstance(available_models, list):
+        for model in available_models:
+            # Model structure varies by binding, common fields are 'name'
+            model_name = model.get('name', 'N/A')
+            model_size = model.get('size', 'N/A') # Common for Ollama
+            print(f"- {model_name} (Size: {model_size})")
+    elif isinstance(available_models, dict) and "error" in available_models:
+        ASCIIColors.error(f"Error listing models: {available_models['error']}")
+    else:
+        print("Could not retrieve model list or unexpected format.")
+
+except Exception as e:
+    ASCIIColors.error(f"An error occurred: {e}")
+
+```
+
 ### Sequential Summarization for Long Texts
 
 When dealing with a document, article, or transcript that is too large to fit into a model's context window, the `summarize` method is the solution. It intelligently chunks the text, summarizes each piece, and then synthesizes those summaries into a final, coherent output.
 
 ```python
-from lollms_client import LollmsClient, MSG_TYPE, LollmsPersonality
+from lollms_client import LollmsClient, MSG_TYPE
 from ascii_colors import ASCIIColors
 
 # --- A very long text (imagine this is 10,000+ tokens) ---
@@ -795,8 +879,8 @@ try:
 
     ASCIIColors.blue("--- Starting Sequential Summarization ---")
     
-    final_summary = lc.summarize(
-        text_to_summarize=long_text,
+    final_summary = lc.sequential_summarize( # Note: changed from summarize to sequential_summarize
+        text_to_process=long_text, # Note: changed from text_to_summarize to text_to_process
         contextual_prompt=context_prompt,
         chunk_size_tokens=1000, # Adjust based on your model's context size
         overlap_tokens=200,

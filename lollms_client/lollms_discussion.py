@@ -111,6 +111,8 @@ def create_dynamic_models(
     optionally including custom mixin classes for extending functionality and
     applying encryption to text fields if a key is provided.
 
+    Requires the 'cryptography' library to be installed.
+
     Args:
         discussion_mixin: An optional class to mix into the Discussion model.
         message_mixin: An optional class to mix into the Message model.
@@ -639,7 +641,8 @@ class LollmsDiscussion:
     
     def _rebuild_message_index(self):
         """Rebuilds the internal dictionary mapping message IDs to message objects."""
-        if self._is_db_backed and self._session.is_active and self._db_discussion in self._session:
+        if self._is_db_backed and self._session and self._session.is_active and self._db_discussion in self._session:
+            # Ensure discussion object's messages collection is loaded/refreshed
             self._session.refresh(self._db_discussion, ['messages'])
         self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
 
@@ -676,7 +679,7 @@ class LollmsDiscussion:
             
         try:
             self._session.commit()
-            self._rebuild_message_index()
+            self._rebuild_message_index() # Rebuild index after commit to reflect DB state
         except Exception as e:
             self._session.rollback()
             raise e
@@ -754,6 +757,7 @@ class LollmsDiscussion:
         
         branch_orms = []
         current_id = leaf_id
+        # Use _message_index for efficient lookup of parents
         while current_id and current_id in self._message_index:
             msg_orm = self._message_index[current_id]
             branch_orms.append(msg_orm)
@@ -774,6 +778,18 @@ class LollmsDiscussion:
         if db_message:
             return LollmsMessage(self, db_message)
         return None
+    
+    def get_all_messages_flat(self) -> List[LollmsMessage]:
+        """
+        Retrieves all messages stored for this discussion as a flat list.
+        Useful for building complex UIs or doing comprehensive data analysis.
+
+        Returns:
+            A list of LollmsMessage objects, representing all messages in the discussion.
+        """
+        self._rebuild_message_index() # Ensure index is fresh
+        return [LollmsMessage(self, msg_obj) for msg_obj in self._message_index.values()]
+
 
     def get_full_data_zone(self):
         """Assembles all data zones into a single, formatted string for the prompt."""
@@ -998,6 +1014,8 @@ class LollmsDiscussion:
             tokens=token_count,
             generation_speed=tok_per_sec,
             parent_id=user_msg.id,
+            model_name = self.lollmsClient.binding.model_name,
+            binding_name = self.lollmsClient.binding.binding_name,
             metadata=message_meta
         )
         
@@ -1068,51 +1086,72 @@ class LollmsDiscussion:
         if not self._is_db_backed:
             raise NotImplementedError("Branch deletion is only supported for database-backed discussions.")
         
+        # Ensure message index is up-to-date with current DB state
+        self._rebuild_message_index() 
+
         if message_id not in self._message_index:
             raise ValueError(f"Message with ID '{message_id}' not found in the discussion.")
 
-        # --- 1. Identify all messages to delete ---
-        # We start with the target message and find all of its descendants.
+        # Identify all messages to delete (including the one specified and its descendants)
         messages_to_delete_ids = set()
-        queue = [message_id] # A queue for breadth-first search of descendants
-
-        while queue:
-            current_id = queue.pop(0)
-            if current_id in messages_to_delete_ids:
-                continue # Already processed
+        queue = [message_id]
+        processed_queue_idx = 0
+        while processed_queue_idx < len(queue):
+            current_msg_id = queue[processed_queue_idx]
+            processed_queue_idx += 1
             
-            messages_to_delete_ids.add(current_id)
+            if current_msg_id in messages_to_delete_ids:
+                continue
+            
+            messages_to_delete_ids.add(current_msg_id)
 
-            # Find all direct children of the current message
-            children = [msg.id for msg in self._db_discussion.messages if msg.parent_id == current_id]
-            queue.extend(children)
-        
-        # --- 2. Get the parent of the starting message to reset the active branch ---
-        original_message_orm = self._message_index[message_id]
-        new_active_branch_id = original_message_orm.parent_id
+            # Find children of current_msg_id from the current _message_index
+            for msg_in_index_id, msg_in_index_obj in self._message_index.items():
+                if msg_in_index_obj.parent_id == current_msg_id and msg_in_index_id not in messages_to_delete_ids:
+                    queue.append(msg_in_index_id)
 
-        # --- 3. Perform the deletion ---
-        # Remove from the ORM object's list
+        # Store potential new active branch ID (parent of the deleted message)
+        original_message_obj = self._message_index[message_id]
+        prospective_new_active_id = original_message_obj.parent_id
+
+        # Update the ORM's in-memory list of messages and mark for actual DB deletion
         self._db_discussion.messages = [
-            msg for msg in self._db_discussion.messages if msg.id not in messages_to_delete_ids
+            msg_obj for msg_obj in self._db_discussion.messages if msg_obj.id not in messages_to_delete_ids
         ]
-        
-        # Remove from the quick-access index
-        for mid in messages_to_delete_ids:
-            if mid in self._message_index:
-                del self._message_index[mid]
-        
-        # Add to the set of messages to be deleted from the DB on next commit
         self._messages_to_delete_from_db.update(messages_to_delete_ids)
 
-        # --- 4. Update the active branch ---
-        # If we deleted the branch that was active, move to its parent.
-        if self.active_branch_id in messages_to_delete_ids:
-            self.active_branch_id = new_active_branch_id
-        
-        self.touch() # Mark discussion as updated and save if autosave is on
+        # Update the internal message index to reflect in-memory changes immediately
+        # This is crucial so subsequent calls to self.get_message or _rebuild_message_index
+        # don't accidentally refer to deleted messages before commit.
+        temp_message_index = {}
+        for mid, mobj in self._message_index.items():
+            if mid not in messages_to_delete_ids:
+                temp_message_index[mid] = mobj
+        object.__setattr__(self, '_message_index', temp_message_index)
 
-        print(f"Marked branch starting at {message_id} ({len(messages_to_delete_ids)} messages) for deletion.")
+
+        # Determine the new active_branch_id
+        # 1. Try the parent of the deleted message (if it still exists and wasn't deleted itself)
+        if (prospective_new_active_id and 
+            prospective_new_active_id not in messages_to_delete_ids and 
+            prospective_new_active_id in self._message_index): # Check existence in updated index
+            
+            self.active_branch_id = prospective_new_active_id
+        else:
+            # 2. If parent is also deleted or doesn't exist, find the most recent remaining message
+            # Sort the remaining messages in reverse chronological order
+            remaining_messages = sorted(
+                [msg_obj for msg_obj in self._db_discussion.messages], # _db_discussion.messages is already updated
+                key=lambda msg: msg.created_at,
+                reverse=True
+            )
+            if remaining_messages:
+                self.active_branch_id = remaining_messages[0].id
+            else:
+                self.active_branch_id = None # Discussion is now completely empty
+
+        self.touch() # Mark for update and auto-save if configured
+        print(f"Branch starting at {message_id} ({len(messages_to_delete_ids)} messages) removed. New active branch: {self.active_branch_id}")
         
     def export(self, format_type: str, branch_tip_id: Optional[str] = None, max_allowed_tokens: Optional[int] = None) -> Union[List[Dict], str]:
         """Exports the discussion history into a specified format.
