@@ -35,22 +35,11 @@ DALLE_MODELS = {
         "max_prompt_length": 4000 # Characters
     }
 }
-
 class DalleTTIBinding_Impl(LollmsTTIBinding):
     """
     Concrete implementation of LollmsTTIBinding for OpenAI's DALL-E API.
     """
-
-    def __init__(self,
-                 api_key: Optional[str] = None, # Can be None to check env var
-                 model_name: str = "dall-e-3", # Default to DALL-E 3
-                 default_size: Optional[str] = None, # e.g. "1024x1024"
-                 default_quality: Optional[str] = None, # "standard" or "hd" (DALL-E 3)
-                 default_style: Optional[str] = None, # "vivid" or "natural" (DALL-E 3)
-                 host_address: str = DALLE_API_HOST, # OpenAI API host
-                 verify_ssl_certificate: bool = True,
-                 **kwargs # To catch any other lollms_client specific params like service_key/client_id
-                 ):
+    def __init__(self, **kwargs):
         """
         Initialize the DALL-E TTI binding.
 
@@ -70,44 +59,56 @@ class DalleTTIBinding_Impl(LollmsTTIBinding):
         """
         super().__init__(binding_name="dalle")
 
-        resolved_api_key = api_key
+        # Extract parameters from kwargs, providing defaults
+        self.api_key = kwargs.get("api_key")
+        self.model_name = kwargs.get("model_name")
+        self.default_size = kwargs.get("default_size")
+        self.default_quality = kwargs.get("default_quality")
+        self.default_style = kwargs.get("default_style")
+        self.host_address = kwargs.get("host_address", DALLE_API_HOST)  # Provide default
+        self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate", True) # Provide default
+
+        # Resolve API key from kwargs or environment variable
+        resolved_api_key = self.api_key
         if not resolved_api_key:
             ASCIIColors.info(f"API key not provided directly, checking environment variable '{OPENAI_API_KEY_ENV_VAR}'...")
             resolved_api_key = os.environ.get(OPENAI_API_KEY_ENV_VAR)
 
         if not resolved_api_key:
             raise ValueError(f"OpenAI API key is required. Provide it directly or set the '{OPENAI_API_KEY_ENV_VAR}' environment variable.")
-        
-        self.api_key = resolved_api_key
-        self.host_address = host_address
-        self.verify_ssl_certificate = verify_ssl_certificate
 
-        if model_name not in DALLE_MODELS:
-            raise ValueError(f"Unsupported DALL-E model: {model_name}. Supported models: {list(DALLE_MODELS.keys())}")
-        self.model_name = model_name
-        
+        self.api_key = resolved_api_key
+
+        # Model name validation
+        if not self.model_name:
+            raise ValueError("Model name is required.")
+        if self.model_name not in DALLE_MODELS:
+            raise ValueError(f"Unsupported DALL-E model: {self.model_name}. Supported models: {list(DALLE_MODELS.keys())}")
+
         model_props = DALLE_MODELS[self.model_name]
 
-        # Set defaults from model_props, overridden by user-provided defaults
-        self.current_size = default_size or model_props["default_size"]
+        # Size
+        self.current_size = self.default_size or model_props["default_size"]
         if self.current_size not in model_props["sizes"]:
             raise ValueError(f"Unsupported size '{self.current_size}' for model '{self.model_name}'. Supported sizes: {model_props['sizes']}")
 
+        # Quality
         if model_props["supports_quality"]:
-            self.current_quality = default_quality or model_props["default_quality"]
+            self.current_quality = self.default_quality or model_props["default_quality"]
             if self.current_quality not in model_props["qualities"]:
                 raise ValueError(f"Unsupported quality '{self.current_quality}' for model '{self.model_name}'. Supported qualities: {model_props['qualities']}")
         else:
-            self.current_quality = None # Explicitly None if not supported
+            self.current_quality = None  # Explicitly None if not supported
 
+        # Style
         if model_props["supports_style"]:
-            self.current_style = default_style or model_props["default_style"]
+            self.current_style = self.default_style or model_props["default_style"]
             if self.current_style not in model_props["styles"]:
                 raise ValueError(f"Unsupported style '{self.current_style}' for model '{self.model_name}'. Supported styles: {model_props['styles']}")
         else:
-            self.current_style = None # Explicitly None if not supported
-        
-        # For potential lollms client specific features, if `service_key` is passed as `client_id`
+            self.current_style = None  # Explicitly None if not supported
+
+        # Client ID
         self.client_id = kwargs.get("service_key", kwargs.get("client_id", "dalle_client_user"))
 
 

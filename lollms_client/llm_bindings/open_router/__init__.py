@@ -152,7 +152,7 @@ class OpenRouterBinding(LollmsLLMBinding):
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
-                stream=stream,
+                stream=stream if stream else False,
                 **api_params
             )
 

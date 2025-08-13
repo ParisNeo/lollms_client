@@ -1,0 +1,16 @@
+title: Remote MCP Binding
+author: ParisNeo
+creation_date: 2024-08-13
+last_update_date: 2024-08-13
+description: >
+  This binding connects to one or more remote MCP-compliant servers over HTTP.
+  It aggregates tools from all connected servers, prefixing each tool name with a server alias for clarity.
+  This allows LollmsClient to use tools hosted on different machines or services.
+input_parameters:
+  - name: servers_infos
+    type: str
+    description: >
+      A JSON string representing a dictionary of remote MCP servers to connect to.
+      Each key is a server alias.
+      The value is a dictionary with 'server_url' (mandatory) and an optional 'auth_config' dictionary for authentication (e.g., API keys, bearer tokens).
+    mandatory: true

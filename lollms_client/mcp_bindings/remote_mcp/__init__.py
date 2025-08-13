@@ -27,8 +27,8 @@ class RemoteMCPBinding(LollmsMCPBinding):
     Tools from all connected servers are aggregated and prefixed with the server's alias.
     """
     def __init__(self,
-                 servers_infos: Dict[str, Dict[str, Any]],
-                 **kwargs: Any):
+                 **kwargs: Any
+                 ):
         """
         Initializes the binding to connect to multiple MCP servers.
 
@@ -45,6 +45,7 @@ class RemoteMCPBinding(LollmsMCPBinding):
         """
         super().__init__(binding_name="remote_mcp")
         # initialization in case no servers are present
+        servers_infos: Dict[str, Dict[str, Any]] = kwargs.get("servers_infos", {})
         self.servers = None
         if not MCP_LIBRARY_AVAILABLE:
             ASCIIColors.error(f"{self.binding_name}: MCP library not available. This binding will be disabled.")

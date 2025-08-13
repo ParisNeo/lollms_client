@@ -48,12 +48,10 @@ class StandardMCPBinding(LollmsMCPBinding):
     """
 
     def __init__(self,
-                 initial_servers: Optional[Dict[str, Dict[str, Any]]] = None,
-                 **other_config_params: Any):
+                 **kwargs: Any):
         super().__init__(binding_name="standard_mcp")
-
-        self.config = {"initial_servers": initial_servers if initial_servers else {}}
-        self.config.update(other_config_params)
+        self.config = kwargs
+        initial_servers = kwargs.get("initial_servers", {})
 
         self._server_configs: Dict[str, Dict[str, Any]] = {}
         # Type hint with ClientSession, actual obj if MCP_LIBRARY_AVAILABLE

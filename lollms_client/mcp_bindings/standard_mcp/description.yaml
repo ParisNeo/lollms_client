@@ -1,0 +1,17 @@
+title: Standard MCP Binding
+author: ParisNeo
+creation_date: 2024-08-13
+last_update_date: 2024-08-13
+description: >
+  This binding launches and communicates with MCP-compliant tool servers as separate processes.
+  Communication is handled via standard input/output (stdio), which is a common pattern for local tool integration.
+  It manages the lifecycle of these server processes and aggregates their tools.
+input_parameters:
+  - name: initial_servers
+    type: str
+    description: >
+      A JSON string representing a dictionary of standard MCP servers to launch.
+      Each key is a server alias.
+      The value is a dictionary containing 'command' (a mandatory list of strings to launch the server),
+      'cwd' (optional current working directory), and 'env' (optional environment variables).
+    mandatory: false

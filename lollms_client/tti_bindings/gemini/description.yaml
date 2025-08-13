@@ -1,0 +1,29 @@
+title: Google Vertex AI (Imagen) TTI Binding
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: |
+  A binding for Google's Imagen 2 models, available via the Vertex AI platform.
+  It uses the google-cloud-aiplatform SDK to connect to Vertex AI and generate high-quality images.
+  Authentication is handled via Application Default Credentials (ADC). Run 'gcloud auth application-default login' in your terminal to set it up.
+input_parameters:
+  - name: project_id
+    type: str
+    description: "Your Google Cloud project ID."
+    mandatory: true
+  - name: location
+    type: str
+    description: "The Google Cloud region for your project (e.g., 'us-central1')."
+    mandatory: true
+  - name: model_name
+    type: str
+    description: "The Imagen model version to use. Defaults to 'imagegeneration@006'."
+    mandatory: false
+  - name: seed
+    type: int
+    description: "The default seed for generation. Use -1 for a random seed."
+    mandatory: false
+  - name: guidance_scale
+    type: float
+    description: "The default guidance scale (CFG) for generation. Controls how closely the output follows the prompt."
+    mandatory: false

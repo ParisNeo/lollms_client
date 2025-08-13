@@ -1,0 +1,13 @@
+title: Local MCP Binding
+author: ParisNeo
+creation_date: 2024-08-13
+last_update_date: 2024-08-13
+description: >
+  This binding discovers and executes tools defined locally in a specified folder.
+  Each tool is defined by a Python file and a corresponding MCP JSON file.
+  It's a simple way to add custom, local functionalities to the agent without needing a separate server.
+input_parameters:
+  - name: tools_folder_path
+    type: str
+    description: "Path to the folder containing local MCP tool definitions. If not provided, uses the default tools included with the binding."
+    mandatory: false

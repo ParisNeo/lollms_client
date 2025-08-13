@@ -70,8 +70,6 @@ class WhisperSTTBinding(LollmsSTTBinding):
     WHISPER_MODEL_SIZES = ["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large", "large-v1", "large-v2", "large-v3"]
 
     def __init__(self,
-                 model_name: str = "base", # Default Whisper model size
-                 device: Optional[str] = None, # "cpu", "cuda", "mps", or None for auto
                  **kwargs # To catch any other LollmsSTTBinding standard args
                  ):
         """
@@ -88,7 +86,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
         if not _whisper_installed:
             raise ImportError(f"Whisper STT binding dependencies not met. Please ensure 'openai-whisper' and 'torch' are installed. Error: {_whisper_installation_error}")
 
-        self.device = device
+        self.device = kwargs.get("device",None)
         if self.device is None: # Auto-detect if not specified
             if torch.cuda.is_available():
                 self.device = "cuda"
@@ -101,7 +99,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
         
         self.loaded_model_name = None
         self.model = None
-        self._load_whisper_model(model_name)
+        self._load_whisper_model(kwargs.get("model_name", "base")) # Default to "base" if not specified
 
 
     def _load_whisper_model(self, model_name_to_load: str):

@@ -18,20 +18,19 @@ DEFAULT_WHISPERCPP_EXE_NAMES = ["main", "whisper-cli", "whisper"] # Common names
 
 class WhisperCppSTTBinding(LollmsSTTBinding):
     def __init__(self,
-                 model_path: Union[str, Path], # Path to the GGUF Whisper model
-                 whispercpp_exe_path: Optional[Union[str, Path]] = None, # Path to whisper.cpp executable
-                 ffmpeg_path: Optional[Union[str, Path]] = None, # Path to ffmpeg executable (if not in PATH)
-                 models_search_path: Optional[Union[str, Path]] = None, # Optional dir to scan for more models
-                 default_language: str = "auto",
-                 n_threads: int = 4,
-                 # Catch LollmsSTTBinding standard args even if not directly used by this local binding
-                 host_address: Optional[str] = None, # Not used for local binding
-                 service_key: Optional[str] = None, # Not used for local binding
-                 verify_ssl_certificate: bool = True, # Not used for local binding
                  **kwargs): # Catch-all for future compatibility or specific whisper.cpp params
 
-        super().__init__(binding_name="whispercpp") 
-        
+        super().__init__(binding_name="whispercpp")
+
+        # --- Extract values from kwargs with defaults ---
+        model_path = kwargs.get("model_path")
+        whispercpp_exe_path = kwargs.get("whispercpp_exe_path")
+        ffmpeg_path = kwargs.get("ffmpeg_path")
+        models_search_path = kwargs.get("models_search_path")
+        default_language = kwargs.get("default_language", "auto")
+        n_threads = kwargs.get("n_threads", 4)
+        extra_whisper_args = kwargs.get("extra_whisper_args", [])  # e.g. ["--no-timestamps"]
+
         # --- Validate FFMPEG ---
         self.ffmpeg_exe = None
         if ffmpeg_path:
@@ -42,7 +41,7 @@ class WhisperCppSTTBinding(LollmsSTTBinding):
                 raise FileNotFoundError(f"Provided ffmpeg_path '{ffmpeg_path}' not found or not executable.")
         else:
             self.ffmpeg_exe = shutil.which("ffmpeg")
-        
+
         if not self.ffmpeg_exe:
             ASCIIColors.warning("ffmpeg not found in PATH or explicitly provided. Audio conversion will not be possible for non-WAV files or incompatible WAV files.")
             ASCIIColors.warning("Please install ffmpeg and ensure it's in your system's PATH, or provide ffmpeg_path argument.")
@@ -63,7 +62,7 @@ class WhisperCppSTTBinding(LollmsSTTBinding):
                     self.whispercpp_exe = found_path
                     ASCIIColors.info(f"Found whisper.cpp executable via PATH: {self.whispercpp_exe}")
                     break
-        
+
         if not self.whispercpp_exe:
             raise FileNotFoundError(
                 f"Whisper.cpp executable (tried: {', '.join(DEFAULT_WHISPERCPP_EXE_NAMES)}) not found in PATH or explicitly provided. "
@@ -79,11 +78,11 @@ class WhisperCppSTTBinding(LollmsSTTBinding):
                 self.model_path = Path(models_search_path, self.model_path).resolve()
             else:
                 raise FileNotFoundError(f"Whisper GGUF model file not found at '{self.model_path}'. Also checked in models_search_path if applicable.")
-        
+
         self.models_search_path = Path(models_search_path).resolve() if models_search_path else None
         self.default_language = default_language
         self.n_threads = n_threads
-        self.extra_whisper_args = kwargs.get("extra_whisper_args", []) # e.g. ["--no-timestamps"]
+        self.extra_whisper_args = extra_whisper_args
 
         ASCIIColors.green(f"WhisperCppSTTBinding initialized with model: {self.model_path}")
 

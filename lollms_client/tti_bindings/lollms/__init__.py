@@ -9,15 +9,12 @@ from ascii_colors import trace_exception, ASCIIColors
 import json # Added for potential error parsing
 
 # Defines the binding name for the manager
-BindingName = "LollmsTTIBinding_Impl"
-
-class LollmsTTIBinding_Impl(LollmsTTIBinding):
+BindingName = "LollmsWebuiTTIBinding_Impl"
+class LollmsWebuiTTIBinding_Impl(LollmsTTIBinding):
     """Concrete implementation of the LollmsTTIBinding for the standard LOLLMS server."""
 
     def __init__(self,
-                 host_address: Optional[str] = "http://localhost:9600", # Default LOLLMS host
-                 service_key: Optional[str] = None,
-                 verify_ssl_certificate: bool = True):
+                 **kwargs):
         """
         Initialize the LOLLMS TTI binding.
 
@@ -27,12 +24,14 @@ class LollmsTTIBinding_Impl(LollmsTTIBinding):
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
         """
         super().__init__(binding_name="lollms")
-        self.host_address=host_address
-        self.verify_ssl_certificate = verify_ssl_certificate
+
+        # Extract parameters from kwargs, providing defaults
+        self.host_address = kwargs.get("host_address", "http://localhost:9600")  # Default LOLLMS host
+        self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate", True)
 
         # The 'service_key' here will act as the 'client_id' for TTI requests if provided.
         # This assumes the client library user provides their LOLLMS client_id here.
-        self.client_id = service_key
+        self.client_id = kwargs.get("service_key", None) # Use service_key or None
 
     def _get_client_id(self, **kwargs) -> str:
         """Helper to get client_id, prioritizing kwargs then instance default."""

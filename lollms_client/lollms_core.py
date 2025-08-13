@@ -109,8 +109,11 @@ class LollmsClient():
         self.binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
         self.binding = self.binding_manager.create_binding(
             binding_name=llm_binding_name,
-            # Pass LLM specific config if needed
-            **(llm_binding_config or {})
+            **{
+                k: v
+                for k, v in (llm_binding_config or {}).items()
+                if k != "binding_name"
+            }
         )
 
         if self.binding is None:
@@ -135,7 +138,11 @@ class LollmsClient():
         if tts_binding_name:
             self.tts = self.tts_binding_manager.create_binding(
                 binding_name=tts_binding_name,
-                **tts_binding_config
+                **{
+                    k: v
+                    for k, v in (tts_binding_config or {}).items()
+                    if k != "binding_name"
+                }
             )
             if self.tts is None:
                 ASCIIColors.warning(f"Failed to create TTS binding: {tts_binding_name}. Available: {self.tts_binding_manager.get_available_bindings()}")
@@ -144,7 +151,11 @@ class LollmsClient():
             if tti_binding_config:
                 self.tti = self.tti_binding_manager.create_binding(
                     binding_name=tti_binding_name,
-                    **tti_binding_config
+                    **{
+                        k: v
+                        for k, v in (tti_binding_config or {}).items()
+                        if k != "binding_name"
+                    }
                 )
             else:
                 self.tti = self.tti_binding_manager.create_binding(
@@ -157,8 +168,13 @@ class LollmsClient():
             if stt_binding_config:
                 self.stt = self.stt_binding_manager.create_binding(
                     binding_name=stt_binding_name,
-                    **stt_binding_config
+                    **{
+                        k: v
+                        for k, v in (stt_binding_config or {}).items()
+                        if k != "binding_name"
+                    }
                 )
+
             else:
                 self.stt = self.stt_binding_manager.create_binding(
                     binding_name=stt_binding_name,
@@ -169,8 +185,13 @@ class LollmsClient():
             if ttv_binding_config:
                 self.ttv = self.ttv_binding_manager.create_binding(
                     binding_name=ttv_binding_name,
-                    **ttv_binding_config
+                    **{
+                        k: v
+                        for k, v in ttv_binding_config.items()
+                        if k != "binding_name"
+                    }
                 )
+
             else:
                 self.ttv = self.ttv_binding_manager.create_binding(
                     binding_name=ttv_binding_name
@@ -182,7 +203,11 @@ class LollmsClient():
             if ttm_binding_config:
                 self.ttm = self.ttm_binding_manager.create_binding(
                     binding_name=ttm_binding_name,
-                    **ttm_binding_config
+                    **{
+                        k: v
+                        for k, v in (ttm_binding_config or {}).items()
+                        if k != "binding_name"
+                    }
                 )
             else:
                 self.ttm = self.ttm_binding_manager.create_binding(
@@ -194,8 +219,12 @@ class LollmsClient():
         if mcp_binding_name:
             if mcp_binding_config:
                 self.mcp = self.mcp_binding_manager.create_binding(
-                    mcp_binding_name,
-                    **mcp_binding_config
+                    binding_name=mcp_binding_name,
+                    **{
+                        k: v
+                        for k, v in (mcp_binding_config or {}).items()
+                        if k != "binding_name"
+                    }
                 )
             else:
                 self.mcp = self.mcp_binding_manager.create_binding(

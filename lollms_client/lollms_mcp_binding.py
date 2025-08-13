@@ -4,7 +4,7 @@ import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 from ascii_colors import trace_exception, ASCIIColors
-
+import yaml
 class LollmsMCPBinding(ABC):
     """
     Abstract Base Class for LOLLMS Model Context Protocol (MCP) Bindings.
@@ -185,6 +185,7 @@ class LollmsMCPBindingManager:
                 return None
         return None
 
+
     def get_available_bindings(self) -> List[str]:
         """
         Return list of available MCP binding names based on subdirectories.
@@ -196,3 +197,33 @@ class LollmsMCPBindingManager:
                 if item.is_dir() and (item / "__init__.py").exists():
                     available.append(item.name)
         return available
+
+    def get_binding_description(self, binding_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Loads and returns the content of the description.yaml file for a given binding.
+
+        Args:
+            binding_name (str): The name of the binding.
+
+        Returns:
+            Optional[Dict[str, Any]]: A dictionary with the parsed YAML content, or None if the file doesn't exist or is invalid.
+        """
+        binding_dir = self.mcp_bindings_dir / binding_name
+        description_file = binding_dir / "description.yaml"
+
+        if not description_file.exists():
+            ASCIIColors.warning(f"No description.yaml found for MCP binding '{binding_name}'.")
+            return None
+
+        try:
+            with open(description_file, 'r', encoding='utf-8') as f:
+                description = yaml.safe_load(f)
+            return description
+        except yaml.YAMLError as e:
+            ASCIIColors.error(f"Error parsing description.yaml for MCP binding '{binding_name}': {e}")
+            trace_exception(e)
+            return None
+        except Exception as e:
+            ASCIIColors.error(f"Error reading description.yaml for MCP binding '{binding_name}': {e}")
+            trace_exception(e)
+            return None

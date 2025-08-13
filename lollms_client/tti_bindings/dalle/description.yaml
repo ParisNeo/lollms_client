@@ -1,0 +1,40 @@
+title: DALL-E TTI Binding
+author: ParisNeo
+creation_date: 2024-05-15
+last_update_date: 2025-08-13
+description: |
+  A binding for OpenAI's DALL-E text-to-image models (DALL-E 2 and DALL-E 3).
+  It connects to the OpenAI API to generate images from text prompts.
+input_parameters:
+  - name: api_key
+    type: str
+    description: "Your OpenAI API key. The binding requires this to authenticate with the DALL-E API. It can also be provided via the `OPENAI_API_KEY` environment variable."
+    mandatory: true
+  - name: model_name
+    type: str
+    description: "The DALL-E model to use, e.g., 'dall-e-3' or 'dall-e-2'."
+    mandatory: true
+  - name: default_size
+    type: str
+    description: "Default image size for generations (e.g., '1024x1024'). If not provided, a model-specific default is used."
+    mandatory: false
+  - name: default_quality
+    type: str
+    description: "Default image quality for DALL-E 3 ('standard' or 'hd')."
+    mandatory: false
+  - name: default_style
+    type: str
+    description: "Default image style for DALL-E 3 ('vivid' or 'natural')."
+    mandatory: false
+  - name: host_address
+    type: str
+    description: "The API host address. Defaults to OpenAI's public API endpoint."
+    mandatory: false
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify SSL certificates for the API endpoint."
+    mandatory: false
+  - name: service_key
+    type: str
+    description: "An optional client ID, also known as 'client_id', for tracking usage. Defaults to 'dalle_client_user'."
+    mandatory: false

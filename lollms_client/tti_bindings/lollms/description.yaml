@@ -1,0 +1,20 @@
+title: LOLLMS WebUI TTI Binding
+author: ParisNeo
+creation_date: 2024-04-10
+last_update_date: 2025-08-13
+description: |
+  A client binding that connects to a running LOLLMS WebUI server to perform text-to-image generation.
+  It acts as a remote control for the TTI capabilities of the main LOLLMS application.
+input_parameters:
+  - name: host_address
+    type: str
+    description: "The host address and port of the LOLLMS WebUI server (e.g., 'http://localhost:9600')."
+    mandatory: false
+  - name: service_key
+    type: str
+    description: "The client_id for authenticating with the LOLLMS server, if required by the server's configuration."
+    mandatory: false
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify SSL certificates if the LOLLMS server is using HTTPS."
+    mandatory: false

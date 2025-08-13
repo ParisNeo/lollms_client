@@ -126,25 +126,24 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         "torch_dtype_str": "auto",  # "auto", "float16", "bfloat16", "float32"
         "use_safetensors": True,
         "scheduler_name": "default",
-        "safety_checker_on": True, # Note: Diffusers default is ON
+        "safety_checker_on": True,  # Note: Diffusers default is ON
         "num_inference_steps": 25,
         "guidance_scale": 7.5,
-        "default_width": 768, # Default for SD 2.1 base
-        "default_height": 768, # Default for SD 2.1 base
+        "default_width": 768,  # Default for SD 2.1 base
+        "default_height": 768,  # Default for SD 2.1 base
         "seed": -1,  # -1 for random on each call
         "enable_cpu_offload": False,
         "enable_sequential_cpu_offload": False,
-        "enable_xformers": False, # Explicit opt-in for xformers
+        "enable_xformers": False,  # Explicit opt-in for xformers
         "hf_variant": None,  # e.g., "fp16"
         "hf_token": None,
         "local_files_only": False,
     }
 
-
     def __init__(self,
                  config: Optional[Dict[str, Any]] = None,
                  lollms_paths: Optional[Dict[str, Union[str, Path]]] = None,
-                 **kwargs # Catches other potential parameters like 'service_key' or 'client_id'
+                 **kwargs  # Catches other potential parameters like 'service_key' or 'client_id'
                  ):
         """
         Initialize the Diffusers TTI binding.
@@ -157,7 +156,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             **kwargs: Catches other parameters (e.g. service_key).
         """
         super().__init__(binding_name="diffusers")
-        
+
         if not DIFFUSERS_AVAILABLE:
             ASCIIColors.error("Diffusers library or its dependencies (torch, Pillow, transformers) are not installed or failed to import.")
             ASCIIColors.info("Attempting to install/verify packages...")
@@ -171,7 +170,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 globals()['AutoPipelineForText2Image'] = _AutoPipelineForText2Image
                 globals()['DiffusionPipeline'] = _DiffusionPipeline
                 globals()['Image'] = _Image
-                
+
                 # Re-populate torch dtype maps if torch was just loaded
                 global TORCH_DTYPE_MAP_STR_TO_OBJ, TORCH_DTYPE_MAP_OBJ_TO_STR
                 TORCH_DTYPE_MAP_STR_TO_OBJ = {
@@ -189,27 +188,32 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                     f"Error: {e}"
                 ) from e
 
+        # Merge configs, lollms_paths, and kwargs
         self.config = {**self.DEFAULT_CONFIG, **(config or {}), **kwargs}
-        self.lollms_paths = {k: Path(v) for k, v in lollms_paths.items()} if lollms_paths else {}
-        
+        self.lollms_paths = {k: Path(v) for k, v in (lollms_paths or {}).items()} if lollms_paths else {}
+
         self.pipeline: Optional[DiffusionPipeline] = None
-        self.current_model_id_or_path = None # To track if model needs reload
+        self.current_model_id_or_path = None  # To track if model needs reload
 
         # Resolve auto settings for device and dtype
         if self.config["device"].lower() == "auto":
-            if torch.cuda.is_available(): self.config["device"] = "cuda"
-            elif torch.backends.mps.is_available(): self.config["device"] = "mps"
-            else: self.config["device"] = "cpu"
-        
+            if torch.cuda.is_available():
+                self.config["device"] = "cuda"
+            elif torch.backends.mps.is_available():
+                self.config["device"] = "mps"
+            else:
+                self.config["device"] = "cpu"
+
         if self.config["torch_dtype_str"].lower() == "auto":
-            if self.config["device"] == "cpu": self.config["torch_dtype_str"] = "float32" # CPU usually float32
-            else: self.config["torch_dtype_str"] = "float16" # Common default for GPU
+            if self.config["device"] == "cpu":
+                self.config["torch_dtype_str"] = "float32"  # CPU usually float32
+            else:
+                self.config["torch_dtype_str"] = "float16"  # Common default for GPU
 
         self.torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config["torch_dtype_str"].lower(), torch.float32)
-        if self.torch_dtype == "auto": # Should have been resolved above
-             self.torch_dtype = torch.float16 if self.config["device"] != "cpu" else torch.float32
-             self.config["torch_dtype_str"] = TORCH_DTYPE_MAP_OBJ_TO_STR.get(self.torch_dtype, "float32")
-
+        if self.torch_dtype == "auto":  # Should have been resolved above
+            self.torch_dtype = torch.float16 if self.config["device"] != "cpu" else torch.float32
+            self.config["torch_dtype_str"] = TORCH_DTYPE_MAP_OBJ_TO_STR.get(self.torch_dtype, "float32")
 
         # For potential lollms client specific features
         self.client_id = kwargs.get("service_key", kwargs.get("client_id", "diffusers_client_user"))
