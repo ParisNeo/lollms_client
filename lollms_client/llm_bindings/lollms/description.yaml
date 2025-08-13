@@ -1,0 +1,26 @@
+title: LoLLMs (OpenAI Compatible)
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: Connects to a LoLLMs service or any other OpenAI-compatible API endpoint.
+input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the model to use from the remote service."
+    mandatory: true
+    default: ""
+  - name: host_address
+    type: str
+    description: "The base URL of the LoLLMs or OpenAI-compatible service (e.g., 'http://localhost:9600/v1')."
+    mandatory: false
+    default: "http://localhost:9600/v1"
+  - name: service_key
+    type: str
+    description: "The API key for the service. Can also be set via the LOLLMS_API_KEY environment variable."
+    mandatory: false
+    default: ""
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify the SSL certificate of the server. Defaults to true."
+    mandatory: false
+    default: true

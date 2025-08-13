@@ -1,0 +1,36 @@
+title: TensorRT-LLM
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: An experimental, high-performance binding for NVIDIA GPUs using TensorRT-LLM. Note - this binding's implementation is currently a duplicate of vLLM and needs specific development.
+input_parameters:
+  - name: model_name
+    type: str
+    description: "The name, Hugging Face ID, or local path of the model to load."
+    mandatory: true
+    default: ""
+  - name: models_folder
+    type: str
+    description: "The path to the directory where local models are stored or downloaded."
+    mandatory: false
+    default: ""
+  - name: tensor_parallel_size
+    type: int
+    description: "The number of GPUs to use for tensor parallelism. Defaults to the number of available GPUs."
+    mandatory: false
+    default: 1
+  - name: quantization
+    type: str
+    description: "The quantization method to use (e.g., 'awq', 'gptq')."
+    mandatory: false
+    default: ""
+  - name: gpu_memory_utilization
+    type: float
+    description: "The fraction of GPU memory to reserve for the model (0.0 to 1.0). Defaults to 0.9."
+    mandatory: false
+    default: 0.9
+  - name: trust_remote_code
+    type: bool
+    description: "Whether to trust and execute remote code from the model's repository. Use with caution. Defaults to false."
+    mandatory: false
+    default: false

@@ -1,0 +1,16 @@
+title: Anthropic Claude
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: A binding for Anthropic's Claude family of models (Opus, Sonnet, Haiku) via their official API.
+input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the Claude model to use (e.g., 'claude-3-5-sonnet-20240620')."
+    mandatory: true
+    default: "claude-3-5-sonnet-20240620"
+  - name: service_key
+    type: str
+    description: "The API key for the Anthropic service. Can also be set via the ANTHROPIC_API_KEY environment variable."
+    mandatory: true
+    default: ""

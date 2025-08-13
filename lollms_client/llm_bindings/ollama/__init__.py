@@ -67,10 +67,6 @@ class OllamaBinding(LollmsLLMBinding):
     DEFAULT_HOST_ADDRESS = "http://localhost:11434"
     
     def __init__(self,
-                 host_address: str = None,
-                 model_name: str = "",
-                 service_key: str = None,
-                 verify_ssl_certificate: bool = True,
                  **kwargs
                  ):
         """
@@ -83,14 +79,13 @@ class OllamaBinding(LollmsLLMBinding):
             verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
             default_completion_format (ELF_COMPLETION_FORMAT): Default completion format.
         """
+        host_address = kwargs.get("host_address")
         _host_address = host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS
-        super().__init__(
-            binding_name=BindingName, # Use the module-level BindingName
-        )
+        super().__init__(BindingName, **kwargs)
         self.host_address=_host_address
-        self.model_name=model_name
-        self.service_key=service_key
-        self.verify_ssl_certificate=verify_ssl_certificate
+        self.model_name=kwargs.get("model_name")
+        self.service_key=kwargs.get("service_key")
+        self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
         self.default_completion_format=kwargs.get("default_completion_format",ELF_COMPLETION_FORMAT.Chat) 
 
         if ollama is None:
@@ -376,7 +371,7 @@ class OllamaBinding(LollmsLLMBinding):
         # 2. Build the generation options dictionary
         options = {
             'num_predict': n_predict,
-            'temperature': float(temperature),
+            'temperature': float(temperature) if temperature else None,
             'top_k': top_k,
             'top_p': top_p,
             'repeat_penalty': repeat_penalty,

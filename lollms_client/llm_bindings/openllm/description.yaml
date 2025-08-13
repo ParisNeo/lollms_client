@@ -1,0 +1,21 @@
+title: OpenLLM
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: Connects to a self-hosted model served via the OpenLLM framework. Each OpenLLM server typically runs a single model.
+input_parameters:
+  - name: host_address
+    type: str
+    description: "The address of the OpenLLM server. Defaults to 'http://localhost:3000'."
+    mandatory: true
+    default: "http://localhost:3000"
+  - name: model_name
+    type: str
+    description: "The name of the model being served, mainly for informational purposes (e.g., 'mistralai/Mistral-7B-Instruct-v0.1'). The binding connects to whatever model is running on the host."
+    mandatory: false
+    default: ""
+  - name: timeout
+    type: int
+    description: "The timeout in seconds for requests to the OpenLLM server."
+    mandatory: false
+    default: 120

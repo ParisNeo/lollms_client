@@ -36,12 +36,21 @@ class LiteLLMBinding(LollmsLLMBinding):
     and correct payload formatting for both streaming and non-streaming modes.
     """
     
-    def __init__(self, host_address: str, model_name: str, service_key: str = "anything", verify_ssl_certificate: bool = True, **kwargs):
-        super().__init__(binding_name="litellm")
-        self.host_address = host_address.rstrip('/')
-        self.model_name = model_name
-        self.service_key = service_key
-        self.verify_ssl_certificate = verify_ssl_certificate
+    def __init__(self, 
+                 **kwargs):
+        """ Initializes the LiteLLM binding with the provided parameters.
+        Args:
+            host_address (str): The base URL of the LiteLLM server.
+            model_name (str): The name of the model to use.
+            service_key (str): The API key for authentication.
+            verify_ssl_certificate (bool): Whether to verify SSL certificates.
+        """
+        super().__init__(BindingName, **kwargs)
+        self.host_address = kwargs.get("host_address")
+        if self.host_address: self.host_address = self.host_address.rstrip('/')
+        self.model_name = kwargs.get("model_name")
+        self.service_key = kwargs.get("service_key")
+        self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate")
 
     def _perform_generation(self, messages: List[Dict], n_predict: Optional[int], stream: bool, temperature: float, top_p: float, repeat_penalty: float, seed: Optional[int], streaming_callback: Optional[Callable[[str, MSG_TYPE], None]]) -> Union[str, dict]:
         url = f'{self.host_address}/v1/chat/completions'

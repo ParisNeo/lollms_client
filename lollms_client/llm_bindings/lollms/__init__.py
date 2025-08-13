@@ -26,11 +26,6 @@ class LollmsBinding(LollmsLLMBinding):
     
     
     def __init__(self,
-                 host_address: str = "http://localhost:9642", #This is the default local installation 
-                 model_name: str = "",
-                 service_key: str|None = None, # a key generated on the lollms interface (it is advised to use LOLLMS_API_KEY environment variable instead)
-                 verify_ssl_certificate: bool = True,
-                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat,
                  **kwargs):
         """
         Initialize the OpenAI binding.
@@ -43,19 +38,34 @@ class LollmsBinding(LollmsLLMBinding):
             verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
             personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
         """
-        super().__init__(
-            binding_name = "openai",
-        )
-        self.host_address=host_address
-        self.model_name=model_name
-        self.service_key=service_key
-        self.verify_ssl_certificate=verify_ssl_certificate
-        self.default_completion_format=default_completion_format
+        super().__init__(BindingName, **kwargs)
+        self.host_address=kwargs.get("host_address","http://localhost:9642/v1").rstrip("/")
+        if not self.host_address.endswith("v1"):
+            self.host_address += "/v1"  
+        self.model_name=kwargs.get("model_name")
+        self.service_key=kwargs.get("service_key")
+        self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
+        self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
 
         if not self.service_key:
             self.service_key = os.getenv("LOLLMS_API_KEY", self.service_key)
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if host_address is None else host_address if len(host_address)>0 else None)
+        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None)
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
+
+    def lollms_listMountedPersonalities(self, host_address:str|None=None):
+        host_address = host_address if host_address else self.host_address
+        url = f"{host_address}/list_mounted_personalities"
+
+        response = requests.get(url)
+
+        if response.status_code == 200:
+            try:
+                text = json.loads(response.content.decode("utf-8"))
+                return text
+            except Exception as ex:
+                return {"status": False, "error": str(ex)}
+        else:
+            return {"status": False, "error": response.text}
 
     
     def generate_text(self,

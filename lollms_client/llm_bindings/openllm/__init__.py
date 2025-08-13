@@ -61,23 +61,23 @@ class OpenLLMBinding(LollmsLLMBinding):
     DEFAULT_HOST_ADDRESS = "http://localhost:3000" # Default OpenLLM server address
     
     def __init__(self,
-                 host_address: str = None,
-                 model_name: str = "", # Informational, as client connects to specific model server
-                 # service_key and verify_ssl_certificate are not directly used by openllm.client.HTTPClient constructor
-                 # but kept for potential future extensions or custom client logic.
-                 service_key: Optional[str] = None, 
-                 verify_ssl_certificate: bool = True,
-                 timeout: int = 120, # Timeout for client requests
                  **kwargs
                  ):
+        """        Initialize the OpenLLM binding.
+        Args:
+            host_address (str): The address of the OpenLLM server (default: http://localhost:3000).
+            model_name (str): The name of the model to connect to. This is primarily for informational purposes.
+            service_key (Optional[str]): Optional service key for authentication, not used by openllm client.
+            verify_ssl_certificate (bool): Whether to verify SSL certificates (default: True).
+            timeout (int): Timeout for client requests in seconds (default: 120).
+        """
+        host_address = kwargs.get("host_address")
         _host_address = host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS
-        super().__init__(
-            binding_name=BindingName,
-        )
+        super().__init__(BindingName, **kwargs)
         self.host_address = _host_address
-        self.model_name = model_name # Can be set by load_model or from config
+        self.model_name = kwargs.get("model_name") # Can be set by load_model or from config
         self.default_completion_format=kwargs.get("default_completion_format",ELF_COMPLETION_FORMAT.Chat) 
-        self.timeout = timeout
+        self.timeout = kwargs.get("timeout")
 
         if openllm is None or openllm.client is None:
             raise ImportError("OpenLLM library is not installed or client module not found. Please run 'pip install openllm'.")

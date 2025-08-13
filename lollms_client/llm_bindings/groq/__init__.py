@@ -29,8 +29,6 @@ class GroqBinding(LollmsLLMBinding):
     """
 
     def __init__(self,
-                 model_name: str = "llama3-8b-8192",
-                 service_key: str|None = None,
                  **kwargs
                  ):
         """
@@ -38,11 +36,11 @@ class GroqBinding(LollmsLLMBinding):
 
         Args:
             model_name (str): The name of the Groq model to use.
-            groq_api_key (str): The API key for the Groq service.
+            service_key (str): The API key for the Groq service.
         """
-        super().__init__(binding_name=BindingName)
-        self.model_name = model_name
-        self.groq_api_key = service_key or os.getenv("GROQ_API_KEY")
+        super().__init__(BindingName, **kwargs)
+        self.model_name = kwargs.get("model_name", "llama3-8b-8192")
+        self.groq_api_key = kwargs.get("service_key") or os.getenv("GROQ_API_KEY")
 
         if not self.groq_api_key:
             raise ValueError("Groq API key is required. Set it via 'groq_api_key' or GROQ_API_KEY env var.")

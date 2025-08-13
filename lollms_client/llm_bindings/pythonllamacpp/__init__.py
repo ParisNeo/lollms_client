@@ -89,7 +89,7 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
                  **kwargs 
                  ):
         
-        super().__init__(binding_name=BindingName)
+        super().__init__(BindingName, **kwargs)
         
         if Llama is None: # Check if import failed
             raise ImportError("Llama-cpp-python library is not available. Please install it.")

@@ -60,10 +60,6 @@ class GrokBinding(LollmsLLMBinding):
     """xAI Grok-specific binding implementation."""
 
     def __init__(self,
-                 host_address: str = None,  # Ignored, for compatibility
-                 model_name: str = "grok-1.5-vision-preview",
-                 service_key: str = None,
-                 verify_ssl_certificate: bool = True, # Ignored, for compatibility
                  **kwargs
                  ):
         """
@@ -73,9 +69,9 @@ class GrokBinding(LollmsLLMBinding):
             model_name (str): Name of the Grok model to use.
             service_key (str): xAI API key.
         """
-        super().__init__(binding_name=BindingName)
-        self.model_name = model_name
-        self.service_key = service_key
+        super().__init__(BindingName, **kwargs)
+        self.model_name = kwargs.get("model_name", "grok-1.5-vision-preview")
+        self.service_key = kwargs.get("service_key")
         self.base_url = kwargs.get("base_url", GROK_API_BASE_URL)
         self._cached_models: Optional[List[Dict[str, str]]] = None
 

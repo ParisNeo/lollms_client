@@ -121,7 +121,14 @@ BindingName = "LlamaCppServerBinding"
 DEFAULT_LLAMACPP_SERVER_HOST = "127.0.0.1"
 
 class LlamaCppServerProcess:
-    def __init__(self, model_path: Union[str, Path], clip_model_path: Optional[Union[str, Path]] = None, server_binary_path: Optional[Union[str, Path]]=None, server_args: Dict[str, Any]={}):
+    def __init__(self, 
+                 model_path: Union[str, Path], 
+                 clip_model_path: Optional[Union[str, Path]] = None, 
+                 server_binary_path: Optional[Union[str, Path]]=None, 
+                 server_args: Dict[str, Any]={}
+                 ):
+        """Initialize the Llama.cpp server process.
+        """
         self.model_path = Path(model_path)
         self.clip_model_path = Path(clip_model_path) if clip_model_path else None
         
@@ -264,24 +271,35 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         "parallel_slots": 4, # Default parallel slots for server
     }
 
-    def __init__(self, model_name: Optional[str], models_path: str, clip_model_name: Optional[str] = None,
-                 config: Optional[Dict[str, Any]] = None, default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat, **kwargs):
-        super().__init__(binding_name=BindingName)
+    def __init__(self, 
+                 **kwargs
+                ):
+        """Initialize the Llama.cpp server binding.
+        Args:
+            model_name (str): Name of the model to load. If None, will use initial_model_name_preference.
+            models_path (str): Path to the directory containing model files.
+            clip_model_name (str): Optional name of the clip model to use. If None, will try to auto-detect based on the main model.
+            config (dict): Additional configuration options for the server.
+            default_completion_format (ELF_COMPLETION_FORMAT): Default format for completions.
+
+        """
+        super().__init__(BindingName, **kwargs)
         if llama_cpp_binaries is None: raise ImportError("llama-cpp-binaries package is required but not found.")
 
+        models_path = kwargs.get("models_path", Path(__file__).parent/"models")
         self.models_path = Path(models_path)
         # Store initial preferences, but do not load/start server yet.
-        self.initial_model_name_preference: Optional[str] = model_name
-        self.user_provided_model_name: Optional[str] = model_name # Tracks the latest requested model
-        self.initial_clip_model_name_preference: Optional[str] = clip_model_name
+        self.initial_model_name_preference: Optional[str] = kwargs.get("model_name")
+        self.user_provided_model_name: Optional[str] = kwargs.get("model_name") # Tracks the latest requested model
+        self.initial_clip_model_name_preference: Optional[str] = kwargs.get("clip_model_name") 
         
         self._model_path_map: Dict[str, Path] = {}  # Maps unique name to full Path
 
         # Initial scan for available models (to populate listModels)
         self._scan_models()
 
-        self.default_completion_format = default_completion_format
-        self.server_args = {**self.DEFAULT_SERVER_ARGS, **(config or {}), **kwargs}
+        self.default_completion_format =  kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
+        self.server_args = {**self.DEFAULT_SERVER_ARGS, **(kwargs.get("config") or {}), **kwargs}
         self.server_binary_path = self._get_server_binary_path()
         
         # Current state of the loaded model and server

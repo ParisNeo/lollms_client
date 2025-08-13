@@ -27,8 +27,6 @@ class MistralBinding(LollmsLLMBinding):
     """
 
     def __init__(self,
-                 model_name: str = "mistral-large-latest",
-                 service_key: str|None = None,
                  **kwargs
                  ):
         """
@@ -38,9 +36,9 @@ class MistralBinding(LollmsLLMBinding):
             model_name (str): The name of the Mistral model to use.
             mistral_api_key (str): The API key for the Mistral service.
         """
-        super().__init__(binding_name=BindingName)
-        self.model_name = model_name
-        self.mistral_api_key = service_key or os.getenv("MISTRAL_API_KEY")
+        super().__init__(BindingName, **kwargs)
+        self.model_name = kwargs.get("model_name","mistral-large-latest")
+        self.mistral_api_key = kwargs.get("service_key") or os.getenv("MISTRAL_API_KEY")
 
         if not self.mistral_api_key:
             raise ValueError("Mistral API key is required. Set it via 'mistral_api_key' or MISTRAL_API_KEY env var.")

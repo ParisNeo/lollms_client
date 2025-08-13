@@ -232,24 +232,28 @@ def resolve_hf_model_path(model_id_or_gguf_id: str, models_base_path: Path) -> P
 # --- VLLM Binding Class ---
 class VLLMBinding(LollmsLLMBinding):
     def __init__(self, 
-                 models_folder: Optional[Union[str, Path]] = None, 
-                 model_name: str = "", 
-                 service_key: Optional[str] = None, 
-                 verify_ssl_certificate: bool = True, 
-                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat,
                  **kwargs 
         ):
+        """Initializes the VLLM binding with the specified model and configuration.
+        Args:
+            models_folder (Optional[Union[str, Path]]): Path to the directory containing local models.²
+            model_name (str): Name or ID of the model to load. Can be a Hugging Face Hub ID or local folder name.
+            service_key (Optional[str]): Service key for authentication (not used in this binding).
+            verify_ssl_certificate (bool): Whether to verify SSL certificates (not used in this binding).
+            default_completion_format (ELF_COMPLETION_FORMAT): Default format for text generation.
+        """
         if not _vllm_deps_installed:
             raise ImportError(f"vLLM or its dependencies not installed. Binding unusable. Error: {_vllm_installation_error}")
         if engine_manager is None:
              raise RuntimeError("VLLMEngineManager failed to initialize. Binding unusable.")
-
+        models_folder = kwargs.get("models_folder")
+        default_completion_format = kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
         _models_folder = Path(models_folder) if models_folder is not None else DEFAULT_models_folder
         _models_folder.mkdir(parents=True, exist_ok=True)
 
-        super().__init__(BindingName)
-        self.models_folder= models_folder
-        self.model_name=model_name
+        super().__init__(BindingName, **kwargs)
+        self.models_folder= kwargs.get("models_folder")
+        self.model_name=kwargs.get("model_name")
         self.default_completion_format=default_completion_format
 
         
@@ -261,11 +265,11 @@ class VLLMBinding(LollmsLLMBinding):
         self.current_engine_params: Optional[Dict[str, Any]] = None
         self.vllm_engine_kwargs_config = kwargs.copy()
 
-        if model_name:
+        if self.model_name:
             try:
-                self.load_model(model_name)
+                self.load_model(self.model_name)
             except Exception as e:
-                ASCIIColors.error(f"Auto-load model '{model_name}' failed: {e}")
+                ASCIIColors.error(f"Auto-load model '{self.model_name}' failed: {e}")
                 trace_exception(e)
 
     def _get_vllm_engine_params_for_load(self) -> Dict[str, Any]:

@@ -30,15 +30,9 @@ class LollmsClient():
     Provides a unified interface to manage and use different bindings for various modalities.
     """
     def __init__(self,
-                 # LLM Binding Parameters
-                 binding_name: str = "lollms",
-                 host_address: Optional[str] = None, # Shared host address (for service based bindings) default for all bindings if not specified
-                 models_path: Optional[str] = None, # Shared models folder path (for local file based bindings) default for all bindings if not specified
-                 model_name: str = "",
-                 llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
-                 llm_binding_config: Optional[Dict[str, any]] = None, 
 
                  # Optional Modality Binding Names
+                 llm_binding_name: str = "lollms",
                  tts_binding_name: Optional[str] = None,
                  tti_binding_name: Optional[str] = None,
                  stt_binding_name: Optional[str] = None,
@@ -47,6 +41,7 @@ class LollmsClient():
                  mcp_binding_name: Optional[str] = None,
 
                  # Modality Binding Directories
+                 llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
                  tts_bindings_dir: Path = Path(__file__).parent / "tts_bindings",
                  tti_bindings_dir: Path = Path(__file__).parent / "tti_bindings",
                  stt_bindings_dir: Path = Path(__file__).parent / "stt_bindings",
@@ -55,28 +50,13 @@ class LollmsClient():
                  mcp_bindings_dir: Path = Path(__file__).parent / "mcp_bindings",
 
                  # Configurations
+                 llm_binding_config: Optional[Dict[str, any]] = None,
                  tts_binding_config: Optional[Dict[str, any]] = None, 
                  tti_binding_config: Optional[Dict[str, any]] = None, 
                  stt_binding_config: Optional[Dict[str, any]] = None, 
                  ttv_binding_config: Optional[Dict[str, any]] = None, 
                  ttm_binding_config: Optional[Dict[str, any]] = None, 
                  mcp_binding_config: Optional[Dict[str, any]] = None,
-
-                 # General Parameters (mostly defaults for LLM generation)
-                 service_key: Optional[str] = None, # Shared service key/client_id
-                 verify_ssl_certificate: bool = True,
-                 ctx_size: Optional[int|None] = None,
-                 n_predict: Optional[int|None] = None,
-                 stream: bool = False,
-                 temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
-                 top_k: int = 40,          # Ollama default is 40
-                 top_p: float = 0.9,       # Ollama default is 0.9
-                 repeat_penalty: float = 1.1, # Ollama default is 1.1
-                 repeat_last_n: int = 64,  # Ollama default is 64
-
-                 seed: Optional[int] = None,
-                 n_threads: int = 8,
-                 streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                  user_name ="user",
                  ai_name = "assistant",
                  **kwargs
@@ -125,27 +105,17 @@ class LollmsClient():
         Raises:
             ValueError: If the primary LLM binding cannot be created.
         """
-        self.host_address = host_address # Store initial preference
-        self.models_path = models_path
-        self.service_key = service_key
-        self.verify_ssl_certificate = verify_ssl_certificate
-
         # --- LLM Binding Setup ---
         self.binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
         self.binding = self.binding_manager.create_binding(
-            binding_name=binding_name,
-            host_address=host_address, # Pass initial host preference
-            models_path=models_path,
-            model_name=model_name,
-            service_key=service_key,
-            verify_ssl_certificate=verify_ssl_certificate,
+            binding_name=llm_binding_name,
             # Pass LLM specific config if needed
             **(llm_binding_config or {})
         )
 
         if self.binding is None:
             available = self.binding_manager.get_available_bindings()
-            raise ValueError(f"Failed to create LLM binding: {binding_name}. Available: {available}")
+            raise ValueError(f"Failed to create LLM binding: {llm_binding_name}. Available: {available}")
 
         # --- Modality Binding Setup ---
         self.tts_binding_manager = LollmsTTSBindingManager(tts_bindings_dir)
@@ -235,17 +205,6 @@ class LollmsClient():
                 ASCIIColors.warning(f"Failed to create MCP binding: {mcp_binding_name}. Available: {self.mcp_binding_manager.get_available_bindings()}")
 
         # --- Store Default Generation Parameters ---
-        self.default_ctx_size = ctx_size
-        self.default_n_predict = n_predict
-        self.default_stream = stream
-        self.default_temperature = temperature
-        self.default_top_k = top_k
-        self.default_top_p = top_p
-        self.default_repeat_penalty = repeat_penalty
-        self.default_repeat_last_n = repeat_last_n
-        self.default_seed = seed
-        self.default_n_threads = n_threads
-        self.default_streaming_callback = streaming_callback
 
         # --- Prompt Formatting Attributes ---
         self.user_name = user_name
@@ -266,11 +225,6 @@ class LollmsClient():
         """Update the LLM binding with a new configuration."""
         self.binding = self.binding_manager.create_binding(
             binding_name=binding_name,
-            host_address=self.host_address,
-            models_path=self.models_path,
-            model_name=self.binding.model_name,  # Keep the same model name
-            service_key=self.service_key,
-            verify_ssl_certificate=self.verify_ssl_certificate,
             **(config or {})
         )
         if self.binding is None:
@@ -280,7 +234,7 @@ class LollmsClient():
     def get_ctx_size(self, model_name:str|None=None):
         if self.binding:
             ctx_size = self.binding.get_ctx_size(model_name)
-            return ctx_size if ctx_size else self.default_ctx_size
+            return ctx_size if ctx_size else self.binding.default_ctx_size
         else:
             return None
 
@@ -525,7 +479,7 @@ class LollmsClient():
         """
         if self.binding:
             
-            ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size if self.default_ctx_size else None
+            ctx_size = ctx_size if ctx_size is not None else self.binding.default_ctx_size if self.binding.default_ctx_size else None
             if ctx_size is None:
                 ctx_size = self.binding.get_ctx_size()
                 if ctx_size is None:
@@ -540,17 +494,17 @@ class LollmsClient():
                 prompt=prompt,
                 images=images,
                 system_prompt=system_prompt,
-                n_predict=n_predict if n_predict else self.default_n_predict if self.default_n_predict else ctx_size - nb_input_tokens,
-                stream=stream if stream is not None else self.default_stream,
-                temperature=temperature if temperature is not None else self.default_temperature,
-                top_k=top_k if top_k is not None else self.default_top_k,
-                top_p=top_p if top_p is not None else self.default_top_p,
-                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.default_repeat_penalty,
-                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.default_repeat_last_n,
-                seed=seed if seed is not None else self.default_seed,
-                n_threads=n_threads if n_threads is not None else self.default_n_threads,
-                ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size,
-                streaming_callback=streaming_callback if streaming_callback is not None else self.default_streaming_callback,
+                n_predict=n_predict if n_predict else self.binding.default_n_predict if self.binding.default_n_predict else ctx_size - nb_input_tokens,
+                stream=stream if stream is not None else self.binding.default_stream,
+                temperature=temperature if temperature is not None else self.binding.default_temperature,
+                top_k=top_k if top_k is not None else self.binding.default_top_k,
+                top_p=top_p if top_p is not None else self.binding.default_top_p,
+                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.binding.default_repeat_penalty,
+                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.binding.default_repeat_last_n,
+                seed=seed if seed is not None else self.binding.default_seed,
+                n_threads=n_threads if n_threads is not None else self.binding.default_n_threads,
+                ctx_size = ctx_size if ctx_size is not None else self.binding.default_ctx_size,
+                streaming_callback=streaming_callback if streaming_callback is not None else self.binding.default_streaming_callback,
                 split= split,
                 user_keyword=user_keyword,
                 ai_keyword=ai_keyword
@@ -595,17 +549,17 @@ class LollmsClient():
         if self.binding:
             return self.binding.generate_from_messages(
                 messages=messages,
-                n_predict=n_predict if n_predict is not None else self.default_n_predict,
-                stream=stream if stream is not None else self.default_stream,
-                temperature=temperature if temperature is not None else self.default_temperature,
-                top_k=top_k if top_k is not None else self.default_top_k,
-                top_p=top_p if top_p is not None else self.default_top_p,
-                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.default_repeat_penalty,
-                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.default_repeat_last_n,
-                seed=seed if seed is not None else self.default_seed,
-                n_threads=n_threads if n_threads is not None else self.default_n_threads,
-                ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size,
-                streaming_callback=streaming_callback if streaming_callback is not None else self.default_streaming_callback,
+                n_predict=n_predict if n_predict is not None else self.binding.default_n_predict,
+                stream=stream if stream is not None else self.binding.default_stream,
+                temperature=temperature if temperature is not None else self.binding.default_temperature,
+                top_k=top_k if top_k is not None else self.binding.default_top_k,
+                top_p=top_p if top_p is not None else self.binding.default_top_p,
+                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.binding.default_repeat_penalty,
+                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.binding.default_repeat_last_n,
+                seed=seed if seed is not None else self.binding.default_seed,
+                n_threads=n_threads if n_threads is not None else self.binding.default_n_threads,
+                ctx_size = ctx_size if ctx_size is not None else self.binding.default_ctx_size,
+                streaming_callback=streaming_callback if streaming_callback is not None else self.binding.default_streaming_callback,
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -654,17 +608,17 @@ class LollmsClient():
             return self.binding.chat(
                 discussion=discussion,
                 branch_tip_id=branch_tip_id,
-                n_predict=n_predict if n_predict is not None else self.default_n_predict,
-                stream=stream if stream is not None else True if streaming_callback is not None else self.default_stream,
-                temperature=temperature if temperature is not None else self.default_temperature,
-                top_k=top_k if top_k is not None else self.default_top_k,
-                top_p=top_p if top_p is not None else self.default_top_p,
-                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.default_repeat_penalty,
-                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.default_repeat_last_n,
-                seed=seed if seed is not None else self.default_seed,
-                n_threads=n_threads if n_threads is not None else self.default_n_threads,
-                ctx_size = ctx_size if ctx_size is not None else self.default_ctx_size,
-                streaming_callback=streaming_callback if streaming_callback is not None else self.default_streaming_callback
+                n_predict=n_predict if n_predict is not None else self.binding.default_n_predict,
+                stream=stream if stream is not None else True if streaming_callback is not None else self.binding.default_stream,
+                temperature=temperature if temperature is not None else self.binding.default_temperature,
+                top_k=top_k if top_k is not None else self.binding.default_top_k,
+                top_p=top_p if top_p is not None else self.binding.default_top_p,
+                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.binding.default_repeat_penalty,
+                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.binding.default_repeat_last_n,
+                seed=seed if seed is not None else self.binding.default_seed,
+                n_threads=n_threads if n_threads is not None else self.binding.default_n_threads,
+                ctx_size = ctx_size if ctx_size is not None else self.binding.default_ctx_size,
+                streaming_callback=streaming_callback if streaming_callback is not None else self.binding.default_streaming_callback
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -1076,7 +1030,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
             "- Do not make up information. If the findings are insufficient to fully answer the request, state what you found and what remains unanswered.\n"
             "- Format your response clearly using markdown where appropriate.\n"
         )
-        final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature if final_answer_temperature is not None else self.default_temperature, **(llm_generation_kwargs or {}))
+        final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature if final_answer_temperature is not None else self.binding.default_temperature, **(llm_generation_kwargs or {}))
         
         if streaming_callback: 
             streaming_callback("Final answer generation complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "final_answer_synthesis"}, turn_history = turn_history)
@@ -1535,7 +1489,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             ASCIIColors.cyan(f"** DEBUG: {title} **")
             ASCIIColors.magenta(prompt_text[-15000:])
             prompt_size = self.count_tokens(prompt_text)
-            ASCIIColors.red(f"Prompt size:{prompt_size}/{self.default_ctx_size}")
+            ASCIIColors.red(f"Prompt size:{prompt_size}/{self.binding.default_ctx_size}")
             ASCIIColors.cyan(f"** DEBUG: DONE **")
 
         # --- 1. Initialize State & Context-Aware Asset Ingestion ---
@@ -2322,7 +2276,7 @@ Do not split the code in multiple tags.
             callback = self.sink
 
         if ctx_size is None:
-            ctx_size = self.default_ctx_size or 8192 # Provide a fallback default
+            ctx_size = self.binding.default_ctx_size or 8192 # Provide a fallback default
         if chunk_size is None:
             chunk_size = ctx_size // 4
         if overlap is None:
@@ -2398,7 +2352,7 @@ Current document analysis memory:
         # Process text in chunks
         while start_token_idx < total_tokens:
             # Calculate available tokens for chunk + memory
-            available_tokens_for_dynamic_content = ctx_size - static_tokens - (self.default_n_predict or 1024) # Reserve space for output
+            available_tokens_for_dynamic_content = ctx_size - static_tokens - (self.binding.default_n_predict or 1024) # Reserve space for output
             if available_tokens_for_dynamic_content <= 100: # Need some minimum space
                 ASCIIColors.error("Context size too small for summarization with current settings.")
                 return "Error: Context size too small."
@@ -2435,7 +2389,7 @@ Current document analysis memory:
                 ASCIIColors.magenta(f"--- Chunk {chunk_id} Prompt ---")
                 ASCIIColors.cyan(prompt)
 
-            response = self.generate_text(prompt, n_predict=(self.default_n_predict or 1024), streaming_callback=callback)
+            response = self.generate_text(prompt, n_predict=(self.binding.default_n_predict or 1024), streaming_callback=callback)
 
             if isinstance(response, dict): # Handle generation error
                  ASCIIColors.error(f"Chunk {chunk_id} processing failed: {response.get('error')}")
@@ -2494,7 +2448,7 @@ The final output must be put inside a {final_output_format} markdown tag.
         final_example_prompt = final_prompt_template.format(memory="<final_memory>")
         try:
             final_static_tokens = len(self.tokenize(final_example_prompt)) - len(self.tokenize("<final_memory>"))
-            available_final_tokens = ctx_size - final_static_tokens - (self.default_n_predict or 1024) # Reserve space for output
+            available_final_tokens = ctx_size - final_static_tokens - (self.binding.default_n_predict or 1024) # Reserve space for output
         except RuntimeError as e:
              ASCIIColors.error(f"Tokenization failed during final setup: {e}")
              return "Error: Could not calculate final prompt size."
@@ -2511,7 +2465,7 @@ The final output must be put inside a {final_output_format} markdown tag.
             ASCIIColors.magenta("--- Final Aggregation Prompt ---")
             ASCIIColors.cyan(final_prompt)
 
-        final_summary_raw = self.generate_text(final_prompt, n_predict=(self.default_n_predict or 1024), streaming_callback=callback)
+        final_summary_raw = self.generate_text(final_prompt, n_predict=(self.binding.default_n_predict or 1024), streaming_callback=callback)
 
         if isinstance(final_summary_raw, dict):
              ASCIIColors.error(f"Final aggregation failed: {final_summary_raw.get('error')}")
@@ -2567,7 +2521,7 @@ The final output must be put inside a {final_output_format} markdown tag.
 
         # Set defaults and validate input
         if ctx_size is None:
-            ctx_size = self.default_ctx_size or 8192
+            ctx_size = self.binding.default_ctx_size or 8192
         if chunk_size is None:
             chunk_size = ctx_size // 4
         if overlap is None:
@@ -2670,7 +2624,7 @@ Task: Update the markdown memory by adding new information from this chunk relev
 
             while start_token_idx < len(file_tokens):
                 # Calculate available space dynamically
-                available_tokens_for_dynamic_content = ctx_size - static_tokens - (self.default_n_predict or 1024)
+                available_tokens_for_dynamic_content = ctx_size - static_tokens - (self.binding.default_n_predict or 1024)
                 if available_tokens_for_dynamic_content <= 100:
                      ASCIIColors.error(f"Context window too small during analysis of {file_name}.")
                      # Option: try truncating memory drastically or break
@@ -2710,7 +2664,7 @@ Task: Update the markdown memory by adding new information from this chunk relev
                     ASCIIColors.magenta(f"--- Deep Analysis Prompt (Global Chunk {global_chunk_id}) ---")
                     ASCIIColors.cyan(prompt)
 
-                response = self.generate_text(prompt, n_predict=(self.default_n_predict or 1024), streaming_callback=callback) # Use main callback for streaming output
+                response = self.generate_text(prompt, n_predict=(self.binding.default_n_predict or 1024), streaming_callback=callback) # Use main callback for streaming output
 
                 if isinstance(response, dict): # Handle error
                      ASCIIColors.error(f"Chunk processing failed (Global {global_chunk_id}): {response.get('error')}")
@@ -2765,7 +2719,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         final_example_prompt = final_prompt.replace("{memory}", "<final_memory>")
         try:
              final_static_tokens = len(self.tokenize(final_example_prompt)) - len(self.tokenize("<final_memory>"))
-             available_final_tokens = ctx_size - final_static_tokens - (self.default_n_predict or 1024)
+             available_final_tokens = ctx_size - final_static_tokens - (self.binding.default_n_predict or 1024)
         except RuntimeError as e:
               ASCIIColors.error(f"Tokenization failed during final setup: {e}")
               return "Error: Could not calculate final prompt size."
@@ -2781,7 +2735,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             ASCIIColors.magenta("--- Final Aggregation Prompt ---")
             ASCIIColors.cyan(final_prompt)
 
-        final_output_raw = self.generate_text(final_prompt, n_predict=(self.default_n_predict or 1024), streaming_callback=callback) # Use main callback
+        final_output_raw = self.generate_text(final_prompt, n_predict=(self.binding.default_n_predict or 1024), streaming_callback=callback) # Use main callback
 
         if isinstance(final_output_raw, dict):
              ASCIIColors.error(f"Final aggregation failed: {final_output_raw.get('error')}")
@@ -2858,7 +2812,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             # Use the binding's tokenizer for accurate chunking
             tokens = self.binding.tokenize(text_to_process)
         if chunk_size_tokens is None:
-            chunk_size_tokens = self.default_ctx_size//2
+            chunk_size_tokens = self.binding.default_ctx_size//2
         
         if len(tokens) <= chunk_size_tokens:
             if streaming_callback:

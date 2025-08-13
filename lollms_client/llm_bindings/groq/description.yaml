@@ -1,0 +1,16 @@
+title: Groq
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: A binding for Groq's LPU-powered inference service, providing extremely fast generation for open-source models like Llama3 and Gemma.
+input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the model to use on Groq's service (e.g., 'llama3-8b-8192')."
+    mandatory: true
+    default: "llama3-8b-8192"
+  - name: service_key
+    type: str
+    description: "The API key for the Groq service. Can also be set via the GROQ_API_KEY environment variable."
+    mandatory: true
+    default: ""

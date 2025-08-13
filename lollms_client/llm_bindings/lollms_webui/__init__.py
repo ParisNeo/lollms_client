@@ -18,10 +18,6 @@ class LollmsWebuiLLMBinding(LollmsLLMBinding):
     DEFAULT_HOST_ADDRESS = "http://localhost:9600"
     
     def __init__(self, 
-                 host_address: str = None,
-                 model_name: str = "",
-                 service_key: str = None,
-                 verify_ssl_certificate: bool = True,
                  personality: Optional[int] = None, 
                  **kwargs
                  ):
@@ -35,16 +31,14 @@ class LollmsWebuiLLMBinding(LollmsLLMBinding):
             verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
             personality (Optional[int]): Personality ID for generation. Defaults to None.
         """
-        super().__init__(
-            binding_name = "lollms"
-        )
-        
+        super().__init__(BindingName, **kwargs)
+        host_address = kwargs.get("host_address")
         self.host_address=host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS
-        self.model_name=model_name
-        self.service_key=service_key
-        self.verify_ssl_certificate=verify_ssl_certificate
+        self.model_name=kwargs.get("model_name")
+        self.service_key=kwargs.get("service_key")
+        self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate")
         self.default_completion_format=kwargs.get("default_completion_format",ELF_COMPLETION_FORMAT.Chat) 
-        self.personality = personality
+        self.personality = kwargs.get("personality")
         self.model = None
     
     def generate_text(self,

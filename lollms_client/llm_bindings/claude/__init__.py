@@ -66,10 +66,6 @@ class ClaudeBinding(LollmsLLMBinding):
     """Anthropic Claude-specific binding implementation."""
 
     def __init__(self,
-                 host_address: str = None,  # Ignored, for compatibility
-                 model_name: str = "claude-3-sonnet-20240229",
-                 service_key: str = None,
-                 verify_ssl_certificate: bool = True, # Ignored, for compatibility
                  **kwargs
                  ):
         """
@@ -79,9 +75,9 @@ class ClaudeBinding(LollmsLLMBinding):
             model_name (str): Name of the Claude model to use.
             service_key (str): Anthropic API key.
         """
-        super().__init__(binding_name=BindingName)
-        self.model_name = model_name
-        self.service_key = service_key
+        super().__init__(BindingName, **kwargs)
+        self.model_name = kwargs.get("model_name")
+        self.service_key = kwargs.get("service_key")
         self._cached_models: Optional[List[Dict[str, str]]] = None
 
         if not self.service_key:

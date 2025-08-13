@@ -25,8 +25,6 @@ class HuggingFaceInferenceAPIBinding(LollmsLLMBinding):
     """
 
     def __init__(self,
-                 model_name: str = "mistralai/Mistral-7B-Instruct-v0.2",
-                 hf_api_key: str = None,
                  **kwargs
                  ):
         """
@@ -34,11 +32,11 @@ class HuggingFaceInferenceAPIBinding(LollmsLLMBinding):
 
         Args:
             model_name (str): The repository ID of the model on the Hugging Face Hub.
-            hf_api_key (str): The Hugging Face API key.
+            service_key (str): The Hugging Face API key.
         """
-        super().__init__(binding_name=BindingName)
-        self.model_name = model_name
-        self.hf_api_key = hf_api_key or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        super().__init__(BindingName, **kwargs)
+        self.model_name = kwargs.get("model_name")
+        self.hf_api_key = kwargs.get("service_key") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 
         if not self.hf_api_key:
             raise ValueError("Hugging Face API key is required. Set it via 'hf_api_key' or HUGGING_FACE_HUB_TOKEN env var.")

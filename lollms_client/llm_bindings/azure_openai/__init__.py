@@ -45,10 +45,6 @@ class AzureOpenAIBinding(LollmsLLMBinding):
     """
 
     def __init__(self,
-                 model_name: str, # In Azure, this is the DEPLOYMENT NAME
-                 azure_api_key: str = None,
-                 azure_endpoint: str = None,
-                 azure_api_version: str = "2024-02-01",
                  **kwargs
                  ):
         """
@@ -56,15 +52,15 @@ class AzureOpenAIBinding(LollmsLLMBinding):
 
         Args:
             model_name (str): The name of the Azure OpenAI DEPLOYMENT to use.
-            azure_api_key (str): The API key for the Azure OpenAI service.
+            service_key (str): The API key for the Azure OpenAI service.
             azure_endpoint (str): The endpoint URL for the Azure OpenAI service.
             azure_api_version (str): The API version to use.
         """
-        super().__init__(binding_name=BindingName)
-        self.model_name = model_name  # Here, it's the deployment name
-        self.azure_api_key = azure_api_key or os.getenv("AZURE_OPENAI_API_KEY")
-        self.azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
-        self.azure_api_version = azure_api_version or os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+        super().__init__(BindingName, **kwargs)
+        self.model_name = kwargs.get("model_name")  # Here, it's the deployment name
+        self.azure_api_key = kwargs.get("service_key") or os.getenv("AZURE_OPENAI_API_KEY")
+        self.azure_endpoint = kwargs.get("azure_endpoint") or os.getenv("AZURE_OPENAI_ENDPOINT")
+        self.azure_api_version = kwargs.get("azure_api_version") or os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
 
         if not self.model_name:
             raise ValueError("Azure deployment name ('model_name') is required.")

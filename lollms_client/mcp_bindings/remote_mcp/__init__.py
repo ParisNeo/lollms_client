@@ -28,7 +28,7 @@ class RemoteMCPBinding(LollmsMCPBinding):
     """
     def __init__(self,
                  servers_infos: Dict[str, Dict[str, Any]],
-                 **other_config_params: Any):
+                 **kwargs: Any):
         """
         Initializes the binding to connect to multiple MCP servers.
 
@@ -41,7 +41,7 @@ class RemoteMCPBinding(LollmsMCPBinding):
                     "main_server": {"server_url": "http://localhost:8787", "auth_config": {}},
                     "experimental_server": {"server_url": "http://test.server:9000"}
                 }
-            **other_config_params (Any): Additional configuration parameters.
+            **kwargs (Any): Additional configuration parameters.
         """
         super().__init__(binding_name="remote_mcp")
         # initialization in case no servers are present
@@ -56,8 +56,8 @@ class RemoteMCPBinding(LollmsMCPBinding):
 
         ### NEW: Store the overall configuration
         self.config = {
-            "servers_infos": servers_infos,
-            **other_config_params
+            "servers_infos": kwargs.get("servers_infos"),
+            **kwargs
         }
 
         ### NEW: State management for multiple servers.

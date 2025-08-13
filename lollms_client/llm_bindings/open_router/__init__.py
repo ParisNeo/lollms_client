@@ -28,8 +28,6 @@ class OpenRouterBinding(LollmsLLMBinding):
     BASE_URL = "https://openrouter.ai/api/v1"
 
     def __init__(self,
-                 model_name: str = "google/gemini-flash-1.5", # A good, fast default
-                 service_key: str|None = None,
                  **kwargs
                  ):
         """
@@ -39,9 +37,9 @@ class OpenRouterBinding(LollmsLLMBinding):
             model_name (str): The name of the model to use from OpenRouter (e.g., 'anthropic/claude-3-haiku-20240307').
             service_key (str): The API key for the OpenRouter service.
         """
-        super().__init__(binding_name=BindingName)
-        self.model_name = model_name
-        self.api_key = service_key or os.getenv("OPENROUTER_API_KEY")
+        super().__init__(BindingName, **kwargs)
+        self.model_name = kwargs.get("model_name","google/gemini-flash-1.5")
+        self.api_key = kwargs.get("service_key") or os.getenv("OPENROUTER_API_KEY")
 
         if not self.api_key:
             raise ValueError("OpenRouter API key is required. Set it via 'open_router_api_key' or OPENROUTER_API_KEY env var.")

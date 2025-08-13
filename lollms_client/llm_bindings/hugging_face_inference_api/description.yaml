@@ -1,0 +1,16 @@
+title: Hugging Face Inference API
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: A binding for the Hugging Face Serverless Inference API, allowing access to a wide range of models hosted on the Hub.
+input_parameters:
+  - name: model_name
+    type: str
+    description: "The repository ID of the model on the Hugging Face Hub (e.g., 'mistralai/Mistral-7B-Instruct-v0.2')."
+    mandatory: true
+    default: "mistralai/Mistral-7B-Instruct-v0.2"
+  - name: service_key
+    type: str
+    description: "The Hugging Face API key (token). Can also be set via the HUGGING_FACE_HUB_TOKEN environment variable."
+    mandatory: true
+    default: ""

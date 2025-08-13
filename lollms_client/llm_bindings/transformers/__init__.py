@@ -91,14 +91,22 @@ class HuggingFaceHubBinding(LollmsLLMBinding):
     }
 
     def __init__(self,
-                 model_name_or_id: str, # Can be HF Hub ID or local folder name relative to models_path
-                 models_path: Union[str, Path],
-                 config: Optional[Dict[str, Any]] = None,
-                 default_completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Chat,
                  **kwargs # Overrides for config_args
                  ):
-        
-        super().__init__(binding_name=BindingName)
+        """
+        Initializes the Hugging Face Hub binding.
+        Args:
+            model_name (str): Hugging Face Hub model ID or local folder name.
+            models_path (str or Path): Path to the directory containing local models.
+            config (Optional[Dict[str, Any]]): Optional configuration dictionary to override defaults.
+            default_completion_format (ELF_COMPLETION_FORMAT): Default format for text generation.
+        """
+        super().__init__(BindingName, **kwargs)
+
+        model_name_or_id = kwargs.get("model_name")
+        models_path = kwargs.get("models_path")
+        config = kwargs.get("config")
+        default_completion_format = kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
 
         if torch is None or transformers is None: # Check if core imports failed
             raise ImportError("Core libraries (torch, transformers) not available. Binding cannot function.")

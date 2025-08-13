@@ -33,10 +33,6 @@ class GeminiBinding(LollmsLLMBinding):
     """Google Gemini-specific binding implementation."""
 
     def __init__(self,
-                 host_address: str = None,  # Ignored, for compatibility
-                 model_name: str = "gemini-1.5-pro-latest",
-                 service_key: str = None,
-                 verify_ssl_certificate: bool = True, # Ignored, for compatibility
                  **kwargs
                  ):
         """
@@ -46,9 +42,9 @@ class GeminiBinding(LollmsLLMBinding):
             model_name (str): Name of the Gemini model to use.
             service_key (str): Google AI Studio API key.
         """
-        super().__init__(binding_name=BindingName)
-        self.model_name = model_name
-        self.service_key = service_key
+        super().__init__(BindingName, **kwargs)
+        self.model_name = kwargs.get("model_name", None)
+        self.service_key = kwargs.get("service_key", None)
 
         if not self.service_key:
             self.service_key = os.getenv("GOOGLE_API_KEY")

@@ -1,0 +1,16 @@
+title: Google Gemini
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: A binding for Google's Gemini family of models (e.g., Gemini 1.5 Pro) via the Google AI Studio API.
+input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the Gemini model to use (e.g., 'gemini-1.5-pro-latest')."
+    mandatory: true
+    default: "gemini-1.5-pro-latest"
+  - name: service_key
+    type: str
+    description: "The API key for the Google AI Studio service. Can also be set via the GOOGLE_API_KEY environment variable."
+    mandatory: true
+    default: ""

@@ -1,0 +1,31 @@
+title: Hugging Face Transformers
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: A direct, in-process binding using the Hugging Face `transformers` library to run a wide variety of models locally on your hardware (CPU, CUDA, MPS).
+input_parameters:
+  - name: model_name_or_id
+    type: str
+    description: "The Hugging Face Hub model ID (e.g., 'microsoft/phi-2') or the name of a local model folder inside `models_path`."
+    mandatory: true
+    default: "microsoft/phi-2"
+  - name: models_path
+    type: str
+    description: "The path to the directory where your local Hugging Face model folders are stored."
+    mandatory: true
+    default: ""
+  - name: quantize
+    type: str
+    description: "Enable quantization for CUDA devices. Options: '4bit', '8bit', or false. Defaults to false."
+    mandatory: false
+    default: false
+  - name: trust_remote_code
+    type: bool
+    description: "Whether to trust and execute remote code from the model's repository. Required for some models like Phi-2. Use with caution. Defaults to false."
+    mandatory: false
+    default: false
+  - name: embedding_model_name
+    type: str
+    description: "The name of a SentenceTransformer model to use for embeddings (e.g., 'sentence-transformers/all-MiniLM-L6-v2')."
+    mandatory: false
+    default: "sentence-transformers/all-MiniLM-L6-v2"

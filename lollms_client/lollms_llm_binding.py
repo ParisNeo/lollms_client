@@ -12,11 +12,13 @@ from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_utilities import ImageTokenizer
 import re
+import yaml
 class LollmsLLMBinding(ABC):
     """Abstract base class for all LOLLMS LLM bindings"""
     
     def __init__(self, 
-                 binding_name: Optional[str] ="unknown"
+                 binding_name: Optional[str] ="unknown",
+                 **kwargs
         ):
         """
         Initialize the LollmsLLMBinding base class.
@@ -26,6 +28,18 @@ class LollmsLLMBinding(ABC):
         """
         self.binding_name=binding_name
         self.model_name = None #Must be set by the instance
+        self.default_ctx_size = kwargs.get("ctx_size") 
+        self.default_n_predict = kwargs.get("n_predict")
+        self.default_stream = kwargs.get("stream")
+        self.default_temperature = kwargs.get("temperature")
+        self.default_top_k = kwargs.get("top_k")
+        self.default_top_p = kwargs.get("top_p")
+        self.default_repeat_penalty = kwargs.get("repeat_penalty")
+        self.default_repeat_last_n = kwargs.get("repeat_last_n")
+        self.default_seed = kwargs.get("seed")
+        self.default_n_threads = kwargs.get("n_threads")
+        self.default_streaming_callback = kwargs.get("streaming_callback")
+
     
     @abstractmethod
     def generate_text(self,
@@ -750,16 +764,155 @@ class LollmsLLMBindingManager:
         if binding_class:
             return binding_class(**kwargs)
         return None
-
-    def get_available_bindings(self) -> list[str]:
+    @staticmethod
+    def _get_fallback_description(binding_name: str) -> Dict:
         """
-        Return list of available binding names.
+        Generates a default description dictionary for a binding without a description.yaml file.
+        """
+        return {
+            "binding_name": binding_name,
+            "title": binding_name.replace("_", " ").title(),
+            "author": "Unknown",
+            "creation_date": "N/A",
+            "last_update_date": "N/A",
+            "description": f"A binding for {binding_name}. No description.yaml file was found, so common parameters are shown as a fallback.",
+            "input_parameters": [
+                {
+                    "name": "model_name",
+                    "type": "str",
+                    "description": "The model name, ID, or filename to be used.",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "host_address",
+                    "type": "str",
+                    "description": "The host address of the service (for API-based bindings).",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "models_path",
+                    "type": "str",
+                    "description": "The path to the models directory (for local bindings).",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "service_key",
+                    "type": "str",
+                    "description": "The API key or service key for authentication (if applicable).",
+                    "mandatory": False,
+                    "default": ""
+                }
+            ]
+        }
+
+    @staticmethod
+    def get_bindings_list(llm_bindings_dir: Union[str, Path]) -> List[Dict]:
+        """
+        Lists all available LLM bindings by scanning a directory, loading their
+        description.yaml file if present, or providing a default description.
+
+        Args:
+            llm_bindings_dir (Union[str, Path]): The path to the directory containing LLM binding folders.
 
         Returns:
-            list[str]: List of binding names.
+            List[Dict]: A list of dictionaries, each describing a binding.
         """
-        return [binding_dir.name for binding_dir in self.llm_bindings_dir.iterdir() if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
+        bindings_dir = Path(llm_bindings_dir)
+        if not bindings_dir.is_dir():
+            return []
 
-def get_available_bindings():
-    bindings_dir = Path(__file__).parent/"llm_bindings"
-    return [binding_dir.name for binding_dir in bindings_dir.iterdir() if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
+        bindings_list = []
+        for binding_folder in bindings_dir.iterdir():
+            if binding_folder.is_dir() and (binding_folder / "__init__.py").exists():
+                binding_name = binding_folder.name
+                description_file = binding_folder / "description.yaml"
+                
+                binding_info = {}
+                if description_file.exists():
+                    try:
+                        with open(description_file, 'r', encoding='utf-8') as f:
+                            binding_info = yaml.safe_load(f)
+                        binding_info['binding_name'] = binding_name
+                    except Exception as e:
+                        print(f"Error loading description.yaml for {binding_name}: {e}")
+                        binding_info = LollmsLLMBinding._get_fallback_description(binding_name)
+                else:
+                    binding_info = LollmsLLMBinding._get_fallback_description(binding_name)
+                
+                bindings_list.append(binding_info)
+
+        return sorted(bindings_list, key=lambda b: b.get('title', b['binding_name']))
+    
+    def get_available_bindings(self) -> List[Dict]:
+        """
+        Retrieves a list of all available LLM bindings with their full descriptions.
+
+        This method scans the configured `llm_bindings_dir`, parsing the `description.yaml`
+        file for each valid binding. If a `description.yaml` is missing, a fallback
+        description with common parameters is generated. This is the primary method
+        for discovering available bindings and their configuration requirements.
+
+        Returns:
+            List[Dict]: 
+                A list of dictionaries, where each dictionary represents the
+                full description of an available binding.
+
+                Each dictionary contains the following keys:
+                - ``binding_name`` (str): The programmatic name of the binding (its folder name).
+                - ``title`` (str): A user-friendly title for the binding.
+                - ``author`` (str): The creator of the binding.
+                - ``creation_date`` (str): The date the binding was created.
+                - ``last_update_date`` (str): The date of the last major update.
+                - ``description`` (str): A detailed explanation of the binding's purpose.
+                - ``input_parameters`` (List[Dict]): A list of parameters required to
+                  configure the binding. Each parameter is a dictionary with:
+                    - ``name`` (str): The parameter's name (e.g., 'model_name').
+                    - ``type`` (str): The expected data type ('str', 'int', 'float', 'bool').
+                    - ``description`` (str): A user-friendly description of the parameter.
+                    - ``mandatory`` (bool): True if the parameter must be provided.
+                    - ``default``: The default value for the parameter.
+
+        Example of a returned dictionary in the list:
+        .. code-block:: python
+
+            {
+                "binding_name": "ollama",
+                "title": "Ollama",
+                "author": "ParisNeo",
+                ...
+                "input_parameters": [
+                    {
+                        "name": "host_address",
+                        "type": "str",
+                        "description": "The URL of the Ollama server.",
+                        "mandatory": True,
+                        "default": "http://localhost:11434"
+                    },
+                    ...
+                ]
+            }
+        """
+        return LollmsLLMBindingManager.get_bindings_list(self.llm_bindings_dir)
+
+def get_available_bindings(llm_bindings_dir: Union[str, Path] = None) -> List[Dict]:
+    """
+    Lists all available LLM bindings with their detailed descriptions.
+
+    This function serves as a primary entry point for discovering what bindings
+    are available and how to configure them.
+
+    Args:
+        llm_bindings_dir (Union[str, Path], optional): 
+            The path to the LLM bindings directory. If None, it defaults to the
+            'llm_bindings' subdirectory relative to this file. 
+            Defaults to None.
+
+    Returns:
+        List[Dict]: A list of dictionaries, each describing a binding.
+    """
+    if llm_bindings_dir is None:
+        llm_bindings_dir = Path(__file__).parent / "llm_bindings"
+    return LollmsLLMBindingManager.get_bindings_list(llm_bindings_dir)

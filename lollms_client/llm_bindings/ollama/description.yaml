@@ -1,0 +1,26 @@
+title: Ollama
+author: ParisNeo
+creation_date: 2025-08-13
+last_update_date: 2025-08-13
+description: Connects to a local or remote Ollama server, allowing for easy use of a wide variety of models like Llama3, Phi3, etc.
+input_parameters:
+  - name: host_address
+    type: str
+    description: "The URL of the Ollama server. Defaults to 'http://localhost:11434'."
+    mandatory: true
+    default: "http://localhost:11434"
+  - name: model_name
+    type: str
+    description: "The name of the model to use from the Ollama server (e.g., 'llama3:8b')."
+    mandatory: true
+    default: "llama3:latest"
+  - name: service_key
+    type: str
+    description: "An optional API key or bearer token if the Ollama server requires authentication."
+    mandatory: false
+    default: ""
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify the SSL certificate of the Ollama server. Defaults to true."
+    mandatory: false
+    default: true

@@ -1,9 +1,12 @@
 from lollms_client import LollmsClient
 
 # Initialize the LollmsClient instance
-#lc = LollmsClient("lollms", service_key="your service key")
+lc = LollmsClient(llm_binding_name="lollms", llm_binding_config={
+        "model_name": "ollama/gemma3:12b",
+        "service_key": "lollms_m1fOU6eS_HXTc09wA9CtCl-yyJBGpaqcvPtOvMqANKPZL9_PEn18",
+    })
 #lc = LollmsClient("ollama", model_name="mistral-nemo:latest")
-lc = LollmsClient("llamacpp", models_path=r"E:\drumber", model_name="llava-v1.6-mistral-7b.Q3_K_XS.gguf")
+#lc = LollmsClient("llamacpp", models_path=r"E:\drumber", model_name="llava-v1.6-mistral-7b.Q3_K_XS.gguf")
 # Generate Text
 # response = lc.generate_text(prompt="Once upon a time", stream=False, temperature=0.5)
 # print(response)

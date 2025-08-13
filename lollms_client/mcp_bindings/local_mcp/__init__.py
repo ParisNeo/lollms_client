@@ -21,15 +21,16 @@ class LocalMCPBinding(LollmsMCPBinding):
     """
 
     def __init__(self,
-                 tools_folder_path: str|Path|None = None):
+                 **kwargs: Any
+                 ):
         """
         Initialize the LocalMCPBinding.
 
         Args:
-            binding_name (str): The name of this binding.
             tools_folder_path (str|Path) a folder where to find tools
         """
         super().__init__(binding_name="LocalMCP")
+        tools_folder_path = kwargs.get("tools_folder_path")
         if tools_folder_path:
             try:
                 self.tools_folder_path: Optional[Path] = Path(tools_folder_path)
