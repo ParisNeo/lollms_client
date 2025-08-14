@@ -331,6 +331,7 @@ class ClaudeBinding(LollmsLLMBinding):
             )
             return response.token_count # Updated to correct response attribute
         except Exception as e:
+            trace_exception(e)
             ASCIIColors.error(f"Failed to count tokens with Claude API: {e}")
             return len(self.tokenize(text))
 

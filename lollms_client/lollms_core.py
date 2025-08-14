@@ -106,8 +106,8 @@ class LollmsClient():
             ValueError: If the primary LLM binding cannot be created.
         """
         # --- LLM Binding Setup ---
-        self.binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
-        self.binding = self.binding_manager.create_binding(
+        self.llm_binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
+        self.llm = self.llm_binding_manager.create_binding(
             binding_name=llm_binding_name,
             **{
                 k: v
@@ -116,8 +116,8 @@ class LollmsClient():
             }
         )
 
-        if self.binding is None:
-            available = self.binding_manager.get_available_bindings()
+        if self.llm is None:
+            available = self.llm_binding_manager.get_available_bindings()
             raise ValueError(f"Failed to create LLM binding: {llm_binding_name}. Available: {available}")
 
         # --- Modality Binding Setup ---
@@ -252,30 +252,30 @@ class LollmsClient():
     # 
     def update_llm_binding(self, binding_name: str, config: Optional[Dict[str, Any]] = None):
         """Update the LLM binding with a new configuration."""
-        self.binding = self.binding_manager.create_binding(
+        self.llm = self.llm_binding_manager.create_binding(
             binding_name=binding_name,
             **(config or {})
         )
-        if self.binding is None:
-            available = self.binding_manager.get_available_bindings()
+        if self.llm is None:
+            available = self.llm_binding_manager.get_available_bindings()
             raise ValueError(f"Failed to update LLM binding: {binding_name}. Available: {available}")
 
     def get_ctx_size(self, model_name:str|None=None):
-        if self.binding:
-            ctx_size = self.binding.get_ctx_size(model_name)
-            return ctx_size if ctx_size else self.binding.default_ctx_size
+        if self.llm:
+            ctx_size = self.llm.get_ctx_size(model_name)
+            return ctx_size if ctx_size else self.llm.default_ctx_size
         else:
             return None
 
     def get_model_name(self):
-        if self.binding:
-            return self.binding.model_name
+        if self.llm:
+            return self.llm.model_name
         else:
             return None
 
     def set_model_name(self, model_name)->bool:
-        if self.binding:
-            self.binding.model_name = model_name
+        if self.llm:
+            self.llm.model_name = model_name
             return True
         else:
             return False
@@ -383,8 +383,8 @@ class LollmsClient():
         Returns:
             list: List of tokens.
         """
-        if self.binding:
-            return self.binding.tokenize(text)
+        if self.llm:
+            return self.llm.tokenize(text)
         raise RuntimeError("LLM binding not initialized.")
 
     def detokenize(self, tokens: list) -> str:
@@ -397,8 +397,8 @@ class LollmsClient():
         Returns:
             str: Detokenized text.
         """
-        if self.binding:
-            return self.binding.detokenize(tokens)
+        if self.llm:
+            return self.llm.detokenize(tokens)
         raise RuntimeError("LLM binding not initialized.")
     def count_tokens(self, text: str) -> int:
         """
@@ -410,8 +410,8 @@ class LollmsClient():
         Returns:
             int: Number of tokens.
         """
-        if self.binding:
-            return self.binding.count_tokens(text)
+        if self.llm:
+            return self.llm.count_tokens(text)
         raise RuntimeError("LLM binding not initialized.")
 
     def count_image_tokens(self, image: str) -> int:
@@ -424,8 +424,8 @@ class LollmsClient():
         Returns:
             int: Estimated number of tokens for the image. Returns -1 on error.
         """
-        if self.binding:
-            return self.binding.count_image_tokens(image)
+        if self.llm:
+            return self.llm.count_image_tokens(image)
         raise RuntimeError("LLM binding not initialized.")
 
     def get_model_details(self) -> dict:
@@ -435,8 +435,8 @@ class LollmsClient():
         Returns:
             dict: Model information dictionary.
         """
-        if self.binding:
-            return self.binding.get_model_info()
+        if self.llm:
+            return self.llm.get_model_info()
         raise RuntimeError("LLM binding not initialized.")
 
     def switch_model(self, model_name: str) -> bool:
@@ -449,8 +449,8 @@ class LollmsClient():
         Returns:
             bool: True if model loaded successfully, False otherwise.
         """
-        if self.binding:
-            return self.binding.load_model(model_name)
+        if self.llm:
+            return self.llm.load_model(model_name)
         raise RuntimeError("LLM binding not initialized.")
 
     def get_available_llm_bindings(self) -> List[str]: 
@@ -460,7 +460,7 @@ class LollmsClient():
         Returns:
             List[str]: List of binding names that can be used for LLMs.
         """
-        return self.binding_manager.get_available_bindings()
+        return self.llm_binding_manager.get_available_bindings()
 
     def generate_text(self,
                      prompt: str,
@@ -506,11 +506,11 @@ class LollmsClient():
         Returns:
             Union[str, dict]: Generated text or error dictionary if failed.
         """
-        if self.binding:
+        if self.llm:
             
-            ctx_size = ctx_size if ctx_size is not None else self.binding.default_ctx_size if self.binding.default_ctx_size else None
+            ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size if self.llm.default_ctx_size else None
             if ctx_size is None:
-                ctx_size = self.binding.get_ctx_size()
+                ctx_size = self.llm.get_ctx_size()
                 if ctx_size is None:
                     ctx_size = 1024*8 # 1028*8= 8192 tokens, a common default for many models
             nb_input_tokens = self.count_tokens(prompt)+ (sum([self.count_image_tokens(image) for image in images]) if images else 0)
@@ -519,21 +519,21 @@ class LollmsClient():
                 ASCIIColors.magenta(f"ctx_size : {ctx_size}")
                 ASCIIColors.magenta(f"nb_input_tokens : {nb_input_tokens}")
             
-            return self.binding.generate_text(
+            return self.llm.generate_text(
                 prompt=prompt,
                 images=images,
                 system_prompt=system_prompt,
-                n_predict=n_predict if n_predict else self.binding.default_n_predict if self.binding.default_n_predict else ctx_size - nb_input_tokens,
-                stream=stream if stream is not None else self.binding.default_stream,
-                temperature=temperature if temperature is not None else self.binding.default_temperature,
-                top_k=top_k if top_k is not None else self.binding.default_top_k,
-                top_p=top_p if top_p is not None else self.binding.default_top_p,
-                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.binding.default_repeat_penalty,
-                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.binding.default_repeat_last_n,
-                seed=seed if seed is not None else self.binding.default_seed,
-                n_threads=n_threads if n_threads is not None else self.binding.default_n_threads,
-                ctx_size = ctx_size if ctx_size is not None else self.binding.default_ctx_size,
-                streaming_callback=streaming_callback if streaming_callback is not None else self.binding.default_streaming_callback,
+                n_predict=n_predict if n_predict else self.llm.default_n_predict if self.llm.default_n_predict else ctx_size - nb_input_tokens,
+                stream=stream if stream is not None else self.llm.default_stream,
+                temperature=temperature if temperature is not None else self.llm.default_temperature,
+                top_k=top_k if top_k is not None else self.llm.default_top_k,
+                top_p=top_p if top_p is not None else self.llm.default_top_p,
+                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.llm.default_repeat_penalty,
+                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.llm.default_repeat_last_n,
+                seed=seed if seed is not None else self.llm.default_seed,
+                n_threads=n_threads if n_threads is not None else self.llm.default_n_threads,
+                ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size,
+                streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback,
                 split= split,
                 user_keyword=user_keyword,
                 ai_keyword=ai_keyword
@@ -575,20 +575,20 @@ class LollmsClient():
         Returns:
             Union[str, dict]: Generated text or error dictionary if failed.
         """
-        if self.binding:
-            return self.binding.generate_from_messages(
+        if self.llm:
+            return self.llm.generate_from_messages(
                 messages=messages,
-                n_predict=n_predict if n_predict is not None else self.binding.default_n_predict,
-                stream=stream if stream is not None else self.binding.default_stream,
-                temperature=temperature if temperature is not None else self.binding.default_temperature,
-                top_k=top_k if top_k is not None else self.binding.default_top_k,
-                top_p=top_p if top_p is not None else self.binding.default_top_p,
-                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.binding.default_repeat_penalty,
-                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.binding.default_repeat_last_n,
-                seed=seed if seed is not None else self.binding.default_seed,
-                n_threads=n_threads if n_threads is not None else self.binding.default_n_threads,
-                ctx_size = ctx_size if ctx_size is not None else self.binding.default_ctx_size,
-                streaming_callback=streaming_callback if streaming_callback is not None else self.binding.default_streaming_callback,
+                n_predict=n_predict if n_predict is not None else self.llm.default_n_predict,
+                stream=stream if stream is not None else self.llm.default_stream,
+                temperature=temperature if temperature is not None else self.llm.default_temperature,
+                top_k=top_k if top_k is not None else self.llm.default_top_k,
+                top_p=top_p if top_p is not None else self.llm.default_top_p,
+                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.llm.default_repeat_penalty,
+                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.llm.default_repeat_last_n,
+                seed=seed if seed is not None else self.llm.default_seed,
+                n_threads=n_threads if n_threads is not None else self.llm.default_n_threads,
+                ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size,
+                streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback,
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -633,21 +633,21 @@ class LollmsClient():
         Returns:
             Union[str, dict]: Generated text or an error dictionary if failed.
         """
-        if self.binding:
-            return self.binding.chat(
+        if self.llm:
+            return self.llm.chat(
                 discussion=discussion,
                 branch_tip_id=branch_tip_id,
-                n_predict=n_predict if n_predict is not None else self.binding.default_n_predict,
-                stream=stream if stream is not None else True if streaming_callback is not None else self.binding.default_stream,
-                temperature=temperature if temperature is not None else self.binding.default_temperature,
-                top_k=top_k if top_k is not None else self.binding.default_top_k,
-                top_p=top_p if top_p is not None else self.binding.default_top_p,
-                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.binding.default_repeat_penalty,
-                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.binding.default_repeat_last_n,
-                seed=seed if seed is not None else self.binding.default_seed,
-                n_threads=n_threads if n_threads is not None else self.binding.default_n_threads,
-                ctx_size = ctx_size if ctx_size is not None else self.binding.default_ctx_size,
-                streaming_callback=streaming_callback if streaming_callback is not None else self.binding.default_streaming_callback
+                n_predict=n_predict if n_predict is not None else self.llm.default_n_predict,
+                stream=stream if stream is not None else True if streaming_callback is not None else self.llm.default_stream,
+                temperature=temperature if temperature is not None else self.llm.default_temperature,
+                top_k=top_k if top_k is not None else self.llm.default_top_k,
+                top_p=top_p if top_p is not None else self.llm.default_top_p,
+                repeat_penalty=repeat_penalty if repeat_penalty is not None else self.llm.default_repeat_penalty,
+                repeat_last_n=repeat_last_n if repeat_last_n is not None else self.llm.default_repeat_last_n,
+                seed=seed if seed is not None else self.llm.default_seed,
+                n_threads=n_threads if n_threads is not None else self.llm.default_n_threads,
+                ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size,
+                streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -662,15 +662,15 @@ class LollmsClient():
         Returns:
             list: List of embeddings.
         """
-        if self.binding:
-            return self.binding.embed(text, **kwargs)
+        if self.llm:
+            return self.llm.embed(text, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
 
     def listModels(self):
         """Lists models available to the current LLM binding."""
-        if self.binding:
-            return self.binding.listModels()
+        if self.llm:
+            return self.llm.listModels()
         raise RuntimeError("LLM binding not initialized.")
 
     # --- Convenience Methods for Lollms LLM Binding Features ---
@@ -681,8 +681,8 @@ class LollmsClient():
         Returns:
             Union[List[Dict], Dict]: List of personality dicts or error dict.
         """
-        if self.binding and hasattr(self.binding, 'lollms_listMountedPersonalities'):
-            return self.binding.lollms_listMountedPersonalities()
+        if self.llm and hasattr(self.llm, 'lollms_listMountedPersonalities'):
+            return self.llm.lollms_listMountedPersonalities()
         else:
             ASCIIColors.warning("listMountedPersonalities is only available for the 'lollms' LLM binding.")
             return {"status": False, "error": "Functionality not available for the current binding"}
@@ -893,7 +893,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
         streaming_callback: Optional[Callable[[str, int, Optional[Dict], Optional[List]], bool]] = None,
         **llm_generation_kwargs
     ) -> Dict[str, Any]:
-        if not self.binding or not self.mcp:
+        if not self.llm or not self.mcp:
             return {"final_answer": "", "tool_calls": [], "error": "LLM or MCP binding not initialized."}
 
         turn_history: List[Dict[str, Any]] = []
@@ -1059,7 +1059,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
             "- Do not make up information. If the findings are insufficient to fully answer the request, state what you found and what remains unanswered.\n"
             "- Format your response clearly using markdown where appropriate.\n"
         )
-        final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature if final_answer_temperature is not None else self.binding.default_temperature, **(llm_generation_kwargs or {}))
+        final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, images=images, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature if final_answer_temperature is not None else self.llm.default_temperature, **(llm_generation_kwargs or {}))
         
         if streaming_callback: 
             streaming_callback("Final answer generation complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": "final_answer_synthesis"}, turn_history = turn_history)
@@ -1100,7 +1100,7 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
         """
         Enhanced RAG with dynamic objective refinement and a knowledge scratchpad.
         """
-        if not self.binding:
+        if not self.llm:
             return {"final_answer": "", "rag_hops_history": [], "all_retrieved_sources": [], "error": "LLM binding not initialized."}
 
         effective_ctx_size = ctx_size or getattr(self, "default_ctx_size", 20000)
@@ -1500,7 +1500,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         Returns:
             A dictionary containing the agent's full run.
         """
-        if not self.binding:
+        if not self.llm:
             return {"final_answer": "", "tool_calls": [], "sources": [], "error": "LLM binding not initialized."}
         if max_reasoning_steps is None:
             max_reasoning_steps = 10
@@ -1519,7 +1519,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             ASCIIColors.cyan(f"** DEBUG: {title} **")
             ASCIIColors.magenta(prompt_text[-15000:])
             prompt_size = self.count_tokens(prompt_text)
-            ASCIIColors.red(f"Prompt size:{prompt_size}/{self.binding.default_ctx_size}")
+            ASCIIColors.red(f"Prompt size:{prompt_size}/{self.llm.default_ctx_size}")
             ASCIIColors.cyan(f"** DEBUG: DONE **")
 
         # --- 1. Initialize State & Context-Aware Asset Ingestion ---
@@ -2306,7 +2306,7 @@ Do not split the code in multiple tags.
             callback = self.sink
 
         if ctx_size is None:
-            ctx_size = self.binding.default_ctx_size or 8192 # Provide a fallback default
+            ctx_size = self.llm.default_ctx_size or 8192 # Provide a fallback default
         if chunk_size is None:
             chunk_size = ctx_size // 4
         if overlap is None:
@@ -2382,7 +2382,7 @@ Current document analysis memory:
         # Process text in chunks
         while start_token_idx < total_tokens:
             # Calculate available tokens for chunk + memory
-            available_tokens_for_dynamic_content = ctx_size - static_tokens - (self.binding.default_n_predict or 1024) # Reserve space for output
+            available_tokens_for_dynamic_content = ctx_size - static_tokens - (self.llm.default_n_predict or 1024) # Reserve space for output
             if available_tokens_for_dynamic_content <= 100: # Need some minimum space
                 ASCIIColors.error("Context size too small for summarization with current settings.")
                 return "Error: Context size too small."
@@ -2419,7 +2419,7 @@ Current document analysis memory:
                 ASCIIColors.magenta(f"--- Chunk {chunk_id} Prompt ---")
                 ASCIIColors.cyan(prompt)
 
-            response = self.generate_text(prompt, n_predict=(self.binding.default_n_predict or 1024), streaming_callback=callback)
+            response = self.generate_text(prompt, n_predict=(self.llm.default_n_predict or 1024), streaming_callback=callback)
 
             if isinstance(response, dict): # Handle generation error
                  ASCIIColors.error(f"Chunk {chunk_id} processing failed: {response.get('error')}")
@@ -2478,7 +2478,7 @@ The final output must be put inside a {final_output_format} markdown tag.
         final_example_prompt = final_prompt_template.format(memory="<final_memory>")
         try:
             final_static_tokens = len(self.tokenize(final_example_prompt)) - len(self.tokenize("<final_memory>"))
-            available_final_tokens = ctx_size - final_static_tokens - (self.binding.default_n_predict or 1024) # Reserve space for output
+            available_final_tokens = ctx_size - final_static_tokens - (self.llm.default_n_predict or 1024) # Reserve space for output
         except RuntimeError as e:
              ASCIIColors.error(f"Tokenization failed during final setup: {e}")
              return "Error: Could not calculate final prompt size."
@@ -2495,7 +2495,7 @@ The final output must be put inside a {final_output_format} markdown tag.
             ASCIIColors.magenta("--- Final Aggregation Prompt ---")
             ASCIIColors.cyan(final_prompt)
 
-        final_summary_raw = self.generate_text(final_prompt, n_predict=(self.binding.default_n_predict or 1024), streaming_callback=callback)
+        final_summary_raw = self.generate_text(final_prompt, n_predict=(self.llm.default_n_predict or 1024), streaming_callback=callback)
 
         if isinstance(final_summary_raw, dict):
              ASCIIColors.error(f"Final aggregation failed: {final_summary_raw.get('error')}")
@@ -2551,7 +2551,7 @@ The final output must be put inside a {final_output_format} markdown tag.
 
         # Set defaults and validate input
         if ctx_size is None:
-            ctx_size = self.binding.default_ctx_size or 8192
+            ctx_size = self.llm.default_ctx_size or 8192
         if chunk_size is None:
             chunk_size = ctx_size // 4
         if overlap is None:
@@ -2654,7 +2654,7 @@ Task: Update the markdown memory by adding new information from this chunk relev
 
             while start_token_idx < len(file_tokens):
                 # Calculate available space dynamically
-                available_tokens_for_dynamic_content = ctx_size - static_tokens - (self.binding.default_n_predict or 1024)
+                available_tokens_for_dynamic_content = ctx_size - static_tokens - (self.llm.default_n_predict or 1024)
                 if available_tokens_for_dynamic_content <= 100:
                      ASCIIColors.error(f"Context window too small during analysis of {file_name}.")
                      # Option: try truncating memory drastically or break
@@ -2694,7 +2694,7 @@ Task: Update the markdown memory by adding new information from this chunk relev
                     ASCIIColors.magenta(f"--- Deep Analysis Prompt (Global Chunk {global_chunk_id}) ---")
                     ASCIIColors.cyan(prompt)
 
-                response = self.generate_text(prompt, n_predict=(self.binding.default_n_predict or 1024), streaming_callback=callback) # Use main callback for streaming output
+                response = self.generate_text(prompt, n_predict=(self.llm.default_n_predict or 1024), streaming_callback=callback) # Use main callback for streaming output
 
                 if isinstance(response, dict): # Handle error
                      ASCIIColors.error(f"Chunk processing failed (Global {global_chunk_id}): {response.get('error')}")
@@ -2749,7 +2749,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         final_example_prompt = final_prompt.replace("{memory}", "<final_memory>")
         try:
              final_static_tokens = len(self.tokenize(final_example_prompt)) - len(self.tokenize("<final_memory>"))
-             available_final_tokens = ctx_size - final_static_tokens - (self.binding.default_n_predict or 1024)
+             available_final_tokens = ctx_size - final_static_tokens - (self.llm.default_n_predict or 1024)
         except RuntimeError as e:
               ASCIIColors.error(f"Tokenization failed during final setup: {e}")
               return "Error: Could not calculate final prompt size."
@@ -2765,7 +2765,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             ASCIIColors.magenta("--- Final Aggregation Prompt ---")
             ASCIIColors.cyan(final_prompt)
 
-        final_output_raw = self.generate_text(final_prompt, n_predict=(self.binding.default_n_predict or 1024), streaming_callback=callback) # Use main callback
+        final_output_raw = self.generate_text(final_prompt, n_predict=(self.llm.default_n_predict or 1024), streaming_callback=callback) # Use main callback
 
         if isinstance(final_output_raw, dict):
              ASCIIColors.error(f"Final aggregation failed: {final_output_raw.get('error')}")
@@ -2840,9 +2840,9 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             tokens = []
         else:
             # Use the binding's tokenizer for accurate chunking
-            tokens = self.binding.tokenize(text_to_process)
+            tokens = self.llm.tokenize(text_to_process)
         if chunk_size_tokens is None:
-            chunk_size_tokens = self.binding.default_ctx_size//2
+            chunk_size_tokens = self.llm.default_ctx_size//2
         
         if len(tokens) <= chunk_size_tokens:
             if streaming_callback:
@@ -2873,7 +2873,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         step = chunk_size_tokens - overlap_tokens
         for i in range(0, len(tokens), step):
             chunk_tokens = tokens[i:i + chunk_size_tokens]
-            chunk_text = self.binding.detokenize(chunk_tokens)
+            chunk_text = self.llm.detokenize(chunk_tokens)
             chunks.append(chunk_text)
 
         chunk_summaries = []

@@ -523,6 +523,7 @@ class LollmsDiscussion:
         # --- END FIX ---
 
         self._rebuild_message_index()
+        self._validate_and_set_active_branch() # Call for initial load
 
     @classmethod
     def create_new(cls, lollms_client: 'LollmsClient', db_manager: Optional[LollmsDataManager] = None, **kwargs) -> 'LollmsDiscussion':
@@ -646,6 +647,31 @@ class LollmsDiscussion:
             self._session.refresh(self._db_discussion, ['messages'])
         self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
 
+    def _validate_and_set_active_branch(self):
+        """
+        Ensures that self.active_branch_id points to an existing message.
+        If it's None or points to a non-existent message, it attempts to set it
+        to the ID of the most recently created message in the discussion.
+        """
+        if self.active_branch_id is None or self.active_branch_id not in self._message_index:
+            ASCIIColors.warning(f"Active branch ID '{self.active_branch_id}' is invalid or missing for discussion {self.id}. Attempting to select a new one.")
+            
+            all_messages_orms = list(self._message_index.values())
+            if all_messages_orms:
+                # Sort by creation date in descending order to find the most recent
+                most_recent_message = max(all_messages_orms, key=lambda msg: msg.created_at)
+                self.active_branch_id = most_recent_message.id
+                ASCIIColors.success(f"New active branch ID for discussion {self.id} set to: {self.active_branch_id} (most recent message).")
+                # Mark for save if DB backed and autosave is on
+                # No need to call self.touch() directly here if this method is called within commit() or init()
+                # as init() will lead to commit() if a new discussion is created and commit() handles saving.
+                # If only _validate_and_set_active_branch is called, then a touch is needed.
+                self.touch() # This will ensure it's saved if autosave is on
+            else:
+                self.active_branch_id = None
+                ASCIIColors.yellow(f"No messages available in discussion {self.id}. Active branch ID remains None.")
+
+
     def touch(self):
         """Marks the discussion as updated, persists images, and saves if autosave is on."""
         # Persist in-memory discussion images to the metadata field before saving.
@@ -680,6 +706,7 @@ class LollmsDiscussion:
         try:
             self._session.commit()
             self._rebuild_message_index() # Rebuild index after commit to reflect DB state
+            self._validate_and_set_active_branch() # Validate active branch after commit
         except Exception as e:
             self._session.rollback()
             raise e
@@ -2002,6 +2029,7 @@ class LollmsDiscussion:
             self.touch() # Mark discussion as updated
             self.commit() # Commit changes to DB
             self._rebuild_message_index() # Rebuild index after changes
+            self._validate_and_set_active_branch() # Re-validate active branch after fixing orphans
         else:
             ASCIIColors.yellow("No new messages were re-parented (they might have already been roots or discussion was already healthy).")
 

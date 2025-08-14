@@ -58,7 +58,7 @@ else:
 
 
 # List Mounted Personalities (This is an LLM feature, specific to 'lollms' LLM binding)
-if lc.binding and hasattr(lc.binding, 'lollms_listMountedPersonalities'):
+if lc.llm and hasattr(lc.llm, 'lollms_listMountedPersonalities'):
     personalities_response = lc.listMountedPersonalities()
     ASCIIColors.blue("\nMounted Personalities:")
     print(personalities_response)

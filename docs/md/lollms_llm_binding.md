@@ -154,15 +154,15 @@ The `LollmsLLMBindingManager` is responsible for discovering available LLM bindi
 # from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
 #
 # llm_bindings_directory = Path(__file__).parent / "llm_bindings"
-# self.binding_manager = LollmsLLMBindingManager(llm_bindings_directory)
+# self.llm_binding_manager = LollmsLLMBindingManager(llm_bindings_directory)
 #
 # # To create a specific binding:
 # binding_config = {"host_address": "http://localhost:11434", "model_name": "mistral"}
-# self.binding = self.binding_manager.create_binding(
+# self.llm = self.llm_binding_manager.create_binding(
 #     binding_name="ollama",
 #     **binding_config
 # )
-# if self.binding is None:
+# if self.llm is None:
 #     raise ValueError("Failed to create Ollama binding.")
 ```
 

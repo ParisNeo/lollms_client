@@ -131,12 +131,12 @@ def test_text_generation():
                     target_model = available_models[0]
 
 
-            if target_model and target_model != lc.binding.model_name: # Only if different and valid
+            if target_model and target_model != lc.llm.model_name: # Only if different and valid
                 ASCIIColors.info(f"\nSwitching to model (or using for next gen): {target_model}")
                 # For bindings like ollama/openai, setting model_name on binding directly works.
                 # For 'lollms' server binding, LollmsClient doesn't have a direct 'switch_model_on_server'
-                # but setting lc.binding.model_name will make the next generate_text request it.
-                lc.binding.model_name = target_model # Update the binding's current model_name
+                # but setting lc.llm.model_name will make the next generate_text request it.
+                lc.llm.model_name = target_model # Update the binding's current model_name
 
                 prompt_specific_model = f"What is the main capability of the {target_model.split(':')[0]} language model?"
                 ASCIIColors.yellow(f"Prompt (for {target_model}): {prompt_specific_model}")
@@ -148,7 +148,7 @@ def test_text_generation():
                     n_predict=200
                 )
                 print()
-            elif target_model == lc.binding.model_name:
+            elif target_model == lc.llm.model_name:
                 ASCIIColors.yellow(f"Target model '{target_model}' is already the current model. Skipping specific model test.")
             else:
                 ASCIIColors.yellow("Could not determine a different target model from the list to test specific model generation.")
