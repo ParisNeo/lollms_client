@@ -154,7 +154,7 @@ def main():
     try:
         ASCIIColors.magenta(f"Initializing LollmsClient with {args.ttm_binding} for TTM...")
         lollms_client = LollmsClient(
-            binding_name="lollms", # Can be a dummy if only using TTM
+            llm_binding_name="lollms", # Can be a dummy if only using TTM
             ttm_binding_name=args.ttm_binding,
             ttm_binding_config=ttm_binding_config
         )

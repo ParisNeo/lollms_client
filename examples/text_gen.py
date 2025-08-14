@@ -3,7 +3,7 @@ from lollms_client import LollmsClient
 # Initialize the LollmsClient instance
 lc = LollmsClient(llm_binding_name="lollms", llm_binding_config={
         "model_name": "ollama/gemma3:12b",
-        "service_key": "lollms_m1fOU6eS_HXTc09wA9CtCl-yyJBGpaqcvPtOvMqANKPZL9_PEn18",
+        "service_key": "lollms_m1fOU6eS_HXTc09wA9CtCl-yyJBGpaqcvPtOvMqANKPZL9_PEn18",# change this to your actual service key
     })
 #lc = LollmsClient("ollama", model_name="mistral-nemo:latest")
 #lc = LollmsClient("llamacpp", models_path=r"E:\drumber", model_name="llava-v1.6-mistral-7b.Q3_K_XS.gguf")
