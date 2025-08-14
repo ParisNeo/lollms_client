@@ -21,13 +21,13 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 *   🤖 **Function Calling with MCP:** Empowers LLMs to use external tools and functions through the Model Context Protocol (MCP), with built-in support for local Python tool execution via `local_mcp` binding and its default tools (file I/O, internet search, Python interpreter, image generation).
 *   🎭 **Personalities as Agents:** Personalities can now define their own set of required tools (MCPs) and have access to static or dynamic knowledge bases (`data_source`), turning them into self-contained, ready-to-use agents.
 *   🚀 **Streaming & Callbacks:** Efficiently handle real-time text generation with customizable callback functions, including during MCP interactions.
-*   📑 **Sequential Summarization:** A `summarize` method to process and summarize texts that exceed the model's context window.
+*   📑 **Sequential Summarization:** A `sequential_summarize` method to process and summarize texts that exceed the model's context window.
 *   📝 **Advanced Structured Content Generation:** Reliably generate structured JSON output from natural language prompts using the `generate_structured_content` helper method.
 *   💬 **Advanced Discussion Management:** Robustly manage conversation histories with `LollmsDiscussion`, featuring branching, context exporting, and automatic pruning.
 *   🧠 **Persistent Memory & Data Zones:** `LollmsDiscussion` now supports multiple, distinct data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field. This allows for sophisticated context layering and state management.
 *   ✍️ **Automatic Memorization:** A new `memorize()` method allows the AI to analyze a conversation and extract key facts, appending them to the long-term `memory` for recall in future sessions.
 *   📊 **Detailed Context Analysis:** The `get_context_status()` method now provides a rich, detailed breakdown of the prompt context, showing the content and token count for each individual component (system prompt, data zones, message history).
-*   ⚙️ **Configuration Management:** Flexible ways to configure bindings and generation parameters.
+*   ⚙️ **Standardized Configuration Management:** A unified dictionary-based system (`llm_binding_config`) to configure any binding in a consistent manner.
 *   🧩 **Extensible:** Designed to easily incorporate new LLM backends and modality services, including custom MCP toolsets.
 *   📝 **High-Level Operations:** Includes convenience methods for complex tasks like sequential summarization and deep text analysis directly within `LollmsClient`.
 
@@ -62,12 +62,14 @@ def simple_streaming_callback(chunk: str, msg_type: MSG_TYPE, params=None, metad
     return True # True to continue streaming
 
 try:
-    # Initialize client to connect to a LoLLMs server
-    # For other backends, change 'binding_name' and provide necessary parameters.
-    # See below for detailed initialization examples for various bindings.
+    # Initialize client to connect to a LoLLMs server.
+    # All binding-specific parameters now go into the 'llm_binding_config' dictionary.
     lc = LollmsClient(
-        binding_name="lollms",
-        host_address="http://localhost:9600"
+        llm_binding_name="lollms", # This is the default binding
+        llm_binding_config={
+            "host_address": "http://localhost:9642", # Default port is now 9642
+            "service_key": "your_lollms_api_key_here" # Get key from LoLLMs UI -> User Settings
+        }
     )
 
     prompt = "Tell me a fun fact about space."
@@ -94,7 +96,7 @@ except ValueError as ve:
     ASCIIColors.error(f"Initialization Error: {ve}")
     ASCIIColors.info("Ensure a LoLLMs server is running or configure another binding.")
 except ConnectionRefusedError:
-    ASCIIColors.error("Connection refused. Is the LoLLMs server running at http://localhost:9600?")
+    ASCIIColors.error("Connection refused. Is the LoLLMs server running at http://localhost:9642?")
 except Exception as e:
     ASCIIColors.error(f"An unexpected error occurred: {e}")
 
@@ -114,10 +116,13 @@ def streaming_callback_for_messages(chunk: str, msg_type: MSG_TYPE, params=None,
     return True
 
 try:
+    # Example for an Ollama binding
     lc = LollmsClient(
-        binding_name="ollama", # Or "openai", "claude", "gemini", etc.
-        model_name="llama3",
-        host_address="http://localhost:11434" # Adjust for your binding
+        llm_binding_name="ollama", 
+        llm_binding_config={
+            "model_name": "llama3",
+            "host_address": "http://localhost:11434" # Default Ollama address
+        }
     )
 
     # Define the conversation history as a list of messages
@@ -151,7 +156,7 @@ The `generate_structured_content` method is a powerful utility for forcing an LL
 from lollms_client import LollmsClient
 import json
 
-lc = LollmsClient(binding_name="ollama", model_name="llama3")
+lc = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
 
 text_block = "John Doe is a 34-year-old software engineer from New York. He loves hiking and Python programming."
 
@@ -167,7 +172,7 @@ output_template = {
 # Generate the structured data
 extracted_data = lc.generate_structured_content(
     prompt=f"Extract the relevant information from the following text:\n\n{text_block}",
-    schema=output_template # Note: parameter is 'schema', not 'output_format'
+    schema=output_template # Note: parameter is 'schema'
 )
 
 if extracted_data:
@@ -196,9 +201,11 @@ from ascii_colors import ASCIIColors
 
 # Initialize LollmsClient
 lc = LollmsClient(
-    binding_name="ollama", 
-    model_name="llama3",
-    host_address="http://localhost:11434"
+    llm_binding_name="ollama", 
+    llm_binding_config={
+        "model_name": "llama3",
+        "host_address": "http://localhost:11434"
+    }
 )
 
 # Create a new discussion. For persistent discussions, pass a db_manager.
@@ -267,7 +274,7 @@ import json
 
 # --- 1. Setup a persistent database for our discussion ---
 db_manager = LollmsDataManager('sqlite:///my_assistant.db')
-lc = LollmsClient(binding_name="ollama", model_name="llama3")
+lc = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
 
 # Try to load an existing discussion or create a new one
 discussion_id = "user_assistant_chat_1"
@@ -380,7 +387,7 @@ def create_dummy_image(text):
     return b64
 
 # --- 1. Setup ---
-lc = LollmsClient(binding_name="ollama", model_name="llava")
+lc = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llava"})
 discussion = LollmsDiscussion.create_new(lollms_client=lc)
 
 # --- 2. Add a message with multiple images ---
@@ -489,9 +496,12 @@ try:
     )
 
     # --- 3. Initialize the Client and Discussion ---
+    # A code-specialized model is recommended
     lc = LollmsClient(
-        binding_name="ollama",          # Or any capable model binding
-        model_name="codellama",         # A code-specialized model is recommended
+        llm_binding_name="ollama",          
+        llm_binding_config={
+            "model_name": "codellama"
+        },
         mcp_binding_name="local_mcp"    # Enable the local tool execution engine
     )
     discussion = LollmsDiscussion.create_new(lollms_client=lc)
@@ -547,27 +557,58 @@ This example showcases how `lollms-client` allows you to build powerful, knowled
 
 `lollms-client` supports a wide range of LLM backends through its binding system. This section provides practical examples of how to initialize `LollmsClient` for each of the major supported bindings.
 
-### A Note on Configuration
+### A New Configuration Model
 
-The recommended way to provide credentials and other binding-specific settings is through the `llm_binding_config` dictionary during `LollmsClient` initialization. While many bindings can fall back to reading environment variables (e.g., `OPENAI_API_KEY`), passing them explicitly in the config is clearer and less error-prone.
+Configuration for all bindings has been unified. Instead of passing parameters like `host_address` or `model_name` directly to the `LollmsClient` constructor, you now pass them inside a single dictionary: `llm_binding_config`.
+
+This approach provides a clean, consistent, and extensible way to manage settings for any backend. Each binding defines its own set of required and optional parameters (e.g., `host_address`, `model_name`, `service_key`, `n_gpu_layers`).
 
 ```python
 # General configuration pattern
 lc = LollmsClient(
-    binding_name="your_binding_name",
-    model_name="a_model_name",
+    llm_binding_name="your_binding_name",
     llm_binding_config={
-        "specific_api_key_param": "your_api_key_here",
-        "another_specific_param": "some_value"
+        "parameter_1_for_this_binding": "value_1",
+        "parameter_2_for_this_binding": "value_2",
+        # ... and so on
     }
 )
 ```
 
 ---
 
-### 1. Local Bindings
+### 1. Core and Local Server Bindings
 
-These bindings run models directly on your local machine, giving you full control and privacy.
+These bindings connect to servers running on your local network, including the core LoLLMs server itself.
+
+#### **LoLLMs (Default Binding)**
+
+This connects to a running LoLLMs service, which acts as a powerful backend providing access to models, personalities, and tools. This is the default and most feature-rich way to use `lollms-client`.
+
+**Prerequisites:**
+*   A LoLLMs server instance installed and running.
+*   An API key generated from the LoLLMs web UI (under User Settings).
+
+**Usage:**
+
+```python
+from lollms_client import LollmsClient
+
+# The default port for a LoLLMs server is 9642 (a nod to The Hitchhiker's Guide to the Galaxy).
+# The API key is required and can also be set via the LOLLMS_API_KEY environment variable.
+config = {
+    "host_address": "http://localhost:9642",
+    "service_key": "your_lollms_api_key_here"
+}
+
+lc = LollmsClient(
+    llm_binding_name="lollms", # This is the default, so specifying it is optional
+    llm_binding_config=config
+)
+
+response = lc.generate_text("What is the answer to life, the universe, and everything?")
+print(response)
+```
 
 #### **Ollama**
 
@@ -584,9 +625,11 @@ from lollms_client import LollmsClient
 
 # Configuration for a local Ollama server
 lc = LollmsClient(
-    binding_name="ollama",
-    model_name="llama3",  # Or any other model you have pulled
-    host_address="http://localhost:11434" # Default Ollama address
+    llm_binding_name="ollama",
+    llm_binding_config={
+        "model_name": "llama3",  # Or any other model you have pulled
+        "host_address": "http://localhost:11434" # Default Ollama address
+    }
 )
 
 # Now you can use lc.generate_text(), lc.chat(), etc.
@@ -607,23 +650,22 @@ The `pythonllamacpp` binding loads and runs GGUF model files directly using the 
 ```python
 from lollms_client import LollmsClient
 
-# --- Configuration for Llama.cpp ---
 # Path to your GGUF model file
 MODEL_PATH = "/path/to/your/model.gguf" 
 
 # Binding-specific configuration
-LLAMACPP_CONFIG = {
-    "n_gpu_layers": -1,  # -1 for all layers to GPU, 0 for CPU
-    "n_ctx": 4096,       # Context size
-    "seed": -1,          # -1 for random seed
-    "chat_format": "chatml" # Or another format like 'llama-2'
+config = {
+    "model_path": MODEL_PATH, # The path to the GGUF file
+    "n_gpu_layers": -1,       # -1 for all layers to GPU, 0 for CPU
+    "n_ctx": 4096,            # Context size
+    "seed": -1,               # -1 for random seed
+    "chat_format": "chatml"   # Or another format like 'llama-2'
 }
 
 try:
     lc = LollmsClient(
-        binding_name="pythonllamacpp",
-        model_name=MODEL_PATH, # For this binding, model_name is the file path
-        llm_binding_config=LLAMACPP_CONFIG
+        llm_binding_name="pythonllamacpp",
+        llm_binding_config=config
     )
 
     response = lc.generate_text("Write a recipe for a great day.")
@@ -653,14 +695,12 @@ Connects to the official OpenAI API to use models like GPT-4o, GPT-4, and GPT-3.
 ```python
 from lollms_client import LollmsClient
 
-OPENAI_CONFIG = {
-    "service_key": "your_openai_api_key_here" # sk-...
-}
-
 lc = LollmsClient(
-    binding_name="openai",
-    model_name="gpt-4o",
-    llm_binding_config=OPENAI_CONFIG
+    llm_binding_name="openai",
+    llm_binding_config={
+        "model_name": "gpt-4o",
+        "service_key": "your_openai_api_key_here" # sk-...
+    }
 )
 
 response = lc.generate_text("What is the difference between AI and machine learning?")
@@ -679,14 +719,12 @@ Connects to Google's Gemini family of models via the Google AI Studio API.
 ```python
 from lollms_client import LollmsClient
 
-GEMINI_CONFIG = {
-    "service_key": "your_google_api_key_here"
-}
-
 lc = LollmsClient(
-    binding_name="gemini",
-    model_name="gemini-1.5-pro-latest",
-    llm_binding_config=GEMINI_CONFIG
+    llm_binding_name="gemini",
+    llm_binding_config={
+        "model_name": "gemini-1.5-pro-latest",
+        "service_key": "your_google_api_key_here"
+    }
 )
 
 response = lc.generate_text("Summarize the plot of 'Dune' in three sentences.")
@@ -705,14 +743,12 @@ Connects to Anthropic's API to use the Claude family of models, including Claude
 ```python
 from lollms_client import LollmsClient
 
-CLAUDE_CONFIG = {
-    "service_key": "your_anthropic_api_key_here"
-}
-
 lc = LollmsClient(
-    binding_name="claude",
-    model_name="claude-3-5-sonnet-20240620",
-    llm_binding_config=CLAUDE_CONFIG
+    llm_binding_name="claude",
+    llm_binding_config={
+        "model_name": "claude-3-5-sonnet-20240620",
+        "service_key": "your_anthropic_api_key_here"
+    }
 )
 
 response = lc.generate_text("What are the core principles of constitutional AI?")
@@ -738,15 +774,12 @@ Model names must be specified in the format `provider/model-name`.
 ```python
 from lollms_client import LollmsClient
 
-OPENROUTER_CONFIG = {
-    "open_router_api_key": "your_openrouter_api_key_here"
-}
-
-# Example using a Claude model through OpenRouter
 lc = LollmsClient(
-    binding_name="open_router",
-    model_name="anthropic/claude-3-haiku-20240307",
-    llm_binding_config=OPENROUTER_CONFIG
+    llm_binding_name="open_router",
+    llm_binding_config={
+        "model_name": "anthropic/claude-3-haiku-20240307",
+        "open_router_api_key": "your_openrouter_api_key_here"
+    }
 )
 
 response = lc.generate_text("Explain what an API aggregator is, as if to a beginner.")
@@ -765,14 +798,12 @@ While Groq is a direct provider, it's famous as an aggregator of speed. It runs 
 ```python
 from lollms_client import LollmsClient
 
-GROQ_CONFIG = {
-    "groq_api_key": "your_groq_api_key_here"
-}
-
 lc = LollmsClient(
-    binding_name="groq",
-    model_name="llama3-8b-8192",
-    llm_binding_config=GROQ_CONFIG
+    llm_binding_name="groq",
+    llm_binding_config={
+        "model_name": "llama3-8b-8192",
+        "groq_api_key": "your_groq_api_key_here"
+    }
 )
 
 response = lc.generate_text("Write a 3-line poem about incredible speed.")
@@ -793,14 +824,12 @@ This connects to the serverless Hugging Face Inference API, allowing experimenta
 ```python
 from lollms_client import LollmsClient
 
-HF_CONFIG = {
-    "hf_api_key": "your_hugging_face_token_here"
-}
-
 lc = LollmsClient(
-    binding_name="hugging_face_inference_api",
-    model_name="google/gemma-1.1-7b-it",
-    llm_binding_config=HF_CONFIG
+    llm_binding_name="hugging_face_inference_api",
+    llm_binding_config={
+        "model_name": "google/gemma-1.1-7b-it",
+        "hf_api_key": "your_hugging_face_token_here"
+    }
 )
 
 response = lc.generate_text("Write a short story about a robot who discovers music.")
@@ -818,9 +847,11 @@ from ascii_colors import ASCIIColors
 try:
     # Initialize client for Ollama (or any other binding)
     lc = LollmsClient(
-        binding_name="ollama",
-        model_name="llama3", # A default model is still required for initialization
-        host_address="http://localhost:11434"
+        llm_binding_name="ollama",
+        llm_binding_config={
+            "host_address": "http://localhost:11434"
+            # model_name is not needed just to list models
+        }
     )
 
     ASCIIColors.yellow("\nListing available models for the current binding:")
@@ -844,7 +875,7 @@ except Exception as e:
 
 ### Sequential Summarization for Long Texts
 
-When dealing with a document, article, or transcript that is too large to fit into a model's context window, the `summarize` method is the solution. It intelligently chunks the text, summarizes each piece, and then synthesizes those summaries into a final, coherent output.
+When dealing with a document, article, or transcript that is too large to fit into a model's context window, the `sequential_summarize` method is the solution. It intelligently chunks the text, summarizes each piece, and then synthesizes those summaries into a final, coherent output.
 
 ```python
 from lollms_client import LollmsClient, MSG_TYPE
@@ -858,7 +889,7 @@ the Analytical Engine, a mechanical computer that was never fully built but laid
 ...
 (many, many paragraphs later)
 ...
-Today, quantum computing promises to revolutionize the field once again, tackling problems currently intractable 
+Today, a new revolution is on the horizon with quantum computing, which promises to solve problems that are currently intractable 
 for even the most powerful supercomputers. Researchers are exploring qubits and quantum entanglement to create 
 machines that will redefine what is computationally possible, impacting fields from medicine to materials science.
 """ * 50 # Simulate a very long text
@@ -872,15 +903,15 @@ def summary_callback(chunk: str, msg_type: MSG_TYPE, params: dict = None, **kwar
     return True
 
 try:
-    lc = LollmsClient(binding_name="ollama", model_name="llama3")
+    lc = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
 
     # The contextual prompt guides the focus of the summary
     context_prompt = "Summarize the text, focusing on the key technological milestones and their inventors."
 
     ASCIIColors.blue("--- Starting Sequential Summarization ---")
     
-    final_summary = lc.sequential_summarize( # Note: changed from summarize to sequential_summarize
-        text_to_process=long_text, # Note: changed from text_to_summarize to text_to_process
+    final_summary = lc.sequential_summarize(
+        text_to_process=long_text,
         contextual_prompt=context_prompt,
         chunk_size_tokens=1000, # Adjust based on your model's context size
         overlap_tokens=200,
