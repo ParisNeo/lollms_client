@@ -68,7 +68,7 @@ try:
     lc = LollmsClient(
         llm_binding_name="lollms", # This is the default binding
         llm_binding_config={
-            "host_address": "http://localhost:9642", # Default port for LoLLMs WebUI
+            "host_address": "http://localhost:9642", # Default port for LoLLMs server
             # "service_key": "your_lollms_api_key_here" # Get key from LoLLMs UI -> User Settings if security is enabled
         }
     )
