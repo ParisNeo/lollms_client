@@ -314,7 +314,7 @@ class LollmsDataManager:
             A list of dictionaries representing the matching discussions.
         """
         with self.get_session() as session:
-            query = session.query(self.DiscussionModel)
+            query = query = session.query(self.DiscussionModel)
             for key, value in criteria.items():
                 if hasattr(self.DiscussionModel, key):
                     query = query.filter(getattr(self.DiscussionModel, key).ilike(f"%{value}%"))
@@ -647,29 +647,117 @@ class LollmsDiscussion:
             self._session.refresh(self._db_discussion, ['messages'])
         self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
 
+    def _find_deepest_leaf(self, start_id: Optional[str]) -> Optional[str]:
+        """
+        Finds the ID of the most recent leaf message in the branch starting from start_id.
+        If start_id is None or not found, it finds the most recent leaf in the entire discussion.
+        A leaf message is one that has no children.
+        """
+        if not self._message_index:
+            return None
+
+        self._rebuild_message_index() # Ensure the internal index is up-to-date
+
+        # Build an adjacency list (children_of_parent_id -> [child1_id, child2_id])
+        children_of = {msg_id: [] for msg_id in self._message_index.keys()}
+        for msg_id, msg_obj in self._message_index.items():
+            if msg_obj.parent_id in children_of: # Only if parent exists in current index
+                children_of[msg_obj.parent_id].append(msg_id)
+
+        # Helper to find the most recent leaf from a list of messages
+        def get_most_recent_leaf_from_list(message_list: List[Any]) -> Optional[str]:
+            if not message_list:
+                return None
+            leaves_in_list = [msg for msg in message_list if not children_of.get(msg.id)]
+            if leaves_in_list:
+                return max(leaves_in_list, key=lambda msg: msg.created_at).id
+            return None
+
+        if start_id and start_id in self._message_index:
+            # Perform BFS to get all descendants including the start_id itself
+            queue = [self._message_index[start_id]]
+            visited_ids = {start_id}
+            descendants_and_self = [self._message_index[start_id]]
+            
+            head = 0
+            while head < len(queue):
+                current_msg_obj = queue[head]
+                head += 1
+                
+                for child_id in children_of.get(current_msg_obj.id, []):
+                    if child_id not in visited_ids:
+                        visited_ids.add(child_id)
+                        child_obj = self._message_index[child_id]
+                        queue.append(child_obj)
+                        descendants_and_self.append(child_obj)
+            
+            # Now find the most recent leaf among these descendants and the start_id itself
+            result_leaf_id = get_most_recent_leaf_from_list(descendants_and_self)
+            if result_leaf_id:
+                return result_leaf_id
+            else:
+                # If no actual leaves were found within the branch rooted at start_id,
+                # then start_id itself is the 'leaf' of its known subgraph IF it has no children.
+                if not children_of.get(start_id):
+                    return start_id
+                return None # The start_id is not a leaf and has no reachable leaves.
+
+        else: # No specific starting point, find the most recent leaf in the entire discussion
+            all_messages_in_discussion = list(self._message_index.values())
+            return get_most_recent_leaf_from_list(all_messages_in_discussion)
+
+
     def _validate_and_set_active_branch(self):
         """
-        Ensures that self.active_branch_id points to an existing message.
-        If it's None or points to a non-existent message, it attempts to set it
-        to the ID of the most recently created message in the discussion.
+        Ensures that self.active_branch_id points to an existing message and is a leaf message.
+        If it's None, points to a non-existent message, or points to a non-leaf message,
+        it attempts to set it to the ID of the most recently created leaf message in the entire discussion.
+        If a valid active_branch_id exists but is not a leaf, it will try to find the deepest leaf
+        from that point onwards.
+        This method directly updates the underlying _db_discussion object to avoid recursion.
         """
-        if self.active_branch_id is None or self.active_branch_id not in self._message_index:
-            ASCIIColors.warning(f"Active branch ID '{self.active_branch_id}' is invalid or missing for discussion {self.id}. Attempting to select a new one.")
-            
-            all_messages_orms = list(self._message_index.values())
-            if all_messages_orms:
-                # Sort by creation date in descending order to find the most recent
-                most_recent_message = max(all_messages_orms, key=lambda msg: msg.created_at)
-                self.active_branch_id = most_recent_message.id
-                ASCIIColors.success(f"New active branch ID for discussion {self.id} set to: {self.active_branch_id} (most recent message).")
-                # Mark for save if DB backed and autosave is on
-                # No need to call self.touch() directly here if this method is called within commit() or init()
-                # as init() will lead to commit() if a new discussion is created and commit() handles saving.
-                # If only _validate_and_set_active_branch is called, then a touch is needed.
-                self.touch() # This will ensure it's saved if autosave is on
+        self._rebuild_message_index() # Ensure index is fresh
+
+        # If the discussion is empty, silently set active_branch_id to None and exit.
+        if not self._message_index:
+            object.__setattr__(self._db_discussion, 'active_branch_id', None)
+            return
+
+        current_active_id = self._db_discussion.active_branch_id # Access direct attribute
+
+        # Case 1: Active branch ID is invalid or missing
+        if current_active_id is None or current_active_id not in self._message_index:
+            ASCIIColors.warning(f"Active branch ID '{current_active_id}' is invalid or missing for discussion {self.id}. Attempting to select a new leaf.")
+            new_active_leaf_id = self._find_deepest_leaf(None) # Find most recent leaf in entire discussion
+            if new_active_leaf_id:
+                object.__setattr__(self._db_discussion, 'active_branch_id', new_active_leaf_id)
+                ASCIIColors.success(f"New active branch ID for discussion {self.id} set to: {new_active_leaf_id} (most recent overall leaf).")
             else:
-                self.active_branch_id = None
-                ASCIIColors.yellow(f"No messages available in discussion {self.id}. Active branch ID remains None.")
+                # This else block should theoretically not be reached if _message_index is not empty,
+                # as _find_deepest_leaf(None) would find a leaf. Added for robustness.
+                object.__setattr__(self, '_db_discussion.active_branch_id', None) # Use setattr for direct ORM access
+                ASCIIColors.yellow(f"Could not find any leaf messages in discussion {self.id}. Active branch ID remains None.")
+        
+        # Case 2: Active branch ID exists, but is it a leaf?
+        else:
+            # Determine if current_active_id is a leaf
+            children_of_current_active = []
+            for msg_obj in self._message_index.values():
+                if msg_obj.parent_id == current_active_id:
+                    children_of_current_active.append(msg_obj.id)
+
+            if children_of_current_active: # If it has children, it's not a leaf
+                ASCIIColors.warning(f"Active branch ID '{current_active_id}' is not a leaf message. Finding deepest leaf from this point.")
+                new_active_leaf_id = self._find_deepest_leaf(current_active_id)
+                if new_active_leaf_id and new_active_leaf_id != current_active_id:
+                    object.__setattr__(self._db_discussion, 'active_branch_id', new_active_leaf_id)
+                    ASCIIColors.success(f"Active branch ID for discussion {self.id} updated to: {new_active_leaf_id} (deepest leaf descendant).")
+                elif new_active_leaf_id is None: # Should not happen if current_active_id exists
+                    ASCIIColors.warning(f"Could not find a deeper leaf from '{current_active_id}'. Keeping current ID.")
+                else:
+                    ASCIIColors.info(f"Active branch ID '{current_active_id}' is already the deepest leaf. No change needed.")
+            else:
+                ASCIIColors.info(f"Active branch ID '{current_active_id}' is already a leaf. No change needed.")
 
 
     def touch(self):
@@ -706,7 +794,7 @@ class LollmsDiscussion:
         try:
             self._session.commit()
             self._rebuild_message_index() # Rebuild index after commit to reflect DB state
-            self._validate_and_set_active_branch() # Validate active branch after commit
+            # self._validate_and_set_active_branch() # REMOVED: This validation is now handled by direct operations or on load.
         except Exception as e:
             self._session.rollback()
             raise e
@@ -765,8 +853,8 @@ class LollmsDiscussion:
             new_msg_orm = SimpleNamespace(**message_data)
             self._db_discussion.messages.append(new_msg_orm)
             
+        self.active_branch_id = msg_id # New message is always a leaf
         self._message_index[msg_id] = new_msg_orm
-        self.active_branch_id = msg_id
         self.touch()
         return LollmsMessage(self, new_msg_orm)
     
@@ -846,6 +934,7 @@ class LollmsDiscussion:
         max_reasoning_steps: int = 20,
         images: Optional[List[str]] = None,
         debug: bool = False,
+        remove_thinking_blocks:bool = True,
         **kwargs
     ) -> Dict[str, 'LollmsMessage']:
         """Main interaction method that can invoke the dynamic, multi-modal agent.
@@ -875,6 +964,11 @@ class LollmsDiscussion:
             images: A list of base64-encoded images provided by the user, which will
                     be passed to the agent or a multi-modal LLM.
             debug: If True, prints full prompts and raw AI responses to the console.
+            remove_thinking_blocks: If True, removes any thinking blocks from the final
+                                   response content, cleaning it up for user display.
+            branch_tip_id: If provided, this is the ID of the message to use as the
+                           starting point for the branch. If None, uses the current
+                           active branch tip.
             **kwargs: Additional keyword arguments passed to the underlying generation
                       methods, such as 'streaming_callback'.
 
@@ -894,7 +988,7 @@ class LollmsDiscussion:
                     if callback:
                         callback("Loading static personality data...", MSG_TYPE.MSG_TYPE_STEP, {"id": "static_data_loading"})
                     if personality.data_source:
-                        self.personality_data_zone = personality.data_source.strip()
+                        self.personality_data_zone = personality.data_zone.strip()
 
                 elif callable(personality.data_source):
                     # --- Dynamic Data Source ---
@@ -970,8 +1064,10 @@ class LollmsDiscussion:
                 **kwargs
             )
         else: # Regeneration logic
-            if self.active_branch_id not in self._message_index:
-                raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
+            # _validate_and_set_active_branch ensures active_branch_id is valid and a leaf.
+            # So, if we are regenerating, active_branch_id must be valid.
+            if self.active_branch_id not in self._message_index: # Redundant check, but safe
+                 raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
             user_msg_orm = self._message_index[self.active_branch_id]
             if user_msg_orm.sender_type != 'user':
                 raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
@@ -1018,7 +1114,10 @@ class LollmsDiscussion:
             if isinstance(final_raw_response, dict) and final_raw_response.get("status") == "error":
                 raise Exception(final_raw_response.get("message", "Unknown error from lollmsClient.chat"))
             else:
-                final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
+                if remove_thinking_blocks:
+                    final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
+                else:
+                    final_content = final_raw_response
             final_scratchpad = None
 
         end_time = datetime.now()
@@ -1041,8 +1140,8 @@ class LollmsDiscussion:
             tokens=token_count,
             generation_speed=tok_per_sec,
             parent_id=user_msg.id,
-            model_name = self.lollmsClient.binding.model_name,
-            binding_name = self.lollmsClient.binding.binding_name,
+            model_name = self.lollmsClient.llm.model_name,
+            binding_name = self.lollmsClient.llm.binding_name,
             metadata=message_meta
         )
         
@@ -1051,55 +1150,76 @@ class LollmsDiscussion:
             
         return {"user_message": user_msg, "ai_message": ai_message_obj}
 
-    def regenerate_branch(self, branch_tip_id=None, **kwargs) -> Dict[str, 'LollmsMessage']:
-        """Regenerates the last AI response in the active branch.
+    def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, 'LollmsMessage']:
+        """Regenerates the AI response for a given message or the active branch's AI response.
 
-        It deletes the previous AI response and calls chat() again with the
-        same user prompt.
+        If the target is an AI message, it's deleted and its children are re-parented to its parent
+        (the user message). A new AI response is then generated from that user message.
+        If the target is a user message, all its existing AI children are deleted, and their
+        descendants are re-parented to the user message. A new AI response is then generated.
 
         Args:
+            branch_tip_id (Optional[str]): The ID of the message to regenerate from.
+                                           If None, the currently active branch tip is used.
             **kwargs: Additional arguments for the chat() method.
 
         Returns:
             A dictionary with the user and the newly generated AI message.
         """
-        if not branch_tip_id:
-            branch_tip_id = self.active_branch_id
-        if not self.active_branch_id or self.active_branch_id not in self._message_index:
-            if len(self._message_index)>0:
-                ASCIIColors.warning("No active message to regenerate from.\n")
-                ASCIIColors.warning(f"Using last available message:{list(self._message_index.keys())[-1]}\n")
-                # Fix for when branch_tip_id is not provided
-                branch_tip_id = list(self._message_index.keys())[-1]
-            else:
-                raise ValueError("No active message to regenerate from.")
-        
-        last_message_orm = self._message_index[self.active_branch_id]
-        
-        if last_message_orm.sender_type == 'assistant':
-            parent_id = last_message_orm.parent_id
-            if not parent_id:
-                raise ValueError("Cannot regenerate from an assistant message with no parent.")
-                
-            last_message_id = last_message_orm.id
-            self._db_discussion.messages.remove(last_message_orm)
-            del self._message_index[last_message_id]
-            if self._is_db_backed:
-                self._messages_to_delete_from_db.add(last_message_id)
-            
-            self.active_branch_id = parent_id
-            # We now pass the parent ID as the tip, because that's what we want to generate from
-            return self.chat(user_message="", add_user_message=False, branch_tip_id=parent_id, **kwargs)
+        self._rebuild_message_index() # Ensure index is fresh before operations
 
-        # If the last message is a user message, we can just call chat on it
-        return self.chat(user_message="", add_user_message=False, branch_tip_id=branch_tip_id, **kwargs)
-    
+        target_id = branch_tip_id if branch_tip_id is not None else self.active_branch_id
+
+        if not target_id or target_id not in self._message_index:
+            raise ValueError("Regeneration failed: Target message ID not found or discussion is empty.")
+
+        target_message_orm = self._message_index[target_id]
+        
+        # Determine the user message ID that will be the parent for the new AI generation
+        if target_message_orm.sender_type == 'assistant':
+            user_parent_id = target_message_orm.parent_id
+            if user_parent_id is None or user_parent_id not in self._message_index:
+                raise ValueError("Regeneration failed: Assistant message has no valid user parent to regenerate from.")
+            user_msg_to_regenerate_from = self._message_index[user_parent_id]
+        elif target_message_orm.sender_type == 'user':
+            user_msg_to_regenerate_from = target_message_orm
+            user_parent_id = user_msg_to_regenerate_from.id
+        else:
+            raise ValueError(f"Regeneration failed: Target message '{target_id}' is of an unexpected sender type '{target_message_orm.sender_type}'.")
+
+        ai_messages_to_overwrite_ids = set()
+        if target_message_orm.sender_type == 'assistant':
+            # If target is an AI, we only remove this specific AI message.
+            ai_messages_to_overwrite_ids.add(target_message_orm.id)
+        elif target_message_orm.sender_type == 'user':
+            # If target is a user, we remove ALL AI children of this user message.
+            for msg_obj in self._db_discussion.messages:
+                if msg_obj.parent_id == user_msg_to_regenerate_from.id and msg_obj.sender_type == 'assistant':
+                    ai_messages_to_overwrite_ids.add(msg_obj.id)
+        
+        if not ai_messages_to_overwrite_ids:
+            ASCIIColors.warning(f"No AI messages found to regenerate from '{target_id}'. This might be unintended.")
+            # If no AI messages to overwrite, just proceed with generation from user message.
+            # No changes to existing messages needed, so skip the cleanup phase.
+            self.active_branch_id = user_msg_to_regenerate_from.id # Ensure active branch is correct for chat
+            return self.chat(user_message="", add_user_message=False, branch_tip_id=user_msg_to_regenerate_from.id, **kwargs)
+
+        # --- Phase 1: Generate new AI response ---
+        # The user message for the new generation is user_msg_to_regenerate_from
+        self.active_branch_id = user_msg_to_regenerate_from.id
+        
+        # Call chat with add_user_message=False as the user message already exists (or was just found)
+        # The chat method's add_message will set the new AI message as the active_branch_id.
+        return self.chat(user_message="", add_user_message=False, branch_tip_id=user_msg_to_regenerate_from.id, **kwargs)
+
     def delete_branch(self, message_id: str):
         """Deletes a message and its entire descendant branch.
 
         This method removes the specified message and any messages that have it
         as a parent or an ancestor. After deletion, the active branch is moved
-        to the parent of the deleted message.
+        to the parent of the deleted message. If the parent doesn't exist or is also
+        deleted, it finds the most recent remaining message. Crucially, it re-parented
+        children of the deleted message to the parent of the deleted message.
 
         This operation is only supported for database-backed discussions.
 
@@ -1119,6 +1239,15 @@ class LollmsDiscussion:
         if message_id not in self._message_index:
             raise ValueError(f"Message with ID '{message_id}' not found in the discussion.")
 
+        original_message_obj = self._message_index[message_id]
+        new_parent_id_for_children = original_message_obj.parent_id
+        
+        # Identify direct children of the message being deleted (before removal from _db_discussion.messages)
+        children_of_deleted_message_ids = [
+            msg_obj.id for msg_obj in self._db_discussion.messages 
+            if msg_obj.parent_id == message_id and msg_obj.id != message_id
+        ]
+
         # Identify all messages to delete (including the one specified and its descendants)
         messages_to_delete_ids = set()
         queue = [message_id]
@@ -1137,9 +1266,15 @@ class LollmsDiscussion:
                 if msg_in_index_obj.parent_id == current_msg_id and msg_in_index_id not in messages_to_delete_ids:
                     queue.append(msg_in_index_id)
 
-        # Store potential new active branch ID (parent of the deleted message)
-        original_message_obj = self._message_index[message_id]
-        prospective_new_active_id = original_message_obj.parent_id
+        # Re-parent children of the deleted message to its parent BEFORE removing messages from _db_discussion.messages
+        reparented_children_count = 0
+        for msg_obj in self._db_discussion.messages:
+            if msg_obj.id in children_of_deleted_message_ids:
+                msg_obj.parent_id = new_parent_id_for_children
+                reparented_children_count += 1
+        
+        if reparented_children_count > 0:
+            ASCIIColors.info(f"Re-parented {reparented_children_count} children from deleted message '{message_id}' to '{new_parent_id_for_children}'.")
 
         # Update the ORM's in-memory list of messages and mark for actual DB deletion
         self._db_discussion.messages = [
@@ -1148,8 +1283,6 @@ class LollmsDiscussion:
         self._messages_to_delete_from_db.update(messages_to_delete_ids)
 
         # Update the internal message index to reflect in-memory changes immediately
-        # This is crucial so subsequent calls to self.get_message or _rebuild_message_index
-        # don't accidentally refer to deleted messages before commit.
         temp_message_index = {}
         for mid, mobj in self._message_index.items():
             if mid not in messages_to_delete_ids:
@@ -1157,26 +1290,18 @@ class LollmsDiscussion:
         object.__setattr__(self, '_message_index', temp_message_index)
 
 
-        # Determine the new active_branch_id
-        # 1. Try the parent of the deleted message (if it still exists and wasn't deleted itself)
-        if (prospective_new_active_id and 
-            prospective_new_active_id not in messages_to_delete_ids and 
-            prospective_new_active_id in self._message_index): # Check existence in updated index
-            
-            self.active_branch_id = prospective_new_active_id
-        else:
-            # 2. If parent is also deleted or doesn't exist, find the most recent remaining message
-            # Sort the remaining messages in reverse chronological order
-            remaining_messages = sorted(
-                [msg_obj for msg_obj in self._db_discussion.messages], # _db_discussion.messages is already updated
-                key=lambda msg: msg.created_at,
-                reverse=True
-            )
-            if remaining_messages:
-                self.active_branch_id = remaining_messages[0].id
-            else:
-                self.active_branch_id = None # Discussion is now completely empty
+        # Determine the new active_branch_id by finding the most recent leaf
+        # We first try to find a leaf descendant from the `new_parent_id_for_children` path.
+        # If that path does not exist or has no leaves, then we search the entire discussion for the most recent leaf.
+        new_active_id = None
+        if new_parent_id_for_children and new_parent_id_for_children in self._message_index:
+            new_active_id = self._find_deepest_leaf(new_parent_id_for_children)
+        
+        if new_active_id is None: # Fallback if direct re-parenting path doesn't yield a leaf
+            new_active_id = self._find_deepest_leaf(None) # Find most recent leaf in the entire remaining discussion
 
+        self.active_branch_id = new_active_id
+        
         self.touch() # Mark for update and auto-save if configured
         print(f"Branch starting at {message_id} ({len(messages_to_delete_ids)} messages) removed. New active branch: {self.active_branch_id}")
         
@@ -1670,7 +1795,7 @@ class LollmsDiscussion:
                     content += f"\n({len(active_images)} image(s) attached)"
                     # Count image tokens
                     for i, image_b64 in enumerate(active_images):
-                        tokens = tokenizer_images(image_b64)
+                        tokens = self.lollmsClient.count_image_tokens(image_b64) # Use self.lollmsClient.count_image_tokens
                         if tokens > 0:
                             total_image_tokens += tokens
                             image_details_list.append({"message_id": msg.id, "index": i, "tokens": tokens})
@@ -1699,7 +1824,7 @@ class LollmsDiscussion:
             img for i, img in enumerate(self.images or [])
             if i < len(self.active_images or []) and self.active_images[i]
         ]
-        discussion_image_tokens = sum(tokenizer_images(img) for img in active_discussion_b64)
+        discussion_image_tokens = sum(self.lollmsClient.count_image_tokens(img) for img in active_discussion_b64) # Use self.lollmsClient.count_image_tokens
         
         # Add a new zone for discussion images for clarity
         if discussion_image_tokens > 0:
@@ -1782,8 +1907,39 @@ class LollmsDiscussion:
 
         return active_discussion_images
 
-    def switch_to_branch(self, branch_id):
-        self.active_branch_id = branch_id
+    def switch_to_branch(self, branch_id: str):
+        """
+        Switches the active discussion branch to the specified message ID.
+        It then finds the deepest leaf descendant of that message and sets it as the active branch.
+        """
+        if branch_id not in self._message_index:
+            ASCIIColors.warning(f"Attempted to switch to non-existent branch ID: {branch_id}. No action taken.")
+            return
+
+        # Find the deepest leaf in the branch starting from the provided branch_id
+        # This ensures the active_branch_id is always a leaf
+        new_active_leaf_id = self._find_deepest_leaf(branch_id)
+        
+        if new_active_leaf_id:
+            self.active_branch_id = new_active_leaf_id
+            self.touch() # Mark for saving if autosave is on
+            ASCIIColors.info(f"Switched active branch to leaf: {self.active_branch_id}.")
+        else:
+            # Fallback: If no deeper leaf is found (e.g., branch_id is already a leaf or has no valid descendants)
+            # then set active_branch_id to the provided branch_id.
+            # _find_deepest_leaf handles returning start_id if it's a leaf.
+            # So, if new_active_leaf_id is None, it means the provided branch_id was either not found (already checked)
+            # or it's a non-leaf with no valid leaf descendants. In that edge case, we'll still try to use it.
+            # Re-confirming it is present in the index:
+            if branch_id in self._message_index:
+                self.active_branch_id = branch_id
+                self.touch()
+                ASCIIColors.warning(f"Could not find a deeper leaf from branch ID {branch_id}. Active branch set to {branch_id}.")
+            else:
+                self.active_branch_id = None
+                self.touch()
+                ASCIIColors.error(f"Failed to set active branch: provided ID {branch_id} is invalid and no leaf could be found.")
+
 
     def auto_title(self):
         try:
