@@ -1876,6 +1876,136 @@ class LollmsDiscussion:
         del self.active_images[index]
         self.touch()
         
+    def fix_orphan_messages(self):
+        """
+        Detects and re-chains orphan messages or branches in the discussion.
+        
+        An "orphan message" is one whose parent_id points to a message that
+        does not exist in the discussion, or whose lineage cannot be traced
+        back to a root message (parent_id is None) within the current discussion.
+
+        This method attempts to reconnect such messages by:
+        1. Identifying all messages and their parent-child relationships.
+        2. Finding the true root message(s) of the discussion.
+        3. Identifying all reachable messages from the true root(s).
+        4. Any message not reachable is considered an orphan.
+        5. For each orphan, traces up to find its "orphan branch top"
+           (the highest message in its disconnected chain).
+        6. Re-parents these orphan branch tops to the main discussion's
+           primary root (the oldest root message). If no primary root exists,
+           the oldest orphan branch top becomes the new primary root.
+        """
+        ASCIIColors.info(f"Checking discussion {self.id} for orphan messages...")
+        
+        self._rebuild_message_index() # Ensure the index is fresh
+        
+        all_messages_orms = list(self._message_index.values())
+        if not all_messages_orms:
+            ASCIIColors.yellow("No messages in discussion. Nothing to fix.")
+            return
+
+        message_map = {msg_orm.id: msg_orm for msg_orm in all_messages_orms}
+        
+        # 1. Identify all true root messages (parent_id is None)
+        # And also build a children map for efficient traversal
+        root_messages = []
+        children_map = {msg_id: [] for msg_id in message_map.keys()}
+        
+        for msg_orm in all_messages_orms:
+            if msg_orm.parent_id is None:
+                root_messages.append(msg_orm)
+            elif msg_orm.parent_id in message_map:
+                # Only add to children map if the parent actually exists in this discussion
+                children_map[msg_orm.parent_id].append(msg_orm.id)
+
+        # Sort roots by creation time to find the 'primary' root
+        root_messages.sort(key=lambda msg: msg.created_at)
+        primary_root = root_messages[0] if root_messages else None
+
+        if primary_root:
+            ASCIIColors.info(f"Primary discussion root identified: {primary_root.id} (created at {primary_root.created_at})")
+        else:
+            ASCIIColors.warning("No root message found in discussion initially.")
+
+        # 2. Find all messages reachable from the primary root (or any identified root)
+        reachable_messages = set()
+        queue = []
+        
+        # Add any current roots as starting points for reachability check.
+        for root in root_messages:
+            if root.id not in reachable_messages: # Avoid re-processing if multiple paths lead to same root
+                queue.append(root.id)
+                reachable_messages.add(root.id)
+
+        head = 0
+        while head < len(queue):
+            current_msg_id = queue[head]
+            head += 1
+            
+            for child_id in children_map.get(current_msg_id, []):
+                if child_id not in reachable_messages:
+                    reachable_messages.add(child_id)
+                    queue.append(child_id)
+
+        # 3. Identify orphan messages (those not reachable from any current root)
+        orphan_messages_ids = set(message_map.keys()) - reachable_messages
+        
+        if not orphan_messages_ids:
+            ASCIIColors.success("No orphan messages found. Discussion chain is healthy.")
+            return
+            
+        ASCIIColors.warning(f"Found {len(orphan_messages_ids)} orphan message(s). Attempting to fix...")
+        
+        # 4. Find the "top" message of each orphan branch
+        orphan_branch_tops = set()
+        for orphan_id in orphan_messages_ids:
+            current_id = orphan_id
+            # Trace upwards until parent is None or parent is NOT an orphan
+            # We must use message_map for lookup as parent might be deleted from _message_index
+            while message_map[current_id].parent_id is not None and message_map[current_id].parent_id in orphan_messages_ids:
+                current_id = message_map[current_id].parent_id
+            orphan_branch_tops.add(current_id)
+
+        # Sort orphan branch tops by creation time, oldest first
+        sorted_orphan_tops_orms = sorted(
+            [message_map[top_id] for top_id in orphan_branch_tops], 
+            key=lambda msg: msg.created_at
+        )
+
+        reparented_count = 0
+        
+        if not primary_root:
+            # If there was no primary root, make the oldest orphan top the new primary root
+            if sorted_orphan_tops_orms:
+                new_primary_root_orm = sorted_orphan_tops_orms[0]
+                new_primary_root_orm.parent_id = None # Make it a root
+                ASCIIColors.success(f"Discussion had no root. Set oldest orphan top '{new_primary_root_orm.id}' as new primary root.")
+                primary_root = new_primary_root_orm
+                reparented_count += 1
+                # Remove this one from the list of tops to be reparented
+                sorted_orphan_tops_orms = sorted_orphan_tops_orms[1:]
+            else:
+                ASCIIColors.warning("No orphan branch tops found to create a new root. Discussion remains empty or unrooted.")
+                return
+
+        if primary_root:
+            # Re-parent all remaining orphan branch tops to the primary root
+            for orphan_top_orm in sorted_orphan_tops_orms:
+                if orphan_top_orm.id != primary_root.id: # Ensure not reparenting the primary root to itself
+                    old_parent = orphan_top_orm.parent_id # Store old parent for logging
+                    orphan_top_orm.parent_id = primary_root.id
+                    ASCIIColors.info(f"Re-parented orphan branch top '{orphan_top_orm.id}' (was child of '{old_parent}') to primary root '{primary_root.id}'.")
+                    reparented_count += 1
+        
+        if reparented_count > 0:
+            ASCIIColors.success(f"Successfully re-parented {reparented_count} orphan message(s)/branches.")
+            self.touch() # Mark discussion as updated
+            self.commit() # Commit changes to DB
+            self._rebuild_message_index() # Rebuild index after changes
+        else:
+            ASCIIColors.yellow("No new messages were re-parented (they might have already been roots or discussion was already healthy).")
+
+
     @property
     def system_prompt(self) -> str:
         """Returns the system prompt for this discussion."""
