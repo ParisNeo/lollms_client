@@ -6,7 +6,7 @@ description: |
   A binding for OpenAI's DALL-E text-to-image models (DALL-E 2 and DALL-E 3).
   It connects to the OpenAI API to generate images from text prompts.
 input_parameters:
-  - name: api_key
+  - name: service_key
     type: str
     description: "Your OpenAI API key. The binding requires this to authenticate with the DALL-E API. It can also be provided via the `OPENAI_API_KEY` environment variable."
     mandatory: true

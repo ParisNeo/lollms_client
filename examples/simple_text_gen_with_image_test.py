@@ -4,27 +4,21 @@ from ascii_colors import ASCIIColors, trace_exception
 
 # --- Configuration ---
 # Choose your LLM binding and parameters here
-# Option 1: Default LOLLMS server binding
-# BINDING_NAME = "lollms"
-# HOST_ADDRESS = "http://localhost:9600"
-# MODEL_NAME = None # Server will use its default or last loaded model
-
-# Option 2: Ollama binding
-BINDING_NAME = "ollama"
-HOST_ADDRESS = "http://localhost:11434" # Default Ollama host
-MODEL_NAME = "llava:latest" # Or "llama3:latest", "phi3:latest", etc. - ensure it's pulled in Ollama
-
-# Option 3: llamacpp binding
-# BINDING_NAME = "llamacpp"
-# MODELS_PATH = r"E:\drumber" # Change to your own models folder
-# MODEL_NAME = "llava-v1.6-mistral-7b.Q3_K_XS.gguf" # Change to your vision capable model (make sure you have a mmprj file with the gguf model with the same name but without the quantization name and with mmproj- prefix (mmproj-llava-v1.6-mistral-7b.gguf))
-# You can also add a clip_model_path parameter to your lc_params
+# Ollama binding
+LLM_BINDING_NAME = "ollama"
+LLM_BINDING_CONFIG ={
+    "host_address":"http://localhost:11434",
+    "model_name": "llava:latest"
+}
+# OpenAi binding
+# LLM_BINDING_NAME = "openai"
+# LLM_BINDING_CONFIG ={
+#     "model_name": "o3-mini",
+#     "service_key": "Put your key here"
+# }
+# put the path to your image here
 img = "E:\\drumber\\1711741182996.jpg"
-# Option 3: OpenAI binding (requires OPENAI_API_KEY environment variable or service_key)
-# BINDING_NAME = "openai"
-# HOST_ADDRESS = None # Defaults to OpenAI API
-# MODEL_NAME = "gpt-3.5-turbo"
-# SERVICE_KEY = "sk-your_openai_api_key_here" # Optional, can use env var
+
 
 # --- Callback for streaming ---
 def simple_streaming_callback(chunk: str, msg_type: MSG_TYPE, params=None, metadata=None) -> bool:
@@ -39,27 +33,18 @@ def simple_streaming_callback(chunk: str, msg_type: MSG_TYPE, params=None, metad
     return True
 
 def test_text_generation():
-    ASCIIColors.cyan(f"\n--- Testing Text Generation with '{BINDING_NAME}' binding ---")
+    ASCIIColors.cyan(f"\n--- Testing Text Generation with '{LLM_BINDING_NAME}' binding ---")
 
-    if BINDING_NAME!="llamacpp":
-        ASCIIColors.cyan(f"Host: {HOST_ADDRESS or 'Default'}, Model: {MODEL_NAME or 'Default'}")
+    if LLM_BINDING_NAME!="llamacpp":
+        ASCIIColors.cyan(f"Host: {LLM_BINDING_CONFIG.get('host_address') or 'Default'}, Model: {LLM_BINDING_CONFIG.get('model_name') or 'Default'}")
     else:
-        ASCIIColors.cyan(f"Host: {MODELS_PATH or 'Default'}, Model: {MODEL_NAME or 'Default'}")
+        ASCIIColors.cyan(f"Host: {LLM_BINDING_CONFIG.get('models_path') or 'Default'}, Model: {LLM_BINDING_CONFIG.get('model_name') or 'Default'}")
     try:
         # Initialize LollmsClient
         lc_params = {
-            "binding_name": BINDING_NAME,
-            "model_name": MODEL_NAME,
-            # "service_key": SERVICE_KEY, # Uncomment for OpenAI if needed
+            "llm_binding_name": LLM_BINDING_NAME,
+            "llm_binding_config": LLM_BINDING_CONFIG
         }
-        if BINDING_NAME!="llamacpp":
-            lc_params["host_address"]= HOST_ADDRESS
-            # Remove None host_address for bindings that have internal defaults (like OpenAI)
-            if lc_params["host_address"] is None and BINDING_NAME in ["openai"]:
-                del lc_params["host_address"]
-        else:
-            lc_params["models_path"]= MODELS_PATH
-
 
         lc = LollmsClient(**lc_params)
 
@@ -119,7 +104,7 @@ def test_text_generation():
 
             # Try to use the first available model (or a known one if list is too generic)
             target_model = None
-            if BINDING_NAME == "ollama":
+            if LLM_BINDING_NAME == "ollama":
                 # For Ollama, try using a different small model if available, or the same one
                 if "phi3:latest" in [m.get('name') for m in available_models if isinstance(m, dict)]:
                     target_model = "phi3:latest"
@@ -128,7 +113,7 @@ def test_text_generation():
                      target_model = first_model_entry.get('name', first_model_entry.get('model_name'))
 
 
-            elif BINDING_NAME == "lollms":
+            elif LLM_BINDING_NAME == "lollms":
                 # For lollms, this would typically be a path or server-recognized name
                 # This part is harder to make generic without knowing server's models
                 ASCIIColors.yellow("For 'lollms' binding, ensure the target model is known to the server.")

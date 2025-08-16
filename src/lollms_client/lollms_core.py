@@ -32,7 +32,7 @@ class LollmsClient():
     def __init__(self,
 
                  # Optional Modality Binding Names
-                 llm_binding_name: str = "lollms",
+                 llm_binding_name: Optional[str] = None,
                  tts_binding_name: Optional[str] = None,
                  tti_binding_name: Optional[str] = None,
                  stt_binding_name: Optional[str] = None,
@@ -106,21 +106,8 @@ class LollmsClient():
             ValueError: If the primary LLM binding cannot be created.
         """
         # --- LLM Binding Setup ---
-        self.llm_binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
-        self.llm = self.llm_binding_manager.create_binding(
-            binding_name=llm_binding_name,
-            **{
-                k: v
-                for k, v in (llm_binding_config or {}).items()
-                if k != "binding_name"
-            }
-        )
-
-        if self.llm is None:
-            available = self.llm_binding_manager.get_available_bindings()
-            raise ValueError(f"Failed to create LLM binding: {llm_binding_name}. Available: {available}")
-
         # --- Modality Binding Setup ---
+        self.llm_binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
         self.tts_binding_manager = LollmsTTSBindingManager(tts_bindings_dir)
         self.tti_binding_manager = LollmsTTIBindingManager(tti_bindings_dir)
         self.stt_binding_manager = LollmsSTTBindingManager(stt_bindings_dir)
@@ -128,12 +115,29 @@ class LollmsClient():
         self.ttm_binding_manager = LollmsTTMBindingManager(ttm_bindings_dir)
         self.mcp_binding_manager = LollmsMCPBindingManager(mcp_bindings_dir)
 
+
+        self.llm: Optional[LollmsLLMBinding] = None
         self.tts: Optional[LollmsTTSBinding] = None
         self.tti: Optional[LollmsTTIBinding] = None
         self.stt: Optional[LollmsSTTBinding] = None
         self.ttv: Optional[LollmsTTVBinding] = None
         self.ttm: Optional[LollmsTTMBinding] = None
         self.mcp: Optional[LollmsMCPBinding] = None
+
+
+        if llm_binding_name:
+            self.llm = self.llm_binding_manager.create_binding(
+                binding_name=llm_binding_name,
+                **{
+                    k: v
+                    for k, v in (llm_binding_config or {}).items()
+                    if k != "binding_name"
+                }
+            )
+
+            if self.llm is None:
+                available = self.llm_binding_manager.get_available_bindings()
+                ASCIIColors.warning(f"Failed to create LLM binding: {llm_binding_name}. Available: {available}")
 
         if tts_binding_name:
             self.tts = self.tts_binding_manager.create_binding(

@@ -4,7 +4,7 @@ import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 from ascii_colors import trace_exception
-
+import yaml
 class LollmsTTIBinding(ABC):
     """Abstract base class for all LOLLMS Text-to-Image bindings."""
 
@@ -58,6 +58,7 @@ class LollmsTTIBinding(ABC):
         """
         pass
 
+
     @abstractmethod
     def get_settings(self, **kwargs) -> Optional[Dict[str, Any]]:
         """
@@ -71,6 +72,11 @@ class LollmsTTIBinding(ABC):
             Optional[Dict[str, Any]]: A dictionary representing the settings structure
                                      (often a list matching ConfigTemplate format) or None if not supported/failed.
         """
+        pass
+
+    @abstractmethod
+    def listModels(self) -> list:
+        """Lists models"""
         pass
 
     @abstractmethod
@@ -139,7 +145,86 @@ class LollmsTTIBindingManager:
                 print(f"Failed to instantiate TTI binding {binding_name}: {str(e)}")
                 return None
         return None
+    def _get_fallback_description(binding_name: str) -> Dict:
+        """
+        Generates a default description dictionary for a binding without a description.yaml file.
+        """
+        return {
+            "binding_name": binding_name,
+            "title": binding_name.replace("_", " ").title(),
+            "author": "Unknown",
+            "creation_date": "N/A",
+            "last_update_date": "N/A",
+            "description": f"A binding for {binding_name}. No description.yaml file was found, so common parameters are shown as a fallback.",
+            "input_parameters": [
+                {
+                    "name": "model_name",
+                    "type": "str",
+                    "description": "The model name, ID, or filename to be used.",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "host_address",
+                    "type": "str",
+                    "description": "The host address of the service (for API-based bindings).",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "models_path",
+                    "type": "str",
+                    "description": "The path to the models directory (for local bindings).",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "service_key",
+                    "type": "str",
+                    "description": "The API key or service key for authentication (if applicable).",
+                    "mandatory": False,
+                    "default": ""
+                }
+            ]
+        }
 
+    @staticmethod
+    def get_bindings_list(llm_bindings_dir: Union[str, Path]) -> List[Dict]:
+        """
+        Lists all available LLM bindings by scanning a directory, loading their
+        description.yaml file if present, or providing a default description.
+
+        Args:
+            llm_bindings_dir (Union[str, Path]): The path to the directory containing LLM binding folders.
+
+        Returns:
+            List[Dict]: A list of dictionaries, each describing a binding.
+        """
+        bindings_dir = Path(llm_bindings_dir)
+        if not bindings_dir.is_dir():
+            return []
+
+        bindings_list = []
+        for binding_folder in bindings_dir.iterdir():
+            if binding_folder.is_dir() and (binding_folder / "__init__.py").exists():
+                binding_name = binding_folder.name
+                description_file = binding_folder / "description.yaml"
+                
+                binding_info = {}
+                if description_file.exists():
+                    try:
+                        with open(description_file, 'r', encoding='utf-8') as f:
+                            binding_info = yaml.safe_load(f)
+                        binding_info['binding_name'] = binding_name
+                    except Exception as e:
+                        print(f"Error loading description.yaml for {binding_name}: {e}")
+                        binding_info = LollmsTTIBindingManager._get_fallback_description(binding_name)
+                else:
+                    binding_info = LollmsTTIBindingManager._get_fallback_description(binding_name)
+                
+                bindings_list.append(binding_info)
+
+        return sorted(bindings_list, key=lambda b: b.get('title', b['binding_name']))
     def get_available_bindings(self) -> list[str]:
         """
         Return list of available TTI binding names based on subdirectories.
@@ -149,3 +234,23 @@ class LollmsTTIBindingManager:
         """
         return [binding_dir.name for binding_dir in self.tti_bindings_dir.iterdir()
                 if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
+
+def get_available_bindings(tti_bindings_dir: Union[str, Path] = None) -> List[Dict]:
+    """
+    Lists all available LLM bindings with their detailed descriptions.
+
+    This function serves as a primary entry point for discovering what bindings
+    are available and how to configure them.
+
+    Args:
+        llm_bindings_dir (Union[str, Path], optional): 
+            The path to the LLM bindings directory. If None, it defaults to the
+            'llm_bindings' subdirectory relative to this file. 
+            Defaults to None.
+
+    Returns:
+        List[Dict]: A list of dictionaries, each describing a binding.
+    """
+    if tti_bindings_dir is None:
+        tti_bindings_dir = Path(__file__).parent / "tti_bindings"
+    return LollmsTTIBindingManager.get_bindings_list(tti_bindings_dir)

@@ -1,36 +1,85 @@
 title: Diffusers TTI Binding
 author: ParisNeo
-creation_date: 2024-07-20
-last_update_date: 2025-08-13
+creation_date: 2024-05-21
+last_update_date: 2024-05-21
 description: |
-  A local text-to-image binding using the Hugging Face Diffusers library.
-  It allows running a wide variety of Stable Diffusion and other diffusion models locally on your own hardware (CPU or GPU).
+  A binding for the Hugging Face Diffusers library.
+  It allows running a wide variety of text-to-image models locally on your own hardware.
+  Models can be downloaded from the Hugging Face Hub or loaded from a local directory.
 input_parameters:
-  - name: model_id_or_path
+  - name: model_name
     type: str
-    description: "The Hugging Face model ID (e.g., 'stabilityai/stable-diffusion-xl-base-1.0') or a path to a local diffusers model directory. If not provided, defaults to 'stabilityai/stable-diffusion-2-1-base'."
+    description: "Hugging Face model ID (e.g., 'stabilityai/stable-diffusion-xl-base-1.0') or a folder name for a local model stored in the models_path directory."
+    mandatory: true
+  - name: models_path
+    type: str
+    description: "Path to the directory for storing local text-to-image models. Defaults to a 'models' folder inside the binding directory."
+    mandatory: false
+  - name: hf_cache_path
+    type: str
+    description: "Path to a directory for Hugging Face to cache downloaded models. If not provided, the default Hugging Face cache location is used."
     mandatory: false
   - name: device
     type: str
-    description: "The device to run the model on. 'auto' will attempt to use GPU (cuda/mps) if available, otherwise CPU. Options: 'auto', 'cuda', 'mps', 'cpu'."
+    description: "Device for inference. Options: 'auto', 'cuda', 'mps', 'cpu'. Defaults to 'auto', which selects the best available hardware."
     mandatory: false
   - name: torch_dtype_str
     type: str
-    description: "The torch data type for the model. 'auto' selects an appropriate dtype for the device. Options: 'auto', 'float16', 'bfloat16', 'float32'."
+    description: "PyTorch data type for model weights. Options: 'auto', 'float16', 'bfloat16', 'float32'. 'auto' is recommended."
     mandatory: false
   - name: use_safetensors
     type: bool
-    description: "Whether to prefer loading model weights from '.safetensors' files for security and speed."
+    description: "Whether to prefer loading model weights from '.safetensors' files for improved security and performance. Defaults to true."
     mandatory: false
-  - name: hf_token
+  - name: scheduler_name
     type: str
-    description: "A Hugging Face API token, required for accessing private or gated models."
-    mandatory: false
-  - name: enable_xformers
-    type: bool
-    description: "Enable xFormers memory-efficient attention to save VRAM and potentially increase speed on NVIDIA GPUs."
+    description: "The diffusion scheduler to use for the generation process. Different schedulers can produce varying results. 'default' uses the model's recommended scheduler."
     mandatory: false
   - name: safety_checker_on
     type: bool
-    description: "Enable the model's built-in safety checker to filter for NSFW content."
+    description: "Enable the model's built-in safety checker to filter potentially NSFW content. Defaults to true."
+    mandatory: false
+  - name: num_inference_steps
+    type: int
+    description: "Default number of steps for the generation process. Higher values can improve quality but take longer. Defaults to 25."
+    mandatory: false
+  - name: guidance_scale
+    type: float
+    description: "Default Classifier-Free Guidance (CFG) scale. Higher values make the image adhere more closely to the prompt. Defaults to 7.5."
+    mandatory: false
+  - name: default_width
+    type: int
+    description: "Default width in pixels for generated images. Defaults to 768."
+    mandatory: false
+  - name: default_height
+    type: int
+    description: "Default height in pixels for generated images. Defaults to 768."
+    mandatory: false
+  - name: seed
+    type: int
+    description: "Default seed for the random number generator to ensure reproducibility. Set to -1 for a random seed each time. Defaults to -1."
+    mandatory: false
+  - name: enable_cpu_offload
+    type: bool
+    description: "Offload parts of the model to the CPU to save VRAM, at the cost of slower generation speed. Useful for GPUs with limited memory. Defaults to false."
+    mandatory: false
+  - name: enable_sequential_cpu_offload
+    type: bool
+    description: "A more aggressive form of CPU offloading that saves more VRAM but is significantly slower. Defaults to false."
+    mandatory: false
+  - name: enable_xformers
+    type: bool
+    description: "Enable xFormers memory-efficient attention to reduce VRAM usage and potentially speed up generation on compatible hardware. Requires xFormers to be installed. Defaults to false."
+    mandatory: false
+  - name: hf_variant
+    type: str
+    description: "Specify a model variant from the Hugging Face Hub, such as 'fp16' or 'bf16', if available for the chosen model."
+    mandatory: false
+  - name: hf_token
+    type: str
+    description: "Your Hugging Face Hub user access token. Required for downloading private or gated models."
+    mandatory: false
+  - name: local_files_only
+    type: bool
+    description: "If true, the binding will only use local files and will not attempt to download models from the Hugging Face Hub. Defaults to false."
     mandatory: false

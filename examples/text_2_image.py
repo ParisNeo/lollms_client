@@ -21,7 +21,7 @@ LOLLMS_CLIENT_ID = "my_lollms_client_id" # Replace with your actual client ID or
 # make sure you have a OPENAI_API_KEY environment variable
 lc = LollmsClient(
     tti_binding_name="dalle",
-    ttm_binding_config={
+    tti_binding_config={
         "model_name": "dall-e-3",  # Example model, adjust as needed
     }
 )

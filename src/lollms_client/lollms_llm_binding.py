@@ -380,7 +380,7 @@ class LollmsLLMBinding(ABC):
 class LollmsLLMBindingManager:
     """Manages binding discovery and instantiation"""
 
-    def __init__(self, llm_bindings_dir: str = "llm_bindings"):
+    def __init__(self, llm_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "llm_bindings"):
         """
         Initialize the LollmsLLMBindingManager.
 

@@ -60,7 +60,7 @@ class DalleTTIBinding_Impl(LollmsTTIBinding):
         super().__init__(binding_name="dalle")
 
         # Extract parameters from kwargs, providing defaults
-        self.api_key = kwargs.get("api_key")
+        self.api_key = kwargs.get("service_key")
         self.model_name = kwargs.get("model_name")
         self.default_size = kwargs.get("default_size")
         self.default_quality = kwargs.get("default_quality")
@@ -81,9 +81,11 @@ class DalleTTIBinding_Impl(LollmsTTIBinding):
 
         # Model name validation
         if not self.model_name:
-            raise ValueError("Model name is required.")
+            ASCIIColors.warning("Model name is required.")
         if self.model_name not in DALLE_MODELS:
-            raise ValueError(f"Unsupported DALL-E model: {self.model_name}. Supported models: {list(DALLE_MODELS.keys())}")
+            ASCIIColors.warning(f"Unsupported DALL-E model: {self.model_name}. Supported models: {list(DALLE_MODELS.keys())}")
+            self.model_name = list(DALLE_MODELS.keys())[1]
+            ASCIIColors.warning(f"Defaulting to {self.model_name}")
 
         model_props = DALLE_MODELS[self.model_name]
 
@@ -432,3 +434,21 @@ class DalleTTIBinding_Impl(LollmsTTIBinding):
             trace_exception(e)
             ASCIIColors.error(f"Failed to apply settings due to an unexpected error: {e}")
             return False
+        
+    def listModels(self) -> list:
+        """Lists models"""
+        formatted_models=[
+            {
+                'model_name': "dall-e-2",
+                'display_name': "Dall-e 2",
+                'description': "Dalle 2 model",
+                'owned_by': 'openai'
+            },
+            {
+            'model_name': "dall-e-3",
+            'display_name': "Dall-e 3",
+            'description': "Dalle 3 model",
+            'owned_by': 'openai'
+            }
+        ]
+        return formatted_models
