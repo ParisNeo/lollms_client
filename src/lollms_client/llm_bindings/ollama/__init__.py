@@ -434,7 +434,7 @@ class OllamaBinding(LollmsLLMBinding):
             list: List of individual characters.
         """
         ## Since ollama has no endpoints to tokenize the text, we use tiktoken to have a rough estimate
-        return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text)
+        return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text, disallowed_special=())
             
     def detokenize(self, tokens: list) -> str:
         """

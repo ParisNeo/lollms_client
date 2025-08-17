@@ -4,7 +4,9 @@ import importlib
 from io import BytesIO
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
-
+import pipmaster as pm
+pm.ensure_packages(["torch","torchvision","torchaudio"],index_url="https://download.pytorch.org/whl/cu126")
+pm.ensure_packages(["diffusers","pillow"])
 # Attempt to import core dependencies and set availability flag
 try:
     import torch
@@ -143,6 +145,25 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             ASCIIColors.warning("No model_name provided during initialization. The binding is idle.")
 
 
+    def listModels(self) -> list:
+        """Lists models"""
+        # TODO: use the models from the folder if set
+        formatted_models=[
+            {
+                'model_name': "dummy model 1",
+                'display_name': "Test dummy model 1",
+                'description': "A test dummy model",
+                'owned_by': 'parisneo'
+            },
+            {
+                'model_name': "dummy model 2",
+                'display_name': "Test dummy model 2",
+                'description': "A test dummy model",
+                'owned_by': 'parisneo'
+            }
+        ]
+        return formatted_models
+    
     def _resolve_device_and_dtype(self):
         """Resolves auto settings for device and dtype from config."""
         if self.config["device"].lower() == "auto":
@@ -459,22 +480,3 @@ if __name__ == '__main__':
         if temp_paths_dir.exists():
             shutil.rmtree(temp_paths_dir)
         ASCIIColors.magenta("--- Diffusers TTI Binding Test Finished ---")
-
-    def listModels(self) -> list:
-        """Lists models"""
-        # TODO: use the models from the folder if set
-        formatted_models=[
-            {
-                'model_name': "dummy model 1",
-                'display_name': "Test dummy model 1",
-                'description': "A test dummy model",
-                'owned_by': 'parisneo'
-            },
-            {
-                'model_name': "dummy model 2",
-                'display_name': "Test dummy model 2",
-                'description': "A test dummy model",
-                'owned_by': 'parisneo'
-            }
-        ]
-        return formatted_models
