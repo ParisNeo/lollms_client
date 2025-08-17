@@ -459,3 +459,22 @@ if __name__ == '__main__':
         if temp_paths_dir.exists():
             shutil.rmtree(temp_paths_dir)
         ASCIIColors.magenta("--- Diffusers TTI Binding Test Finished ---")
+
+    def listModels(self) -> list:
+        """Lists models"""
+        # TODO: use the models from the folder if set
+        formatted_models=[
+            {
+                'model_name': "dummy model 1",
+                'display_name': "Test dummy model 1",
+                'description': "A test dummy model",
+                'owned_by': 'parisneo'
+            },
+            {
+                'model_name': "dummy model 2",
+                'display_name': "Test dummy model 2",
+                'description': "A test dummy model",
+                'owned_by': 'parisneo'
+            }
+        ]
+        return formatted_models
