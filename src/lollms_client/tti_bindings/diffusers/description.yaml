@@ -27,26 +27,31 @@ input_parameters:
     description: "Device for inference. Options: 'auto', 'cuda', 'mps', 'cpu'. Defaults to 'auto', which selects the best available hardware."
     mandatory: false
     default: "auto"
+    options: "auto,cuda,mps,cpu"
   - name: torch_dtype_str
     type: str
     description: "PyTorch data type for model weights. Options: 'auto', 'float16', 'bfloat16', 'float32'. 'auto' is recommended."
     mandatory: false
     default: "auto"
+    options: "auto,float16,bfloat16,float32"
   - name: use_safetensors
     type: bool
     description: "Whether to prefer loading model weights from '.safetensors' files for improved security and performance. Defaults to true."
     mandatory: false
     default: true
+    options: "true,false"
   - name: scheduler_name
     type: str
     description: "The diffusion scheduler to use for the generation process. Different schedulers can produce varying results. 'default' uses the model's recommended scheduler."
     mandatory: false
     default: "default"
+    options: "default,ddim,ddpm,deis_multistep,dpm_multistep,dpm_multistep_karras,dpm_single,dpm_adaptive,dpm++_2m,dpm++_2m_karras,dpm++_2s_ancestral,dpm++_2s_ancestral_karras,dpm++_sde,dpm++_sde_karras,euler_ancestral_discrete,euler_discrete,heun_discrete,heun_karras,lms_discrete,lms_karras,pndm,unipc_multistep"
   - name: safety_checker_on
     type: bool
     description: "Enable the model's built-in safety checker to filter potentially NSFW content. Defaults to true."
     mandatory: false
     default: true
+    options: "true,false"
   - name: num_inference_steps
     type: int
     description: "Default number of steps for the generation process. Higher values can improve quality but take longer. Defaults to 25."
@@ -77,21 +82,25 @@ input_parameters:
     description: "Offload parts of the model to the CPU to save VRAM, at the cost of slower generation speed. Useful for GPUs with limited memory. Defaults to false."
     mandatory: false
     default: false
+    options: "true,false"
   - name: enable_sequential_cpu_offload
     type: bool
     description: "A more aggressive form of CPU offloading that saves more VRAM but is significantly slower. Defaults to false."
     mandatory: false
     default: false
+    options: "true,false"
   - name: enable_xformers
     type: bool
     description: "Enable xFormers memory-efficient attention to reduce VRAM usage and potentially speed up generation on compatible hardware. Requires xFormers to be installed. Defaults to false."
     mandatory: false
     default: false
+    options: "true,false"
   - name: hf_variant
     type: str
     description: "Specify a model variant from the Hugging Face Hub, such as 'fp16' or 'bf16', if available for the chosen model."
     mandatory: false
     default: null
+    options: "fp16,bf16"
   - name: hf_token
     type: str
     description: "Your Hugging Face Hub user access token. Required for downloading private or gated models."
@@ -102,3 +111,4 @@ input_parameters:
     description: "If true, the binding will only use local files and will not attempt to download models from the Hugging Face Hub. Defaults to false."
     mandatory: false
     default: false
+    options: "true,false"
