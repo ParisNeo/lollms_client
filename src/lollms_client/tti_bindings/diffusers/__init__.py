@@ -48,7 +48,7 @@ BindingName = "DiffusersTTIBinding_Impl"
 # --- START: Civitai Model Definitions ---
 # Expanded list of popular Civitai models (as single .safetensors files)
 CIVITAI_MODELS = {
-    # Photorealistic
+    # --- Photorealistic ---
     "realistic-vision-v6": {
         "display_name": "Realistic Vision V6.0",
         "url": "https://civitai.com/api/download/models/130072",
@@ -63,7 +63,7 @@ CIVITAI_MODELS = {
         "description": "A top-tier model for generating realistic images.",
         "owned_by": "civitai"
     },
-    # Artistic / General Purpose
+    # --- General / Artistic ---
     "dreamshaper-8": {
         "display_name": "DreamShaper 8",
         "url": "https://civitai.com/api/download/models/128713",
@@ -78,7 +78,14 @@ CIVITAI_MODELS = {
         "description": "High-quality artistic model, great for cinematic styles (SDXL-based).",
         "owned_by": "civitai"
     },
-    # Anime
+    "lyriel-v1.6": {
+        "display_name": "Lyriel v1.6",
+        "url": "https://civitai.com/api/download/models/92407",
+        "filename": "lyriel_v16.safetensors",
+        "description": "A popular artistic model for fantasy and stylized images.",
+        "owned_by": "civitai"
+    },
+    # --- Anime / Illustration ---
     "anything-v5": {
         "display_name": "Anything V5",
         "url": "https://civitai.com/api/download/models/9409",
@@ -86,11 +93,47 @@ CIVITAI_MODELS = {
         "description": "A classic and highly popular model for anime-style generation.",
         "owned_by": "civitai"
     },
-    "lyriel-v1.6": {
-        "display_name": "Lyriel v1.6",
-        "url": "https://civitai.com/api/download/models/92407",
-        "filename": "lyriel_v16.safetensors",
-        "description": "A popular artistic model for fantasy and stylized images.",
+    "meinamix": {
+        "display_name": "MeinaMix",
+        "url": "https://civitai.com/api/download/models/119057",
+        "filename": "meinamix_meinaV11.safetensors",
+        "description": "A highly popular model for generating illustrative and vibrant anime-style images.",
+        "owned_by": "civitai"
+    },
+    # --- Game Assets & Specialized Styles ---
+    "rpg-v5": {
+        "display_name": "RPG v5",
+        "url": "https://civitai.com/api/download/models/137379",
+        "filename": "rpg_v5.safetensors",
+        "description": "Specialized in generating fantasy characters and assets in the style of classic RPGs.",
+        "owned_by": "civitai"
+    },
+    "pixel-art-xl": {
+        "display_name": "Pixel Art XL",
+        "url": "https://civitai.com/api/download/models/252919",
+        "filename": "pixelartxl_v11.safetensors",
+        "description": "A dedicated SDXL model for generating high-quality pixel art sprites and scenes.",
+        "owned_by": "civitai"
+    },
+    "lowpoly-world": {
+        "display_name": "Lowpoly World",
+        "url": "https://civitai.com/api/download/models/90299",
+        "filename": "lowpoly_world_v10.safetensors",
+        "description": "Generates assets and scenes with a stylized low-polygon, 3D render aesthetic.",
+        "owned_by": "civitai"
+    },
+    "toonyou": {
+        "display_name": "ToonYou",
+        "url": "https://civitai.com/api/download/models/152361",
+        "filename": "toonyou_beta6.safetensors",
+        "description": "Excellent for creating expressive, high-quality cartoon and Disney-style characters.",
+        "owned_by": "civitai"
+    },
+    "papercut": {
+        "display_name": "Papercut",
+        "url": "https://civitai.com/api/download/models/45579",
+        "filename": "papercut_v1.safetensors",
+        "description": "Creates unique images with a distinct paper cutout and layered diorama style.",
         "owned_by": "civitai"
     }
 }
