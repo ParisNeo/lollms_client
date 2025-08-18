@@ -5,33 +5,98 @@ from io import BytesIO
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
 import pipmaster as pm
+# --- Concurrency Imports ---
+import threading
+import queue
+from concurrent.futures import Future
+import time
+import hashlib
+import re
+# -------------------------
+# --- Download Imports ---
+import requests
+from tqdm import tqdm
+# --------------------
+
 pm.ensure_packages(["torch","torchvision"],index_url="https://download.pytorch.org/whl/cu126")
-pm.ensure_packages(["diffusers","pillow"])
+pm.ensure_packages(["diffusers","pillow","transformers","safetensors", "requests", "tqdm"])
+
 # Attempt to import core dependencies and set availability flag
 try:
     import torch
-    from diffusers import AutoPipelineForText2Image, DiffusionPipeline
-    from diffusers.utils import load_image # Potentially for future img2img etc.
+    from diffusers import AutoPipelineForText2Image, DiffusionPipeline, StableDiffusionPipeline
+    from diffusers.utils import load_image
     from PIL import Image
     DIFFUSERS_AVAILABLE = True
 except ImportError:
     torch = None
     AutoPipelineForText2Image = None
     DiffusionPipeline = None
+    StableDiffusionPipeline = None
     Image = None
     load_image = None
     DIFFUSERS_AVAILABLE = False
-    # A detailed error will be raised in __init__ if the user tries to use the binding.
 
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import trace_exception, ASCIIColors
-import json # For potential JSONDecodeError and settings
+import json
 import shutil
 
 # Defines the binding name for the manager
 BindingName = "DiffusersTTIBinding_Impl"
 
-# Helper for torch.dtype string conversion, handles case where torch is not installed
+# --- START: Civitai Model Definitions ---
+# Expanded list of popular Civitai models (as single .safetensors files)
+CIVITAI_MODELS = {
+    # Photorealistic
+    "realistic-vision-v6": {
+        "display_name": "Realistic Vision V6.0",
+        "url": "https://civitai.com/api/download/models/130072",
+        "filename": "realisticVisionV60_v60B1.safetensors",
+        "description": "One of the most popular photorealistic models.",
+        "owned_by": "civitai"
+    },
+    "absolute-reality": {
+        "display_name": "Absolute Reality",
+        "url": "https://civitai.com/api/download/models/132760",
+        "filename": "absolutereality_v181.safetensors",
+        "description": "A top-tier model for generating realistic images.",
+        "owned_by": "civitai"
+    },
+    # Artistic / General Purpose
+    "dreamshaper-8": {
+        "display_name": "DreamShaper 8",
+        "url": "https://civitai.com/api/download/models/128713",
+        "filename": "dreamshaper_8.safetensors",
+        "description": "A very popular and versatile general-purpose model.",
+        "owned_by": "civitai"
+    },
+    "juggernaut-xl": {
+        "display_name": "Juggernaut XL",
+        "url": "https://civitai.com/api/download/models/133005",
+        "filename": "juggernautXL_version6Rundiffusion.safetensors",
+        "description": "High-quality artistic model, great for cinematic styles (SDXL-based).",
+        "owned_by": "civitai"
+    },
+    # Anime
+    "anything-v5": {
+        "display_name": "Anything V5",
+        "url": "https://civitai.com/api/download/models/9409",
+        "filename": "anythingV5_PrtRE.safetensors",
+        "description": "A classic and highly popular model for anime-style generation.",
+        "owned_by": "civitai"
+    },
+    "lyriel-v1.6": {
+        "display_name": "Lyriel v1.6",
+        "url": "https://civitai.com/api/download/models/92407",
+        "filename": "lyriel_v16.safetensors",
+        "description": "A popular artistic model for fantasy and stylized images.",
+        "owned_by": "civitai"
+    }
+}
+# --- END: Civitai Model Definitions ---
+
+# Helper for torch.dtype string conversion
 TORCH_DTYPE_MAP_STR_TO_OBJ = {
     "float16": getattr(torch, 'float16', 'float16'),
     "bfloat16": getattr(torch, 'bfloat16', 'bfloat16'),
@@ -39,224 +104,214 @@ TORCH_DTYPE_MAP_STR_TO_OBJ = {
     "auto": "auto"
 }
 TORCH_DTYPE_MAP_OBJ_TO_STR = {v: k for k, v in TORCH_DTYPE_MAP_STR_TO_OBJ.items()}
-if torch: # Add None mapping if torch is loaded
+if torch:
     TORCH_DTYPE_MAP_OBJ_TO_STR[None] = "None"
 
-
-# Common Schedulers mapping (User-friendly name to Class name)
+# Common Schedulers mapping
 SCHEDULER_MAPPING = {
-    "default": None,  # Use model's default
-    "ddim": "DDIMScheduler",
-    "ddpm": "DDPMScheduler",
-    "deis_multistep": "DEISMultistepScheduler",
-    "dpm_multistep": "DPMSolverMultistepScheduler",
-    "dpm_multistep_karras": "DPMSolverMultistepScheduler",
-    "dpm_single": "DPMSolverSinglestepScheduler",
-    "dpm_adaptive": "DPMSolverPlusPlusScheduler",
-    "dpm++_2m": "DPMSolverMultistepScheduler",
-    "dpm++_2m_karras": "DPMSolverMultistepScheduler",
-    "dpm++_2s_ancestral": "DPMSolverAncestralDiscreteScheduler",
-    "dpm++_2s_ancestral_karras": "DPMSolverAncestralDiscreteScheduler",
-    "dpm++_sde": "DPMSolverSDEScheduler",
-    "dpm++_sde_karras": "DPMSolverSDEScheduler",
-    "euler_ancestral_discrete": "EulerAncestralDiscreteScheduler",
-    "euler_discrete": "EulerDiscreteScheduler",
-    "heun_discrete": "HeunDiscreteScheduler",
-    "heun_karras": "HeunDiscreteScheduler",
-    "lms_discrete": "LMSDiscreteScheduler",
-    "lms_karras": "LMSDiscreteScheduler",
-    "pndm": "PNDMScheduler",
-    "unipc_multistep": "UniPCMultistepScheduler",
+    "default": None, "ddim": "DDIMScheduler", "ddpm": "DDPMScheduler", "deis_multistep": "DEISMultistepScheduler",
+    "dpm_multistep": "DPMSolverMultistepScheduler", "dpm_multistep_karras": "DPMSolverMultistepScheduler",
+    "dpm_single": "DPMSolverSinglestepScheduler", "dpm_adaptive": "DPMSolverPlusPlusScheduler",
+    "dpm++_2m": "DPMSolverMultistepScheduler", "dpm++_2m_karras": "DPMSolverMultistepScheduler",
+    "dpm++_2s_ancestral": "DPMSolverAncestralDiscreteScheduler", "dpm++_2s_ancestral_karras": "DPMSolverAncestralDiscreteScheduler",
+    "dpm++_sde": "DPMSolverSDEScheduler", "dpm++_sde_karras": "DPMSolverSDEScheduler",
+    "euler_ancestral_discrete": "EulerAncestralDiscreteScheduler", "euler_discrete": "EulerDiscreteScheduler",
+    "heun_discrete": "HeunDiscreteScheduler", "heun_karras": "HeunDiscreteScheduler",
+    "lms_discrete": "LMSDiscreteScheduler", "lms_karras": "LMSDiscreteScheduler",
+    "pndm": "PNDMScheduler", "unipc_multistep": "UniPCMultistepScheduler",
 }
 SCHEDULER_USES_KARRAS_SIGMAS = [
     "dpm_multistep_karras", "dpm++_2m_karras", "dpm++_2s_ancestral_karras",
     "dpm++_sde_karras", "heun_karras", "lms_karras"
 ]
 
+# --- START: Concurrency and Singleton Management ---
 
-class DiffusersTTIBinding_Impl(LollmsTTIBinding):
+class ModelManager:
     """
-    Concrete implementation of LollmsTTIBinding for Hugging Face Diffusers library.
-    Allows running various text-to-image models locally.
+    Manages a single pipeline instance, its generation queue, and a worker thread.
+    This ensures all interactions with a specific model are thread-safe.
     """
-    DEFAULT_CONFIG = {
-        "model_name": "",
-        "device": "auto",
-        "torch_dtype_str": "auto",
-        "use_safetensors": True,
-        "scheduler_name": "default",
-        "safety_checker_on": True,
-        "num_inference_steps": 25,
-        "guidance_scale": 7.5,
-        "default_width": 768,
-        "default_height": 768,
-        "seed": -1,
-        "enable_cpu_offload": False,
-        "enable_sequential_cpu_offload": False,
-        "enable_xformers": False,
-        "hf_variant": None,
-        "hf_token": None,
-        "hf_cache_path": None,
-        "local_files_only": False,
-    }
-
-    def __init__(self, **kwargs):
-        """
-        Initialize the Diffusers TTI binding.
-
-        Args:
-            **kwargs: A dictionary of configuration parameters.
-                Expected keys:
-                - model_name (str): The name of the model to use. Can be a Hugging Face Hub ID
-                  (e.g., 'stabilityai/stable-diffusion-xl-base-1.0') or the name of a local
-                  model directory located in `models_path`.
-                - models_path (str or Path): The path to the directory where local models are stored.
-                  Defaults to a 'models' folder next to this file.
-                - hf_cache_path (str or Path, optional): Path to a directory for Hugging Face
-                  to cache downloaded models and files.
-                - Other settings from the DEFAULT_CONFIG can be overridden here.
-        """
-        super().__init__(binding_name=BindingName)
-
-        if not DIFFUSERS_AVAILABLE:
-            raise ImportError(
-                "Diffusers library or its dependencies (torch, Pillow, transformers) are not installed. "
-                "Please install them using: pip install torch diffusers Pillow transformers safetensors"
-            )
-
-        # Merge default config with user-provided kwargs
-        self.config = {**self.DEFAULT_CONFIG, **kwargs}
-
-        # model_name is crucial, get it from the merged config
-        self.model_name = self.config.get("model_name", "")
-        
-        # models_path is also special, handle it with its default logic
-        self.models_path = Path(kwargs.get("models_path", Path(__file__).parent / "models"))
-        self.models_path.mkdir(parents=True, exist_ok=True)
-
+    def __init__(self, config: Dict[str, Any], models_path: Path):
+        self.config = config
+        self.models_path = models_path
         self.pipeline: Optional[DiffusionPipeline] = None
-        self.current_model_id_or_path = None
-
-        self._resolve_device_and_dtype()
+        self.ref_count = 0
+        self.lock = threading.Lock()
+        self.queue = queue.Queue()
+        self.worker_thread = threading.Thread(target=self._generation_worker, daemon=True)
+        self._stop_event = threading.Event()
+        self.is_loaded = False
         
+        self.worker_thread.start()
 
-    def listModels(self) -> list:
-        """Lists models"""
-        # TODO: use the models from the folder if set
-        formatted_models=[
-            {
-                'model_name': "CompVis/stable-diffusion-v1-4",
-                'display_name': "SD 1.4",
-                'description': "Stable diffusion v1.4",
-                'owned_by': 'parisneo'
-            },
-            {
-                'model_name': "dummy model 2",
-                'display_name': "Test dummy model 2",
-                'description': "A test dummy model",
-                'owned_by': 'parisneo'
-            }
-        ]
-        return formatted_models
-    
-    def _resolve_device_and_dtype(self):
-        """Resolves auto settings for device and dtype from config."""
-        if self.config["device"].lower() == "auto":
-            if torch.cuda.is_available():
-                self.config["device"] = "cuda"
-            elif torch.backends.mps.is_available():
-                self.config["device"] = "mps"
-            else:
-                self.config["device"] = "cpu"
+    def acquire(self):
+        with self.lock:
+            self.ref_count += 1
+            return self
 
-        if self.config["torch_dtype_str"].lower() == "auto":
-            self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
+    def release(self):
+        with self.lock:
+            self.ref_count -= 1
+            return self.ref_count
 
-        self.torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config["torch_dtype_str"].lower(), torch.float32)
-        if self.torch_dtype == "auto": # Final fallback
-            self.torch_dtype = torch.float16 if self.config["device"] != "cpu" else torch.float32
-            self.config["torch_dtype_str"] = TORCH_DTYPE_MAP_OBJ_TO_STR.get(self.torch_dtype, "float32")
+    def stop(self):
+        self._stop_event.set()
+        self.queue.put(None)
+        self.worker_thread.join(timeout=5)
 
-    def _resolve_model_path(self, model_name: str) -> str:
-        """
-        Resolves a model name to a full path if it's a local model,
-        otherwise returns it as is (assuming it's a Hugging Face Hub ID).
-        """
+    def _load_pipeline(self):
+        if self.pipeline:
+            return
+
+        model_name = self.config.get("model_name", "")
         if not model_name:
-            raise ValueError("Model name cannot be empty.")
+            raise ValueError("Model name cannot be empty for loading.")
             
-        if Path(model_name).is_absolute() and Path(model_name).is_dir():
-            ASCIIColors.info(f"Using absolute path for model: {model_name}")
-            return model_name
+        ASCIIColors.info(f"Loading Diffusers model: {model_name}")
+        model_path = self._resolve_model_path(model_name)
+        torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config["torch_dtype_str"].lower())
         
-        local_model_path = self.models_path / model_name
-        if local_model_path.exists() and local_model_path.is_dir():
-            ASCIIColors.info(f"Found local model in '{self.models_path}': {local_model_path}")
-            return str(local_model_path)
-        
-        ASCIIColors.info(f"'{model_name}' not found locally. Assuming it is a Hugging Face Hub ID.")
-        return model_name
-
-    def load_model(self):
-        """Loads the Diffusers pipeline based on current configuration."""
-        ASCIIColors.info("Loading Diffusers model...")
-        if self.pipeline is not None:
-            self.unload_model()
-
         try:
-            model_path = self._resolve_model_path(self.model_name)
-            self.current_model_id_or_path = model_path
-
-            load_args = {
-                "torch_dtype": self.torch_dtype,
-                "use_safetensors": self.config["use_safetensors"],
-                "token": self.config["hf_token"],
-                "local_files_only": self.config["local_files_only"],
-            }
-            if self.config["hf_variant"]:
-                load_args["variant"] = self.config["hf_variant"]
-            
-            if not self.config["safety_checker_on"]:
-                load_args["safety_checker"] = None
-            
-            if self.config.get("hf_cache_path"):
-                load_args["cache_dir"] = str(self.config["hf_cache_path"])
-
-            self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **load_args)
-            
-            self._set_scheduler()
-
-            self.pipeline.to(self.config["device"])
-
-            if self.config["enable_xformers"]:
+            if str(model_path).endswith(".safetensors"):
+                ASCIIColors.info(f"Loading from single safetensors file: {model_path}")
                 try:
-                    self.pipeline.enable_xformers_memory_efficient_attention()
-                    ASCIIColors.info("xFormers memory efficient attention enabled.")
-                except Exception as e:
-                    ASCIIColors.warning(f"Could not enable xFormers: {e}. Proceeding without it.")
-            
-            if self.config["enable_cpu_offload"] and self.config["device"] != "cpu":
-                self.pipeline.enable_model_cpu_offload()
-                ASCIIColors.info("Model CPU offload enabled.")
-            elif self.config["enable_sequential_cpu_offload"] and self.config["device"] != "cpu":
-                self.pipeline.enable_sequential_cpu_offload()
-                ASCIIColors.info("Sequential CPU offload enabled.")
-
-            ASCIIColors.green(f"Diffusers model '{model_path}' loaded on device '{self.config['device']}'.")
+                    # Modern, preferred method for newer diffusers versions
+                    self.pipeline = AutoPipelineForText2Image.from_single_file(
+                        model_path,
+                        torch_dtype=torch_dtype,
+                        cache_dir=self.config.get("hf_cache_path")
+                    )
+                except AttributeError:
+                    # Fallback for older diffusers versions
+                    ASCIIColors.warning("AutoPipelineForText2Image.from_single_file not found. Falling back to StableDiffusionPipeline.")
+                    ASCIIColors.warning("Consider updating diffusers for better compatibility: pip install --upgrade diffusers")
+                    self.pipeline = StableDiffusionPipeline.from_single_file(
+                        model_path,
+                        torch_dtype=torch_dtype,
+                        cache_dir=self.config.get("hf_cache_path")
+                    )
+            else:
+                ASCIIColors.info(f"Loading from pretrained folder/repo: {model_path}")
+                load_args = {
+                    "torch_dtype": torch_dtype, "use_safetensors": self.config["use_safetensors"],
+                    "token": self.config["hf_token"], "local_files_only": self.config["local_files_only"],
+                }
+                if self.config["hf_variant"]: load_args["variant"] = self.config["hf_variant"]
+                if not self.config["safety_checker_on"]: load_args["safety_checker"] = None
+                if self.config.get("hf_cache_path"): load_args["cache_dir"] = str(self.config["hf_cache_path"])
+                self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **load_args)
 
         except Exception as e:
-            trace_exception(e)
+            error_str = str(e).lower()
+            if "401" in error_str or "gated" in error_str or "authorization" in error_str:
+                auth_error_msg = (
+                    f"AUTHENTICATION FAILED for model '{model_name}'. This is likely a 'gated' model on Hugging Face.\n"
+                    "Please ensure you have accepted its license and provided a valid HF Access Token in the settings."
+                )
+                raise RuntimeError(auth_error_msg) from e
+            else:
+                raise e
+
+        self._set_scheduler()
+        self.pipeline.to(self.config["device"])
+
+        if self.config["enable_xformers"]:
+            try:
+                self.pipeline.enable_xformers_memory_efficient_attention()
+            except Exception as e:
+                ASCIIColors.warning(f"Could not enable xFormers: {e}.")
+        
+        if self.config["enable_cpu_offload"] and self.config["device"] != "cpu":
+            self.pipeline.enable_model_cpu_offload()
+        elif self.config["enable_sequential_cpu_offload"] and self.config["device"] != "cpu":
+            self.pipeline.enable_sequential_cpu_offload()
+        
+        self.is_loaded = True
+        ASCIIColors.green(f"Model '{model_name}' loaded successfully on '{self.config['device']}'.")
+
+    def _unload_pipeline(self):
+        if self.pipeline:
+            del self.pipeline
             self.pipeline = None
-            raise RuntimeError(f"Failed to load Diffusers model '{self.model_name}': {e}") from e
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.is_loaded = False
+            ASCIIColors.info(f"Model '{self.config.get('model_name')}' unloaded.")
+
+    def _generation_worker(self):
+        while not self._stop_event.is_set():
+            try:
+                job = self.queue.get(timeout=1)
+                if job is None:
+                    break
+                future, pipeline_args = job
+                try:
+                    with self.lock:
+                        if not self.pipeline:
+                            self._load_pipeline()
+                    with torch.no_grad():
+                        pipeline_output = self.pipeline(**pipeline_args)
+                    pil_image: Image.Image = pipeline_output.images[0]
+                    img_byte_arr = BytesIO()
+                    pil_image.save(img_byte_arr, format="PNG")
+                    future.set_result(img_byte_arr.getvalue())
+                except Exception as e:
+                    trace_exception(e)
+                    future.set_exception(e)
+                finally:
+                    self.queue.task_done()
+            except queue.Empty:
+                continue
+
+    def _download_civitai_model(self, model_key: str):
+        model_info = CIVITAI_MODELS[model_key]
+        url = model_info["url"]
+        filename = model_info["filename"]
+        dest_path = self.models_path / filename
+        temp_path = dest_path.with_suffix(".temp")
+        
+        ASCIIColors.cyan(f"Downloading '{filename}' from Civitai...")
+        try:
+            with requests.get(url, stream=True) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+                with open(temp_path, 'wb') as f, tqdm(
+                    total=total_size, unit='iB', unit_scale=True, desc=f"Downloading {filename}"
+                ) as bar:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            
+            shutil.move(temp_path, dest_path)
+            ASCIIColors.green(f"Model '{filename}' downloaded successfully.")
+        except Exception as e:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise Exception(f"Failed to download model {filename}: {e}") from e
+
+    def _resolve_model_path(self, model_name: str) -> Union[str, Path]:
+        path_obj = Path(model_name)
+        if path_obj.is_absolute() and path_obj.exists():
+            return model_name
+        
+        if model_name in CIVITAI_MODELS:
+            filename = CIVITAI_MODELS[model_name]["filename"]
+            local_path = self.models_path / filename
+            if not local_path.exists():
+                self._download_civitai_model(model_name)
+            return local_path
+        
+        local_path = self.models_path / model_name
+        if local_path.exists():
+            return local_path
+            
+        return model_name
 
     def _set_scheduler(self):
-        """Sets the scheduler for the pipeline based on config."""
         if not self.pipeline: return
-        
         scheduler_name_key = self.config["scheduler_name"].lower()
-        if scheduler_name_key == "default":
-            ASCIIColors.info(f"Using model's default scheduler: {self.pipeline.scheduler.__class__.__name__}")
-            return
+        if scheduler_name_key == "default": return
 
         scheduler_class_name = SCHEDULER_MAPPING.get(scheduler_name_key)
         if scheduler_class_name:
@@ -265,34 +320,148 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 scheduler_config = self.pipeline.scheduler.config
                 scheduler_config["use_karras_sigmas"] = scheduler_name_key in SCHEDULER_USES_KARRAS_SIGMAS
                 self.pipeline.scheduler = SchedulerClass.from_config(scheduler_config)
-                ASCIIColors.info(f"Switched scheduler to {scheduler_name_key} ({scheduler_class_name}).")
             except Exception as e:
                 ASCIIColors.warning(f"Could not switch scheduler to {scheduler_name_key}: {e}. Using current default.")
-        else:
-            ASCIIColors.warning(f"Unknown scheduler: '{self.config['scheduler_name']}'. Using model default.")
+
+class PipelineRegistry:
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._managers = {}
+                cls._instance._registry_lock = threading.Lock()
+        return cls._instance
+
+    def _get_config_key(self, config: Dict[str, Any]) -> str:
+        critical_keys = [
+            "model_name", "device", "torch_dtype_str", "use_safetensors", 
+            "safety_checker_on", "hf_variant", "enable_cpu_offload", 
+            "enable_sequential_cpu_offload", "enable_xformers",
+            "local_files_only", "hf_cache_path"
+        ]
+        key_data = tuple(sorted((k, config.get(k)) for k in critical_keys))
+        return hashlib.sha256(str(key_data).encode('utf-8')).hexdigest()
+
+    def get_manager(self, config: Dict[str, Any], models_path: Path) -> ModelManager:
+        key = self._get_config_key(config)
+        with self._registry_lock:
+            if key not in self._managers:
+                self._managers[key] = ModelManager(config.copy(), models_path)
+            return self._managers[key].acquire()
+
+    def release_manager(self, config: Dict[str, Any]):
+        key = self._get_config_key(config)
+        with self._registry_lock:
+            if key in self._managers:
+                manager = self._managers[key]
+                ref_count = manager.release()
+                if ref_count == 0:
+                    ASCIIColors.info(f"Reference count for model '{config.get('model_name')}' is zero. Cleaning up.")
+                    manager.stop()
+                    manager._unload_pipeline()
+                    del self._managers[key]
+
+class DiffusersTTIBinding_Impl(LollmsTTIBinding):
+    DEFAULT_CONFIG = {
+        "model_name": "", "device": "auto", "torch_dtype_str": "auto", "use_safetensors": True,
+        "scheduler_name": "default", "safety_checker_on": True, "num_inference_steps": 25,
+        "guidance_scale": 7.0, "default_width": 512, "default_height": 512, "seed": -1,
+        "enable_cpu_offload": False, "enable_sequential_cpu_offload": False, "enable_xformers": False,
+        "hf_variant": None, "hf_token": None, "hf_cache_path": None, "local_files_only": False,
+    }
+
+    def __init__(self, **kwargs):
+        super().__init__(binding_name=BindingName)
+
+        if not DIFFUSERS_AVAILABLE:
+            raise ImportError(
+                "Diffusers or its dependencies not installed. "
+                "Please run: pip install torch torchvision diffusers Pillow transformers safetensors requests tqdm"
+            )
+
+        self.config = {**self.DEFAULT_CONFIG, **kwargs}
+        self.model_name = self.config.get("model_name", "")
+        self.models_path = Path(kwargs.get("models_path", Path(__file__).parent / "models"))
+        self.models_path.mkdir(parents=True, exist_ok=True)
+        
+        self.registry = PipelineRegistry()
+        self.manager: Optional[ModelManager] = None
+        
+        self._resolve_device_and_dtype()
+        if self.model_name:
+            self._acquire_manager()
+
+    def _acquire_manager(self):
+        if self.manager:
+            self.registry.release_manager(self.manager.config)
+        self.manager = self.registry.get_manager(self.config, self.models_path)
+        ASCIIColors.info(f"Binding instance acquired manager for '{self.config['model_name']}'.")
+
+    def _resolve_device_and_dtype(self):
+        if self.config["device"].lower() == "auto":
+            self.config["device"] = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        
+        if self.config["torch_dtype_str"].lower() == "auto":
+            self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
+
+    def list_safetensor_models(self) -> List[str]:
+        if not self.models_path.exists(): return []
+        return sorted([f.name for f in self.models_path.iterdir() if f.is_file() and f.suffix == ".safetensors"])
+
+    def listModels(self) -> list:
+        # Start with hardcoded Civitai and Hugging Face models
+        civitai_list = [
+            {'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']}
+            for key, info in CIVITAI_MODELS.items()
+        ]
+        hf_default_list = [
+            # SDXL Models (1024x1024 native)
+            {'model_name': "stabilityai/stable-diffusion-xl-base-1.0", 'display_name': "Stable Diffusion XL 1.0", 'description': "Official SDXL base model from Stability AI. Native resolution is 1024x1024.", 'owned_by': 'HuggingFace'},
+            {'model_name': "playgroundai/playground-v2.5-1024px-aesthetic", 'display_name': "Playground v2.5", 'description': "Known for high aesthetic quality. Native resolution is 1024x1024.", 'owned_by': 'HuggingFace'},
+            # SD 1.5 Models (512x512 native)
+            {'model_name': "runwayml/stable-diffusion-v1-5", 'display_name': "Stable Diffusion 1.5", 'description': "A popular and versatile open-access text-to-image model.", 'owned_by': 'HuggingFace'},
+            {'model_name': "dataautogpt3/OpenDalleV1.1", 'display_name': "OpenDalle v1.1", 'description': "An open-source reproduction of DALL-E 3, good for prompt adherence.", 'owned_by': 'HuggingFace'},
+            {'model_name': "stabilityai/stable-diffusion-2-1-base", 'display_name': "Stable Diffusion 2.1 (512px)", 'description': "A 512x512 resolution model from Stability AI.", 'owned_by': 'HuggingFace'},
+            {'model_name': "CompVis/stable-diffusion-v1-4", 'display_name': "Stable Diffusion 1.4 (Gated)", 'description': "Original SD v1.4. Requires accepting license on Hugging Face and an HF token.", 'owned_by': 'HuggingFace'}
+        ]
+        
+        # Discover local .safetensors files
+        custom_local_models = []
+        civitai_filenames = {info['filename'] for info in CIVITAI_MODELS.values()}
+        local_safetensors = self.list_safetensor_models()
+
+        for filename in local_safetensors:
+            if filename not in civitai_filenames:
+                custom_local_models.append({
+                    'model_name': filename,
+                    'display_name': filename,
+                    'description': 'Local safetensors file from your models folder.',
+                    'owned_by': 'local_user'
+                })
+
+        return civitai_list + hf_default_list + custom_local_models
+
+    def load_model(self):
+        ASCIIColors.info("load_model() called. Loading is now automatic.")
+        if self.model_name and not self.manager:
+             self._acquire_manager()
 
     def unload_model(self):
-        if self.pipeline is not None:
-            del self.pipeline
-            self.pipeline = None
-            if torch and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            ASCIIColors.info("Diffusers pipeline unloaded.")
+        if self.manager:
+            ASCIIColors.info(f"Binding instance releasing manager for '{self.manager.config['model_name']}'.")
+            self.registry.release_manager(self.manager.config)
+            self.manager = None
 
     def generate_image(self, prompt: str, negative_prompt: str = "", width: int = None, height: int = None, **kwargs) -> bytes:
-        """Generates an image using the loaded Diffusers pipeline."""
-        if not self.pipeline:
-            if self.model_name:
-                try:
-                    self.load_model()
-                except Exception as e:
-                    trace_exception(e)
-                    raise RuntimeError("Couldn't build image generation tool.")
-
-            else:
-                raise RuntimeError("No model_name provided during initialization. The binding is idle.")
-
-
+        if not self.model_name:
+            raise RuntimeError("No model_name configured. Please select a model in settings.")
+        
+        if not self.manager:
+            self._acquire_manager()
+        
         _width = width or self.config["default_width"]
         _height = height or self.config["default_height"]
         _num_inference_steps = kwargs.get("num_inference_steps", self.config["num_inference_steps"])
@@ -302,179 +471,137 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         generator = torch.Generator(device=self.config["device"]).manual_seed(_seed) if _seed != -1 else None
         
         pipeline_args = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt or None,
-            "width": _width,
-            "height": _height,
-            "num_inference_steps": _num_inference_steps,
-            "guidance_scale": _guidance_scale,
-            "generator": generator,
+            "prompt": prompt, "negative_prompt": negative_prompt or None, "width": _width,
+            "height": _height, "num_inference_steps": _num_inference_steps,
+            "guidance_scale": _guidance_scale, "generator": generator,
         }
-        ASCIIColors.info(f"Generating image with prompt: '{prompt[:100]}...'")
-
-        try:
-            with torch.no_grad():
-                 pipeline_output = self.pipeline(**pipeline_args)
-            
-            pil_image: Image.Image = pipeline_output.images[0]
-            img_byte_arr = BytesIO()
-            pil_image.save(img_byte_arr, format="PNG")
-            
-            ASCIIColors.green("Image generated successfully.")
-            return img_byte_arr.getvalue()
-
-        except Exception as e:
-            trace_exception(e)
-            raise Exception(f"Diffusers image generation failed: {e}") from e
-
-    def list_models(self) -> List[str]:
-        """Lists available local models from the models_path."""
-        if not self.models_path.exists():
-            return []
         
-        models = []
-        for model_dir in self.models_path.iterdir():
-            if model_dir.is_dir():
-                # Check for key files indicating a valid diffusers model directory
-                if (model_dir / "model_index.json").exists() or (model_dir / "unet" / "config.json").exists():
-                    models.append(model_dir.name)
-        return sorted(models)
+        future = Future()
+        self.manager.queue.put((future, pipeline_args))
+        ASCIIColors.info(f"Job for prompt '{prompt[:50]}...' queued. Waiting...")
+        
+        try:
+            image_bytes = future.result()
+            ASCIIColors.green("Image generated successfully.")
+            return image_bytes
+        except Exception as e:
+            raise Exception(f"Image generation failed: {e}") from e
+
+    def list_local_models(self) -> List[str]:
+        if not self.models_path.exists(): return []
+        
+        folders = [
+            d.name for d in self.models_path.iterdir()
+            if d.is_dir() and ((d / "model_index.json").exists() or (d / "unet" / "config.json").exists())
+        ]
+        safetensors = self.list_safetensor_models()
+        return sorted(folders + safetensors)
+    
+    def list_available_models(self) -> List[str]:
+        discoverable_models = [m['model_name'] for m in self.listModels()]
+        local_models = self.list_local_models()
+        
+        combined_list = sorted(list(set(local_models + discoverable_models)))
+        return combined_list
 
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
-        """Lists available local models from the models_path."""
-        models = self.list_models()
+        models = self.list_available_models()
+        local_models = self.list_local_models()
+
         if not models:
-            return [{
-                "name": "diffusers_no_local_models", 
-                "caption": "No local Diffusers models found", 
-                "help": f"Place Diffusers model folders inside '{self.models_path.resolve()}' or specify a Hugging Face model ID in settings to download one."
-            }]
-        
-        return [{
-            "name": model_name,
-            "caption": f"Diffusers: {model_name}",
-            "help": f"Local Diffusers model from: {self.models_path.resolve()}"
-        } for model_name in models]
+            return [{"name": "diffusers_no_models", "caption": "No models found", "help": f"Place models in '{self.models_path.resolve()}'."}]
+
+        services = []
+        for m in models:
+            help_text = "Hugging Face model ID"
+            if m in local_models:
+                 help_text = f"Local model from: {self.models_path.resolve()}"
+            elif m in CIVITAI_MODELS:
+                filename = CIVITAI_MODELS[m]['filename']
+                help_text = f"Civitai model (downloads as {filename})"
+            
+            services.append({"name": m, "caption": f"Diffusers: {m}", "help": help_text})
+        return services
 
     def get_settings(self, **kwargs) -> List[Dict[str, Any]]:
-        """Retrieves the current configurable settings for the binding."""
-        local_models = self.list_models()
+        available_models = self.list_available_models()
         return [
-            {"name": "model_name", "type": "str", "value": self.model_name, "description": "Hugging Face model ID or a local model name from the models folder.", "options": local_models},
-            {"name": "device", "type": "str", "value": self.config["device"], "description": f"Device for inference. Current resolved: {self.config['device']}", "options": ["auto", "cuda", "mps", "cpu"]},
-            {"name": "torch_dtype_str", "type": "str", "value": self.config["torch_dtype_str"], "description": f"Torch dtype. Current resolved: {self.config['torch_dtype_str']}", "options": ["auto", "float16", "bfloat16", "float32"]},
-            {"name": "hf_variant", "type": "str", "value": self.config["hf_variant"], "description": "Model variant from HF (e.g., 'fp16', 'bf16'). Optional."},
-            {"name": "use_safetensors", "type": "bool", "value": self.config["use_safetensors"], "description": "Prefer loading models from .safetensors files."},
+            {"name": "model_name", "type": "str", "value": self.model_name, "description": "Local, Civitai, or Hugging Face model.", "options": available_models},
+            {"name": "device", "type": "str", "value": self.config["device"], "description": f"Inference device. Resolved: {self.config['device']}", "options": ["auto", "cuda", "mps", "cpu"]},
+            {"name": "torch_dtype_str", "type": "str", "value": self.config["torch_dtype_str"], "description": f"Torch dtype. Resolved: {self.config['torch_dtype_str']}", "options": ["auto", "float16", "bfloat16", "float32"]},
+            {"name": "hf_variant", "type": "str", "value": self.config["hf_variant"], "description": "HF model variant (e.g., 'fp16')."},
+            {"name": "use_safetensors", "type": "bool", "value": self.config["use_safetensors"], "description": "Prefer .safetensors when loading from Hugging Face."},
             {"name": "scheduler_name", "type": "str", "value": self.config["scheduler_name"], "description": "Scheduler for diffusion.", "options": list(SCHEDULER_MAPPING.keys())},
-            {"name": "safety_checker_on", "type": "bool", "value": self.config["safety_checker_on"], "description": "Enable the safety checker (if model has one)."},
+            {"name": "safety_checker_on", "type": "bool", "value": self.config["safety_checker_on"], "description": "Enable the safety checker."},
             {"name": "enable_cpu_offload", "type": "bool", "value": self.config["enable_cpu_offload"], "description": "Enable model CPU offload (saves VRAM, slower)."},
             {"name": "enable_sequential_cpu_offload", "type": "bool", "value": self.config["enable_sequential_cpu_offload"], "description": "Enable sequential CPU offload (more VRAM savings, much slower)."},
             {"name": "enable_xformers", "type": "bool", "value": self.config["enable_xformers"], "description": "Enable xFormers memory efficient attention."},
-            {"name": "default_width", "type": "int", "value": self.config["default_width"], "description": "Default width for generated images."},
-            {"name": "default_height", "type": "int", "value": self.config["default_height"], "description": "Default height for generated images."},
-            {"name": "num_inference_steps", "type": "int", "value": self.config["num_inference_steps"], "description": "Default number of inference steps."},
+            {"name": "default_width", "type": "int", "value": self.config["default_width"], "description": "Default image width. Note: SDXL models prefer 1024."},
+            {"name": "default_height", "type": "int", "value": self.config["default_height"], "description": "Default image height. Note: SDXL models prefer 1024."},
+            {"name": "num_inference_steps", "type": "int", "value": self.config["num_inference_steps"], "description": "Default inference steps."},
             {"name": "guidance_scale", "type": "float", "value": self.config["guidance_scale"], "description": "Default guidance scale (CFG)."},
-            {"name": "seed", "type": "int", "value": self.config["seed"], "description": "Default seed for generation (-1 for random)."},
-            {"name": "hf_token", "type": "str", "value": self.config["hf_token"], "description": "Hugging Face API token (for private models).", "is_secret": True},
-            {"name": "hf_cache_path", "type": "str", "value": self.config["hf_cache_path"], "description": "Path to Hugging Face cache. Defaults to ~/.cache/huggingface."},
-            {"name": "local_files_only", "type": "bool", "value": self.config["local_files_only"], "description": "Only use local files, do not download."},
+            {"name": "seed", "type": "int", "value": self.config["seed"], "description": "Default seed (-1 for random)."},
+            {"name": "hf_token", "type": "str", "value": self.config["hf_token"], "description": "HF API token (for private/gated models).", "is_secret": True},
+            {"name": "hf_cache_path", "type": "str", "value": self.config["hf_cache_path"], "description": "Path to HF cache."},
+            {"name": "local_files_only", "type": "bool", "value": self.config["local_files_only"], "description": "Do not download from Hugging Face."},
         ]
 
     def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
-        """Applies new settings to the binding. Some may trigger a model reload."""
         parsed_settings = settings if isinstance(settings, dict) else \
                           {item["name"]: item["value"] for item in settings if "name" in item and "value" in item}
 
-        needs_reload = False
-        critical_keys = ["model_name", "device", "torch_dtype_str", "use_safetensors", 
-                         "safety_checker_on", "hf_variant", "enable_cpu_offload", 
-                         "enable_sequential_cpu_offload", "enable_xformers", "hf_token", 
-                         "local_files_only", "hf_cache_path"]
+        critical_keys = self.registry._get_config_key({}).__self__.critical_keys
+        needs_manager_swap = False
 
         for key, value in parsed_settings.items():
-            current_value = getattr(self, key, self.config.get(key))
-            if current_value != value:
+            if self.config.get(key) != value:
                 ASCIIColors.info(f"Setting '{key}' changed to: {value}")
-                if key == "model_name":
-                    self.model_name = value
                 self.config[key] = value
-                if key in critical_keys:
-                    needs_reload = True
-                elif key == "scheduler_name" and self.pipeline:
-                    self._set_scheduler()
+                if key == "model_name": self.model_name = value
+                if key in critical_keys: needs_manager_swap = True
+                
+        if needs_manager_swap and self.model_name:
+            ASCIIColors.info("Critical settings changed. Swapping model manager...")
+            self._resolve_device_and_dtype()
+            self._acquire_manager()
+        
+        if not needs_manager_swap and self.manager:
+            self.manager.config.update(parsed_settings)
+            if 'scheduler_name' in parsed_settings and self.manager.pipeline:
+                 with self.manager.lock:
+                    self.manager._set_scheduler()
 
-        if needs_reload and self.model_name:
-            ASCIIColors.info("Reloading model due to settings changes...")
-            try:
-                self._resolve_device_and_dtype()
-                self.load_model()
-                ASCIIColors.green("Model reloaded successfully.")
-            except Exception as e:
-                trace_exception(e)
-                ASCIIColors.error(f"Failed to reload model with new settings: {e}. Binding may be unstable.")
-                return False
         return True
 
     def __del__(self):
         self.unload_model()
 
-# Example Usage (for testing within this file)
+# Example Usage
 if __name__ == '__main__':
     ASCIIColors.magenta("--- Diffusers TTI Binding Test ---")
     
     if not DIFFUSERS_AVAILABLE:
-        ASCIIColors.error("Diffusers or its dependencies are not available. Cannot run test.")
+        ASCIIColors.error("Diffusers not available. Cannot run test.")
         exit(1)
 
     temp_paths_dir = Path(__file__).parent / "temp_lollms_paths_diffusers"
     temp_models_path = temp_paths_dir / "models"
-    temp_cache_path = temp_paths_dir / "shared_cache"
     
-    # Clean up previous runs
-    if temp_paths_dir.exists():
-        shutil.rmtree(temp_paths_dir)
+    if temp_paths_dir.exists(): shutil.rmtree(temp_paths_dir)
     temp_models_path.mkdir(parents=True, exist_ok=True)
-    temp_cache_path.mkdir(parents=True, exist_ok=True)
         
-    # A very small, fast model for testing from Hugging Face.
-    test_model_id = "hf-internal-testing/tiny-stable-diffusion-torch"
-    
     try:
-        ASCIIColors.cyan("\n1. Initializing binding without a model...")
-        binding = DiffusersTTIBinding_Impl(
-            models_path=str(temp_models_path),
-            hf_cache_path=str(temp_cache_path)
-        )
-        assert binding.pipeline is None, "Pipeline should not be loaded initially."
-        ASCIIColors.green("Initialization successful.")
+        ASCIIColors.cyan("\n--- Test: Loading a Hugging Face model ---")
+        # Using a very small model for fast testing
+        binding_config = {"models_path": str(temp_models_path), "model_name": "hf-internal-testing/tiny-stable-diffusion-torch"}
+        binding = DiffusersTTIBinding_Impl(**binding_config)
+        
+        img_bytes = binding.generate_image("a tiny robot", width=64, height=64, num_inference_steps=2)
+        assert len(img_bytes) > 1000, "Image generation from HF model should succeed."
+        ASCIIColors.green("HF model loading and generation successful.")
 
-        ASCIIColors.cyan("\n2. Listing services (should be empty)...")
-        services = binding.list_services()
-        ASCIIColors.info(json.dumps(services, indent=2))
-        assert services[0]["name"] == "diffusers_no_local_models"
-
-        ASCIIColors.cyan(f"\n3. Setting model_name to '{test_model_id}' to trigger load...")
-        binding.set_settings({"model_name": test_model_id})
-        assert binding.model_name == test_model_id
-        assert binding.pipeline is not None, "Pipeline should be loaded after setting model_name."
-        ASCIIColors.green("Model loaded successfully.")
-
-        ASCIIColors.cyan("\n4. Generating an image...")
-        image_bytes = binding.generate_image(
-            prompt="A tiny robot",
-            width=64, height=64,
-            num_inference_steps=2
-        )
-        assert image_bytes and isinstance(image_bytes, bytes)
-        ASCIIColors.green(f"Image generated (size: {len(image_bytes)} bytes).")
-        test_image_path = Path(__file__).parent / "test_diffusers_image.png"
-        with open(test_image_path, "wb") as f:
-            f.write(image_bytes)
-        ASCIIColors.info(f"Test image saved to: {test_image_path.resolve()}")
-
-        ASCIIColors.cyan("\n5. Unloading model...")
-        binding.unload_model()
-        assert binding.pipeline is None, "Pipeline should be None after unload."
+        del binding
+        time.sleep(0.1)
 
     except Exception as e:
         trace_exception(e)

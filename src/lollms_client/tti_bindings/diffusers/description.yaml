@@ -9,77 +9,96 @@ description: |
 input_parameters:
   - name: model_name
     type: str
-    description: "Hugging Face model ID (e.g., 'stabilityai/stable-diffusion-xl-base-1.0') or a folder name for a local model stored in the models_path directory."
+    description: "Hugging Face model ID (e.g., 'stabilityai/stable-diffusion-xl-base-1.0') or a local model name from the models folder."
     mandatory: true
+    default: "runwayml/stable-diffusion-v1-5"
   - name: models_path
     type: str
     description: "Path to the directory for storing local text-to-image models. Defaults to a 'models' folder inside the binding directory."
     mandatory: false
+    default: null
   - name: hf_cache_path
     type: str
     description: "Path to a directory for Hugging Face to cache downloaded models. If not provided, the default Hugging Face cache location is used."
     mandatory: false
+    default: null
   - name: device
     type: str
     description: "Device for inference. Options: 'auto', 'cuda', 'mps', 'cpu'. Defaults to 'auto', which selects the best available hardware."
     mandatory: false
+    default: "auto"
   - name: torch_dtype_str
     type: str
     description: "PyTorch data type for model weights. Options: 'auto', 'float16', 'bfloat16', 'float32'. 'auto' is recommended."
     mandatory: false
+    default: "auto"
   - name: use_safetensors
     type: bool
     description: "Whether to prefer loading model weights from '.safetensors' files for improved security and performance. Defaults to true."
     mandatory: false
+    default: true
   - name: scheduler_name
     type: str
     description: "The diffusion scheduler to use for the generation process. Different schedulers can produce varying results. 'default' uses the model's recommended scheduler."
     mandatory: false
+    default: "default"
   - name: safety_checker_on
     type: bool
     description: "Enable the model's built-in safety checker to filter potentially NSFW content. Defaults to true."
     mandatory: false
+    default: true
   - name: num_inference_steps
     type: int
     description: "Default number of steps for the generation process. Higher values can improve quality but take longer. Defaults to 25."
     mandatory: false
+    default: 25
   - name: guidance_scale
     type: float
-    description: "Default Classifier-Free Guidance (CFG) scale. Higher values make the image adhere more closely to the prompt. Defaults to 7.5."
+    description: "Default Classifier-Free Guidance (CFG) scale. Higher values make the image adhere more closely to the prompt. Defaults to 7.0."
     mandatory: false
+    default: 7.0
   - name: default_width
     type: int
-    description: "Default width in pixels for generated images. Defaults to 768."
+    description: "Default width in pixels for generated images. SD1.5 is 512, SDXL is 1024. Defaults to 512."
     mandatory: false
+    default: 512
   - name: default_height
     type: int
-    description: "Default height in pixels for generated images. Defaults to 768."
+    description: "Default height in pixels for generated images. SD1.5 is 512, SDXL is 1024. Defaults to 512."
     mandatory: false
+    default: 512
   - name: seed
     type: int
     description: "Default seed for the random number generator to ensure reproducibility. Set to -1 for a random seed each time. Defaults to -1."
     mandatory: false
+    default: -1
   - name: enable_cpu_offload
     type: bool
     description: "Offload parts of the model to the CPU to save VRAM, at the cost of slower generation speed. Useful for GPUs with limited memory. Defaults to false."
     mandatory: false
+    default: false
   - name: enable_sequential_cpu_offload
     type: bool
     description: "A more aggressive form of CPU offloading that saves more VRAM but is significantly slower. Defaults to false."
     mandatory: false
+    default: false
   - name: enable_xformers
     type: bool
     description: "Enable xFormers memory-efficient attention to reduce VRAM usage and potentially speed up generation on compatible hardware. Requires xFormers to be installed. Defaults to false."
     mandatory: false
+    default: false
   - name: hf_variant
     type: str
     description: "Specify a model variant from the Hugging Face Hub, such as 'fp16' or 'bf16', if available for the chosen model."
     mandatory: false
+    default: null
   - name: hf_token
     type: str
     description: "Your Hugging Face Hub user access token. Required for downloading private or gated models."
     mandatory: false
+    default: null
   - name: local_files_only
     type: bool
     description: "If true, the binding will only use local files and will not attempt to download models from the Hugging Face Hub. Defaults to false."
     mandatory: false
+    default: false
