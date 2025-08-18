@@ -373,7 +373,8 @@ class LollmsLLMBinding(ABC):
             if messages[-1]["content"]=="":
                 del messages[-1]
         return messages
-
+    def ps(self):
+        return []
 
 
 

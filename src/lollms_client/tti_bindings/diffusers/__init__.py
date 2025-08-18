@@ -5,7 +5,7 @@ from io import BytesIO
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
 import pipmaster as pm
-pm.ensure_packages(["torch","torchvision","torchaudio"],index_url="https://download.pytorch.org/whl/cu126")
+pm.ensure_packages(["torch","torchvision"],index_url="https://download.pytorch.org/whl/cu126")
 pm.ensure_packages(["diffusers","pillow"])
 # Attempt to import core dependencies and set availability flag
 try:
@@ -139,20 +139,15 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
 
         self._resolve_device_and_dtype()
         
-        if self.model_name:
-            self.load_model()
-        else:
-            ASCIIColors.warning("No model_name provided during initialization. The binding is idle.")
-
 
     def listModels(self) -> list:
         """Lists models"""
         # TODO: use the models from the folder if set
         formatted_models=[
             {
-                'model_name': "dummy model 1",
-                'display_name': "Test dummy model 1",
-                'description': "A test dummy model",
+                'model_name': "CompVis/stable-diffusion-v1-4",
+                'display_name': "SD 1.4",
+                'description': "Stable diffusion v1.4",
                 'owned_by': 'parisneo'
             },
             {
@@ -287,7 +282,16 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
     def generate_image(self, prompt: str, negative_prompt: str = "", width: int = None, height: int = None, **kwargs) -> bytes:
         """Generates an image using the loaded Diffusers pipeline."""
         if not self.pipeline:
-            raise RuntimeError("Diffusers pipeline is not loaded. Cannot generate image.")
+            if self.model_name:
+                try:
+                    self.load_model()
+                except Exception as e:
+                    trace_exception(e)
+                    raise RuntimeError("Couldn't build image generation tool.")
+
+            else:
+                raise RuntimeError("No model_name provided during initialization. The binding is idle.")
+
 
         _width = width or self.config["default_width"]
         _height = height or self.config["default_height"]
