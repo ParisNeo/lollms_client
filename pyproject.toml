@@ -46,3 +46,5 @@ where = ["src"]
 
 [tool.setuptools.dynamic]
 version = {attr = "lollms_client.__version__"}
+[tool.setuptools.package-data]
+lollms_client = ["assets/*.json"]
