@@ -10,7 +10,7 @@ from typing import Optional, Callable, List, Union
 from ascii_colors import ASCIIColors, trace_exception
 from typing import List, Dict
 import math
-
+import httpx
 import pipmaster as pm
 
 pm.ensure_packages(["openai","tiktoken"])
@@ -47,7 +47,7 @@ class OpenAIBinding(LollmsLLMBinding):
 
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None)
+        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=self.verify_ssl_certificate))
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     def _build_openai_params(self, messages: list, **kwargs) -> dict:
