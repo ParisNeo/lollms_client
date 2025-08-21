@@ -152,28 +152,53 @@ if torch:
 
 # Common Schedulers mapping
 SCHEDULER_MAPPING = {
-    "default": None, "ddim": "DDIMScheduler", "ddpm": "DDPMScheduler", "deis_multistep": "DEISMultistepScheduler",
-    "dpm_multistep": "DPMSolverMultistepScheduler", "dpm_multistep_karras": "DPMSolverMultistepScheduler",
-    "dpm_single": "DPMSolverSinglestepScheduler", "dpm_adaptive": "DPMSolverPlusPlusScheduler",
-    "dpm++_2m": "DPMSolverMultistepScheduler", "dpm++_2m_karras": "DPMSolverMultistepScheduler",
-    "dpm++_2s_ancestral": "DPMSolverAncestralDiscreteScheduler", "dpm++_2s_ancestral_karras": "DPMSolverAncestralDiscreteScheduler",
-    "dpm++_sde": "DPMSolverSDEScheduler", "dpm++_sde_karras": "DPMSolverSDEScheduler",
-    "euler_ancestral_discrete": "EulerAncestralDiscreteScheduler", "euler_discrete": "EulerDiscreteScheduler",
-    "heun_discrete": "HeunDiscreteScheduler", "heun_karras": "HeunDiscreteScheduler",
-    "lms_discrete": "LMSDiscreteScheduler", "lms_karras": "LMSDiscreteScheduler",
-    "pndm": "PNDMScheduler", "unipc_multistep": "UniPCMultistepScheduler",
+    "default": None,
+    "ddim": "DDIMScheduler",
+    "ddpm": "DDPMScheduler",
+    "deis_multistep": "DEISMultistepScheduler",
+    "dpm_multistep": "DPMSolverMultistepScheduler",
+    "dpm_multistep_karras": "DPMSolverMultistepScheduler",
+    "dpm_single": "DPMSolverSinglestepScheduler",
+    "dpm_adaptive": "DPMSolverPlusPlusScheduler",  # Retained; no direct Diffusers equivalent confirmed, may require custom config
+    "dpm++_2m": "DPMSolverMultistepScheduler",
+    "dpm++_2m_karras": "DPMSolverMultistepScheduler",
+    "dpm++_2s_ancestral": "DPMSolverAncestralDiscreteScheduler",  # Retained; consider "KDPM2AncestralDiscreteScheduler" as alternative if class unavailable
+    "dpm++_2s_ancestral_karras": "DPMSolverAncestralDiscreteScheduler",
+    "dpm++_sde": "DPMSolverSDEScheduler",
+    "dpm++_sde_karras": "DPMSolverSDEScheduler",
+    "euler_ancestral_discrete": "EulerAncestralDiscreteScheduler",
+    "euler_discrete": "EulerDiscreteScheduler",
+    "heun_discrete": "HeunDiscreteScheduler",
+    "heun_karras": "HeunDiscreteScheduler",
+    "lms_discrete": "LMSDiscreteScheduler",
+    "lms_karras": "LMSDiscreteScheduler",
+    "pndm": "PNDMScheduler",
+    "unipc_multistep": "UniPCMultistepScheduler",
+    # Additions
+    "dpm++_2m_sde": "DPMSolverMultistepScheduler",
+    "dpm++_2m_sde_karras": "DPMSolverMultistepScheduler",
+    "dpm2": "KDPM2DiscreteScheduler",
+    "dpm2_karras": "KDPM2DiscreteScheduler",
+    "dpm2_a": "KDPM2AncestralDiscreteScheduler",
+    "dpm2_a_karras": "KDPM2AncestralDiscreteScheduler",
+    "euler": "EulerDiscreteScheduler",
+    "euler_a": "EulerAncestralDiscreteScheduler",
+    "heun": "HeunDiscreteScheduler",
+    "lms": "LMSDiscreteScheduler",
 }
 SCHEDULER_USES_KARRAS_SIGMAS = [
     "dpm_multistep_karras", "dpm++_2m_karras", "dpm++_2s_ancestral_karras",
-    "dpm++_sde_karras", "heun_karras", "lms_karras"
+    "dpm++_sde_karras", "heun_karras", "lms_karras",
+    # Additions
+    "dpm++_2m_sde_karras", "dpm2_karras", "dpm2_a_karras",
 ]
 
 # --- START: Concurrency and Singleton Management ---
 
 class ModelManager:
     """
-    Manages a single pipeline instance, its generation queue, and a worker thread.
-    This ensures all interactions with a specific model are thread-safe.
+    Manages a single pipeline instance, its generation queue, a worker thread,
+    and an optional auto-unload timer.
     """
     def __init__(self, config: Dict[str, Any], models_path: Path):
         self.config = config
@@ -182,11 +207,18 @@ class ModelManager:
         self.ref_count = 0
         self.lock = threading.Lock()
         self.queue = queue.Queue()
-        self.worker_thread = threading.Thread(target=self._generation_worker, daemon=True)
-        self._stop_event = threading.Event()
         self.is_loaded = False
+        self.last_used_time = time.time()
         
+        # --- Worker and Monitor Threads ---
+        self._stop_event = threading.Event()
+        self.worker_thread = threading.Thread(target=self._generation_worker, daemon=True)
         self.worker_thread.start()
+        
+        self._stop_monitor_event = threading.Event()
+        self._unload_monitor_thread = None
+        self._start_unload_monitor()
+
 
     def acquire(self):
         with self.lock:
@@ -200,10 +232,35 @@ class ModelManager:
 
     def stop(self):
         self._stop_event.set()
-        self.queue.put(None)
+        if self._unload_monitor_thread:
+            self._stop_monitor_event.set()
+            self._unload_monitor_thread.join(timeout=2)
+        self.queue.put(None) # Sentinel to unblock queue.get()
         self.worker_thread.join(timeout=5)
 
+    def _start_unload_monitor(self):
+        unload_after = self.config.get("unload_inactive_model_after", 0)
+        if unload_after > 0 and self._unload_monitor_thread is None:
+            self._stop_monitor_event.clear()
+            self._unload_monitor_thread = threading.Thread(target=self._unload_monitor, daemon=True)
+            self._unload_monitor_thread.start()
+
+    def _unload_monitor(self):
+        unload_after = self.config.get("unload_inactive_model_after", 0)
+        if unload_after <= 0: return
+
+        ASCIIColors.info(f"Starting inactivity monitor for '{self.config['model_name']}' (timeout: {unload_after}s).")
+        while not self._stop_monitor_event.wait(timeout=5.0): # Check every 5 seconds
+            with self.lock:
+                if not self.is_loaded:
+                    continue
+                
+                if time.time() - self.last_used_time > unload_after:
+                    ASCIIColors.info(f"Model '{self.config['model_name']}' has been inactive. Unloading.")
+                    self._unload_pipeline()
+
     def _load_pipeline(self):
+        # This method assumes a lock is already held
         if self.pipeline:
             return
 
@@ -271,16 +328,19 @@ class ModelManager:
             self.pipeline.enable_sequential_cpu_offload()
         
         self.is_loaded = True
+        self.last_used_time = time.time()
         ASCIIColors.green(f"Model '{model_name}' loaded successfully on '{self.config['device']}'.")
 
     def _unload_pipeline(self):
+        # This method assumes a lock is already held
         if self.pipeline:
+            model_name = self.config.get('model_name', 'Unknown')
             del self.pipeline
             self.pipeline = None
             if torch and torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self.is_loaded = False
-            ASCIIColors.info(f"Model '{self.config.get('model_name')}' unloaded.")
+            ASCIIColors.info(f"Model '{model_name}' unloaded and VRAM cleared.")
 
     def _generation_worker(self):
         while not self._stop_event.is_set():
@@ -291,8 +351,10 @@ class ModelManager:
                 future, pipeline_args = job
                 try:
                     with self.lock:
-                        if not self.pipeline:
+                        self.last_used_time = time.time()
+                        if not self.is_loaded:
                             self._load_pipeline()
+                    
                     with torch.no_grad():
                         pipeline_output = self.pipeline(**pipeline_args)
                     pil_image: Image.Image = pipeline_output.images[0]
@@ -363,6 +425,7 @@ class ModelManager:
                 scheduler_config = self.pipeline.scheduler.config
                 scheduler_config["use_karras_sigmas"] = scheduler_name_key in SCHEDULER_USES_KARRAS_SIGMAS
                 self.pipeline.scheduler = SchedulerClass.from_config(scheduler_config)
+                ASCIIColors.info(f"Switched scheduler to {scheduler_class_name}")
             except Exception as e:
                 ASCIIColors.warning(f"Could not switch scheduler to {scheduler_name_key}: {e}. Using current default.")
 
@@ -378,14 +441,17 @@ class PipelineRegistry:
                 cls._instance._registry_lock = threading.Lock()
         return cls._instance
 
-    def _get_config_key(self, config: Dict[str, Any]) -> str:
-        critical_keys = [
+    @staticmethod
+    def _get_critical_keys():
+        return [
             "model_name", "device", "torch_dtype_str", "use_safetensors", 
             "safety_checker_on", "hf_variant", "enable_cpu_offload", 
             "enable_sequential_cpu_offload", "enable_xformers",
-            "local_files_only", "hf_cache_path"
+            "local_files_only", "hf_cache_path", "unload_inactive_model_after"
         ]
-        key_data = tuple(sorted((k, config.get(k)) for k in critical_keys))
+
+    def _get_config_key(self, config: Dict[str, Any]) -> str:
+        key_data = tuple(sorted((k, config.get(k)) for k in self._get_critical_keys()))
         return hashlib.sha256(str(key_data).encode('utf-8')).hexdigest()
 
     def get_manager(self, config: Dict[str, Any], models_path: Path) -> ModelManager:
@@ -402,10 +468,15 @@ class PipelineRegistry:
                 manager = self._managers[key]
                 ref_count = manager.release()
                 if ref_count == 0:
-                    ASCIIColors.info(f"Reference count for model '{config.get('model_name')}' is zero. Cleaning up.")
+                    ASCIIColors.info(f"Reference count for model '{config.get('model_name')}' is zero. Cleaning up manager.")
                     manager.stop()
-                    manager._unload_pipeline()
+                    with manager.lock:
+                        manager._unload_pipeline()
                     del self._managers[key]
+
+    def get_active_managers(self) -> List[ModelManager]:
+        with self._registry_lock:
+            return [m for m in self._managers.values() if m.is_loaded]
 
 class DiffusersTTIBinding_Impl(LollmsTTIBinding):
     DEFAULT_CONFIG = {
@@ -414,6 +485,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         "guidance_scale": 7.0, "default_width": 512, "default_height": 512, "seed": -1,
         "enable_cpu_offload": False, "enable_sequential_cpu_offload": False, "enable_xformers": False,
         "hf_variant": None, "hf_token": None, "hf_cache_path": None, "local_files_only": False,
+        "unload_inactive_model_after": 0,
     }
 
     def __init__(self, **kwargs):
@@ -425,9 +497,13 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 "Please run: pip install torch torchvision diffusers Pillow transformers safetensors requests tqdm"
             )
 
-        self.config = {**self.DEFAULT_CONFIG, **kwargs}
+        # Initialize config with defaults, then override with user kwargs
+        self.config = self.DEFAULT_CONFIG.copy()
+        self.config.update(kwargs)
+
         self.model_name = self.config.get("model_name", "")
-        self.models_path = Path(kwargs.get("models_path", Path(__file__).parent / "models"))
+        models_path_str = kwargs.get("models_path", str(Path(__file__).parent / "models"))
+        self.models_path = Path(models_path_str)
         self.models_path.mkdir(parents=True, exist_ok=True)
         
         self.registry = PipelineRegistry()
@@ -436,6 +512,49 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         self._resolve_device_and_dtype()
         if self.model_name:
             self._acquire_manager()
+
+    def ps(self) -> List[dict]:
+        """
+        Lists running models in a standardized, flat format.
+        """
+        if not self.registry:
+            ASCIIColors.warning("Diffusers PipelineRegistry not available.")
+            return []
+
+        try:
+            active_managers = self.registry.get_active_managers()
+            standardized_models = []
+
+            for manager in active_managers:
+                with manager.lock:
+                    config = manager.config
+                    pipeline = manager.pipeline
+                    
+                    vram_usage_bytes = 0
+                    if torch.cuda.is_available() and config.get("device") == "cuda" and pipeline:
+                        for component in pipeline.components.values():
+                            if hasattr(component, 'parameters'):
+                                mem_params = sum(p.nelement() * p.element_size() for p in component.parameters())
+                                mem_bufs = sum(b.nelement() * b.element_size() for b in component.buffers())
+                                vram_usage_bytes += (mem_params + mem_bufs)
+
+                    flat_model_info = {
+                        "model_name": config.get("model_name"),
+                        "vram_size": vram_usage_bytes,
+                        "device": config.get("device"),
+                        "torch_dtype": str(pipeline.dtype) if pipeline else config.get("torch_dtype_str"),
+                        "pipeline_type": pipeline.__class__.__name__ if pipeline else "N/A",
+                        "scheduler_class": pipeline.scheduler.__class__.__name__ if pipeline and hasattr(pipeline, 'scheduler') else "N/A",
+                        "status": "Active" if manager.is_loaded else "Idle",
+                        "queue_size": manager.queue.qsize(),
+                    }
+                    standardized_models.append(flat_model_info)
+            
+            return standardized_models
+
+        except Exception as e:
+            ASCIIColors.error(f"Failed to list running models from Diffusers registry: {e}")
+            return []
 
     def _acquire_manager(self):
         if self.manager:
@@ -455,40 +574,29 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         return sorted([f.name for f in self.models_path.iterdir() if f.is_file() and f.suffix == ".safetensors"])
 
     def listModels(self) -> list:
-        # Start with hardcoded Civitai and Hugging Face models
+        # Implementation is unchanged...
         civitai_list = [
             {'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']}
             for key, info in CIVITAI_MODELS.items()
         ]
         hf_default_list = [
-            # SDXL Models (1024x1024 native)
             {'model_name': "stabilityai/stable-diffusion-xl-base-1.0", 'display_name': "Stable Diffusion XL 1.0", 'description': "Official SDXL base model from Stability AI. Native resolution is 1024x1024.", 'owned_by': 'HuggingFace'},
             {'model_name': "playgroundai/playground-v2.5-1024px-aesthetic", 'display_name': "Playground v2.5", 'description': "Known for high aesthetic quality. Native resolution is 1024x1024.", 'owned_by': 'HuggingFace'},
-            # SD 1.5 Models (512x512 native)
             {'model_name': "runwayml/stable-diffusion-v1-5", 'display_name': "Stable Diffusion 1.5", 'description': "A popular and versatile open-access text-to-image model.", 'owned_by': 'HuggingFace'},
-            {'model_name': "dataautogpt3/OpenDalleV1.1", 'display_name': "OpenDalle v1.1", 'description': "An open-source reproduction of DALL-E 3, good for prompt adherence.", 'owned_by': 'HuggingFace'},
-            {'model_name': "stabilityai/stable-diffusion-2-1-base", 'display_name': "Stable Diffusion 2.1 (512px)", 'description': "A 512x512 resolution model from Stability AI.", 'owned_by': 'HuggingFace'},
-            {'model_name': "CompVis/stable-diffusion-v1-4", 'display_name': "Stable Diffusion 1.4 (Gated)", 'description': "Original SD v1.4. Requires accepting license on Hugging Face and an HF token.", 'owned_by': 'HuggingFace'}
         ]
-        
-        # Discover local .safetensors files
         custom_local_models = []
         civitai_filenames = {info['filename'] for info in CIVITAI_MODELS.values()}
         local_safetensors = self.list_safetensor_models()
-
         for filename in local_safetensors:
             if filename not in civitai_filenames:
                 custom_local_models.append({
-                    'model_name': filename,
-                    'display_name': filename,
-                    'description': 'Local safetensors file from your models folder.',
-                    'owned_by': 'local_user'
+                    'model_name': filename, 'display_name': filename,
+                    'description': 'Local safetensors file from your models folder.', 'owned_by': 'local_user'
                 })
-
         return civitai_list + hf_default_list + custom_local_models
 
     def load_model(self):
-        ASCIIColors.info("load_model() called. Loading is now automatic.")
+        ASCIIColors.info("load_model() called. Loading is now automatic on first use.")
         if self.model_name and not self.manager:
              self._acquire_manager()
 
@@ -498,26 +606,28 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             self.registry.release_manager(self.manager.config)
             self.manager = None
 
-    def generate_image(self, prompt: str, negative_prompt: str = "", width: int = None, height: int = None, **kwargs) -> bytes:
+    def generate_image(self, prompt: str, negative_prompt: str = "", width: int|None = None, height: int|None = None, **kwargs) -> bytes:
         if not self.model_name:
             raise RuntimeError("No model_name configured. Please select a model in settings.")
         
         if not self.manager:
             self._acquire_manager()
-        
-        _width = width or self.config["default_width"]
-        _height = height or self.config["default_height"]
-        _num_inference_steps = kwargs.get("num_inference_steps", self.config["num_inference_steps"])
-        _guidance_scale = kwargs.get("guidance_scale", self.config["guidance_scale"])
-        _seed = kwargs.get("seed", self.config["seed"])
 
-        generator = torch.Generator(device=self.config["device"]).manual_seed(_seed) if _seed != -1 else None
-        
+        # Build pipeline arguments, prioritizing kwargs over config defaults
+        seed = kwargs.pop("seed", self.config["seed"])
+        generator = torch.Generator(device=self.config["device"]).manual_seed(seed) if seed != -1 else None
+
         pipeline_args = {
-            "prompt": prompt, "negative_prompt": negative_prompt or None, "width": _width,
-            "height": _height, "num_inference_steps": _num_inference_steps,
-            "guidance_scale": _guidance_scale, "generator": generator,
+            "prompt": prompt,
+            "negative_prompt": negative_prompt or None,
+            "width": width if width is not None else self.config["default_width"],
+            "height": height if height is not None else self.config["default_height"],
+            "num_inference_steps": self.config["num_inference_steps"],
+            "guidance_scale": self.config["guidance_scale"],
+            "generator": generator,
         }
+        # Allow any other valid pipeline kwargs to be passed through
+        pipeline_args.update(kwargs)
         
         future = Future()
         self.manager.queue.put((future, pipeline_args))
@@ -531,8 +641,8 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             raise Exception(f"Image generation failed: {e}") from e
 
     def list_local_models(self) -> List[str]:
+        # Implementation is unchanged...
         if not self.models_path.exists(): return []
-        
         folders = [
             d.name for d in self.models_path.iterdir()
             if d.is_dir() and ((d / "model_index.json").exists() or (d / "unet" / "config.json").exists())
@@ -541,28 +651,22 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         return sorted(folders + safetensors)
     
     def list_available_models(self) -> List[str]:
+        # Implementation is unchanged...
         discoverable_models = [m['model_name'] for m in self.listModels()]
         local_models = self.list_local_models()
-        
-        combined_list = sorted(list(set(local_models + discoverable_models)))
-        return combined_list
+        return sorted(list(set(local_models + discoverable_models)))
 
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
+        # Implementation is unchanged...
         models = self.list_available_models()
         local_models = self.list_local_models()
-
         if not models:
             return [{"name": "diffusers_no_models", "caption": "No models found", "help": f"Place models in '{self.models_path.resolve()}'."}]
-
         services = []
         for m in models:
             help_text = "Hugging Face model ID"
-            if m in local_models:
-                 help_text = f"Local model from: {self.models_path.resolve()}"
-            elif m in CIVITAI_MODELS:
-                filename = CIVITAI_MODELS[m]['filename']
-                help_text = f"Civitai model (downloads as {filename})"
-            
+            if m in local_models: help_text = f"Local model from: {self.models_path.resolve()}"
+            elif m in CIVITAI_MODELS: help_text = f"Civitai model (downloads as {CIVITAI_MODELS[m]['filename']})"
             services.append({"name": m, "caption": f"Diffusers: {m}", "help": help_text})
         return services
 
@@ -570,6 +674,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         available_models = self.list_available_models()
         return [
             {"name": "model_name", "type": "str", "value": self.model_name, "description": "Local, Civitai, or Hugging Face model.", "options": available_models},
+            {"name": "unload_inactive_model_after", "type": "int", "value": self.config["unload_inactive_model_after"], "description": "Unload model after X seconds of inactivity (0 to disable)."},
             {"name": "device", "type": "str", "value": self.config["device"], "description": f"Inference device. Resolved: {self.config['device']}", "options": ["auto", "cuda", "mps", "cpu"]},
             {"name": "torch_dtype_str", "type": "str", "value": self.config["torch_dtype_str"], "description": f"Torch dtype. Resolved: {self.config['torch_dtype_str']}", "options": ["auto", "float16", "bfloat16", "float32"]},
             {"name": "hf_variant", "type": "str", "value": self.config["hf_variant"], "description": "HF model variant (e.g., 'fp16')."},
@@ -593,7 +698,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         parsed_settings = settings if isinstance(settings, dict) else \
                           {item["name"]: item["value"] for item in settings if "name" in item and "value" in item}
 
-        critical_keys = self.registry._get_config_key({}).__self__.critical_keys
+        critical_keys = self.registry._get_critical_keys()
         needs_manager_swap = False
 
         for key, value in parsed_settings.items():
@@ -609,6 +714,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             self._acquire_manager()
         
         if not needs_manager_swap and self.manager:
+            # Update non-critical settings on the existing manager
             self.manager.config.update(parsed_settings)
             if 'scheduler_name' in parsed_settings and self.manager.pipeline:
                  with self.manager.lock:

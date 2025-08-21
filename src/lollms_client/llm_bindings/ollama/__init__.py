@@ -680,7 +680,63 @@ class OllamaBinding(LollmsLLMBinding):
         
         ASCIIColors.warning(f"Context size not found for model '{model_name}'")
         return None
+
+    def ps(self):
+        """
+        Lists running models in a standardized, flat format.
+
+        This method corresponds to the /api/ps endpoint in the Ollama API. It retrieves
+        the models currently loaded into memory and transforms the data into a simplified,
+        flat list of dictionaries.
+
+        Returns:
+            list[dict]: A list of dictionaries, each representing a running model with a standardized set of keys.
+                        Returns an empty list if the client is not initialized or if an error occurs.
         
+        Example of a returned model dictionary:
+        {
+            "model_name": "gemma3:12b",
+            "size": 13861175232,
+            "vram_size": 10961479680,
+            "parameters_size": "12.2B",
+            "quantization_level": "Q4_K_M",
+            "context_size": 32000,
+            "parent_model": "",
+            "expires_at": "2025-08-20T22:28:18.6708784+02:00"
+        }
+        """
+        if not self.ollama_client:
+            ASCIIColors.warning("Ollama client not initialized. Cannot list running models.")
+            return []
+
+        try:
+            running_models_response = self.ollama_client.ps()
+            
+            models_list = running_models_response.get('models', [])
+            standardized_models = []
+
+            for model_data in models_list:
+                details = model_data.get('details', {})
+                
+                flat_model_info = {
+                    "model_name": model_data.get("name"),
+                    "size": model_data.get("size"),
+                    "vram_size": model_data.get("size_vram"),
+                    "expires_at": model_data.get("expires_at"),
+                    "parameters_size": details.get("parameter_size"),
+                    "quantization_level": details.get("quantization_level"),
+                    "parent_model": details.get("parent_model"),
+                    # Add context_size if it exists in the details
+                    "context_size": details.get("context_length") 
+                }
+                standardized_models.append(flat_model_info)
+            
+            return standardized_models
+
+        except Exception as e:
+            ASCIIColors.error(f"Failed to list running models from Ollama at {self.host_address}: {e}")
+            return []
+
 if __name__ == '__main__':
     global full_streamed_text
     # Example Usage (requires an Ollama server running)

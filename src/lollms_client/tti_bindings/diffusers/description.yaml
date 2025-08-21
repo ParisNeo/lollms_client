@@ -1,114 +1,148 @@
-title: Diffusers TTI Binding
-author: ParisNeo
-creation_date: 2024-05-21
-last_update_date: 2024-05-21
-description: |
-  A binding for the Hugging Face Diffusers library.
-  It allows running a wide variety of text-to-image models locally on your own hardware.
-  Models can be downloaded from the Hugging Face Hub or loaded from a local directory.
+author: 'LoLLMS Team'
+version: 1.0.0
+binding_name: 'diffusers'
+display_name: 'Diffusers'
+supported_file_types: []
+
+# Input parameters are used to initialize the binding.
+# These settings are configured once and typically require a model reload if changed.
 input_parameters:
-  - name: model_name
-    type: str
-    description: "Hugging Face model ID (e.g., 'stabilityai/stable-diffusion-xl-base-1.0') or a local model name from the models folder."
-    mandatory: true
+  - name: "model_name"
+    type: "str"
     default: "runwayml/stable-diffusion-v1-5"
-  - name: models_path
-    type: str
-    description: "Path to the directory for storing local text-to-image models. Defaults to a 'models' folder inside the binding directory."
-    mandatory: false
-    default: null
-  - name: hf_cache_path
-    type: str
-    description: "Path to a directory for Hugging Face to cache downloaded models. If not provided, the default Hugging Face cache location is used."
-    mandatory: false
-    default: null
-  - name: device
-    type: str
-    description: "Device for inference. Options: 'auto', 'cuda', 'mps', 'cpu'. Defaults to 'auto', which selects the best available hardware."
-    mandatory: false
+    description: "The local path, Civitai key, or Hugging Face repository ID of the model to be used."
+    options: ["runwayml/stable-diffusion-v1-5", "stabilityai/stable-diffusion-xl-base-1.0", "dreamshaper-8", "realistic-vision-v6"]
+  - name: "unload_inactive_model_after"
+    type: "int"
+    default: 0
+    description: "Unloads the model from VRAM after a specified number of seconds of inactivity. Set to 0 to keep the model loaded."
+  - name: "device"
+    type: "str"
     default: "auto"
-    options: "auto,cuda,mps,cpu"
-  - name: torch_dtype_str
-    type: str
-    description: "PyTorch data type for model weights. Options: 'auto', 'float16', 'bfloat16', 'float32'. 'auto' is recommended."
-    mandatory: false
+    description: "The device to run the model on. 'auto' will select CUDA if available, otherwise CPU."
+    options: ["auto", "cuda", "cpu", "mps"]
+  - name: "torch_dtype_str"
+    type: "str"
     default: "auto"
-    options: "auto,float16,bfloat16,float32"
-  - name: use_safetensors
-    type: bool
-    description: "Whether to prefer loading model weights from '.safetensors' files for improved security and performance. Defaults to true."
-    mandatory: false
-    default: true
-    options: "true,false"
-  - name: scheduler_name
-    type: str
-    description: "The diffusion scheduler to use for the generation process. Different schedulers can produce varying results. 'default' uses the model's recommended scheduler."
-    mandatory: false
+    description: "The torch data type to use. 'auto' selects float16 for CUDA and float32 for CPU."
+    options: ["auto", "float16", "bfloat16", "float32"]
+  - name: "scheduler_name"
+    type: "str"
     default: "default"
-    options: "default,ddim,ddpm,deis_multistep,dpm_multistep,dpm_multistep_karras,dpm_single,dpm_adaptive,dpm++_2m,dpm++_2m_karras,dpm++_2s_ancestral,dpm++_2s_ancestral_karras,dpm++_sde,dpm++_sde_karras,euler_ancestral_discrete,euler_discrete,heun_discrete,heun_karras,lms_discrete,lms_karras,pndm,unipc_multistep"
-  - name: safety_checker_on
-    type: bool
-    description: "Enable the model's built-in safety checker to filter potentially NSFW content. Defaults to true."
-    mandatory: false
+    description: "The noise scheduler to use for the diffusion process."
+    options: [
+      "default",
+      "ddim",
+      "ddpm",
+      "deis_multistep",
+      "dpm_multistep",
+      "dpm_multistep_karras",
+      "dpm_single",
+      "dpm_adaptive",
+      "dpm++_2m",
+      "dpm++_2m_karras",
+      "dpm++_2s_ancestral",
+      "dpm++_2s_ancestral_karras",
+      "dpm++_sde",
+      "dpm++_sde_karras",
+      "euler_ancestral_discrete",
+      "euler_discrete",
+      "heun_discrete",
+      "heun_karras",
+      "lms_discrete",
+      "lms_karras",
+      "pndm",
+      "unipc_multistep",
+      "dpm++_2m_sde",
+      "dpm++_2m_sde_karras",
+      "dpm2",
+      "dpm2_karras",
+      "dpm2_a",
+      "dpm2_a_karras",
+      "euler",
+      "euler_a",
+      "heun",
+      "lms"
+    ]
+  - name: "safety_checker_on"
+    type: "bool"
     default: true
-    options: "true,false"
-  - name: num_inference_steps
-    type: int
-    description: "Default number of steps for the generation process. Higher values can improve quality but take longer. Defaults to 25."
-    mandatory: false
+    description: "Enables the safety checker to prevent generating potentially unsafe content."
+  - name: "enable_xformers"
+    type: "bool"
+    default: false
+    description: "Enables xFormers for memory-efficient attention, which can speed up generation and reduce VRAM usage."
+  - name: "enable_cpu_offload"
+    type: "bool"
+    default: false
+    description: "Enables model CPU offloading to save VRAM at the cost of slower generation speed."
+
+# Model parameters are used for each generation request.
+# These settings can be overridden at runtime for each call to `generate_image`.
+model_parameters:
+  - name: "scheduler_name"
+    type: "str"
+    default: "default"
+    description: "The noise scheduler to use for the diffusion process."
+    options: [
+      "default",
+      "ddim",
+      "ddpm",
+      "deis_multistep",
+      "dpm_multistep",
+      "dpm_multistep_karras",
+      "dpm_single",
+      "dpm_adaptive",
+      "dpm++_2m",
+      "dpm++_2m_karras",
+      "dpm++_2s_ancestral",
+      "dpm++_2s_ancestral_karras",
+      "dpm++_sde",
+      "dpm++_sde_karras",
+      "euler_ancestral_discrete",
+      "euler_discrete",
+      "heun_discrete",
+      "heun_karras",
+      "lms_discrete",
+      "lms_karras",
+      "pndm",
+      "unipc_multistep",
+      "dpm++_2m_sde",
+      "dpm++_2m_sde_karras",
+      "dpm2",
+      "dpm2_karras",
+      "dpm2_a",
+      "dpm2_a_karras",
+      "euler",
+      "euler_a",
+      "heun",
+      "lms"
+    ]  
+  - name: "width"
+    type: "int"
+    default: 512
+    description: "The width of the generated image in pixels. SDXL models typically prefer 1024."
+  - name: "height"
+    type: "int"
+    default: 512
+    description: "The height of the generated image in pixels. SDXL models typically prefer 1024."
+  - name: "num_inference_steps"
+    type: "int"
     default: 25
-  - name: guidance_scale
-    type: float
-    description: "Default Classifier-Free Guidance (CFG) scale. Higher values make the image adhere more closely to the prompt. Defaults to 7.0."
-    mandatory: false
+    description: "The number of denoising steps. More steps can lead to higher quality but take longer."
+  - name: "guidance_scale"
+    type: "float"
     default: 7.0
-  - name: default_width
-    type: int
-    description: "Default width in pixels for generated images. SD1.5 is 512, SDXL is 1024. Defaults to 512."
-    mandatory: false
-    default: 512
-  - name: default_height
-    type: int
-    description: "Default height in pixels for generated images. SD1.5 is 512, SDXL is 1024. Defaults to 512."
-    mandatory: false
-    default: 512
-  - name: seed
-    type: int
-    description: "Default seed for the random number generator to ensure reproducibility. Set to -1 for a random seed each time. Defaults to -1."
-    mandatory: false
+    description: "Classifier-Free Guidance scale. A higher value makes the image adhere more closely to the prompt."
+  - name: "seed"
+    type: "int"
     default: -1
-  - name: enable_cpu_offload
-    type: bool
-    description: "Offload parts of the model to the CPU to save VRAM, at the cost of slower generation speed. Useful for GPUs with limited memory. Defaults to false."
-    mandatory: false
-    default: false
-    options: "true,false"
-  - name: enable_sequential_cpu_offload
-    type: bool
-    description: "A more aggressive form of CPU offloading that saves more VRAM but is significantly slower. Defaults to false."
-    mandatory: false
-    default: false
-    options: "true,false"
-  - name: enable_xformers
-    type: bool
-    description: "Enable xFormers memory-efficient attention to reduce VRAM usage and potentially speed up generation on compatible hardware. Requires xFormers to be installed. Defaults to false."
-    mandatory: false
-    default: false
-    options: "true,false"
-  - name: hf_variant
-    type: str
-    description: "Specify a model variant from the Hugging Face Hub, such as 'fp16' or 'bf16', if available for the chosen model."
-    mandatory: false
+    description: "The seed for the random number generator. Use -1 for a random seed."
+  - name: "eta"
+    type: "float"
+    default: 0.0
+    description: "A parameter for the DDIM scheduler, controlling the amount of noise added at each step."
+  - name: "clip_skip"
+    type: "int"
     default: null
-    options: "fp16,bf16"
-  - name: hf_token
-    type: str
-    description: "Your Hugging Face Hub user access token. Required for downloading private or gated models."
-    mandatory: false
-    default: null
-  - name: local_files_only
-    type: bool
-    description: "If true, the binding will only use local files and will not attempt to download models from the Hugging Face Hub. Defaults to false."
-    mandatory: false
-    default: false
-    options: "true,false"
+    description: "Number of layers to skip from the end of the CLIP model. An advanced parameter for style tuning." 
