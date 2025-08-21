@@ -1468,7 +1468,6 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         if max_reasoning_steps is None:
             max_reasoning_steps = 10
 
-        # --- Helper Functions ---
         def log_event(desc, event_type=MSG_TYPE.MSG_TYPE_CHUNK, meta=None, event_id=None) -> Optional[str]:
             if not streaming_callback:
                 return None
@@ -1489,7 +1488,6 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             ASCIIColors.red(f"Prompt size:{prompt_size}/{self.llm.default_ctx_size}")
             ASCIIColors.cyan(f"** DEBUG: DONE **")
 
-        # --- 1. Initialize State ---
         original_user_prompt, tool_calls_this_turn, sources_this_turn = prompt, [], []
         asset_store: Dict[str, Dict] = {}
         initial_state_parts = ["### Initial State", "- My goal is to address the user's request comprehensively."]
@@ -1507,9 +1505,10 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 initial_state_parts.append(f"- A code block was found in the context. It has been registered as asset ID: {code_uuid}")
         current_scratchpad = "\n".join(initial_state_parts)
 
-        # --- 2. Tool Discovery ---
         discovery_step_id = log_event("Discovering tools...", MSG_TYPE.MSG_TYPE_STEP_START)
         all_discovered_tools, visible_tools = [], []
+        rag_registry: Dict[str, Callable] = {}
+        rag_tool_specs: Dict[str, Dict] = {}
 
         if use_mcps and hasattr(self, 'mcp'):
             mcp_tools = self.mcp.discover_tools(force_refresh=True)
@@ -1520,47 +1519,61 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 
         if use_data_store:
             for name, info in use_data_store.items():
-                visible_tools.append({
-                    "name": f"research::{name}",
-                    "description": info.get("description", f"Queries '{name}'."),
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {"query": {"type": "string"}},
-                        "required": ["query"]
-                    }
-                })
+                tool_name = f"research::{name}"
+                description = f"Queries '{name}'."
+                call_fn = None
+                if callable(info):
+                    call_fn = info
+                elif isinstance(info, dict):
+                    if "call" in info and callable(info["call"]):
+                        call_fn = info["call"]
+                    description = info.get("description", description)
+                if call_fn:
+                    visible_tools.append({
+                        "name": tool_name,
+                        "description": description,
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "top_k": {"type": "integer"},
+                                "min_similarity_percent": {"type": "number"},
+                                "filters": {"type": "object"}
+                            },
+                            "required": ["query"]
+                        }
+                    })
+                    rag_registry[tool_name] = call_fn
+                    rag_tool_specs[tool_name] = {"default_top_k": rag_top_k, "default_min_sim": rag_min_similarity_percent}
+                else:
+                    log_event("RAG tool registration failed", MSG_TYPE.MSG_TYPE_WARNING, meta={"store_name": name})
 
         visible_tools.extend(all_discovered_tools)
 
         built_in_tools = [
-            {"name": "local_tools::final_answer",
-             "description": "Provide the final answer directly to the user.",
-             "input_schema": {}},
-            {"name": "local_tools::request_clarification",
-             "description": "Ask the user for more information.",
-             "input_schema": {"type": "object", "properties": {"question_to_user": {"type": "string"}}, "required": ["question_to_user"]}}
+            {"name": "local_tools::final_answer", "description": "Provide the final answer directly to the user.", "input_schema": {}},
+            {"name": "local_tools::request_clarification", "description": "Ask the user for more information.", "input_schema": {"type": "object", "properties": {"question_to_user": {"type": "string"}}, "required": ["question_to_user"]}}
         ]
 
         if getattr(self, "tti", None):
             built_in_tools.append({
                 "name": "local_tools::generate_image",
                 "description": "Generate an image from a text description. Returns a base64-encoded image.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"prompt": {"type": "string"}},
-                    "required": ["prompt"]
-                }
+                "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}
             })
 
         all_visible_tools = visible_tools + built_in_tools
         formatted_tools_list = "\n".join([f"**{t['name']}**:\n- Description: {t['description']}" for t in all_visible_tools])
-        log_event(f"Made {len(all_visible_tools)} tools visible.", MSG_TYPE.MSG_TYPE_STEP_END, meta={"visible": len(all_visible_tools)}, event_id=discovery_step_id)
+        log_event(
+            f"Made {len(all_visible_tools)} tools visible.",
+            MSG_TYPE.MSG_TYPE_STEP_END,
+            meta={"visible": len(all_visible_tools), "rag_tools": list(rag_registry.keys())},
+            event_id=discovery_step_id
+        )
 
-        # --- 3. Dynamic Reasoning Loop ---
         for i in range(max_reasoning_steps):
             reasoning_step_id = log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_START)
             try:
-                # === DECISION PHASE ===
                 reasoning_prompt = f"""--- AVAILABLE ACTIONS ---
 {formatted_tools_list}
 
@@ -1568,13 +1581,13 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
 {current_scratchpad}
 --- END SCRATCHPAD ---
 
-**INSTRUCTIONS:**
-1. OBSERVE: Review your scratchpad and available assets (code, images, etc.).
-2. THINK: Based on the original user request "{original_user_prompt}", what is the single next logical action?
-3. ACT: Output a JSON object with the following schema:
+INSTRUCTIONS:
+1) OBSERVE the scratchpad and available assets.
+2) THINK what is the single best next action to progress toward the user's goal: "{original_user_prompt}".
+3) ACT: Produce only this JSON:
 
 {{
-  "thought": "Your reasoning here.",
+  "thought": "short, concrete reasoning",
   "action": {{
     "tool_name": "string",
     "requires_code_input": true/false,
@@ -1582,16 +1595,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
   }}
 }}
 
-You may choose "local_tools::final_answer" if you can directly answer the user without tools.
+You may choose "local_tools::final_answer" to answer directly without tools.
 """
-
+                log_prompt("Decision Prompt", reasoning_prompt)
                 decision_schema = {
                     "thought": "My reasoning.",
-                    "action": {
-                        "tool_name": "string",
-                        "requires_code_input": "boolean",
-                        "requires_image_input": "boolean"
-                    }
+                    "action": {"tool_name": "string", "requires_code_input": "boolean", "requires_image_input": "boolean"}
                 }
                 decision_data = self.generate_structured_content(
                     prompt=reasoning_prompt,
@@ -1600,25 +1609,23 @@ You may choose "local_tools::final_answer" if you can directly answer the user w
                     temperature=decision_temperature,
                     **llm_generation_kwargs
                 )
-
                 if not decision_data or not isinstance(decision_data.get("action"), dict):
-                    log_event("Failed to generate a valid JSON decision. Will retry.", MSG_TYPE.MSG_TYPE_WARNING, event_id=reasoning_step_id)
-                    current_scratchpad += "\n\n### Step Failure\n- **Error:** Failed to produce a valid JSON decision."
+                    log_event("Invalid decision JSON", MSG_TYPE.MSG_TYPE_WARNING, meta={"decision_raw": str(decision_data)}, event_id=reasoning_step_id)
+                    current_scratchpad += "\n\n### Step Failure\n- Error: Invalid decision JSON."
                     continue
 
                 thought, action = decision_data.get("thought", ""), decision_data.get("action", {})
                 tool_name = action.get("tool_name")
                 requires_code = action.get("requires_code_input", False)
                 requires_image = action.get("requires_image_input", False)
-
                 current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
-                log_event(thought, MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT)
+                log_event("Decision taken", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name, "requires_code": requires_code, "requires_image": requires_image})
 
                 if tool_name == "local_tools::final_answer":
                     break
                 if tool_name == "local_tools::request_clarification":
                     return {
-                        "final_answer": "?",
+                        "final_answer": decision_data.get("question_to_user", "?"),
                         "final_scratchpad": current_scratchpad,
                         "tool_calls": tool_calls_this_turn,
                         "sources": sources_this_turn,
@@ -1626,43 +1633,53 @@ You may choose "local_tools::final_answer" if you can directly answer the user w
                         "error": None
                     }
 
-                # === PREPARE PARAMETERS PHASE ===
                 prepared_assets = {}
                 if requires_code:
-                    code_prompt = f"""Generate raw code (without explanation) that addresses the current user request.
-User Request: "{original_user_prompt}"
-Context scratchpad:
+                    code_prompt = f"""--- ORIGINAL USER REQUEST ---
+"{original_user_prompt}"
+
+--- YOUR INTERNAL SCRATCHPAD ---
 {current_scratchpad}
-"""
-                    generated_code = self.generate_code(
-                        prompt=code_prompt,
-                        system_prompt="Generate ONLY raw code.",
-                        **llm_generation_kwargs
-                    )
+--- END SCRATCHPAD ---
+
+INSTRUCTIONS:
+Generate raw code only, with no explanations. The code must be self-contained and directly address the current next action."""
+                    log_prompt("Code Generation Prompt", code_prompt)
+                    generated_code = self.generate_code(prompt=code_prompt, system_prompt="Generate ONLY raw code.", **llm_generation_kwargs)
                     code_uuid = str(uuid.uuid4())
                     asset_store[code_uuid] = {"type": "code", "content": generated_code}
                     prepared_assets["code_asset_id"] = code_uuid
+                    log_event("Code asset created", MSG_TYPE.MSG_TYPE_STEP, meta={"code_asset_id": code_uuid, "code_len": len(generated_code) if isinstance(generated_code, str) else None})
 
                 if requires_image:
                     for img_b64 in images or []:
                         img_uuid = str(uuid.uuid4())
                         asset_store[img_uuid] = {"type": "image", "content": img_b64}
                         prepared_assets.setdefault("image_asset_ids", []).append(img_uuid)
+                    log_event("Image assets prepared", MSG_TYPE.MSG_TYPE_STEP, meta={"image_asset_ids": prepared_assets.get("image_asset_ids", [])})
 
-                param_prompt = f"""You already decided to call tool: {tool_name}.
-Now you must fill in the parameters for this tool.
+                param_prompt = f"""--- SELECTED TOOL ---
+{tool_name}
 
-Important rules:
-- If you require code, DO NOT paste raw code. Instead, use the code asset ID: {prepared_assets.get("code_asset_id","<none>")}
-- If you require images, DO NOT paste raw image data. Instead, use the image asset IDs: {prepared_assets.get("image_asset_ids","<none>")}
+--- AVAILABLE ASSETS ---
+code_asset_id: {prepared_assets.get("code_asset_id","<none>")}
+image_asset_ids: {prepared_assets.get("image_asset_ids","<none>")}
 
-Output a JSON object with the following schema:
+--- ORIGINAL USER REQUEST ---
+"{original_user_prompt}"
+
+--- YOUR INTERNAL SCRATCHPAD ---
+{current_scratchpad}
+--- END SCRATCHPAD ---
+
+INSTRUCTIONS:
+Fill the parameters for the selected tool. If code is required, do not paste code; use the code asset ID string exactly. If images are required, use the provided image asset IDs. Output only:
 
 {{
-  "tool_params": {{ ... }}
+  "tool_params": {{...}}
 }}
 """
-
+                log_prompt("Parameter Generation Prompt", param_prompt)
                 param_schema = {"tool_params": "object"}
                 param_data = self.generate_structured_content(
                     prompt=param_prompt,
@@ -1671,10 +1688,11 @@ Output a JSON object with the following schema:
                     temperature=decision_temperature,
                     **llm_generation_kwargs
                 )
-
                 tool_params = {}
                 if param_data and isinstance(param_data.get("tool_params"), dict):
                     tool_params = param_data["tool_params"]
+                else:
+                    log_event("Parameter generation returned empty", MSG_TYPE.MSG_TYPE_WARNING, meta={"param_raw": str(param_data)})
 
                 def _hydrate(data: Any, store: Dict) -> Any:
                     if isinstance(data, dict):
@@ -1686,60 +1704,85 @@ Output a JSON object with the following schema:
                     return data
 
                 hydrated_params = _hydrate(tool_params, asset_store)
+                log_event("Hydrated parameters", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name})
 
-                # === TOOL EXECUTION ===
                 tool_result = {"status": "failure", "error": f"Tool '{tool_name}' failed."}
                 try:
                     if tool_name == "local_tools::generate_image":
                         prompt_for_img = hydrated_params.get("prompt", "")
+                        log_event("TTI call start", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name})
                         image_bytes = self.tti.generate_image(prompt=prompt_for_img)
                         if not image_bytes:
                             raise Exception("TTI binding returned empty image data.")
                         b64_image = base64.b64encode(image_bytes).decode("utf-8")
                         img_uuid = str(uuid.uuid4())
                         asset_store[img_uuid] = {"type": "image", "content": f"data:image/png;base64,{b64_image}"}
-                        tool_result = {
-                            "status": "success",
-                            "image_asset": img_uuid,
-                            "html_tag": f"<img src='data:image/png;base64,{b64_image}' alt='Generated Image'/>"
-                        }
+                        tool_result = {"status": "success", "image_asset": img_uuid, "html_tag": f"<img src='data:image/png;base64,{b64_image}' alt='Generated Image'/>"}
+                        log_event("TTI call success", MSG_TYPE.MSG_TYPE_STEP, meta={"image_asset": img_uuid})
+                    elif tool_name in rag_registry:
+                        query = hydrated_params.get("query", "")
+                        top_k = int(hydrated_params.get("top_k", rag_tool_specs[tool_name]["default_top_k"]))
+                        min_sim = float(hydrated_params.get("min_similarity_percent", rag_tool_specs[tool_name]["default_min_sim"]))
+                        filters = hydrated_params.get("filters", None)
+                        log_event("RAG call start", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name, "query": query, "top_k": top_k, "min_similarity_percent": min_sim, "has_filters": bool(filters)})
+                        rag_fn = rag_registry[tool_name]
+                        try:
+                            raw_results = rag_fn(query=query, top_k=top_k, filters=filters)
+                        except TypeError:
+                            raw_results = rag_fn(query)
+                        docs = []
+                        if isinstance(raw_results, dict) and "results" in raw_results:
+                            raw_iter = raw_results["results"]
+                        else:
+                            raw_iter = raw_results
+                        for d in raw_iter or []:
+                            text = d.get("text") if isinstance(d, dict) else str(d)
+                            score = d.get("score", 0.0) if isinstance(d, dict) else 0.0
+                            meta = d.get("metadata", {}) if isinstance(d, dict) else {}
+                            pct = score * 100.0 if score <= 1.0 else score
+                            docs.append({"text": text, "score": pct, "metadata": meta})
+                        docs.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+                        kept = [x for x in docs if x.get("score", 0.0) >= min_sim][:top_k]
+                        dropped = len(docs) - len(kept)
+                        tool_result = {"status": "success", "results": kept, "dropped": dropped, "min_similarity_percent": min_sim, "top_k": top_k}
+                        sources_this_turn.extend([{"source": tool_name, "metadata": x.get("metadata", {}), "score": x.get("score", 0.0)} for x in kept])
+                        snippet_preview = [{"score": x["score"], "text": (x["text"][:200] + "…") if isinstance(x["text"], str) and len(x["text"]) > 200 else x["text"]} for x in kept]
+                        log_event("RAG call end", MSG_TYPE.MSG_TYPE_STEP_END, meta={"tool_name": tool_name, "kept": len(kept), "dropped": dropped, "preview": snippet_preview})
+                        rag_notes = "\n".join([f"- [{idx+1}] score={x['score']:.1f}% | {x['text'][:500]}" for idx, x in enumerate(kept)])
+                        current_scratchpad += f"\n\n### RAG Notes ({tool_name})\n{rag_notes if rag_notes else '- No results above threshold.'}"
                     elif hasattr(self, "mcp"):
-                        tool_result = self.mcp.execute_tool(
-                            tool_name,
-                            hydrated_params,
-                            lollms_client_instance=self
-                        )
+                        log_event("MCP tool call start", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name})
+                        tool_result = self.mcp.execute_tool(tool_name, hydrated_params, lollms_client_instance=self)
+                        log_event("MCP tool call end", MSG_TYPE.MSG_TYPE_STEP_END, meta={"tool_name": tool_name})
+                    else:
+                        tool_result = {"status": "failure", "error": "No MCP instance available and tool is not RAG/TTI."}
                 except Exception as e:
                     tool_result = {"status": "failure", "error": str(e)}
+                    log_event("Tool call exception", MSG_TYPE.MSG_TYPE_EXCEPTION, meta={"tool_name": tool_name, "error": str(e)})
 
-                sanitized_result = {}
-                if isinstance(tool_result, dict):
-                    sanitized_result = tool_result.copy()
-                else:
-                    sanitized_result = {"raw_output": str(tool_result)}
-
+                sanitized_result = tool_result.copy() if isinstance(tool_result, dict) else {"raw_output": str(tool_result)}
                 observation_text = f"```json\n{json.dumps(sanitized_result, indent=2)}\n```"
-                log_event(f"Received output from: {tool_name}", MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, meta={"name": tool_name, "result": sanitized_result})
                 tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
-                current_scratchpad += f"\n\n### Step {i+1}: Observation\n- **Action:** Called `{tool_name}`\n- **Result:**\n{observation_text}"
+                current_scratchpad += f"\n\n### Step {i+1}: Observation\n- Action: `{tool_name}`\n- Result:\n{observation_text}"
+                log_event("Observation recorded", MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, meta={"tool_name": tool_name})
 
                 log_event(f"Finished reasoning step {i+1}", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
-
             except Exception as ex:
                 trace_exception(ex)
-                log_event(f"Error in reasoning loop: {str(ex)}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=reasoning_step_id)
+                log_event("Error in reasoning loop", MSG_TYPE.MSG_TYPE_EXCEPTION, meta={"error": str(ex)}, event_id=reasoning_step_id)
 
-        # --- 4. Final Answer Synthesis ---
         synthesis_id = log_event("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_START)
-        final_answer_prompt = f"""--- Original User Request ---
+        final_answer_prompt = f"""--- ORIGINAL USER REQUEST ---
 "{original_user_prompt}"
 
---- Your Internal Scratchpad ---
+--- YOUR INTERNAL SCRATCHPAD ---
 {current_scratchpad}
+--- END SCRATCHPAD ---
 
---- INSTRUCTIONS ---
-Synthesize a clear, comprehensive, and friendly answer for the user based ONLY on your scratchpad."""
+INSTRUCTIONS:
+Synthesize a clear, comprehensive, and friendly answer for the user based ONLY on your scratchpad. If relevant images were generated, refer to them naturally. Keep the answer concise but complete."""
         final_synthesis_images = [img for img in (images or [])] + [asset['content'] for asset in asset_store.values() if asset['type'] == 'image']
+        log_prompt("Final Synthesis Prompt", final_answer_prompt)
         final_answer_text = self.generate_text(
             prompt=final_answer_prompt,
             system_prompt=system_prompt,
@@ -1749,25 +1792,24 @@ Synthesize a clear, comprehensive, and friendly answer for the user based ONLY o
             temperature=final_answer_temperature,
             **llm_generation_kwargs
         )
-
         if isinstance(final_answer_text, dict) and "error" in final_answer_text:
-            return {"final_answer": "", "final_scratchpad": current_scratchpad,
-                    "tool_calls": tool_calls_this_turn, "sources": sources_this_turn,
-                    "clarification_required": False, "error": final_answer_text["error"]}
+            return {"final_answer": "", "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": False, "error": final_answer_text["error"]}
 
         final_answer = self.remove_thinking_blocks(final_answer_text)
-
-        # Append generated images
         for asset_id, asset in asset_store.items():
-            if asset["type"] == "image":
-                if asset["content"].startswith("data:image"):
-                    final_answer += f"\n\n<img src='{asset['content']}' alt='Generated Image'/>"
+            if asset["type"] == "image" and isinstance(asset.get("content"), str) and asset["content"].startswith("data:image"):
+                final_answer += f"\n\n<img src='{asset['content']}' alt='Generated Image'/>"
 
         log_event("Finished synthesizing answer.", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id)
 
-        return {"final_answer": final_answer, "final_scratchpad": current_scratchpad,
-                "tool_calls": tool_calls_this_turn, "sources": sources_this_turn,
-                "clarification_required": False, "error": None}
+        return {
+            "final_answer": final_answer,
+            "final_scratchpad": current_scratchpad,
+            "tool_calls": tool_calls_this_turn,
+            "sources": sources_this_turn,
+            "clarification_required": False,
+            "error": None
+        }
 
     def generate_code(
                         self,
