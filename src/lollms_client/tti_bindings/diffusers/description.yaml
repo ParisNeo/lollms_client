@@ -1,148 +1,132 @@
+title: 'Diffusers TTI'
 author: 'LoLLMS Team'
-version: 1.0.0
+version: 1.0.1
 binding_name: 'diffusers'
-display_name: 'Diffusers'
 supported_file_types: []
 
-# Input parameters are used to initialize the binding.
-# These settings are configured once and typically require a model reload if changed.
+description: |
+  This binding integrates Hugging Face's Diffusers library into LoLLMS
+  for Text-to-Image (TTI) and Image-to-Image (ITI) tasks.
+
+  It supports a wide range of diffusion-based models (e.g., Stable Diffusion,
+  Stable Diffusion XL, Kandinsky, etc.), as provided through the `diffusers`
+  ecosystem.
+
+  Two main operations are supported:
+
+  1. generate_image:
+     - Generates one or multiple images from a text prompt.
+     - Supports configuration of model, size, guidance scale, inference steps, scheduler, etc.
+
+  2. edit_image (image-to-image / inpainting):
+     - Modifies an existing image based on a prompt and optional mask.
+     - Useful for inpainting, outpainting, or style transformation.
+
+  Parameters can be set globally at initialization (e.g., default model, steps, scheduler),
+  or per-request at runtime. Runtime overrides global, which overrides defaults.
+
 input_parameters:
-  - name: "model_name"
+  - name: "model"
     type: "str"
     default: "runwayml/stable-diffusion-v1-5"
-    description: "The local path, Civitai key, or Hugging Face repository ID of the model to be used."
-    options: ["runwayml/stable-diffusion-v1-5", "stabilityai/stable-diffusion-xl-base-1.0", "dreamshaper-8", "realistic-vision-v6"]
-  - name: "unload_inactive_model_after"
-    type: "int"
-    default: 0
-    description: "Unloads the model from VRAM after a specified number of seconds of inactivity. Set to 0 to keep the model loaded."
+    description: "The Hugging Face model ID to use (e.g., 'stabilityai/stable-diffusion-xl-base-1.0')."
+
   - name: "device"
     type: "str"
-    default: "auto"
-    description: "The device to run the model on. 'auto' will select CUDA if available, otherwise CPU."
-    options: ["auto", "cuda", "cpu", "mps"]
-  - name: "torch_dtype_str"
-    type: "str"
-    default: "auto"
-    description: "The torch data type to use. 'auto' selects float16 for CUDA and float32 for CPU."
-    options: ["auto", "float16", "bfloat16", "float32"]
-  - name: "scheduler_name"
-    type: "str"
-    default: "default"
-    description: "The noise scheduler to use for the diffusion process."
-    options: [
-      "default",
-      "ddim",
-      "ddpm",
-      "deis_multistep",
-      "dpm_multistep",
-      "dpm_multistep_karras",
-      "dpm_single",
-      "dpm_adaptive",
-      "dpm++_2m",
-      "dpm++_2m_karras",
-      "dpm++_2s_ancestral",
-      "dpm++_2s_ancestral_karras",
-      "dpm++_sde",
-      "dpm++_sde_karras",
-      "euler_ancestral_discrete",
-      "euler_discrete",
-      "heun_discrete",
-      "heun_karras",
-      "lms_discrete",
-      "lms_karras",
-      "pndm",
-      "unipc_multistep",
-      "dpm++_2m_sde",
-      "dpm++_2m_sde_karras",
-      "dpm2",
-      "dpm2_karras",
-      "dpm2_a",
-      "dpm2_a_karras",
-      "euler",
-      "euler_a",
-      "heun",
-      "lms"
-    ]
-  - name: "safety_checker_on"
-    type: "bool"
-    default: true
-    description: "Enables the safety checker to prevent generating potentially unsafe content."
-  - name: "enable_xformers"
-    type: "bool"
-    default: false
-    description: "Enables xFormers for memory-efficient attention, which can speed up generation and reduce VRAM usage."
-  - name: "enable_cpu_offload"
-    type: "bool"
-    default: false
-    description: "Enables model CPU offloading to save VRAM at the cost of slower generation speed."
+    default: "cuda"
+    description: "Device to run the model on (e.g., 'cuda', 'mps', 'cpu')."
 
-# Model parameters are used for each generation request.
-# These settings can be overridden at runtime for each call to `generate_image`.
-model_parameters:
-  - name: "scheduler_name"
+  - name: "dtype"
     type: "str"
-    default: "default"
-    description: "The noise scheduler to use for the diffusion process."
-    options: [
-      "default",
-      "ddim",
-      "ddpm",
-      "deis_multistep",
-      "dpm_multistep",
-      "dpm_multistep_karras",
-      "dpm_single",
-      "dpm_adaptive",
-      "dpm++_2m",
-      "dpm++_2m_karras",
-      "dpm++_2s_ancestral",
-      "dpm++_2s_ancestral_karras",
-      "dpm++_sde",
-      "dpm++_sde_karras",
-      "euler_ancestral_discrete",
-      "euler_discrete",
-      "heun_discrete",
-      "heun_karras",
-      "lms_discrete",
-      "lms_karras",
-      "pndm",
-      "unipc_multistep",
-      "dpm++_2m_sde",
-      "dpm++_2m_sde_karras",
-      "dpm2",
-      "dpm2_karras",
-      "dpm2_a",
-      "dpm2_a_karras",
-      "euler",
-      "euler_a",
-      "heun",
-      "lms"
-    ]  
-  - name: "width"
-    type: "int"
-    default: 512
-    description: "The width of the generated image in pixels. SDXL models typically prefer 1024."
-  - name: "height"
-    type: "int"
-    default: 512
-    description: "The height of the generated image in pixels. SDXL models typically prefer 1024."
-  - name: "num_inference_steps"
-    type: "int"
-    default: 25
-    description: "The number of denoising steps. More steps can lead to higher quality but take longer."
-  - name: "guidance_scale"
-    type: "float"
-    default: 7.0
-    description: "Classifier-Free Guidance scale. A higher value makes the image adhere more closely to the prompt."
+    default: "float16"
+    description: "Torch dtype to use for inference ('float16' recommended for GPU)."
+
   - name: "seed"
     type: "int"
-    default: -1
-    description: "The seed for the random number generator. Use -1 for a random seed."
-  - name: "eta"
-    type: "float"
-    default: 0.0
-    description: "A parameter for the DDIM scheduler, controlling the amount of noise added at each step."
-  - name: "clip_skip"
+    default: 42
+    description: "Random seed for reproducibility."
+
+  - name: "scheduler_name"
+    type: "str"
+    default: "default"
+    description: "Default scheduler to use for denoising steps. Can be overridden per generation."
+    options: ["default", "ddim", "ddpm", "deis_multistep", "dpm_multistep", "dpm_multistep_karras", "dpm_single", "dpm_adaptive", "dpm++_2m", "dpm++_2m_karras", "dpm++_2s_ancestral", "dpm++_2s_ancestral_karras", "dpm++_sde", "dpm++_sde_karras", "euler_ancestral_discrete", "euler_discrete", "heun_discrete", "heun_karras", "lms_discrete", "lms_karras", "pndm", "unipc_multistep", "dpm++_2m_sde", "dpm++_2m_sde_karras", "dpm2", "dpm2_karras", "dpm2_a", "dpm2_a_karras", "euler", "euler_a", "heun", "lms"]
+
+generate_image_parameters:
+  - name: "prompt"
+    type: "str"
+    default: ""
+    description: "The text prompt describing the image to generate."
+
+  - name: "negative_prompt"
+    type: "str"
+    default: ""
+    description: "Optional negative prompt to avoid unwanted features."
+
+  - name: "size"
+    type: "str"
+    default: "512x512"
+    description: "Image size in WxH format. E.g., '512x512', '1024x1024'."
+
+  - name: "n"
     type: "int"
-    default: null
-    description: "Number of layers to skip from the end of the CLIP model. An advanced parameter for style tuning." 
+    default: 1
+    description: "Number of images to generate per request."
+
+  - name: "num_inference_steps"
+    type: "int"
+    default: 50
+    description: "Number of denoising steps (more steps = higher quality, slower)."
+
+  - name: "guidance_scale"
+    type: "float"
+    default: 7.5
+    description: "Classifier-free guidance scale. Higher = more prompt adherence."
+
+  - name: "scheduler_name"
+    type: "str"
+    default: "default"
+    description: "Scheduler to use for this generation request. Overrides global scheduler if provided."
+    options: ["default", "ddim", "ddpm", "deis_multistep", "dpm_multistep", "dpm_multistep_karras", "dpm_single", "dpm_adaptive", "dpm++_2m", "dpm++_2m_karras", "dpm++_2s_ancestral", "dpm++_2s_ancestral_karras", "dpm++_sde", "dpm++_sde_karras", "euler_ancestral_discrete", "euler_discrete", "heun_discrete", "heun_karras", "lms_discrete", "lms_karras", "pndm", "unipc_multistep", "dpm++_2m_sde", "dpm++_2m_sde_karras", "dpm2", "dpm2_karras", "dpm2_a", "dpm2_a_karras", "euler", "euler_a", "heun", "lms"]
+
+edit_image_parameters:
+  - name: "prompt"
+    type: "str"
+    default: ""
+    description: "The prompt describing the edit or transformation."
+
+  - name: "image"
+    type: "str"
+    default: ""
+    description: "The input image to edit. Can be a base64 string, URL, or local file path."
+
+  - name: "mask"
+    type: "str"
+    default: ""
+    description: "Optional mask image for inpainting. White areas = editable."
+
+  - name: "size"
+    type: "str"
+    default: "512x512"
+    description: "Size of the output image."
+
+  - name: "num_inference_steps"
+    type: "int"
+    default: 50
+    description: "Number of denoising steps."
+
+  - name: "guidance_scale"
+    type: "float"
+    default: 7.5
+    description: "Prompt adherence strength."
+
+  - name: "strength"
+    type: "float"
+    default: 0.8
+    description: "Strength of transformation when editing an image."
+
+  - name: "scheduler_name"
+    type: "str"
+    default: "default"
+    description: "Scheduler to use for this edit request. Overrides global scheduler if provided."
+    options: ["default", "ddim", "ddpm", "deis_multistep", "dpm_multistep", "dpm_multistep_karras", "dpm_single", "dpm_adaptive", "dpm++_2m", "dpm++_2m_karras", "dpm++_2s_ancestral", "dpm++_2s_ancestral_karras", "dpm++_sde", "dpm++_sde_karras", "euler_ancestral_discrete", "euler_discrete", "heun_discrete", "heun_karras", "lms_discrete", "lms_karras", "pndm", "unipc_multistep", "dpm++_2m_sde", "dpm++_2m_sde_karras", "dpm2", "dpm2_karras", "dpm2_a", "dpm2_a_karras", "euler", "euler_a", "heun", "lms"]

@@ -31,7 +31,8 @@ if False:
 
 from lollms_client.lollms_utilities import build_image_dicts, robust_json_parser
 from ascii_colors import ASCIIColors, trace_exception
-from .lollms_types import MSG_TYPE
+# Assuming lollms_types is a local module providing MSG_TYPE enum/constants
+# from .lollms_types import MSG_TYPE 
 
 class EncryptedString(TypeDecorator):
     """A SQLAlchemy TypeDecorator for field-level database encryption.
@@ -461,7 +462,7 @@ class LollmsDiscussion:
         """Initializes a discussion instance.
 
         Args:
-            lollmsClient: The LollmsClient instance used for generation and token counting.
+            lollmsClient: The LollmsClient instance for generation and token counting.
             db_manager: An optional LollmsDataManager for database persistence.
             discussion_id: The ID of the discussion to load (if db_manager is provided).
             db_discussion_obj: A pre-loaded ORM object to wrap.
@@ -500,30 +501,20 @@ class LollmsDiscussion:
         
         object.__setattr__(self, '_system_prompt', getattr(self._db_discussion, 'system_prompt', None))
 
-        # --- THE FIX IS HERE: Load discussion-level images from metadata ---
+        # --- REVISED IMAGE HANDLING ---
+        # Load raw image data from metadata. This might be in the old (list of strings)
+        # or new (list of dicts) format. The get_discussion_images() method will
+        # handle the migration and act as the single source of truth.
         metadata = getattr(self._db_discussion, 'discussion_metadata', {}) or {}
-        image_data = metadata.get("discussion_images", {})
-        
-        images_list = []
-        active_list = []
-        
-        if isinstance(image_data, dict) and 'data' in image_data:
-            # New format: {'data': [...], 'active': [...]}
-            images_list = image_data.get('data', [])
-            active_list = image_data.get('active', [])
-        else:
-            # Covers case where image_data is None, empty dict, or a legacy list
-            # We will rely on migration logic in `get_user_discussion` to fix the DB format
-            # For now, we just don't crash and load empty lists.
-            images_list = []
-            active_list = []
-            
-        object.__setattr__(self, 'images', images_list)
-        object.__setattr__(self, 'active_images', active_list)
-        # --- END FIX ---
+        images_data = metadata.get("discussion_images", [])
+        object.__setattr__(self, 'images', images_data)
+        # The separate `active_images` list is deprecated and removed to avoid inconsistency.
 
         self._rebuild_message_index()
-        self._validate_and_set_active_branch() # Call for initial load
+        self._validate_and_set_active_branch()
+        # Trigger potential migration on load to ensure data is consistent from the start.
+        self.get_discussion_images()
+
 
     @classmethod
     def create_new(cls, lollms_client: 'LollmsClient', db_manager: Optional[LollmsDataManager] = None, **kwargs) -> 'LollmsDiscussion':
@@ -597,7 +588,7 @@ class LollmsDiscussion:
         # and should not be proxied to the underlying data object.
         internal_attrs = [
             'lollmsClient', 'db_manager', 'autosave', 'max_context_size', 'scratchpad',
-            'images', 'active_images',
+            'images',
             '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db',
             '_is_db_backed', '_system_prompt'
         ]
@@ -763,13 +754,12 @@ class LollmsDiscussion:
     def touch(self):
         """Marks the discussion as updated, persists images, and saves if autosave is on."""
         # Persist in-memory discussion images to the metadata field before saving.
-        # This works for both DB-backed and in-memory discussions.
+        # self.images is the single source of truth and is guaranteed to be in the
+        # correct dictionary format by the get_discussion_images() lazy migration.
         metadata = (getattr(self._db_discussion, 'discussion_metadata', {}) or {}).copy()
-        if self.images or "discussion_images" in metadata:  # Only update if needed
-            metadata["discussion_images"] = {
-                "data": self.images,
-                "active": self.active_images
-            }
+        
+        if self.images or "discussion_images" in metadata:
+            metadata["discussion_images"] = self.images
             setattr(self._db_discussion, 'discussion_metadata', metadata)
 
         setattr(self._db_discussion, 'updated_at', datetime.utcnow())
@@ -794,7 +784,6 @@ class LollmsDiscussion:
         try:
             self._session.commit()
             self._rebuild_message_index() # Rebuild index after commit to reflect DB state
-            # self._validate_and_set_active_branch() # REMOVED: This validation is now handled by direct operations or on load.
         except Exception as e:
             self._session.rollback()
             raise e
@@ -983,6 +972,9 @@ class LollmsDiscussion:
 
             # --- New Data Source Handling Logic ---
             if hasattr(personality, 'data_source') and personality.data_source is not None:
+                # Placeholder for MSG_TYPE if not imported
+                MSG_TYPE = SimpleNamespace(MSG_TYPE_STEP="step", MSG_TYPE_STEP_START="step_start", MSG_TYPE_STEP_END="step_end", MSG_TYPE_EXCEPTION="exception")
+
                 if isinstance(personality.data_source, str):
                     # --- Static Data Source ---
                     if callback:
@@ -1413,11 +1405,9 @@ class LollmsDiscussion:
 
         # --- OPENAI & OLLAMA CHAT FORMATS ---
         messages = []
-        # Get active discussion-level images
-        active_discussion_b64 = [
-            img for i, img in enumerate(self.images or [])
-            if i < len(self.active_images or []) and self.active_images[i]
-        ]
+        # Get active discussion-level images using the corrected method
+        active_discussion_b64 = self.get_active_images(branch_tip_id=None) # Get all active discussion images
+        
         # Handle system message, which can now contain text and/or discussion-level images
         if full_system_prompt or (active_discussion_b64 and format_type in ["openai_chat", "ollama_chat", "markdown"]):
             discussion_level_images = build_image_dicts(active_discussion_b64)
@@ -1795,7 +1785,7 @@ class LollmsDiscussion:
                     content += f"\n({len(active_images)} image(s) attached)"
                     # Count image tokens
                     for i, image_b64 in enumerate(active_images):
-                        tokens = self.lollmsClient.count_image_tokens(image_b64) # Use self.lollmsClient.count_image_tokens
+                        tokens = self.lollmsClient.count_image_tokens(image_b64) 
                         if tokens > 0:
                             total_image_tokens += tokens
                             image_details_list.append({"message_id": msg.id, "index": i, "tokens": tokens})
@@ -1820,11 +1810,9 @@ class LollmsDiscussion:
             }
         
         # Calculate discussion-level image tokens separately and add them to the total.
-        active_discussion_b64 = [
-            img for i, img in enumerate(self.images or [])
-            if i < len(self.active_images or []) and self.active_images[i]
-        ]
-        discussion_image_tokens = sum(self.lollmsClient.count_image_tokens(img) for img in active_discussion_b64) # Use self.lollmsClient.count_image_tokens
+        active_discussion_images = self.get_discussion_images()
+        active_discussion_b64 = [img['data'] for img in active_discussion_images if img.get('active', True)]
+        discussion_image_tokens = sum(self.lollmsClient.count_image_tokens(img) for img in active_discussion_b64)
         
         # Add a new zone for discussion images for clarity
         if discussion_image_tokens > 0:
@@ -1892,10 +1880,11 @@ class LollmsDiscussion:
         Returns:
             A flat list of base64-encoded strings for all active images.
         """
-        # Start with active discussion-level images
+        # Start with active discussion-level images. get_discussion_images() ensures
+        # the format is correct (list of dicts) before we filter.
+        discussion_images = self.get_discussion_images()
         active_discussion_images = [
-            img for i, img in enumerate(self.images or [])
-            if i < len(self.active_images or []) and self.active_images[i]
+            img['data'] for img in discussion_images if img.get('active', True)
         ]
         
         branch = self.get_branch(branch_tip_id or self.active_branch_id)
@@ -1927,10 +1916,6 @@ class LollmsDiscussion:
         else:
             # Fallback: If no deeper leaf is found (e.g., branch_id is already a leaf or has no valid descendants)
             # then set active_branch_id to the provided branch_id.
-            # _find_deepest_leaf handles returning start_id if it's a leaf.
-            # So, if new_active_leaf_id is None, it means the provided branch_id was either not found (already checked)
-            # or it's a non-leaf with no valid leaf descendants. In that edge case, we'll still try to use it.
-            # Re-confirming it is present in the index:
             if branch_id in self._message_index:
                 self.active_branch_id = branch_id
                 self.touch()
@@ -1978,109 +1963,100 @@ class LollmsDiscussion:
         self.metadata = new_metadata
         self.commit()
 
-    def add_discussion_image(self, image_b64: str):
+    def add_discussion_image(self, image_b64: str, source: str = "user", active: bool = True):
         """
-        Adds an image at the discussion level and marks it as active.
-
-        This image is not tied to a specific message but is considered part of the
-        overall discussion context. It will be included with the system prompt
-        when exporting the conversation for multi-modal models. The change is
-        persisted to the database on the next commit.
-
+        Adds an image at the discussion level and marks it with a source.
+        
         Args:
             image_b64: A base64-encoded string of the image to add.
+            source: The origin of the image ('user', 'generation', 'artefact:<name> v<version>').
+            active: Whether the image should be active by default.
         """
-        self.images.append(image_b64)
-        self.active_images.append(True)
+        # Ensures self.images is in the correct format before appending.
+        current_images = self.get_discussion_images()
+
+        new_image_data = {
+            "data": image_b64,
+            "source": source,
+            "active": active,
+            "created_at": datetime.utcnow().isoformat()
+        }
+
+        current_images.append(new_image_data)
+        self.images = current_images
         self.touch()
 
-    def get_discussion_images(self) -> List[Dict[str, Union[str, bool]]]:
+    def get_discussion_images(self) -> List[Dict[str, Any]]:
         """
-        Returns a list of all images attached to the discussion, including their
-        activation status.
+        Returns a list of all images attached to the discussion, ensuring they are
+        in the new dictionary format.
 
-        Returns:
-            A list of dictionaries, where each dictionary represents an image.
-            Example: [{"data": "base64_string", "active": True}]
+        - This method performs a lazy migration: if it detects the old format
+          (a list of base64 strings), it converts it to the new format (a list
+          of dictionaries) and marks the discussion for saving.
         """
         if not self.images:
             return []
 
-        # Ensure active_images list is in sync, default to True if not
-        if len(self.active_images) != len(self.images):
-            active_flags = [True] * len(self.images)
-        else:
-            active_flags = self.active_images
+        # Check if migration is needed (if the first element is a string).
+        if isinstance(self.images[0], str):
+            ASCIIColors.yellow(f"Discussion {self.id}: Upgrading legacy discussion image format.")
+            upgraded_images = []
+            for i, img_data_str in enumerate(self.images):
+                upgraded_images.append({
+                    "data": img_data_str,
+                    "source": "user",  # Assume 'user' for old format
+                    "active": True,   # Assume active for old format
+                    "created_at": datetime.utcnow().isoformat()
+                })
+            self.images = upgraded_images
+            self.touch() # Mark for saving the upgraded format.
+            
+        return self.images
 
-        return [
-            {"data": img_data, "active": active_flags[i]}
-            for i, img_data in enumerate(self.images)
-        ]
 
     def toggle_discussion_image_activation(self, index: int, active: Optional[bool] = None):
         """
         Toggles or sets the activation status of a discussion-level image at a given index.
-        The change is persisted to the database on the next commit.
-
-        Args:
-            index: The index of the image in the discussion's 'images' list.
-            active: If provided, sets the status to this boolean. If None, toggles the current status.
         """
-        if not self.images or index >= len(self.images):
+        current_images = self.get_discussion_images() # Ensures format is upgraded.
+        if index >= len(current_images):
             raise IndexError("Discussion image index out of range.")
-
-        # Ensure active_images list is in sync before modification
-        if len(self.active_images) != len(self.images):
-            self.active_images = [True] * len(self.images)
 
         if active is None:
-            self.active_images[index] = not self.active_images[index]
+            # Toggle the current state, defaulting to True if key is missing.
+            current_images[index]["active"] = not current_images[index].get("active", True)
         else:
-            self.active_images[index] = bool(active)
+            current_images[index]["active"] = bool(active)
         
+        self.images = current_images
         self.touch()
 
-    def remove_discussion_image(self, index: int):
+    def remove_discussion_image(self, index: int, commit: bool = True):
         """
         Removes a discussion-level image at a given index.
-        The change is persisted to the database on the next commit.
-
-        Args:
-            index: The index of the image in the discussion's 'images' list.
         """
-        if not self.images or index >= len(self.images):
+        current_images = self.get_discussion_images() # Ensures format is upgraded.
+        if index >= len(current_images):
             raise IndexError("Discussion image index out of range.")
-
-        # Ensure active_images list is in sync before modification
-        if len(self.active_images) != len(self.images):
-            self.active_images = [True] * len(self.images)
-
-        del self.images[index]
-        del self.active_images[index]
-        self.touch()
         
+        del current_images[index]
+        self.images = current_images
+        
+        self.touch()
+        if commit:
+            self.commit()
+              
     def fix_orphan_messages(self):
         """
         Detects and re-chains orphan messages or branches in the discussion.
         
         An "orphan message" is one whose parent_id points to a message that
-        does not exist in the discussion, or whose lineage cannot be traced
-        back to a root message (parent_id is None) within the current discussion.
-
-        This method attempts to reconnect such messages by:
-        1. Identifying all messages and their parent-child relationships.
-        2. Finding the true root message(s) of the discussion.
-        3. Identifying all reachable messages from the true root(s).
-        4. Any message not reachable is considered an orphan.
-        5. For each orphan, traces up to find its "orphan branch top"
-           (the highest message in its disconnected chain).
-        6. Re-parents these orphan branch tops to the main discussion's
-           primary root (the oldest root message). If no primary root exists,
-           the oldest orphan branch top becomes the new primary root.
+        does not exist, or whose lineage cannot be traced back to a root.
         """
         ASCIIColors.info(f"Checking discussion {self.id} for orphan messages...")
         
-        self._rebuild_message_index() # Ensure the index is fresh
+        self._rebuild_message_index()
         
         all_messages_orms = list(self._message_index.values())
         if not all_messages_orms:
@@ -2089,8 +2065,6 @@ class LollmsDiscussion:
 
         message_map = {msg_orm.id: msg_orm for msg_orm in all_messages_orms}
         
-        # 1. Identify all true root messages (parent_id is None)
-        # And also build a children map for efficient traversal
         root_messages = []
         children_map = {msg_id: [] for msg_id in message_map.keys()}
         
@@ -2098,27 +2072,19 @@ class LollmsDiscussion:
             if msg_orm.parent_id is None:
                 root_messages.append(msg_orm)
             elif msg_orm.parent_id in message_map:
-                # Only add to children map if the parent actually exists in this discussion
                 children_map[msg_orm.parent_id].append(msg_orm.id)
 
-        # Sort roots by creation time to find the 'primary' root
         root_messages.sort(key=lambda msg: msg.created_at)
         primary_root = root_messages[0] if root_messages else None
 
         if primary_root:
-            ASCIIColors.info(f"Primary discussion root identified: {primary_root.id} (created at {primary_root.created_at})")
+            ASCIIColors.info(f"Primary discussion root identified: {primary_root.id}")
         else:
             ASCIIColors.warning("No root message found in discussion initially.")
 
-        # 2. Find all messages reachable from the primary root (or any identified root)
         reachable_messages = set()
-        queue = []
-        
-        # Add any current roots as starting points for reachability check.
-        for root in root_messages:
-            if root.id not in reachable_messages: # Avoid re-processing if multiple paths lead to same root
-                queue.append(root.id)
-                reachable_messages.add(root.id)
+        queue = [r.id for r in root_messages]
+        reachable_messages.update(queue)
 
         head = 0
         while head < len(queue):
@@ -2130,7 +2096,6 @@ class LollmsDiscussion:
                     reachable_messages.add(child_id)
                     queue.append(child_id)
 
-        # 3. Identify orphan messages (those not reachable from any current root)
         orphan_messages_ids = set(message_map.keys()) - reachable_messages
         
         if not orphan_messages_ids:
@@ -2139,17 +2104,13 @@ class LollmsDiscussion:
             
         ASCIIColors.warning(f"Found {len(orphan_messages_ids)} orphan message(s). Attempting to fix...")
         
-        # 4. Find the "top" message of each orphan branch
         orphan_branch_tops = set()
         for orphan_id in orphan_messages_ids:
             current_id = orphan_id
-            # Trace upwards until parent is None or parent is NOT an orphan
-            # We must use message_map for lookup as parent might be deleted from _message_index
             while message_map[current_id].parent_id is not None and message_map[current_id].parent_id in orphan_messages_ids:
                 current_id = message_map[current_id].parent_id
             orphan_branch_tops.add(current_id)
 
-        # Sort orphan branch tops by creation time, oldest first
         sorted_orphan_tops_orms = sorted(
             [message_map[top_id] for top_id in orphan_branch_tops], 
             key=lambda msg: msg.created_at
@@ -2158,39 +2119,350 @@ class LollmsDiscussion:
         reparented_count = 0
         
         if not primary_root:
-            # If there was no primary root, make the oldest orphan top the new primary root
             if sorted_orphan_tops_orms:
                 new_primary_root_orm = sorted_orphan_tops_orms[0]
-                new_primary_root_orm.parent_id = None # Make it a root
-                ASCIIColors.success(f"Discussion had no root. Set oldest orphan top '{new_primary_root_orm.id}' as new primary root.")
+                new_primary_root_orm.parent_id = None
+                ASCIIColors.success(f"Set oldest orphan '{new_primary_root_orm.id}' as new primary root.")
                 primary_root = new_primary_root_orm
                 reparented_count += 1
-                # Remove this one from the list of tops to be reparented
                 sorted_orphan_tops_orms = sorted_orphan_tops_orms[1:]
             else:
-                ASCIIColors.warning("No orphan branch tops found to create a new root. Discussion remains empty or unrooted.")
+                ASCIIColors.error("Could not create a new root. Discussion remains unrooted.")
                 return
 
         if primary_root:
-            # Re-parent all remaining orphan branch tops to the primary root
             for orphan_top_orm in sorted_orphan_tops_orms:
-                if orphan_top_orm.id != primary_root.id: # Ensure not reparenting the primary root to itself
-                    old_parent = orphan_top_orm.parent_id # Store old parent for logging
+                if orphan_top_orm.id != primary_root.id:
                     orphan_top_orm.parent_id = primary_root.id
-                    ASCIIColors.info(f"Re-parented orphan branch top '{orphan_top_orm.id}' (was child of '{old_parent}') to primary root '{primary_root.id}'.")
+                    ASCIIColors.info(f"Re-parented orphan '{orphan_top_orm.id}' to primary root '{primary_root.id}'.")
                     reparented_count += 1
         
         if reparented_count > 0:
-            ASCIIColors.success(f"Successfully re-parented {reparented_count} orphan message(s)/branches.")
-            self.touch() # Mark discussion as updated
-            self.commit() # Commit changes to DB
-            self._rebuild_message_index() # Rebuild index after changes
-            self._validate_and_set_active_branch() # Re-validate active branch after fixing orphans
+            ASCIIColors.success(f"Successfully re-parented {reparented_count} orphan(s).")
+            self.touch()
+            self.commit()
+            self._rebuild_message_index()
+            self._validate_and_set_active_branch()
         else:
-            ASCIIColors.yellow("No new messages were re-parented (they might have already been roots or discussion was already healthy).")
+            ASCIIColors.yellow("No messages were re-parented.")
 
 
     @property
     def system_prompt(self) -> str:
         """Returns the system prompt for this discussion."""
         return self._system_prompt
+    
+    # Artefacts management system
+
+    def list_artefacts(self) -> List[Dict[str, Any]]:
+        """
+        Lists all artefacts stored in the discussion's metadata.
+
+        - Upgrades artefacts with missing fields to the new schema on-the-fly.
+        - Computes the `is_loaded` status for each artefact.
+        """
+        metadata = self.metadata or {}
+        artefacts = metadata.get("_artefacts", [])
+        now = datetime.utcnow().isoformat()
+
+        upgraded = []
+        dirty = False
+        for artefact in artefacts:
+            fixed = artefact.copy()
+            # Schema upgrade checks
+            if "title" not in fixed: fixed["title"] = "untitled"; dirty = True
+            if "content" not in fixed: fixed["content"] = ""; dirty = True
+            if "images" not in fixed: fixed["images"] = []; dirty = True
+            if "audios" not in fixed: fixed["audios"] = []; dirty = True
+            if "videos" not in fixed: fixed["videos"] = []; dirty = True
+            if "zip" not in fixed: fixed["zip"] = None; dirty = True
+            if "version" not in fixed: fixed["version"] = 1; dirty = True
+            if "created_at" not in fixed: fixed["created_at"] = now; dirty = True
+            if "updated_at" not in fixed: fixed["updated_at"] = now; dirty = True
+
+            # Reconstruct `is_loaded` from discussion context
+            section_start = f"--- Document: {fixed['title']} v{fixed['version']} ---"
+            is_content_loaded = section_start in (self.discussion_data_zone or "")
+            
+            artefact_source_id = f"artefact:{fixed['title']} v{fixed['version']}"
+            is_image_loaded = any(
+                img.get("source") == artefact_source_id for img in self.get_discussion_images()
+            )
+
+            fixed["is_loaded"] = is_content_loaded or is_image_loaded
+            upgraded.append(fixed)
+
+        if dirty:
+            metadata["_artefacts"] = upgraded
+            self.metadata = metadata
+            self.commit()
+
+        return upgraded
+
+    def add_artefact(self, title: str, content: str = "", images: List[str] = None, audios: List[str] = None, videos: List[str] = None, zip_content: Optional[str] = None, version: int = 1, **extra_data) -> Dict[str, Any]:
+        """
+        Adds or overwrites an artefact in the discussion.
+        """
+        new_metadata = (self.metadata or {}).copy()
+        artefacts = new_metadata.get("_artefacts", [])
+        
+        artefacts = [a for a in artefacts if not (a.get('title') == title and a.get('version') == version)]
+
+        new_artefact = {
+            "title": title, "version": version, "content": content,
+            "images": images or [], "audios": audios or [], "videos": videos or [],
+            "zip": zip_content, "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(), **extra_data
+        }
+        artefacts.append(new_artefact)
+        
+        new_metadata["_artefacts"] = artefacts
+        self.metadata = new_metadata
+        self.commit()
+        return new_artefact
+
+    def get_artefact(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves an artefact by title. Returns the latest version if `version` is None.
+        """
+        artefacts = self.list_artefacts()
+        candidates = [a for a in artefacts if a.get('title') == title]
+        if not candidates:
+            return None
+            
+        if version is not None:
+            return next((a for a in candidates if a.get('version') == version), None)
+        else:
+            return max(candidates, key=lambda a: a.get('version', 0))
+
+    def update_artefact(self, title: str, new_content: str, new_images: List[str] = None, **extra_data) -> Dict[str, Any]:
+        """
+        Creates a new, incremented version of an existing artefact.
+        """
+        latest_artefact = self.get_artefact(title)
+        if latest_artefact is None:
+            raise ValueError(f"Cannot update non-existent artefact '{title}'.")
+            
+        latest_version = latest_artefact.get("version", 0)
+        
+        return self.add_artefact(
+            title, content=new_content, images=new_images,
+            audios=latest_artefact.get("audios", []), videos=latest_artefact.get("videos", []),
+            zip_content=latest_artefact.get("zip"), version=latest_version + 1, **extra_data
+        )
+
+    def load_artefact_into_data_zone(self, title: str, version: Optional[int] = None):
+        """
+        Loads an artefact's content and images into the active discussion context.
+        """
+        artefact = self.get_artefact(title, version)
+        if not artefact:
+            raise ValueError(f"Artefact '{title}' not found.")
+
+        # Load text content
+        if artefact.get('content'):
+            section = (
+                f"--- Document: {artefact['title']} v{artefact['version']} ---\n"
+                f"{artefact['content']}\n"
+                f"--- End Document: {artefact['title']} ---\n\n"
+            )
+            if section not in (self.discussion_data_zone or ""):
+                current_zone = self.discussion_data_zone or ""
+                self.discussion_data_zone = current_zone.rstrip() + "\n\n" + section
+
+        # Load images
+        artefact_source_id = f"artefact:{artefact['title']} v{artefact['version']}"
+        if artefact.get('images'):
+            current_images_data = [img['data'] for img in self.get_discussion_images() if img.get('source') == artefact_source_id]
+            for img_b64 in artefact['images']:
+                if img_b64 not in current_images_data:
+                    self.add_discussion_image(img_b64, source=artefact_source_id)
+        
+        self.touch()
+        self.commit()
+        print(f"Loaded artefact '{title}' v{artefact['version']} into context.")
+
+    def unload_artefact_from_data_zone(self, title: str, version: Optional[int] = None):
+        """
+        Removes an artefact's content and images from the discussion context.
+        """
+        artefact = self.get_artefact(title, version)
+        if not artefact:
+            raise ValueError(f"Artefact '{title}' not found.")
+
+        # Unload text content
+        if self.discussion_data_zone and artefact.get('content'):
+            section_start = f"--- Document: {artefact['title']} v{artefact['version']} ---"
+            pattern = rf"\n*\s*{re.escape(section_start)}.*?--- End Document: {re.escape(artefact['title'])} ---\s*\n*"
+            self.discussion_data_zone = re.sub(pattern, "", self.discussion_data_zone, flags=re.DOTALL).strip()
+        
+        # Unload images
+        artefact_source_id = f"artefact:{artefact['title']} v{artefact['version']}"
+        all_images = self.get_discussion_images()
+        
+        indices_to_remove = [i for i, img in enumerate(all_images) if img.get("source") == artefact_source_id]
+        
+        if indices_to_remove:
+            for index in sorted(indices_to_remove, reverse=True):
+                self.remove_discussion_image(index, commit=False)
+
+        self.touch()
+        self.commit()
+        print(f"Unloaded artefact '{title}' v{artefact['version']} from context.")
+
+
+    def is_artefact_loaded(self, title: str, version: Optional[int] = None) -> bool:
+        """
+        Checks if any part of an artefact is currently loaded in the context.
+        """
+        artefact = self.get_artefact(title, version)
+        if not artefact:
+            return False
+
+        section_start = f"--- Document: {artefact['title']} v{artefact['version']} ---"
+        if section_start in (self.discussion_data_zone or ""):
+            return True
+
+        artefact_source_id = f"artefact:{artefact['title']} v{artefact['version']}"
+        if any(img.get("source") == artefact_source_id for img in self.get_discussion_images()):
+            return True
+
+        return False
+        
+    def export_as_artefact(self, title: str, version: int = 1, **extra_data) -> Dict[str, Any]:
+        """
+        Exports the discussion_data_zone content as a new artefact.
+        """
+        content = (self.discussion_data_zone or "").strip()
+        if not content:
+            raise ValueError("Discussion data zone is empty. Nothing to export.")
+
+        return self.add_artefact(
+            title=title, content=content, version=version, **extra_data
+        )
+
+    def clone_without_messages(self) -> 'LollmsDiscussion':
+        """
+        Creates a new discussion with the same context but no message history.
+        """
+        discussion_data = {
+            "system_prompt": self.system_prompt,
+            "user_data_zone": self.user_data_zone,
+            "discussion_data_zone": self.discussion_data_zone,
+            "personality_data_zone": self.personality_data_zone,
+            "memory": self.memory,
+            "participants": self.participants,
+            "discussion_metadata": self.metadata,
+            "images": [img.copy() for img in self.get_discussion_images()],
+        }
+
+        new_discussion = LollmsDiscussion.create_new(
+            lollms_client=self.lollmsClient,
+            db_manager=self.db_manager,
+            **discussion_data
+        )
+        return new_discussion
+
+    def export_to_json_str(self) -> str:
+        """
+        Serializes the entire discussion state to a JSON string.
+        """
+        export_data = {
+            "id": self.id,
+            "system_prompt": self.system_prompt,
+            "user_data_zone": self.user_data_zone,
+            "discussion_data_zone": self.discussion_data_zone,
+            "personality_data_zone": self.personality_data_zone,
+            "memory": self.memory,
+            "participants": self.participants,
+            "active_branch_id": self.active_branch_id,
+            "discussion_metadata": self.metadata,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "pruning_summary": self.pruning_summary,
+            "pruning_point_id": self.pruning_point_id,
+            "images": self.get_discussion_images(), # Ensures new format is exported
+            "messages": []
+        }
+
+        for msg in self.get_all_messages_flat():
+            msg_data = {
+                "id": msg.id, "discussion_id": msg.discussion_id, "parent_id": msg.parent_id,
+                "sender": msg.sender, "sender_type": msg.sender_type,
+                "raw_content": msg.raw_content, "thoughts": msg.thoughts, "content": msg.content,
+                "scratchpad": msg.scratchpad, "tokens": msg.tokens,
+                "binding_name": msg.binding_name, "model_name": msg.model_name,
+                "generation_speed": msg.generation_speed, "message_metadata": msg.metadata,
+                "images": msg.images, "active_images": msg.active_images,
+                "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            }
+            export_data["messages"].append(msg_data)
+        
+        return json.dumps(export_data, indent=2)
+
+    @classmethod
+    def import_from_json_str(
+        cls,
+        json_str: str,
+        lollms_client: 'LollmsClient',
+        db_manager: Optional[LollmsDataManager] = None
+    ) -> 'LollmsDiscussion':
+        """
+        Creates a new LollmsDiscussion instance from a JSON string.
+        """
+        data = json.loads(json_str)
+        
+        message_data_list = data.pop("messages", [])
+        
+        # Clean up deprecated fields before creation if they exist in the JSON.
+        data.pop("active_images", None)
+        
+        new_discussion = cls.create_new(
+            lollms_client=lollms_client,
+            db_manager=db_manager,
+            **data
+        )
+
+        for msg_data in message_data_list:
+            if 'created_at' in msg_data and msg_data['created_at']:
+                msg_data['created_at'] = datetime.fromisoformat(msg_data['created_at'])
+            
+            new_discussion.add_message(**msg_data)
+
+        new_discussion.active_branch_id = data.get('active_branch_id')
+        if db_manager:
+            new_discussion.commit()
+
+        return new_discussion
+
+    def remove_artefact(self, title: str, version: Optional[int] = None) -> int:
+        """
+        Removes artefacts by title. Removes all versions if `version` is None.
+        
+        Returns:
+            The number of artefact entries removed.
+        """
+        new_metadata = (self.metadata or {}).copy()
+        artefacts = new_metadata.get("_artefacts", [])
+        if not artefacts:
+            return 0
+
+        initial_count = len(artefacts)
+        
+        if version is None:
+            # Remove all versions with the matching title
+            kept_artefacts = [a for a in artefacts if a.get('title') != title]
+        else:
+            # Remove only the specific title and version
+            kept_artefacts = [a for a in artefacts if not (a.get('title') == title and a.get('version') == version)]
+
+        if len(kept_artefacts) < initial_count:
+            new_metadata["_artefacts"] = kept_artefacts
+            self.metadata = new_metadata
+            self.commit()
+
+        removed_count = initial_count - len(kept_artefacts)
+        if removed_count > 0:
+            print(f"Removed {removed_count} artefact(s) titled '{title}'.")
+            
+        return removed_count

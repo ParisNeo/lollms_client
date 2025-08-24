@@ -1,0 +1,73 @@
+title: 'OpenAI TTI'
+author: 'LoLLMS Team'
+version: 1.0.0
+binding_name: 'openai'
+supported_file_types: []
+
+input_parameters:
+  - name: "model"
+    type: "str"
+    default: "gpt-image-1"
+    description: "The OpenAI image model to use."
+    options: ["gpt-image-1", "dall-e-2", "dall-e-3"]
+
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Optional API key for OpenAI. If empty, the environment variable OPENAI_API_KEY will be used."
+
+generate_image_parameters:
+  - name: "prompt"
+    type: "str"
+    default: ""
+    description: "The prompt describing the image to generate."
+
+  - name: "size"
+    type: "str"
+    default: "1024x1024"
+    description: "Size of the generated image."
+    options: ["256x256", "512x512", "1024x1024", "2048x2048"]
+
+  - name: "n"
+    type: "int"
+    default: 1
+    description: "Number of images to generate per request. Maximum 10."
+
+  - name: "quality"
+    type: "str"
+    default: "standard"
+    description: "Image quality (only supported by dall-e-3)."
+    options: ["standard", "hd"]
+
+edit_image_parameters:
+  - name: "prompt"
+    type: "str"
+    default: ""
+    description: "The prompt describing the edit to apply."
+
+  - name: "image"
+    type: "str"
+    default: ""
+    description: "The input image to edit. Can be base64, URL, or local file path."
+
+  - name: "mask"
+    type: "str"
+    default: ""
+    description: "Optional mask image. Areas in white will be edited."
+
+  - name: "size"
+    type: "str"
+    default: "1024x1024"
+    description: "Size of the output image."
+    options: ["256x256", "512x512", "1024x1024", "2048x2048"]
+
+  - name: "n"
+    type: "int"
+    default: 1
+    description: "Number of edited images to generate. Maximum 10."
+
+  - name: "quality"
+    type: "str"
+    default: "standard"
+    description: "Image quality (only supported by dall-e-3)."
+    options: ["standard", "hd"]
