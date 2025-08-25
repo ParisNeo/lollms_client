@@ -13,7 +13,7 @@ from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
 from lollms_client.lollms_utilities import ImageTokenizer
 pm.ensure_packages(["ollama","pillow","tiktoken"])
-
+import re
 
 import ollama
 import tiktoken
