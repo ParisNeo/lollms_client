@@ -297,8 +297,11 @@ class OllamaBinding(LollmsLLMBinding):
                     if item.get("type") == "text":
                         text_parts.append(item.get("text", ""))
                     elif item.get("type") == "image_url":
+                        base64 = item.get("image_url", {}).get("base64")
                         url = item.get("image_url", {}).get("url")
-                        if url:
+                        if base64:
+                            images.append(base64)
+                        elif url:
                             images.append(url)
 
             return {
