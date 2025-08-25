@@ -323,6 +323,7 @@ class OllamaBinding(LollmsLLMBinding):
                 })
 
         full_response_text = ""
+        ASCIIColors.info(f"Ollama messages:{ollama_messages}")
 
         try:
             if stream:
