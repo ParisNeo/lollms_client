@@ -1727,7 +1727,7 @@ Fill the parameters for the selected tool. If code is required, do not paste cod
                         log_event("RAG call start", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name, "query": query, "top_k": top_k, "min_similarity_percent": min_sim, "has_filters": bool(filters)})
                         rag_fn = rag_registry[tool_name]
                         try:
-                            raw_results = rag_fn(query=query, top_k=top_k, filters=filters)
+                            raw_results = rag_fn(query=query, top_k=top_k if top_k else None, filters=filters if filters else None)
                         except TypeError:
                             raw_results = rag_fn(query)
                         docs = []
