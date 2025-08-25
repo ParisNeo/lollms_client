@@ -1449,7 +1449,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         context: Optional[str] = None,
         use_mcps: Union[None, bool, List[str]] = None,
         use_data_store: Union[None, Dict[str, Callable]] = None,
-        system_prompt: str = None,
+        system_prompt: str|None = None,
         reasoning_system_prompt: str = "You are a logical AI assistant. Your task is to achieve the user's goal by thinking step-by-step and using the available tools.",
         images: Optional[List[str]] = None,
         max_reasoning_steps: int = 10,
@@ -1525,8 +1525,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 if callable(info):
                     call_fn = info
                 elif isinstance(info, dict):
-                    if "call" in info and callable(info["call"]):
-                        call_fn = info["call"]
+                    if "callable" in info and callable(info["callable"]):
+                        call_fn = info["callable"]
                     description = info.get("description", description)
                 if call_fn:
                     visible_tools.append({
