@@ -476,6 +476,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
 
     def __init__(self, **kwargs):
         super().__init__(binding_name=BindingName)
+        self.manager: Optional[ModelManager] = None
         if not DIFFUSERS_AVAILABLE:
             raise ImportError("Diffusers not available. Please install required packages.")
         self.config = self.DEFAULT_CONFIG.copy()
@@ -485,7 +486,6 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         self.models_path = Path(models_path_str)
         self.models_path.mkdir(parents=True, exist_ok=True)
         self.registry = PipelineRegistry()
-        self.manager: Optional[ModelManager] = None
         self._resolve_device_and_dtype()
         if self.model_name:
             self._acquire_manager()
