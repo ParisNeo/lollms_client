@@ -256,22 +256,22 @@ class OllamaBinding(LollmsLLMBinding):
             return {"status": False, "error": error_message}
 
     def generate_from_messages(self,
-                     messages: List[Dict],
-                     n_predict: Optional[int] = None,
-                     stream: Optional[bool] = None,
-                     temperature: Optional[float] = None,
-                     top_k: Optional[int] = None,
-                     top_p: Optional[float] = None,
-                     repeat_penalty: Optional[float] = None,
-                     repeat_last_n: Optional[int] = None,
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     **kwargs
-                     ) -> Union[str, dict]:
+                        messages: List[Dict],
+                        n_predict: Optional[int] = None,
+                        stream: Optional[bool] = None,
+                        temperature: Optional[float] = None,
+                        top_k: Optional[int] = None,
+                        top_p: Optional[float] = None,
+                        repeat_penalty: Optional[float] = None,
+                        repeat_last_n: Optional[int] = None,
+                        seed: Optional[int] = None,
+                        n_threads: Optional[int] = None,
+                        ctx_size: int | None = None,
+                        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                        **kwargs
+                        ) -> Union[str, dict]:
         if not self.ollama_client:
-             return {"status": False, "error": "Ollama client not initialized."}
+            return {"status": False, "error": "Ollama client not initialized."}
 
         options = {}
         if n_predict is not None: options['num_predict'] = n_predict
@@ -283,33 +283,85 @@ class OllamaBinding(LollmsLLMBinding):
         if seed is not None: options['seed'] = seed
         if n_threads is not None: options['num_thread'] = n_threads
         if ctx_size is not None: options['num_ctx'] = ctx_size
-        
+
+        def normalize_message(msg: Dict) -> Dict:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            text_parts = []
+            images = []
+
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") == "image_url":
+                        url = item.get("image_url", {}).get("url")
+                        if url:
+                            images.append(url)
+
+            return {
+                "role": role,
+                "content": "\n".join([p for p in text_parts if p.strip()]),
+                "images": images if images else None
+            }
+
+        ollama_messages = []
+        for m in messages:
+            nm = normalize_message(m)
+            if nm["images"]:
+                ollama_messages.append({
+                    "role": nm["role"],
+                    "content": nm["content"],
+                    "images": nm["images"]
+                })
+            else:
+                ollama_messages.append({
+                    "role": nm["role"],
+                    "content": nm["content"]
+                })
+
         full_response_text = ""
 
         try:
             if stream:
                 response_stream = self.ollama_client.chat(
                     model=self.model_name,
-                    messages=messages,
+                    messages=ollama_messages,
                     stream=True,
                     options=options if options else None
                 )
                 for chunk_dict in response_stream:
                     chunk_content = chunk_dict.get('message', {}).get('content', '')
-                    if chunk_content: # Ensure there is content to process
+                    if chunk_content:
                         full_response_text += chunk_content
                         if streaming_callback:
                             if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break # Callback requested stop
+                                break
                 return full_response_text
-            else: # Not streaming
+            else:
                 response_dict = self.ollama_client.chat(
                     model=self.model_name,
-                    messages=messages,
+                    messages=ollama_messages,
                     stream=False,
                     options=options if options else None
                 )
                 return response_dict.get('message', {}).get('content', '')
+
+        except ollama.ResponseError as e:
+            error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
+            ASCIIColors.error(error_message)
+            return {"status": False, "error": error_message, "status_code": e.status_code}
+        except ollama.RequestError as e:
+            error_message = f"Ollama API RequestError: {str(e)}"
+            ASCIIColors.error(error_message)
+            return {"status": False, "error": error_message}
+        except Exception as ex:
+            error_message = f"An unexpected error occurred: {str(ex)}"
+            trace_exception(ex)
+            return {"status": False, "error": error_message}
+
 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
