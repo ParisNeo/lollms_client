@@ -1,4 +1,4 @@
-# bindings/ollama/binding.py
+# bindings/ollama/__init__.py
 import requests
 import json
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
