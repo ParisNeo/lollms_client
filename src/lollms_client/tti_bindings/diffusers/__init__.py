@@ -49,14 +49,14 @@ BindingName = "DiffusersTTIBinding_Impl"
 CIVITAI_MODELS = {
     "realistic-vision-v6": {
         "display_name": "Realistic Vision V6.0",
-        "url": "https://civitai.com/api/download/models/130072",
+        "url": "https://civitai.com/api/download/models/501240?type=Model&format=SafeTensor&size=pruned&fp=fp16",
         "filename": "realisticVisionV60_v60B1.safetensors",
         "description": "Photorealistic SD1.5 checkpoint.",
         "owned_by": "civitai"
     },
     "absolute-reality": {
         "display_name": "Absolute Reality",
-        "url": "https://civitai.com/api/download/models/132760",
+        "url": "https://civitai.com/api/download/models/132760?type=Model&format=SafeTensor&size=pruned&fp=fp16",
         "filename": "absolutereality_v181.safetensors",
         "description": "General realistic SD1.5.",
         "owned_by": "civitai"
@@ -77,57 +77,57 @@ CIVITAI_MODELS = {
     },
     "lyriel-v1.6": {
         "display_name": "Lyriel v1.6",
-        "url": "https://civitai.com/api/download/models/92407",
+        "url": "https://civitai.com/api/download/models/72396?type=Model&format=SafeTensor&size=full&fp=fp16",
         "filename": "lyriel_v16.safetensors",
         "description": "Fantasy/stylized SD1.5.",
         "owned_by": "civitai"
     },
-    "anything-v5": {
-        "display_name": "Anything V5",
-        "url": "https://civitai.com/api/download/models/9409",
-        "filename": "anythingV5_PrtRE.safetensors",
-        "description": "Anime SD1.5.",
+    "ui_icons": {
+        "display_name": "UI Icons",
+        "url": "https://civitai.com/api/download/models/367044?type=Model&format=SafeTensor&size=full&fp=fp16",
+        "filename": "uiIcons_v10.safetensors",
+        "description": "A model for generating UI icons.",
         "owned_by": "civitai"
     },
     "meinamix": {
         "display_name": "MeinaMix",
-        "url": "https://civitai.com/api/download/models/119057",
+        "url": "https://civitai.com/api/download/models/948574?type=Model&format=SafeTensor&size=pruned&fp=fp16",
         "filename": "meinamix_meinaV11.safetensors",
         "description": "Anime/illustration SD1.5.",
         "owned_by": "civitai"
     },
     "rpg-v5": {
         "display_name": "RPG v5",
-        "url": "https://civitai.com/api/download/models/137379",
+        "url": "https://civitai.com/api/download/models/124626?type=Model&format=SafeTensor&size=pruned&fp=fp16",
         "filename": "rpg_v5.safetensors",
         "description": "RPG assets SD1.5.",
         "owned_by": "civitai"
     },
     "pixel-art-xl": {
         "display_name": "Pixel Art XL",
-        "url": "https://civitai.com/api/download/models/252919",
+        "url": "https://civitai.com/api/download/models/135931?type=Model&format=SafeTensor",
         "filename": "pixelartxl_v11.safetensors",
         "description": "Pixel art SDXL.",
         "owned_by": "civitai"
     },
     "lowpoly-world": {
         "display_name": "Lowpoly World",
-        "url": "https://civitai.com/api/download/models/90299",
-        "filename": "lowpoly_world_v10.safetensors",
+        "url": "https://civitai.com/api/download/models/146502?type=Model&format=SafeTensor",
+        "filename": "LowpolySDXL.safetensors",
         "description": "Lowpoly style SD1.5.",
         "owned_by": "civitai"
     },
     "toonyou": {
         "display_name": "ToonYou",
-        "url": "https://civitai.com/api/download/models/152361",
+        "url": "https://civitai.com/api/download/models/125771?type=Model&format=SafeTensor&size=pruned&fp=fp16",
         "filename": "toonyou_beta6.safetensors",
         "description": "Cartoon/Disney SD1.5.",
         "owned_by": "civitai"
     },
     "papercut": {
         "display_name": "Papercut",
-        "url": "https://civitai.com/api/download/models/45579",
-        "filename": "papercut_v1.safetensors",
+        "url": "https://civitai.com/api/download/models/133503?type=Model&format=SafeTensor",
+        "filename": "papercut.safetensors",
         "description": "Paper cutout SD1.5.",
         "owned_by": "civitai"
     }
