@@ -471,7 +471,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         {"family": "SD 1.x", "model_name": "runwayml/stable-diffusion-v1-5", "display_name": "Stable Diffusion 1.5", "desc": "Classic SD1.5."},
         {"family": "SD 2.x", "model_name": "stabilityai/stable-diffusion-2-1", "display_name": "Stable Diffusion 2.1", "desc": "SD2.1 base."},
         {"family": "SD3", "model_name": "stabilityai/stable-diffusion-3-medium-diffusers", "display_name": "Stable Diffusion 3 Medium", "desc": "SD3 medium."},
-        {"family": "Qwen", "model_name": "Qwen/Qwen-Image", "display_name": "Qwen Image Edit", "desc": "Dedicated image generation."}
+        {"family": "Qwen", "model_name": "Qwen/Qwen-Image", "display_name": "Qwen Image Edit", "desc": "Dedicated image generation."},
         {"family": "Specialized", "model_name": "playgroundai/playground-v2.5-1024px-aesthetic", "display_name": "Playground v2.5", "desc": "High aesthetic 1024."},
         {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit", "display_name": "Qwen Image Edit", "desc": "Dedicated image editing."}
     ]
