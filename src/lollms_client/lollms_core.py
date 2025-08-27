@@ -14,6 +14,8 @@ from lollms_client.lollms_mcp_binding import LollmsMCPBinding, LollmsMCPBindingM
 
 from lollms_client.lollms_discussion import LollmsDiscussion
 
+from lollms_client.lollms_agentic import TaskStatus, TaskPlanner, MemoryManager, UncertaintyManager, ToolPerformanceTracker
+
 from lollms_client.lollms_utilities import build_image_dicts, dict_to_markdown
 import json, re
 from enum import Enum
@@ -23,7 +25,8 @@ from typing import List, Optional, Callable, Union, Dict, Any
 import numpy as np
 from pathlib import Path
 import uuid
-
+import hashlib
+import time
 class LollmsClient():
     """
     Core client class for interacting with LOLLMS services, including LLM, TTS, TTI, STT, TTV, and TTM.
@@ -1442,374 +1445,368 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         )
         new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
         return self.remove_thinking_blocks(new_scratchpad_text).strip()
+    
 
+    def _get_friendly_action_description(self, tool_name: str, requires_code: bool, requires_image: bool) -> str:
+            """Convert technical tool names to user-friendly descriptions for logging."""
+            # Handle specific, high-priority built-in tools first
+            if tool_name == "local_tools::final_answer":
+                return "📋 Ready to provide your final answer"
+            elif tool_name == "local_tools::request_clarification":
+                return "❓ Asking for more information to proceed"
+            elif tool_name == "local_tools::generate_image":
+                return "🎨 Creating an image based on your request"
+            
+            # Handle RAG (data store) tools by their pattern
+            elif "research::" in tool_name:
+                # Extract the friendly name of the data source
+                source_name = tool_name.split("::")[-1].replace("_", " ").title()
+                return f"🔍 Searching {source_name} for relevant information"
+            
+            # Handle generic actions based on their input requirements
+            elif requires_code:
+                return "💻 Working on a coding solution"
+            elif requires_image:
+                return "🖼️ Analyzing the provided image(s)"
+            
+            # Default fallback for any other tool
+            else:
+                # Clean up the technical tool name for a more readable display
+                clean_name = tool_name.replace("_", " ").replace("::", " - ").title()
+                return f"🔧 Using the {clean_name} tool"
     def generate_with_mcp_rag(
-        self,
-        prompt: str,
-        context: Optional[str] = None,
-        use_mcps: Union[None, bool, List[str]] = None,
-        use_data_store: Union[None, Dict[str, Callable]] = None,
-        system_prompt: str|None = None,
-        reasoning_system_prompt: str = "You are a logical AI assistant. Your task is to achieve the user's goal by thinking step-by-step and using the available tools.",
-        images: Optional[List[str]] = None,
-        max_reasoning_steps: int = 10,
-        decision_temperature: float = 0.5,
-        final_answer_temperature: float = 0.7,
-        streaming_callback: Optional[Callable[[str, 'MSG_TYPE', Optional[Dict], Optional[List]], bool]] = None,
-        rag_top_k: int = 5,
-        rag_min_similarity_percent: float = 50.0,
-        output_summarization_threshold: int = 500,
-        force_mcp_use: bool = False,
-        debug: bool = False,
-        **llm_generation_kwargs
-    ) -> Dict[str, Any]:
+            self,
+            prompt: str,
+            context: Optional[str] = None,
+            use_mcps: Union[None, bool, List[str]] = None,
+            use_data_store: Union[None, Dict[str, Callable]] = None,
+            system_prompt: str|None = None,
+            reasoning_system_prompt: str = "You are a logical AI assistant. Your task is to achieve the user's goal by thinking step-by-step and using the available tools.",
+            images: Optional[List[str]] = None,
+            max_reasoning_steps: int = 15,
+            decision_temperature: float = 0.5,
+            final_answer_temperature: float = 0.7,
+            streaming_callback: Optional[Callable[[str, 'MSG_TYPE', Optional[Dict], Optional[List]], bool]] = None,
+            rag_top_k: int = 5,
+            rag_min_similarity_percent: float = 50.0,
+            output_summarization_threshold: int = 500,
+            force_mcp_use: bool = False,
+            debug: bool = False,
+            enable_parallel_execution: bool = True,
+            enable_self_reflection: bool = True,
+            **llm_generation_kwargs
+        ) -> Dict[str, Any]:
+        
         if not self.llm:
             return {"final_answer": "", "tool_calls": [], "sources": [], "error": "LLM binding not initialized."}
-        if max_reasoning_steps is None:
-            max_reasoning_steps = 10
 
         def log_event(desc, event_type=MSG_TYPE.MSG_TYPE_CHUNK, meta=None, event_id=None) -> Optional[str]:
-            if not streaming_callback:
-                return None
+            if not streaming_callback: return None
             is_start = event_type == MSG_TYPE.MSG_TYPE_STEP_START
             event_id = str(uuid.uuid4()) if is_start and not event_id else event_id
             params = {"type": event_type, "description": desc, **(meta or {})}
-            if event_id:
-                params["id"] = event_id
+            if event_id: params["id"] = event_id
             streaming_callback(desc, event_type, params)
             return event_id
 
         def log_prompt(title: str, prompt_text: str):
-            if not debug:
-                return
+            if not debug: return
             ASCIIColors.cyan(f"** DEBUG: {title} **")
             ASCIIColors.magenta(prompt_text[-15000:])
             prompt_size = self.count_tokens(prompt_text)
             ASCIIColors.red(f"Prompt size:{prompt_size}/{self.llm.default_ctx_size}")
             ASCIIColors.cyan(f"** DEBUG: DONE **")
 
+        discovery_step_id = log_event("🔧 Setting up capabilities...", MSG_TYPE.MSG_TYPE_STEP_START)
+        all_discovered_tools, visible_tools, rag_registry, rag_tool_specs = [], [], {}, {}
+        if use_mcps and hasattr(self, 'mcp'):
+            mcp_tools = self.mcp.discover_tools(force_refresh=True)
+            if isinstance(use_mcps, list): all_discovered_tools.extend([t for t in mcp_tools if t["name"] in use_mcps])
+            elif use_mcps is True: all_discovered_tools.extend(mcp_tools)
+        if use_data_store:
+            for name, info in use_data_store.items():
+                tool_name, description, call_fn = f"research::{name}", f"Queries the '{name}' knowledge base.", None
+                if callable(info): call_fn = info
+                elif isinstance(info, dict):
+                    if "callable" in info and callable(info["callable"]): call_fn = info["callable"]
+                    description = info.get("description", description)
+                if call_fn:
+                    visible_tools.append({"name": tool_name, "description": description, "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}})
+                    rag_registry[tool_name] = call_fn
+                    rag_tool_specs[tool_name] = {"default_top_k": rag_top_k, "default_min_sim": rag_min_similarity_percent}
+        visible_tools.extend(all_discovered_tools)
+        built_in_tools = [{"name": "local_tools::final_answer", "description": "Provide the final answer directly to the user.", "input_schema": {}}]
+        if getattr(self, "tti", None): built_in_tools.append({"name": "local_tools::generate_image", "description": "Generate an image from a text description.", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}})
+        all_visible_tools = visible_tools + built_in_tools
+        tool_summary = "\n".join([f"- {t['name']}: {t['description']}" for t in all_visible_tools[:15]])
+        log_event(f"✅ Ready with {len(all_visible_tools)} capabilities", MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id)
+
+        triage_step_id = log_event("🤔 Analyzing the best approach...", MSG_TYPE.MSG_TYPE_STEP_START)
+        strategy = "COMPLEX_PLAN"
+        strategy_data = {}
+        try:
+            triage_prompt = f"""Analyze the user's request and determine the most efficient strategy.
+USER REQUEST: "{prompt}"
+AVAILABLE TOOLS:\n{tool_summary}
+Choose a strategy:
+- "DIRECT_ANSWER": For greetings or simple questions that need no tools.
+- "REQUEST_CLARIFICATION": If the request is ambiguous and you need more information from the user.
+- "SINGLE_TOOL": If the request can be resolved with one tool call.
+- "COMPLEX_PLAN": For multi-step requests requiring multiple tools or complex reasoning.
+
+Provide your decision as JSON: {{"thought": "...", "strategy": "...", "text_output": "Your direct answer or clarification question.", "required_tool_name": "..."}}"""
+            
+            triage_schema = {
+                "thought": "string", "strategy": "string", 
+                "text_output": "string", "required_tool_name": "string"
+            }
+            strategy_data = self.generate_structured_content(prompt=triage_prompt, schema=triage_schema, temperature=0.1, **llm_generation_kwargs)
+            strategy = strategy_data.get("strategy") if strategy_data else "COMPLEX_PLAN"
+        except Exception as e:
+            log_event(f"Triage failed, defaulting to complex plan. Error: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=triage_step_id)
+
+        if force_mcp_use and strategy == "DIRECT_ANSWER":
+            strategy = "COMPLEX_PLAN"
+        log_event(f"✅ Approach decided: {strategy.replace('_', ' ').title()}", MSG_TYPE.MSG_TYPE_STEP_END, event_id=triage_step_id)
+
+        if strategy == "DIRECT_ANSWER":
+            final_answer = strategy_data.get("text_output", "I can help with that.")
+            if streaming_callback: streaming_callback(final_answer, MSG_TYPE.MSG_TYPE_FULL, {})
+            return {"final_answer": final_answer, "tool_calls": [], "sources": [], "error": None, "clarification_required": False, "final_scratchpad": f"Strategy: DIRECT_ANSWER\nThought: {strategy_data.get('thought')}"}
+
+        if strategy == "REQUEST_CLARIFICATION":
+            clarification_question = strategy_data.get("text_output", "Could you please provide more details?")
+            return {"final_answer": clarification_question, "tool_calls": [], "sources": [], "error": None, "clarification_required": True, "final_scratchpad": f"Strategy: REQUEST_CLARIFICATION\nThought: {strategy_data.get('thought')}"}
+
+        if strategy == "SINGLE_TOOL":
+            synthesis_id = log_event("⚡ Taking a direct approach...", MSG_TYPE.MSG_TYPE_STEP_START)
+            try:
+                tool_name = strategy_data.get("required_tool_name")
+                tool_spec = next((t for t in all_visible_tools if t['name'] == tool_name), None)
+                if not tool_spec:
+                    raise ValueError(f"LLM chose an unavailable tool: '{tool_name}'")
+                
+                param_prompt = f"""Given the user request, generate the correct parameters for the selected tool.
+USER REQUEST: "{prompt}"
+SELECTED TOOL: {json.dumps(tool_spec, indent=2)}
+Output ONLY the JSON for the tool's parameters: {{"tool_params": {{...}}}}"""
+                param_data = self.generate_structured_content(prompt=param_prompt, schema={"tool_params": "object"}, temperature=0.1, **llm_generation_kwargs)
+                tool_params = param_data.get("tool_params", {}) if param_data else {}
+                
+                start_time, sources, tool_result = time.time(), [], {}
+                if tool_name in rag_registry:
+                    query = tool_params.get("query", prompt)
+                    rag_fn = rag_registry[tool_name]
+                    raw_results = rag_fn(query=query, rag_top_k=rag_top_k, rag_min_similarity_percent=rag_min_similarity_percent)
+                    docs = [d for d in (raw_results.get("results", []) if isinstance(raw_results, dict) else raw_results or [])]
+                    tool_result = {"status": "success", "results": docs}
+                    sources = [{"source": tool_name, "metadata": d.get("metadata", {}), "score": d.get("score", 0.0)} for d in docs]
+                elif hasattr(self, "mcp") and "local_tools" not in tool_name:
+                    tool_result = self.mcp.execute_tool(tool_name, tool_params, lollms_client_instance=self)
+                else:
+                    tool_result = {"status": "failure", "error": f"Tool '{tool_name}' could not be executed in single-step mode."}
+                
+                if tool_result.get("status") != "success":
+                    error_detail = tool_result.get("error", "Unknown tool error in single-step mode.")
+                    raise RuntimeError(error_detail)
+
+                response_time = time.time() - start_time
+                tool_calls_this_turn = [{"name": tool_name, "params": tool_params, "result": tool_result, "response_time": response_time}]
+                
+                synthesis_prompt = f"""The user asked: "{prompt}"
+I used the tool '{tool_name}' and got this result: {json.dumps(tool_result, indent=2)}
+Synthesize a direct, user-friendly final answer."""
+                final_answer = self.generate_text(prompt=synthesis_prompt, system_prompt=system_prompt, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature, **llm_generation_kwargs)
+                final_answer = self.remove_thinking_blocks(final_answer)
+                
+                log_event("✅ Direct answer ready!", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id)
+                return {"final_answer": final_answer, "tool_calls": tool_calls_this_turn, "sources": sources, "error": None, "clarification_required": False, "final_scratchpad": f"Strategy: SINGLE_TOOL\nTool: {tool_name}\nResult: {json.dumps(tool_result)}"}
+
+            except Exception as e:
+                log_event(f"Direct approach failed: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=synthesis_id)
+                log_event("Escalating to a more detailed plan.", MSG_TYPE.MSG_TYPE_INFO)
+
+        return self._execute_complex_reasoning_loop(
+            prompt=prompt, context=context, system_prompt=system_prompt,
+            reasoning_system_prompt=reasoning_system_prompt, images=images,
+            max_reasoning_steps=max_reasoning_steps, decision_temperature=decision_temperature,
+            final_answer_temperature=final_answer_temperature, streaming_callback=streaming_callback,
+            debug=debug, enable_self_reflection=enable_self_reflection,
+            all_visible_tools=all_visible_tools, rag_registry=rag_registry, rag_tool_specs=rag_tool_specs,
+            log_event_fn=log_event, log_prompt_fn=log_prompt,
+            **llm_generation_kwargs
+        )
+
+    def _execute_complex_reasoning_loop(
+        self, prompt, context, system_prompt, reasoning_system_prompt, images,
+        max_reasoning_steps, decision_temperature, final_answer_temperature,
+        streaming_callback, debug, enable_self_reflection, all_visible_tools,
+        rag_registry, rag_tool_specs, log_event_fn, log_prompt_fn, **llm_generation_kwargs
+    ) -> Dict[str, Any]:
+        
+        planner, memory_manager, performance_tracker = TaskPlanner(self), MemoryManager(), ToolPerformanceTracker()
+        
+        def _get_friendly_action_description(tool_name, requires_code, requires_image):
+            if tool_name == "local_tools::final_answer": return "📋 Ready to provide your answer"
+            if tool_name == "local_tools::request_clarification": return "❓ Need to ask for clarification"
+            if tool_name == "local_tools::generate_image": return "🎨 Creating an image for you"
+            if "research::" in tool_name: return f"🔍 Searching {tool_name.split('::')[-1]} for information"
+            if requires_code: return "💻 Working on a coding solution"
+            if requires_image: return "🖼️ Analyzing the provided images"
+            return f"🔧 Using {tool_name.replace('_', ' ').replace('::', ' - ').title()}"
+
         original_user_prompt, tool_calls_this_turn, sources_this_turn = prompt, [], []
         asset_store: Dict[str, Dict] = {}
-        initial_state_parts = ["### Initial State", "- My goal is to address the user's request comprehensively."]
+        
+        planning_step_id = log_event_fn("📋 Creating a detailed plan...", MSG_TYPE.MSG_TYPE_STEP_START)
+        execution_plan = planner.decompose_task(original_user_prompt, context or "")
+        log_event_fn(f"✅ Plan ready ({len(execution_plan.tasks)} steps)", MSG_TYPE.MSG_TYPE_STEP_END, event_id=planning_step_id)
+        
+        initial_state_parts = [f"### Execution Plan\n- Total tasks: {len(execution_plan.tasks)}"]
+        for i, task in enumerate(execution_plan.tasks): initial_state_parts.append(f"  {i+1}. {task.description}")
         if images:
             for img_b64 in images:
                 img_uuid = str(uuid.uuid4())
-                asset_store[img_uuid] = {"type": "image", "content": img_b64}
+                asset_store[img_uuid] = {"type": "image", "content": img_b64, "source": "user"}
                 initial_state_parts.append(f"- User provided image, asset ID: {img_uuid}")
-        if context:
-            code_blocks = re.findall(r"```(?:\w+)?\n([\s\S]+?)\n```", context)
-            if code_blocks:
-                last_code_block = code_blocks[-1]
-                code_uuid = str(uuid.uuid4())
-                asset_store[code_uuid] = {"type": "code", "content": last_code_block}
-                initial_state_parts.append(f"- A code block was found in the context. It has been registered as asset ID: {code_uuid}")
         current_scratchpad = "\n".join(initial_state_parts)
 
-        discovery_step_id = log_event("Discovering tools...", MSG_TYPE.MSG_TYPE_STEP_START)
-        all_discovered_tools, visible_tools = [], []
-        rag_registry: Dict[str, Callable] = {}
-        rag_tool_specs: Dict[str, Dict] = {}
-
-        if use_mcps and hasattr(self, 'mcp'):
-            mcp_tools = self.mcp.discover_tools(force_refresh=True)
-            if isinstance(use_mcps, list):
-                all_discovered_tools.extend([t for t in mcp_tools if t["name"] in use_mcps])
-            elif use_mcps is True:
-                all_discovered_tools.extend(mcp_tools)
-
-        if use_data_store:
-            for name, info in use_data_store.items():
-                tool_name = f"research::{name}"
-                description = f"Queries '{name}'."
-                call_fn = None
-                if callable(info):
-                    call_fn = info
-                elif isinstance(info, dict):
-                    if "callable" in info and callable(info["callable"]):
-                        call_fn = info["callable"]
-                    description = info.get("description", description)
-                if call_fn:
-                    visible_tools.append({
-                        "name": tool_name,
-                        "description": description,
-                        "input_schema": {
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string"},
-                                "top_k": {"type": "integer"},
-                                "min_similarity_percent": {"type": "number"},
-                                "filters": {"type": "object"}
-                            },
-                            "required": ["query"]
-                        }
-                    })
-                    rag_registry[tool_name] = call_fn
-                    rag_tool_specs[tool_name] = {"default_top_k": rag_top_k, "default_min_sim": rag_min_similarity_percent}
-                else:
-                    log_event("RAG tool registration failed", MSG_TYPE.MSG_TYPE_WARNING, meta={"store_name": name})
-
-        visible_tools.extend(all_discovered_tools)
-
-        built_in_tools = [
-            {"name": "local_tools::final_answer", "description": "Provide the final answer directly to the user.", "input_schema": {}},
-            {"name": "local_tools::request_clarification", "description": "Ask the user for more information.", "input_schema": {"type": "object", "properties": {"question_to_user": {"type": "string"}}, "required": ["question_to_user"]}}
-        ]
-
-        if getattr(self, "tti", None):
-            built_in_tools.append({
-                "name": "local_tools::generate_image",
-                "description": "Generate an image from a text description. Returns a base64-encoded image.",
-                "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}
-            })
-
-        all_visible_tools = visible_tools + built_in_tools
-        formatted_tools_list = "\n".join([f"**{t['name']}**:\n- Description: {t['description']}" for t in all_visible_tools])
-        log_event(
-            f"Made {len(all_visible_tools)} tools visible.",
-            MSG_TYPE.MSG_TYPE_STEP_END,
-            meta={"visible": len(all_visible_tools), "rag_tools": list(rag_registry.keys())},
-            event_id=discovery_step_id
-        )
-
+        formatted_tools_list = "\n".join([f"**{t['name']}**: {t['description']}" for t in all_visible_tools])
+        completed_tasks, current_task_index = set(), 0
+        
         for i in range(max_reasoning_steps):
-            reasoning_step_id = log_event(f"Reasoning Step {i+1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_START)
+            step_desc = f"🤔 Working on: {execution_plan.tasks[current_task_index].description}" if current_task_index < len(execution_plan.tasks) else f"🤔 Analyzing next steps... ({i+1}/{max_reasoning_steps})"
+            reasoning_step_id = log_event_fn(step_desc, MSG_TYPE.MSG_TYPE_STEP_START)
+            
             try:
-                reasoning_prompt = f"""--- AVAILABLE ACTIONS ---
-{formatted_tools_list}
-
---- YOUR INTERNAL SCRATCHPAD ---
-{current_scratchpad}
---- END SCRATCHPAD ---
-
-INSTRUCTIONS:
-1) OBSERVE the scratchpad and available assets.
-2) THINK what is the single best next action to progress toward the user's goal: "{original_user_prompt}".
-3) ACT: Produce only this JSON:
-
-{{
-  "thought": "short, concrete reasoning",
-  "action": {{
-    "tool_name": "string",
-    "requires_code_input": true/false,
-    "requires_image_input": true/false
-  }}
-}}
-
-You may choose "local_tools::final_answer" to answer directly without tools.
-"""
-                log_prompt("Decision Prompt", reasoning_prompt)
-                decision_schema = {
-                    "thought": "My reasoning.",
-                    "action": {"tool_name": "string", "requires_code_input": "boolean", "requires_image_input": "boolean"}
-                }
-                decision_data = self.generate_structured_content(
-                    prompt=reasoning_prompt,
-                    schema=decision_schema,
-                    system_prompt=reasoning_system_prompt,
-                    temperature=decision_temperature,
-                    **llm_generation_kwargs
-                )
-                if not decision_data or not isinstance(decision_data.get("action"), dict):
-                    log_event("Invalid decision JSON", MSG_TYPE.MSG_TYPE_WARNING, meta={"decision_raw": str(decision_data)}, event_id=reasoning_step_id)
-                    current_scratchpad += "\n\n### Step Failure\n- Error: Invalid decision JSON."
+                if len(current_scratchpad) > 12000:
+                    current_scratchpad = memory_manager.compress_scratchpad(current_scratchpad, original_user_prompt, 8000)
+                
+                reasoning_prompt = f"""--- AVAILABLE ACTIONS ---\n{formatted_tools_list}\n--- YOUR INTERNAL SCRATCHPAD ---\n{current_scratchpad}\n--- END SCRATCHPAD ---\n
+INSTRUCTIONS: Observe, think, and then act. Choose the single best next action to achieve: "{original_user_prompt}".
+Produce ONLY this JSON: {{"thought": "short reasoning", "action": {{"tool_name": "...", "requires_code_input": false, "requires_image_input": false}}}}"""
+                decision_data = self.generate_structured_content(prompt=reasoning_prompt, schema={"thought": "string", "action": "object"}, system_prompt=reasoning_system_prompt, temperature=decision_temperature, **llm_generation_kwargs)
+                
+                if not (decision_data and isinstance(decision_data.get("action"), dict)):
+                    log_event_fn("LLM failed to produce a valid action JSON.", MSG_TYPE.MSG_TYPE_WARNING, event_id=reasoning_step_id)
+                    current_scratchpad += "\n\n### Step Failure\n- Error: Invalid decision JSON from LLM."
                     continue
 
-                thought, action = decision_data.get("thought", ""), decision_data.get("action", {})
-                tool_name = action.get("tool_name")
-                requires_code = action.get("requires_code_input", False)
-                requires_image = action.get("requires_image_input", False)
-                current_scratchpad += f"\n\n### Step {i+1}: Thought\n{thought}"
-                log_event("Decision taken", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name, "requires_code": requires_code, "requires_image": requires_image})
-
-                if tool_name == "local_tools::final_answer":
-                    break
+                action = decision_data.get("action", {})
+                tool_name, requires_code, requires_image = action.get("tool_name"), action.get("requires_code_input", False), action.get("requires_image_input", False)
+                current_scratchpad += f"\n\n### Step {i+1}: Thought\n{decision_data.get('thought', '')}"
+                
+                log_event_fn(_get_friendly_action_description(tool_name, requires_code, requires_image), MSG_TYPE.MSG_TYPE_STEP)
+                if tool_name == "local_tools::final_answer": break
                 if tool_name == "local_tools::request_clarification":
-                    return {
-                        "final_answer": decision_data.get("question_to_user", "?"),
-                        "final_scratchpad": current_scratchpad,
-                        "tool_calls": tool_calls_this_turn,
-                        "sources": sources_this_turn,
-                        "clarification_required": True,
-                        "error": None
-                    }
+                    clarification_prompt = f"Based on your thought process, what is the single question you need to ask the user?\n\nSCRATCHPAD:\n{current_scratchpad}\n\nQUESTION:"
+                    question = self.generate_text(clarification_prompt)
+                    return {"final_answer": self.remove_thinking_blocks(question), "clarification_required": True, "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "error": None}
 
-                prepared_assets = {}
+                param_assets = {}
                 if requires_code:
-                    code_prompt = f"""--- ORIGINAL USER REQUEST ---
-"{original_user_prompt}"
-
---- YOUR INTERNAL SCRATCHPAD ---
-{current_scratchpad}
---- END SCRATCHPAD ---
-
-INSTRUCTIONS:
-Generate raw code only, with no explanations. The code must be self-contained and directly address the current next action."""
-                    log_prompt("Code Generation Prompt", code_prompt)
-                    generated_code = self.generate_code(prompt=code_prompt, system_prompt="Generate ONLY raw code.", **llm_generation_kwargs)
-                    code_uuid = str(uuid.uuid4())
-                    asset_store[code_uuid] = {"type": "code", "content": generated_code}
-                    prepared_assets["code_asset_id"] = code_uuid
-                    log_event("Code asset created", MSG_TYPE.MSG_TYPE_STEP, meta={"code_asset_id": code_uuid, "code_len": len(generated_code) if isinstance(generated_code, str) else None})
-
+                    code_prompt = f"Generate only the raw code required for the current step.\n\nSCRATCHPAD:\n{current_scratchpad}\n\nCODE:"
+                    code_content = self.generate_code(prompt=code_prompt, **llm_generation_kwargs)
+                    code_uuid = f"code_asset_{uuid.uuid4()}"
+                    asset_store[code_uuid] = {"type": "code", "content": code_content}
+                    param_assets['code_asset_id'] = code_uuid
+                    log_event_fn("Code asset generated.", MSG_TYPE.MSG_TYPE_STEP)
                 if requires_image:
-                    for img_b64 in images or []:
-                        img_uuid = str(uuid.uuid4())
-                        asset_store[img_uuid] = {"type": "image", "content": img_b64}
-                        prepared_assets.setdefault("image_asset_ids", []).append(img_uuid)
-                    log_event("Image assets prepared", MSG_TYPE.MSG_TYPE_STEP, meta={"image_asset_ids": prepared_assets.get("image_asset_ids", [])})
+                    image_assets = [asset_id for asset_id, asset in asset_store.items() if asset['type'] == 'image' and asset.get('source') == 'user']
+                    if image_assets:
+                        param_assets['image_asset_id'] = image_assets[0]
 
-                param_prompt = f"""--- SELECTED TOOL ---
-{tool_name}
-
---- AVAILABLE ASSETS ---
-code_asset_id: {prepared_assets.get("code_asset_id","<none>")}
-image_asset_ids: {prepared_assets.get("image_asset_ids","<none>")}
-
---- ORIGINAL USER REQUEST ---
-"{original_user_prompt}"
-
---- YOUR INTERNAL SCRATCHPAD ---
-{current_scratchpad}
---- END SCRATCHPAD ---
-
-INSTRUCTIONS:
-Fill the parameters for the selected tool. If code is required, do not paste code; use the code asset ID string exactly. If images are required, use the provided image asset IDs. Output only:
-
-{{
-  "tool_params": {{...}}
-}}
-"""
-                log_prompt("Parameter Generation Prompt", param_prompt)
-                param_schema = {"tool_params": "object"}
-                param_data = self.generate_structured_content(
-                    prompt=param_prompt,
-                    schema=param_schema,
-                    system_prompt=reasoning_system_prompt,
-                    temperature=decision_temperature,
-                    **llm_generation_kwargs
-                )
-                tool_params = {}
-                if param_data and isinstance(param_data.get("tool_params"), dict):
-                    tool_params = param_data["tool_params"]
-                else:
-                    log_event("Parameter generation returned empty", MSG_TYPE.MSG_TYPE_WARNING, meta={"param_raw": str(param_data)})
-
+                param_prompt = f"""Fill the parameters for the tool: '{tool_name}'. Available assets: {json.dumps(param_assets)}.
+SCRATCHPAD:\n{current_scratchpad}\n
+Output only: {{"tool_params": {{...}}}}"""
+                param_data = self.generate_structured_content(prompt=param_prompt, schema={"tool_params": "object"}, temperature=decision_temperature, **llm_generation_kwargs)
+                tool_params = param_data.get("tool_params", {}) if param_data else {}
+                
                 def _hydrate(data: Any, store: Dict) -> Any:
-                    if isinstance(data, dict):
-                        return {k: _hydrate(v, store) for k, v in data.items()}
-                    if isinstance(data, list):
-                        return [_hydrate(item, store) for item in data]
-                    if isinstance(data, str) and data in store:
-                        return store[data].get("content", data)
+                    if isinstance(data, dict): return {k: _hydrate(v, store) for k, v in data.items()}
+                    if isinstance(data, list): return [_hydrate(item, store) for item in data]
+                    if isinstance(data, str) and "asset_" in data and data in store: return store[data].get("content", data)
                     return data
-
                 hydrated_params = _hydrate(tool_params, asset_store)
-                log_event("Hydrated parameters", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name})
-
-                tool_result = {"status": "failure", "error": f"Tool '{tool_name}' failed."}
+                
+                start_time, tool_result = time.time(), {"status": "failure", "error": f"Tool '{tool_name}' failed to execute."}
                 try:
-                    if tool_name == "local_tools::generate_image":
-                        prompt_for_img = hydrated_params.get("prompt", "")
-                        log_event("TTI call start", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name})
-                        image_bytes = self.tti.generate_image(prompt=prompt_for_img)
-                        if not image_bytes:
-                            raise Exception("TTI binding returned empty image data.")
-                        b64_image = base64.b64encode(image_bytes).decode("utf-8")
-                        img_uuid = str(uuid.uuid4())
-                        asset_store[img_uuid] = {"type": "image", "content": f"data:image/png;base64,{b64_image}"}
-                        tool_result = {"status": "success", "image_asset": img_uuid, "html_tag": f"<img src='data:image/png;base64,{b64_image}' alt='Generated Image'/>"}
-                        log_event("TTI call success", MSG_TYPE.MSG_TYPE_STEP, meta={"image_asset": img_uuid})
-                    elif tool_name in rag_registry:
+                    if tool_name in rag_registry:
                         query = hydrated_params.get("query", "")
-                        top_k = int(hydrated_params.get("top_k", rag_tool_specs[tool_name]["default_top_k"]))
-                        min_sim = float(hydrated_params.get("min_similarity_percent", rag_tool_specs[tool_name]["default_min_sim"]))
-                        filters = hydrated_params.get("filters", None)
-                        log_event("RAG call start", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name, "query": query, "top_k": top_k, "min_similarity_percent": min_sim, "has_filters": bool(filters)})
-                        rag_fn = rag_registry[tool_name]
-                        try:
-                            raw_results = rag_fn(query=query, top_k=top_k if top_k else None, filters=filters if filters else None)
-                        except TypeError:
-                            raw_results = rag_fn(query)
-                        docs = []
-                        if isinstance(raw_results, dict) and "results" in raw_results:
-                            raw_iter = raw_results["results"]
-                        else:
-                            raw_iter = raw_results
-                        for d in raw_iter or []:
-                            text = d.get("text") if isinstance(d, dict) else str(d)
-                            score = d.get("score", 0.0) if isinstance(d, dict) else 0.0
-                            meta = d.get("metadata", {}) if isinstance(d, dict) else {}
-                            pct = score * 100.0 if score <= 1.0 else score
-                            docs.append({"text": text, "score": pct, "metadata": meta})
-                        docs.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-                        kept = [x for x in docs if x.get("score", 0.0) >= min_sim][:top_k]
-                        dropped = len(docs) - len(kept)
-                        tool_result = {"status": "success", "results": kept, "dropped": dropped, "min_similarity_percent": min_sim, "top_k": top_k}
-                        sources_this_turn.extend([{"source": tool_name, "metadata": x.get("metadata", {}), "score": x.get("score", 0.0)} for x in kept])
-                        snippet_preview = [{"score": x["score"], "text": (x["text"][:200] + "…") if isinstance(x["text"], str) and len(x["text"]) > 200 else x["text"]} for x in kept]
-                        log_event("RAG call end", MSG_TYPE.MSG_TYPE_STEP_END, meta={"tool_name": tool_name, "kept": len(kept), "dropped": dropped, "preview": snippet_preview})
-                        rag_notes = "\n".join([f"- [{idx+1}] score={x['score']:.1f}% | {x['text'][:500]}" for idx, x in enumerate(kept)])
-                        current_scratchpad += f"\n\n### RAG Notes ({tool_name})\n{rag_notes if rag_notes else '- No results above threshold.'}"
+                        top_k, min_sim = rag_tool_specs[tool_name]["default_top_k"], rag_tool_specs[tool_name]["default_min_sim"]
+                        raw_results = rag_registry[tool_name](query=query, top_k=top_k)
+                        raw_iter = raw_results["results"] if isinstance(raw_results, dict) and "results" in raw_results else raw_results
+                        docs = [{"text": d.get("text", str(d)), "score": d.get("score", 0)*100, "metadata": d.get("metadata", {})} for d in raw_iter or []]
+                        kept = [x for x in docs if x['score'] >= min_sim]
+                        tool_result = {"status": "success", "results": kept, "dropped": len(docs) - len(kept)}
+                        sources_this_turn.extend([{"source": tool_name, "metadata": x["metadata"], "score": x["score"]} for x in kept])
                     elif hasattr(self, "mcp"):
-                        log_event("MCP tool call start", MSG_TYPE.MSG_TYPE_STEP, meta={"tool_name": tool_name})
                         tool_result = self.mcp.execute_tool(tool_name, hydrated_params, lollms_client_instance=self)
-                        log_event("MCP tool call end", MSG_TYPE.MSG_TYPE_STEP_END, meta={"tool_name": tool_name})
-                    else:
-                        tool_result = {"status": "failure", "error": "No MCP instance available and tool is not RAG/TTI."}
                 except Exception as e:
-                    tool_result = {"status": "failure", "error": str(e)}
-                    log_event("Tool call exception", MSG_TYPE.MSG_TYPE_EXCEPTION, meta={"tool_name": tool_name, "error": str(e)})
+                    error_msg = f"Exception during '{tool_name}' execution: {e}"
+                    log_event_fn(error_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+                    tool_result = {"status": "failure", "error": error_msg}
 
-                sanitized_result = tool_result.copy() if isinstance(tool_result, dict) else {"raw_output": str(tool_result)}
-                observation_text = f"```json\n{json.dumps(sanitized_result, indent=2)}\n```"
-                tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result})
+                response_time = time.time() - start_time
+                success = tool_result.get("status") == "success"
+                performance_tracker.record_tool_usage(tool_name, success, 0.8, response_time, tool_result.get("error"))
+                
+                if success and current_task_index < len(execution_plan.tasks):
+                    execution_plan.tasks[current_task_index].status = TaskStatus.COMPLETED
+                    current_task_index += 1
+                
+                observation_text = f"```json\n{json.dumps(tool_result, indent=2)}\n```"
+                tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result, "response_time": response_time})
                 current_scratchpad += f"\n\n### Step {i+1}: Observation\n- Action: `{tool_name}`\n- Result:\n{observation_text}"
-                log_event("Observation recorded", MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, meta={"tool_name": tool_name})
-
-                log_event(f"Finished reasoning step {i+1}", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
+                
+                if success:
+                    log_event_fn(f"✅ Step completed successfully", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
+                else:
+                    error_detail = tool_result.get("error", "No error detail provided.")
+                    log_event_fn(f"Tool reported failure: {error_detail}", MSG_TYPE.MSG_TYPE_WARNING)
+                    log_event_fn(f"⚠️ Step completed with issues", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id, meta={"error": error_detail})
+                
+                if len(completed_tasks) == len(execution_plan.tasks): break
+                    
             except Exception as ex:
+                log_event_fn(f"An unexpected error occurred in reasoning loop: {ex}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=reasoning_step_id)
                 trace_exception(ex)
-                log_event("Error in reasoning loop", MSG_TYPE.MSG_TYPE_EXCEPTION, meta={"error": str(ex)}, event_id=reasoning_step_id)
+                log_event_fn("⚠️ Encountered an issue, adjusting approach...", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
 
-        synthesis_id = log_event("Synthesizing final answer...", MSG_TYPE.MSG_TYPE_STEP_START)
-        final_answer_prompt = f"""--- ORIGINAL USER REQUEST ---
-"{original_user_prompt}"
+        if enable_self_reflection and len(tool_calls_this_turn) > 1:
+            reflection_id = log_event_fn("🤔 Reviewing my work...", MSG_TYPE.MSG_TYPE_STEP_START)
+            try:
+                reflection_prompt = f"""Review the user request and your work. Was the goal achieved effectively?
+REQUEST: "{original_user_prompt}"
+SCRATCHPAD:\n{current_scratchpad}\n
+JSON assessment: {{"goal_achieved": true, "effectiveness_score": 0.8, "summary": "..."}}"""
+                reflection_data = self.generate_structured_content(prompt=reflection_prompt, schema={"goal_achieved": "boolean", "effectiveness_score": "number", "summary": "string"}, temperature=0.3, **llm_generation_kwargs)
+                if reflection_data: current_scratchpad += f"\n\n### Self-Reflection\n- Goal Achieved: {reflection_data.get('goal_achieved')}\n- Effectiveness: {reflection_data.get('effectiveness_score')}"
+                log_event_fn("✅ Quality check completed", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reflection_id)
+            except Exception as e:
+                log_event_fn(f"Self-review failed: {e}", MSG_TYPE.MSG_TYPE_WARNING, event_id=reflection_id)
 
---- YOUR INTERNAL SCRATCHPAD ---
-{current_scratchpad}
---- END SCRATCHPAD ---
-
-INSTRUCTIONS:
-Synthesize a clear, comprehensive, and friendly answer for the user based ONLY on your scratchpad. If relevant images were generated, refer to them naturally. Keep the answer concise but complete."""
-        final_synthesis_images = [img for img in (images or [])] + [asset['content'] for asset in asset_store.values() if asset['type'] == 'image']
-        log_prompt("Final Synthesis Prompt", final_answer_prompt)
-        final_answer_text = self.generate_text(
-            prompt=final_answer_prompt,
-            system_prompt=system_prompt,
-            images=final_synthesis_images,
-            stream=streaming_callback is not None,
-            streaming_callback=streaming_callback,
-            temperature=final_answer_temperature,
-            **llm_generation_kwargs
-        )
-        if isinstance(final_answer_text, dict) and "error" in final_answer_text:
-            return {"final_answer": "", "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "clarification_required": False, "error": final_answer_text["error"]}
-
+        synthesis_id = log_event_fn("📝 Preparing your complete answer...", MSG_TYPE.MSG_TYPE_STEP_START)
+        final_answer_prompt = f"""Synthesize a comprehensive, user-friendly final answer based on your complete analysis.
+USER REQUEST: "{original_user_prompt}"
+FULL SCRATCHPAD:\n{current_scratchpad}\n---
+FINAL ANSWER:"""
+        
+        final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature, **llm_generation_kwargs)
+        if isinstance(final_answer_text, dict) and "error" in final_answer_text: 
+            return {"final_answer": "", "error": final_answer_text["error"], "final_scratchpad": current_scratchpad}
+        
         final_answer = self.remove_thinking_blocks(final_answer_text)
-        for asset_id, asset in asset_store.items():
-            if asset["type"] == "image" and isinstance(asset.get("content"), str) and asset["content"].startswith("data:image"):
-                final_answer += f"\n\n<img src='{asset['content']}' alt='Generated Image'/>"
+        log_event_fn("✅ Answer ready!", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id)
 
-        log_event("Finished synthesizing answer.", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id)
-
+        overall_confidence = sum(c.get('confidence', 0.5) for c in tool_calls_this_turn) / max(len(tool_calls_this_turn), 1)
         return {
-            "final_answer": final_answer,
-            "final_scratchpad": current_scratchpad,
-            "tool_calls": tool_calls_this_turn,
-            "sources": sources_this_turn,
-            "clarification_required": False,
-            "error": None
+            "final_answer": final_answer, "final_scratchpad": current_scratchpad,
+            "tool_calls": tool_calls_this_turn, "sources": sources_this_turn,
+            "performance_stats": {"total_steps": len(tool_calls_this_turn), "average_confidence": overall_confidence},
+            "clarification_required": False, "overall_confidence": overall_confidence, "error": None
         }
+
 
     def generate_code(
                         self,
