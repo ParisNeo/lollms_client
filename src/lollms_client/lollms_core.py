@@ -1501,7 +1501,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             return {"final_answer": "", "tool_calls": [], "sources": [], "error": "LLM binding not initialized."}
         if max_reasoning_steps is None:
             max_reasoning_steps=15
-            
+
         def log_event(desc, event_type=MSG_TYPE.MSG_TYPE_CHUNK, meta=None, event_id=None) -> Optional[str]:
             if not streaming_callback: return None
             is_start = event_type == MSG_TYPE.MSG_TYPE_STEP_START
@@ -1608,7 +1608,7 @@ Output ONLY the JSON for the tool's parameters: {{"tool_params": {{...}}}}"""
                 else:
                     tool_result = {"status": "failure", "error": f"Tool '{tool_name}' could not be executed in single-step mode."}
                 
-                if tool_result.get("status") != "success":
+                if tool_result.get("status","success") != "success" or "error" in tool_result:
                     error_detail = tool_result.get("error", "Unknown tool error in single-step mode.")
                     raise RuntimeError(error_detail)
 
