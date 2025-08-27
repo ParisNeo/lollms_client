@@ -1571,7 +1571,7 @@ Provide your decision as JSON: {{"thought": "...", "strategy": "...", "text_outp
 
         if strategy == "DIRECT_ANSWER":
             final_answer = strategy_data.get("text_output", "I can help with that.")
-            if streaming_callback: streaming_callback(final_answer, MSG_TYPE.MSG_TYPE_FULL, {})
+            if streaming_callback: streaming_callback(final_answer, MSG_TYPE.MSG_TYPE_CONTENT, {})
             return {"final_answer": final_answer, "tool_calls": [], "sources": [], "error": None, "clarification_required": False, "final_scratchpad": f"Strategy: DIRECT_ANSWER\nThought: {strategy_data.get('thought')}"}
 
         if strategy == "REQUEST_CLARIFICATION":
