@@ -1483,7 +1483,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             system_prompt: str|None = None,
             reasoning_system_prompt: str = "You are a logical AI assistant. Your task is to achieve the user's goal by thinking step-by-step and using the available tools.",
             images: Optional[List[str]] = None,
-            max_reasoning_steps: int = 15,
+            max_reasoning_steps: int|None = None,
             decision_temperature: float = 0.5,
             final_answer_temperature: float = 0.7,
             streaming_callback: Optional[Callable[[str, 'MSG_TYPE', Optional[Dict], Optional[List]], bool]] = None,
@@ -1499,7 +1499,9 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         
         if not self.llm:
             return {"final_answer": "", "tool_calls": [], "sources": [], "error": "LLM binding not initialized."}
-
+        if max_reasoning_steps is None:
+            max_reasoning_steps=15
+            
         def log_event(desc, event_type=MSG_TYPE.MSG_TYPE_CHUNK, meta=None, event_id=None) -> Optional[str]:
             if not streaming_callback: return None
             is_start = event_type == MSG_TYPE.MSG_TYPE_STEP_START
