@@ -37,12 +37,13 @@ if not pm.is_installed("llama-cpp-binaries"):
 
         if system == "Windows":
             # llama_cpp_binaries-0.14.0+cu124-py3-none-win_amd64.whl
-            url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.12.0/llama_cpp_binaries-0.14.0{cuda_suffix}-{python_version_simple}-none-win_amd64.whl"
-            fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.14.0/llama_cpp_binaries-0.14.0+cu124-py3-none-win_amd64.whl" # Generic py3
+            url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.39.0/llama_cpp_binaries-0.39.0{cuda_suffix}-{python_version_simple}-none-win_amd64.whl"
+            #url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.12.0/llama_cpp_binaries-0.14.0{cuda_suffix}-{python_version_simple}-none-win_amd64.whl"
+            fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.39.0/llama_cpp_binaries-0.39.0+cu124-py3-none-win_amd64.whl" # Generic py3
         elif system == "Linux":
             # llama_cpp_binaries-0.14.0+cu124-py3-none-linux_x86_64.whl
-            url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.14.0/llama_cpp_binaries-0.14.0{cuda_suffix}-{python_version_simple}-none-linux_x86_64.whl"
-            fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.14.0/llama_cpp_binaries-0.14.0+cu124-py3-none-linux_x86_64.whl" # Generic py3
+            url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.39.0/llama_cpp_binaries-0.39.0{cuda_suffix}-{python_version_simple}-none-linux_x86_64.whl"
+            fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.39.0/llama_cpp_binaries-0.39.0+cu124-py3-none-linux_x86_64.whl" # Generic py3
         else:
             ASCIIColors.warning(f"Unsupported OS for prebuilt llama-cpp-binaries: {system}. Please install manually.")
             return
@@ -724,13 +725,15 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     if line_str == '[DONE]': break
                     try:
                         chunk_data = json.loads(line_str)
-                        chunk_content = chunk_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
-                        if chunk_content:
-                            full_response_text += chunk_content
-                            if streaming_callback and not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                ASCIIColors.info("Streaming callback requested stop.")
-                                response.close()
-                                break
+                        choices = chunk_data.get('choices', [{}])
+                        if choices and len(choices)>0:
+                            chunk_content = choices[0].get('delta', {}).get('content', '')
+                            if chunk_content:
+                                full_response_text += chunk_content
+                                if streaming_callback and not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                    ASCIIColors.info("Streaming callback requested stop.")
+                                    response.close()
+                                    break
                     except json.JSONDecodeError:
                         ASCIIColors.warning(f"Failed to decode JSON stream chunk: {line_str}")
                         continue
