@@ -34,13 +34,13 @@ def load_known_contexts():
         return known_contexts
     except FileNotFoundError:
         print(f"Error: File not found at {file_path}")
-        return None
+        return []
     except json.JSONDecodeError:
         print(f"Error: Could not decode JSON from {file_path}")
-        return None
+        return []
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-        return None
+        return []
 
 class LollmsLLMBinding(ABC):
     """Abstract base class for all LOLLMS LLM bindings"""
