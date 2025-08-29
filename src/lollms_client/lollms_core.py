@@ -1834,7 +1834,7 @@ FINAL ANSWER:"""
         if not  system_prompt:
             system_prompt = f"""Act as a code generation assistant that generates code from user prompt."""
 
-        if template:
+        if template and template !="{}":
             if language in ["json","yaml","xml"]:
                 system_prompt += f"\nMake sure the generated context follows the following schema:\n```{language}\n{template}\n```\n"
             else:
@@ -1923,92 +1923,172 @@ Do not split the code in multiple tags.
     def generate_structured_content(
         self,
         prompt,
-        images=[],
-        schema={},
+        images=None,
+        schema=None,
         system_prompt=None,
+        max_retries=1,
         **kwargs
     ):
-        """
-        Generates structured data (a dict) from a prompt using a JSON schema.
+        import json
+        images = [] if images is None else images
+        schema = {} if schema is None else schema
+        try:
+            from jsonschema import validate
+            has_validator = True
+        except ImportError:
+            has_validator = False
 
-        This method is a high-level wrapper around `generate_code`, specializing it 
-        for JSON output. It ensures the LLM sticks to a predefined structure,
-        and then parses the output into a Python dictionary.
-
-        Args:
-            prompt (str): 
-                The user's request (e.g., "Extract the name, age, and city of the person described").
-            schema (dict or str): 
-                A Python dictionary or a JSON string representing the desired output 
-                structure. This will be used as a schema for the LLM.
-                Example: {"name": "string", "age": "integer", "city": "string"}
-            system_prompt (str, optional): 
-                Additional instructions for the system prompt, to be appended to the 
-                main instructions. Defaults to None.
-            **kwargs: 
-                Additional keyword arguments to be passed directly to the 
-                `generate_code` method (e.g., temperature, n_predict, top_k, debug).
-
-        Returns:
-            dict: The parsed JSON data as a Python dictionary, or None if
-                generation or parsing fails.
-        """
-        # 1. Validate and prepare the schema string from the schema
         if isinstance(schema, dict):
-            # Convert the dictionary to a nicely formatted JSON string for the schema
-            schema_str = json.dumps(schema, indent=2)
+            schema_obj = schema
         elif isinstance(schema, str):
-            # Assume it's already a valid JSON string schema
-            schema_str = schema
+            try:
+                schema_obj = json.loads(schema)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"The provided schema string is not valid JSON: {e}")
         else:
-            # It's good practice to fail early for invalid input types
             raise TypeError("schema must be a dict or a JSON string.")
-        # 2. Construct a specialized system prompt for structured data generation
-        full_system_prompt = (
-            "Your objective is to build a json structured output based on the user's request and the provided schema."
-            "Your entire response must be a single valid JSON object within a markdown code block."
-            "do not use tabs in your response."
-        )
-        if system_prompt:
-            full_system_prompt = f"{system_prompt}\n\n{full_system_prompt}"
 
-        # 3. Call the underlying generate_code method with JSON-specific settings
-        if kwargs.get('debug'):
+        # --- FIX STARTS HERE ---
+        # Heuristic to detect if the schema is a properties-only dictionary
+        # and needs to be wrapped in a root object to be a valid schema.
+        # This handles cases where the user provides `{"field1": {...}, "field2": {...}}`
+        # instead of `{"type": "object", "properties": {"field1": ...}}`.
+        if "type" not in schema_obj and "properties" not in schema_obj and all(isinstance(v, dict) for v in schema_obj.values()):
+            if kwargs.get("debug"):
+                ASCIIColors.info("Schema appears to be a properties-only dictionary; wrapping it in a root object.")
+            schema_obj = {
+                "type": "object",
+                "properties": schema_obj,
+                # Assume all top-level keys are required when wrapping
+                "required": list(schema_obj.keys())
+            }
+        # --- FIX ENDS HERE ---
+
+        def _instance_skeleton(s):
+            if not isinstance(s, dict):
+                return {}
+            if "const" in s:
+                return s["const"]
+            if "enum" in s and isinstance(s["enum"], list) and s["enum"]:
+                return s["enum"][0]
+            
+            # Handle default values
+            if "default" in s:
+                return s["default"]
+
+            t = s.get("type")
+            if t == "string":
+                return ""
+            if t == "integer":
+                return 0
+            if t == "number":
+                return 0.0
+            if t == "boolean":
+                return False
+            if t == "array":
+                # Generate one minimal item if schema is provided
+                items = s.get("items", {})
+                min_items = s.get("minItems", 0)
+                # Let's generate at least one item for the example if possible
+                num_items = max(min_items, 1) if items and not min_items == 0 else min_items
+                return [_instance_skeleton(items) for _ in range(num_items)]
+            if t == "object":
+                props = s.get("properties", {})
+                # Use required fields, otherwise fall back to all properties for the skeleton
+                req = s.get("required", list(props.keys()))
+                out = {}
+                for k in req:
+                    if k in props:
+                        out[k] = _instance_skeleton(props[k])
+                    else:
+                        out[k] = None # Should not happen if schema is well-formed
+                return out
+            if "oneOf" in s and isinstance(s["oneOf"], list) and s["oneOf"]:
+                return _instance_skeleton(s["oneOf"][0])
+            if "anyOf" in s and isinstance(s["anyOf"], list) and s["anyOf"]:
+                return _instance_skeleton(s["anyOf"][0])
+            if "allOf" in s and isinstance(s["allOf"], list) and s["allOf"]:
+                merged = {}
+                for sub in s["allOf"]:
+                    val = _instance_skeleton(sub)
+                    if isinstance(val, dict):
+                        merged.update(val)
+                return merged if merged else {}
+            return {}
+
+        # Now derive strings from the (potentially corrected) schema_obj
+        schema_str = json.dumps(schema_obj, indent=2, ensure_ascii=False)
+        example_obj = _instance_skeleton(schema_obj)
+        example_str = json.dumps(example_obj, indent=2, ensure_ascii=False)
+
+        base_system = (
+            "Your objective is to generate a JSON object that satisfies the user's request and conforms to the provided schema.\n"
+            "Rules:\n"
+            "1) The schema is reference ONLY. Do not include the schema in the output.\n"
+            "2) Output exactly ONE valid JSON object.\n"
+            "3) Wrap the JSON object inside a single ```json code block.\n"
+            "4) Do not output explanations or text outside the JSON.\n"
+            "5) Use 2 spaces for indentation. Do not use tabs.\n"
+            "6) Only include fields allowed by the schema and ensure all required fields are present.\n"
+            "7) For enums, choose a valid value from the list.\n\n"
+            "Schema (reference only):\n"
+            f"```json\n{schema_str}\n```\n\n"
+            "Correct example of output format (structure only, values are illustrative):\n"
+            f"```json\n{example_str}\n```"
+        )
+        full_system_prompt = f"{system_prompt}\n\n{base_system}" if system_prompt else base_system
+
+        if kwargs.get("debug"):
             ASCIIColors.info("Generating structured content...")
 
-        json_string = self.generate_code(
-            prompt=prompt,
-            images=images,
-            system_prompt=full_system_prompt,
-            template=schema_str,
-            language="json",
-            code_tag_format="markdown", # Sticking to markdown is generally more reliable
-            **kwargs # Pass other params like temperature, top_k, etc.
-        )
+        last_error = None
+        for attempt in range(max_retries + 1):
+            json_string = self.generate_code(
+                prompt=prompt,
+                images=images,
+                system_prompt=full_system_prompt if attempt == 0 else f"{full_system_prompt}\n\nPrevious attempt failed validation: {last_error}\nReturn a corrected JSON instance that strictly satisfies the schema.",
+                template=example_str,
+                language="json",
+                code_tag_format="markdown",
+                **kwargs
+            )
+            if not json_string:
+                last_error = "LLM returned an empty response."
+                if kwargs.get("debug"): ASCIIColors.warning(last_error)
+                continue
 
-        # 4. Parse the result and return
-        if not json_string:
-            # generate_code already logs the error, so no need for another message
-            return None
+            if kwargs.get("debug"):
+                ASCIIColors.info("Parsing generated JSON string...")
+                print(f"--- Raw JSON String ---\n{json_string}\n-----------------------")
 
-        if kwargs.get('debug'):
-            ASCIIColors.info("Parsing generated JSON string...")
-            print(f"--- Raw JSON String ---\n{json_string}\n-----------------------")
-
-        try:
-            # Use the provided robust parser
-            parsed_json = robust_json_parser(json_string)
-            
-            if parsed_json is None:
-                ASCIIColors.warning("Failed to robustly parse the generated JSON.")
-                return None
+            try:
+                parsed_json = robust_json_parser(json_string)
+                if parsed_json is None:
+                    last_error = "Failed to robustly parse the generated string into JSON."
+                    if kwargs.get("debug"): ASCIIColors.warning(last_error)
+                    continue
                 
-            return parsed_json
-
-        except Exception as e:
-            trace_exception(e)
-            ASCIIColors.error(f"An unexpected error occurred during JSON parsing: {e}")
-            return None
+                if has_validator:
+                    try:
+                        validate(instance=parsed_json, schema=schema_obj)
+                        return parsed_json
+                    except Exception as ve:
+                        last_error = f"JSON Schema Validation Error: {ve}"
+                        if kwargs.get("debug"): ASCIIColors.warning(last_error)
+                        if attempt < max_retries:
+                            continue
+                        # Return the invalid object after last retry if validation fails
+                        return parsed_json
+                return parsed_json
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.error(f"Unexpected error during JSON processing: {e}")
+                last_error = f"An unexpected error occurred: {e}"
+                # Do not retry on unexpected errors, break the loop
+                break
+        
+        ASCIIColors.error(f"Failed to generate valid structured content after {max_retries + 1} attempts. Last error: {last_error}")
+        return None
 
 
     def extract_code_blocks(self, text: str, format: str = "markdown") -> List[dict]:

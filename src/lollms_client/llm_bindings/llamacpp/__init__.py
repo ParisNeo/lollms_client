@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 from pathlib import Path
 from typing import Optional, Callable, List, Union, Dict, Any, Set
 import base64
@@ -20,28 +21,60 @@ from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
 import platform
 
-# Ensure llama-cpp-binaries and requests are installed
-pm.ensure_packages(["requests", "pillow"]) # pillow for dummy image in test
+# --- Multi-process locking for registry ---
+# On Windows, we need msvcrt, on POSIX, fcntl
+try:
+    if platform.system() == "Windows":
+        import msvcrt
+    else:
+        import fcntl
+except ImportError:
+    # This might happen in some restricted environments.
+    # The binding will fall back to thread-safety only.
+    msvcrt = fcntl = None
+
+
+class FileLock:
+    def __init__(self, lock_file_path):
+        self.lock_file_path = lock_file_path
+        self.lock_file = None
+        self._is_windows = platform.system() == "Windows"
+
+    def __enter__(self):
+        self.lock_file = open(self.lock_file_path, 'w')
+        if self._is_windows and msvcrt:
+            msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        elif not self._is_windows and fcntl:
+            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_file:
+            if self._is_windows and msvcrt:
+                self.lock_file.seek(0)
+                msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            elif not self._is_windows and fcntl:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            self.lock_file.close()
+            self.lock_file = None
+
+# --- End multi-process locking ---
+
+
+# Ensure llama-cpp-binaries, requests, pillow, and psutil are installed
+pm.ensure_packages(["requests", "pillow", "psutil"]) # pillow for dummy image in test, psutil for multi-process management
 if not pm.is_installed("llama-cpp-binaries"):
     def install_llama_cpp():
         system = platform.system()
         python_version_simple = f"py{sys.version_info.major}" # e.g. py310 for 3.10
 
-        # Determine CUDA suffix based on common recent versions. Adjust if needed.
-        # For simplicity, we'll target a common recent CUDA version.
-        # Users with specific needs might need to install manually.
-        # As of late 2023/early 2024, cu121 or cu118 are common.
-        # The oobabooga binaries often use +cu124 for recent builds. Let's try that.
         cuda_suffix = "+cu124" 
 
 
         if system == "Windows":
-            # llama_cpp_binaries-0.14.0+cu124-py3-none-win_amd64.whl
             url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.39.0/llama_cpp_binaries-0.39.0{cuda_suffix}-{python_version_simple}-none-win_amd64.whl"
-            #url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.12.0/llama_cpp_binaries-0.14.0{cuda_suffix}-{python_version_simple}-none-win_amd64.whl"
             fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.39.0/llama_cpp_binaries-0.39.0+cu124-py3-none-win_amd64.whl" # Generic py3
         elif system == "Linux":
-            # llama_cpp_binaries-0.14.0+cu124-py3-none-linux_x86_64.whl
             url = f"https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.39.0/llama_cpp_binaries-0.39.0{cuda_suffix}-{python_version_simple}-none-linux_x86_64.whl"
             fallback_url = "https://github.com/oobabooga/llama-cpp-binaries/releases/download/v0.39.0/llama_cpp_binaries-0.39.0+cu124-py3-none-linux_x86_64.whl" # Generic py3
         else:
@@ -64,11 +97,12 @@ if not pm.is_installed("llama-cpp-binaries"):
 
 try:
     import llama_cpp_binaries
+    import psutil
 except ImportError:
-    ASCIIColors.error("llama-cpp-binaries package not found. Please install it.")
-    ASCIIColors.error("You can try: pip install llama-cpp-python[server] (for server support)")
-    ASCIIColors.error("Or download a wheel from: https://github.com/oobabooga/llama-cpp-binaries/releases or https://pypi.org/project/llama-cpp-python/#files")
+    ASCIIColors.error("llama-cpp-binaries or psutil package not found. Please ensure they are installed.")
+    ASCIIColors.error("You can try: pip install llama-cpp-python[server] psutil")
     llama_cpp_binaries = None
+    psutil = None
 
 
 # --- Predefined patterns ---
@@ -113,10 +147,130 @@ def get_gguf_model_base_name(file_path_or_name: Union[str, Path]) -> str:
     while name_part and name_part[-1] in ['.', '-', '_']: name_part = name_part[:-1]
     return name_part
 
-# --- Global Server Registry ---
-_active_servers: Dict[tuple, 'LlamaCppServerProcess'] = {}
-_server_ref_counts: Dict[tuple, int] = {}
-_server_registry_lock = threading.Lock()
+# --- Global Server Registry (File-based for multi-process support) ---
+
+class ServerRegistry:
+    def __init__(self):
+        self.registry_dir = Path(tempfile.gettempdir()) / "lollms_llamacpp_servers"
+        self.registry_dir.mkdir(parents=True, exist_ok=True)
+        self.registry_file = self.registry_dir / "registry.json"
+        self.lock_file = self.registry_dir / "registry.lock"
+        self.my_pid = os.getpid()
+
+    def _is_pid_running(self, pid: int) -> bool:
+        if psutil is None: return True # Conservative default if psutil is missing
+        return psutil.pid_exists(pid)
+
+    def _read_registry(self) -> Dict[str, Any]:
+        if not self.registry_file.exists():
+            return {}
+        try:
+            with open(self.registry_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+
+    def _write_registry(self, data: Dict[str, Any]):
+        with open(self.registry_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def _clean_stale_entries(self, registry_data: Dict[str, Any]) -> bool:
+        """Cleans stale servers and clients. Returns True if changes were made."""
+        changed = False
+        # Clean dead servers
+        dead_servers = [k for k, v in registry_data.items() if not self._is_pid_running(v['pid'])]
+        for key in dead_servers:
+            ASCIIColors.warning(f"Registry Cleaner: Found dead server process (PID: {registry_data[key]['pid']}). Removing entry {key}.")
+            del registry_data[key]
+            changed = True
+
+        # Clean dead clients from living servers
+        for key, server_info in list(registry_data.items()):
+            dead_clients = [pid for pid in server_info.get('client_pids', []) if not self._is_pid_running(pid)]
+            if dead_clients:
+                ASCIIColors.warning(f"Registry Cleaner: Found dead client PIDs {dead_clients} for server {key}. Cleaning up.")
+                server_info['client_pids'] = [pid for pid in server_info['client_pids'] if pid not in dead_clients]
+                server_info['ref_count'] = len(server_info['client_pids'])
+                changed = True
+
+            # If a server has no clients left after cleanup, it's an orphan. Remove it.
+            if server_info['ref_count'] <= 0:
+                ASCIIColors.warning(f"Registry Cleaner: Server {key} (PID: {server_info['pid']}) has no clients left. Shutting it down.")
+                try:
+                    p = psutil.Process(server_info['pid'])
+                    p.terminate()
+                    p.wait(timeout=5)
+                except psutil.NoSuchProcess: pass
+                except Exception as e: ASCIIColors.error(f"Error terminating orphaned server PID {server_info['pid']}: {e}")
+                del registry_data[key]
+                changed = True
+        
+        return changed
+
+    def get_server(self, server_key: str) -> Optional[Dict[str, Any]]:
+        with FileLock(self.lock_file):
+            registry = self._read_registry()
+            self._clean_stale_entries(registry) # Always clean before read
+            server_info = registry.get(server_key)
+            if server_info:
+                self._write_registry(registry) # Write back changes from cleaning
+            return server_info
+
+    def register_new_server(self, server_key: str, pid: int, port: int):
+        with FileLock(self.lock_file):
+            registry = self._read_registry()
+            # Clean just in case something happened between server start and registration
+            self._clean_stale_entries(registry)
+            
+            registry[server_key] = {
+                "pid": pid, "port": port,
+                "ref_count": 1, "client_pids": [self.my_pid]
+            }
+            self._write_registry(registry)
+            ASCIIColors.info(f"Process {self.my_pid} registered new server {server_key} (PID: {pid}, Port: {port})")
+
+    def increment_ref_count(self, server_key: str):
+        with FileLock(self.lock_file):
+            registry = self._read_registry()
+            self._clean_stale_entries(registry)
+            
+            server_info = registry.get(server_key)
+            if server_info:
+                if self.my_pid not in server_info['client_pids']:
+                    server_info['client_pids'].append(self.my_pid)
+                    server_info['ref_count'] = len(server_info['client_pids'])
+                    self._write_registry(registry)
+                    ASCIIColors.info(f"Process {self.my_pid} attached to server {server_key}. New ref_count: {server_info['ref_count']}")
+            else:
+                ASCIIColors.warning(f"Process {self.my_pid} tried to attach to non-existent server {server_key}.")
+
+    def decrement_ref_count(self, server_key: str):
+        with FileLock(self.lock_file):
+            registry = self._read_registry()
+            made_changes = self._clean_stale_entries(registry)
+            
+            server_info = registry.get(server_key)
+            if server_info:
+                if self.my_pid in server_info['client_pids']:
+                    server_info['client_pids'].remove(self.my_pid)
+                    server_info['ref_count'] = len(server_info['client_pids'])
+                    made_changes = True
+                    ASCIIColors.info(f"Process {self.my_pid} detached from server {server_key}. New ref_count: {server_info['ref_count']}")
+
+                if server_info['ref_count'] <= 0:
+                    ASCIIColors.info(f"Last client (PID: {self.my_pid}) detached. Shutting down server {server_key} (PID: {server_info['pid']}).")
+                    try:
+                        p = psutil.Process(server_info['pid'])
+                        p.terminate()
+                        p.wait(timeout=10)
+                    except psutil.NoSuchProcess:
+                        ASCIIColors.warning(f"Server process {server_info['pid']} was already gone.")
+                    except Exception as e:
+                        ASCIIColors.error(f"Error terminating server process {server_info['pid']}: {e}")
+                    del registry[server_key]
+            
+            if made_changes:
+                self._write_registry(registry)
 
 BindingName = "LlamaCppServerBinding"
 DEFAULT_LLAMACPP_SERVER_HOST = "127.0.0.1"
@@ -126,9 +280,12 @@ class LlamaCppServerProcess:
                  model_path: Union[str, Path], 
                  clip_model_path: Optional[Union[str, Path]] = None, 
                  server_binary_path: Optional[Union[str, Path]]=None, 
-                 server_args: Dict[str, Any]={}
+                 server_args: Dict[str, Any]={},
+                 process_pid: Optional[int]=None, # PID if we are attaching to existing process
+                 port: Optional[int]=None,
                  ):
-        """Initialize the Llama.cpp server process.
+        """Initialize the Llama.cpp server process wrapper.
+           Can either start a new process or wrap an existing one.
         """
         self.model_path = Path(model_path)
         self.clip_model_path = Path(clip_model_path) if clip_model_path else None
@@ -140,12 +297,14 @@ class LlamaCppServerProcess:
         else:
             raise FileNotFoundError("llama_cpp_binaries not found and no server_binary_path provided.")
 
-        self.port: Optional[int] = None # Set by start() method
+        self.port: Optional[int] = port
+        self.pid: Optional[int] = process_pid
         self.server_args = server_args
-        self.process: Optional[subprocess.Popen] = None
+        # The actual subprocess.Popen object. Will be None if this instance is just a client to a server started by another process.
+        self.process: Optional[subprocess.Popen] = None 
         self.session = requests.Session()
         self.host = self.server_args.get("host",DEFAULT_LLAMACPP_SERVER_HOST)
-        self.base_url: Optional[str] = None # Set by start() method
+        self.base_url: Optional[str] = f"http://{self.host}:{self.port}" if self.port else None
         self.is_healthy = False
         self._stderr_lines: List[str] = []
         self._stderr_thread: Optional[threading.Thread] = None
@@ -156,6 +315,23 @@ class LlamaCppServerProcess:
             ASCIIColors.warning(f"Clip model file '{self.clip_model_path}' not found. Vision features may not work or may use a different auto-detected clip model.")
         if not self.server_binary_path.exists():
             raise FileNotFoundError(f"Llama.cpp server binary not found: {self.server_binary_path}")
+
+    def attach(self):
+        """Attaches to an already running process by checking its health."""
+        if not self.pid or not self.port:
+            raise ValueError("Cannot attach without PID and port.")
+        self.base_url = f"http://{self.host}:{self.port}"
+        health_url = f"{self.base_url}/health"
+        try:
+            response = self.session.get(health_url, timeout=5)
+            if response.status_code == 200 and response.json().get("status") == "ok":
+                self.is_healthy = True
+                ASCIIColors.green(f"Successfully attached to Llama.cpp server on port {self.port} (PID: {self.pid}).")
+                return
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.warning(f"Failed to attach to server on port {self.port}: {e}")
+            self.is_healthy = False
+            raise ConnectionError(f"Could not connect to existing server at {health_url}")
 
     def _filter_stderr(self, stderr_pipe):
         try:
@@ -217,6 +393,7 @@ class LlamaCppServerProcess:
 
         try:
             self.process = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
+            self.pid = self.process.pid
         except Exception as e:
             ASCIIColors.error(f"Failed to start llama.cpp server process on port {self.port}: {e}"); trace_exception(e); raise
 
@@ -235,7 +412,7 @@ class LlamaCppServerProcess:
                 response = self.session.get(health_url, timeout=2)
                 if response.status_code == 200 and response.json().get("status") == "ok":
                     self.is_healthy = True
-                    ASCIIColors.green(f"Llama.cpp server started successfully on port {self.port}.")
+                    ASCIIColors.green(f"Llama.cpp server started successfully on port {self.port} (PID: {self.pid}).")
                     return
             except requests.exceptions.ConnectionError: time.sleep(1)
             except Exception as e: ASCIIColors.warning(f"Health check for port {self.port} failed: {e}"); time.sleep(1)
@@ -246,12 +423,13 @@ class LlamaCppServerProcess:
         raise TimeoutError(f"Llama.cpp server failed to become healthy on port {self.port} within {max_wait_time}s. Stderr:\n{stderr_output}")
 
     def shutdown(self):
+        """ This method only shuts down a server if this instance owns the Popen object.
+            The actual termination for multi-process is handled by the ServerRegistry. """
         self.is_healthy = False
         if self.process:
-            ASCIIColors.info(f"Shutting down Llama.cpp server (PID: {self.process.pid} on port {self.port})...")
+            ASCIIColors.info(f"Shutting down owned Llama.cpp server process (PID: {self.process.pid} on port {self.port})...")
             try:
-                if os.name == 'nt': self.process.terminate()
-                else: self.process.terminate()
+                self.process.terminate()
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 ASCIIColors.warning(f"Llama.cpp server (port {self.port}) did not terminate gracefully, killing...")
@@ -270,45 +448,31 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         "n_gpu_layers": 0, "n_ctx": 128000, "n_batch": 512,
         "embedding": False, "verbose": False, "server_startup_timeout": 120,
         "parallel_slots": 4, # Default parallel slots for server
+        "stop_sequences": ["<|im_start|>"], # Default stop sequences
     }
 
-    def __init__(self, 
-                 **kwargs
-                ):
-        """Initialize the Llama.cpp server binding.
-        Args:
-            model_name (str): Name of the model to load. If None, will use initial_model_name_preference.
-            models_path (str): Path to the directory containing model files.
-            clip_model_name (str): Optional name of the clip model to use. If None, will try to auto-detect based on the main model.
-            config (dict): Additional configuration options for the server.
-            default_completion_format (ELF_COMPLETION_FORMAT): Default format for completions.
-
-        """
+    def __init__(self, **kwargs):
         super().__init__(BindingName, **kwargs)
-        if llama_cpp_binaries is None: raise ImportError("llama-cpp-binaries package is required but not found.")
+        if llama_cpp_binaries is None or psutil is None: 
+            raise ImportError("llama-cpp-binaries and psutil packages are required.")
 
+        self.registry = ServerRegistry()
         models_path = kwargs.get("models_path", Path(__file__).parent/"models")
         self.models_path = Path(models_path)
-        # Store initial preferences, but do not load/start server yet.
         self.initial_model_name_preference: Optional[str] = kwargs.get("model_name")
-        self.user_provided_model_name: Optional[str] = kwargs.get("model_name") # Tracks the latest requested model
+        self.user_provided_model_name: Optional[str] = kwargs.get("model_name")
         self.initial_clip_model_name_preference: Optional[str] = kwargs.get("clip_model_name") 
-        
-        self._model_path_map: Dict[str, Path] = {}  # Maps unique name to full Path
-
-        # Initial scan for available models (to populate listModels)
+        self._model_path_map: Dict[str, Path] = {}
         self._scan_models()
-
         self.default_completion_format =  kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
         self.server_args = {**self.DEFAULT_SERVER_ARGS, **(kwargs.get("config") or {}), **kwargs}
         self.server_binary_path = self._get_server_binary_path()
         
-        # Current state of the loaded model and server
         self.current_model_path: Optional[Path] = None 
-        self.clip_model_path: Optional[Path] = None # Actual resolved path of loaded clip model
+        self.clip_model_path: Optional[Path] = None
         self.server_process: Optional[LlamaCppServerProcess] = None
         self.port: Optional[int] = None
-        self.server_key: Optional[tuple] = None
+        self.server_key: Optional[str] = None
 
         ASCIIColors.info("LlamaCppServerBinding initialized. Server will start on-demand with first generation call.")
 
@@ -325,7 +489,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 bin_path = Path(bin_path_str)
                 if bin_path.exists() and bin_path.is_file():
                     ASCIIColors.info(f"Using binary from llama-cpp-binaries: {bin_path}"); return bin_path
-        raise FileNotFoundError("Llama.cpp server binary not found. Ensure 'llama-cpp-binaries' or 'llama-cpp-python[server]' is installed or provide 'llama_server_binary_path'.")
+        raise FileNotFoundError("Llama.cpp server binary not found.")
 
     def _resolve_model_path(self, model_name_or_path: str) -> Path:
         """
@@ -333,36 +497,16 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         It prioritizes the internal map, then checks for absolute/relative paths,
         and rescans the models directory as a fallback.
         """
-        # 1. Check if the provided name is a key in our map
         if model_name_or_path in self._model_path_map:
-            resolved_path = self._model_path_map[model_name_or_path]
-            ASCIIColors.info(f"Resolved model name '{model_name_or_path}' to path: {resolved_path}")
-            return resolved_path
-
-        # 2. If not in map, treat it as a potential path (absolute or relative to models_path)
+            return self._model_path_map[model_name_or_path]
         model_p = Path(model_name_or_path)
-        if model_p.is_absolute():
-            if model_p.exists() and model_p.is_file():
-                return model_p
-
+        if model_p.is_absolute() and model_p.exists(): return model_p
         path_in_models_dir = self.models_path / model_name_or_path
-        if path_in_models_dir.exists() and path_in_models_dir.is_file():
-            ASCIIColors.info(f"Found model at relative path: {path_in_models_dir}")
-            return path_in_models_dir
-
-        # 3. As a fallback, rescan the models directory in case the file was just added
-        ASCIIColors.info("Model not found in cache, rescanning directory...")
+        if path_in_models_dir.exists(): return path_in_models_dir
         self._scan_models()
         if model_name_or_path in self._model_path_map:
-            resolved_path = self._model_path_map[model_name_or_path]
-            ASCIIColors.info(f"Found model '{model_name_or_path}' after rescan: {resolved_path}")
-            return resolved_path
-
-        # Final check for absolute path after rescan
-        if model_p.is_absolute() and model_p.exists() and model_p.is_file():
-            return model_p
-
-        raise FileNotFoundError(f"Model '{model_name_or_path}' not found in the map, as an absolute path, or within '{self.models_path}'.")
+            return self._model_path_map[model_name_or_path]
+        raise FileNotFoundError(f"Model '{model_name_or_path}' not found.")
 
     def _find_available_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -370,147 +514,105 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
     def _release_server_instance(self):
         if self.server_process and self.server_key:
-            with _server_registry_lock:
-                if self.server_key in _server_ref_counts:
-                    _server_ref_counts[self.server_key] -= 1
-                    ASCIIColors.info(f"Decremented ref count for server {self.server_key}. New count: {_server_ref_counts[self.server_key]}")
-                    if _server_ref_counts[self.server_key] <= 0:
-                        ASCIIColors.info(f"Ref count for server {self.server_key} is zero. Shutting it down.")
-                        server_to_stop = _active_servers.pop(self.server_key, None)
-                        _server_ref_counts.pop(self.server_key, None)
-                        if server_to_stop:
-                            try: server_to_stop.shutdown()
-                            except Exception as e: ASCIIColors.error(f"Error shutting down server {self.server_key}: {e}")
-                else:
-                     ASCIIColors.warning(f"Server key {self.server_key} not in ref counts during release. Might have been shut down already.")
-                     _active_servers.pop(self.server_key, None) # Ensure removal
-
+            self.registry.decrement_ref_count(self.server_key)
         self.server_process = None
         self.port = None
         self.server_key = None
-        self.current_model_path = None # Also clear this binding's model association
-        self.clip_model_path = None # And clip model association
+        self.current_model_path = None
+        self.clip_model_path = None
 
     def load_model(self, model_name_or_path: str) -> bool:
-        self.user_provided_model_name = model_name_or_path # Keep track of the selected model name
+        self.user_provided_model_name = model_name_or_path
         try:
             resolved_model_path = self._resolve_model_path(model_name_or_path)
         except Exception as ex:
-            trace_exception(ex)
-            return False
+            trace_exception(ex); return False
 
-        # Determine the final clip_model_path for this server instance
-        # Priority: 1. Explicit `initial_clip_model_name_preference` from __init__ (if valid path)
-        #           2. Auto-detection based on the resolved main model.
         final_clip_model_path: Optional[Path] = None
         if self.initial_clip_model_name_preference:
             p_clip_pref = Path(self.initial_clip_model_name_preference)
-            if p_clip_pref.is_absolute() and p_clip_pref.exists():
-                final_clip_model_path = p_clip_pref
-                ASCIIColors.info(f"Using explicitly configured LLaVA clip model: {final_clip_model_path}")
-            elif (self.models_path / self.initial_clip_model_name_preference).exists():
-                final_clip_model_path = self.models_path / self.initial_clip_model_name_preference
-                ASCIIColors.info(f"Using explicitly configured LLaVA clip model: {final_clip_model_path} (relative to models path)")
-            else:
-                ASCIIColors.warning(f"Specified initial clip_model_name '{self.initial_clip_model_name_preference}' not found. Attempting auto-detection.")
+            if p_clip_pref.is_absolute() and p_clip_pref.exists(): final_clip_model_path = p_clip_pref
+            elif (self.models_path / p_clip_pref).exists(): final_clip_model_path = self.models_path / p_clip_pref
+            else: ASCIIColors.warning(f"Specified clip model '{self.initial_clip_model_name_preference}' not found.")
 
-        if not final_clip_model_path: # If no explicit path was provided or it was invalid, try auto-detection
+        if not final_clip_model_path:
             base_name = get_gguf_model_base_name(resolved_model_path.stem)
             potential_paths = [
                 resolved_model_path.parent / f"{base_name}.mmproj",
                 resolved_model_path.parent / f"mmproj-{base_name}.gguf",
-                resolved_model_path.with_suffix(".mmproj"),
-                self.models_path / f"{base_name}.mmproj", # Check in general models dir too
+                self.models_path / f"{base_name}.mmproj",
                 self.models_path / f"mmproj-{base_name}.gguf",
             ]
             for p_clip in potential_paths:
-                if p_clip.exists():
-                    final_clip_model_path = p_clip
-                    ASCIIColors.info(f"Auto-detected LLaVA clip model: {final_clip_model_path}")
-                    break
+                if p_clip.exists(): final_clip_model_path = p_clip; break
         
-        final_clip_model_path_str = str(final_clip_model_path) if final_clip_model_path else None
+        final_clip_model_path_str = str(final_clip_model_path) if final_clip_model_path else "None"
+        new_server_key = f"{resolved_model_path}|{final_clip_model_path_str}"
+
+        if self.server_process and self.server_key == new_server_key and self.server_process.is_healthy:
+            ASCIIColors.info(f"Model '{model_name_or_path}' is already loaded. No change.")
+            return True
+
+        if self.server_process and self.server_key != new_server_key:
+            self._release_server_instance()
         
-        # Server key based on model and essential server configurations (like clip model)
-        new_server_key = (str(resolved_model_path), final_clip_model_path_str)
-
-        with _server_registry_lock:
-            # If this binding instance is already using the exact same server, do nothing
-            if self.server_process and self.server_key == new_server_key and self.server_process.is_healthy:
-                ASCIIColors.info(f"Model '{model_name_or_path}' with clip '{final_clip_model_path_str}' is already loaded and server is healthy on port {self.port}. No change.")
-                return True
-
-            # If this binding was using a *different* server, release it first
-            if self.server_process and self.server_key != new_server_key:
-                ASCIIColors.info(f"Switching models. Releasing previous server: {self.server_key}")
-                self._release_server_instance() # This clears self.server_process, self.port, self.server_key
-
-            # Check if a suitable server already exists in the global registry
-            if new_server_key in _active_servers:
-                existing_server = _active_servers[new_server_key]
-                if existing_server.is_healthy:
-                    ASCIIColors.info(f"Reusing existing healthy server for {new_server_key} on port {existing_server.port}.")
-                    self.server_process = existing_server
-                    self.port = existing_server.port
-                    _server_ref_counts[new_server_key] += 1
-                    self.current_model_path = resolved_model_path
-                    self.clip_model_path = final_clip_model_path # Update binding's clip path
-                    self.server_key = new_server_key
-                    return True
-                else: # Found existing but unhealthy server
-                    ASCIIColors.warning(f"Found unhealthy server for {new_server_key}. Attempting to remove and restart.")
-                    try: existing_server.shutdown()
-                    except Exception as e: ASCIIColors.error(f"Error shutting down unhealthy server {new_server_key}: {e}")
-                    _active_servers.pop(new_server_key, None)
-                    _server_ref_counts.pop(new_server_key, None)
-            
-            # No suitable server found or existing was unhealthy: start a new one
-            ASCIIColors.info(f"Starting new server for {new_server_key}.")
-            self.current_model_path = resolved_model_path
-            self.clip_model_path = final_clip_model_path # Update binding's clip path for the new server
-            self.server_key = new_server_key # Set before potential failure to allow cleanup by _release_server_instance
-
-            new_port_for_server = self._find_available_port()
-            
-            current_server_args_for_new_server = self.server_args.copy()
-            # Ensure parallel_slots is set; it's crucial for shared servers
-            if "parallel_slots" not in current_server_args_for_new_server or not isinstance(current_server_args_for_new_server["parallel_slots"], int) or current_server_args_for_new_server["parallel_slots"] <=0:
-                current_server_args_for_new_server["parallel_slots"] = self.DEFAULT_SERVER_ARGS["parallel_slots"]
-            
-            ASCIIColors.info(f"New Llama.cpp server: model={self.current_model_path}, clip={self.clip_model_path}, port={new_port_for_server}, slots={current_server_args_for_new_server['parallel_slots']}")
-
+        # Check registry for an existing server
+        existing_server_info = self.registry.get_server(new_server_key)
+        if existing_server_info:
+            ASCIIColors.info(f"Found existing server for {new_server_key} in registry (PID: {existing_server_info['pid']}, Port: {existing_server_info['port']}). Attaching...")
             try:
-                new_server = LlamaCppServerProcess(
-                    model_path=str(self.current_model_path),
-                    clip_model_path=str(self.clip_model_path) if self.clip_model_path else None,
-                    server_binary_path=str(self.server_binary_path),
-                    server_args=current_server_args_for_new_server,
+                self.server_process = LlamaCppServerProcess(
+                    model_path=resolved_model_path, clip_model_path=final_clip_model_path,
+                    process_pid=existing_server_info['pid'], port=existing_server_info['port'],
+                    server_args=self.server_args
                 )
-                new_server.start(port_to_use=new_port_for_server) # Actual server start
-
-                if new_server.is_healthy:
-                    self.server_process = new_server
-                    self.port = new_port_for_server
-                    _active_servers[self.server_key] = new_server
-                    _server_ref_counts[self.server_key] = 1
-                    ASCIIColors.green(f"New server {self.server_key} started on port {self.port}.")
-                    return True
-                else: # Should have been caught by new_server.start() raising an error
-                    ASCIIColors.error(f"New server {self.server_key} failed to become healthy (this state should be rare).")
-                    self._release_server_instance() # Clean up registry if something went very wrong
-                    return False
+                self.server_process.attach() # This verifies health
+                self.port = self.server_process.port
+                self.current_model_path = resolved_model_path
+                self.clip_model_path = final_clip_model_path
+                self.server_key = new_server_key
+                self.registry.increment_ref_count(new_server_key)
+                return True
             except Exception as e:
-                ASCIIColors.error(f"Failed to load model '{model_name_or_path}' and start server: {e}")
-                trace_exception(e)
-                self._release_server_instance() # Ensure cleanup if start failed
+                ASCIIColors.error(f"Failed to attach to existing server: {e}. It might be stale. Will attempt to start a new one.")
+                self.registry.decrement_ref_count(new_server_key) # Clean up failed attach
+        
+        # Start a new server
+        ASCIIColors.info(f"No existing server found for {new_server_key}. Starting a new one.")
+        self.current_model_path = resolved_model_path
+        self.clip_model_path = final_clip_model_path
+        self.server_key = new_server_key
+
+        try:
+            new_port = self._find_available_port()
+            current_server_args = self.server_args.copy()
+            if "parallel_slots" not in current_server_args or current_server_args["parallel_slots"] <=0:
+                current_server_args["parallel_slots"] = self.DEFAULT_SERVER_ARGS["parallel_slots"]
+
+            new_server = LlamaCppServerProcess(
+                model_path=self.current_model_path, clip_model_path=self.clip_model_path,
+                server_binary_path=self.server_binary_path, server_args=current_server_args
+            )
+            new_server.start(port_to_use=new_port)
+
+            if new_server.is_healthy:
+                self.server_process = new_server
+                self.port = new_port
+                self.registry.register_new_server(self.server_key, new_server.pid, new_port)
+                ASCIIColors.green(f"New server {self.server_key} started and registered.")
+                return True
+            else:
                 return False
+        except Exception as e:
+            ASCIIColors.error(f"Failed to start new server for '{model_name_or_path}': {e}"); trace_exception(e)
+            self._release_server_instance()
+            return False
 
     def unload_model(self):
         if self.server_process:
-            ASCIIColors.info(f"Unloading model for binding. Current server: {self.server_key}, port: {self.port}")
-            self._release_server_instance() # Handles ref counting and actual shutdown if needed
+            self._release_server_instance()
         else:
-            ASCIIColors.info("Unload_model called, but no server process was active for this binding instance.")
+            ASCIIColors.info("Unload called, but no server was active for this binding instance.")
 
     def _ensure_server_is_running(self) -> bool:
         """
@@ -522,21 +624,18 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         ASCIIColors.info("Server is not running. Attempting to start on-demand...")
         
-        # Determine which model to load
         model_to_load = self.user_provided_model_name or self.initial_model_name_preference
         
         if not model_to_load:
-            # No model specified, try to find one automatically
             self._scan_models()
             available_models = self.listModels()
             if not available_models:
                 ASCIIColors.error("No model specified and no GGUF models found in models path.")
                 return False
             
-            model_to_load = available_models[0]['name'] # Pick the first one
+            model_to_load = available_models[0]['name']
             ASCIIColors.info(f"No model was specified. Automatically selecting the first available model: '{model_to_load}'")
 
-        # Now, attempt to load the selected model
         if self.load_model(model_to_load):
             return True
         else:
@@ -544,7 +643,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             return False
 
     def _get_request_url(self, endpoint: str) -> str:
-        # This function now assumes _ensure_server_is_running has been called.
         return f"{self.server_process.base_url}{endpoint}"
 
     def _prepare_generation_payload(self, prompt: str, system_prompt: str = "", n_predict: Optional[int] = None,
@@ -552,10 +650,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                                    repeat_penalty: float = 1.1, repeat_last_n: Optional[int] = 64,
                                    seed: Optional[int] = None, stream: bool = False, use_chat_format: bool = True,
                                    images: Optional[List[str]] = None,
-                                    split:Optional[bool]=False, # put to true if the prompt is a discussion
-                                    user_keyword:Optional[str]="!@>user:",
-                                    ai_keyword:Optional[str]="!@>assistant:", 
-                                   
+                                   stop_sequences: Optional[List[str]] = None,
+                                   split:Optional[bool]=False,
+                                   user_keyword:Optional[str]="!@>user:",
+                                   ai_keyword:Optional[str]="!@>assistant:", 
                                    **extra_params) -> Dict:
         payload_params = {
             "temperature": self.server_args.get("temperature", 0.7), "top_k": self.server_args.get("top_k", 40),
@@ -569,6 +667,15 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         payload_params.update({"temperature": temperature, "top_k": top_k, "top_p": top_p, "repeat_penalty": repeat_penalty, "repeat_last_n": repeat_last_n})
         if n_predict is not None: payload_params['n_predict'] = n_predict
         if seed is not None: payload_params['seed'] = seed
+
+        # --- Handle stop sequences ---
+        all_stop_sequences = set(self.server_args.get("stop_sequences", []))
+        if stop_sequences:
+            all_stop_sequences.update(stop_sequences)
+        if all_stop_sequences:
+            payload_params['stop'] = list(all_stop_sequences)
+        # --- End stop sequences ---
+
         payload_params = {k: v for k, v in payload_params.items() if v is not None}
         payload_params.update(extra_params)
 
@@ -580,7 +687,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 messages += self.split_discussion(user_content,user_keyword=user_keyword, ai_keyword=ai_keyword)
             else:
                 messages.append({"role": "user", "content": user_content})
-            if images and self.clip_model_path: # Use the binding's current clip_model_path
+            if images and self.clip_model_path:
                 image_parts = []
                 for img_path in images:
                     try:
@@ -595,7 +702,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         else:
             full_prompt = f"{system_prompt}\n\nUSER: {prompt}\nASSISTANT:" if system_prompt and system_prompt.strip() else prompt
             final_payload = {"prompt": full_prompt, "stream": stream, **payload_params}
-            if images and self.clip_model_path: # Use binding's clip_model_path
+            if images and self.clip_model_path:
                 image_data_list = []
                 for i, img_path in enumerate(images):
                     try:
@@ -621,6 +728,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                      n_threads: Optional[int] = None,
                      ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     stop_sequences: Optional[List[str]] = None,
                      split:Optional[bool]=False,
                      user_keyword:Optional[str]="!@>user:",
                      ai_keyword:Optional[str]="!@>assistant:", 
@@ -640,6 +748,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             repeat_last_n=repeat_last_n if repeat_last_n is not None else self.server_args.get("repeat_last_n",64),
             seed=seed if seed is not None else self.server_args.get("seed", -1), stream=stream,
             use_chat_format=_use_chat_format, images=images,
+            stop_sequences=stop_sequences,
             split= split, user_keyword=user_keyword, ai_keyword=ai_keyword, **generation_kwargs
         )
         endpoint = "/v1/chat/completions" if _use_chat_format else "/completion"
@@ -669,7 +778,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             else:
                 response_data = response.json()
                 return response_data.get('choices', [{}])[0].get('message', {}).get('content', '') if _use_chat_format \
-                       else response_data.get('content','') # /completion has 'content' at top level for non-stream
+                       else response_data.get('content','')
         except requests.exceptions.RequestException as e:
             error_message = f"Llama.cpp server request error: {e}"
             if e.response is not None:
@@ -695,6 +804,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
              n_threads: Optional[int] = None,
              ctx_size: Optional[int] = None,
              streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+             stop_sequences: Optional[List[str]] = None,
              **generation_kwargs
              ) -> Union[str, dict]:
 
@@ -707,6 +817,13 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             "top_k": top_k, "top_p": top_p, "repeat_penalty": repeat_penalty,
             "seed": seed, "stream": stream, **generation_kwargs
         }
+        
+        all_stop_sequences = set(self.server_args.get("stop_sequences", []))
+        if stop_sequences:
+            all_stop_sequences.update(stop_sequences)
+        if all_stop_sequences:
+            payload['stop'] = list(all_stop_sequences)
+
         payload = {k: v for k, v in payload.items() if v is not None}
         
         endpoint = "/v1/chat/completions"
@@ -738,7 +855,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                         ASCIIColors.warning(f"Failed to decode JSON stream chunk: {line_str}")
                         continue
                 return full_response_text
-            else: # Not streaming
+            else:
                 response_data = response.json()
                 return response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
 
@@ -797,7 +914,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             return []
         
     def get_model_info(self) -> dict:
-        # This method reports the current state without triggering a server start
         is_loaded = self.server_process is not None and self.server_process.is_healthy
         info = {
             "name": self.binding_name,
@@ -896,7 +1012,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         return None
 
 if __name__ == '__main__':
-    global full_streamed_text
+    # NOTE: This test block is designed for a single-process scenario to verify basic functionality.
+    # Testing the multi-process capabilities requires a separate script that launches multiple
+    # instances of a test program using this binding. The logic here, however, will now use the
+    # new file-based registry system.
     full_streamed_text = ""
     ASCIIColors.yellow("Testing LlamaCppServerBinding...")
 
@@ -920,6 +1039,7 @@ if __name__ == '__main__':
     binding_config = {
         "n_gpu_layers": 0, "n_ctx": 512, "embedding": True,
         "verbose": False, "server_startup_timeout": 180, "parallel_slots": 2,
+        "stop_sequences": ["<|user|>", "\nUSER:"], # Example default stop sequences
     }
 
     active_binding1: Optional[LlamaCppServerBinding] = None
@@ -936,12 +1056,18 @@ if __name__ == '__main__':
             ASCIIColors.info(f"Initial model info: {json.dumps(active_binding1.get_model_info(), indent=2)}")
 
             prompt_text = "What is the capital of France?"
-            generated_text = active_binding1.generate_text(prompt_text, system_prompt="Concise expert.", n_predict=20, stream=False)
+            generated_text = active_binding1.generate_text(
+                prompt_text, 
+                system_prompt="Concise expert.", 
+                n_predict=20, 
+                stream=False,
+                stop_sequences=["Paris"] # Test per-call stop sequence
+            )
             
-            if isinstance(generated_text, str) and "Paris" in generated_text:
-                ASCIIColors.green(f"SUCCESS: Auto-start generation successful. Response: {generated_text}")
+            if isinstance(generated_text, str) and "Paris" not in generated_text: # Should stop *before* generating Paris
+                ASCIIColors.green(f"SUCCESS: Auto-start generation with stop sequence successful. Response: '{generated_text}'")
             else:
-                ASCIIColors.error(f"FAILURE: Auto-start generation failed. Response: {generated_text}")
+                ASCIIColors.error(f"FAILURE: Auto-start generation failed or stop sequence ignored. Response: {generated_text}")
 
             ASCIIColors.info(f"Model info after auto-start: {json.dumps(active_binding1.get_model_info(), indent=2)}")
             if not active_binding1.server_process or not active_binding1.server_process.is_healthy:
@@ -952,7 +1078,6 @@ if __name__ == '__main__':
             active_binding2 = LlamaCppServerBinding(
                 model_name=model_name_str, models_path=str(models_path), config=binding_config
             )
-            # This call should reuse the server from binding1
             generated_text_b2 = active_binding2.generate_text("Ping", n_predict=5, stream=False)
             if isinstance(generated_text_b2, str):
                 ASCIIColors.green(f"SUCCESS: Binding2 generation successful. Response: {generated_text_b2}")
@@ -969,14 +1094,6 @@ if __name__ == '__main__':
             active_binding1.unload_model()
             ASCIIColors.info("Binding1 unloaded. Ref count should be 1, server still up for binding2.")
             
-            # The server should still be up because binding2 holds a reference
-            with _server_registry_lock:
-                if not _active_servers:
-                    ASCIIColors.error("FAILURE: Server shut down prematurely while still referenced by binding2.")
-                else:
-                    ASCIIColors.green("SUCCESS: Server correctly remained active for binding2.")
-
-            # This call should re-acquire a reference to the same server for binding1
             generated_text_reloaded = active_binding1.generate_text("Test reload", n_predict=5, stream=False)
             if isinstance(generated_text_reloaded, str):
                  ASCIIColors.green(f"SUCCESS: Generation after reload successful. Response: {generated_text_reloaded}")
@@ -1014,17 +1131,18 @@ if __name__ == '__main__':
         ASCIIColors.cyan("\n--- Unloading Models and Stopping Servers ---")
         if active_binding1: active_binding1.unload_model(); ASCIIColors.info("Binding1 unloaded.")
         if active_binding2: active_binding2.unload_model(); ASCIIColors.info("Binding2 unloaded.")
+        # Any other bindings will be cleaned up by __del__ on exit
         
-        with _server_registry_lock:
-            if _active_servers:
-                ASCIIColors.warning(f"Warning: {_active_servers.keys()} servers still in registry after tests.")
-                for key, server_proc in list(_active_servers.items()):
-                    ASCIIColors.info(f"Force shutting down stray server: {key}")
-                    try: server_proc.shutdown()
-                    except Exception as e_shutdown: ASCIIColors.error(f"Error shutting down stray server {key}: {e_shutdown}")
-                    _active_servers.pop(key, None)
-                    _server_ref_counts.pop(key, None)
+        registry = ServerRegistry()
+        with FileLock(registry.lock_file):
+            final_state = registry._read_registry()
+            if not final_state or not any(c for s in final_state.values() for c in s.get('client_pids',[])):
+                ASCIIColors.green("All servers shut down correctly and registry is empty or has no clients.")
+                if final_state: registry._write_registry({}) # Clean up for next run
             else:
-                ASCIIColors.green("All servers shut down correctly.")
+                ASCIIColors.warning(f"Warning: Registry is not empty after tests: {final_state}")
+                registry._clean_stale_entries(final_state)
+                registry._write_registry(final_state)
+                ASCIIColors.info("Forced a final registry cleanup.")
 
     ASCIIColors.yellow("\nLlamaCppServerBinding test finished.")

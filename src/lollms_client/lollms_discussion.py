@@ -1944,7 +1944,7 @@ class LollmsDiscussion:
                 "required": ["title"],
                 "description": "JSON object as title of the discussion."
             }
-            infos = self.lollmsClient.generate_structured_content(prompt = prompt, system_prompt=system_prompt, schema = title_generation_schema)
+            infos = self.lollmsClient.generate_structured_content(prompt = prompt, system_prompt=system_prompt, schema = title_generation_schema, n_predict=512)
             if infos is None or "title" not in infos:
                 raise ValueError("Title generation failed or returned invalid data.")
             discussion_title = infos["title"]
@@ -1995,7 +1995,7 @@ class LollmsDiscussion:
           (a list of base64 strings), it converts it to the new format (a list
           of dictionaries) and marks the discussion for saving.
         """
-        if not self.images:
+        if not self.images or len(self.images) == 0:
             return []
 
         # Check if migration is needed (if the first element is a string).
