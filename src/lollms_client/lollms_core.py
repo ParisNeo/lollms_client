@@ -1501,6 +1501,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             return {"final_answer": "", "tool_calls": [], "sources": [], "error": "LLM binding not initialized."}
         if max_reasoning_steps is None:
             max_reasoning_steps=15
+        if rag_min_similarity_percent is None:
+            rag_min_similarity_percent=50.0
+        if final_answer_temperature is None:
+            final_answer_temperature=0.7
+        if rag_top_k is None:
+            rag_top_k=5
 
         def log_event(desc, event_type=MSG_TYPE.MSG_TYPE_CHUNK, meta=None, event_id=None) -> Optional[str]:
             if not streaming_callback: return None
