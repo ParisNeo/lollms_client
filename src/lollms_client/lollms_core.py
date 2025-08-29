@@ -1736,7 +1736,7 @@ Output only: {{"tool_params": {{...}}}}"""
                     if tool_name in rag_registry:
                         query = hydrated_params.get("query", "")
                         top_k, min_sim = rag_tool_specs[tool_name]["default_top_k"], rag_tool_specs[tool_name]["default_min_sim"]
-                        raw_results = rag_registry[tool_name](query=query, top_k=top_k)
+                        raw_results = rag_registry[tool_name](query=query, rag_top_k=top_k)
                         raw_iter = raw_results["results"] if isinstance(raw_results, dict) and "results" in raw_results else raw_results
                         docs = [{"text": d.get("text", str(d)), "score": d.get("score", 0)*100, "metadata": d.get("metadata", {})} for d in raw_iter or []]
                         kept = [x for x in docs if x['score'] >= min_sim]
