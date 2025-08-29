@@ -1,0 +1,1 @@
+Create an extract structured data that uses pydentic validators
