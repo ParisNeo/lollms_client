@@ -9,7 +9,7 @@ lc = LollmsClient(llm_binding_name="lollms", llm_binding_config={
 def cb(chunk, type):
     if type == MSG_TYPE.MSG_TYPE_CHUNK:
         print(chunk,end="",flush=True)
-    
+    return True
 response = lc.generate_text(prompt="!@>user: Hi there\n!@>assistant: Hi there, how can I help you?!@>user: what is 1+1?\n!@>assistant: ", stream=True, temperature=0.5, streaming_callback=cb, split=True)
 print()
 print(response)
