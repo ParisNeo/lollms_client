@@ -214,6 +214,60 @@ class LollmsDataManager:
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         self.create_and_migrate_tables()
 
+    @staticmethod
+    def new_message(**kwargs) -> 'SimpleNamespace':
+        """A static factory method to create a new message data object.
+
+        This is a convenience method for building message objects to be passed
+        to LollmsDiscussion.from_messages. It returns a SimpleNamespace that
+        mimics the structure of an ORM message object for in-memory use.
+
+        Args:
+            **kwargs: Attributes for the new message (e.g., sender, content, sender_type).
+
+        Returns:
+            A SimpleNamespace object representing the message data.
+        """
+        # Set default sender based on sender_type if not provided
+        if 'sender' not in kwargs:
+            if kwargs.get('sender_type') == 'user':
+                kwargs['sender'] = 'user'
+            else:
+                kwargs['sender'] = 'assistant'
+        
+        # Ensure default sender_type if not provided
+        if 'sender_type' not in kwargs:
+            if kwargs.get('sender') == 'user':
+                kwargs['sender_type'] = 'user'
+            else:
+                kwargs['sender_type'] = 'assistant'
+
+        # Default values for a new message
+        message_data = {
+            'id': str(uuid.uuid4()),
+            'parent_id': None,  # Will be set by from_messages
+            'discussion_id': None, # Will be set by from_messages
+            'created_at': datetime.utcnow(),
+            'raw_content': kwargs.get('content'),
+            'thoughts': None,
+            'scratchpad': None,
+            'tokens': None,
+            'binding_name': None,
+            'model_name': None,
+            'generation_speed': None,
+            'message_metadata': {},
+            'images': [],
+            'active_images': [],
+        }
+        
+        # Override defaults with user-provided kwargs
+        message_data.update(kwargs)
+        
+        # Handle metadata alias
+        if 'metadata' in message_data:
+            message_data['message_metadata'] = message_data.pop('metadata')
+
+        return SimpleNamespace(**message_data)
     def create_and_migrate_tables(self):
         """Creates all tables if they don't exist and performs simple schema migrations."""
         self.Base.metadata.create_all(bind=self.engine)
@@ -515,6 +569,58 @@ class LollmsDiscussion:
         # Trigger potential migration on load to ensure data is consistent from the start.
         self.get_discussion_images()
 
+
+    @classmethod
+    def from_messages(
+        cls,
+        messages: List[Any],
+        lollms_client: 'LollmsClient',
+        db_manager: Optional[LollmsDataManager] = None,
+        **kwargs
+    ) -> 'LollmsDiscussion':
+        """Creates a new discussion instance directly from a list of message objects.
+
+        This factory is useful for creating temporary or programmatic discussions
+        without manually adding each message. Messages are chained sequentially.
+
+        Args:
+            messages: A list of message-like objects (e.g., SimpleNamespace from
+                      LollmsMessage.new_message).
+            lollms_client: The LollmsClient instance for the discussion.
+            db_manager: An optional LollmsDataManager to make the discussion persistent.
+            **kwargs: Additional arguments for the new discussion (e.g., system_prompt).
+
+        Returns:
+            A new LollmsDiscussion instance populated with the provided messages.
+        """
+        # Create a new, empty discussion
+        discussion = cls.create_new(
+            lollms_client=lollms_client,
+            db_manager=db_manager,
+            **kwargs
+        )
+
+        last_message_id = None
+        for msg_data in messages:
+            # Convert the message-like object to a dict for add_message
+            if isinstance(msg_data, SimpleNamespace):
+                msg_kwargs = msg_data.__dict__.copy()
+            elif isinstance(msg_data, dict):
+                msg_kwargs = msg_data.copy()
+            else:
+                raise TypeError("message objects must be of type dict or SimpleNamespace")
+
+            # Set the parent to the previous message in the list
+            msg_kwargs['parent_id'] = last_message_id
+            
+            # Add the message and update the last_message_id for the next iteration
+            new_msg = discussion.add_message(**msg_kwargs)
+            last_message_id = new_msg.id
+            
+        # The active_branch_id is already set to the last message by add_message,
+        # so no further action is needed.
+        
+        return discussion
 
     @classmethod
     def create_new(cls, lollms_client: 'LollmsClient', db_manager: Optional[LollmsDataManager] = None, **kwargs) -> 'LollmsDiscussion':
