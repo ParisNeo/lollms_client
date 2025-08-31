@@ -1,0 +1,38 @@
+title: 'XTTS v2'
+author: 'ParisNeo & TTS Community'
+version: 1.0.0
+binding_name: 'xtts'
+
+description: |
+  This binding integrates the powerful XTTSv2 model from the community-maintained
+  TTS library. It excels at zero-shot voice cloning, allowing it to mimic any
+  voice from a short (6-15 second) high-quality audio sample.
+
+  The core function `generate_audio` requires a path to a reference WAV file
+  to be passed in the `voice` parameter.
+
+input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "tts_models/multilingual/multi-dataset/xtts_v2"
+    description: "The Hugging Face model ID for the XTTS model to use."
+  - name: "device"
+    type: "str"
+    default: "auto"
+    description: "Device to run the model on ('cuda', 'cpu', 'auto'). 'auto' will detect GPU if available."
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The text to synthesize."
+  - name: "voice"
+    type: "str"
+    description: "Mandatory. The file path to the reference WAV audio file for voice cloning."
+  - name: "language"
+    type: "str"
+    default: "en"
+    description: "The two-letter language code for the text (e.g., 'en', 'fr', 'es')."
+  - name: "split_sentences"
+    type: "bool"
+    default: true
+    description: "Whether to split the text into sentences for better stability with long inputs."

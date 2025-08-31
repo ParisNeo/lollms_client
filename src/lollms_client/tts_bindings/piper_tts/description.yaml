@@ -1,0 +1,30 @@
+title: 'Piper TTS'
+author: 'ParisNeo & Mycroft AI'
+version: 1.0.0
+binding_name: 'piper'
+
+description: |
+  This binding integrates the fast, local, and high-quality Piper TTS engine.
+  It requires the `piper-tts` library to be installed (or the executable to be
+  in the system's PATH).
+
+  Piper uses a set of pre-trained voice models that need to be downloaded locally.
+  The `list_voices` method returns a list of available voice keys.
+
+input_parameters:
+  - name: "piper_executable_path"
+    type: "str"
+    default: "piper"
+    description: "The path to the piper executable. Defaults to 'piper', assuming it's in the system's PATH."
+  - name: "models_path"
+    type: "str"
+    default: ""
+    description: "Optional. Path to a directory where piper models (.onnx and .json) are stored."
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The text to synthesize."
+  - name: "voice"
+    type: "str"
+    description: "The key of the voice model to use (e.g., 'en_US-lessac-medium'). If None, a default en_US voice is used."

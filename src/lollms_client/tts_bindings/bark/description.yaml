@@ -1,0 +1,33 @@
+title: 'Bark TTS'
+author: 'ParisNeo & Suno AI'
+version: '1.0.0'
+binding_name: 'bark'
+
+description: |
+  This binding integrates Suno AI's Bark model, a powerful and creative
+  generative audio model. Unlike traditional TTS, Bark can generate highly
+  expressive speech, music, and non-speech sounds like laughter or sighs.
+
+  Instead of voice cloning, Bark uses a selection of pre-defined "voice presets"
+  that can be listed and chosen.
+
+  You can embed non-speech sounds in the text, for example:
+  "Hello, my name is Suno, and I like to [laughter] laugh."
+
+input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "suno/bark"
+    description: "The Hugging Face model ID for the Bark model (e.g., 'suno/bark' or 'suno/bark-small')."
+  - name: "device"
+    type: "str"
+    default: "auto"
+    description: "Device to run the model on ('cuda', 'cpu', 'auto'). 'auto' will detect GPU if available."
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The text to synthesize. Can include sounds like [laughter]."
+  - name: "voice"
+    type: "str"
+    description: "The preset speaker ID to use (e.g., 'v2/en_speaker_6'). If None, a default English voice is used."```

@@ -1,5 +1,5 @@
 title: 'Diffusers TTI'
-author: 'LoLLMS Team'
+author: 'ParisNeo'
 version: 1.0.1
 binding_name: 'diffusers'
 supported_file_types: []
@@ -67,6 +67,12 @@ input_parameters:
     default: ""
     description: "Optional negative prompt to avoid unwanted features."
 
+  - name: "size"
+    type: "str"
+    default: "512x512"
+    description: "Image size in WxH format. E.g., '512x512', '1024x1024'."
+
+    
 generate_image_parameters:
   - name: "prompt"
     type: "str"

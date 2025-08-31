@@ -1,0 +1,15 @@
+# TTS avec torch compatible CUDA 11.8
+coqui-tts
+# TTS avec torch compatible CUDA 11.8
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+torchaudio==2.0.2+cu118
+
+# Extra index pour CUDA wheels
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# Serveur FastAPI
+fastapi==0.116.1
+uvicorn==0.35.0
+python-multipart==0.0.20
+

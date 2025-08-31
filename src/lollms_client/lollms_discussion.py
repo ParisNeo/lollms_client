@@ -1995,7 +1995,7 @@ class LollmsDiscussion:
           (a list of base64 strings), it converts it to the new format (a list
           of dictionaries) and marks the discussion for saving.
         """
-        if not self.images or len(self.images) == 0:
+        if not self.images or len(self.images) == 0 or type(self.images) is not list:
             return []
 
         # Check if migration is needed (if the first element is a string).

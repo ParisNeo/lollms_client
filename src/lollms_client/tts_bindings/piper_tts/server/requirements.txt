@@ -1,0 +1,17 @@
+# File: lollms_client/tts_bindings/piper/server/requirements.txt
+# Piper TTS
+piper-tts>=1.2.0
+
+# Audio processing
+soundfile>=0.12.1
+numpy>=1.21.0
+
+# Web server
+fastapi>=0.68.0
+uvicorn[standard]>=0.15.0
+pydantic>=1.8.0
+
+# HTTP client for downloading models
+requests>=2.25.0
+aiohttp>=3.8.0
+aiofiles>=0.7.0
