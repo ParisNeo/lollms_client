@@ -3076,7 +3076,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         Returns:
             str: The final, comprehensive summary of the text.
         """
-        if not text_to_process and len(kwargs.get("images",[]))==0:
+        if not text_to_process and len(kwargs.get("images",[]))==0 and contextual_prompt is None:
             return ""
         if not text_to_process:
             text_to_process=""
