@@ -1474,6 +1474,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 # Clean up the technical tool name for a more readable display
                 clean_name = tool_name.replace("_", " ").replace("::", " - ").title()
                 return f"🔧 Using the {clean_name} tool"
+            
     def generate_with_mcp_rag(
             self,
             prompt: str,
@@ -1494,6 +1495,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             debug: bool = False,
             enable_parallel_execution: bool = True,
             enable_self_reflection: bool = True,
+            max_scratchpad_size: int = 20000,
             **llm_generation_kwargs
         ) -> Dict[str, Any]:
         
@@ -1525,13 +1527,23 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             ASCIIColors.red(f"Prompt size:{prompt_size}/{self.llm.default_ctx_size}")
             ASCIIColors.cyan(f"** DEBUG: DONE **")
 
-        discovery_step_id = log_event("🔧 Setting up capabilities...", MSG_TYPE.MSG_TYPE_STEP_START)
+        # Enhanced discovery phase with more detailed logging
+        discovery_step_id = log_event("🔧 Discovering and configuring available capabilities...", MSG_TYPE.MSG_TYPE_STEP_START)
         all_discovered_tools, visible_tools, rag_registry, rag_tool_specs = [], [], {}, {}
+        
         if use_mcps and hasattr(self, 'mcp'):
+            log_event("  📡 Connecting to MCP services...", MSG_TYPE.MSG_TYPE_INFO)
             mcp_tools = self.mcp.discover_tools(force_refresh=True)
-            if isinstance(use_mcps, list): all_discovered_tools.extend([t for t in mcp_tools if t["name"] in use_mcps])
-            elif use_mcps is True: all_discovered_tools.extend(mcp_tools)
+            if isinstance(use_mcps, list): 
+                filtered_tools = [t for t in mcp_tools if t["name"] in use_mcps]
+                all_discovered_tools.extend(filtered_tools)
+                log_event(f"  ✅ Loaded {len(filtered_tools)} specific MCP tools: {', '.join(use_mcps)}", MSG_TYPE.MSG_TYPE_INFO)
+            elif use_mcps is True: 
+                all_discovered_tools.extend(mcp_tools)
+                log_event(f"  ✅ Loaded {len(mcp_tools)} MCP tools", MSG_TYPE.MSG_TYPE_INFO)
+        
         if use_data_store:
+            log_event(f"  📚 Setting up {len(use_data_store)} knowledge bases...", MSG_TYPE.MSG_TYPE_INFO)
             for name, info in use_data_store.items():
                 tool_name, description, call_fn = f"research::{name}", f"Queries the '{name}' knowledge base.", None
                 if callable(info): call_fn = info
@@ -1542,75 +1554,138 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                     visible_tools.append({"name": tool_name, "description": description, "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}})
                     rag_registry[tool_name] = call_fn
                     rag_tool_specs[tool_name] = {"default_top_k": rag_top_k, "default_min_sim": rag_min_similarity_percent}
+                    log_event(f"    📖 Ready: {name}", MSG_TYPE.MSG_TYPE_INFO)
+        
         visible_tools.extend(all_discovered_tools)
-        built_in_tools = [{"name": "local_tools::final_answer", "description": "Provide the final answer directly to the user.", "input_schema": {}}]
-        if getattr(self, "tti", None): built_in_tools.append({"name": "local_tools::generate_image", "description": "Generate an image from a text description.", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}})
+        built_in_tools = [
+            {"name": "local_tools::final_answer", "description": "Provide the final answer directly to the user.", "input_schema": {}},
+            {"name": "local_tools::request_clarification", "description": "Ask the user for more specific information when the request is ambiguous.", "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}},
+            {"name": "local_tools::revise_plan", "description": "Update the execution plan based on new discoveries or changing requirements.", "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}, "new_plan": {"type": "array"}}, "required": ["reason", "new_plan"]}}
+        ]
+        if getattr(self, "tti", None): 
+            built_in_tools.append({"name": "local_tools::generate_image", "description": "Generate an image from a text description.", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}})
+        
         all_visible_tools = visible_tools + built_in_tools
-        tool_summary = "\n".join([f"- {t['name']}: {t['description']}" for t in all_visible_tools[:15]])
-        log_event(f"✅ Ready with {len(all_visible_tools)} capabilities", MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id)
+        tool_summary = "\n".join([f"- **{t['name']}**: {t['description']}" for t in all_visible_tools[:20]])
+        
+        log_event(f"✅ Ready with {len(all_visible_tools)} total capabilities", MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id, meta={"tool_count": len(all_visible_tools), "mcp_tools": len(all_discovered_tools), "rag_tools": len(rag_registry)})
 
-        triage_step_id = log_event("🤔 Analyzing the best approach...", MSG_TYPE.MSG_TYPE_STEP_START)
+        # Enhanced triage with better prompting
+        triage_step_id = log_event("🤔 Analyzing request complexity and optimal approach...", MSG_TYPE.MSG_TYPE_STEP_START)
         strategy = "COMPLEX_PLAN"
         strategy_data = {}
         try:
-            triage_prompt = f"""Analyze the user's request and determine the most efficient strategy.
-USER REQUEST: "{prompt}"
-AVAILABLE TOOLS:\n{tool_summary}
-Choose a strategy:
-- "DIRECT_ANSWER": For greetings or simple questions that need no tools.
-- "REQUEST_CLARIFICATION": If the request is ambiguous and you need more information from the user.
-- "SINGLE_TOOL": If the request can be resolved with one tool call.
-- "COMPLEX_PLAN": For multi-step requests requiring multiple tools or complex reasoning.
+            triage_prompt = f"""Analyze this user request to determine the most efficient execution strategy.
 
-Provide your decision as JSON: {{"thought": "...", "strategy": "...", "text_output": "Your direct answer or clarification question.", "required_tool_name": "..."}}"""
+USER REQUEST: "{prompt}"
+CONTEXT: {context or "No additional context provided"}
+IMAGES PROVIDED: {"Yes" if images else "No"}
+
+AVAILABLE CAPABILITIES:
+{tool_summary}
+
+Based on the request complexity and available tools, choose the optimal strategy:
+
+1. **DIRECT_ANSWER**: For simple greetings, basic questions, or requests that don't require any tools
+   - Use when: The request can be fully answered with your existing knowledge
+   - Example: "Hello", "What is Python?", "Explain quantum physics"
+
+2. **REQUEST_CLARIFICATION**: When the request is too vague or ambiguous
+   - Use when: The request lacks essential details needed to proceed
+   - Example: "Help me with my code" (what code? what issue?)
+
+3. **SINGLE_TOOL**: For straightforward requests that need exactly one tool
+   - Use when: The request clearly maps to a single, specific tool operation
+   - Example: "Search for information about X", "Generate an image of Y"
+
+4. **COMPLEX_PLAN**: For multi-step requests requiring coordination of multiple tools
+   - Use when: The request involves multiple steps, data analysis, or complex reasoning
+   - Example: "Research X, then create a report comparing it to Y"
+
+Provide your analysis in JSON format:
+{{"thought": "Detailed reasoning about the request complexity and requirements", "strategy": "ONE_OF_THE_FOUR_OPTIONS", "confidence": 0.8, "text_output": "Direct answer or clarification question if applicable", "required_tool_name": "specific tool name if SINGLE_TOOL strategy", "estimated_steps": 3}}"""
+            
+            log_prompt("Triage Prompt", triage_prompt)
             
             triage_schema = {
-                "thought": "string", "strategy": "string", 
-                "text_output": "string", "required_tool_name": "string"
+                "thought": "string", "strategy": "string", "confidence": "number",
+                "text_output": "string", "required_tool_name": "string", "estimated_steps": "number"
             }
             strategy_data = self.generate_structured_content(prompt=triage_prompt, schema=triage_schema, temperature=0.1, **llm_generation_kwargs)
             strategy = strategy_data.get("strategy") if strategy_data else "COMPLEX_PLAN"
+            
+            log_event(f"Strategy analysis complete", MSG_TYPE.MSG_TYPE_INFO, meta={
+                "strategy": strategy,
+                "confidence": strategy_data.get("confidence", 0.5),
+                "estimated_steps": strategy_data.get("estimated_steps", 1),
+                "reasoning": strategy_data.get("thought", "")
+            })
+            
         except Exception as e:
-            log_event(f"Triage failed, defaulting to complex plan. Error: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=triage_step_id)
+            log_event(f"Triage analysis failed: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=triage_step_id)
+            log_event("Defaulting to complex planning approach", MSG_TYPE.MSG_TYPE_WARNING)
 
         if force_mcp_use and strategy == "DIRECT_ANSWER":
             strategy = "COMPLEX_PLAN"
-        log_event(f"✅ Approach decided: {strategy.replace('_', ' ').title()}", MSG_TYPE.MSG_TYPE_STEP_END, event_id=triage_step_id)
+            log_event("Forcing tool usage - switching to complex planning", MSG_TYPE.MSG_TYPE_INFO)
+            
+        log_event(f"✅ Strategy selected: {strategy.replace('_', ' ').title()}", MSG_TYPE.MSG_TYPE_STEP_END, event_id=triage_step_id, meta={"final_strategy": strategy})
 
+        # Handle simple strategies
         if strategy == "DIRECT_ANSWER":
             final_answer = strategy_data.get("text_output", "I can help with that.")
+            log_event("Providing direct response", MSG_TYPE.MSG_TYPE_INFO)
             if streaming_callback: streaming_callback(final_answer, MSG_TYPE.MSG_TYPE_CONTENT, {})
-            return {"final_answer": final_answer, "tool_calls": [], "sources": [], "error": None, "clarification_required": False, "final_scratchpad": f"Strategy: DIRECT_ANSWER\nThought: {strategy_data.get('thought')}"}
+            return {"final_answer": final_answer, "tool_calls": [], "sources": [], "error": None, "clarification_required": False, "final_scratchpad": f"Strategy: DIRECT_ANSWER\nConfidence: {strategy_data.get('confidence', 0.9)}\nReasoning: {strategy_data.get('thought')}"}
 
         if strategy == "REQUEST_CLARIFICATION":
-            clarification_question = strategy_data.get("text_output", "Could you please provide more details?")
-            return {"final_answer": clarification_question, "tool_calls": [], "sources": [], "error": None, "clarification_required": True, "final_scratchpad": f"Strategy: REQUEST_CLARIFICATION\nThought: {strategy_data.get('thought')}"}
+            clarification_question = strategy_data.get("text_output", "Could you please provide more details about what specifically you'd like me to help with?")
+            log_event("Requesting clarification from user", MSG_TYPE.MSG_TYPE_INFO)
+            return {"final_answer": clarification_question, "tool_calls": [], "sources": [], "error": None, "clarification_required": True, "final_scratchpad": f"Strategy: REQUEST_CLARIFICATION\nConfidence: {strategy_data.get('confidence', 0.8)}\nReasoning: {strategy_data.get('thought')}"}
 
+        # Enhanced single tool execution
         if strategy == "SINGLE_TOOL":
-            synthesis_id = log_event("⚡ Taking a direct approach...", MSG_TYPE.MSG_TYPE_STEP_START)
+            synthesis_id = log_event("⚡ Executing single-tool strategy...", MSG_TYPE.MSG_TYPE_STEP_START)
             try:
                 tool_name = strategy_data.get("required_tool_name")
                 tool_spec = next((t for t in all_visible_tools if t['name'] == tool_name), None)
                 if not tool_spec:
-                    raise ValueError(f"LLM chose an unavailable tool: '{tool_name}'")
+                    raise ValueError(f"Strategy analysis selected unavailable tool: '{tool_name}'")
                 
-                param_prompt = f"""Given the user request, generate the correct parameters for the selected tool.
+                log_event(f"Selected tool: {tool_name}", MSG_TYPE.MSG_TYPE_INFO)
+                
+                # Enhanced parameter generation prompt
+                param_prompt = f"""Generate the optimal parameters for the selected tool to fulfill the user's request.
+
 USER REQUEST: "{prompt}"
 SELECTED TOOL: {json.dumps(tool_spec, indent=2)}
-Output ONLY the JSON for the tool's parameters: {{"tool_params": {{...}}}}"""
+CONTEXT: {context or "None"}
+
+Analyze the user's request carefully and provide the most appropriate parameters.
+If the request has implicit requirements, infer them intelligently.
+
+Output the parameters as JSON: {{"tool_params": {{...}}}}"""
+                
+                log_prompt("Parameter Generation Prompt", param_prompt)
                 param_data = self.generate_structured_content(prompt=param_prompt, schema={"tool_params": "object"}, temperature=0.1, **llm_generation_kwargs)
                 tool_params = param_data.get("tool_params", {}) if param_data else {}
+                
+                log_event(f"Generated parameters: {json.dumps(tool_params)}", MSG_TYPE.MSG_TYPE_INFO)
                 
                 start_time, sources, tool_result = time.time(), [], {}
                 if tool_name in rag_registry:
                     query = tool_params.get("query", prompt)
+                    log_event(f"Searching knowledge base with query: '{query}'", MSG_TYPE.MSG_TYPE_INFO)
                     rag_fn = rag_registry[tool_name]
                     raw_results = rag_fn(query=query, rag_top_k=rag_top_k, rag_min_similarity_percent=rag_min_similarity_percent)
                     docs = [d for d in (raw_results.get("results", []) if isinstance(raw_results, dict) else raw_results or [])]
                     tool_result = {"status": "success", "results": docs}
                     sources = [{"source": tool_name, "metadata": d.get("metadata", {}), "score": d.get("score", 0.0)} for d in docs]
+                    log_event(f"Retrieved {len(docs)} relevant documents", MSG_TYPE.MSG_TYPE_INFO)
                 elif hasattr(self, "mcp") and "local_tools" not in tool_name:
+                    log_event(f"Executing MCP tool: {tool_name}", MSG_TYPE.MSG_TYPE_TOOL_CALL, meta={"tool_name": tool_name, "params": tool_params})
                     tool_result = self.mcp.execute_tool(tool_name, tool_params, lollms_client_instance=self)
+                    log_event(f"Tool execution completed", MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, meta={"result_status": tool_result.get("status", "unknown")})
                 else:
                     tool_result = {"status": "failure", "error": f"Tool '{tool_name}' could not be executed in single-step mode."}
                 
@@ -1621,19 +1696,34 @@ Output ONLY the JSON for the tool's parameters: {{"tool_params": {{...}}}}"""
                 response_time = time.time() - start_time
                 tool_calls_this_turn = [{"name": tool_name, "params": tool_params, "result": tool_result, "response_time": response_time}]
                 
-                synthesis_prompt = f"""The user asked: "{prompt}"
-I used the tool '{tool_name}' and got this result: {json.dumps(tool_result, indent=2)}
-Synthesize a direct, user-friendly final answer."""
+                # Enhanced synthesis prompt
+                synthesis_prompt = f"""Create a comprehensive and user-friendly response based on the tool execution results.
+
+USER REQUEST: "{prompt}"
+TOOL USED: {tool_name}
+TOOL RESULT: {json.dumps(tool_result, indent=2)}
+
+Guidelines for your response:
+1. Be direct and helpful
+2. Synthesize the information clearly
+3. Address the user's specific needs
+4. If the tool provided data, present it in an organized way
+5. If relevant, mention any limitations or additional context
+
+RESPONSE:"""
+                
+                log_event("Synthesizing final response", MSG_TYPE.MSG_TYPE_INFO)
                 final_answer = self.generate_text(prompt=synthesis_prompt, system_prompt=system_prompt, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature, **llm_generation_kwargs)
                 final_answer = self.remove_thinking_blocks(final_answer)
                 
-                log_event("✅ Direct answer ready!", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id)
-                return {"final_answer": final_answer, "tool_calls": tool_calls_this_turn, "sources": sources, "error": None, "clarification_required": False, "final_scratchpad": f"Strategy: SINGLE_TOOL\nTool: {tool_name}\nResult: {json.dumps(tool_result)}"}
+                log_event("✅ Single-tool execution completed successfully", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id)
+                return {"final_answer": final_answer, "tool_calls": tool_calls_this_turn, "sources": sources, "error": None, "clarification_required": False, "final_scratchpad": f"Strategy: SINGLE_TOOL\nTool: {tool_name}\nResult: Success\nResponse Time: {response_time:.2f}s"}
 
             except Exception as e:
-                log_event(f"Direct approach failed: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=synthesis_id)
-                log_event("Escalating to a more detailed plan.", MSG_TYPE.MSG_TYPE_INFO)
+                log_event(f"Single-tool execution failed: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=synthesis_id)
+                log_event("Escalating to complex planning approach", MSG_TYPE.MSG_TYPE_INFO)
 
+        # Execute complex reasoning with enhanced capabilities
         return self._execute_complex_reasoning_loop(
             prompt=prompt, context=context, system_prompt=system_prompt,
             reasoning_system_prompt=reasoning_system_prompt, images=images,
@@ -1641,7 +1731,7 @@ Synthesize a direct, user-friendly final answer."""
             final_answer_temperature=final_answer_temperature, streaming_callback=streaming_callback,
             debug=debug, enable_self_reflection=enable_self_reflection,
             all_visible_tools=all_visible_tools, rag_registry=rag_registry, rag_tool_specs=rag_tool_specs,
-            log_event_fn=log_event, log_prompt_fn=log_prompt,
+            log_event_fn=log_event, log_prompt_fn=log_prompt, max_scratchpad_size=max_scratchpad_size,
             **llm_generation_kwargs
         )
 
@@ -1649,170 +1739,1437 @@ Synthesize a direct, user-friendly final answer."""
         self, prompt, context, system_prompt, reasoning_system_prompt, images,
         max_reasoning_steps, decision_temperature, final_answer_temperature,
         streaming_callback, debug, enable_self_reflection, all_visible_tools,
-        rag_registry, rag_tool_specs, log_event_fn, log_prompt_fn, **llm_generation_kwargs
+        rag_registry, rag_tool_specs, log_event_fn, log_prompt_fn, max_scratchpad_size, **llm_generation_kwargs
     ) -> Dict[str, Any]:
         
         planner, memory_manager, performance_tracker = TaskPlanner(self), MemoryManager(), ToolPerformanceTracker()
         
         def _get_friendly_action_description(tool_name, requires_code, requires_image):
-            if tool_name == "local_tools::final_answer": return "📋 Ready to provide your answer"
-            if tool_name == "local_tools::request_clarification": return "❓ Need to ask for clarification"
-            if tool_name == "local_tools::generate_image": return "🎨 Creating an image for you"
-            if "research::" in tool_name: return f"🔍 Searching {tool_name.split('::')[-1]} for information"
-            if requires_code: return "💻 Working on a coding solution"
-            if requires_image: return "🖼️ Analyzing the provided images"
+            descriptions = {
+                "local_tools::final_answer": "📋 Preparing final answer",
+                "local_tools::request_clarification": "❓ Requesting clarification",
+                "local_tools::generate_image": "🎨 Creating image",
+                "local_tools::revise_plan": "📝 Revising execution plan"
+            }
+            if tool_name in descriptions:
+                return descriptions[tool_name]
+            if "research::" in tool_name: 
+                return f"🔍 Searching {tool_name.split('::')[-1]} knowledge base"
+            if requires_code: 
+                return "💻 Processing code"
+            if requires_image: 
+                return "🖼️ Analyzing images"
             return f"🔧 Using {tool_name.replace('_', ' ').replace('::', ' - ').title()}"
+
+        def _compress_scratchpad_intelligently(scratchpad: str, original_request: str, target_size: int) -> str:
+            """Enhanced scratchpad compression that preserves key decisions and recent context"""
+            if len(scratchpad) <= target_size:
+                return scratchpad
+            
+            log_event_fn("📝 Compressing scratchpad to maintain focus...", MSG_TYPE.MSG_TYPE_INFO)
+            
+            # Extract key components
+            lines = scratchpad.split('\n')
+            plan_section = []
+            decisions = []
+            recent_observations = []
+            
+            current_section = None
+            for i, line in enumerate(lines):
+                if "### Execution Plan" in line or "### Updated Plan" in line:
+                    current_section = "plan"
+                elif "### Step" in line and ("Thought" in line or "Decision" in line):
+                    current_section = "decision"
+                elif "### Step" in line and "Observation" in line:
+                    current_section = "observation"
+                elif line.startswith("###"):
+                    current_section = None
+                
+                if current_section == "plan" and line.strip():
+                    plan_section.append(line)
+                elif current_section == "decision" and line.strip():
+                    decisions.append((i, line))
+                elif current_section == "observation" and line.strip():
+                    recent_observations.append((i, line))
+            
+            # Keep most recent items and important decisions
+            recent_decisions = decisions[-3:] if len(decisions) > 3 else decisions
+            recent_obs = recent_observations[-5:] if len(recent_observations) > 5 else recent_observations
+            
+            compressed_parts = [
+                f"### Original Request\n{original_request}",
+                f"### Current Plan\n" + '\n'.join(plan_section[-10:]),
+                f"### Recent Key Decisions"
+            ]
+            
+            for _, decision in recent_decisions:
+                compressed_parts.append(decision)
+            
+            compressed_parts.append("### Recent Observations")
+            for _, obs in recent_obs:
+                compressed_parts.append(obs)
+            
+            compressed = '\n'.join(compressed_parts)
+            if len(compressed) > target_size:
+                # Final trim if still too long
+                compressed = compressed[:target_size-100] + "\n...[content compressed for focus]"
+            
+            return compressed
 
         original_user_prompt, tool_calls_this_turn, sources_this_turn = prompt, [], []
         asset_store: Dict[str, Dict] = {}
+        decision_history = []  # Track all decisions made
         
-        planning_step_id = log_event_fn("📋 Creating a detailed plan...", MSG_TYPE.MSG_TYPE_STEP_START)
+        # Enhanced planning phase
+        planning_step_id = log_event_fn("📋 Creating adaptive execution plan...", MSG_TYPE.MSG_TYPE_STEP_START)
         execution_plan = planner.decompose_task(original_user_prompt, context or "")
-        log_event_fn(f"✅ Plan ready ({len(execution_plan.tasks)} steps)", MSG_TYPE.MSG_TYPE_STEP_END, event_id=planning_step_id)
+        current_plan_version = 1
         
-        initial_state_parts = [f"### Execution Plan\n- Total tasks: {len(execution_plan.tasks)}"]
-        for i, task in enumerate(execution_plan.tasks): initial_state_parts.append(f"  {i+1}. {task.description}")
+        log_event_fn(f"Initial plan created with {len(execution_plan.tasks)} tasks", MSG_TYPE.MSG_TYPE_INFO, meta={
+            "plan_version": current_plan_version,
+            "total_tasks": len(execution_plan.tasks),
+            "estimated_complexity": "medium" if len(execution_plan.tasks) <= 5 else "high"
+        })
+        
+        for i, task in enumerate(execution_plan.tasks):
+            log_event_fn(f"Task {i+1}: {task.description}", MSG_TYPE.MSG_TYPE_INFO)
+            
+        log_event_fn("✅ Adaptive plan ready", MSG_TYPE.MSG_TYPE_STEP_END, event_id=planning_step_id)
+        
+        # Enhanced initial state
+        initial_state_parts = [
+            f"### Original User Request\n{original_user_prompt}",
+            f"### Context\n{context or 'No additional context provided'}",
+            f"### Execution Plan (Version {current_plan_version})\n- Total tasks: {len(execution_plan.tasks)}",
+            f"- Estimated complexity: {'High' if len(execution_plan.tasks) > 5 else 'Medium'}"
+        ]
+        
+        for i, task in enumerate(execution_plan.tasks): 
+            initial_state_parts.append(f"  {i+1}. {task.description} [Status: {task.status.value}]")
+        
         if images:
+            initial_state_parts.append(f"### Provided Assets")
             for img_b64 in images:
                 img_uuid = str(uuid.uuid4())
                 asset_store[img_uuid] = {"type": "image", "content": img_b64, "source": "user"}
-                initial_state_parts.append(f"- User provided image, asset ID: {img_uuid}")
+                initial_state_parts.append(f"- Image asset: {img_uuid}")
+        
         current_scratchpad = "\n".join(initial_state_parts)
+        log_event_fn("Initial analysis complete", MSG_TYPE.MSG_TYPE_SCRATCHPAD, meta={"scratchpad_size": len(current_scratchpad)})
 
         formatted_tools_list = "\n".join([f"**{t['name']}**: {t['description']}" for t in all_visible_tools])
         completed_tasks, current_task_index = set(), 0
+        plan_revision_count = 0
         
+        # Main reasoning loop with enhanced decision tracking
         for i in range(max_reasoning_steps):
-            step_desc = f"🤔 Working on: {execution_plan.tasks[current_task_index].description}" if current_task_index < len(execution_plan.tasks) else f"🤔 Analyzing next steps... ({i+1}/{max_reasoning_steps})"
+            current_task_desc = execution_plan.tasks[current_task_index].description if current_task_index < len(execution_plan.tasks) else "Finalizing analysis"
+            step_desc = f"🤔 Step {i+1}: {current_task_desc}"
             reasoning_step_id = log_event_fn(step_desc, MSG_TYPE.MSG_TYPE_STEP_START)
             
             try:
-                if len(current_scratchpad) > 12000:
-                    current_scratchpad = memory_manager.compress_scratchpad(current_scratchpad, original_user_prompt, 8000)
+                # Enhanced scratchpad management
+                if len(current_scratchpad) > max_scratchpad_size:
+                    log_event_fn(f"Scratchpad size ({len(current_scratchpad)}) exceeds limit, compressing...", MSG_TYPE.MSG_TYPE_INFO)
+                    current_scratchpad = _compress_scratchpad_intelligently(current_scratchpad, original_user_prompt, max_scratchpad_size // 2)
+                    log_event_fn(f"Scratchpad compressed to {len(current_scratchpad)} characters", MSG_TYPE.MSG_TYPE_INFO)
                 
-                reasoning_prompt = f"""--- AVAILABLE ACTIONS ---\n{formatted_tools_list}\n--- YOUR INTERNAL SCRATCHPAD ---\n{current_scratchpad}\n--- END SCRATCHPAD ---\n
-INSTRUCTIONS: Observe, think, and then act. Choose the single best next action to achieve: "{original_user_prompt}".
-Produce ONLY this JSON: {{"thought": "short reasoning", "action": {{"tool_name": "...", "requires_code_input": false, "requires_image_input": false}}}}"""
-                decision_data = self.generate_structured_content(prompt=reasoning_prompt, schema={"thought": "string", "action": "object"}, system_prompt=reasoning_system_prompt, temperature=decision_temperature, **llm_generation_kwargs)
+                # Enhanced reasoning prompt with better decision tracking
+                reasoning_prompt = f"""You are working on: "{original_user_prompt}"
+
+=== AVAILABLE ACTIONS ===
+{formatted_tools_list}
+
+=== YOUR COMPLETE ANALYSIS HISTORY ===
+{current_scratchpad}
+=== END ANALYSIS HISTORY ===
+
+=== DECISION GUIDELINES ===
+1. **Review your progress**: Look at what you've already discovered and accomplished
+2. **Consider your current task**: Focus on the next logical step in your plan
+3. **Remember your decisions**: If you previously decided to use a tool, follow through unless you have a good reason to change
+4. **Be adaptive**: If you discover new information that changes the situation, consider revising your plan
+5. **Stay focused**: Each action should clearly advance toward the final goal
+
+=== YOUR NEXT DECISION ===
+Choose the single most appropriate action to take right now. Consider:
+- What specific step are you currently working on?
+- What information do you still need?
+- What would be most helpful for the user?
+
+Provide your decision as JSON:
+{{
+    "reasoning": "Explain your current thinking and why this action makes sense now",
+    "action": {{
+        "tool_name": "exact_tool_name",
+        "requires_code_input": false,
+        "requires_image_input": false,
+        "confidence": 0.8
+    }},
+    "plan_status": "on_track" // or "needs_revision" if you want to change the plan
+}}"""
+
+                log_prompt_fn(f"Reasoning Prompt Step {i+1}", reasoning_prompt)
+                decision_data = self.generate_structured_content(
+                    prompt=reasoning_prompt, 
+                    schema={
+                        "reasoning": "string", 
+                        "action": "object",
+                        "plan_status": "string"
+                    }, 
+                    system_prompt=reasoning_system_prompt, 
+                    temperature=decision_temperature, 
+                    **llm_generation_kwargs
+                )
                 
                 if not (decision_data and isinstance(decision_data.get("action"), dict)):
-                    log_event_fn("LLM failed to produce a valid action JSON.", MSG_TYPE.MSG_TYPE_WARNING, event_id=reasoning_step_id)
-                    current_scratchpad += "\n\n### Step Failure\n- Error: Invalid decision JSON from LLM."
+                    log_event_fn("⚠️ Invalid decision format from AI", MSG_TYPE.MSG_TYPE_WARNING, event_id=reasoning_step_id)
+                    current_scratchpad += f"\n\n### Step {i+1}: Decision Error\n- Error: AI produced invalid decision JSON\n- Continuing with fallback approach"
                     continue
 
                 action = decision_data.get("action", {})
-                tool_name, requires_code, requires_image = action.get("tool_name"), action.get("requires_code_input", False), action.get("requires_image_input", False)
-                current_scratchpad += f"\n\n### Step {i+1}: Thought\n{decision_data.get('thought', '')}"
+                reasoning = decision_data.get("reasoning", "No reasoning provided")
+                plan_status = decision_data.get("plan_status", "on_track")
+                tool_name = action.get("tool_name")
+                requires_code = action.get("requires_code_input", False)
+                requires_image = action.get("requires_image_input", False)
+                confidence = action.get("confidence", 0.5)
                 
-                log_event_fn(_get_friendly_action_description(tool_name, requires_code, requires_image), MSG_TYPE.MSG_TYPE_STEP)
-                if tool_name == "local_tools::final_answer": break
+                # Track the decision
+                decision_history.append({
+                    "step": i+1,
+                    "tool_name": tool_name,
+                    "reasoning": reasoning,
+                    "confidence": confidence,
+                    "plan_status": plan_status
+                })
+                
+                current_scratchpad += f"\n\n### Step {i+1}: Decision & Reasoning\n**Reasoning**: {reasoning}\n**Chosen Action**: {tool_name}\n**Confidence**: {confidence}\n**Plan Status**: {plan_status}"
+                
+                log_event_fn(_get_friendly_action_description(tool_name, requires_code, requires_image), MSG_TYPE.MSG_TYPE_STEP, meta={
+                    "tool_name": tool_name,
+                    "confidence": confidence,
+                    "reasoning": reasoning[:100] + "..." if len(reasoning) > 100 else reasoning
+                })
+                
+                # Handle plan revision
+                if plan_status == "needs_revision" and tool_name != "local_tools::revise_plan":
+                    log_event_fn("🔄 AI indicates plan needs revision", MSG_TYPE.MSG_TYPE_INFO)
+                    tool_name = "local_tools::revise_plan"  # Force plan revision
+                
+                # Handle final answer
+                if tool_name == "local_tools::final_answer": 
+                    log_event_fn("🎯 Ready to provide final answer", MSG_TYPE.MSG_TYPE_INFO)
+                    break
+                
+                # Handle clarification request
                 if tool_name == "local_tools::request_clarification":
-                    clarification_prompt = f"Based on your thought process, what is the single question you need to ask the user?\n\nSCRATCHPAD:\n{current_scratchpad}\n\nQUESTION:"
-                    question = self.generate_text(clarification_prompt)
-                    return {"final_answer": self.remove_thinking_blocks(question), "clarification_required": True, "final_scratchpad": current_scratchpad, "tool_calls": tool_calls_this_turn, "sources": sources_this_turn, "error": None}
+                    clarification_prompt = f"""Based on your analysis, what specific information do you need from the user?
 
+CURRENT ANALYSIS:
+{current_scratchpad}
+
+Generate a clear, specific question that will help you proceed effectively:"""
+                    
+                    question = self.generate_text(clarification_prompt, temperature=0.3)
+                    question = self.remove_thinking_blocks(question)
+                    
+                    log_event_fn("❓ Clarification needed from user", MSG_TYPE.MSG_TYPE_INFO)
+                    return {
+                        "final_answer": question, 
+                        "clarification_required": True, 
+                        "final_scratchpad": current_scratchpad,
+                        "tool_calls": tool_calls_this_turn, 
+                        "sources": sources_this_turn, 
+                        "error": None,
+                        "decision_history": decision_history
+                    }
+                
+                # Handle final answer
+                if tool_name == "local_tools::final_answer": 
+                    log_event_fn("🎯 Ready to provide final answer", MSG_TYPE.MSG_TYPE_INFO)
+                    break
+                
+                # Handle clarification request
+                if tool_name == "local_tools::request_clarification":
+                    clarification_prompt = f"""Based on your analysis, what specific information do you need from the user?
+
+CURRENT ANALYSIS:
+{current_scratchpad}
+
+Generate a clear, specific question that will help you proceed effectively:"""
+                    
+                    question = self.generate_text(clarification_prompt, temperature=0.3)
+                    question = self.remove_thinking_blocks(question)
+                    
+                    log_event_fn("❓ Clarification needed from user", MSG_TYPE.MSG_TYPE_INFO)
+                    return {
+                        "final_answer": question, 
+                        "clarification_required": True, 
+                        "final_scratchpad": current_scratchpad,
+                        "tool_calls": tool_calls_this_turn, 
+                        "sources": sources_this_turn, 
+                        "error": None,
+                        "decision_history": decision_history
+                    }
+
+                # Handle plan revision
+                if tool_name == "local_tools::revise_plan":
+                    plan_revision_count += 1
+                    revision_id = log_event_fn(f"📝 Revising execution plan (revision #{plan_revision_count})", MSG_TYPE.MSG_TYPE_STEP_START)
+                    
+                    try:
+                        revision_prompt = f"""Based on your current analysis and discoveries, create an updated execution plan.
+
+ORIGINAL REQUEST: "{original_user_prompt}"
+CURRENT ANALYSIS:
+{current_scratchpad}
+
+REASON FOR REVISION: {reasoning}
+
+Create a new plan that reflects your current understanding. Consider:
+1. What have you already accomplished?
+2. What new information have you discovered?
+3. What steps are still needed?
+4. How can you be more efficient?
+
+Provide your revision as JSON:
+{{
+    "revision_reason": "Clear explanation of why the plan needed to change",
+    "new_plan": [
+        {{"step": 1, "description": "First revised step", "status": "pending"}},
+        {{"step": 2, "description": "Second revised step", "status": "pending"}}
+    ],
+    "confidence": 0.8
+}}"""
+
+                        revision_data = self.generate_structured_content(
+                            prompt=revision_prompt,
+                            schema={
+                                "revision_reason": "string",
+                                "new_plan": "array", 
+                                "confidence": "number"
+                            },
+                            temperature=0.3,
+                            **llm_generation_kwargs
+                        )
+                        
+                        if revision_data and revision_data.get("new_plan"):
+                            # Update the plan
+                            current_plan_version += 1
+                            new_tasks = []
+                            for task_data in revision_data["new_plan"]:
+                                task = TaskDecomposition()  # Assuming this class exists
+                                task.description = task_data.get("description", "Undefined step")
+                                task.status = TaskStatus.PENDING  # Reset all to pending
+                                new_tasks.append(task)
+                            
+                            execution_plan.tasks = new_tasks
+                            current_task_index = 0  # Reset to beginning
+                            
+                            # Update scratchpad with new plan
+                            current_scratchpad += f"\n\n### Updated Plan (Version {current_plan_version})\n"
+                            current_scratchpad += f"**Revision Reason**: {revision_data.get('revision_reason', 'Plan needed updating')}\n"
+                            current_scratchpad += f"**New Tasks**:\n"
+                            for i, task in enumerate(execution_plan.tasks):
+                                current_scratchpad += f"  {i+1}. {task.description}\n"
+                            
+                            log_event_fn(f"✅ Plan revised with {len(execution_plan.tasks)} updated tasks", MSG_TYPE.MSG_TYPE_STEP_END, event_id=revision_id, meta={
+                                "plan_version": current_plan_version,
+                                "new_task_count": len(execution_plan.tasks),
+                                "revision_reason": revision_data.get("revision_reason", "")
+                            })
+                            
+                            # Continue with the new plan
+                            continue
+                        else:
+                            raise ValueError("Failed to generate valid plan revision")
+                            
+                    except Exception as e:
+                        log_event_fn(f"Plan revision failed: {e}", MSG_TYPE.MSG_TYPE_WARNING, event_id=revision_id)
+                        current_scratchpad += f"\n**Plan Revision Failed**: {str(e)}\nContinuing with original plan."
+
+                # Prepare parameters for tool execution
                 param_assets = {}
                 if requires_code:
-                    code_prompt = f"Generate only the raw code required for the current step.\n\nSCRATCHPAD:\n{current_scratchpad}\n\nCODE:"
+                    log_event_fn("💻 Generating code for task", MSG_TYPE.MSG_TYPE_INFO)
+                    code_prompt = f"""Generate the specific code needed for the current step.
+
+CURRENT CONTEXT:
+{current_scratchpad}
+
+CURRENT TASK: {tool_name}
+USER REQUEST: "{original_user_prompt}"
+
+Generate clean, functional code that addresses the specific requirements. Focus on:
+1. Solving the immediate problem
+2. Being clear and readable
+3. Including necessary imports and dependencies
+4. Adding helpful comments where appropriate
+
+CODE:"""
+
                     code_content = self.generate_code(prompt=code_prompt, **llm_generation_kwargs)
                     code_uuid = f"code_asset_{uuid.uuid4()}"
                     asset_store[code_uuid] = {"type": "code", "content": code_content}
                     param_assets['code_asset_id'] = code_uuid
-                    log_event_fn("Code asset generated.", MSG_TYPE.MSG_TYPE_STEP)
+                    log_event_fn(f"Code asset created: {code_uuid[:8]}...", MSG_TYPE.MSG_TYPE_INFO)
+                    
                 if requires_image:
                     image_assets = [asset_id for asset_id, asset in asset_store.items() if asset['type'] == 'image' and asset.get('source') == 'user']
                     if image_assets:
                         param_assets['image_asset_id'] = image_assets[0]
+                        log_event_fn(f"Using image asset: {image_assets[0][:8]}...", MSG_TYPE.MSG_TYPE_INFO)
+                    else:
+                        log_event_fn("⚠️ Image required but none available", MSG_TYPE.MSG_TYPE_WARNING)
 
-                param_prompt = f"""Fill the parameters for the tool: '{tool_name}'. Available assets: {json.dumps(param_assets)}.
-SCRATCHPAD:\n{current_scratchpad}\n
-Output only: {{"tool_params": {{...}}}}"""
-                param_data = self.generate_structured_content(prompt=param_prompt, schema={"tool_params": "object"}, temperature=decision_temperature, **llm_generation_kwargs)
+                # Enhanced parameter generation
+                param_prompt = f"""Generate the optimal parameters for this tool execution.
+
+TOOL: {tool_name}
+CURRENT CONTEXT: {current_scratchpad}
+CURRENT REASONING: {reasoning}
+AVAILABLE ASSETS: {json.dumps(param_assets) if param_assets else "None"}
+
+Based on your analysis and the current step you're working on, provide the most appropriate parameters.
+Be specific and purposeful in your parameter choices.
+
+Output format: {{"tool_params": {{...}}}}"""
+
+                log_prompt_fn(f"Parameter Generation Step {i+1}", param_prompt)
+                param_data = self.generate_structured_content(
+                    prompt=param_prompt, 
+                    schema={"tool_params": "object"}, 
+                    temperature=decision_temperature, 
+                    **llm_generation_kwargs
+                )
                 tool_params = param_data.get("tool_params", {}) if param_data else {}
                 
+                current_scratchpad += f"\n**Parameters Generated**: {json.dumps(tool_params, indent=2)}"
+                
+                # Hydrate parameters with assets
                 def _hydrate(data: Any, store: Dict) -> Any:
                     if isinstance(data, dict): return {k: _hydrate(v, store) for k, v in data.items()}
                     if isinstance(data, list): return [_hydrate(item, store) for item in data]
                     if isinstance(data, str) and "asset_" in data and data in store: return store[data].get("content", data)
                     return data
+                    
                 hydrated_params = _hydrate(tool_params, asset_store)
                 
-                start_time, tool_result = time.time(), {"status": "failure", "error": f"Tool '{tool_name}' failed to execute."}
+                # Execute the tool with detailed logging
+                start_time = time.time()
+                tool_result = {"status": "failure", "error": f"Tool '{tool_name}' failed to execute."}
+                
                 try:
                     if tool_name in rag_registry:
                         query = hydrated_params.get("query", "")
-                        top_k, min_sim = rag_tool_specs[tool_name]["default_top_k"], rag_tool_specs[tool_name]["default_min_sim"]
+                        if not query:
+                            # Fall back to using reasoning as query
+                            query = reasoning[:200] + "..." if len(reasoning) > 200 else reasoning
+                            
+                        log_event_fn(f"🔍 Searching knowledge base with query: '{query[:50]}...'", MSG_TYPE.MSG_TYPE_INFO)
+                        
+                        top_k = rag_tool_specs[tool_name]["default_top_k"]
+                        min_sim = rag_tool_specs[tool_name]["default_min_sim"]
+                        
                         raw_results = rag_registry[tool_name](query=query, rag_top_k=top_k)
                         raw_iter = raw_results["results"] if isinstance(raw_results, dict) and "results" in raw_results else raw_results
-                        docs = [{"text": d.get("text", str(d)), "score": d.get("score", 0)*100, "metadata": d.get("metadata", {})} for d in raw_iter or []]
+                        
+                        docs = []
+                        for d in raw_iter or []:
+                            doc_data = {
+                                "text": d.get("text", str(d)), 
+                                "score": d.get("score", 0) * 100, 
+                                "metadata": d.get("metadata", {})
+                            }
+                            docs.append(doc_data)
+                        
                         kept = [x for x in docs if x['score'] >= min_sim]
-                        tool_result = {"status": "success", "results": kept, "dropped": len(docs) - len(kept)}
-                        sources_this_turn.extend([{"source": tool_name, "metadata": x["metadata"], "score": x["score"]} for x in kept])
-                    elif hasattr(self, "mcp"):
+                        tool_result = {
+                            "status": "success", 
+                            "results": kept, 
+                            "total_found": len(docs),
+                            "kept_after_filtering": len(kept),
+                            "query_used": query
+                        }
+                        
+                        sources_this_turn.extend([{
+                            "source": tool_name, 
+                            "metadata": x["metadata"], 
+                            "score": x["score"]
+                        } for x in kept])
+                        
+                        log_event_fn(f"📚 Retrieved {len(kept)} relevant documents (from {len(docs)} total)", MSG_TYPE.MSG_TYPE_INFO)
+                        
+                    elif hasattr(self, "mcp") and "local_tools" not in tool_name:
+                        log_event_fn(f"🔧 Executing MCP tool: {tool_name}", MSG_TYPE.MSG_TYPE_TOOL_CALL, meta={
+                            "tool_name": tool_name,
+                            "params": {k: str(v)[:100] for k, v in hydrated_params.items()}  # Truncate for logging
+                        })
+                        
                         tool_result = self.mcp.execute_tool(tool_name, hydrated_params, lollms_client_instance=self)
+                        
+                        log_event_fn(f"Tool execution completed", MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, meta={
+                            "result_status": tool_result.get("status", "unknown"),
+                            "has_error": "error" in tool_result
+                        })
+                        
+                    elif tool_name == "local_tools::generate_image" and hasattr(self, "tti"):
+                        image_prompt = hydrated_params.get("prompt", "")
+                        log_event_fn(f"🎨 Generating image with prompt: '{image_prompt[:50]}...'", MSG_TYPE.MSG_TYPE_INFO)
+                        
+                        # This would call your text-to-image functionality
+                        image_result = self.tti.generate_image(image_prompt)  # Assuming this method exists
+                        if image_result:
+                            image_uuid = f"generated_image_{uuid.uuid4()}"
+                            asset_store[image_uuid] = {"type": "image", "content": image_result, "source": "generated"}
+                            tool_result = {"status": "success", "image_id": image_uuid, "prompt_used": image_prompt}
+                        else:
+                            tool_result = {"status": "failure", "error": "Image generation failed"}
+                            
+                    else:
+                        tool_result = {"status": "failure", "error": f"Tool '{tool_name}' is not available or supported in this context."}
+                        
                 except Exception as e:
-                    error_msg = f"Exception during '{tool_name}' execution: {e}"
+                    error_msg = f"Exception during '{tool_name}' execution: {str(e)}"
                     log_event_fn(error_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
                     tool_result = {"status": "failure", "error": error_msg}
 
                 response_time = time.time() - start_time
                 success = tool_result.get("status") == "success"
-                performance_tracker.record_tool_usage(tool_name, success, 0.8, response_time, tool_result.get("error"))
                 
+                # Record performance
+                performance_tracker.record_tool_usage(tool_name, success, confidence, response_time, tool_result.get("error"))
+                
+                # Update task status
                 if success and current_task_index < len(execution_plan.tasks):
                     execution_plan.tasks[current_task_index].status = TaskStatus.COMPLETED
+                    completed_tasks.add(current_task_index)
                     current_task_index += 1
                 
-                observation_text = f"```json\n{json.dumps(tool_result, indent=2)}\n```"
-                tool_calls_this_turn.append({"name": tool_name, "params": tool_params, "result": tool_result, "response_time": response_time})
-                current_scratchpad += f"\n\n### Step {i+1}: Observation\n- Action: `{tool_name}`\n- Result:\n{observation_text}"
+                # Enhanced observation logging
+                observation_text = json.dumps(tool_result, indent=2)
+                if len(observation_text) > 1000:
+                    # Truncate very long results for scratchpad
+                    truncated_result = {k: (str(v)[:200] + "..." if len(str(v)) > 200 else v) for k, v in tool_result.items()}
+                    observation_text = json.dumps(truncated_result, indent=2)
+                
+                current_scratchpad += f"\n\n### Step {i+1}: Execution & Observation\n"
+                current_scratchpad += f"**Tool Used**: {tool_name}\n"
+                current_scratchpad += f"**Success**: {success}\n"
+                current_scratchpad += f"**Response Time**: {response_time:.2f}s\n"
+                current_scratchpad += f"**Result**:\n```json\n{observation_text}\n```"
+                
+                # Track tool call
+                tool_calls_this_turn.append({
+                    "name": tool_name,
+                    "params": tool_params,
+                    "result": tool_result,
+                    "response_time": response_time,
+                    "confidence": confidence,
+                    "reasoning": reasoning
+                })
                 
                 if success:
-                    log_event_fn(f"✅ Step completed successfully", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
+                    log_event_fn(f"✅ Step {i+1} completed successfully", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id, meta={
+                        "tool_name": tool_name,
+                        "response_time": response_time,
+                        "confidence": confidence
+                    })
                 else:
                     error_detail = tool_result.get("error", "No error detail provided.")
-                    log_event_fn(f"Tool reported failure: {error_detail}", MSG_TYPE.MSG_TYPE_WARNING)
-                    log_event_fn(f"⚠️ Step completed with issues", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id, meta={"error": error_detail})
+                    log_event_fn(f"⚠️ Step {i+1} completed with issues: {error_detail}", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id, meta={
+                        "tool_name": tool_name,
+                        "error": error_detail,
+                        "confidence": confidence
+                    })
+                    
+                    # Add failure handling to scratchpad
+                    current_scratchpad += f"\n**Failure Analysis**: {error_detail}"
+                    current_scratchpad += f"\n**Next Steps**: Consider alternative approaches or tools"
                 
-                if len(completed_tasks) == len(execution_plan.tasks): break
+                # Log current progress
+                completed_count = len(completed_tasks)
+                total_tasks = len(execution_plan.tasks)
+                if total_tasks > 0:
+                    progress = (completed_count / total_tasks) * 100
+                    log_event_fn(f"Progress: {completed_count}/{total_tasks} tasks completed ({progress:.1f}%)", MSG_TYPE.MSG_TYPE_STEP_PROGRESS, meta={"progress": progress})
+                
+                # Check if all tasks are completed
+                if completed_count >= total_tasks:
+                    log_event_fn("🎯 All planned tasks completed", MSG_TYPE.MSG_TYPE_INFO)
+                    break
                     
             except Exception as ex:
-                log_event_fn(f"An unexpected error occurred in reasoning loop: {ex}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=reasoning_step_id)
+                log_event_fn(f"💥 Unexpected error in reasoning step {i+1}: {str(ex)}", MSG_TYPE.MSG_TYPE_ERROR, event_id=reasoning_step_id)
                 trace_exception(ex)
-                log_event_fn("⚠️ Encountered an issue, adjusting approach...", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
+                
+                # Add error to scratchpad for context
+                current_scratchpad += f"\n\n### Step {i+1}: Unexpected Error\n**Error**: {str(ex)}\n**Recovery**: Continuing with adjusted approach"
+                
+                log_event_fn("🔄 Recovering and continuing with next step", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
 
-        if enable_self_reflection and len(tool_calls_this_turn) > 1:
-            reflection_id = log_event_fn("🤔 Reviewing my work...", MSG_TYPE.MSG_TYPE_STEP_START)
+        # Enhanced self-reflection
+        if enable_self_reflection and len(tool_calls_this_turn) > 0:
+            reflection_id = log_event_fn("🤔 Conducting comprehensive self-assessment...", MSG_TYPE.MSG_TYPE_STEP_START)
             try:
-                reflection_prompt = f"""Review the user request and your work. Was the goal achieved effectively?
-REQUEST: "{original_user_prompt}"
-SCRATCHPAD:\n{current_scratchpad}\n
-JSON assessment: {{"goal_achieved": true, "effectiveness_score": 0.8, "summary": "..."}}"""
-                reflection_data = self.generate_structured_content(prompt=reflection_prompt, schema={"goal_achieved": "boolean", "effectiveness_score": "number", "summary": "string"}, temperature=0.3, **llm_generation_kwargs)
-                if reflection_data: current_scratchpad += f"\n\n### Self-Reflection\n- Goal Achieved: {reflection_data.get('goal_achieved')}\n- Effectiveness: {reflection_data.get('effectiveness_score')}"
-                log_event_fn("✅ Quality check completed", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reflection_id)
-            except Exception as e:
-                log_event_fn(f"Self-review failed: {e}", MSG_TYPE.MSG_TYPE_WARNING, event_id=reflection_id)
+                reflection_prompt = f"""Conduct a thorough review of your work and assess the quality of your response to the user's request.
 
-        synthesis_id = log_event_fn("📝 Preparing your complete answer...", MSG_TYPE.MSG_TYPE_STEP_START)
-        final_answer_prompt = f"""Synthesize a comprehensive, user-friendly final answer based on your complete analysis.
-USER REQUEST: "{original_user_prompt}"
-FULL SCRATCHPAD:\n{current_scratchpad}\n---
-FINAL ANSWER:"""
+ORIGINAL REQUEST: "{original_user_prompt}"
+TOOLS USED: {len(tool_calls_this_turn)}
+PLAN REVISIONS: {plan_revision_count}
+
+COMPLETE ANALYSIS:
+{current_scratchpad}
+
+Evaluate your performance on multiple dimensions:
+
+1. **Goal Achievement**: Did you fully address the user's request?
+2. **Process Efficiency**: Was your approach optimal given the available tools?
+3. **Information Quality**: Is the information you gathered accurate and relevant?
+4. **Decision Making**: Were your tool choices and parameters appropriate?
+5. **Adaptability**: How well did you handle unexpected results or plan changes?
+
+Provide your assessment as JSON:
+{{
+    "goal_achieved": true,
+    "effectiveness_score": 0.85,
+    "process_efficiency": 0.8,
+    "information_quality": 0.9,
+    "decision_making": 0.85,
+    "adaptability": 0.7,
+    "overall_confidence": 0.82,
+    "strengths": ["Clear reasoning", "Good tool selection"],
+    "areas_for_improvement": ["Could have been more efficient"],
+    "summary": "Successfully completed the user's request with high quality results",
+    "key_insights": ["Discovered that X was more important than initially thought"]
+}}"""
+
+                reflection_data = self.generate_structured_content(
+                    prompt=reflection_prompt,
+                    schema={
+                        "goal_achieved": "boolean",
+                        "effectiveness_score": "number",
+                        "process_efficiency": "number", 
+                        "information_quality": "number",
+                        "decision_making": "number",
+                        "adaptability": "number",
+                        "overall_confidence": "number",
+                        "strengths": "array",
+                        "areas_for_improvement": "array",
+                        "summary": "string",
+                        "key_insights": "array"
+                    },
+                    temperature=0.3,
+                    **llm_generation_kwargs
+                )
+                
+                if reflection_data:
+                    current_scratchpad += f"\n\n### Comprehensive Self-Assessment\n"
+                    current_scratchpad += f"**Goal Achieved**: {reflection_data.get('goal_achieved', False)}\n"
+                    current_scratchpad += f"**Overall Confidence**: {reflection_data.get('overall_confidence', 0.5):.2f}\n"
+                    current_scratchpad += f"**Effectiveness Score**: {reflection_data.get('effectiveness_score', 0.5):.2f}\n"
+                    current_scratchpad += f"**Key Strengths**: {', '.join(reflection_data.get('strengths', []))}\n"
+                    current_scratchpad += f"**Improvement Areas**: {', '.join(reflection_data.get('areas_for_improvement', []))}\n"
+                    current_scratchpad += f"**Summary**: {reflection_data.get('summary', '')}\n"
+                    
+                    log_event_fn(f"✅ Self-assessment completed", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reflection_id, meta={
+                        "overall_confidence": reflection_data.get('overall_confidence', 0.5),
+                        "goal_achieved": reflection_data.get('goal_achieved', False),
+                        "effectiveness_score": reflection_data.get('effectiveness_score', 0.5)
+                    })
+                else:
+                    log_event_fn("Self-assessment data generation failed", MSG_TYPE.MSG_TYPE_WARNING, event_id=reflection_id)
+                    
+            except Exception as e:
+                log_event_fn(f"Self-assessment failed: {e}", MSG_TYPE.MSG_TYPE_WARNING, event_id=reflection_id)
+
+        # Enhanced final synthesis
+        synthesis_id = log_event_fn("📝 Synthesizing comprehensive final response...", MSG_TYPE.MSG_TYPE_STEP_START)
         
-        final_answer_text = self.generate_text(prompt=final_answer_prompt, system_prompt=system_prompt, stream=streaming_callback is not None, streaming_callback=streaming_callback, temperature=final_answer_temperature, **llm_generation_kwargs)
+        final_answer_prompt = f"""Create a comprehensive, well-structured final response that fully addresses the user's request.
+
+ORIGINAL REQUEST: "{original_user_prompt}"
+CONTEXT: {context or "No additional context"}
+
+COMPLETE ANALYSIS AND WORK:
+{current_scratchpad}
+
+GUIDELINES for your response:
+1. **Be Complete**: Address all aspects of the user's request
+2. **Be Clear**: Organize your response logically and use clear language  
+3. **Be Helpful**: Provide actionable information and insights
+4. **Be Honest**: If there were limitations or uncertainties, mention them appropriately
+5. **Be Concise**: While being thorough, avoid unnecessary verbosity
+6. **Cite Sources**: If you used research tools, reference the information appropriately
+
+Your response should feel natural and conversational while being informative and valuable.
+
+FINAL RESPONSE:"""
+        
+        log_prompt_fn("Final Synthesis Prompt", final_answer_prompt)
+        
+        final_answer_text = self.generate_text(
+            prompt=final_answer_prompt,
+            system_prompt=system_prompt,
+            stream=streaming_callback is not None,
+            streaming_callback=streaming_callback,
+            temperature=final_answer_temperature,
+            **llm_generation_kwargs
+        )
+        
         if isinstance(final_answer_text, dict) and "error" in final_answer_text: 
-            return {"final_answer": "", "error": final_answer_text["error"], "final_scratchpad": current_scratchpad}
+            log_event_fn(f"Final synthesis failed: {final_answer_text['error']}", MSG_TYPE.MSG_TYPE_ERROR, event_id=synthesis_id)
+            return {
+                "final_answer": "I encountered an issue while preparing my final response. Please let me know if you'd like me to try again.",
+                "error": final_answer_text["error"],
+                "final_scratchpad": current_scratchpad,
+                "tool_calls": tool_calls_this_turn,
+                "sources": sources_this_turn,
+                "decision_history": decision_history
+            }
         
         final_answer = self.remove_thinking_blocks(final_answer_text)
-        log_event_fn("✅ Answer ready!", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id)
+        
+        # Calculate overall performance metrics
+        overall_confidence = sum(call.get('confidence', 0.5) for call in tool_calls_this_turn) / max(len(tool_calls_this_turn), 1)
+        successful_calls = sum(1 for call in tool_calls_this_turn if call.get('result', {}).get('status') == 'success')
+        success_rate = successful_calls / max(len(tool_calls_this_turn), 1)
+        
+        log_event_fn("✅ Comprehensive response ready", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id, meta={
+            "final_answer_length": len(final_answer),
+            "total_tools_used": len(tool_calls_this_turn),
+            "success_rate": success_rate,
+            "overall_confidence": overall_confidence
+        })
 
-        overall_confidence = sum(c.get('confidence', 0.5) for c in tool_calls_this_turn) / max(len(tool_calls_this_turn), 1)
         return {
-            "final_answer": final_answer, "final_scratchpad": current_scratchpad,
-            "tool_calls": tool_calls_this_turn, "sources": sources_this_turn,
-            "performance_stats": {"total_steps": len(tool_calls_this_turn), "average_confidence": overall_confidence},
-            "clarification_required": False, "overall_confidence": overall_confidence, "error": None
+            "final_answer": final_answer,
+            "final_scratchpad": current_scratchpad,
+            "tool_calls": tool_calls_this_turn,
+            "sources": sources_this_turn,
+            "decision_history": decision_history,
+            "performance_stats": {
+                "total_steps": len(tool_calls_this_turn),
+                "successful_steps": successful_calls,
+                "success_rate": success_rate,
+                "average_confidence": overall_confidence,
+                "plan_revisions": plan_revision_count,
+                "total_reasoning_steps": len(decision_history)
+            },
+            "plan_evolution": {
+                "initial_tasks": len(execution_plan.tasks),
+                "final_version": current_plan_version,
+                "total_revisions": plan_revision_count
+            },
+            "clarification_required": False,
+            "overall_confidence": overall_confidence,
+            "error": None
+        }
+
+
+    def _execute_complex_reasoning_loop(
+        self, prompt, context, system_prompt, reasoning_system_prompt, images,
+        max_reasoning_steps, decision_temperature, final_answer_temperature,
+        streaming_callback, debug, enable_self_reflection, all_visible_tools,
+        rag_registry, rag_tool_specs, log_event_fn, log_prompt_fn, max_scratchpad_size, **llm_generation_kwargs
+    ) -> Dict[str, Any]:
+        
+        planner, memory_manager, performance_tracker = TaskPlanner(self), MemoryManager(), ToolPerformanceTracker()
+        
+        def _get_friendly_action_description(tool_name, requires_code, requires_image):
+            descriptions = {
+                "local_tools::final_answer": "📋 Preparing final answer",
+                "local_tools::request_clarification": "❓ Requesting clarification",
+                "local_tools::generate_image": "🎨 Creating image",
+                "local_tools::revise_plan": "📝 Revising execution plan"
+            }
+            if tool_name in descriptions:
+                return descriptions[tool_name]
+            if "research::" in tool_name: 
+                return f"🔍 Searching {tool_name.split('::')[-1]} knowledge base"
+            if requires_code: 
+                return "💻 Processing code"
+            if requires_image: 
+                return "🖼️ Analyzing images"
+            return f"🔧 Using {tool_name.replace('_', ' ').replace('::', ' - ').title()}"
+
+        def _compress_scratchpad_intelligently(scratchpad: str, original_request: str, target_size: int) -> str:
+            """Enhanced scratchpad compression that preserves key decisions and recent context"""
+            if len(scratchpad) <= target_size:
+                return scratchpad
+            
+            log_event_fn("📝 Compressing scratchpad to maintain focus...", MSG_TYPE.MSG_TYPE_INFO)
+            
+            # Extract key components
+            lines = scratchpad.split('\n')
+            plan_section = []
+            decisions = []
+            recent_observations = []
+            
+            current_section = None
+            for i, line in enumerate(lines):
+                if "### Execution Plan" in line or "### Updated Plan" in line:
+                    current_section = "plan"
+                elif "### Step" in line and ("Thought" in line or "Decision" in line):
+                    current_section = "decision"
+                elif "### Step" in line and "Observation" in line:
+                    current_section = "observation"
+                elif line.startswith("###"):
+                    current_section = None
+                
+                if current_section == "plan" and line.strip():
+                    plan_section.append(line)
+                elif current_section == "decision" and line.strip():
+                    decisions.append((i, line))
+                elif current_section == "observation" and line.strip():
+                    recent_observations.append((i, line))
+            
+            # Keep most recent items and important decisions
+            recent_decisions = decisions[-3:] if len(decisions) > 3 else decisions
+            recent_obs = recent_observations[-5:] if len(recent_observations) > 5 else recent_observations
+            
+            compressed_parts = [
+                f"### Original Request\n{original_request}",
+                f"### Current Plan\n" + '\n'.join(plan_section[-10:]),
+                f"### Recent Key Decisions"
+            ]
+            
+            for _, decision in recent_decisions:
+                compressed_parts.append(decision)
+            
+            compressed_parts.append("### Recent Observations")
+            for _, obs in recent_obs:
+                compressed_parts.append(obs)
+            
+            compressed = '\n'.join(compressed_parts)
+            if len(compressed) > target_size:
+                # Final trim if still too long
+                compressed = compressed[:target_size-100] + "\n...[content compressed for focus]"
+            
+            return compressed
+
+        original_user_prompt, tool_calls_this_turn, sources_this_turn = prompt, [], []
+        asset_store: Dict[str, Dict] = {}
+        decision_history = []  # Track all decisions made
+        
+        # Enhanced planning phase
+        planning_step_id = log_event_fn("📋 Creating adaptive execution plan...", MSG_TYPE.MSG_TYPE_STEP_START)
+        execution_plan = planner.decompose_task(original_user_prompt, context or "")
+        current_plan_version = 1
+        
+        log_event_fn(f"Initial plan created with {len(execution_plan.tasks)} tasks", MSG_TYPE.MSG_TYPE_INFO, meta={
+            "plan_version": current_plan_version,
+            "total_tasks": len(execution_plan.tasks),
+            "estimated_complexity": "medium" if len(execution_plan.tasks) <= 5 else "high"
+        })
+        
+        for i, task in enumerate(execution_plan.tasks):
+            log_event_fn(f"Task {i+1}: {task.description}", MSG_TYPE.MSG_TYPE_INFO)
+            
+        log_event_fn("✅ Adaptive plan ready", MSG_TYPE.MSG_TYPE_STEP_END, event_id=planning_step_id)
+        
+        # Enhanced initial state
+        initial_state_parts = [
+            f"### Original User Request\n{original_user_prompt}",
+            f"### Context\n{context or 'No additional context provided'}",
+            f"### Execution Plan (Version {current_plan_version})\n- Total tasks: {len(execution_plan.tasks)}",
+            f"- Estimated complexity: {'High' if len(execution_plan.tasks) > 5 else 'Medium'}"
+        ]
+        
+        for i, task in enumerate(execution_plan.tasks): 
+            initial_state_parts.append(f"  {i+1}. {task.description} [Status: {task.status.value}]")
+        
+        if images:
+            initial_state_parts.append(f"### Provided Assets")
+            for img_b64 in images:
+                img_uuid = str(uuid.uuid4())
+                asset_store[img_uuid] = {"type": "image", "content": img_b64, "source": "user"}
+                initial_state_parts.append(f"- Image asset: {img_uuid}")
+        
+        current_scratchpad = "\n".join(initial_state_parts)
+        log_event_fn("Initial analysis complete", MSG_TYPE.MSG_TYPE_SCRATCHPAD, meta={"scratchpad_size": len(current_scratchpad)})
+
+        formatted_tools_list = "\n".join([f"**{t['name']}**: {t['description']}" for t in all_visible_tools])
+        completed_tasks, current_task_index = set(), 0
+        plan_revision_count = 0
+        
+        # Main reasoning loop with enhanced decision tracking
+        for i in range(max_reasoning_steps):
+            current_task_desc = execution_plan.tasks[current_task_index].description if current_task_index < len(execution_plan.tasks) else "Finalizing analysis"
+            step_desc = f"🤔 Step {i+1}: {current_task_desc}"
+            reasoning_step_id = log_event_fn(step_desc, MSG_TYPE.MSG_TYPE_STEP_START)
+            
+            try:
+                # Enhanced scratchpad management
+                if len(current_scratchpad) > max_scratchpad_size:
+                    log_event_fn(f"Scratchpad size ({len(current_scratchpad)}) exceeds limit, compressing...", MSG_TYPE.MSG_TYPE_INFO)
+                    current_scratchpad = _compress_scratchpad_intelligently(current_scratchpad, original_user_prompt, max_scratchpad_size // 2)
+                    log_event_fn(f"Scratchpad compressed to {len(current_scratchpad)} characters", MSG_TYPE.MSG_TYPE_INFO)
+                
+                # Enhanced reasoning prompt with better decision tracking
+                reasoning_prompt = f"""You are working on: "{original_user_prompt}"
+
+=== AVAILABLE ACTIONS ===
+{formatted_tools_list}
+
+=== YOUR COMPLETE ANALYSIS HISTORY ===
+{current_scratchpad}
+=== END ANALYSIS HISTORY ===
+
+=== DECISION GUIDELINES ===
+1. **Review your progress**: Look at what you've already discovered and accomplished
+2. **Consider your current task**: Focus on the next logical step in your plan
+3. **Remember your decisions**: If you previously decided to use a tool, follow through unless you have a good reason to change
+4. **Be adaptive**: If you discover new information that changes the situation, consider revising your plan
+5. **Stay focused**: Each action should clearly advance toward the final goal
+
+=== YOUR NEXT DECISION ===
+Choose the single most appropriate action to take right now. Consider:
+- What specific step are you currently working on?
+- What information do you still need?
+- What would be most helpful for the user?
+
+Provide your decision as JSON:
+{{
+    "reasoning": "Explain your current thinking and why this action makes sense now",
+    "action": {{
+        "tool_name": "exact_tool_name",
+        "requires_code_input": false,
+        "requires_image_input": false,
+        "confidence": 0.8
+    }},
+    "plan_status": "on_track" // or "needs_revision" if you want to change the plan
+}}"""
+
+                log_prompt_fn(f"Reasoning Prompt Step {i+1}", reasoning_prompt)
+                decision_data = self.generate_structured_content(
+                    prompt=reasoning_prompt, 
+                    schema={
+                        "reasoning": "string", 
+                        "action": "object",
+                        "plan_status": "string"
+                    }, 
+                    system_prompt=reasoning_system_prompt, 
+                    temperature=decision_temperature, 
+                    **llm_generation_kwargs
+                )
+                
+                if not (decision_data and isinstance(decision_data.get("action"), dict)):
+                    log_event_fn("⚠️ Invalid decision format from AI", MSG_TYPE.MSG_TYPE_WARNING, event_id=reasoning_step_id)
+                    current_scratchpad += f"\n\n### Step {i+1}: Decision Error\n- Error: AI produced invalid decision JSON\n- Continuing with fallback approach"
+                    continue
+
+                action = decision_data.get("action", {})
+                reasoning = decision_data.get("reasoning", "No reasoning provided")
+                plan_status = decision_data.get("plan_status", "on_track")
+                tool_name = action.get("tool_name")
+                requires_code = action.get("requires_code_input", False)
+                requires_image = action.get("requires_image_input", False)
+                confidence = action.get("confidence", 0.5)
+                
+                # Track the decision
+                decision_history.append({
+                    "step": i+1,
+                    "tool_name": tool_name,
+                    "reasoning": reasoning,
+                    "confidence": confidence,
+                    "plan_status": plan_status
+                })
+                
+                current_scratchpad += f"\n\n### Step {i+1}: Decision & Reasoning\n**Reasoning**: {reasoning}\n**Chosen Action**: {tool_name}\n**Confidence**: {confidence}\n**Plan Status**: {plan_status}"
+                
+                log_event_fn(_get_friendly_action_description(tool_name, requires_code, requires_image), MSG_TYPE.MSG_TYPE_STEP, meta={
+                    "tool_name": tool_name,
+                    "confidence": confidence,
+                    "reasoning": reasoning[:100] + "..." if len(reasoning) > 100 else reasoning
+                })
+                
+                # Handle plan revision
+                if plan_status == "needs_revision" and tool_name != "local_tools::revise_plan":
+                    log_event_fn("🔄 AI indicates plan needs revision", MSG_TYPE.MSG_TYPE_INFO)
+                    tool_name = "local_tools::revise_plan"  # Force plan revision
+                
+                # Handle final answer
+                if tool_name == "local_tools::final_answer": 
+                    log_event_fn("🎯 Ready to provide final answer", MSG_TYPE.MSG_TYPE_INFO)
+                    break
+                
+                # Handle clarification request
+                if tool_name == "local_tools::request_clarification":
+                    clarification_prompt = f"""Based on your analysis, what specific information do you need from the user?
+
+CURRENT ANALYSIS:
+{current_scratchpad}
+
+Generate a clear, specific question that will help you proceed effectively:"""
+                    
+                    question = self.generate_text(clarification_prompt, temperature=0.3)
+                    question = self.remove_thinking_blocks(question)
+                    
+                    log_event_fn("❓ Clarification needed from user", MSG_TYPE.MSG_TYPE_INFO)
+                    return {
+                        "final_answer": question, 
+                        "clarification_required": True, 
+                        "final_scratchpad": current_scratchpad,
+                        "tool_calls": tool_calls_this_turn, 
+                        "sources": sources_this_turn, 
+                        "error": None,
+                        "decision_history": decision_history
+                    }
+
+                # Handle plan revision
+                if tool_name == "local_tools::revise_plan":
+                    plan_revision_count += 1
+                    revision_id = log_event_fn(f"📝 Revising execution plan (revision #{plan_revision_count})", MSG_TYPE.MSG_TYPE_STEP_START)
+                    
+                    try:
+                        revision_prompt = f"""Based on your current analysis and discoveries, create an updated execution plan.
+
+ORIGINAL REQUEST: "{original_user_prompt}"
+CURRENT ANALYSIS:
+{current_scratchpad}
+
+REASON FOR REVISION: {reasoning}
+
+Create a new plan that reflects your current understanding. Consider:
+1. What have you already accomplished?
+2. What new information have you discovered?
+3. What steps are still needed?
+4. How can you be more efficient?
+
+Provide your revision as JSON:
+{{
+    "revision_reason": "Clear explanation of why the plan needed to change",
+    "new_plan": [
+        {{"step": 1, "description": "First revised step", "status": "pending"}},
+        {{"step": 2, "description": "Second revised step", "status": "pending"}}
+    ],
+    "confidence": 0.8
+}}"""
+
+                        revision_data = self.generate_structured_content(
+                            prompt=revision_prompt,
+                            schema={
+                                "revision_reason": "string",
+                                "new_plan": "array", 
+                                "confidence": "number"
+                            },
+                            temperature=0.3,
+                            **llm_generation_kwargs
+                        )
+                        
+                        if revision_data and revision_data.get("new_plan"):
+                            # Update the plan
+                            current_plan_version += 1
+                            new_tasks = []
+                            for task_data in revision_data["new_plan"]:
+                                task = TaskDecomposition()  # Assuming this class exists
+                                task.description = task_data.get("description", "Undefined step")
+                                task.status = TaskStatus.PENDING  # Reset all to pending
+                                new_tasks.append(task)
+                            
+                            execution_plan.tasks = new_tasks
+                            current_task_index = 0  # Reset to beginning
+                            
+                            # Update scratchpad with new plan
+                            current_scratchpad += f"\n\n### Updated Plan (Version {current_plan_version})\n"
+                            current_scratchpad += f"**Revision Reason**: {revision_data.get('revision_reason', 'Plan needed updating')}\n"
+                            current_scratchpad += f"**New Tasks**:\n"
+                            for i, task in enumerate(execution_plan.tasks):
+                                current_scratchpad += f"  {i+1}. {task.description}\n"
+                            
+                            log_event_fn(f"✅ Plan revised with {len(execution_plan.tasks)} updated tasks", MSG_TYPE.MSG_TYPE_STEP_END, event_id=revision_id, meta={
+                                "plan_version": current_plan_version,
+                                "new_task_count": len(execution_plan.tasks),
+                                "revision_reason": revision_data.get("revision_reason", "")
+                            })
+                            
+                            # Continue with the new plan
+                            continue
+                        else:
+                            raise ValueError("Failed to generate valid plan revision")
+                            
+                    except Exception as e:
+                        log_event_fn(f"Plan revision failed: {e}", MSG_TYPE.MSG_TYPE_WARNING, event_id=revision_id)
+                        current_scratchpad += f"\n**Plan Revision Failed**: {str(e)}\nContinuing with original plan."
+
+                # Prepare parameters for tool execution
+                param_assets = {}
+                if requires_code:
+                    log_event_fn("💻 Generating code for task", MSG_TYPE.MSG_TYPE_INFO)
+                    code_prompt = f"""Generate the specific code needed for the current step.
+
+CURRENT CONTEXT:
+{current_scratchpad}
+
+CURRENT TASK: {tool_name}
+USER REQUEST: "{original_user_prompt}"
+
+Generate clean, functional code that addresses the specific requirements. Focus on:
+1. Solving the immediate problem
+2. Being clear and readable
+3. Including necessary imports and dependencies
+4. Adding helpful comments where appropriate
+
+CODE:"""
+
+                    code_content = self.generate_code(prompt=code_prompt, **llm_generation_kwargs)
+                    code_uuid = f"code_asset_{uuid.uuid4()}"
+                    asset_store[code_uuid] = {"type": "code", "content": code_content}
+                    param_assets['code_asset_id'] = code_uuid
+                    log_event_fn(f"Code asset created: {code_uuid[:8]}...", MSG_TYPE.MSG_TYPE_INFO)
+                    
+                if requires_image:
+                    image_assets = [asset_id for asset_id, asset in asset_store.items() if asset['type'] == 'image' and asset.get('source') == 'user']
+                    if image_assets:
+                        param_assets['image_asset_id'] = image_assets[0]
+                        log_event_fn(f"Using image asset: {image_assets[0][:8]}...", MSG_TYPE.MSG_TYPE_INFO)
+                    else:
+                        log_event_fn("⚠️ Image required but none available", MSG_TYPE.MSG_TYPE_WARNING)
+
+                # Enhanced parameter generation
+                param_prompt = f"""Generate the optimal parameters for this tool execution.
+
+TOOL: {tool_name}
+CURRENT CONTEXT: {current_scratchpad}
+CURRENT REASONING: {reasoning}
+AVAILABLE ASSETS: {json.dumps(param_assets) if param_assets else "None"}
+
+Based on your analysis and the current step you're working on, provide the most appropriate parameters.
+Be specific and purposeful in your parameter choices.
+
+Output format: {{"tool_params": {{...}}}}"""
+
+                log_prompt_fn(f"Parameter Generation Step {i+1}", param_prompt)
+                param_data = self.generate_structured_content(
+                    prompt=param_prompt, 
+                    schema={"tool_params": "object"}, 
+                    temperature=decision_temperature, 
+                    **llm_generation_kwargs
+                )
+                tool_params = param_data.get("tool_params", {}) if param_data else {}
+                
+                current_scratchpad += f"\n**Parameters Generated**: {json.dumps(tool_params, indent=2)}"
+                
+                # Hydrate parameters with assets
+                def _hydrate(data: Any, store: Dict) -> Any:
+                    if isinstance(data, dict): return {k: _hydrate(v, store) for k, v in data.items()}
+                    if isinstance(data, list): return [_hydrate(item, store) for item in data]
+                    if isinstance(data, str) and "asset_" in data and data in store: return store[data].get("content", data)
+                    return data
+                    
+                hydrated_params = _hydrate(tool_params, asset_store)
+                
+                # Execute the tool with detailed logging
+                start_time = time.time()
+                tool_result = {"status": "failure", "error": f"Tool '{tool_name}' failed to execute."}
+                
+                try:
+                    if tool_name in rag_registry:
+                        query = hydrated_params.get("query", "")
+                        if not query:
+                            # Fall back to using reasoning as query
+                            query = reasoning[:200] + "..." if len(reasoning) > 200 else reasoning
+                            
+                        log_event_fn(f"🔍 Searching knowledge base with query: '{query[:50]}...'", MSG_TYPE.MSG_TYPE_INFO)
+                        
+                        top_k = rag_tool_specs[tool_name]["default_top_k"]
+                        min_sim = rag_tool_specs[tool_name]["default_min_sim"]
+                        
+                        raw_results = rag_registry[tool_name](query=query, rag_top_k=top_k)
+                        raw_iter = raw_results["results"] if isinstance(raw_results, dict) and "results" in raw_results else raw_results
+                        
+                        docs = []
+                        for d in raw_iter or []:
+                            doc_data = {
+                                "text": d.get("text", str(d)), 
+                                "score": d.get("score", 0) * 100, 
+                                "metadata": d.get("metadata", {})
+                            }
+                            docs.append(doc_data)
+                        
+                        kept = [x for x in docs if x['score'] >= min_sim]
+                        tool_result = {
+                            "status": "success", 
+                            "results": kept, 
+                            "total_found": len(docs),
+                            "kept_after_filtering": len(kept),
+                            "query_used": query
+                        }
+                        
+                        sources_this_turn.extend([{
+                            "source": tool_name, 
+                            "metadata": x["metadata"], 
+                            "score": x["score"]
+                        } for x in kept])
+                        
+                        log_event_fn(f"📚 Retrieved {len(kept)} relevant documents (from {len(docs)} total)", MSG_TYPE.MSG_TYPE_INFO)
+                        
+                    elif hasattr(self, "mcp") and "local_tools" not in tool_name:
+                        log_event_fn(f"🔧 Executing MCP tool: {tool_name}", MSG_TYPE.MSG_TYPE_TOOL_CALL, meta={
+                            "tool_name": tool_name,
+                            "params": {k: str(v)[:100] for k, v in hydrated_params.items()}  # Truncate for logging
+                        })
+                        
+                        tool_result = self.mcp.execute_tool(tool_name, hydrated_params, lollms_client_instance=self)
+                        
+                        log_event_fn(f"Tool execution completed", MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, meta={
+                            "result_status": tool_result.get("status", "unknown"),
+                            "has_error": "error" in tool_result
+                        })
+                        
+                    elif tool_name == "local_tools::generate_image" and hasattr(self, "tti"):
+                        image_prompt = hydrated_params.get("prompt", "")
+                        log_event_fn(f"🎨 Generating image with prompt: '{image_prompt[:50]}...'", MSG_TYPE.MSG_TYPE_INFO)
+                        
+                        # This would call your text-to-image functionality
+                        image_result = self.tti.generate_image(image_prompt)  # Assuming this method exists
+                        if image_result:
+                            image_uuid = f"generated_image_{uuid.uuid4()}"
+                            asset_store[image_uuid] = {"type": "image", "content": image_result, "source": "generated"}
+                            tool_result = {"status": "success", "image_id": image_uuid, "prompt_used": image_prompt}
+                        else:
+                            tool_result = {"status": "failure", "error": "Image generation failed"}
+                            
+                    else:
+                        tool_result = {"status": "failure", "error": f"Tool '{tool_name}' is not available or supported in this context."}
+                        
+                except Exception as e:
+                    error_msg = f"Exception during '{tool_name}' execution: {str(e)}"
+                    log_event_fn(error_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+                    tool_result = {"status": "failure", "error": error_msg}
+
+                response_time = time.time() - start_time
+                success = tool_result.get("status") == "success"
+                
+                # Record performance
+                performance_tracker.record_tool_usage(tool_name, success, confidence, response_time, tool_result.get("error"))
+                
+                # Update task status
+                if success and current_task_index < len(execution_plan.tasks):
+                    execution_plan.tasks[current_task_index].status = TaskStatus.COMPLETED
+                    completed_tasks.add(current_task_index)
+                    current_task_index += 1
+                
+                # Enhanced observation logging
+                observation_text = json.dumps(tool_result, indent=2)
+                if len(observation_text) > 1000:
+                    # Truncate very long results for scratchpad
+                    truncated_result = {k: (str(v)[:200] + "..." if len(str(v)) > 200 else v) for k, v in tool_result.items()}
+                    observation_text = json.dumps(truncated_result, indent=2)
+                
+                current_scratchpad += f"\n\n### Step {i+1}: Execution & Observation\n"
+                current_scratchpad += f"**Tool Used**: {tool_name}\n"
+                current_scratchpad += f"**Success**: {success}\n"
+                current_scratchpad += f"**Response Time**: {response_time:.2f}s\n"
+                current_scratchpad += f"**Result**:\n```json\n{observation_text}\n```"
+                
+                # Track tool call
+                tool_calls_this_turn.append({
+                    "name": tool_name,
+                    "params": tool_params,
+                    "result": tool_result,
+                    "response_time": response_time,
+                    "confidence": confidence,
+                    "reasoning": reasoning
+                })
+                
+                if success:
+                    log_event_fn(f"✅ Step {i+1} completed successfully", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id, meta={
+                        "tool_name": tool_name,
+                        "response_time": response_time,
+                        "confidence": confidence
+                    })
+                else:
+                    error_detail = tool_result.get("error", "No error detail provided.")
+                    log_event_fn(f"⚠️ Step {i+1} completed with issues: {error_detail}", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id, meta={
+                        "tool_name": tool_name,
+                        "error": error_detail,
+                        "confidence": confidence
+                    })
+                    
+                    # Add failure handling to scratchpad
+                    current_scratchpad += f"\n**Failure Analysis**: {error_detail}"
+                    current_scratchpad += f"\n**Next Steps**: Consider alternative approaches or tools"
+                
+                # Log current progress
+                completed_count = len(completed_tasks)
+                total_tasks = len(execution_plan.tasks)
+                if total_tasks > 0:
+                    progress = (completed_count / total_tasks) * 100
+                    log_event_fn(f"Progress: {completed_count}/{total_tasks} tasks completed ({progress:.1f}%)", MSG_TYPE.MSG_TYPE_STEP_PROGRESS, meta={"progress": progress})
+                
+                # Check if all tasks are completed
+                if completed_count >= total_tasks:
+                    log_event_fn("🎯 All planned tasks completed", MSG_TYPE.MSG_TYPE_INFO)
+                    break
+                    
+            except Exception as ex:
+                log_event_fn(f"💥 Unexpected error in reasoning step {i+1}: {str(ex)}", MSG_TYPE.MSG_TYPE_ERROR, event_id=reasoning_step_id)
+                trace_exception(ex)
+                
+                # Add error to scratchpad for context
+                current_scratchpad += f"\n\n### Step {i+1}: Unexpected Error\n**Error**: {str(ex)}\n**Recovery**: Continuing with adjusted approach"
+                
+                log_event_fn("🔄 Recovering and continuing with next step", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reasoning_step_id)
+
+        # Enhanced self-reflection
+        if enable_self_reflection and len(tool_calls_this_turn) > 0:
+            reflection_id = log_event_fn("🤔 Conducting comprehensive self-assessment...", MSG_TYPE.MSG_TYPE_STEP_START)
+            try:
+                reflection_prompt = f"""Conduct a thorough review of your work and assess the quality of your response to the user's request.
+
+ORIGINAL REQUEST: "{original_user_prompt}"
+TOOLS USED: {len(tool_calls_this_turn)}
+PLAN REVISIONS: {plan_revision_count}
+
+COMPLETE ANALYSIS:
+{current_scratchpad}
+
+Evaluate your performance on multiple dimensions:
+
+1. **Goal Achievement**: Did you fully address the user's request?
+2. **Process Efficiency**: Was your approach optimal given the available tools?
+3. **Information Quality**: Is the information you gathered accurate and relevant?
+4. **Decision Making**: Were your tool choices and parameters appropriate?
+5. **Adaptability**: How well did you handle unexpected results or plan changes?
+
+Provide your assessment as JSON:
+{{
+    "goal_achieved": true,
+    "effectiveness_score": 0.85,
+    "process_efficiency": 0.8,
+    "information_quality": 0.9,
+    "decision_making": 0.85,
+    "adaptability": 0.7,
+    "overall_confidence": 0.82,
+    "strengths": ["Clear reasoning", "Good tool selection"],
+    "areas_for_improvement": ["Could have been more efficient"],
+    "summary": "Successfully completed the user's request with high quality results",
+    "key_insights": ["Discovered that X was more important than initially thought"]
+}}"""
+
+                reflection_data = self.generate_structured_content(
+                    prompt=reflection_prompt,
+                    schema={
+                        "goal_achieved": "boolean",
+                        "effectiveness_score": "number",
+                        "process_efficiency": "number", 
+                        "information_quality": "number",
+                        "decision_making": "number",
+                        "adaptability": "number",
+                        "overall_confidence": "number",
+                        "strengths": "array",
+                        "areas_for_improvement": "array",
+                        "summary": "string",
+                        "key_insights": "array"
+                    },
+                    temperature=0.3,
+                    **llm_generation_kwargs
+                )
+                
+                if reflection_data:
+                    current_scratchpad += f"\n\n### Comprehensive Self-Assessment\n"
+                    current_scratchpad += f"**Goal Achieved**: {reflection_data.get('goal_achieved', False)}\n"
+                    current_scratchpad += f"**Overall Confidence**: {reflection_data.get('overall_confidence', 0.5):.2f}\n"
+                    current_scratchpad += f"**Effectiveness Score**: {reflection_data.get('effectiveness_score', 0.5):.2f}\n"
+                    current_scratchpad += f"**Key Strengths**: {', '.join(reflection_data.get('strengths', []))}\n"
+                    current_scratchpad += f"**Improvement Areas**: {', '.join(reflection_data.get('areas_for_improvement', []))}\n"
+                    current_scratchpad += f"**Summary**: {reflection_data.get('summary', '')}\n"
+                    
+                    log_event_fn(f"✅ Self-assessment completed", MSG_TYPE.MSG_TYPE_STEP_END, event_id=reflection_id, meta={
+                        "overall_confidence": reflection_data.get('overall_confidence', 0.5),
+                        "goal_achieved": reflection_data.get('goal_achieved', False),
+                        "effectiveness_score": reflection_data.get('effectiveness_score', 0.5)
+                    })
+                else:
+                    log_event_fn("Self-assessment data generation failed", MSG_TYPE.MSG_TYPE_WARNING, event_id=reflection_id)
+                    
+            except Exception as e:
+                log_event_fn(f"Self-assessment failed: {e}", MSG_TYPE.MSG_TYPE_WARNING, event_id=reflection_id)
+
+        # Enhanced final synthesis
+        synthesis_id = log_event_fn("📝 Synthesizing comprehensive final response...", MSG_TYPE.MSG_TYPE_STEP_START)
+        
+        final_answer_prompt = f"""Create a comprehensive, well-structured final response that fully addresses the user's request.
+
+ORIGINAL REQUEST: "{original_user_prompt}"
+CONTEXT: {context or "No additional context"}
+
+COMPLETE ANALYSIS AND WORK:
+{current_scratchpad}
+
+GUIDELINES for your response:
+1. **Be Complete**: Address all aspects of the user's request
+2. **Be Clear**: Organize your response logically and use clear language  
+3. **Be Helpful**: Provide actionable information and insights
+4. **Be Honest**: If there were limitations or uncertainties, mention them appropriately
+5. **Be Concise**: While being thorough, avoid unnecessary verbosity
+6. **Cite Sources**: If you used research tools, reference the information appropriately
+
+Your response should feel natural and conversational while being informative and valuable.
+
+FINAL RESPONSE:"""
+        
+        log_prompt_fn("Final Synthesis Prompt", final_answer_prompt)
+        
+        final_answer_text = self.generate_text(
+            prompt=final_answer_prompt,
+            system_prompt=system_prompt,
+            stream=streaming_callback is not None,
+            streaming_callback=streaming_callback,
+            temperature=final_answer_temperature,
+            **llm_generation_kwargs
+        )
+        
+        if isinstance(final_answer_text, dict) and "error" in final_answer_text: 
+            log_event_fn(f"Final synthesis failed: {final_answer_text['error']}", MSG_TYPE.MSG_TYPE_ERROR, event_id=synthesis_id)
+            return {
+                "final_answer": "I encountered an issue while preparing my final response. Please let me know if you'd like me to try again.",
+                "error": final_answer_text["error"],
+                "final_scratchpad": current_scratchpad,
+                "tool_calls": tool_calls_this_turn,
+                "sources": sources_this_turn,
+                "decision_history": decision_history
+            }
+        
+        final_answer = self.remove_thinking_blocks(final_answer_text)
+        
+        # Calculate overall performance metrics
+        overall_confidence = sum(call.get('confidence', 0.5) for call in tool_calls_this_turn) / max(len(tool_calls_this_turn), 1)
+        successful_calls = sum(1 for call in tool_calls_this_turn if call.get('result', {}).get('status') == 'success')
+        success_rate = successful_calls / max(len(tool_calls_this_turn), 1)
+        
+        log_event_fn("✅ Comprehensive response ready", MSG_TYPE.MSG_TYPE_STEP_END, event_id=synthesis_id, meta={
+            "final_answer_length": len(final_answer),
+            "total_tools_used": len(tool_calls_this_turn),
+            "success_rate": success_rate,
+            "overall_confidence": overall_confidence
+        })
+
+        return {
+            "final_answer": final_answer,
+            "final_scratchpad": current_scratchpad,
+            "tool_calls": tool_calls_this_turn,
+            "sources": sources_this_turn,
+            "decision_history": decision_history,
+            "performance_stats": {
+                "total_steps": len(tool_calls_this_turn),
+                "successful_steps": successful_calls,
+                "success_rate": success_rate,
+                "average_confidence": overall_confidence,
+                "plan_revisions": plan_revision_count,
+                "total_reasoning_steps": len(decision_history)
+            },
+            "plan_evolution": {
+                "initial_tasks": len(execution_plan.tasks),
+                "final_version": current_plan_version,
+                "total_revisions": plan_revision_count
+            },
+            "clarification_required": False,
+            "overall_confidence": overall_confidence,
+            "error": None
         }
 
 

@@ -25,7 +25,7 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 *   📝 **Advanced Structured Content Generation:** Reliably generate structured JSON output from natural language prompts using the `generate_structured_content` helper method, enforcing a specific schema.
 *   💬 **Advanced Discussion Management:** Robustly manage conversation histories with `LollmsDiscussion`, featuring branching, context exporting, and automatic pruning.
 *   🧠 **Persistent Memory & Data Zones:** `LollmsDiscussion` now supports multiple, distinct data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field. This allows for sophisticated context layering and state management, enabling agents to learn and remember over time.
-*   ✍️ **Automatic Memorization:** A new `memorize()` method allows the AI to analyze a conversation and extract key facts, appending them to the long-term `memory` for recall in future sessions.
+*   ✍️ **Structured Memorization:** The `memorize()` method analyzes a conversation to extract its essence (e.g., a problem and its solution), creating a structured "memory" with a title and content. These memories are stored and can be explicitly loaded into the AI's context, providing a more robust and manageable long-term memory system.
 *   📊 **Detailed Context Analysis:** The `get_context_status()` method provides a rich, detailed breakdown of the prompt context, showing the content and token count for each individual component (system prompt, data zones, message history).
 *   ⚙️ **Standardized Configuration Management:** A unified dictionary-based system (`llm_binding_config`) to configure any binding in a consistent manner.
 *   🧩 **Extensible:** Designed to easily incorporate new LLM backends and modality services, including custom MCP toolsets.
@@ -353,7 +353,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
             # The 'breakdown' shows the individual zones that were combined
             for name, content in sys_ctx.get('breakdown', {}).items():
                 # For brevity, show only first line of content
-                print(f"    -> Contains '{name}': {content.split(os.linesep)[0]}...")
+                print(f"    -> Contains '{name}': {content.split(os.linesep)}...")
 
         # Print the message history details
         if 'message_history' in status['zones']:
@@ -393,7 +393,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
             if name == 'memory':
                 ASCIIColors.yellow(f"    -> Full '{name}' content:\n{content}")
             else:
-                print(f"    -> Contains '{name}': {content.split(os.linesep)[0]}...")
+                print(f"    -> Contains '{name}': {content.split(os.linesep)}...")
     print("------------------------------------------")
 
 ```

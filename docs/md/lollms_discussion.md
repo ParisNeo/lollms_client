@@ -34,19 +34,17 @@ Long conversations can exceed the LLM's context window. `LollmsDiscussion` imple
 *   **`user_data_zone`**: For information specific to the user across multiple discussions (e.g., user preferences, persona details).
 *   **`discussion_data_zone`**: For information specific to the current discussion that might not be part of the direct chat (e.g., project details, specific instructions for this session).
 *   **`personality_data_zone`**: When using `LollmsPersonality`, this zone is populated with data specific to the loaded personality.
-*   **`memory`**: A long-term memory store that can accumulate knowledge extracted from discussions over time using the `memorize` method.
+*   **`memory`**: A long-term memory store. This zone holds the content of "memories" that have been explicitly loaded. The `memorize()` method analyzes a discussion and creates new, structured memories (e.g., about a problem and its solution) that can be managed and loaded into this zone.
 
 These zones are automatically included in the `lollms_text` export format, providing the LLM with relevant background context.
 
-### Artefacts: Managing Custom Content
+### Artefacts & Memories: Managing Custom Content
 
-Beyond conversation history, `LollmsDiscussion` allows you to embed, version, and manage custom content blobs called **Artefacts**. Artefacts are stored within the discussion's metadata and are ideal for tracking generated content like:
-*   Documents (e.g., project briefs, summaries)
-*   Code snippets
-*   Configuration files (JSON, YAML)
-*   Any other structured text that evolves with the conversation.
+Beyond conversation history, `LollmsDiscussion` allows you to manage custom content blobs called **Artefacts** and **Memories**. These are stored within the discussion's metadata and are ideal for tracking different kinds of generated or provided information:
+*   **Artefacts**: Best for version-controlled content that evolves with the conversation, such as documents, code snippets, or configuration files. They can be loaded into the `discussion_data_zone`.
+*   **Memories**: Designed to capture the essence of a discussion (e.g., a problem and its final solution). They are created by the `memorize()` method and can be loaded into the `memory` data zone to provide long-term context.
 
-This provides a structured way to manage outputs that are more than just a chat message, allowing you to track their versions, load them into the context for refinement, and export them with the discussion.
+This provides a structured way to manage and inject different types of contextual information into the LLM's prompt.
 
 ### Multi-Modality (Image Handling)
 
@@ -125,7 +123,7 @@ class MockLollmsClient(LollmsClient):
     def count_image_tokens(self, image_b64): return 100 # Mock value
     def generate_text(self, prompt, **kwargs): return f"AI response to: {prompt}"
     def generate_structured_content(self, prompt, schema, system_prompt, **kwargs):
-        if "title" in schema.get("properties", {}): return {"title": "Mocked Discussion Title"}
+        if "title" in schema.get("properties", {}): return {"title": "Mocked Discussion Title", "content":"Mocked content"}
         return {"result": "mock"}
     def remove_thinking_blocks(self, text):
         return text.replace("<thinking>", "").replace("</thinking>", "").replace("<think>", "").replace("</think>", "")
@@ -177,7 +175,7 @@ else:
 *   `id` (str): Unique identifier for the discussion.
 *   `system_prompt` (str): The initial system-level instructions for the LLM.
 *   `user_data_zone`, `discussion_data_zone`, `personality_data_zone` (str): Persistent data zones.
-*   `memory` (str): Long-term knowledge accumulated via `memorize()`.
+*   `memory` (str): Long-term knowledge accumulated via `memorize()` and by loading memories.
 *   `participants` (dict): Maps sender names to roles (e.g., `{"user": "User"}`).
 *   `active_branch_id` (str): The ID of the last message in the current active branch.
 *   `discussion_metadata` (dict): A flexible dictionary for storing arbitrary discussion-level metadata. Accessed via the `metadata` property.
@@ -196,8 +194,7 @@ Adds a new message to the discussion. This is how you build the conversation his
 # Assuming loaded_discussion is a valid LollmsDiscussion instance
 user_msg_1 = loaded_discussion.add_message(sender="user", content="Hello!")
 ai_msg_1 = loaded_discussion.add_message(sender="assistant", content="Hi there!", parent_id=user_msg_1.id)
-print(f"Added User Message: {user_msg_1.content} (ID: {user_msg_1.id})")
-```
+print(f"Added User Message: {user_msg_1.content} (ID: {user_msg_1.id})")```
 
 #### `chat(...) -> Dict[str, LollmsMessage]`
 
@@ -216,8 +213,7 @@ Deletes the last AI response and re-generates a new one based on the previous us
 ```python
 print("\n--- Regenerate Branch Example ---")
 regenerated_messages = loaded_discussion.regenerate_branch()
-print(f"Regenerated AI Response: {regenerated_messages['ai_message'].content}")
-```
+print(f"Regenerated AI Response: {regenerated_messages['ai_message'].content}")```
 
 #### `get_messages(branch_id: Optional[str] = None) -> List[LollmsMessage]`
 
@@ -279,12 +275,15 @@ if loaded_discussion.pruning_summary:
 
 #### `memorize(branch_tip_id: Optional[str] = None)`
 
-Analyzes the discussion and extracts key information to append to the discussion's long-term `memory` field.
+Analyzes the discussion and creates a new structured "memory" containing the essence of the conversation (e.g., a problem and its solution). This memory is stored and can be loaded into the `memory` data zone for future reference.
 
 ```python
-loaded_discussion.chat(user_message="My favorite color is blue.")
+loaded_discussion.chat(user_message="I'm having a bug where my Python script fails to read a file. The error is FileNotFoundError. I fixed it by providing the absolute path instead of the relative one.")
 loaded_discussion.memorize()
-print(f"Memory after memorizing: {loaded_discussion.memory}")
+new_memory = loaded_discussion.list_memories()[-1]
+print(f"New memory created: '{new_memory['title']}'")
+# To use it, you would load it into the context:
+# loaded_discussion.load_memory_into_context(new_memory['title'])
 ```
 
 #### `get_full_data_zone() -> str`
@@ -337,16 +336,16 @@ generated_title = loaded_discussion.auto_title()
 loaded_discussion.set_metadata_item("project_status", "in_progress")
 ```
 
-#### Artefact Management
+#### Artefact & Memory Management
 
-Methods for creating, retrieving, updating, and deleting versioned custom content.
+Methods for creating, retrieving, updating, and managing versioned custom content (Artefacts) and discussion summaries (Memories).
 
 *   **`list_artefacts() -> List[Dict]`**: Lists all artefacts.
 *   **`add_artefact(title, content, ...)`**: Adds a new artefact.
-*   **`get_artefact(title, version=None)`**: Retrieves an artefact.
-*   **`update_artefact(title, new_content, ...)`**: Creates a new version of an artefact.
-*   **`remove_artefact(title, version=None)`**: Removes artefact(s).
-*   **`load_artefact_into_data_zone(title, ...)`**: Places artefact content into the context.
+*   **`load_artefact_into_data_zone(title, ...)`**: Places artefact content into the `discussion_data_zone`.
+*   **`list_memories() -> List[Dict]`**: Lists all memories.
+*   **`add_memory(title, content, ...)`**: Adds a new memory.
+*   **`load_memory_into_context(title)`**: Places memory content into the `memory` data zone.
 
 ```python
 print("\n--- Artefact Management Example ---")
@@ -374,8 +373,7 @@ print(f"Cloned discussion {cloned.id} has {len(cloned.get_all_messages_flat())} 
 json_data = loaded_discussion.export_to_json_str()
 # Import
 imported = LollmsDiscussion.import_from_json_str(json_data, lollms_client, data_manager)
-print(f"Imported discussion {imported.id} with {len(imported.get_all_messages_flat())} messages.")
-```
+print(f"Imported discussion {imported.id} with {len(imported.get_all_messages_flat())} messages.")```
 
 #### `commit()`, `close()`, `touch()`
 

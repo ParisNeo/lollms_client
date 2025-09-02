@@ -134,7 +134,7 @@ def create_dynamic_models(
         user_data_zone = Column(EncryptedText, nullable=True) # Field for persistent user-specific data
         discussion_data_zone = Column(EncryptedText, nullable=True) # Field for persistent discussion-specific data
         personality_data_zone = Column(EncryptedText, nullable=True) # Field for persistent personality-specific data
-        memory = Column(EncryptedText, nullable=True) # New field for long-term memory across discussions
+        memory = Column(EncryptedText, nullable=True) # Field for long-term memory, now managed with structured memories
         
         participants = Column(JSON, nullable=True, default=dict)
         active_branch_id = Column(String, nullable=True)
@@ -1646,71 +1646,81 @@ class LollmsDiscussion:
 
     def memorize(self, branch_tip_id: Optional[str] = None):
         """
-        Analyzes the current discussion, extracts key information suitable for long-term
-        memory, and appends it to the discussion's 'memory' field.
-
-        This is intended to build a persistent knowledge base about user preferences,
-        facts, and context that can be useful across different future discussions.
+        Analyzes the current discussion to create a structured memory of its essence,
+        focusing on preserving detailed technical content, problems, and solutions.
+        This new memory is then automatically saved and loaded into the context for immediate use.
 
         Args:
             branch_tip_id: The ID of the message to use as the end of the context
-                           for memory extraction. Defaults to the active branch.
+                        for memory extraction. Defaults to the active branch.
         """
         try:
-            # 1. Get the current conversation context
             discussion_context = self.export("markdown", branch_tip_id=branch_tip_id)
             if not discussion_context.strip():
                 print("[INFO] Memorize: Discussion is empty, nothing to memorize.")
                 return
 
-            # 2. Formulate the prompt for the LLM
             system_prompt = (
-                "You are a Memory Extractor AI. Your task is to analyze a conversation "
-                "and extract only the most critical pieces of information that would be "
-                "valuable for a future, unrelated conversation with the same user. "
-                "Focus on: \n"
-                "- Explicit user preferences, goals, or facts about themselves.\n"
-                "- Key decisions or conclusions reached.\n"
-                "- Important entities, projects, or topics mentioned that are likely to recur.\n"
-                "Format the output as a concise list of bullet points. Be brief and factual. "
-                "Do not repeat information that is already in the User Data Zone or the Memory"
-                "If no new, significant long-term information is present, output the single word: 'NOTHING'."
+                "You are a Technical Knowledge Extraction AI specialized in preserving detailed information. "
+                "Your task is to extract and preserve the ACTUAL CONTENT and DETAILS from discussions, not just summaries.\n\n"
+                
+                "CRITICAL INSTRUCTIONS:\n"
+                "- If equations, formulas, or code are mentioned, INCLUDE THE FULL EQUATIONS/FORMULAS/CODE in the memory\n"
+                "- If technical procedures or steps are discussed, preserve the EXACT STEPS\n"
+                "- If specific values, parameters, or constants are mentioned, include them\n"
+                "- If problems and solutions are discussed, capture BOTH the problem statement AND the detailed solution\n"
+                "- Focus on ACTIONABLE and REFERENCEABLE content that someone could use later\n"
+                "- Preserve technical terminology, variable names, and specific implementation details\n"
+                "- Do NOT create high-level summaries - capture the actual working content\n\n"
+                
+                "OUTPUT FORMAT: JSON with 'title' (descriptive but specific) and 'content' (detailed technical content)"
             )
             
             prompt = (
-                "Analyze the following discussion and extract key information for long-term memory:\n\n"
-                f"--- Conversation ---\n{discussion_context}\n\n"
-                "--- Extracted Memory Points (as a bulleted list) ---"
-            )
-
-            # 3. Call the LLM to extract information
-            print("[INFO] Memorize: Extracting key information from discussion...")
-            extracted_info = self.lollmsClient.generate_text(
-                prompt,
-                system_prompt=system_prompt,
-                n_predict=512, # A reasonable length for a summary
-                temperature=0.1, # Low temperature for factual extraction
-                top_k=10,
-            )
-
-            # 4. Process and append the information
-            if extracted_info and "NOTHING" not in extracted_info.upper():
-                new_memory_entry = extracted_info.strip()
+                "Extract the key technical content from this discussion. Focus on preserving:\n"
+                "1. Complete equations, formulas, or code snippets\n"
+                "2. Specific problem statements and their detailed solutions\n"
+                "3. Step-by-step procedures or algorithms\n"
+                "4. Important constants, values, or parameters\n"
+                "5. Technical concepts with their precise definitions\n"
+                "6. Any implementation details or configuration settings\n\n"
                 
-                # Format with a timestamp for context
-                timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                formatted_entry = f"\n\n--- Memory entry from {timestamp} ---\n{new_memory_entry}"
+                "IMPORTANT: Do not summarize what was discussed - extract the actual usable content.\n"
+                "If Maxwell's equations were shown, include the actual equations.\n"
+                "If code was provided, include the actual code.\n"
+                "If a solution method was explained, include the actual steps.\n\n"
+                
+                f"--- Conversation to Extract From ---\n{discussion_context}\n\n"
+                
+                "Extract the technical essence that would be valuable for future reference:"
+            )
 
-                current_memory = self.memory or ""
-                self.memory = (current_memory + formatted_entry).strip()
-                self.touch() # Mark as updated and save if autosave is on
-                print(f"[INFO] Memorize: New information added to long-term memory.")
+            print("[INFO] Memorize: Extracting detailed technical content into a new memory...")
+            memory_json = self.lollmsClient.generate_structured_content(
+                prompt,
+                schema={
+                    "title": "A descriptive title indicating the type of problem solved (e.g., 'Python Import Error Fix', 'Database Connection Issue Solution')", 
+                    "content": "Structured content with PROBLEM: [detailed problem] and SOLUTION: [detailed solution] sections"
+                },
+                system_prompt=system_prompt,
+                temperature=0.1
+            )
+
+            if memory_json and memory_json.get("title") and memory_json.get("content"):
+                title = memory_json["title"]
+                self.add_memory(
+                    title=title,
+                    content=memory_json["content"]
+                )
+                # Automatically load the newly created memory into the context
+                self.load_memory_into_context(title)
+                print(f"[INFO] Memorize: New memory created and loaded into context: '{title}'.")
             else:
-                print("[INFO] Memorize: No new significant information found to add to memory.")
+                print("[WARNING] Memorize: Failed to generate a valid memory from the discussion.")
                 
         except Exception as e:
             trace_exception(e)
-            print(f"[ERROR] Memorize: Failed to extract memory. {e}")
+            print(f"[ERROR] Memorize: Failed to create memory. {e}")
 
     def count_discussion_tokens(self, format_type: str, branch_tip_id: Optional[str] = None) -> int:
         """Counts the number of tokens in the exported discussion content.
@@ -2447,6 +2457,166 @@ class LollmsDiscussion:
             title=title, content=content, version=version, **extra_data
         )
 
+    def remove_artefact(self, title: str, version: Optional[int] = None) -> int:
+        """
+        Removes artefacts by title. Removes all versions if `version` is None.
+        
+        Returns:
+            The number of artefact entries removed.
+        """
+        new_metadata = (self.metadata or {}).copy()
+        artefacts = new_metadata.get("_artefacts", [])
+        if not artefacts:
+            return 0
+
+        initial_count = len(artefacts)
+        
+        if version is None:
+            # Remove all versions with the matching title
+            kept_artefacts = [a for a in artefacts if a.get('title') != title]
+        else:
+            # Remove only the specific title and version
+            kept_artefacts = [a for a in artefacts if not (a.get('title') == title and a.get('version') == version)]
+
+        if len(kept_artefacts) < initial_count:
+            new_metadata["_artefacts"] = kept_artefacts
+            self.metadata = new_metadata
+            self.commit()
+
+        removed_count = initial_count - len(kept_artefacts)
+        if removed_count > 0:
+            print(f"Removed {removed_count} artefact(s) titled '{title}'.")
+            
+        return removed_count
+
+    # Memories management system
+    def list_memories(self) -> List[Dict[str, Any]]:
+        """
+        Lists all memories stored in the discussion's metadata.
+        """
+        metadata = self.metadata or {}
+        memories = metadata.get("_memories", [])
+        now = datetime.utcnow().isoformat()
+        
+        upgraded = []
+        dirty = False
+        for memory in memories:
+            fixed = memory.copy()
+            if "title" not in fixed: fixed["title"] = "untitled"; dirty = True
+            if "content" not in fixed: fixed["content"] = ""; dirty = True
+            if "created_at" not in fixed: fixed["created_at"] = now; dirty = True
+            
+            section_start = f"--- Memory: {fixed['title']} ---"
+            fixed["is_loaded"] = section_start in (self.memory or "")
+            upgraded.append(fixed)
+
+        if dirty:
+            metadata["_memories"] = upgraded
+            self.metadata = metadata
+            self.commit()
+
+        return upgraded
+
+    def add_memory(self, title: str, content: str, **extra_data) -> Dict[str, Any]:
+        """
+        Adds or overwrites a memory in the discussion.
+        """
+        new_metadata = (self.metadata or {}).copy()
+        memories = new_metadata.get("_memories", [])
+        
+        memories = [m for m in memories if m.get('title') != title]
+
+        new_memory = {
+            "title": title, "content": content,
+            "created_at": datetime.utcnow().isoformat(),
+            **extra_data
+        }
+        memories.append(new_memory)
+        
+        new_metadata["_memories"] = memories
+        self.metadata = new_metadata
+        self.commit()
+        return new_memory
+
+    def get_memory(self, title: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves a memory by title.
+        """
+        memories = self.list_memories()
+        return next((m for m in memories if m.get('title') == title), None)
+
+    def load_memory_into_context(self, title: str):
+        """
+        Loads a memory's content into the long-term memory context.
+        """
+        memory = self.get_memory(title)
+        if not memory:
+            raise ValueError(f"Memory '{title}' not found.")
+
+        if memory.get('content'):
+            section = (
+                f"--- Memory: {memory['title']} ---\n"
+                f"{memory['content']}\n"
+                f"--- End Memory: {memory['title']} ---\n\n"
+            )
+            if section not in (self.memory or ""):
+                current_memory_zone = self.memory or ""
+                self.memory = current_memory_zone.rstrip() + "\n\n" + section
+                self.touch()
+                self.commit()
+                print(f"Loaded memory '{title}' into context.")
+
+    def unload_memory_from_context(self, title: str):
+        """
+        Removes a memory's content from the long-term memory context.
+        """
+        memory = self.get_memory(title)
+        if not memory:
+            raise ValueError(f"Memory '{title}' not found.")
+
+        if self.memory and memory.get('content'):
+            section_start = f"--- Memory: {memory['title']} ---"
+            pattern = rf"\n*\s*{re.escape(section_start)}.*?--- End Memory: {re.escape(memory['title'])} ---\s*\n*"
+            self.memory = re.sub(pattern, "", self.memory, flags=re.DOTALL).strip()
+            self.touch()
+            self.commit()
+            print(f"Unloaded memory '{title}' from context.")
+
+    def is_memory_loaded(self, title: str) -> bool:
+        """
+        Checks if a memory is currently loaded in the long-term memory context.
+        """
+        memory = self.get_memory(title)
+        if not memory:
+            return False
+
+        section_start = f"--- Memory: {memory['title']} ---"
+        return section_start in (self.memory or "")
+
+    def remove_memory(self, title: str) -> int:
+        """
+        Removes a memory by title.
+        
+        Returns:
+            The number of memories removed (0 or 1).
+        """
+        new_metadata = (self.metadata or {}).copy()
+        memories = new_metadata.get("_memories", [])
+        if not memories:
+            return 0
+
+        initial_count = len(memories)
+        kept_memories = [m for m in memories if m.get('title') != title]
+
+        if len(kept_memories) < initial_count:
+            new_metadata["_memories"] = kept_memories
+            self.metadata = new_metadata
+            self.commit()
+            print(f"Removed memory titled '{title}'.")
+            return 1
+            
+        return 0
+
     def clone_without_messages(self) -> 'LollmsDiscussion':
         """
         Creates a new discussion with the same context but no message history.
@@ -2540,35 +2710,3 @@ class LollmsDiscussion:
             new_discussion.commit()
 
         return new_discussion
-
-    def remove_artefact(self, title: str, version: Optional[int] = None) -> int:
-        """
-        Removes artefacts by title. Removes all versions if `version` is None.
-        
-        Returns:
-            The number of artefact entries removed.
-        """
-        new_metadata = (self.metadata or {}).copy()
-        artefacts = new_metadata.get("_artefacts", [])
-        if not artefacts:
-            return 0
-
-        initial_count = len(artefacts)
-        
-        if version is None:
-            # Remove all versions with the matching title
-            kept_artefacts = [a for a in artefacts if a.get('title') != title]
-        else:
-            # Remove only the specific title and version
-            kept_artefacts = [a for a in artefacts if not (a.get('title') == title and a.get('version') == version)]
-
-        if len(kept_artefacts) < initial_count:
-            new_metadata["_artefacts"] = kept_artefacts
-            self.metadata = new_metadata
-            self.commit()
-
-        removed_count = initial_count - len(kept_artefacts)
-        if removed_count > 0:
-            print(f"Removed {removed_count} artefact(s) titled '{title}'.")
-            
-        return removed_count
