@@ -4033,6 +4033,383 @@ Do not split the code in multiple tags.
 
         return code_content # Return the (potentially completed) code content or None
 
+
+    def update_code(
+        self,
+        original_code: str,
+        modification_prompt: str,
+        language: str = "python",
+        images=[],
+        system_prompt: str | None = None,
+        patch_format: str = "unified",  # "unified" or "simple"
+        n_predict: int | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repeat_penalty: float | None = None,
+        repeat_last_n: int | None = None,
+        callback=None,
+        debug: bool = False,
+        max_retries: int = 3
+    ):
+        """
+        Updates existing code based on a modification prompt by generating and applying patches.
+        Designed to work reliably even with smaller LLMs.
+        
+        Args:
+            original_code: The original code to be modified
+            modification_prompt: Description of changes to apply to the code
+            language: Programming language of the code
+            patch_format: "unified" for diff-style patches or "simple" for line-based replacements
+            max_retries: Maximum number of attempts if patch generation/application fails
+            
+        Returns:
+            dict: Contains 'success' (bool), 'updated_code' (str or None), 'patch' (str or None), 
+                and 'error' (str or None)
+        """
+        
+        if not original_code or not original_code.strip():
+            return {
+                "success": False,
+                "updated_code": None,
+                "patch": None,
+                "error": "Original code is empty"
+            }
+        
+        # Choose patch format based on LLM capabilities
+        if patch_format == "simple":
+            # Simple format for smaller LLMs - just old/new line pairs
+            patch_system_prompt = f"""You are a code modification assistant.
+You will receive {language} code and a modification request.
+Generate a patch using this EXACT format:
+
+PATCH_START
+REPLACE_LINE: <line_number>
+OLD: <exact_old_line>
+NEW: <new_line>
+REPLACE_LINE: <another_line_number>
+OLD: <exact_old_line>
+NEW: <new_line>
+PATCH_END
+
+For adding lines:
+ADD_AFTER: <line_number>
+NEW: <line_to_add>
+
+For removing lines:
+REMOVE_LINE: <line_number>
+
+Rules:
+- Line numbers start at 1
+- Match OLD lines EXACTLY including whitespace
+- Only include lines that need changes
+- Keep changes minimal and focused"""
+
+        else:  # unified diff format
+            patch_system_prompt = f"""You are a code modification assistant.
+You will receive {language} code and a modification request.
+Generate a unified diff patch showing the changes.
+
+Format your response as:
+```diff
+@@ -start_line,count +start_line,count @@
+ context_line (unchanged)
+-removed_line
++added_line
+ context_line (unchanged)
+```
+
+Rules:
+- Use standard unified diff format
+- Include 1-2 lines of context around changes
+- Be precise with line numbers
+- Keep changes minimal"""
+
+        if system_prompt:
+            patch_system_prompt = system_prompt + "\n\n" + patch_system_prompt
+        
+        # Prepare the prompt with line numbers for reference
+        numbered_code = "\n".join(
+            f"{i+1:4d}: {line}" 
+            for i, line in enumerate(original_code.split("\n"))
+        )
+        
+        patch_prompt = f"""Original {language} code (with line numbers for reference):
+```{language}
+{numbered_code}
+```
+
+Modification request: {modification_prompt}
+
+Generate a patch to apply these changes. Follow the format specified in your instructions exactly."""
+
+        retry_count = 0
+        last_error = None
+        
+        while retry_count < max_retries:
+            try:
+                if debug:
+                    ASCIIColors.info(f"Attempting to generate patch (attempt {retry_count + 1}/{max_retries})")
+                
+                # Generate the patch
+                response = self.generate_text(
+                    patch_prompt,
+                    images=images,
+                    system_prompt=patch_system_prompt,
+                    n_predict=n_predict or 2000,  # Usually patches are not too long
+                    temperature=temperature or 0.3,  # Lower temperature for more deterministic patches
+                    top_k=top_k,
+                    top_p=top_p,
+                    repeat_penalty=repeat_penalty,
+                    repeat_last_n=repeat_last_n,
+                    streaming_callback=callback
+                )
+                
+                if isinstance(response, dict) and not response.get("status", True):
+                    raise Exception(f"Patch generation failed: {response.get('error')}")
+                
+                # Extract and apply the patch
+                if patch_format == "simple":
+                    updated_code, patch_text = self._apply_simple_patch(original_code, response, debug)
+                else:
+                    updated_code, patch_text = self._apply_unified_patch(original_code, response, debug)
+                
+                if updated_code:
+                    if debug:
+                        ASCIIColors.success("Code successfully updated")
+                    return {
+                        "success": True,
+                        "updated_code": updated_code,
+                        "patch": patch_text,
+                        "error": None
+                    }
+                else:
+                    raise Exception("Failed to apply patch - no valid changes found")
+                    
+            except Exception as e:
+                last_error = str(e)
+                if debug:
+                    ASCIIColors.warning(f"Attempt {retry_count + 1} failed: {last_error}")
+                
+                retry_count += 1
+                
+                # Try simpler approach on retry
+                if retry_count < max_retries and patch_format == "unified":
+                    patch_format = "simple"
+                    if debug:
+                        ASCIIColors.info("Switching to simple patch format for next attempt")
+        
+        # All retries exhausted
+        return {
+            "success": False,
+            "updated_code": None,
+            "patch": None,
+            "error": f"Failed after {max_retries} attempts. Last error: {last_error}"
+        }
+
+
+    def _apply_simple_patch(self, original_code: str, patch_response: str, debug: bool = False):
+        """
+        Apply a simple line-based patch to the original code.
+        
+        Returns:
+            tuple: (updated_code or None, patch_text or None)
+        """
+        try:
+            lines = original_code.split("\n")
+            patch_lines = []
+            
+            # Extract patch content
+            if "PATCH_START" in patch_response and "PATCH_END" in patch_response:
+                start_idx = patch_response.index("PATCH_START")
+                end_idx = patch_response.index("PATCH_END")
+                patch_content = patch_response[start_idx + len("PATCH_START"):end_idx].strip()
+            else:
+                # Try to extract patch instructions even without markers
+                patch_content = patch_response
+            
+            # Track modifications to apply them in reverse order (to preserve line numbers)
+            modifications = []
+            
+            for line in patch_content.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                patch_lines.append(line)
+                
+                if line.startswith("REPLACE_LINE:"):
+                    try:
+                        line_num = int(line.split(":")[1].strip()) - 1  # Convert to 0-based
+                        # Look for OLD and NEW in next lines
+                        idx = patch_content.index(line)
+                        remaining = patch_content[idx:].split("\n")
+                        
+                        old_line = None
+                        new_line = None
+                        
+                        for next_line in remaining[1:]:
+                            if next_line.strip().startswith("OLD:"):
+                                old_line = next_line[next_line.index("OLD:") + 4:].strip()
+                            elif next_line.strip().startswith("NEW:"):
+                                new_line = next_line[next_line.index("NEW:") + 4:].strip()
+                                break
+                        
+                        if old_line is not None and new_line is not None:
+                            modifications.append(("replace", line_num, old_line, new_line))
+                            
+                    except (ValueError, IndexError) as e:
+                        if debug:
+                            ASCIIColors.warning(f"Failed to parse REPLACE_LINE: {e}")
+                            
+                elif line.startswith("ADD_AFTER:"):
+                    try:
+                        line_num = int(line.split(":")[1].strip()) - 1
+                        # Look for NEW in next line
+                        idx = patch_content.index(line)
+                        remaining = patch_content[idx:].split("\n")
+                        
+                        for next_line in remaining[1:]:
+                            if next_line.strip().startswith("NEW:"):
+                                new_line = next_line[next_line.index("NEW:") + 4:].strip()
+                                modifications.append(("add_after", line_num, None, new_line))
+                                break
+                                
+                    except (ValueError, IndexError) as e:
+                        if debug:
+                            ASCIIColors.warning(f"Failed to parse ADD_AFTER: {e}")
+                            
+                elif line.startswith("REMOVE_LINE:"):
+                    try:
+                        line_num = int(line.split(":")[1].strip()) - 1
+                        modifications.append(("remove", line_num, None, None))
+                        
+                    except (ValueError, IndexError) as e:
+                        if debug:
+                            ASCIIColors.warning(f"Failed to parse REMOVE_LINE: {e}")
+            
+            if not modifications:
+                return None, None
+            
+            # Sort modifications by line number in reverse order
+            modifications.sort(key=lambda x: x[1], reverse=True)
+            
+            # Apply modifications
+            for mod_type, line_num, old_line, new_line in modifications:
+                if line_num < 0 or line_num >= len(lines):
+                    if debug:
+                        ASCIIColors.warning(f"Line number {line_num + 1} out of range")
+                    continue
+                    
+                if mod_type == "replace":
+                    # Verify old line matches (with some flexibility for whitespace)
+                    if old_line and lines[line_num].strip() == old_line.strip():
+                        # Preserve original indentation
+                        indent = len(lines[line_num]) - len(lines[line_num].lstrip())
+                        lines[line_num] = " " * indent + new_line.lstrip()
+                    elif debug:
+                        ASCIIColors.warning(f"Line {line_num + 1} doesn't match expected content")
+                        
+                elif mod_type == "add_after":
+                    # Get indentation from the reference line
+                    indent = len(lines[line_num]) - len(lines[line_num].lstrip())
+                    lines.insert(line_num + 1, " " * indent + new_line.lstrip())
+                    
+                elif mod_type == "remove":
+                    del lines[line_num]
+            
+            updated_code = "\n".join(lines)
+            patch_text = "\n".join(patch_lines)
+            
+            return updated_code, patch_text
+            
+        except Exception as e:
+            if debug:
+                ASCIIColors.error(f"Error applying simple patch: {e}")
+            return None, None
+
+
+    def _apply_unified_patch(self, original_code: str, patch_response: str, debug: bool = False):
+        """
+        Apply a unified diff patch to the original code.
+        
+        Returns:
+            tuple: (updated_code or None, patch_text or None)
+        """
+        try:
+            import re
+            
+            lines = original_code.split("\n")
+            
+            # Extract diff content
+            diff_pattern = r'```diff\n(.*?)\n```'
+            diff_match = re.search(diff_pattern, patch_response, re.DOTALL)
+            
+            if diff_match:
+                patch_text = diff_match.group(1)
+            else:
+                # Try to find diff content without code blocks
+                if "@@" in patch_response:
+                    patch_text = patch_response
+                else:
+                    return None, None
+            
+            # Parse and apply hunks
+            hunk_pattern = r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@'
+            hunks = re.finditer(hunk_pattern, patch_text)
+            
+            changes = []
+            for hunk in hunks:
+                old_start = int(hunk.group(1)) - 1  # Convert to 0-based
+                old_count = int(hunk.group(2)) if hunk.group(2) else 1
+                new_start = int(hunk.group(3)) - 1
+                new_count = int(hunk.group(4)) if hunk.group(4) else 1
+                
+                # Extract hunk content
+                hunk_start = hunk.end()
+                next_hunk = re.search(hunk_pattern, patch_text[hunk_start:])
+                hunk_end = hunk_start + next_hunk.start() if next_hunk else len(patch_text)
+                
+                hunk_lines = patch_text[hunk_start:hunk_end].strip().split("\n")
+                
+                # Process hunk lines
+                for line in hunk_lines:
+                    if not line:
+                        continue
+                        
+                    if line.startswith("-"):
+                        changes.append(("remove", old_start, line[1:].strip()))
+                    elif line.startswith("+"):
+                        changes.append(("add", old_start, line[1:].strip()))
+                    # Context lines (starting with space) are ignored
+            
+            # Apply changes (in reverse order to maintain line numbers)
+            changes.sort(key=lambda x: x[1], reverse=True)
+            
+            for change_type, line_num, content in changes:
+                if line_num < 0 or line_num > len(lines):
+                    continue
+                    
+                if change_type == "remove":
+                    if line_num < len(lines) and lines[line_num].strip() == content:
+                        del lines[line_num]
+                elif change_type == "add":
+                    # Preserve indentation from nearby lines
+                    indent = 0
+                    if line_num > 0:
+                        indent = len(lines[line_num - 1]) - len(lines[line_num - 1].lstrip())
+                    lines.insert(line_num, " " * indent + content)
+            
+            updated_code = "\n".join(lines)
+            
+            return updated_code, patch_text
+            
+        except Exception as e:
+            if debug:
+                ASCIIColors.error(f"Error applying unified patch: {e}")
+            return None, None
+
+
     def generate_structured_content(
         self,
         prompt,
