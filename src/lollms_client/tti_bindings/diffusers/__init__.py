@@ -333,7 +333,13 @@ class ModelManager:
             if str(model_path).endswith(".safetensors"):
                 if task == "text2image":
                     try:
-                        self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
+                        from diffusers import QwenImagePipeline  # or whatever the correct import is
+                        
+                        # In your _load_pipeline_for_task method, add a special case for Qwen:
+                        if "qwen" in model_name.lower():
+                            self.pipeline = QwenImagePipeline.from_pretrained(model_path, **common_args)
+                        else:
+                            self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
                     except AttributeError:
                         self.pipeline = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
                 elif task == "image2image":
