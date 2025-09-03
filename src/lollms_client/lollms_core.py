@@ -3921,23 +3921,35 @@ FINAL RESPONSE:"""
                         repeat_penalty:float|None=None,
                         repeat_last_n:int|None=None,
                         callback=None,
-                        debug:bool=False ):
+                        debug:bool=False,
+                        override_all_prompts:bool=False ):
         """
         Generates a single code block based on a prompt.
         Uses the underlying LLM binding via `generate_text`.
         Handles potential continuation if the code block is incomplete.
+        
+        Args:
+            override_all_prompts: If True, uses only the provided prompt and system_prompt 
+                                without any internal prompt engineering or modifications.
         """
-        if not  system_prompt:
-            system_prompt = f"""Act as a code generation assistant that generates code from user prompt."""
+        
+        # Use original prompts without modification if override is enabled
+        if override_all_prompts:
+            final_system_prompt = system_prompt if system_prompt else ""
+            final_prompt = prompt
+        else:
+            # Original prompt engineering logic
+            if not system_prompt:
+                system_prompt = f"""Act as a code generation assistant that generates code from user prompt."""
 
-        if template and template !="{}":
-            if language in ["json","yaml","xml"]:
-                system_prompt += f"\nMake sure the generated context follows the following schema:\n```{language}\n{template}\n```\n"
-            else:
-                system_prompt += f"\nHere is a template of the answer:\n```{language}\n{template}\n```\n"
-            
-            if code_tag_format=="markdown":
-                system_prompt += f"""You must answer with the code placed inside the markdown code tag:
+            if template and template !="{}":
+                if language in ["json","yaml","xml"]:
+                    system_prompt += f"\nMake sure the generated context follows the following schema:\n```{language}\n{template}\n```\n"
+                else:
+                    system_prompt += f"\nHere is a template of the answer:\n```{language}\n{template}\n```\n"
+                
+                if code_tag_format=="markdown":
+                    system_prompt += f"""You must answer with the code placed inside the markdown code tag:
 ```{language}
 ```
 """
@@ -3946,14 +3958,17 @@ FINAL RESPONSE:"""
 <code language="{language}">
 </code>
 """
-        system_prompt += f"""You must return a single code tag.
+            system_prompt += f"""You must return a single code tag.
 Do not split the code in multiple tags.
 {self.ai_full_header}"""
+            
+            final_system_prompt = system_prompt
+            final_prompt = prompt
 
         response = self.generate_text(
-            prompt,
+            final_prompt,
             images=images,
-            system_prompt=system_prompt,
+            system_prompt=final_system_prompt,
             n_predict=n_predict,
             temperature=temperature,
             top_k=top_k,
@@ -3964,8 +3979,8 @@ Do not split the code in multiple tags.
             )
 
         if isinstance(response, dict) and not response.get("status", True):
-             ASCIIColors.error(f"Code generation failed: {response.get('error')}")
-             return None
+            ASCIIColors.error(f"Code generation failed: {response.get('error')}")
+            return None
 
         codes = self.extract_code_blocks(response, format=code_tag_format)
         code_content = None
@@ -3975,44 +3990,46 @@ Do not split the code in multiple tags.
             code_content = last_code["content"]
 
             # Handle incomplete code block continuation (simple approach)
-            max_retries = 3 # Limit continuation attempts
-            retries = 0
-            while not last_code["is_complete"] and retries < max_retries:
-                retries += 1
-                ASCIIColors.info(f"Code block seems incomplete. Attempting continuation ({retries}/{max_retries})...")
-                continuation_prompt = f"{prompt}\n\nAssistant:\n{code_content}\n\n{self.user_full_header}The previous code block was incomplete. Continue the code exactly from where it left off. Do not repeat the previous part. Only provide the continuation inside a single {code_tag_format} code tag.\n{self.ai_full_header}"
+            # Skip continuation logic if override_all_prompts is True to respect user's intent
+            if not override_all_prompts:
+                max_retries = 3 # Limit continuation attempts
+                retries = 0
+                while not last_code["is_complete"] and retries < max_retries:
+                    retries += 1
+                    ASCIIColors.info(f"Code block seems incomplete. Attempting continuation ({retries}/{max_retries})...")
+                    continuation_prompt = f"{prompt}\n\nAssistant:\n{code_content}\n\n{self.user_full_header}The previous code block was incomplete. Continue the code exactly from where it left off. Do not repeat the previous part. Only provide the continuation inside a single {code_tag_format} code tag.\n{self.ai_full_header}"
 
-                continuation_response = self.generate_text(
-                    continuation_prompt,
-                    images=images, # Resend images if needed for context
-                    n_predict=n_predict, # Allow space for continuation
-                    temperature=temperature, # Use same parameters
-                    top_k=top_k,
-                    top_p=top_p,
-                    repeat_penalty=repeat_penalty,
-                    repeat_last_n=repeat_last_n,
-                    streaming_callback=callback
-                )
+                    continuation_response = self.generate_text(
+                        continuation_prompt,
+                        images=images, # Resend images if needed for context
+                        n_predict=n_predict, # Allow space for continuation
+                        temperature=temperature, # Use same parameters
+                        top_k=top_k,
+                        top_p=top_p,
+                        repeat_penalty=repeat_penalty,
+                        repeat_last_n=repeat_last_n,
+                        streaming_callback=callback
+                    )
 
-                if isinstance(continuation_response, dict) and not continuation_response.get("status", True):
-                    ASCIIColors.warning(f"Continuation attempt failed: {continuation_response.get('error')}")
-                    break # Stop trying if generation fails
+                    if isinstance(continuation_response, dict) and not continuation_response.get("status", True):
+                        ASCIIColors.warning(f"Continuation attempt failed: {continuation_response.get('error')}")
+                        break # Stop trying if generation fails
 
-                continuation_codes = self.extract_code_blocks(continuation_response, format=code_tag_format)
+                    continuation_codes = self.extract_code_blocks(continuation_response, format=code_tag_format)
 
-                if continuation_codes:
-                    new_code_part = continuation_codes[0]["content"]
-                    code_content += "\n" + new_code_part # Append continuation
-                    last_code["is_complete"] = continuation_codes[0]["is_complete"] # Update completeness
-                    if last_code["is_complete"]:
-                        ASCIIColors.info("Code block continuation successful.")
-                        break # Exit loop if complete
-                else:
-                     ASCIIColors.warning("Continuation response contained no code block.")
-                     break # Stop if no code block found in continuation
+                    if continuation_codes:
+                        new_code_part = continuation_codes[0]["content"]
+                        code_content += "\n" + new_code_part # Append continuation
+                        last_code["is_complete"] = continuation_codes[0]["is_complete"] # Update completeness
+                        if last_code["is_complete"]:
+                            ASCIIColors.info("Code block continuation successful.")
+                            break # Exit loop if complete
+                    else:
+                        ASCIIColors.warning("Continuation response contained no code block.")
+                        break # Stop if no code block found in continuation
 
-            if not last_code["is_complete"]:
-                ASCIIColors.warning("Code block remained incomplete after multiple attempts.")
+                if not last_code["is_complete"]:
+                    ASCIIColors.warning("Code block remained incomplete after multiple attempts.")
 
         return code_content # Return the (potentially completed) code content or None
 
@@ -4023,8 +4040,16 @@ Do not split the code in multiple tags.
         schema=None,
         system_prompt=None,
         max_retries=1,
+        use_override=False,
         **kwargs
     ):
+        """
+        Enhanced structured content generation with optional prompt override.
+        
+        Args:
+            use_override: If True, uses override_all_prompts=True in generate_code
+                        and relies entirely on provided system_prompt and prompt.
+        """
         import json
         images = [] if images is None else images
         schema = {} if schema is None else schema
@@ -4044,21 +4069,15 @@ Do not split the code in multiple tags.
         else:
             raise TypeError("schema must be a dict or a JSON string.")
 
-        # --- FIX STARTS HERE ---
         # Heuristic to detect if the schema is a properties-only dictionary
-        # and needs to be wrapped in a root object to be a valid schema.
-        # This handles cases where the user provides `{"field1": {...}, "field2": {...}}`
-        # instead of `{"type": "object", "properties": {"field1": ...}}`.
         if "type" not in schema_obj and "properties" not in schema_obj and all(isinstance(v, dict) for v in schema_obj.values()):
             if kwargs.get("debug"):
                 ASCIIColors.info("Schema appears to be a properties-only dictionary; wrapping it in a root object.")
             schema_obj = {
                 "type": "object",
                 "properties": schema_obj,
-                # Assume all top-level keys are required when wrapping
                 "required": list(schema_obj.keys())
             }
-        # --- FIX ENDS HERE ---
 
         def _instance_skeleton(s):
             if not isinstance(s, dict):
@@ -4068,7 +4087,6 @@ Do not split the code in multiple tags.
             if "enum" in s and isinstance(s["enum"], list) and s["enum"]:
                 return s["enum"][0]
             
-            # Handle default values
             if "default" in s:
                 return s["default"]
 
@@ -4082,22 +4100,19 @@ Do not split the code in multiple tags.
             if t == "boolean":
                 return False
             if t == "array":
-                # Generate one minimal item if schema is provided
                 items = s.get("items", {})
                 min_items = s.get("minItems", 0)
-                # Let's generate at least one item for the example if possible
                 num_items = max(min_items, 1) if items and not min_items == 0 else min_items
                 return [_instance_skeleton(items) for _ in range(num_items)]
             if t == "object":
                 props = s.get("properties", {})
-                # Use required fields, otherwise fall back to all properties for the skeleton
                 req = s.get("required", list(props.keys()))
                 out = {}
                 for k in req:
                     if k in props:
                         out[k] = _instance_skeleton(props[k])
                     else:
-                        out[k] = None # Should not happen if schema is well-formed
+                        out[k] = None
                 return out
             if "oneOf" in s and isinstance(s["oneOf"], list) and s["oneOf"]:
                 return _instance_skeleton(s["oneOf"][0])
@@ -4112,42 +4127,56 @@ Do not split the code in multiple tags.
                 return merged if merged else {}
             return {}
 
-        # Now derive strings from the (potentially corrected) schema_obj
         schema_str = json.dumps(schema_obj, indent=2, ensure_ascii=False)
         example_obj = _instance_skeleton(schema_obj)
         example_str = json.dumps(example_obj, indent=2, ensure_ascii=False)
 
-        base_system = (
-            "Your objective is to generate a JSON object that satisfies the user's request and conforms to the provided schema.\n"
-            "Rules:\n"
-            "1) The schema is reference ONLY. Do not include the schema in the output.\n"
-            "2) Output exactly ONE valid JSON object.\n"
-            "3) Wrap the JSON object inside a single ```json code block.\n"
-            "4) Do not output explanations or text outside the JSON.\n"
-            "5) Use 2 spaces for indentation. Do not use tabs.\n"
-            "6) Only include fields allowed by the schema and ensure all required fields are present.\n"
-            "7) For enums, choose a valid value from the list.\n\n"
-            "Schema (reference only):\n"
-            f"```json\n{schema_str}\n```\n\n"
-            "Correct example of output format (structure only, values are illustrative):\n"
-            f"```json\n{example_str}\n```"
-        )
-        full_system_prompt = f"{system_prompt}\n\n{base_system}" if system_prompt else base_system
+        if use_override:
+            # Use provided system_prompt and prompt as-is
+            final_system_prompt = system_prompt if system_prompt else ""
+            final_prompt = prompt
+            override_prompts = True
+        else:
+            # Use original prompt engineering
+            base_system = (
+                "Your objective is to generate a JSON object that satisfies the user's request and conforms to the provided schema.\n"
+                "Rules:\n"
+                "1) The schema is reference ONLY. Do not include the schema in the output.\n"
+                "2) Output exactly ONE valid JSON object.\n"
+                "3) Wrap the JSON object inside a single ```json code block.\n"
+                "4) Do not output explanations or text outside the JSON.\n"
+                "5) Use 2 spaces for indentation. Do not use tabs.\n"
+                "6) Only include fields allowed by the schema and ensure all required fields are present.\n"
+                "7) For enums, choose a valid value from the list.\n\n"
+                "Schema (reference only):\n"
+                f"```json\n{schema_str}\n```\n\n"
+                "Correct example of output format (structure only, values are illustrative):\n"
+                f"```json\n{example_str}\n```"
+            )
+            final_system_prompt = f"{system_prompt}\n\n{base_system}" if system_prompt else base_system
+            final_prompt = prompt
+            override_prompts = False
 
         if kwargs.get("debug"):
             ASCIIColors.info("Generating structured content...")
 
         last_error = None
         for attempt in range(max_retries + 1):
+            retry_system_prompt = final_system_prompt
+            if attempt > 0 and not use_override:
+                retry_system_prompt = f"{final_system_prompt}\n\nPrevious attempt failed validation: {last_error}\nReturn a corrected JSON instance that strictly satisfies the schema."
+            
             json_string = self.generate_code(
-                prompt=prompt,
+                prompt=final_prompt,
                 images=images,
-                system_prompt=full_system_prompt if attempt == 0 else f"{full_system_prompt}\n\nPrevious attempt failed validation: {last_error}\nReturn a corrected JSON instance that strictly satisfies the schema.",
-                template=example_str,
+                system_prompt=retry_system_prompt,
+                template=example_str if not use_override else None,
                 language="json",
                 code_tag_format="markdown",
+                override_all_prompts=override_prompts,
                 **kwargs
             )
+            
             if not json_string:
                 last_error = "LLM returned an empty response."
                 if kwargs.get("debug"): ASCIIColors.warning(last_error)
@@ -4173,19 +4202,213 @@ Do not split the code in multiple tags.
                         if kwargs.get("debug"): ASCIIColors.warning(last_error)
                         if attempt < max_retries:
                             continue
-                        # Return the invalid object after last retry if validation fails
                         return parsed_json
                 return parsed_json
             except Exception as e:
                 trace_exception(e)
                 ASCIIColors.error(f"Unexpected error during JSON processing: {e}")
                 last_error = f"An unexpected error occurred: {e}"
-                # Do not retry on unexpected errors, break the loop
                 break
         
         ASCIIColors.error(f"Failed to generate valid structured content after {max_retries + 1} attempts. Last error: {last_error}")
         return None
 
+    def generate_structured_content_pydantic(
+        self,
+        prompt,
+        pydantic_model,
+        images=None,
+        system_prompt=None,
+        max_retries=1,
+        use_override=False,
+        **kwargs
+    ):
+        """
+        Generate structured content using Pydantic models for validation.
+        
+        Args:
+            prompt: The user prompt
+            pydantic_model: A Pydantic BaseModel class or instance
+            images: Optional images for context
+            system_prompt: Optional system prompt
+            max_retries: Number of retry attempts
+            use_override: If True, uses override_all_prompts=True in generate_code
+            **kwargs: Additional arguments passed to generate_code
+            
+        Returns:
+            Validated Pydantic model instance or None if generation failed
+        """
+        import json
+        from typing import get_type_hints, get_origin, get_args
+        
+        try:
+            from pydantic import BaseModel, ValidationError
+            from pydantic.fields import FieldInfo
+        except ImportError:
+            ASCIIColors.error("Pydantic is required for this method. Please install it with: pip install pydantic")
+            return None
+        
+        images = [] if images is None else images
+        
+        # Handle both class and instance
+        if isinstance(pydantic_model, type) and issubclass(pydantic_model, BaseModel):
+            model_class = pydantic_model
+        elif isinstance(pydantic_model, BaseModel):
+            model_class = type(pydantic_model)
+        else:
+            raise TypeError("pydantic_model must be a Pydantic BaseModel class or instance")
+        
+        def _get_pydantic_schema_info(model_cls):
+            """Extract schema information from Pydantic model."""
+            schema = model_cls.model_json_schema()
+            
+            # Create example instance
+            try:
+                # Try to create with defaults first
+                example_instance = model_cls()
+                example_dict = example_instance.model_dump()
+            except:
+                # If that fails, create minimal example based on schema
+                example_dict = _create_example_from_schema(schema)
+            
+            return schema, example_dict
+        
+        def _create_example_from_schema(schema):
+            """Create example data from JSON schema."""
+            if schema.get("type") == "object":
+                properties = schema.get("properties", {})
+                required = schema.get("required", [])
+                example = {}
+                
+                for field_name, field_schema in properties.items():
+                    if field_name in required or "default" in field_schema:
+                        example[field_name] = _get_example_value(field_schema)
+                
+                return example
+            return {}
+        
+        def _get_example_value(field_schema):
+            """Get example value for a field based on its schema."""
+            if "default" in field_schema:
+                return field_schema["default"]
+            if "const" in field_schema:
+                return field_schema["const"]
+            if "enum" in field_schema and field_schema["enum"]:
+                return field_schema["enum"][0]
+            
+            field_type = field_schema.get("type")
+            if field_type == "string":
+                return "example"
+            elif field_type == "integer":
+                return 0
+            elif field_type == "number":
+                return 0.0
+            elif field_type == "boolean":
+                return False
+            elif field_type == "array":
+                items_schema = field_schema.get("items", {})
+                return [_get_example_value(items_schema)]
+            elif field_type == "object":
+                return _create_example_from_schema(field_schema)
+            else:
+                return None
+        
+        # Get schema and example from Pydantic model
+        try:
+            schema, example_dict = _get_pydantic_schema_info(model_class)
+            schema_str = json.dumps(schema, indent=2, ensure_ascii=False)
+            example_str = json.dumps(example_dict, indent=2, ensure_ascii=False)
+        except Exception as e:
+            ASCIIColors.error(f"Failed to extract schema from Pydantic model: {e}")
+            return None
+        
+        if use_override:
+            # Use provided system_prompt and prompt as-is
+            final_system_prompt = system_prompt if system_prompt else ""
+            final_prompt = prompt
+            override_prompts = True
+        else:
+            # Enhanced prompt engineering for Pydantic
+            base_system = (
+                "Your objective is to generate a JSON object that satisfies the user's request and conforms to the provided Pydantic model schema.\n"
+                "Rules:\n"
+                "1) The schema is reference ONLY. Do not include the schema in the output.\n"
+                "2) Output exactly ONE valid JSON object that can be parsed by the Pydantic model.\n"
+                "3) Wrap the JSON object inside a single ```json code block.\n"
+                "4) Do not output explanations or text outside the JSON.\n"
+                "5) Use 2 spaces for indentation. Do not use tabs.\n"
+                "6) Respect all field types, constraints, and validation rules.\n"
+                "7) Include all required fields and use appropriate default values where specified.\n"
+                "8) For enums, choose a valid value from the allowed options.\n\n"
+                f"Pydantic Model Schema (reference only):\n"
+                f"```json\n{schema_str}\n```\n\n"
+                "Correct example of output format (structure only, values are illustrative):\n"
+                f"```json\n{example_str}\n```"
+            )
+            final_system_prompt = f"{system_prompt}\n\n{base_system}" if system_prompt else base_system
+            final_prompt = prompt
+            override_prompts = False
+        
+        if kwargs.get("debug"):
+            ASCIIColors.info("Generating Pydantic-structured content...")
+            ASCIIColors.info(f"Using model: {model_class.__name__}")
+        
+        last_error = None
+        for attempt in range(max_retries + 1):
+            retry_system_prompt = final_system_prompt
+            if attempt > 0:
+                retry_system_prompt = f"{final_system_prompt}\n\nPrevious attempt failed Pydantic validation: {last_error}\nReturn a corrected JSON instance that strictly satisfies the Pydantic model."
+            
+            json_string = self.generate_code(
+                prompt=prompt,
+                images=images,
+                system_prompt=retry_system_prompt,
+                language="json",
+                code_tag_format="markdown",
+                override_all_prompts=True,  # Always use override for structured content
+                **kwargs
+            )
+            
+            if not json_string:
+                last_error = "LLM returned an empty response."
+                if kwargs.get("debug"): ASCIIColors.warning(last_error)
+                continue
+            
+            if kwargs.get("debug"):
+                ASCIIColors.info("Parsing generated JSON string...")
+                print(f"--- Raw JSON String ---\n{json_string}\n-----------------------")
+            
+            try:
+                # Parse JSON
+                parsed_json = robust_json_parser(json_string)
+                if parsed_json is None:
+                    last_error = "Failed to robustly parse the generated string into JSON."
+                    if kwargs.get("debug"): ASCIIColors.warning(last_error)
+                    continue
+                
+                # Validate with Pydantic
+                try:
+                    validated_instance = model_class.model_validate(parsed_json)
+                    if kwargs.get("debug"):
+                        ASCIIColors.success("Pydantic validation successful!")
+                    return validated_instance
+                except ValidationError as ve:
+                    last_error = f"Pydantic Validation Error: {ve}"
+                    if kwargs.get("debug"): ASCIIColors.warning(last_error)
+                    if attempt < max_retries:
+                        continue
+                    # Return the raw parsed JSON if validation fails on last attempt
+                    ASCIIColors.warning("Returning unvalidated JSON after final attempt.")
+                    return parsed_json
+                    
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.error(f"Unexpected error during JSON processing: {e}")
+                last_error = f"An unexpected error occurred: {e}"
+                break
+    
+        ASCIIColors.error(f"Failed to generate valid Pydantic-structured content after {max_retries + 1} attempts. Last error: {last_error}")
+        return None
 
     def extract_code_blocks(self, text: str, format: str = "markdown") -> List[dict]:
         """
