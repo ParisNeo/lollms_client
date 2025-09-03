@@ -131,7 +131,7 @@ CIVITAI_MODELS = {
         "filename": "papercut.safetensors",
         "description": "Paper cutout SD1.5.",
         "owned_by": "civitai"
-    }
+    },
     "fantassifiedIcons": {
         "display_name": "Fantassified Icons",
         "url": "https://civitai.com/api/download/models/67584?type=Model&format=SafeTensor&size=pruned&fp=fp16",
