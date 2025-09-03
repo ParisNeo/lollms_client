@@ -480,8 +480,8 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         "safety_checker_on": True,
         "num_inference_steps": 25,
         "guidance_scale": 7.0,
-        "default_width": 512,
-        "default_height": 512,
+        "width": 512,
+        "height": 512,
         "seed": -1,
         "enable_cpu_offload": False,
         "enable_sequential_cpu_offload": False,
@@ -511,6 +511,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         self.config = self.DEFAULT_CONFIG.copy()
         self.config.update(kwargs)
         self.model_name = self.config.get("model_name", "")
+        
         models_path_str = kwargs.get("models_path", str(Path(__file__).parent / "models"))
         self.models_path = Path(models_path_str)
         self.models_path.mkdir(parents=True, exist_ok=True)
@@ -627,11 +628,11 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         generator = self._prepare_seed(kwargs)
         pipeline_args = {
             "prompt": prompt,
-            "negative_prompt": negative_prompt or None,
-            "width": width if width is not None else self.config["default_width"],
-            "height": height if height is not None else self.config["default_height"],
-            "num_inference_steps": kwargs.pop("num_inference_steps", self.config["num_inference_steps"]),
-            "guidance_scale": kwargs.pop("guidance_scale", self.config["guidance_scale"]),
+            "negative_prompt": negative_prompt or self.config.get("negative_prompt", ""),
+            "width": width if width is not None else self.config.get("width", 512),
+            "height": height if height is not None else self.config.get("height", 512),
+            "num_inference_steps": kwargs.pop("num_inference_steps", self.config.get("num_inference_steps",25)),
+            "guidance_scale": kwargs.pop("guidance_scale", self.config.get("guidance_scale",6.5)),
             "generator": generator
         }
         pipeline_args.update(kwargs)
@@ -673,8 +674,8 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             self._acquire_manager()
         imgs = [images] if isinstance(images, str) else list(images)
         pil_images = [self._decode_image_input(s) for s in imgs]
-        out_w = width if width is not None else self.config["default_width"]
-        out_h = height if height is not None else self.config["default_height"]
+        out_w = width if width is not None else self.config["width"]
+        out_h = height if height is not None else self.config["height"]
         generator = self._prepare_seed(kwargs)
         steps = kwargs.pop("num_inference_steps", self.config["num_inference_steps"])
         guidance = kwargs.pop("guidance_scale", self.config["guidance_scale"])
@@ -783,8 +784,8 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             {"name": "enable_cpu_offload", "type": "bool", "value": self.config["enable_cpu_offload"], "description": "Enable model CPU offload (saves VRAM, slower)."},
             {"name": "enable_sequential_cpu_offload", "type": "bool", "value": self.config["enable_sequential_cpu_offload"], "description": "Enable sequential CPU offload."},
             {"name": "enable_xformers", "type": "bool", "value": self.config["enable_xformers"], "description": "Enable xFormers memory efficient attention."},
-            {"name": "default_width", "type": "int", "value": self.config["default_width"], "description": "Default image width."},
-            {"name": "default_height", "type": "int", "value": self.config["default_height"], "description": "Default image height."},
+            {"name": "width", "type": "int", "value": self.config["width"], "description": "Default image width."},
+            {"name": "height", "type": "int", "value": self.config["height"], "description": "Default image height."},
             {"name": "num_inference_steps", "type": "int", "value": self.config["num_inference_steps"], "description": "Default inference steps."},
             {"name": "guidance_scale", "type": "float", "value": self.config["guidance_scale"], "description": "Default guidance scale (CFG)."},
             {"name": "seed", "type": "int", "value": self.config["seed"], "description": "Default seed (-1 for random)."},
