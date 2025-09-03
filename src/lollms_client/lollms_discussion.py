@@ -2593,6 +2593,20 @@ class LollmsDiscussion:
         section_start = f"--- Memory: {memory['title']} ---"
         return section_start in (self.memory or "")
 
+    def purge_memories(self) -> bool:
+        """
+        Removes all memories from the discussion.
+        
+        Returns:
+            The number of memories removed (0 or 1).
+        """
+        new_metadata = (self.metadata or {}).copy()
+        new_metadata["_memories"] = []
+        self.metadata = new_metadata
+        self.commit()
+        print(f"Removed memory titled.")
+        return True
+
     def remove_memory(self, title: str) -> int:
         """
         Removes a memory by title.
