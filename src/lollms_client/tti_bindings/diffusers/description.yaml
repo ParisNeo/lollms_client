@@ -67,10 +67,15 @@ input_parameters:
     default: ""
     description: "Optional negative prompt to avoid unwanted features."
 
-  - name: "size"
-    type: "str"
-    default: "512x512"
-    description: "Image size in WxH format. E.g., '512x512', '1024x1024'."
+  - name: "width"
+    type: "int"
+    default: "512"
+    description: "Image width."
+
+  - name: "height"
+    type: "int"
+    default: "512"
+    description: "Image height."
 
     
 generate_image_parameters:
