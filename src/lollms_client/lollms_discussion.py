@@ -1715,9 +1715,10 @@ class LollmsDiscussion:
                 # Automatically load the newly created memory into the context
                 self.load_memory_into_context(title)
                 print(f"[INFO] Memorize: New memory created and loaded into context: '{title}'.")
+                return memory_json
             else:
                 print("[WARNING] Memorize: Failed to generate a valid memory from the discussion.")
-                
+                return None
         except Exception as e:
             trace_exception(e)
             print(f"[ERROR] Memorize: Failed to create memory. {e}")
