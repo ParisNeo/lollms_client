@@ -132,6 +132,27 @@ CIVITAI_MODELS = {
         "description": "Paper cutout SD1.5.",
         "owned_by": "civitai"
     }
+    "fantassifiedIcons": {
+        "display_name": "Fantassified Icons",
+        "url": "https://civitai.com/api/download/models/67584?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "fantassifiedIcons_fantassifiedIconsV20.safetensors",
+        "description": "Flat, modern Icons.",
+        "owned_by": "civitai"
+    },
+    "game_icon_institute": {
+        "display_name": "Game icon institute",
+        "url": "https://civitai.com/api/download/models/158776?type=Model&format=SafeTensor&size=full&fp=fp16",
+        "filename": "gameIconInstituteV10_v10.safetensors",
+        "description": "Flat, modern game Icons.",
+        "owned_by": "civitai"
+    },
+    "M4RV3LS_DUNGEONS": {
+        "display_name": "M4RV3LS & DUNGEONS",
+        "url": "https://civitai.com/api/download/models/139417?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "M4RV3LSDUNGEONSNEWV40COMICS_mD40.safetensors",
+        "description": "comics.",
+        "owned_by": "civitai"
+    },
 }
 
 TORCH_DTYPE_MAP_STR_TO_OBJ = {
