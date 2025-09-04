@@ -1707,13 +1707,6 @@ class LollmsDiscussion:
             )
 
             if memory_json and memory_json.get("title") and memory_json.get("content"):
-                title = memory_json["title"]
-                self.add_memory(
-                    title=title,
-                    content=memory_json["content"]
-                )
-                # Automatically load the newly created memory into the context
-                self.load_memory_into_context(title)
                 print(f"[INFO] Memorize: New memory created and loaded into context: '{title}'.")
                 return memory_json
             else:
@@ -1722,6 +1715,16 @@ class LollmsDiscussion:
         except Exception as e:
             trace_exception(e)
             print(f"[ERROR] Memorize: Failed to create memory. {e}")
+
+        def set_memory(self, memory_text: str):
+            """Sets the discussion's memory content.
+            This memory is included in the system context during exports and can be
+            used to provide background information or retain important details across turns.
+            Args:
+                memory_text: The text to set as the discussion's memory.
+            """       
+            self.memory = memory_text.strip()
+            self.touch()
 
     def count_discussion_tokens(self, format_type: str, branch_tip_id: Optional[str] = None) -> int:
         """Counts the number of tokens in the exported discussion content.
@@ -2364,7 +2367,7 @@ class LollmsDiscussion:
         
         return self.add_artefact(
             title, content=new_content, images=new_images,
-            audios=latest_artefact.get("audios", []), videos=latest_artefact.get("videos", []),
+            audios=latest_artefact.get("audios", []),videos=latest_artefact.get("videos", []),
             zip_content=latest_artefact.get("zip"), version=latest_version + 1, **extra_data
         )
 
@@ -2489,148 +2492,6 @@ class LollmsDiscussion:
             print(f"Removed {removed_count} artefact(s) titled '{title}'.")
             
         return removed_count
-
-    # Memories management system
-    def list_memories(self) -> List[Dict[str, Any]]:
-        """
-        Lists all memories stored in the discussion's metadata.
-        """
-        metadata = self.metadata or {}
-        memories = metadata.get("_memories", [])
-        now = datetime.utcnow().isoformat()
-        
-        upgraded = []
-        dirty = False
-        for memory in memories:
-            fixed = memory.copy()
-            if "title" not in fixed: fixed["title"] = "untitled"; dirty = True
-            if "content" not in fixed: fixed["content"] = ""; dirty = True
-            if "created_at" not in fixed: fixed["created_at"] = now; dirty = True
-            
-            section_start = f"--- Memory: {fixed['title']} ---"
-            fixed["is_loaded"] = section_start in (self.memory or "")
-            upgraded.append(fixed)
-
-        if dirty:
-            metadata["_memories"] = upgraded
-            self.metadata = metadata
-            self.commit()
-
-        return upgraded
-
-    def add_memory(self, title: str, content: str, **extra_data) -> Dict[str, Any]:
-        """
-        Adds or overwrites a memory in the discussion.
-        """
-        new_metadata = (self.metadata or {}).copy()
-        memories = new_metadata.get("_memories", [])
-        
-        memories = [m for m in memories if m.get('title') != title]
-
-        new_memory = {
-            "title": title, "content": content,
-            "created_at": datetime.utcnow().isoformat(),
-            **extra_data
-        }
-        memories.append(new_memory)
-        
-        new_metadata["_memories"] = memories
-        self.metadata = new_metadata
-        self.commit()
-        return new_memory
-
-    def get_memory(self, title: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieves a memory by title.
-        """
-        memories = self.list_memories()
-        return next((m for m in memories if m.get('title') == title), None)
-
-    def load_memory_into_context(self, title: str):
-        """
-        Loads a memory's content into the long-term memory context.
-        """
-        memory = self.get_memory(title)
-        if not memory:
-            raise ValueError(f"Memory '{title}' not found.")
-
-        if memory.get('content'):
-            section = (
-                f"--- Memory: {memory['title']} ---\n"
-                f"{memory['content']}\n"
-                f"--- End Memory: {memory['title']} ---\n\n"
-            )
-            if section not in (self.memory or ""):
-                current_memory_zone = self.memory or ""
-                self.memory = current_memory_zone.rstrip() + "\n\n" + section
-                self.touch()
-                self.commit()
-                print(f"Loaded memory '{title}' into context.")
-
-    def unload_memory_from_context(self, title: str):
-        """
-        Removes a memory's content from the long-term memory context.
-        """
-        memory = self.get_memory(title)
-        if not memory:
-            raise ValueError(f"Memory '{title}' not found.")
-
-        if self.memory and memory.get('content'):
-            section_start = f"--- Memory: {memory['title']} ---"
-            pattern = rf"\n*\s*{re.escape(section_start)}.*?--- End Memory: {re.escape(memory['title'])} ---\s*\n*"
-            self.memory = re.sub(pattern, "", self.memory, flags=re.DOTALL).strip()
-            self.touch()
-            self.commit()
-            print(f"Unloaded memory '{title}' from context.")
-
-    def is_memory_loaded(self, title: str) -> bool:
-        """
-        Checks if a memory is currently loaded in the long-term memory context.
-        """
-        memory = self.get_memory(title)
-        if not memory:
-            return False
-
-        section_start = f"--- Memory: {memory['title']} ---"
-        return section_start in (self.memory or "")
-
-    def purge_memories(self) -> bool:
-        """
-        Removes all memories from the discussion.
-        
-        Returns:
-            The number of memories removed (0 or 1).
-        """
-        new_metadata = (self.metadata or {}).copy()
-        new_metadata["_memories"] = []
-        self.metadata = new_metadata
-        self.commit()
-        print(f"Removed memory titled.")
-        return True
-
-    def remove_memory(self, title: str) -> int:
-        """
-        Removes a memory by title.
-        
-        Returns:
-            The number of memories removed (0 or 1).
-        """
-        new_metadata = (self.metadata or {}).copy()
-        memories = new_metadata.get("_memories", [])
-        if not memories:
-            return 0
-
-        initial_count = len(memories)
-        kept_memories = [m for m in memories if m.get('title') != title]
-
-        if len(kept_memories) < initial_count:
-            new_metadata["_memories"] = kept_memories
-            self.metadata = new_metadata
-            self.commit()
-            print(f"Removed memory titled '{title}'.")
-            return 1
-            
-        return 0
 
     def clone_without_messages(self) -> 'LollmsDiscussion':
         """
