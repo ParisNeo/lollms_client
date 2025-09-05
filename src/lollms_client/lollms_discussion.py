@@ -1,3 +1,6 @@
+#lollms_client/lollms_discussion.py
+#author : ParisNeo
+
 import base64
 import json
 import re
@@ -1000,6 +1003,13 @@ class LollmsDiscussion:
         self._rebuild_message_index() # Ensure index is fresh
         return [LollmsMessage(self, msg_obj) for msg_obj in self._message_index.values()]
 
+    def setMemory(self, memory:str):
+        """sets memory content
+
+        Args:
+            memory (str): _description_
+        """
+        self.memory = memory
 
     def get_full_data_zone(self):
         """Assembles all data zones into a single, formatted string for the prompt."""
