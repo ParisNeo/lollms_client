@@ -1,0 +1,43 @@
+title: 'Leonardo.ai TTI'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'leonardo_ai'
+description: |
+  Integrates with the Leonardo.ai platform for creative image generation.
+  Access a wide range of custom-tuned models for various styles from photorealism to fantasy art.
+  This binding uses an asynchronous API, polling for results after submission.
+
+input_parameters:
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Your Leonardo.ai API key. Can also be set via the LEONARDO_API_KEY environment variable."
+    is_secret: true
+  - name: "model_name"
+    type: "str"
+    default: "ac4f3991-8a40-42cd-b174-14a8e33738e4"
+    description: "The Leonardo.ai model ID to use for generation."
+    options: ["ac4f3991-8a40-42cd-b174-14a8e33738e4", "1e65d070-22c9-4aed-a5be-ce58a1b65b38", "b24e16ff-06e3-43eb-a255-db4322b0f345", "6bef9f1b-29cb-40c7-b9df-32b51c1f67d3", "f3296a34-a868-4665-8b2f-f4313f8c8533", "2067ae58-a02e-4318-9742-2b55b2a4c813"]
+
+generate_image_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "The text prompt describing the image to generate."
+  - name: "negative_prompt"
+    type: "str"
+    description: "Optional negative prompt to avoid unwanted features."
+  - name: "width"
+    type: "int"
+    default: 1024
+    description: "Image width."
+  - name: "height"
+    type: "int"
+    default: 1024
+    description: "Image height."
+  - name: "guidance_scale"
+    type: "int"
+    default: 7
+    description: "Prompt adherence strength (CFG)."
+  - name: "seed"
+    type: "int"
+    description: "Seed for reproducibility (leave empty for random)."

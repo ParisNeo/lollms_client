@@ -1,0 +1,48 @@
+title: 'Novita.ai TTI'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'novita_ai'
+description: |
+  A binding for the Novita.ai image generation API.
+  Provides fast and cost-effective access to a wide variety of popular open-source
+  diffusion models like Juggernaut XL, Realistic Vision, and DreamShaper.
+
+input_parameters:
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Your Novita.ai API key. Can also be set via the NOVITA_API_KEY environment variable."
+    is_secret: true
+  - name: "model_name"
+    type: "str"
+    default: "juggernaut_xl_v9_rundiffusion.safetensors"
+    description: "The model file name to use on Novita.ai."
+    options: ["juggernaut_xl_v9_rundiffusion.safetensors", "dreamshaper_xl_1_0.safetensors", "sd_xl_base_1.0.safetensors", "realistic_vision_v5.1.safetensors", "absolutereality_v1.8.1.safetensors", "meinamix_meina_v11.safetensors"]
+
+generate_image_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "The text prompt describing the image."
+  - name: "negative_prompt"
+    type: "str"
+    description: "Optional negative prompt to avoid unwanted features."
+  - name: "width"
+    type: "int"
+    default: 1024
+    description: "Image width."
+  - name: "height"
+    type: "int"
+    default: 1024
+    description: "Image height."
+  - name: "num_inference_steps"
+    type: "int"
+    default: 25
+    description: "Number of denoising steps."
+  - name: "guidance_scale"
+    type: "float"
+    default: 7.0
+    description: "Prompt adherence strength (CFG)."
+  - name: "seed"
+    type: "int"
+    default: -1
+    description: "Seed for reproducibility (-1 for random)."

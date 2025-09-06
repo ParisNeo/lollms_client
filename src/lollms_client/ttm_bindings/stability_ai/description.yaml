@@ -1,0 +1,33 @@
+title: 'Stability AI TTM'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'stability_ai_ttm'
+description: |
+  A binding for Stability AI's Stable Audio API.
+  Generates high-quality music and sound effects from text prompts.
+  Supports models like Stable Audio 2.0 for creating full musical tracks.
+
+input_parameters:
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Your Stability AI API key. Can also be set via the STABILITY_API_KEY environment variable."
+    is_secret: true
+  - name: "model_name"
+    type: "str"
+    default: "stable-audio-2.0"
+    description: "The Stable Audio model to use."
+    options: ["stable-audio-2.0", "stable-audio-1.0"]
+
+generate_music_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "A detailed description of the music you want to generate (e.g., genre, mood, instruments)."
+  - name: "duration"
+    type: "int"
+    default: 29
+    description: "The desired duration of the audio in seconds."
+  - name: "seed"
+    type: "int"
+    default: 0
+    description: "Seed for reproducibility. Use 0 for a random seed."

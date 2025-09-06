@@ -1,0 +1,24 @@
+title: 'TopMediai TTM'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'topmediai_ttm'
+description: |
+  A binding for the TopMediai Text-to-Music API.
+  This service provides a simple and fast way to generate music from a text prompt.
+  The API is synchronous, returning the result in a single request.
+
+input_parameters:
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Your TopMediai API key. Can also be set via the TOPMEDIAI_API_KEY environment variable."
+    is_secret: true
+
+generate_music_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "A description of the music you want to generate."
+  - name: "duration"
+    type: "int"
+    default: 30
+    description: "Duration of the music in seconds."

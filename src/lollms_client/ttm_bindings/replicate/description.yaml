@@ -1,0 +1,40 @@
+title: 'Replicate TTM'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'replicate_ttm'
+description: |
+  A binding to generate music using models hosted on the Replicate platform.
+  This allows access to a variety of open-source models like Meta's MusicGen
+  through a unified API. The binding starts a job and polls for the result.
+
+input_parameters:
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Your Replicate API Token. Can also be set via the REPLICATE_API_TOKEN environment variable."
+    is_secret: true
+  - name: "model_name"
+    type: "str"
+    default: "meta/musicgen:b05b1dff1d8c6ac63d42422dd565e23b63869bf2d51acda751e04b5dd304535d"
+    description: "The Replicate model ID and version to use."
+    options:
+      - "meta/musicgen:b05b1dff1d8c6ac63d42422dd565e23b63869bf2d51acda751e04b5dd304535d"
+      - "suno-ai/bark:b76242b40d67c76ab6742e987628a2a9ac019e11d56ab96c4e91ce03b79b2787"
+      - "joehoover/musicgen-melody:7a76a8258b23fae65c5a24debbe88414f9bed22c2422a63465731103f6990803"
+
+generate_music_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "A description of the music to generate."
+  - name: "duration"
+    type: "int"
+    default: 8
+    description: "Duration of the generated audio in seconds."
+  - name: "temperature"
+    type: "float"
+    default: 1.0
+    description: "Controls randomness. Higher values are more creative."
+  - name: "top_p"
+    type: "float"
+    default: 0.9
+    description: "Nucleus sampling parameter."

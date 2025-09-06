@@ -1,0 +1,61 @@
+title: 'Stability AI TTI'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'stability_ai'
+supported_file_types: []
+
+description: |
+  This binding integrates Stability AI's official API for image generation.
+  It provides access to powerful models like Stable Diffusion 3, SDXL, and others.
+  Supports text-to-image, image-to-image, and inpainting.
+
+input_parameters:
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Your Stability AI API key. Can also be set via the STABILITY_API_KEY environment variable."
+    is_secret: true
+  - name: "model_name"
+    type: "str"
+    default: "stable-diffusion-3-medium"
+    description: "The Stability AI model to use for generation."
+    options: ["stable-diffusion-3-medium", "stable-diffusion-3-large", "stable-diffusion-3-large-turbo", "stable-diffusion-xl-1024-v1-0", "stable-diffusion-v1-6"]
+
+generate_image_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "The text prompt describing the image to generate."
+  - name: "negative_prompt"
+    type: "str"
+    description: "Optional negative prompt to avoid unwanted features."
+  - name: "width"
+    type: "int"
+    default: 1024
+    description: "Image width. Note: SD3 uses aspect_ratio derived from this."
+  - name: "height"
+    type: "int"
+    default: 1024
+    description: "Image height. Note: SD3 uses aspect_ratio derived from this."
+  - name: "seed"
+    type: "int"
+    default: 0
+    description: "Seed for reproducibility (0 for random)."
+
+edit_image_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "The prompt describing the edit."
+  - name: "images"
+    type: "str"
+    description: "The input image to edit (base64, URL, or local path)."
+  - name: "mask"
+    type: "str"
+    description: "Optional mask image for inpainting (white areas are edited)."
+  - name: "strength"
+    type: "float"
+    default: 0.6
+    description: "Transformation strength (for image-to-image only)."
+  - name: "seed"
+    type: "int"
+    default: 0
+    description: "Seed for reproducibility (0 for random)."

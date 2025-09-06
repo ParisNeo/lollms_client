@@ -1,0 +1,16 @@
+title: Perplexity
+author: ParisNeo
+creation_date: 2025-09-05
+last_update_date: 2025-09-05
+description: A binding for the Perplexity AI API, providing access to their Sonar family of online and offline models, as well as select open-source models. The API is compatible with the OpenAI chat completions format.
+input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the Perplexity model to use (e.g., 'llama-3.1-sonar-large-128k-online')."
+    mandatory: true
+    default: "llama-3.1-sonar-large-128k-online"
+  - name: service_key
+    type: str
+    description: "The API key for the Perplexity service. Can also be set via the PERPLEXITY_API_KEY environment variable."
+    mandatory: true
+    default: ""

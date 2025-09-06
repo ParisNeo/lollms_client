@@ -1,0 +1,34 @@
+title: 'Beatoven.ai TTM'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'beatoven_ai_ttm'
+description: |
+  A binding for the Beatoven.ai API, which specializes in creating royalty-free background music.
+  It uses a prompt and parameters like genre, mood, and tempo to compose music.
+  The API is asynchronous, so this binding handles the process of starting and polling for the result.
+
+input_parameters:
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Your Beatoven.ai API key. Can also be set via the BEATOVEN_API_KEY environment variable."
+    is_secret: true
+
+generate_music_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "A description of the music's mood and style."
+  - name: "duration"
+    type: "int"
+    default: 30
+    description: "Duration of the music in seconds (e.g., 30, 60, 90)."
+  - name: "genre"
+    type: "str"
+    default: "Cinematic"
+    description: "The primary genre for the music."
+    options: ["Cinematic", "Electronic", "Hip Hop", "Pop", "Rock", "Ambient", "Indian", "World"]
+  - name: "tempo"
+    type: "str"
+    default: "medium"
+    description: "The desired tempo for the track."
+    options: ["slow", "medium", "fast"]
