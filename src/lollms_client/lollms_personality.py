@@ -84,7 +84,10 @@ class LollmsPersonality:
         """
         Creates a filesystem-safe, unique ID based on the author and name.
         """
-        safe_author = "".join(c if c.isalnum() else '_' for c in self.author)
+        if self.author:
+            safe_author = "".join(c if c.isalnum() else '_' for c in self.author)
+        else:
+            safe_author = "".join(c if c.isalnum() else '_' for c in "ParisNeo")
         safe_name = "".join(c if c.isalnum() else '_' for c in self.name)
         return f"{safe_author}_{safe_name}"
 
