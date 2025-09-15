@@ -2378,7 +2378,7 @@ class LollmsDiscussion:
         return self.add_artefact(
             title, content=new_content, images=new_images,
             audios=latest_artefact.get("audios", []),videos=latest_artefact.get("videos", []),
-            zip_content=latest_artefact.get("zip"), version=latest_version + 1, **extra_data
+            zip_content=latest_artefact.get("zip"), **extra_data
         )
 
     def load_artefact_into_data_zone(self, title: str, version: Optional[int] = None):
