@@ -5845,8 +5845,11 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                     MSG_TYPE.MSG_TYPE_STEP_START, 
                     {"id": f"chunk_{i+1}", "progress": progress_before}
                 )
-
-            prompt = chunk_summary_prompt_template.format(chunk_text=chunk)
+            try:
+                prompt = chunk_summary_prompt_template.format(chunk_text=chunk)
+            except Exception as ex:
+                ASCIIColors.warning(ex)
+                prompt = chunk_summary_prompt_template.replace("{chunk_text}", chunk)
             processed_system_prompt = system_prompt.format(chunk_id=i,scratchpad="\n\n---\n\n".join(chunk_summaries))
             try:
                 # Generate summary for the current chunk
