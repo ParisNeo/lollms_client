@@ -12,7 +12,7 @@ from typing import List, Dict
 import math
 import httpx
 import pipmaster as pm
-
+import mimetypes
 pm.ensure_packages(["openai","tiktoken"])
 
 import openai
@@ -22,6 +22,63 @@ import os
 BindingName = "OpenAIBinding"
 
 
+def _read_file_as_base64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+def _extract_markdown_path(s):
+    s = s.strip()
+    if s.startswith("[") and s.endswith(")"):
+        lb, rb = s.find("["), s.find("]")
+        if lb != -1 and rb != -1 and rb > lb:
+            return s[lb+1:rb].strip()
+    return s
+
+def _guess_mime_from_name(name, default="image/jpeg"):
+    mime, _ = mimetypes.guess_type(name)
+    return mime or default
+
+def _to_data_url(b64_str, mime):
+    return f"data:{mime};base64,{b64_str}"
+
+def normalize_image_input(img, default_mime="image/jpeg"):
+    """
+    Returns a Responses API-ready content block:
+      { "type": "input_image", "image_url": "data:<mime>;base64,<...>" }
+    Accepts:
+      - dict {'data': '<base64>', 'mime': 'image/png'}
+      - dict {'path': 'E:\\images\\x.png'}
+      - string raw base64
+      - string local path (Windows/POSIX), including markdown-like "[E:\\path\\img.png]()"
+    URLs are intentionally not supported (base64 only).
+    """
+    if isinstance(img, dict):
+        if "data" in img and isinstance(img["data"], str):
+            mime = img.get("mime", default_mime)
+            return {"type": "input_image", "image_url": _to_data_url(img["data"], mime)}
+        if "path" in img and isinstance(img["path"], str):
+            p = _extract_markdown_path(img["path"])
+            b64 = _read_file_as_base64(p)
+            mime = _guess_mime_from_name(p, default_mime)
+            return {"type": "input_image", "image_url": _to_data_url(b64, mime)}
+        if "url" in img:
+            raise ValueError("URL inputs not allowed here; provide base64 or local path")
+        raise ValueError("Unsupported dict format for image input")
+
+    if isinstance(img, str):
+        s = _extract_markdown_path(img)
+        # Accept already-correct data URLs as-is
+        if s.startswith("data:"):
+            return {"type": "input_image", "image_url": s}
+        # Local path heuristics: exists on disk or looks like a path
+        if os.path.exists(s) or (":" in s and "\\" in s) or s.startswith("/") or s.startswith("."):
+            b64 = _read_file_as_base64(s)
+            mime = _guess_mime_from_name(s, default_mime)
+            return {"type": "input_image", "image_url": _to_data_url(b64, mime)}
+        # Otherwise, treat as raw base64 payload
+        return {"type": "input_image", "image_url": _to_data_url(s, default_mime)}
+
+    raise ValueError("Unsupported image input type")
 class OpenAIBinding(LollmsLLMBinding):
     """OpenAI-specific binding implementation"""
     
@@ -123,17 +180,18 @@ class OpenAIBinding(LollmsLLMBinding):
 
         if images:
             if split:
+                # Original call to split message roles
                 messages += self.split_discussion(prompt, user_keyword=user_keyword, ai_keyword=ai_keyword)
-                messages[-1]["content"] = [{"type": "text", "text": messages[-1]["content"]}] + [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(path)}"}}
-                    for path in images
-                ]
+                # Convert the last message content to the structured content array
+                last = messages[-1]
+                text_block = {"type": "text", "text": last["content"]}
+                image_blocks = [normalize_image_input(img) for img in images]
+                last["content"] = [text_block] + image_blocks
             else:
                 messages.append({
-                    'role': 'user',
-                    'content': [{"type": "text", "text": prompt}] + [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(path)}"}}
-                        for path in images
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}] + [
+                        normalize_image_input(img) for img in images
                     ]
                 })
         else:
