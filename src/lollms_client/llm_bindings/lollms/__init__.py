@@ -114,7 +114,12 @@ class LollmsBinding(LollmsLLMBinding):
         host_address = host_address if host_address else self.host_address
         url = f"{host_address}/personalities"
 
-        response = requests.get(url)
+        headers = {
+            "Authorization": f"Bearer {self.service_key}",
+            "Accept": "application/json",
+        }
+
+        response = requests.get(url, headers=headers, timeout=30)
 
         if response.status_code == 200:
             try:
