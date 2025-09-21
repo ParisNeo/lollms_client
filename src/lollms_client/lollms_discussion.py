@@ -217,6 +217,11 @@ class LollmsDataManager:
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         self.create_and_migrate_tables()
 
+    def discussion_exists(self, discussion_id: str) -> bool:
+        """Checks if a discussion with the given ID exists in the database."""
+        with self.get_session() as session:
+            return session.query(self.DiscussionModel).filter_by(id=discussion_id).first() is not None
+
     @staticmethod
     def new_message(**kwargs) -> 'SimpleNamespace':
         """A static factory method to create a new message data object.
@@ -854,10 +859,6 @@ class LollmsDiscussion:
                     ASCIIColors.success(f"Active branch ID for discussion {self.id} updated to: {new_active_leaf_id} (deepest leaf descendant).")
                 elif new_active_leaf_id is None: # Should not happen if current_active_id exists
                     ASCIIColors.warning(f"Could not find a deeper leaf from '{current_active_id}'. Keeping current ID.")
-                else:
-                    ASCIIColors.info(f"Active branch ID '{current_active_id}' is already the deepest leaf. No change needed.")
-            else:
-                ASCIIColors.info(f"Active branch ID '{current_active_id}' is already a leaf. No change needed.")
 
 
     def touch(self):
@@ -928,6 +929,18 @@ class LollmsDiscussion:
             else:
                 kwargs['sender_type'] = 'assistant'
 
+        # --- NEW PARTICIPANT LOGIC ---
+        if kwargs.get('sender_type') == 'user':
+            sender_name = kwargs.get('sender')
+            sender_icon = kwargs.get('sender_icon')
+            if sender_name:
+                if self.participants is None:
+                    self.participants = {}
+                # Update only if not present or icon is missing
+                if sender_name not in self.participants or self.participants[sender_name].get('icon') is None:
+                    self.participants[sender_name] = {"icon": sender_icon}
+                    self.touch()
+        # --- END NEW PARTICIPANT LOGIC ---
 
         message_data = {
             'id': msg_id,
@@ -1165,7 +1178,7 @@ class LollmsDiscussion:
         # Step 1: Add user message, now including any images.
         if add_user_message:
             user_msg = self.add_message(
-                sender="user", 
+                sender=kwargs.get("user_name", "user"), 
                 sender_type="user", 
                 content=user_message,
                 images=images,
