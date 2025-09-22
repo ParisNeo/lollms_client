@@ -3922,7 +3922,8 @@ FINAL RESPONSE:"""
                         repeat_last_n:int|None=None,
                         callback=None,
                         debug:bool=False,
-                        override_all_prompts:bool=False ):
+                        override_all_prompts:bool=False,
+                        **kwargs ):
         """
         Generates a single code block based on a prompt.
         Uses the underlying LLM binding via `generate_text`.
