@@ -1680,7 +1680,7 @@ Output the parameters as JSON: {{"tool_params": {{...}}}}"""
                     raw_results = rag_fn(query=query, rag_top_k=rag_top_k, rag_min_similarity_percent=rag_min_similarity_percent)
                     docs = [d for d in (raw_results.get("results", []) if isinstance(raw_results, dict) else raw_results or [])]
                     tool_result = {"status": "success", "results": docs}
-                    sources = [{"source": tool_name, "metadata": d.get("metadata", {}), "score": d.get("score", 0.0)} for d in docs]
+                    sources = [{"title":d["title"], "content":d["content"], "source": tool_name, "metadata": d.get("metadata", {}), "score": d.get("score", 0.0)} for d in docs]
                     log_event(f"Retrieved {len(docs)} relevant documents", MSG_TYPE.MSG_TYPE_INFO)
                 elif hasattr(self, "mcp") and "local_tools" not in tool_name:
                     log_event(f"Executing MCP tool: {tool_name}", MSG_TYPE.MSG_TYPE_TOOL_CALL, meta={"tool_name": tool_name, "params": tool_params})
