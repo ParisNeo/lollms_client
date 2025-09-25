@@ -1,4 +1,4 @@
-# bindings/Lollms_chat/binding.py
+# bindings/OpenAI/binding.py
 import requests
 import json
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
@@ -9,18 +9,18 @@ from lollms_client.lollms_discussion import LollmsDiscussion
 from typing import Optional, Callable, List, Union
 from ascii_colors import ASCIIColors, trace_exception
 from typing import List, Dict
+import math
 import httpx
 import pipmaster as pm
 import mimetypes
-import base64
-
 pm.ensure_packages(["openai","tiktoken"])
 
 import openai
 import tiktoken
 import os
 
-BindingName = "LollmsBinding"
+BindingName = "OpenAIBinding"
+
 
 def _read_file_as_base64(path):
     with open(path, "rb") as f:
@@ -79,8 +79,8 @@ def normalize_image_input(img, default_mime="image/jpeg"):
         return {"type": "input_image", "image_url": _to_data_url(s, default_mime)}
 
     raise ValueError("Unsupported image input type")
-class LollmsBinding(LollmsLLMBinding):
-    """Lollms-specific binding implementation (open ai compatible with some extra parameters)"""
+class OpenAIBinding(LollmsLLMBinding):
+    """OpenAI-specific binding implementation"""
     
     
     def __init__(self,
@@ -91,46 +91,22 @@ class LollmsBinding(LollmsLLMBinding):
         Args:
             host_address (str): Host address for the OpenAI service. Defaults to DEFAULT_HOST_ADDRESS.
             model_name (str): Name of the model to use. Defaults to empty string.
-            service_key (str): Authentication key for the service. Defaults to None. This is a key generated 
-                               on the lollms interface (it is advised to use LOLLMS_API_KEY environment variable instead)
+            service_key (str): Authentication key for the service. Defaults to None.
             verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
             personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
         """
         super().__init__(BindingName, **kwargs)
-        self.host_address=kwargs.get("host_address","http://localhost:9642/v1").rstrip("/")
-        if not self.host_address.endswith("v1"):
-            self.host_address += "/v1"  
+        self.host_address=kwargs.get("host_address")
         self.model_name=kwargs.get("model_name")
         self.service_key=kwargs.get("service_key")
         self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
         self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
 
         if not self.service_key:
-            self.service_key = os.getenv("LOLLMS_API_KEY", self.service_key)
+            self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
         self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=self.verify_ssl_certificate))
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
-    def lollms_listMountedPersonalities(self, host_address:str|None=None):
-        host_address = host_address if host_address else self.host_address
-        url = f"{host_address}/personalities"
-
-        headers = {
-            "Authorization": f"Bearer {self.service_key}",
-            "Accept": "application/json",
-        }
-
-        response = requests.get(url, headers=headers, timeout=30)
-
-        if response.status_code == 200:
-            try:
-                text = json.loads(response.content.decode("utf-8"))
-                return text
-            except Exception as ex:
-                return {"status": False, "error": str(ex)}
-        else:
-            return {"status": False, "error": response.text}
-
-  
     def _build_openai_params(self, messages: list, **kwargs) -> dict:
         model = kwargs.get("model", self.model_name)
         if "n_predict" in kwargs:
@@ -172,7 +148,12 @@ class LollmsBinding(LollmsLLMBinding):
                 params.pop("top_p")
 
         return params
-  
+
+
+
+
+
+    
     def generate_text(self,
                     prompt: str,
                     images: Optional[List[str]] = None,
@@ -232,7 +213,7 @@ class LollmsBinding(LollmsLLMBinding):
                     chat_completion = self.client.chat.completions.create(**params)
                 except Exception as ex:
                     # exception for new openai models
-                    params["max_completion_tokens"]=params.get("max_tokens") or params.get("max_completion_tokens") or self.default_ctx_size
+                    params["max_completion_tokens"]=params["max_tokens"]
                     params["temperature"]=1
                     try: del params["max_tokens"] 
                     except Exception: pass
@@ -302,6 +283,7 @@ class LollmsBinding(LollmsLLMBinding):
 
         return output
 
+
     
     def generate_from_messages(self,
                      messages: List[Dict],
@@ -339,8 +321,21 @@ class LollmsBinding(LollmsLLMBinding):
         output = ""
         # 2. Call the API
         try:
-            completion = self.client.chat.completions.create(**params)
+            try:
+                completion = self.client.chat.completions.create(**params)
+            except Exception as ex:
+                # exception for new openai models
+                params["max_completion_tokens"]=params["max_tokens"]
+                params["temperature"]=1
+                try: del params["max_tokens"] 
+                except Exception: pass
+                try: del params["top_p"]
+                except Exception: pass
+                try: del params["frequency_penalty"]
+                except Exception: pass
 
+                
+                completion = self.client.chat.completions.create(**params)
             if stream:
                 for chunk in completion:
                     # The streaming response for chat has a different structure
@@ -362,145 +357,163 @@ class LollmsBinding(LollmsLLMBinding):
             return {"status": "error", "message": error_message}
             
         return output
-    
-    def chat(self,
-             discussion: LollmsDiscussion,
-             branch_tip_id: Optional[str] = None,
-             n_predict: Optional[int] = None,
-             stream: Optional[bool] = None,
-             temperature: float = 0.7,
-             top_k: int = 40,
-             top_p: float = 0.9,
-             repeat_penalty: float = 1.1,
-             repeat_last_n: int = 64,
-             seed: Optional[int] = None,
-             n_threads: Optional[int] = None,
-             ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
-             ) -> Union[str, dict]:
-        """
-        Conduct a chat session with the OpenAI model using a LollmsDiscussion object.
-
-        Args:
-            discussion (LollmsDiscussion): The discussion object containing the conversation history.
-            branch_tip_id (Optional[str]): The ID of the message to use as the tip of the conversation branch. Defaults to the active branch.
-            n_predict (Optional[int]): Maximum number of tokens to generate.
-            stream (Optional[bool]): Whether to stream the output.
-            temperature (float): Sampling temperature.
-            top_k (int): Top-k sampling parameter (Note: not all OpenAI models use this).
-            top_p (float): Top-p sampling parameter.
-            repeat_penalty (float): Frequency penalty for repeated tokens.
-            seed (Optional[int]): Random seed for generation.
-            streaming_callback (Optional[Callable[[str, MSG_TYPE], None]]): Callback for streaming output.
-
-        Returns:
-            Union[str, dict]: The generated text or an error dictionary.
-        """
-        # 1. Export the discussion to the OpenAI chat format
-        # This handles system prompts, user/assistant roles, and multi-modal content automatically.
-        messages = discussion.export("openai_chat", branch_tip_id)
-
-        # Build the request parameters
-        params = {
-            "model": self.model_name,
-            "messages": messages,
-            "max_tokens": n_predict,
-            "n": 1,
-            "temperature": temperature,
-            "top_p": top_p,
-            "frequency_penalty": repeat_penalty,
-            "stream": stream
-        }
-        # Add seed if available, as it's supported by newer OpenAI models
-        if seed is not None:
-            params["seed"] = seed
-
-        # Remove None values, as the API expects them to be absent
-        params = {k: v for k, v in params.items() if v is not None}
         
+    def chat(self,
+            discussion: LollmsDiscussion,
+            branch_tip_id: Optional[str] = None,
+            n_predict: Optional[int] = None,
+            stream: Optional[bool] = None,
+            temperature: float = 0.7,
+            top_k: int = 40,
+            top_p: float = 0.9,
+            repeat_penalty: float = 1.1,
+            repeat_last_n: int = 64,
+            seed: Optional[int] = None,
+            n_threads: Optional[int] = None,
+            ctx_size: Optional[int] = None,
+            streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+            ) -> Union[str, dict]:
+
+        messages = discussion.export("openai_chat", branch_tip_id)
+        params = self._build_openai_params(messages=messages,
+                                        n_predict=n_predict,
+                                        stream=stream,
+                                        temperature=temperature,
+                                        top_p=top_p,
+                                        repeat_penalty=repeat_penalty,
+                                        seed=seed)
+
         output = ""
-        # 2. Call the API
         try:
-            # Check if we should use the chat completions or legacy completions endpoint
             if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
                 completion = self.client.chat.completions.create(**params)
-
                 if stream:
                     for chunk in completion:
-                        # The streaming response for chat has a different structure
                         delta = chunk.choices[0].delta
                         if delta.content:
                             word = delta.content
-                            if streaming_callback is not None:
-                                if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                                    break
+                            if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                                break
                             output += word
                 else:
                     output = completion.choices[0].message.content
-
-            else: # Fallback to legacy completion format (not recommended for chat)
-                # We need to format the messages list into a single string prompt
+            else:
                 legacy_prompt = discussion.export("openai_completion", branch_tip_id)
-                legacy_params = {
-                    "model": self.model_name,
-                    "prompt": legacy_prompt,
-                    "max_tokens": n_predict,
-                    "n": 1,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "frequency_penalty": repeat_penalty,
-                    "stream": stream
-                }
+                legacy_params = self._build_openai_params(prompt=legacy_prompt,
+                                                        n_predict=n_predict,
+                                                        stream=stream,
+                                                        temperature=temperature,
+                                                        top_p=top_p,
+                                                        repeat_penalty=repeat_penalty,
+                                                        seed=seed)
                 completion = self.client.completions.create(**legacy_params)
-
                 if stream:
                     for chunk in completion:
                         word = chunk.choices[0].text
-                        if streaming_callback is not None:
-                            if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
+                        if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                            break
                         output += word
                 else:
                     output = completion.choices[0].text
-        
+
         except Exception as e:
-            # Handle API errors gracefully
-            error_message = f"An error occurred with the OpenAI API: {e}"
+            err = f"An error occurred with the OpenAI API: {e}"
             if streaming_callback:
-                streaming_callback(error_message, MSG_TYPE.MSG_TYPE_EXCEPTION)
-            return {"status": "error", "message": error_message}
-            
-        return output    
-    def tokenize(self, text: str) -> list:
+                streaming_callback(err, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": err}
+
+        return output
+
+    def _get_encoding(self, model_name: str | None = None):
         """
-        Tokenize the input text into a list of characters.
+        Get the tiktoken encoding for a given model.
+        Falls back to 'cl100k_base' if model is unknown.
+        """
+        if model_name is None:
+            model_name = self.model_name
+        try:
+            return tiktoken.encoding_for_model(model_name)
+        except KeyError:
+            return tiktoken.get_encoding("cl100k_base")
+
+    def tokenize(self, text: str) -> list[int]:
+        """
+        Tokenize text into a list of token IDs.
 
         Args:
             text (str): The text to tokenize.
 
         Returns:
-            list: List of individual characters.
+            list[int]: List of token IDs.
         """
-        try:
-            return tiktoken.model.encoding_for_model(self.model_name).encode(text)
-        except:
-            return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text)
-            
-    def detokenize(self, tokens: list) -> str:
+        encoding = self._get_encoding()
+        return encoding.encode(text)
+
+    def detokenize(self, tokens: list[int]) -> str:
         """
-        Convert a list of tokens back to text.
+        Convert a list of token IDs back to text.
 
         Args:
-            tokens (list): List of tokens (characters) to detokenize.
+            tokens (list[int]): List of tokens.
 
         Returns:
-            str: Detokenized text.
+            str: The decoded text.
         """
-        try:
-            return tiktoken.model.encoding_for_model(self.model_name).decode(tokens)
-        except:
-            return tiktoken.model.encoding_for_model("gpt-3.5-turbo").decode(tokens)
+        encoding = self._get_encoding()
+        return encoding.decode(tokens)
 
+    def get_input_tokens_price(self, model_name: str | None = None) -> float:
+        """
+        Get the price per input token for a given model (USD).
+
+        Args:
+            model_name (str | None): Model name. Defaults to self.model_name.
+
+        Returns:
+            float: Price per input token in USD.
+        """
+        if model_name is None:
+            model_name = self.model_name
+
+        price_map = {
+            "gpt-4o": 5e-6,
+            "gpt-4o-mini": 1.5e-6,
+            "gpt-3.5-turbo": 1.5e-6,
+            "o1": 15e-6,
+            "o3": 15e-6,
+        }
+
+        for key, price in price_map.items():
+            if model_name.lower().startswith(key):
+                return price
+        return 0.0  # Unknown → treat as free
+
+    def get_output_tokens_price(self, model_name: str | None = None) -> float:
+        """
+        Get the price per output token for a given model (USD).
+
+        Args:
+            model_name (str | None): Model name. Defaults to self.model_name.
+
+        Returns:
+            float: Price per output token in USD.
+        """
+        if model_name is None:
+            model_name = self.model_name
+
+        price_map = {
+            "gpt-4o": 15e-6,
+            "gpt-4o-mini": 6e-6,
+            "gpt-3.5-turbo": 2e-6,
+            "o1": 60e-6,
+            "o3": 60e-6,
+        }
+
+        for key, price in price_map.items():
+            if model_name.lower().startswith(key):
+                return price
+        return 0.0
+    
     def count_tokens(self, text: str) -> int:
         """
         Count tokens from a text.
@@ -514,41 +527,112 @@ class LollmsBinding(LollmsLLMBinding):
         return len(self.tokenize(text))
 
         
-    def embed(self, text: str, **kwargs) -> list:
+
+    def embed(self, text: str | list[str], normalize: bool = False, **kwargs) -> list:
         """
-        Get embeddings for the input text using OpenAI API.
+        Get embeddings for input text(s) using OpenAI API.
 
         Args:
-            text (str): Input text to embed.
+            text (str | list[str]): Input text or list of texts to embed.
+            normalize (bool): Whether to normalize the resulting vector(s) to unit length.
             **kwargs: Additional arguments. The 'model' argument can be used 
-                      to specify the embedding model (e.g., "text-embedding-3-small").
-                      Defaults to "text-embedding-ada-002".
+                    to specify the embedding model (e.g., "text-embedding-3-small").
+                    Defaults to "text-embedding-3-small".
 
         Returns:
-            list: The embedding vector as a list of floats, or an empty list on failure.
+            list: A single embedding vector (list of floats) if input is str,
+                or a list of embedding vectors if input is list[str].
+                Returns empty list on failure.
         """
-        # Determine the embedding model, prioritizing kwargs, with a default
+        # Determine the embedding model
         embedding_model = kwargs.get("model", self.model_name)
-        
+        if not embedding_model.startswith("text-embedding"):
+            embedding_model = "text-embedding-3-small"
+
+        # Ensure input is a list of strings
+        is_single_input = isinstance(text, str)
+        input_texts = [text] if is_single_input else text
+
+        # Optional safety: truncate if too many tokens for embedding model
+        max_tokens_map = {
+            "text-embedding-3-small": 8191,
+            "text-embedding-3-large": 8191,
+            "text-embedding-ada-002": 8191
+        }
+        max_tokens = max_tokens_map.get(embedding_model, None)
+        if max_tokens is not None:
+            input_texts = [
+                self.detokenize(self.tokenize(t)[:max_tokens])
+                for t in input_texts
+            ]
+
         try:
-            # The OpenAI API expects the input to be a list of strings
             response = self.client.embeddings.create(
                 model=embedding_model,
-                input=[text]  # Wrap the single text string in a list
+                input=input_texts
             )
-            
-            # Extract the embedding from the response
-            if response.data and len(response.data) > 0:
-                return response.data[0].embedding
-            else:
-                ASCIIColors.warning("OpenAI API returned no data for the embedding request.")
+
+            if not response.data:
+                ASCIIColors.warning(f"OpenAI API returned no data for the embedding request (model: {embedding_model}).")
                 return []
-                
+
+            embeddings = [item.embedding for item in response.data]
+
+            # Normalize if requested
+            if normalize:
+                embeddings = [
+                    [v / math.sqrt(sum(x*x for x in emb)) for v in emb]
+                    for emb in embeddings
+                ]
+
+            return embeddings[0] if is_single_input else embeddings
+
         except Exception as e:
-            ASCIIColors.error(f"Failed to generate embeddings using OpenAI API: {e}")
+            ASCIIColors.error(f"Failed to generate embeddings using model '{embedding_model}': {e}")
             trace_exception(e)
             return []
-        
+
+
+    def get_ctx_size(self, model_name: str | None = None) -> int:
+        """
+        Get the context size for a given model.
+        If model_name is None, use the instance's model_name.
+
+        Args:
+            model_name (str | None): The model name to check.
+
+        Returns:
+            int: The context window size in tokens.
+        """
+        if model_name is None:
+            model_name = self.model_name
+
+        # Default context sizes (update as needed)
+        context_map = {
+            # GPT-4 family
+            "gpt-4": 8192,
+            "gpt-4-32k": 32768,
+            "gpt-4o": 128000,
+            "gpt-4o-mini": 128000,
+            # GPT-3.5 family
+            "gpt-3.5-turbo": 16385,
+            "gpt-3.5-turbo-16k": 16385,
+            # GPT-5 and o-series
+            "gpt-5": 200000,
+            "o1": 200000,
+            "o3": 200000,
+            "o4": 200000,
+        }
+
+        # Try to find the best match
+        model_name_lower = model_name.lower()
+        for key, size in context_map.items():
+            if model_name_lower.startswith(key):
+                return size
+
+        # Fallback: default safe value
+        return 8192
+
 
     def get_model_info(self) -> dict:
         """
