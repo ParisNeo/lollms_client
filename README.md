@@ -1170,7 +1170,9 @@ else:
 
     except Exception as e:
         ASCIIColors.error(f"An error occurred during multi-image fusion: {e}")
-```This powerful feature allows for complex creative tasks like character swapping, background replacement, and style transfer directly through the `lollms_client` library.
+```
+
+This powerful feature allows for complex creative tasks like character swapping, background replacement, and style transfer directly through the `lollms_client` library.
 
 ### Listing Available Models
 
