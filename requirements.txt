@@ -1,7 +1,7 @@
 requests>=2.25.1
 ascii-colors
 pillow
-pipmaster
+pipmaster>=1.0.5
 pyyaml
 tiktoken
 pydantic

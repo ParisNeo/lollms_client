@@ -5736,6 +5736,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         self,
         text_to_process: str,
         contextual_prompt: Optional[str] = None,
+        system_prompt: str= None,
         context_fill_percentage: float = 0.75,
         overlap_tokens: int = 0,
         expected_generation_tokens: int = 1500,

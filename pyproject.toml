@@ -30,7 +30,7 @@ dependencies = [
     "httpx",
     "requests",
     "ascii-colors",
-    "pipmaster",
+    "pipmaster>=1.0.5",
     "pyyaml",
     "tiktoken",
     "pydantic",

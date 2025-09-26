@@ -19,8 +19,14 @@ from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import trace_exception, ASCIIColors
 
 pm.ensure_packages(["torch","torchvision"],index_url="https://download.pytorch.org/whl/cu126")
-pm.ensure_packages(["diffusers","pillow","transformers","safetensors","requests","tqdm"])
-
+pm.ensure_packages(["pillow","transformers","safetensors","requests","tqdm"])
+pm.ensure_packages([
+    {
+        "name": "diffusers",
+        "vcs": "git+https://github.com/huggingface/diffusers.git",
+        "condition": ">=0.35.1"
+    }
+])
 try:
     import torch
     from diffusers import (
