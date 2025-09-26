@@ -5732,317 +5732,317 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         callback("Deep analysis complete.", MSG_TYPE.MSG_TYPE_STEP_END)
         return final_output
 
-def long_context_processing(
-    self,
-    text_to_process: str,
-    contextual_prompt: Optional[str] = None,
-    system_prompt: str | None = None,
-    context_fill_percentage: float = 0.75,
-    overlap_tokens: int = 150,  # Added a default for better context continuity
-    expected_generation_tokens: int = 1500,
-    streaming_callback: Optional[Callable] = None,
-    return_scratchpad_only: bool = False,
-    debug: bool = True,
-    **kwargs
-) -> str:
-    """
-    Processes long text by breaking it down into chunks, analyzing each one incrementally,
-    and synthesizing the results into a comprehensive final response based on a user-defined objective.
-    """
-
-    if debug:
-        print(f"\n🔧 DEBUG: Starting processing with {len(text_to_process):,} characters")
-
-    # Validate context fill percentage
-    if not (0.1 <= context_fill_percentage <= 0.9):
-        raise ValueError(f"context_fill_percentage must be between 0.1 and 0.9, got {context_fill_percentage}")
-
-    # Get context size
-    try:
-        context_size = self.llm.get_context_size() or 8192 # Using a more modern default
-    except:
-        context_size = 8192
-
-    if debug:
-        print(f"🔧 DEBUG: Context size: {context_size}, Fill %: {context_fill_percentage}")
-
-    # Handle empty input
-    if not text_to_process:
-        return ""
-
-    # Use a simple word-based split for token estimation
-    tokens = text_to_process.split()
-    if debug:
-        print(f"🔧 DEBUG: Tokenized into {len(tokens):,} word tokens")
-
-    # Dynamic token budget calculation
-    def calculate_token_budgets(scratchpad_content: str = "", step_num: int = 0) -> dict:
-        # Generic prompt templates are more concise
-        base_system_tokens = 150
-        user_template_tokens = 250
-        scratchpad_tokens = len(scratchpad_content.split()) * 1.3 if scratchpad_content else 0
-
-        used_tokens = base_system_tokens + user_template_tokens + scratchpad_tokens + expected_generation_tokens
-        total_budget = int(context_size * context_fill_percentage)
-        available_for_chunk = max(500, int(total_budget - used_tokens)) # Ensure a reasonable minimum chunk size
-
-        budget_info = {
-            "total_budget": total_budget,
-            "chunk_budget": available_for_chunk,
-            "efficiency_ratio": available_for_chunk / total_budget if total_budget > 0 else 0,
-            "scratchpad_tokens": int(scratchpad_tokens),
-            "used_tokens": int(used_tokens)
-        }
+    def long_context_processing(
+        self,
+        text_to_process: str,
+        contextual_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
+        context_fill_percentage: float = 0.75,
+        overlap_tokens: int = 150,  # Added a default for better context continuity
+        expected_generation_tokens: int = 1500,
+        streaming_callback: Optional[Callable] = None,
+        return_scratchpad_only: bool = False,
+        debug: bool = True,
+        **kwargs
+    ) -> str:
+        """
+        Processes long text by breaking it down into chunks, analyzing each one incrementally,
+        and synthesizing the results into a comprehensive final response based on a user-defined objective.
+        """
 
         if debug:
-            print(f"🔧 DEBUG Step {step_num}: Budget = {available_for_chunk}/{total_budget} tokens, "
-                  f"Scratchpad = {int(scratchpad_tokens)} tokens")
+            print(f"\n🔧 DEBUG: Starting processing with {len(text_to_process):,} characters")
 
-        return budget_info
+        # Validate context fill percentage
+        if not (0.1 <= context_fill_percentage <= 0.9):
+            raise ValueError(f"context_fill_percentage must be between 0.1 and 0.9, got {context_fill_percentage}")
 
-    # Initial budget calculation
-    initial_budget = calculate_token_budgets()
-    chunk_size_tokens = initial_budget["chunk_budget"]
-
-    if debug:
-        print(f"🔧 DEBUG: Initial chunk size: {chunk_size_tokens} word tokens")
-
-    if streaming_callback:
-        streaming_callback(
-            f"Context Budget: {initial_budget['chunk_budget']:,}/{initial_budget['total_budget']:,} tokens "
-            f"({initial_budget['efficiency_ratio']:.1%} efficiency)",
-            MSG_TYPE.MSG_TYPE_STEP,
-            {"budget_info": initial_budget}
-        )
-
-    # Single pass for short content
-    if len(tokens) <= chunk_size_tokens:
-        if debug:
-            print("🔧 DEBUG: Content is short enough for single-pass processing")
-
-        if streaming_callback:
-            streaming_callback("Content fits in a single pass", MSG_TYPE.MSG_TYPE_STEP, {})
-
-        # Generic single-pass system prompt
-        system_prompt = (
-            "You are an expert AI assistant for text analysis and summarization. "
-            "Your task is to carefully analyze the provided text and generate a comprehensive, "
-            "accurate, and well-structured response that directly addresses the user's objective. "
-            "Focus on extracting key information, identifying main themes, and synthesizing the content effectively."
-        )
-
-        prompt_objective = contextual_prompt or "Provide a comprehensive summary and analysis of the provided text."
-        final_prompt = f"Objective: {prompt_objective}\n\n--- Full Text Content ---\n{text_to_process}"
-
+        # Get context size
         try:
-            result = self.remove_thinking_blocks(self.llm.generate_text(final_prompt, system_prompt=system_prompt, **kwargs))
-            if debug:
-                print(f"🔧 DEBUG: Single-pass result: {len(result):,} characters")
-            return result
-        except Exception as e:
-            if debug:
-                print(f"🔧 DEBUG: Single-pass processing failed: {e}")
-            return f"Error in single-pass processing: {e}"
-
-    # Multi-chunk processing for long content
-    if debug:
-        print("🔧 DEBUG: Using multi-chunk processing for long content")
-
-    chunk_summaries = []
-    current_position = 0
-    step_number = 1
-
-    while current_position < len(tokens):
-        # Recalculate budget for each step for dynamic adaptation
-        current_scratchpad = "\n\n---\n\n".join(chunk_summaries)
-        current_budget = calculate_token_budgets(current_scratchpad, step_number)
-        adaptive_chunk_size = max(500, current_budget["chunk_budget"])
-
-        # Extract the next chunk of text
-        chunk_end = min(current_position + adaptive_chunk_size, len(tokens))
-        chunk_tokens = tokens[current_position:chunk_end]
-        chunk_text = " ".join(chunk_tokens)
+            context_size = self.llm.get_context_size() or 8192 # Using a more modern default
+        except:
+            context_size = 8192
 
         if debug:
-            print(f"\n🔧 DEBUG Step {step_number}: Processing chunk from {current_position} to {chunk_end} "
-                  f"({len(chunk_tokens)} tokens)")
+            print(f"🔧 DEBUG: Context size: {context_size}, Fill %: {context_fill_percentage}")
 
-        # Progress calculation
-        remaining_tokens = len(tokens) - current_position
-        estimated_remaining_steps = max(1, -(-remaining_tokens // adaptive_chunk_size)) # Ceiling division
-        total_estimated_steps = step_number + estimated_remaining_steps -1
-        progress = (current_position / len(tokens)) * 90 if len(tokens) > 0 else 0
+        # Handle empty input
+        if not text_to_process:
+            return ""
+
+        # Use a simple word-based split for token estimation
+        tokens = text_to_process.split()
+        if debug:
+            print(f"🔧 DEBUG: Tokenized into {len(tokens):,} word tokens")
+
+        # Dynamic token budget calculation
+        def calculate_token_budgets(scratchpad_content: str = "", step_num: int = 0) -> dict:
+            # Generic prompt templates are more concise
+            base_system_tokens = 150
+            user_template_tokens = 250
+            scratchpad_tokens = len(scratchpad_content.split()) * 1.3 if scratchpad_content else 0
+
+            used_tokens = base_system_tokens + user_template_tokens + scratchpad_tokens + expected_generation_tokens
+            total_budget = int(context_size * context_fill_percentage)
+            available_for_chunk = max(500, int(total_budget - used_tokens)) # Ensure a reasonable minimum chunk size
+
+            budget_info = {
+                "total_budget": total_budget,
+                "chunk_budget": available_for_chunk,
+                "efficiency_ratio": available_for_chunk / total_budget if total_budget > 0 else 0,
+                "scratchpad_tokens": int(scratchpad_tokens),
+                "used_tokens": int(used_tokens)
+            }
+
+            if debug:
+                print(f"🔧 DEBUG Step {step_num}: Budget = {available_for_chunk}/{total_budget} tokens, "
+                    f"Scratchpad = {int(scratchpad_tokens)} tokens")
+
+            return budget_info
+
+        # Initial budget calculation
+        initial_budget = calculate_token_budgets()
+        chunk_size_tokens = initial_budget["chunk_budget"]
+
+        if debug:
+            print(f"🔧 DEBUG: Initial chunk size: {chunk_size_tokens} word tokens")
 
         if streaming_callback:
             streaming_callback(
-                f"Processing chunk {step_number}/{total_estimated_steps} - "
-                f"Budget: {adaptive_chunk_size:,} tokens",
-                MSG_TYPE.MSG_TYPE_STEP_START,
-                {"step": step_number, "progress": progress}
+                f"Context Budget: {initial_budget['chunk_budget']:,}/{initial_budget['total_budget']:,} tokens "
+                f"({initial_budget['efficiency_ratio']:.1%} efficiency)",
+                MSG_TYPE.MSG_TYPE_STEP,
+                {"budget_info": initial_budget}
             )
 
-        try:
-            # Generic, state-aware system prompt
-            system_prompt = (
-                f"You are a component in a multi-step text processing pipeline. Your role is to analyze a chunk of text and extract key information relevant to a global objective.\n\n"
-                f"**Current Status:** You are on step {step_number} of approximately {total_estimated_steps} steps. Progress is at {progress:.1f}%.\n\n"
-                f"**Your Task:**\n"
-                f"Analyze the 'New Text Chunk' provided below. Extract and summarize any information, data points, or key ideas that are relevant to the 'Global Objective'.\n"
-                f"Review the 'Existing Scratchpad Content' to understand what has already been found. Your goal is to add *new* insights that are not already captured.\n\n"
-                f"**CRITICAL:** Do NOT repeat information already present in the scratchpad. Focus only on new, relevant details from the current chunk. If the chunk contains no new relevant information, respond with '[No new information found in this chunk.]'."
-            )
-
-            # Generic, context-aware user prompt
-            summarization_objective = contextual_prompt or "Create a comprehensive summary by extracting all key facts, concepts, and conclusions from the text."
-            scratchpad_status = "The analysis is just beginning; this is the first chunk." if not chunk_summaries else f"Building on existing analysis with {len(chunk_summaries)} sections already completed."
-
-            user_prompt = (
-                f"--- Global Objective ---\n{summarization_objective}\n\n"
-                f"--- Current Progress ---\n"
-                f"{scratchpad_status} (Step {step_number}/{total_estimated_steps})\n\n"
-                f"--- Existing Scratchpad Content (for context) ---\n{current_scratchpad}\n\n"
-                f"--- New Text Chunk to Analyze ---\n{chunk_text}\n\n"
-                f"--- Your Instructions ---\n"
-                f"Extract key information from the 'New Text Chunk' that aligns with the 'Global Objective'. "
-                f"Provide a concise summary of the new findings. Do not repeat what is already in the scratchpad. "
-                f"If no new relevant information is found, state that clearly."
-            )
-
+        # Single pass for short content
+        if len(tokens) <= chunk_size_tokens:
             if debug:
-                print(f"🔧 DEBUG: Sending {len(user_prompt)} char prompt to LLM")
+                print("🔧 DEBUG: Content is short enough for single-pass processing")
 
-            chunk_summary = self.remove_thinking_blocks(self.llm.generate_text(user_prompt, system_prompt=system_prompt, **kwargs))
-
-            if debug:
-                print(f"🔧 DEBUG: Received {len(chunk_summary)} char response preview: {chunk_summary[:200]}...")
-
-            # Generic content filtering
-            filter_out = False
-            filter_reason = "content accepted"
-
-            # Check for explicit rejection signals
-            if (chunk_summary.strip().lower().startswith('[no new') or
-                chunk_summary.strip().lower().startswith('no new information')):
-                filter_out = True
-                filter_reason = "explicit rejection signal"
-            # Check for overly short or generic refusal responses
-            elif len(chunk_summary.strip()) < 25:
-                filter_out = True
-                filter_reason = "response too short to be useful"
-            # Check for common error phrases
-            elif any(error_phrase in chunk_summary.lower()[:150] for error_phrase in [
-                'error', 'failed', 'cannot provide', 'unable to analyze', 'not possible', 'insufficient information']):
-                filter_out = True
-                filter_reason = "error or refusal response detected"
-
-            if not filter_out:
-                chunk_summaries.append(chunk_summary.strip())
-                content_added = True
-                if debug:
-                    print(f"🔧 DEBUG: ✅ Content added to scratchpad (total sections: {len(chunk_summaries)})")
-            else:
-                content_added = False
-                if debug:
-                    print(f"🔧 DEBUG: ❌ Content filtered out - {filter_reason}: {chunk_summary[:100]}...")
-
-            # Update progress via callback
             if streaming_callback:
-                updated_scratchpad = "\n\n---\n\n".join(chunk_summaries)
+                streaming_callback("Content fits in a single pass", MSG_TYPE.MSG_TYPE_STEP, {})
+
+            # Generic single-pass system prompt
+            system_prompt = (
+                "You are an expert AI assistant for text analysis and summarization. "
+                "Your task is to carefully analyze the provided text and generate a comprehensive, "
+                "accurate, and well-structured response that directly addresses the user's objective. "
+                "Focus on extracting key information, identifying main themes, and synthesizing the content effectively."
+            )
+
+            prompt_objective = contextual_prompt or "Provide a comprehensive summary and analysis of the provided text."
+            final_prompt = f"Objective: {prompt_objective}\n\n--- Full Text Content ---\n{text_to_process}"
+
+            try:
+                result = self.remove_thinking_blocks(self.llm.generate_text(final_prompt, system_prompt=system_prompt, **kwargs))
+                if debug:
+                    print(f"🔧 DEBUG: Single-pass result: {len(result):,} characters")
+                return result
+            except Exception as e:
+                if debug:
+                    print(f"🔧 DEBUG: Single-pass processing failed: {e}")
+                return f"Error in single-pass processing: {e}"
+
+        # Multi-chunk processing for long content
+        if debug:
+            print("🔧 DEBUG: Using multi-chunk processing for long content")
+
+        chunk_summaries = []
+        current_position = 0
+        step_number = 1
+
+        while current_position < len(tokens):
+            # Recalculate budget for each step for dynamic adaptation
+            current_scratchpad = "\n\n---\n\n".join(chunk_summaries)
+            current_budget = calculate_token_budgets(current_scratchpad, step_number)
+            adaptive_chunk_size = max(500, current_budget["chunk_budget"])
+
+            # Extract the next chunk of text
+            chunk_end = min(current_position + adaptive_chunk_size, len(tokens))
+            chunk_tokens = tokens[current_position:chunk_end]
+            chunk_text = " ".join(chunk_tokens)
+
+            if debug:
+                print(f"\n🔧 DEBUG Step {step_number}: Processing chunk from {current_position} to {chunk_end} "
+                    f"({len(chunk_tokens)} tokens)")
+
+            # Progress calculation
+            remaining_tokens = len(tokens) - current_position
+            estimated_remaining_steps = max(1, -(-remaining_tokens // adaptive_chunk_size)) # Ceiling division
+            total_estimated_steps = step_number + estimated_remaining_steps -1
+            progress = (current_position / len(tokens)) * 90 if len(tokens) > 0 else 0
+
+            if streaming_callback:
                 streaming_callback(
-                    updated_scratchpad,
-                    MSG_TYPE.MSG_TYPE_SCRATCHPAD,
-                    {"step": step_number, "sections": len(chunk_summaries), "content_added": content_added, "filter_reason": filter_reason}
-                )
-                progress_after = ((current_position + len(chunk_tokens)) / len(tokens)) * 90 if len(tokens) > 0 else 90
-                streaming_callback(
-                    f"Step {step_number} completed - {'Content added' if content_added else f'Filtered: {filter_reason}'}",
-                    MSG_TYPE.MSG_TYPE_STEP_END,
-                    {"progress": progress_after}
+                    f"Processing chunk {step_number}/{total_estimated_steps} - "
+                    f"Budget: {adaptive_chunk_size:,} tokens",
+                    MSG_TYPE.MSG_TYPE_STEP_START,
+                    {"step": step_number, "progress": progress}
                 )
 
-        except Exception as e:
-            error_msg = f"Step {step_number} failed: {str(e)}"
+            try:
+                # Generic, state-aware system prompt
+                system_prompt = (
+                    f"You are a component in a multi-step text processing pipeline. Your role is to analyze a chunk of text and extract key information relevant to a global objective.\n\n"
+                    f"**Current Status:** You are on step {step_number} of approximately {total_estimated_steps} steps. Progress is at {progress:.1f}%.\n\n"
+                    f"**Your Task:**\n"
+                    f"Analyze the 'New Text Chunk' provided below. Extract and summarize any information, data points, or key ideas that are relevant to the 'Global Objective'.\n"
+                    f"Review the 'Existing Scratchpad Content' to understand what has already been found. Your goal is to add *new* insights that are not already captured.\n\n"
+                    f"**CRITICAL:** Do NOT repeat information already present in the scratchpad. Focus only on new, relevant details from the current chunk. If the chunk contains no new relevant information, respond with '[No new information found in this chunk.]'."
+                )
+
+                # Generic, context-aware user prompt
+                summarization_objective = contextual_prompt or "Create a comprehensive summary by extracting all key facts, concepts, and conclusions from the text."
+                scratchpad_status = "The analysis is just beginning; this is the first chunk." if not chunk_summaries else f"Building on existing analysis with {len(chunk_summaries)} sections already completed."
+
+                user_prompt = (
+                    f"--- Global Objective ---\n{summarization_objective}\n\n"
+                    f"--- Current Progress ---\n"
+                    f"{scratchpad_status} (Step {step_number}/{total_estimated_steps})\n\n"
+                    f"--- Existing Scratchpad Content (for context) ---\n{current_scratchpad}\n\n"
+                    f"--- New Text Chunk to Analyze ---\n{chunk_text}\n\n"
+                    f"--- Your Instructions ---\n"
+                    f"Extract key information from the 'New Text Chunk' that aligns with the 'Global Objective'. "
+                    f"Provide a concise summary of the new findings. Do not repeat what is already in the scratchpad. "
+                    f"If no new relevant information is found, state that clearly."
+                )
+
+                if debug:
+                    print(f"🔧 DEBUG: Sending {len(user_prompt)} char prompt to LLM")
+
+                chunk_summary = self.remove_thinking_blocks(self.llm.generate_text(user_prompt, system_prompt=system_prompt, **kwargs))
+
+                if debug:
+                    print(f"🔧 DEBUG: Received {len(chunk_summary)} char response preview: {chunk_summary[:200]}...")
+
+                # Generic content filtering
+                filter_out = False
+                filter_reason = "content accepted"
+
+                # Check for explicit rejection signals
+                if (chunk_summary.strip().lower().startswith('[no new') or
+                    chunk_summary.strip().lower().startswith('no new information')):
+                    filter_out = True
+                    filter_reason = "explicit rejection signal"
+                # Check for overly short or generic refusal responses
+                elif len(chunk_summary.strip()) < 25:
+                    filter_out = True
+                    filter_reason = "response too short to be useful"
+                # Check for common error phrases
+                elif any(error_phrase in chunk_summary.lower()[:150] for error_phrase in [
+                    'error', 'failed', 'cannot provide', 'unable to analyze', 'not possible', 'insufficient information']):
+                    filter_out = True
+                    filter_reason = "error or refusal response detected"
+
+                if not filter_out:
+                    chunk_summaries.append(chunk_summary.strip())
+                    content_added = True
+                    if debug:
+                        print(f"🔧 DEBUG: ✅ Content added to scratchpad (total sections: {len(chunk_summaries)})")
+                else:
+                    content_added = False
+                    if debug:
+                        print(f"🔧 DEBUG: ❌ Content filtered out - {filter_reason}: {chunk_summary[:100]}...")
+
+                # Update progress via callback
+                if streaming_callback:
+                    updated_scratchpad = "\n\n---\n\n".join(chunk_summaries)
+                    streaming_callback(
+                        updated_scratchpad,
+                        MSG_TYPE.MSG_TYPE_SCRATCHPAD,
+                        {"step": step_number, "sections": len(chunk_summaries), "content_added": content_added, "filter_reason": filter_reason}
+                    )
+                    progress_after = ((current_position + len(chunk_tokens)) / len(tokens)) * 90 if len(tokens) > 0 else 90
+                    streaming_callback(
+                        f"Step {step_number} completed - {'Content added' if content_added else f'Filtered: {filter_reason}'}",
+                        MSG_TYPE.MSG_TYPE_STEP_END,
+                        {"progress": progress_after}
+                    )
+
+            except Exception as e:
+                error_msg = f"Step {step_number} failed: {str(e)}"
+                if debug:
+                    print(f"🔧 DEBUG: ❌ {error_msg}")
+                self.trace_exception(e)
+                if streaming_callback:
+                    streaming_callback(error_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+                chunk_summaries.append(f"[Error processing chunk at step {step_number}: {str(e)[:150]}]")
+
+            # Move to the next chunk, allowing for overlap
+            current_position += max(1, adaptive_chunk_size - overlap_tokens)
+            step_number += 1
+            
+            # Safety break for excessively long documents
+            if step_number > 200:
+                if debug: print(f"🔧 DEBUG: Safety break after {step_number-1} steps.")
+                chunk_summaries.append("[Processing halted due to exceeding maximum step limit.]")
+                break
+
+        if debug:
+            print(f"\n🔧 DEBUG: Chunk processing complete. Total sections gathered: {len(chunk_summaries)}")
+
+        # Return only the scratchpad content if requested
+        if return_scratchpad_only:
+            final_scratchpad = "\n\n---\n\n".join(chunk_summaries)
+            if streaming_callback:
+                streaming_callback("Returning scratchpad content as final output.", MSG_TYPE.MSG_TYPE_STEP, {})
+            return final_scratchpad.strip()
+
+        # Final Synthesis Step
+        if streaming_callback:
+            streaming_callback("Synthesizing final comprehensive response...", MSG_TYPE.MSG_TYPE_STEP_START, {"progress": 95})
+
+        if not chunk_summaries:
+            error_msg = "No content was successfully processed or extracted from the document. The input might be empty or an issue occurred during processing."
             if debug:
                 print(f"🔧 DEBUG: ❌ {error_msg}")
-            self.trace_exception(e)
-            if streaming_callback:
-                streaming_callback(error_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
-            chunk_summaries.append(f"[Error processing chunk at step {step_number}: {str(e)[:150]}]")
+            return error_msg
 
-        # Move to the next chunk, allowing for overlap
-        current_position += max(1, adaptive_chunk_size - overlap_tokens)
-        step_number += 1
-        
-        # Safety break for excessively long documents
-        if step_number > 200:
-            if debug: print(f"🔧 DEBUG: Safety break after {step_number-1} steps.")
-            chunk_summaries.append("[Processing halted due to exceeding maximum step limit.]")
-            break
+        combined_scratchpad = "\n\n---\n\n".join(chunk_summaries)
+        synthesis_objective = contextual_prompt or "Provide a comprehensive, well-structured summary and analysis of the provided text."
 
-    if debug:
-        print(f"\n🔧 DEBUG: Chunk processing complete. Total sections gathered: {len(chunk_summaries)}")
-
-    # Return only the scratchpad content if requested
-    if return_scratchpad_only:
-        final_scratchpad = "\n\n---\n\n".join(chunk_summaries)
-        if streaming_callback:
-            streaming_callback("Returning scratchpad content as final output.", MSG_TYPE.MSG_TYPE_STEP, {})
-        return final_scratchpad.strip()
-
-    # Final Synthesis Step
-    if streaming_callback:
-        streaming_callback("Synthesizing final comprehensive response...", MSG_TYPE.MSG_TYPE_STEP_START, {"progress": 95})
-
-    if not chunk_summaries:
-        error_msg = "No content was successfully processed or extracted from the document. The input might be empty or an issue occurred during processing."
         if debug:
-            print(f"🔧 DEBUG: ❌ {error_msg}")
-        return error_msg
+            print(f"🔧 DEBUG: Synthesizing from {len(combined_scratchpad):,} char scratchpad with {len(chunk_summaries)} sections.")
 
-    combined_scratchpad = "\n\n---\n\n".join(chunk_summaries)
-    synthesis_objective = contextual_prompt or "Provide a comprehensive, well-structured summary and analysis of the provided text."
-
-    if debug:
-        print(f"🔧 DEBUG: Synthesizing from {len(combined_scratchpad):,} char scratchpad with {len(chunk_summaries)} sections.")
-
-    # Generic synthesis prompts
-    synthesis_system_prompt = (
-        "You are an expert AI assistant specializing in synthesizing information. "
-        "Your task is to consolidate a series of text analysis sections from a scratchpad into a single, coherent, and well-structured final response. "
-        "Eliminate redundancy, organize the content logically, and ensure the final output directly and comprehensively addresses the user's primary objective. "
-        "Use markdown for clear formatting (e.g., headers, lists, bold text)."
-    )
-
-    synthesis_user_prompt = (
-        f"--- Final Objective ---\n{synthesis_objective}\n\n"
-        f"--- Collected Analysis Sections (Scratchpad) ---\n{combined_scratchpad}\n\n"
-        f"--- Your Final Task ---\n"
-        f"Synthesize all the information from the 'Collected Analysis Sections' into a single, high-quality, and comprehensive response. "
-        f"Your response must directly address the 'Final Objective'. "
-        f"Organize your answer logically with clear sections using markdown headers. "
-        f"Ensure all key information is included, remove any repetitive statements, and produce a polished, final document."
-    )
-
-    try:
-        final_answer = self.remove_thinking_blocks(self.llm.generate_text(synthesis_user_prompt, system_prompt=synthesis_system_prompt, **kwargs))
-        if debug:
-            print(f"🔧 DEBUG: Final synthesis generated: {len(final_answer):,} characters")
-        if streaming_callback:
-            streaming_callback("Final synthesis complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"progress": 100})
-        return final_answer.strip()
-
-    except Exception as e:
-        error_msg = f"The final synthesis step failed: {str(e)}. Returning the organized scratchpad content as a fallback."
-        if debug: print(f"🔧 DEBUG: ❌ {error_msg}")
-        
-        # Fallback to returning the organized scratchpad
-        organized_scratchpad = (
-            f"# Analysis Summary\n\n"
-            f"*Note: The final synthesis process encountered an error. The raw, organized analysis sections are provided below.*\n\n"
-            f"## Collected Sections\n\n"
-            f"{combined_scratchpad}"
+        # Generic synthesis prompts
+        synthesis_system_prompt = (
+            "You are an expert AI assistant specializing in synthesizing information. "
+            "Your task is to consolidate a series of text analysis sections from a scratchpad into a single, coherent, and well-structured final response. "
+            "Eliminate redundancy, organize the content logically, and ensure the final output directly and comprehensively addresses the user's primary objective. "
+            "Use markdown for clear formatting (e.g., headers, lists, bold text)."
         )
-        return organized_scratchpad
+
+        synthesis_user_prompt = (
+            f"--- Final Objective ---\n{synthesis_objective}\n\n"
+            f"--- Collected Analysis Sections (Scratchpad) ---\n{combined_scratchpad}\n\n"
+            f"--- Your Final Task ---\n"
+            f"Synthesize all the information from the 'Collected Analysis Sections' into a single, high-quality, and comprehensive response. "
+            f"Your response must directly address the 'Final Objective'. "
+            f"Organize your answer logically with clear sections using markdown headers. "
+            f"Ensure all key information is included, remove any repetitive statements, and produce a polished, final document."
+        )
+
+        try:
+            final_answer = self.remove_thinking_blocks(self.llm.generate_text(synthesis_user_prompt, system_prompt=synthesis_system_prompt, **kwargs))
+            if debug:
+                print(f"🔧 DEBUG: Final synthesis generated: {len(final_answer):,} characters")
+            if streaming_callback:
+                streaming_callback("Final synthesis complete.", MSG_TYPE.MSG_TYPE_STEP_END, {"progress": 100})
+            return final_answer.strip()
+
+        except Exception as e:
+            error_msg = f"The final synthesis step failed: {str(e)}. Returning the organized scratchpad content as a fallback."
+            if debug: print(f"🔧 DEBUG: ❌ {error_msg}")
+            
+            # Fallback to returning the organized scratchpad
+            organized_scratchpad = (
+                f"# Analysis Summary\n\n"
+                f"*Note: The final synthesis process encountered an error. The raw, organized analysis sections are provided below.*\n\n"
+                f"## Collected Sections\n\n"
+                f"{combined_scratchpad}"
+            )
+            return organized_scratchpad
         
 
 def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators=True):
