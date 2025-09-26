@@ -49,25 +49,27 @@ class LollmsTTSBindingManager:
             except Exception as e:
                 trace_exception(e)
                 print(f"Failed to load TTS binding {binding_name}: {str(e)}")
-
-    def create_binding(self,
+    def create_binding(self, 
                       binding_name: str,
-                      config: Dict[str, Any] = None) -> Optional[LollmsTTSBinding]:
-        if config is None:
-            config = {}
-            
+                      **kwargs) -> Optional[LollmsTTSBinding]:
+        """
+        Create an instance of a specific binding.
+
+        Args:
+            binding_name (str): Name of the binding to create.
+            kwargs: binding specific arguments
+
+        Returns:
+            Optional[LollmsLLMBinding]: Binding instance or None if creation failed.
+        """
         if binding_name not in self.available_bindings:
             self._load_binding(binding_name)
-
+        
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
-            try:
-                return binding_class(**config)
-            except Exception as e:
-                trace_exception(e)
-                print(f"Failed to instantiate TTS binding {binding_name}: {str(e)}")
-                return None
+            return binding_class(**kwargs)
         return None
+
 
     @staticmethod
     def _get_fallback_description(binding_name: str) -> Dict:

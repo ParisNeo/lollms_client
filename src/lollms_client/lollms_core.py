@@ -143,13 +143,14 @@ class LollmsClient():
                 ASCIIColors.warning(f"Failed to create LLM binding: {llm_binding_name}. Available: {available}")
 
         if tts_binding_name:
-            self.tts = self.tts_binding_manager.create_binding(
-                binding_name=tts_binding_name,
-                **{
+            params = {
                     k: v
                     for k, v in (tts_binding_config or {}).items()
                     if k != "binding_name"
                 }
+            self.tts = self.tts_binding_manager.create_binding(
+                binding_name=tts_binding_name,
+                **params
             )
             if self.tts is None:
                 ASCIIColors.warning(f"Failed to create TTS binding: {tts_binding_name}. Available: {self.tts_binding_manager.get_available_bindings()}")
