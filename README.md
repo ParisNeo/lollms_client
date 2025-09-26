@@ -16,7 +16,8 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 ## Key Features
 
 *   🔌 **Versatile Binding System:** Seamlessly switch between different LLM backends (LoLLMs, Ollama, OpenAI, Llama.cpp, Transformers, vLLM, OpenLLM, Gemini, Claude, Groq, OpenRouter, Hugging Face Inference API) using a unified `llm_binding_config` dictionary for all parameters.
-*   🗣️ **Multimodal Support:** Interact with models capable of processing images and generate various outputs like speech (TTS), images (TTI), video (TTV), and music (TTM).
+*   🗣️ **Comprehensive Multimodal Support:** Interact with models capable of processing images and generate various outputs like speech (TTS), video (TTV), and music (TTM).
+*   🎨 **Advanced Image Generation and Editing:** A new `diffusers` binding provides powerful text-to-image capabilities. It supports a wide range of models from Hugging Face and Civitai, including specialized models like `Qwen-Image-Edit` for single-image editing and the cutting-edge `Qwen-Image-Edit-2509` for **multi-image fusion, pose transfer, and character swapping**.
 *   🖼️ **Selective Image Activation:** Control which images in a message are active and sent to the model, allowing for fine-grained multimodal context management without deleting the original data.
 *   🤖 **Agentic Workflows with MCP:** Empower LLMs to act as sophisticated agents, breaking down complex tasks, selecting and executing external tools (e.g., internet search, code interpreter, file I/O, image generation) through the Model Context Protocol (MCP) using a robust "observe-think-act" loop.
 *   🎭 **Personalities as Agents:** Personalities can now define their own set of required tools (MCPs) and have access to static or dynamic knowledge bases (`data_source`), turning them into self-contained, ready-to-use agents.
@@ -1067,8 +1068,109 @@ try:
 
 except Exception as e:
     ASCIIColors.error(f"Error initializing Hugging Face Inference API binding: {e}")
-    ASCIIColors.info("Please ensure your Hugging Face API token is correctly set and you have access to the specified model.")
+    ASCIIColors.info("Please ensure your Hugging Face API token is correctly set and you have access to the specified model.")```
+
+---
+
+### 4. Local Multimodal and Advanced Bindings
+
+#### **Diffusers (Local Text-to-Image Generation and Editing)**
+
+The `diffusers` binding leverages the Hugging Face `diffusers` library to run a vast array of text-to-image models locally on your own hardware (CPU or GPU). It supports models from Hugging Face and Civitai, providing everything from basic image generation to advanced, state-of-the-art image editing.
+
+**Prerequisites:**
+*   `torch` and `torchvision` must be installed. For GPU acceleration, it's critical to install the version that matches your CUDA toolkit.
+*   The binding will attempt to auto-install other requirements like `diffusers`, `transformers`, and `safetensors`.
+
+**Usage:**
+
+**Example 1: Basic Text-to-Image Generation**
+This example shows how to generate an image from a simple text prompt using a classic Stable Diffusion model.
+
+```python
+from lollms_client import LollmsClient
+from ascii_colors import ASCIIColors
+from pathlib import Path
+
+try:
+    # Initialize the client with the diffusers TTI binding
+    # Let's use a classic Stable Diffusion model for this example
+    lc = LollmsClient(
+        tti_binding_name="diffusers",
+        tti_binding_config={
+            "model_name": "runwayml/stable-diffusion-v1-5",
+            # Other options: "device", "torch_dtype_str", "enable_xformers"
+        }
+    )
+
+    prompt = "A high-quality photograph of an astronaut riding a horse on Mars."
+    ASCIIColors.yellow(f"Generating image for prompt: '{prompt}'")
+
+    # Generate the image. The result is returned as bytes.
+    image_bytes = lc.generate_image(prompt, width=512, height=512)
+
+    if image_bytes:
+        output_path = Path("./astronaut_on_mars.png")
+        with open(output_path, "wb") as f:
+            f.write(image_bytes)
+        ASCIIColors.green(f"Image saved successfully to: {output_path.resolve()}")
+    else:
+        ASCIIColors.error("Image generation failed.")
+
+except Exception as e:
+    ASCIIColors.error(f"An error occurred with the Diffusers binding: {e}")
+    ASCIIColors.info("Please ensure torch is installed correctly for your hardware (CPU/GPU).")
 ```
+
+**Example 2: Advanced Multi-Image Fusion with Qwen-Image-Edit-2509**
+This example demonstrates a cutting-edge capability: using a specialized model to fuse elements from multiple input images based on a text prompt. Here, we'll ask the model to take a person from one image and place them in the background of another.
+
+```python
+from lollms_client import LollmsClient
+from ascii_colors import ASCIIColors
+from pathlib import Path
+
+# --- IMPORTANT ---
+# Replace these with actual paths to your local images
+path_to_person_image = "./path/to/your/person.jpg"
+path_to_background_image = "./path/to/your/background.jpg"
+
+if not Path(path_to_person_image).exists() or not Path(path_to_background_image).exists():
+    ASCIIColors.warning("Input images not found. Skipping multi-image fusion example.")
+    ASCIIColors.warning(f"Please update 'path_to_person_image' and 'path_to_background_image'.")
+else:
+    try:
+        # Initialize with the advanced Qwen multi-image editing model
+        lc = LollmsClient(
+            tti_binding_name="diffusers",
+            tti_binding_config={
+                "model_name": "Qwen/Qwen-Image-Edit-2509",
+                "torch_dtype_str": "bfloat16" # Recommended for this model
+            }
+        )
+
+        # The prompt guides how the images are combined
+        prompt = "Place the person from the first image into the scenic background of the second image."
+        ASCIIColors.yellow(f"Fusing images with prompt: '{prompt}'")
+
+        # The edit_image method can accept a list of image paths for fusion
+        fused_image_bytes = lc.edit_image(
+            images=[path_to_person_image, path_to_background_image],
+            prompt=prompt,
+            num_inference_steps=50
+        )
+
+        if fused_image_bytes:
+            output_path = Path("./fused_image_result.png")
+            with open(output_path, "wb") as f:
+                f.write(fused_image_bytes)
+            ASCIIColors.green(f"Fused image saved successfully to: {output_path.resolve()}")
+        else:
+            ASCIIColors.error("Multi-image editing failed.")
+
+    except Exception as e:
+        ASCIIColors.error(f"An error occurred during multi-image fusion: {e}")
+```This powerful feature allows for complex creative tasks like character swapping, background replacement, and style transfer directly through the `lollms_client` library.
 
 ### Listing Available Models
 

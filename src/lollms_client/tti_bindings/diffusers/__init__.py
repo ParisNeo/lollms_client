@@ -35,7 +35,8 @@ try:
         AutoPipelineForInpainting,
         DiffusionPipeline,
         StableDiffusionPipeline,
-        
+        QwenImageEditPipeline,
+        QwenImageEditPlusPipeline
     )
     from diffusers.utils import load_image
     from PIL import Image
@@ -47,6 +48,8 @@ except ImportError:
     AutoPipelineForInpainting = None
     DiffusionPipeline = None
     StableDiffusionPipeline = None
+    QwenImageEditPipeline = None
+    QwenImageEditPlusPipeline = None
     Image = None
     load_image = None
     DIFFUSERS_AVAILABLE = False
@@ -359,7 +362,12 @@ class ModelManager:
                     common_args["safety_checker"] = None
                 if self.config.get("hf_cache_path"):
                     common_args["cache_dir"] = str(self.config["hf_cache_path"])
-                if task == "text2image":
+
+                if "Qwen-Image-Edit-2509" in str(model_path):
+                    self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
+                elif "Qwen-Image-Edit" in str(model_path):
+                    self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
+                elif task == "text2image":
                     self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **common_args)
                 elif task == "image2image":
                     self.pipeline = AutoPipelineForImage2Image.from_pretrained(model_path, **common_args)
@@ -498,9 +506,10 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         {"family": "SD 1.x", "model_name": "runwayml/stable-diffusion-v1-5", "display_name": "Stable Diffusion 1.5", "desc": "Classic SD1.5."},
         {"family": "SD 2.x", "model_name": "stabilityai/stable-diffusion-2-1", "display_name": "Stable Diffusion 2.1", "desc": "SD2.1 base."},
         {"family": "SD3", "model_name": "stabilityai/stable-diffusion-3-medium-diffusers", "display_name": "Stable Diffusion 3 Medium", "desc": "SD3 medium."},
-        {"family": "Qwen", "model_name": "Qwen/Qwen-Image", "display_name": "Qwen Image Edit", "desc": "Dedicated image generation."},
+        {"family": "Qwen", "model_name": "Qwen/Qwen-Image", "display_name": "Qwen Image", "desc": "Dedicated image generation."},
         {"family": "Specialized", "model_name": "playgroundai/playground-v2.5-1024px-aesthetic", "display_name": "Playground v2.5", "desc": "High aesthetic 1024."},
-        {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit", "display_name": "Qwen Image Edit", "desc": "Dedicated image editing."}
+        {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit", "display_name": "Qwen Image Edit", "desc": "Dedicated image editing."},
+        {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit-2509", "display_name": "Qwen Image Edit Plus (Multi-Image)", "desc": "Advanced multi-image editing, fusion, and pose transfer."}
     ]
 
     def __init__(self, **kwargs):
@@ -679,6 +688,25 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         generator = self._prepare_seed(kwargs)
         steps = kwargs.pop("num_inference_steps", self.config["num_inference_steps"])
         guidance = kwargs.pop("guidance_scale", self.config["guidance_scale"])
+
+        # Handle multi-image fusion for Qwen-Image-Edit-2509
+        if "Qwen-Image-Edit-2509" in self.model_name and len(pil_images) > 1:
+            pipeline_args = {
+                "image": pil_images,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt or " ",
+                "width": out_w, "height": out_h,
+                "num_inference_steps": steps,
+                "true_cfg_scale": guidance,
+                "generator": generator
+            }
+            pipeline_args.update(kwargs)
+            future = Future()
+            self.manager.queue.put((future, "image2image", pipeline_args))
+            ASCIIColors.info(f"Job (multi-image fusion with {len(pil_images)} images) queued.")
+            return future.result()
+
+        # Handle inpainting (single image with mask)
         if mask is not None and len(pil_images) == 1:
             try:
                 mask_img = self._decode_image_input(mask).convert("L")
@@ -689,36 +717,46 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 "mask_image": mask_img,
                 "prompt": prompt,
                 "negative_prompt": negative_prompt or None,
-                "width": out_w,
-                "height": out_h,
+                "width": out_w, "height": out_h,
                 "num_inference_steps": steps,
                 "guidance_scale": guidance,
                 "generator": generator
             }
             pipeline_args.update(kwargs)
+            if "Qwen-Image-Edit" in self.model_name:
+                pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
+                if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
+
             future = Future()
             self.manager.queue.put((future, "inpainting", pipeline_args))
             ASCIIColors.info("Job (inpaint) queued.")
             return future.result()
+
+        # Handle standard image-to-image (single image)
         try:
             pipeline_args = {
-                "image": pil_images if len(pil_images) > 1 else pil_images[0],
+                "image": pil_images[0],
                 "prompt": prompt,
                 "negative_prompt": negative_prompt or None,
                 "strength": kwargs.pop("strength", 0.6),
-                "width": out_w,
-                "height": out_h,
+                "width": out_w, "height": out_h,
                 "num_inference_steps": steps,
                 "guidance_scale": guidance,
                 "generator": generator
             }
             pipeline_args.update(kwargs)
+            if "Qwen-Image-Edit" in self.model_name:
+                pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
+                if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
+
             future = Future()
             self.manager.queue.put((future, "image2image", pipeline_args))
             ASCIIColors.info("Job (i2i) queued.")
             return future.result()
         except Exception:
             pass
+
+        # Fallback to latent-based generation if i2i fails for some reason
         try:
             base = pil_images[0]
             latents, _ = self._encode_image_to_latents(base, out_w, out_h)
@@ -729,8 +767,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 "num_inference_steps": steps,
                 "guidance_scale": guidance,
                 "generator": generator,
-                "width": out_w,
-                "height": out_h
+                "width": out_w, "height": out_h
             }
             pipeline_args.update(kwargs)
             future = Future()
@@ -739,6 +776,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             return future.result()
         except Exception as e:
             raise Exception(f"Image edit failed: {e}") from e
+
 
     def list_local_models(self) -> List[str]:
         if not self.models_path.exists():
