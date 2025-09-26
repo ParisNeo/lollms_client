@@ -1069,6 +1069,7 @@ try:
 except Exception as e:
     ASCIIColors.error(f"Error initializing Hugging Face Inference API binding: {e}")
     ASCIIColors.info("Please ensure your Hugging Face API token is correctly set and you have access to the specified model.")```
+```
 
 ---
 
