@@ -564,7 +564,7 @@ class LollmsBinding(LollmsLLMBinding):
             "model_name": self.model_name
         }
 
-    def listModels(self) -> List[Dict]:
+    def list_models(self) -> List[Dict]:
         # Known context lengths
         known_context_lengths = {
             "gpt-4o": 128000,

@@ -307,7 +307,7 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
         
         return applied_some_settings
 
-    def listModels(self) -> list:
+    def list_models(self) -> list:
         """Lists available Imagen models in a standardized format."""
         models = IMAGEN_VERTEX_MODELS if self.auth_method == "vertex_ai" else IMAGEN_GEMINI_API_MODELS
         return [

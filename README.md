@@ -1195,7 +1195,7 @@ try:
     )
 
     ASCIIColors.yellow("\nListing available models for the current binding:")
-    available_models = lc.listModels()
+    available_models = lc.list_models()
 
     if isinstance(available_models, list):
         for model in available_models:

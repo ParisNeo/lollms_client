@@ -86,7 +86,7 @@ The `LollmsClient` class is the primary interface for interacting with various L
     *   **Parameters**: `text` (str or List[str]), `**kwargs` for binding-specific embedding options.
     *   **Returns**: List of floats (embedding vector) or list of lists of floats (for batch input).
 
-*   **`listModels() -> list`**: (Note: Original `lollms_core_classes.md` shows `listModels(self, host_address: str = None) -> None`. This should probably return a list and delegate to the binding.)
+*   **`list_models() -> list`**: (Note: Original `lollms_core_classes.md` shows `list_models(self, host_address: str = None) -> None`. This should probably return a list and delegate to the binding.)
     *   **Purpose**: Lists models available to the current LLM binding.
     *   **Returns**: List of model information dictionaries.
 

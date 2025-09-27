@@ -422,7 +422,7 @@ class PythonLlamaCppBinding(LollmsLLMBinding):
             "config": self.llama_config 
         }
 
-    def listModels(self, force_rescan: bool = False) -> List[Dict[str, str]]: # type: ignore
+    def list_models(self, force_rescan: bool = False) -> List[Dict[str, str]]: # type: ignore
         """
         Lists available GGUF models.
         
@@ -528,10 +528,10 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models (force_rescan=True) ---")
-        model_list = active_binding.listModels(force_rescan=True)
+        model_list = active_binding.list_models(force_rescan=True)
         print(json.dumps(model_list, indent=2))
         assert len(model_list) == 2, "Model discovery failed to find all dummy models."
-        assert any(m['loaded'] for m in model_list), "listModels did not correctly report a loaded model."
+        assert any(m['loaded'] for m in model_list), "list_models did not correctly report a loaded model."
 
 
         if is_dummy_model:

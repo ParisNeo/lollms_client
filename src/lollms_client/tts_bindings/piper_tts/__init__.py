@@ -104,7 +104,7 @@ class PiperClientBinding(LollmsTTSBinding):
         response.raise_for_status()
         return response.json().get("voices", [])
 
-    def list_models(self, **kwargs) -> List[str]:
+    def list_models(self) -> List[str]:
         """Get available models from the server"""
         response = requests.get(f"{self.base_url}/list_models")
         response.raise_for_status()

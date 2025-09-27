@@ -197,7 +197,7 @@ print(f"Token count: {token_count}")
 
 ```python
 # client = LollmsClient(...)
-available_models = client.listModels()
+available_models = client.list_models()
 print(f"Available models for current binding ({client.binding.binding_name}): {available_models}")
 
 # Example with Ollama
@@ -208,7 +208,7 @@ print(f"Available models for current binding ({client.binding.binding_name}): {a
 #     except Exception as e:
 #         print(f"Failed to switch model: {e}")
 ```
-Behavior of `listModels()` and `switch_model()` is binding-dependent.
+Behavior of `list_models()` and `switch_model()` is binding-dependent.
 
 ### 3.5. Using Other Modalities (TTS, STT, TTI, TTM, TTV)
 

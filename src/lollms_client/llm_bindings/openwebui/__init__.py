@@ -232,7 +232,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
 
         return output
 
-    def listModels(self) -> List[Dict]:
+    def list_models(self) -> List[Dict]:
         models_info = []
         try:
             response = self.client.get("/api/models")

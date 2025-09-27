@@ -66,7 +66,7 @@ Each parameter in any of these sections should have:
 *   **`chat(self, discussion: LollmsDiscussion, ...)`**: The main conversational method. Convert the `LollmsDiscussion` object into the API's required format and handle the generation.
 *   **`generate_text(self, prompt: str, ...)`**: For single-shot text generation. Can often be implemented by wrapping the prompt in a minimal chat structure and calling the `chat` logic.
 *   **`tokenize(self, text)` / `detokenize(self, tokens)` / `count_tokens(self, text)`**: Implement text-to-token conversions. Use the service's official tokenizer library (e.g., `tiktoken`) if available.
-*   **`listModels(self)`**: Return a list of available text generation models.
+*   **`list_models(self)`**: Return a list of available text generation models.
 *   **`embed(self, text)`**: Implement if the service has an embedding API, otherwise raise `NotImplementedError`.
 
 ### 4. How to Build a TTI (Text-to-Image) Binding
@@ -76,7 +76,7 @@ Each parameter in any of these sections should have:
 *   **`__init__(self, **kwargs)`**: Initializes the image generation client using parameters from `description.yaml`.
 *   **`generate_image(self, prompt, ...)`**: Takes a prompt and image dimensions. Your job is to call the API and return the final image as `bytes`.
 *   **`edit_image(self, images, prompt, ...)`**: Implements image-to-image and inpainting. Check if a `mask` is provided to determine which API endpoint to call. Return the edited image as `bytes`.
-*   **`listModels(self)`**: Return a list of available image generation models.
+*   **`list_models(self)`**: Return a list of available image generation models.
 *   **`set_settings(self, settings)`**: Allows the UI to dynamically change configuration, such as switching the active model.
 
 ### 5. How to Build an STT (Speech-to-Text) Binding

@@ -365,7 +365,7 @@ class GrokBinding(LollmsLLMBinding):
             "supports_vision": "vision" in self.model_name or "grok-1.5" == self.model_name,
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """
         Lists available models from the xAI API.
         Caches the result to avoid repeated API calls.
@@ -444,7 +444,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models (dynamic) ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Found {len(models)} models.")
             for m in models:

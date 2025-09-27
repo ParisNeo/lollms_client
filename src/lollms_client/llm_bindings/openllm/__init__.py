@@ -344,7 +344,7 @@ class OpenLLMBinding(LollmsLLMBinding):
             "supports_vision": supports_vision # Highly dependent on the specific model served
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """
         Lists the model currently served by the connected OpenLLM instance.
         OpenLLM client connects to one model server at a time.
@@ -423,7 +423,7 @@ if __name__ == '__main__':
         ASCIIColors.info(f"Using OpenLLM client version: {openllm.__version__ if openllm else 'N/A'}")
 
         ASCIIColors.cyan("\n--- Listing Model (should be the one connected) ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Connected model info:")
             for m in models:

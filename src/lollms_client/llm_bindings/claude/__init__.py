@@ -354,7 +354,7 @@ class ClaudeBinding(LollmsLLMBinding):
             "supports_vision": "claude-3" in self.model_name,
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """
         Lists available models from the Anthropic API.
         Caches the result to avoid repeated API calls.
@@ -451,7 +451,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models (dynamic) ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Found {len(models)} models.")
             for m in models:

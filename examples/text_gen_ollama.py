@@ -27,5 +27,5 @@ print(response)
 print()
 
 # List Models
-response = lc.listModels()
+response = lc.list_models()
 print(response)

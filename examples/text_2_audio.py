@@ -67,7 +67,7 @@ else:
 
 
 # List Models (This is an LLM feature)
-models_response = lc.listModels()
+models_response = lc.list_models()
 ASCIIColors.blue("\nAvailable LLM Models:")
 print(models_response)
 

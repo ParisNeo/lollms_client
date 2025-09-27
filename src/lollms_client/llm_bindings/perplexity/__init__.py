@@ -224,7 +224,7 @@ class PerplexityBinding(LollmsLLMBinding):
             "supports_structured_output": False
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """
         Lists available models. Perplexity API does not have a models endpoint,
         so a hardcoded list is returned.
@@ -255,7 +255,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models (static list) ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Found {len(models)} models.")
             for m in models:

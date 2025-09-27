@@ -143,17 +143,21 @@ class LollmsClient():
                 ASCIIColors.warning(f"Failed to create LLM binding: {llm_binding_name}. Available: {available}")
 
         if tts_binding_name:
-            params = {
-                    k: v
-                    for k, v in (tts_binding_config or {}).items()
-                    if k != "binding_name"
-                }
-            self.tts = self.tts_binding_manager.create_binding(
-                binding_name=tts_binding_name,
-                **params
-            )
-            if self.tts is None:
-                ASCIIColors.warning(f"Failed to create TTS binding: {tts_binding_name}. Available: {self.tts_binding_manager.get_available_bindings()}")
+            try:
+                params = {
+                        k: v
+                        for k, v in (tts_binding_config or {}).items()
+                        if k != "binding_name"
+                    }
+                self.tts = self.tts_binding_manager.create_binding(
+                    binding_name=tts_binding_name,
+                    **params
+                )
+                if self.tts is None:
+                    ASCIIColors.warning(f"Failed to create TTS binding: {tts_binding_name}. Available: {self.tts_binding_manager.get_available_bindings()}")
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.warning(f"Exception occurred while creating TTS binding: {str(e)}")
 
         if tti_binding_name:
             if tti_binding_config:
@@ -675,10 +679,10 @@ class LollmsClient():
         raise RuntimeError("LLM binding not initialized.")
 
 
-    def listModels(self):
+    def list_models(self):
         """Lists models available to the current LLM binding."""
         if self.llm:
-            return self.llm.listModels()
+            return self.llm.list_models()
         raise RuntimeError("LLM binding not initialized.")
 
     # --- Convenience Methods for Lollms LLM Binding Features ---

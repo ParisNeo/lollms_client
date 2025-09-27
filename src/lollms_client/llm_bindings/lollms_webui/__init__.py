@@ -375,7 +375,7 @@ class LollmsWebuiLLMBinding(LollmsLLMBinding):
         }
 
 
-    def listModels(self) -> dict:
+    def list_models(self) -> dict:
         """Lists models"""
         url = f"{self.host_address}/list_models"
 

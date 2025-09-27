@@ -14,7 +14,7 @@ lc = LollmsClient(
 )
 
 # if you want to see what binding/model does the server support, use this:
-models = lc.listModels()
+models = lc.list_models()
 print(f"Found models:\n{models}")
 
 lc.set_model_name("ollama/gemma3:27b")  # Or your preferred binding/model

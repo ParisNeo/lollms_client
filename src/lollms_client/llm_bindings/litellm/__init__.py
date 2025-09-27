@@ -185,7 +185,7 @@ class LiteLLMBinding(LollmsLLMBinding):
             ASCIIColors.error(f"--- [LiteLLM Binding] Fallback method failed: {e}")
         return entries
 
-    def listModels(self) -> List[Dict]:
+    def list_models(self) -> List[Dict]:
         url = f'{self.host_address}/model/info'
         headers = {'Authorization': f'Bearer {self.service_key}'}
         entries = []

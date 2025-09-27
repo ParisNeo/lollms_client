@@ -32,6 +32,6 @@ class LollmsClient:
     def ollama_generate(self, prompt, host_address = None, model_name = None, personality = None, n_predict = None, stream = False, temperature = 0.7, top_k = 50, top_p = 0.95, repeat_penalty = 0.8, repeat_last_n = 40, seed = None, n_threads = 8, completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Instruct, service_key: str = '', streaming_callback = None) -> None
     def litellm_generate(self, prompt, host_address = None, model_name = None, personality = None, n_predict = None, stream = False, temperature = 0.7, top_k = 50, top_p = 0.95, repeat_penalty = 0.8, repeat_last_n = 40, seed = None, n_threads = 8, completion_format: ELF_COMPLETION_FORMAT = ELF_COMPLETION_FORMAT.Instruct, service_key: str = '', streaming_callback = None) -> None
     def listMountedPersonalities(self, host_address: str = None) -> None
-    def listModels(self, host_address: str = None) -> None
+    def list_models(self, host_address: str = None) -> None
 ```
 

@@ -238,7 +238,7 @@ class AzureOpenAIBinding(LollmsLLMBinding):
             "supports_vision": True, # Assume modern deployments support vision
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """
         List Models is not supported via the Azure OpenAI API.
         Deployments are managed in the Azure Portal. This method returns an empty list.
@@ -280,7 +280,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if not models:
             ASCIIColors.green("Correctly returned an empty list for models, as expected for Azure.")
         

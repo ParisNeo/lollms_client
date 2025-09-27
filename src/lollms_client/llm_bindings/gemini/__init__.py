@@ -353,7 +353,7 @@ class GeminiBinding(LollmsLLMBinding):
             "supports_vision": "vision" in self.model_name or "gemini-1.5" in self.model_name,
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """Lists available generative models from the Gemini service."""
         if not self.client:
             ASCIIColors.error("Gemini client not initialized. Cannot list models.")
@@ -407,7 +407,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Found {len(models)} generative models. First 5:")
             for m in models[:5]:

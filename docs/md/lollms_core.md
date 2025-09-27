@@ -152,7 +152,7 @@ These methods provide the primary interface for text generation and related LLM 
 *   `count_tokens(text: str) -> int`: Counts the number of tokens in a given text.
 *   `count_image_tokens(image: str) -> int`: Estimates the number of tokens an image would consume in a multi-modal context (e.g., base64 encoded image).
 *   `get_model_details() -> dict`: Retrieves detailed information about the currently loaded LLM model.
-*   `listModels() -> List[Dict]`: Lists all models available to the active LLM binding.
+*   `list_models() -> List[Dict]`: Lists all models available to the active LLM binding.
 *   `switch_model(model_name: str) -> bool`: Attempts to load a different model within the active LLM binding.
 
 **Example:**
@@ -164,7 +164,7 @@ print(f"Tokens: {tokens}")
 print(f"Detokenized: '{client.detokenize(tokens)}'")
 print(f"Token count: {client.count_tokens(text_to_process)}")
 
-# print(f"Available LLM models for '{client.binding.binding_name}': {client.listModels()}")
+# print(f"Available LLM models for '{client.binding.binding_name}': {client.list_models()}")
 # client.switch_model("another_model_name") # Uncomment to test model switching
 ```
 
@@ -1430,7 +1430,7 @@ These methods provide the primary interface for text generation and related LLM 
 *   `count_tokens(text: str) -> int`: Counts the number of tokens in a given text.
 *   `count_image_tokens(image: str) -> int`: Estimates the number of tokens an image would consume in a multi-modal context (e.g., base64 encoded image).
 *   `get_model_details() -> dict`: Retrieves detailed information about the currently loaded LLM model.
-*   `listModels() -> List[Dict]`: Lists all models available to the active LLM binding.
+*   `list_models() -> List[Dict]`: Lists all models available to the active LLM binding.
 *   `switch_model(model_name: str) -> bool`: Attempts to load a different model within the active LLM binding.
 
 **Example:**
@@ -1442,7 +1442,7 @@ print(f"Tokens: {tokens}")
 print(f"Detokenized: '{client.detokenize(tokens)}'")
 print(f"Token count: {client.count_tokens(text_to_process)}")
 
-# print(f"Available LLM models for '{client.binding.binding_name}': {client.listModels()}")
+# print(f"Available LLM models for '{client.binding.binding_name}': {client.list_models()}")
 # client.switch_model("another_model_name") # Uncomment to test model switching
 ```
 

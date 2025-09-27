@@ -190,11 +190,11 @@ personalities = client.listMountedPersonalities()
 print(personalities)
 ```
 
-#### `listModels() -> list`
+#### `list_models() -> list`
 Lists all available models on the server.
 
 ```python
-models = client.listModels()
+models = client.list_models()
 print(models)
 ```
 

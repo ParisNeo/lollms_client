@@ -628,7 +628,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         
         if not model_to_load:
             self._scan_models()
-            available_models = self.listModels()
+            available_models = self.list_models()
             if not available_models:
                 ASCIIColors.error("No model specified and no GGUF models found in models path.")
                 return False
@@ -964,7 +964,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         
         ASCIIColors.info(f"Scanned {len(self._model_path_map)} models from {self.models_path}.")
 
-    def listModels(self) -> List[Dict[str, Any]]:
+    def list_models(self) -> List[Dict[str, Any]]:
         self._scan_models()
         models_found = []
         for unique_name, model_path in self._model_path_map.items():

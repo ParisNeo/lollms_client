@@ -36,7 +36,7 @@ class NovitaAITTIBinding(LollmsTTIBinding):
         self.base_url = "https://api.novita.ai/v3"
         self.headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
-    def listModels(self) -> list:
+    def list_models(self) -> list:
         return NOVITA_AI_MODELS
     
     def generate_image(self, prompt: str, negative_prompt: str = "", width: int = 1024, height: int = 1024, **kwargs) -> bytes:

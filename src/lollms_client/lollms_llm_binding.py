@@ -312,7 +312,7 @@ class LollmsLLMBinding(ABC):
         pass
 
     @abstractmethod
-    def listModels(self) -> list:
+    def list_models(self) -> list:
         """Lists models"""
         pass
     

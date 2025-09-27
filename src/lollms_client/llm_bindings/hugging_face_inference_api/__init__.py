@@ -196,7 +196,7 @@ class HuggingFaceInferenceAPIBinding(LollmsLLMBinding):
             "supports_vision": False, # Vision models use a different API call
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """Lists text-generation models from the Hugging Face Hub."""
         if not self.hf_api:
             ASCIIColors.error("HF API client not initialized. Cannot list models.")
@@ -252,7 +252,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Successfully fetched {len(models)} text-generation models.")
             ASCIIColors.info("Top 5 most downloaded models:")

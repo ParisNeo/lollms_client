@@ -29,6 +29,7 @@ class LollmsTTSBinding_Impl(LollmsTTSBinding):
                          model_name=model_name,
                          service_key=service_key, # Stored in the parent class
                          verify_ssl_certificate=verify_ssl_certificate)
+        self.host_address = host_address
         # self.client_id = service_key # Can access via self.service_key from parent
 
     def generate_audio(self, text: str, voice: Optional[str] = None, **kwargs) -> bytes:
@@ -143,3 +144,7 @@ class LollmsTTSBinding_Impl(LollmsTTSBinding):
             ASCIIColors.error(f"An unexpected error occurred while listing voices: {e}")
             trace_exception(e)
             return ["main_voice"]
+
+    def list_models(self) -> list:
+        """Lists models"""
+        return  ["lollms"]

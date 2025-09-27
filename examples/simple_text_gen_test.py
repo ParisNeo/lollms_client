@@ -105,7 +105,7 @@ def test_text_generation():
         #    For 'lollms' binding, this would set the model on the server.
         #    For 'ollama' or 'openai', it means the next generate_text will use this model.
         ASCIIColors.magenta("\n\n3. List Available Models & Generate with Specific Model:")
-        available_models = lc.listModels()
+        available_models = lc.list_models()
         if isinstance(available_models, list) and available_models:
             ASCIIColors.green("Available models:")
             for i, model_info in enumerate(available_models[:5]): # Print first 5

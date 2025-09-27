@@ -23,7 +23,7 @@ Most examples typically involve:
         *   Initializing `LollmsClient` for different backends.
         *   Non-streaming text generation (`lc.generate_text(stream=False)`).
         *   Streaming text generation (`lc.generate_text(stream=True)`) with a callback.
-        *   Listing available models (`lc.listModels()`).
+        *   Listing available models (`lc.list_models()`).
         *   Switching or setting the model for generation.
         *   Token counting (`lc.count_tokens()`) and embedding (`lc.embed()`).
 

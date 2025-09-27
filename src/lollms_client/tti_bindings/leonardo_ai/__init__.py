@@ -38,7 +38,7 @@ class LeonardoAITTIBinding(LollmsTTIBinding):
         self.base_url = "https://cloud.leonardo.ai/api/rest/v1"
         self.headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
-    def listModels(self) -> list:
+    def list_models(self) -> list:
         # You could also fetch this dynamically from /models endpoint
         return LEONARDO_AI_MODELS
     

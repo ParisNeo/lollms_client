@@ -451,7 +451,7 @@ class VLLMBinding(LollmsLLMBinding):
             }
         return info
 
-    def listModels(self) -> List[Dict[str, Any]]:
+    def list_models(self) -> List[Dict[str, Any]]:
         local_models = []
         if not self.models_folder.exists(): return []
         for item_path in self.models_folder.rglob('*'):

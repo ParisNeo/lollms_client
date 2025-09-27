@@ -492,7 +492,7 @@ class HuggingFaceHubBinding(LollmsLLMBinding):
                                                 # (unless using external libraries like outlines)
         return info
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         models_found = []
         unique_model_names = set()
 
@@ -549,8 +549,8 @@ if __name__ == '__main__':
     # Let's use a dummy path for models_path for Hub ID testing.
     
     # Adjust current_directory for local model testing if needed
-    # For this test, we'll assume a Hub ID. `models_path` is where `listModels` would scan.
-    test_models_parent_path = Path("./test_hf_models_dir") # Create a dummy for listModels scan
+    # For this test, we'll assume a Hub ID. `models_path` is where `list_models` would scan.
+    test_models_parent_path = Path("./test_hf_models_dir") # Create a dummy for list_models scan
     test_models_parent_path.mkdir(exist_ok=True)
 
     binding_config = {
@@ -582,7 +582,7 @@ if __name__ == '__main__':
         # To make this test useful, you could manually place a model folder in `test_hf_models_dir`
         # e.g., download "gpt2" and put it in `test_hf_models_dir/gpt2`
         # For now, it will likely be empty unless you do that.
-        listed_models = active_binding.listModels()
+        listed_models = active_binding.list_models()
         if listed_models:
             ASCIIColors.green(f"Found {len(listed_models)} potential model folders. First 5:")
             for m in listed_models[:5]: print(m)

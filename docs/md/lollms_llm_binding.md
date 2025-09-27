@@ -63,7 +63,7 @@ This module defines the abstract base class (`LollmsLLMBinding`) for all Large L
     *   **Purpose**: Retrieves information about the currently loaded model or the binding's configuration.
     *   **Returns**: A dictionary containing details such as model name, path, loaded status, context size, supported features (e.g., vision, structured output), and any relevant configuration parameters.
 
-*   **`listModels() -> list`**:
+*   **`list_models() -> list`**:
     *   **Purpose**: Lists models available to this binding. For server-based bindings, this queries the server. For local file-based bindings, it might scan a configured model directory.
     *   **Returns**: A list of dictionaries, where each dictionary provides information about an available model (e.g., `{'model_name': 'Mistral-7B-Instruct-v0.2-Q4_K_M.gguf', 'path_hint': '...', 'size_gb': '...'}`).
 
@@ -113,7 +113,7 @@ class MyCustomLLMBinding(LollmsLLMBinding):
         #   return full_generated_text
         pass # Replace with actual implementation
 
-    # ... Implement other abstract methods (tokenize, detokenize, count_tokens, embed, get_model_info, listModels) ...
+    # ... Implement other abstract methods (tokenize, detokenize, count_tokens, embed, get_model_info, list_models) ...
 ```
 
 ---

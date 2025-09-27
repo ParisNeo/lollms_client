@@ -23,5 +23,5 @@ response = lc.listMountedPersonalities()
 print(response)
 
 # List Models
-response = lc.listModels()
+response = lc.list_models()
 print(response)

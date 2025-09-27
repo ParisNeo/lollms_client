@@ -179,7 +179,7 @@ class GroqBinding(LollmsLLMBinding):
             "supports_vision": False, # Groq models do not currently support vision
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """Lists available models from the Groq service."""
         if not self.client:
             ASCIIColors.error("Groq client not initialized. Cannot list models.")
@@ -229,7 +229,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Found {len(models)} models on Groq. Available models:")
             for m in models:

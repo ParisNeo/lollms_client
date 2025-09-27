@@ -595,7 +595,7 @@ class OllamaBinding(LollmsLLMBinding):
             "supports_vision": True # Many Ollama models (e.g. llava, bakllava) support vision
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """
         Lists available models from the Ollama service using the ollama-python library.
         The returned list of dictionaries matches the format of the original template.
@@ -621,10 +621,10 @@ class OllamaBinding(LollmsLLMBinding):
                     })
             return model_info_list
         except ollama.ResponseError as e:
-            ASCIIColors.error(f"Ollama API listModels ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code}) from {self.host_address}")
+            ASCIIColors.error(f"Ollama API list_models ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code}) from {self.host_address}")
             return []
         except ollama.RequestError as e: # Covers connection errors, timeouts during request
-            ASCIIColors.error(f"Ollama API listModels RequestError: {str(e)} from {self.host_address}")
+            ASCIIColors.error(f"Ollama API list_models RequestError: {str(e)} from {self.host_address}")
             return []
         except Exception as ex:
             trace_exception(ex)
@@ -813,7 +813,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Found {len(models)} models. First 5:")
             for m in models[:5]:

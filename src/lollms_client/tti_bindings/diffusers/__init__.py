@@ -602,7 +602,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             return []
         return sorted([f.name for f in self.models_path.iterdir() if f.is_file() and f.suffix == ".safetensors"])
 
-    def listModels(self) -> list:
+    def list_models(self) -> list:
         civitai_list = [
             {'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']}
             for key, info in CIVITAI_MODELS.items()
@@ -789,7 +789,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         return sorted(folders + safetensors)
 
     def list_available_models(self) -> List[str]:
-        discoverable = [m['model_name'] for m in self.listModels()]
+        discoverable = [m['model_name'] for m in self.list_models()]
         local_models = self.list_local_models()
         return sorted(list(set(local_models + discoverable)))
 

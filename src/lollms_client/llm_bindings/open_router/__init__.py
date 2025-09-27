@@ -227,7 +227,7 @@ class OpenRouterBinding(LollmsLLMBinding):
             "supports_vision": "Depends on the specific model selected. This generic binding does not support vision.",
         }
 
-    def listModels(self) -> List[Dict[str, str]]:
+    def list_models(self) -> List[Dict[str, str]]:
         """Lists available models from the OpenRouter service."""
         if not self.client:
             ASCIIColors.error("OpenRouter client not initialized. Cannot list models.")
@@ -274,7 +274,7 @@ if __name__ == '__main__':
 
         # --- List Models ---
         ASCIIColors.cyan("\n--- Listing Models ---")
-        models = binding.listModels()
+        models = binding.list_models()
         if models:
             ASCIIColors.green(f"Successfully fetched {len(models)} models from OpenRouter.")
             ASCIIColors.info("Sample of available models:")

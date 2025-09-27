@@ -40,7 +40,7 @@ class StabilityAITTIBinding(LollmsTTIBinding):
             raise ValueError("Stability AI API key is required. Please set it in the configuration or as STABILITY_API_KEY environment variable.")
         self.model_name = self.config.get("model_name", "stable-diffusion-3-medium")
 
-    def listModels(self) -> list:
+    def list_models(self) -> list:
         return STABILITY_AI_MODELS
 
     def _get_api_url(self, task: str) -> str:
