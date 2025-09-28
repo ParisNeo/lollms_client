@@ -141,7 +141,16 @@ try:
                             print(f"Server: Using custom voice file: {speaker_wav_path}")
                         else:
                             print(f"Server: Voice '{voice}' not found in voices directory")
-                
+                else:
+                    voice = "default_voice"
+                    # Look for voice file in voices directory
+                    voices_dir = Path(__file__).parent / "voices"
+                    potential_voice_path = voices_dir / f"{voice}.mp3"
+                    if potential_voice_path.exists():
+                        speaker_wav_path = str(potential_voice_path)
+                        print(f"Server: Using custom voice file: {speaker_wav_path}")
+                    else:
+                        print(f"Server: Voice '{voice}' not found in voices directory")
                 # Create a temporary file for output
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
                     temp_output_path = temp_file.name
@@ -311,7 +320,10 @@ try:
         voices_dir = Path(__file__).parent / "voices"
         voices_dir.mkdir(exist_ok=True)
         print(f"Server: Voices directory: {voices_dir}")
-        
-        uvicorn.run(app, host=args.host, port=args.port)
+        try:
+            uvicorn.run(app, host=args.host, port=args.port)
+        except Exception as e:
+            print(f"Server: CRITICAL ERROR running server: {e}")
+            print(f"Server: Traceback:\n{traceback.format_exc()}")  
 except Exception as e:
     print(f"Server: CRITICAL ERROR during startup: {e}")
