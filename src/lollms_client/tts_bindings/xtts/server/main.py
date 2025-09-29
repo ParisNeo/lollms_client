@@ -248,6 +248,7 @@ try:
     async def generate_audio(request: GenerationRequest):
         async with model_lock:
             try:
+                print(f"request.language:{request.language}")
                 audio_bytes = await xtts_server.generate_audio(
                     text=request.text,
                     voice=request.voice,
