@@ -27,6 +27,8 @@ from pydantic import BaseModel
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import trace_exception, ASCIIColors
 
+
+BindingName = "DiffusersTTIBinding_Impl"
 # --- Dependency Management ---
 pm.ensure_packages(["torch","torchvision"],index_url="https://download.pytorch.org/whl/cu126")
 pm.ensure_packages(["pillow","transformers","safetensors","requests","tqdm", "fastapi", "uvicorn", "httpx"])
