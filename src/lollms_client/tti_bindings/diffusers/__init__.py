@@ -680,11 +680,27 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             raise RuntimeError("No model_name configured. Please select a model in settings.")
         if not self.manager:
             self._acquire_manager()
-        generator = self._prepare_seed(kwargs)
-        
+
+        if "Qwen" in self.model_name:
+            kwargs.pop('mu', None)
+
         w = width if width is not None else self.config.get("width", 512)
         h = height if height is not None else self.config.get("height", 512)
 
+        if "Qwen-Image-Edit" in self.model_name:
+            from PIL import Image
+            blank_image = Image.new('RGB', (w, h), color = 'black')
+            return self.edit_image(
+                images=[blank_image],
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=w,
+                height=h,
+                **kwargs
+            )
+        
+        generator = self._prepare_seed(kwargs)
+        
         pipeline_args = {
             "prompt": prompt,
             "negative_prompt": negative_prompt or self.config.get("negative_prompt", ""),
@@ -697,27 +713,9 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         pipeline_args.update(kwargs)
         pipeline_args.pop('size', None)
 
-        task = "text2image"
-        
-        # Special handling for Qwen models
-        if "Qwen" in self.model_name:
-            pipeline_args.pop('mu', None)
-
-        # Special handling for editor models used for generation
-        if "Qwen-Image-Edit" in self.model_name:
-            from PIL import Image
-            pipeline_args["image"] = Image.new('RGB', (w, h)) # Black canvas
-            # Adjust params for Qwen editor convention
-            pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
-            if not pipeline_args.get("negative_prompt"):
-                pipeline_args["negative_prompt"] = " "
-            # Queue as an i2i task since that's what the pipeline expects
-            task = "image2image"
-
         future = Future()
-        self.manager.queue.put((future, task, pipeline_args))
-        log_task = "t2i-from-blank" if task == "image2image" else "t2i"
-        ASCIIColors.info(f"Job ({log_task}) '{prompt[:50]}...' queued.")
+        self.manager.queue.put((future, "text2image", pipeline_args))
+        ASCIIColors.info(f"Job (t2i) '{prompt[:50]}...' queued.")
         try:
             return future.result()
         except Exception as e:
@@ -740,7 +738,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         return latents, (pil.width, pil.height)
 
     def edit_image(self,
-                   images: Union[str, List[str]],
+                   images: Union[str, List[str], Image.Image],
                    prompt: str,
                    negative_prompt: Optional[str] = "",
                    mask: Optional[str] = None,
@@ -751,8 +749,16 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             raise RuntimeError("No model_name configured. Please select a model in settings.")
         if not self.manager:
             self._acquire_manager()
-        imgs = [images] if isinstance(images, str) else list(images)
-        pil_images = [self._decode_image_input(s) for s in imgs]
+
+        if "Qwen" in self.model_name:
+            kwargs.pop('mu', None)
+
+        imgs = [images] if not isinstance(images, list) else images
+        if len(imgs) > 0 and not isinstance(imgs[0], str):
+            pil_images = imgs
+        else:
+            pil_images = [self._decode_image_input(s) for s in imgs]
+
         out_w = width if width is not None else self.config["width"]
         out_h = height if height is not None else self.config["height"]
         generator = self._prepare_seed(kwargs)
@@ -772,7 +778,6 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             }
             pipeline_args.update(kwargs)
             pipeline_args.pop('size', None)
-            pipeline_args.pop('mu', None)
             future = Future()
             self.manager.queue.put((future, "image2image", pipeline_args))
             ASCIIColors.info(f"Job (multi-image fusion with {len(pil_images)} images) queued.")
@@ -799,7 +804,6 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             if "Qwen-Image-Edit" in self.model_name:
                 pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
                 if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
-                pipeline_args.pop('mu', None)
 
             future = Future()
             self.manager.queue.put((future, "inpainting", pipeline_args))
@@ -823,7 +827,6 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             if "Qwen-Image-Edit" in self.model_name:
                 pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
                 if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
-                pipeline_args.pop('mu', None)
 
             future = Future()
             self.manager.queue.put((future, "image2image", pipeline_args))
@@ -847,8 +850,6 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             }
             pipeline_args.update(kwargs)
             pipeline_args.pop('size', None)
-            if "Qwen" in self.model_name:
-                pipeline_args.pop('mu', None)
             future = Future()
             self.manager.queue.put((future, "text2image", pipeline_args))
             ASCIIColors.info("Job (t2i with init latents) queued.")
