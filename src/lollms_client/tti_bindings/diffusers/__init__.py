@@ -364,13 +364,10 @@ class ModelManager:
                     common_args["cache_dir"] = str(self.config["hf_cache_path"])
 
                 if "Qwen-Image-Edit-2509" in str(model_path):
-                    common_args.pop('size', None)
                     self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
                 elif "Qwen-Image-Edit" in str(model_path):
-                    common_args.pop('size', None)
                     self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
                 elif task == "text2image":
-                    common_args.pop('size', None)
                     self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **common_args)
                 elif task == "image2image":
                     self.pipeline = AutoPipelineForImage2Image.from_pretrained(model_path, **common_args)
@@ -648,6 +645,8 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             "generator": generator
         }
         pipeline_args.update(kwargs)
+        pipeline_args.pop('size', None)
+
         future = Future()
         self.manager.queue.put((future, "text2image", pipeline_args))
         ASCIIColors.info(f"Job (t2i) '{prompt[:50]}...' queued.")
