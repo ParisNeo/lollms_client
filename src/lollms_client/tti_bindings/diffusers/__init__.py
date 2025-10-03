@@ -307,7 +307,7 @@ class ModelManager:
         except Exception as e:
             if temp_path.exists():
                 temp_path.unlink()
-            raise Exception(f"Failed to download model {filename}: {e}") from e
+            raise Exception(f"Failed to download model {filename}: {e}")
 
     def _set_scheduler(self):
         if not self.pipeline:
