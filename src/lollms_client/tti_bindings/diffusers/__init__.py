@@ -15,6 +15,7 @@ import requests
 from tqdm import tqdm
 import json
 import shutil
+import numpy as np
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import trace_exception, ASCIIColors
 
@@ -690,10 +691,10 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         h = height if height is not None else self.config.get("height", 512)
 
         if "Qwen-Image-Edit" in self.model_name:
-            from PIL import Image
-            blank_image = Image.new('RGB', (w, h), color='black')
+            noise = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
+            initial_image = Image.fromarray(noise, 'RGB')
             return self.edit_image(
-                images=[blank_image], prompt=prompt, negative_prompt=negative_prompt,
+                images=[initial_image], prompt=prompt, negative_prompt=negative_prompt,
                 width=w, height=h, **kwargs
             )
 
