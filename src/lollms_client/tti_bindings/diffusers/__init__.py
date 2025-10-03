@@ -719,7 +719,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         try:
             return future.result()
         except Exception as e:
-            raise Exception(f"Image generation failed: {e}") from e
+            raise Exception(f"Image generation failed: {e}")
 
     def _encode_image_to_latents(self, pil: Image.Image, width: int, height: int) -> Tuple[torch.Tensor, Tuple[int,int]]:
         pil = pil.convert("RGB").resize((width, height))
