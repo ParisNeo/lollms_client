@@ -307,7 +307,7 @@ class ModelManager:
         except Exception as e:
             if temp_path.exists():
                 temp_path.unlink()
-            raise Exception(f"Failed to download model {filename}: {e}") from e
+            raise Exception(f"Failed to download model {filename}: {e}") 
 
     def _set_scheduler(self):
         if not self.pipeline:
@@ -378,7 +378,7 @@ class ModelManager:
                     f"AUTHENTICATION FAILED for model '{model_name}'. "
                     "Please ensure you accepted the model license and provided a valid HF token."
                 )
-                raise RuntimeError(msg) from e
+                raise RuntimeError(msg) 
             raise e
         self._set_scheduler()
         self.pipeline.to(self.config["device"])
@@ -442,7 +442,7 @@ class ModelManager:
             except Exception as retry_e:
                 is_oom_retry = "out of memory" in str(retry_e).lower()
                 if not is_oom_retry:
-                    raise retry_e from e
+                    raise retry_e 
         
         ASCIIColors.error(f"Could not load '{model_name}' even after unloading all other models.")
         raise e
@@ -748,7 +748,8 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             try:
                 return future.result()
             except Exception as e:
-                raise Exception(f"Qwen image generation failed: {e}") from e
+                trace_exception(e)
+                raise Exception(f"Qwen image generation failed: {e}")
 
         generator = self._prepare_seed(kwargs)
         pipeline_args = {
@@ -767,7 +768,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         try:
             return future.result()
         except Exception as e:
-            raise Exception(f"Image generation failed: {e}") from e
+            raise Exception(f"Image generation failed: {e}") 
 
     def _encode_image_to_latents(self, pil: Image.Image, width: int, height: int) -> Tuple[torch.Tensor, Tuple[int,int]]:
         pil = pil.convert("RGB").resize((width, height))
