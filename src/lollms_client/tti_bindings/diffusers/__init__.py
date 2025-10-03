@@ -45,6 +45,8 @@ except ImportError:
     class DiffusionPipeline: pass
     class Image: pass
 
+
+BindingName = "DiffusersTTIBinding_Impl"
 # =================================================================================================
 # == Internal Classes for the Server Process (The "Engine")
 # =================================================================================================
