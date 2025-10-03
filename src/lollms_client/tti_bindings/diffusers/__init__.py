@@ -307,7 +307,7 @@ class ModelManager:
         except Exception as e:
             if temp_path.exists():
                 temp_path.unlink()
-            raise Exception(f"Failed to download model {filename}: {e}")
+            raise Exception(f"Failed to download model {filename}: {e}") from e
 
     def _set_scheduler(self):
         if not self.pipeline:
@@ -646,6 +646,13 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
     def _resolve_device_and_dtype(self):
         if self.config["device"].lower() == "auto":
             self.config["device"] = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        
+        # Prioritize bfloat16 for Qwen models on supported hardware, as it's more stable
+        if "Qwen" in self.config.get("model_name", "") and self.config["device"] == "cuda" and torch.cuda.is_bf16_supported():
+            self.config["torch_dtype_str"] = "bfloat16"
+            ASCIIColors.info("Qwen model detected on compatible hardware. Forcing dtype to bfloat16 for stability.")
+            return
+
         if self.config["torch_dtype_str"].lower() == "auto":
             self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
 
