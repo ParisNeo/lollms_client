@@ -370,6 +370,7 @@ class ModelManager:
                     common_args.pop('size', None)
                     self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
                 elif task == "text2image":
+                    common_args.pop('size', None)
                     self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **common_args)
                 elif task == "image2image":
                     self.pipeline = AutoPipelineForImage2Image.from_pretrained(model_path, **common_args)
