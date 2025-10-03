@@ -1,363 +1,206 @@
-# lollms_client/tti_bindings/diffusers/__init__.py
-import os
+from abc import ABC, abstractmethod
 import importlib
-from io import BytesIO
-from typing import Optional, List, Dict, Any, Union, Tuple
 from pathlib import Path
-import base64
-import pipmaster as pm
-import threading
-import queue
-from concurrent.futures import Future
-import time
-import hashlib
-import requests
-from tqdm import tqdm
-import json
-import shutil
-import numpy as np
-import gc
-import atexit
-import multiprocessing
-import httpx
-import uvicorn
-from fastapi import FastAPI, Response, APIRouter
-from pydantic import BaseModel
+from typing import Optional, List, Dict, Any, Union
+from ascii_colors import trace_exception
+import yaml
 
-from lollms_client.lollms_tti_binding import LollmsTTIBinding
-from ascii_colors import trace_exception, ASCIIColors
+class LollmsTTIBinding(ABC):
+    """Abstract base class for all LOLLMS Text-to-Image bindings."""
 
-# --- Dependency Management ---
-pm.ensure_packages(["torch","torchvision"],index_url="https://download.pytorch.org/whl/cu126")
-pm.ensure_packages(["pillow","transformers","safetensors","requests","tqdm", "fastapi", "uvicorn", "httpx"])
+    def __init__(self,
+                 binding_name:str="unknown"):
+        """
+        Initialize the LollmsTTIBinding base class.
 
-try:
-    import torch
-    from diffusers import (
-        AutoPipelineForText2Image, AutoPipelineForImage2Image, AutoPipelineForInpainting,
-        DiffusionPipeline, StableDiffusionPipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline
-    )
-    from diffusers.utils import load_image
-    from PIL import Image
-    DIFFUSERS_AVAILABLE = True
-except ImportError:
-    DIFFUSERS_AVAILABLE = False
-    class DiffusionPipeline: pass
-    class Image: pass
+        Args:
+            binding_name (Optional[str]): The binding name
+        """
+        self.binding_name = binding_name
 
-# =================================================================================================
-# == Internal Classes for the Server Process (The "Engine")
-# =================================================================================================
+    @abstractmethod
+    def generate_image(self,
+                       prompt: str,
+                       negative_prompt: Optional[str] = "",
+                       width: int = 512,
+                       height: int = 512,
+                       **kwargs) -> bytes:
+        """
+        Generates image data from the provided text prompt.
 
-CIVITAI_MODELS = {
-    "realistic-vision-v6": { "display_name": "Realistic Vision V6.0", "url": "https://civitai.com/api/download/models/501240?type=Model&format=SafeTensor&size=pruned&fp=fp16", "filename": "realisticVisionV60_v60B1.safetensors", "description": "Photorealistic SD1.5 checkpoint.", "owned_by": "civitai" },
-    "absolute-reality": { "display_name": "Absolute Reality", "url": "https://civitai.com/api/download/models/132760?type=Model&format=SafeTensor&size=pruned&fp=fp16", "filename": "absolutereality_v181.safetensors", "description": "General realistic SD1.5.", "owned_by": "civitai" },
-    "dreamshaper-8": { "display_name": "DreamShaper 8", "url": "https://civitai.com/api/download/models/128713", "filename": "dreamshaper_8.safetensors", "description": "Versatile SD1.5 style model.", "owned_by": "civitai" },
-    "juggernaut-xl": { "display_name": "Juggernaut XL", "url": "https://civitai.com/api/download/models/133005", "filename": "juggernautXL_version6Rundiffusion.safetensors", "description": "Artistic SDXL.", "owned_by": "civitai" },
-}
-TORCH_DTYPE_MAP_STR_TO_OBJ = { "float16": getattr(torch, 'float16', 'float16'), "bfloat16": getattr(torch, 'bfloat16', 'bfloat16'), "float32": getattr(torch, 'float32', 'float32'), "auto": "auto" }
-SCHEDULER_MAPPING = { "default": None, "ddim": "DDIMScheduler", "ddpm": "DDPMScheduler", "euler_discrete": "EulerDiscreteScheduler", "lms_discrete": "LMSDiscreteScheduler" }
-SCHEDULER_USES_KARRAS_SIGMAS = []
+        Args:
+            prompt (str): The positive text prompt describing the desired image.
+            negative_prompt (Optional[str]): Text prompt describing elements to avoid.
+            width (int): The desired width of the image.
+            height (int): The desired height of the image.
+            **kwargs: Additional binding-specific parameters (e.g., seed, steps, cfg_scale).
 
-class ModelManager:
-    # This is the full ModelManager from our previous working version
-    def __init__(self, config: Dict[str, Any], models_path: Path, registry: 'PipelineRegistry'):
-        self.config = config
-        self.models_path = models_path
-        self.registry = registry
-        self.pipeline: Optional[DiffusionPipeline] = None
-        self.current_task: Optional[str] = None
-        self.ref_count = 0
-        self.lock = threading.Lock()
-        self.queue = queue.Queue()
-        self.is_loaded = False
-        self.last_used_time = time.time()
-        self._stop_event = threading.Event()
-        self.worker_thread = threading.Thread(target=self._generation_worker, daemon=True)
-        self.worker_thread.start()
+        Returns:
+            bytes: The generated image data (e.g., in PNG or JPEG format).
 
-    def acquire(self):
-        with self.lock: self.ref_count += 1
-        return self
+        Raises:
+            Exception: If image generation fails.
+        """
+        pass
 
-    def release(self):
-        with self.lock: self.ref_count -= 1
-        return self.ref_count
-        
-    def stop(self):
-        self._stop_event.set()
-        self.queue.put(None)
-        self.worker_thread.join(timeout=5)
+    @abstractmethod
+    def edit_image(self,
+                   images: Union[str, List[str]],
+                   prompt: str,
+                   negative_prompt: Optional[str] = "",
+                   mask: Optional[str] = None,
+                   width: Optional[int] = None,
+                   height: Optional[int] = None,
+                   **kwargs) -> bytes:
+        """
+        Edits an image or a set of images based on the provided prompts.
 
-    def _resolve_model_path(self, model_name: str) -> Union[str, Path]:
-        if model_name in CIVITAI_MODELS:
-            pass
-        return model_name
+        Args:
+            images (Union[str, List[str]]): One or multiple images in URL or base64 format.
+            prompt (str): Positive prompt describing desired modifications.
+            negative_prompt (Optional[str]): Prompt describing elements to avoid.
+            mask (Optional[str]): A mask image (URL or base64). Only valid if a single image is provided.
+            width (Optional[int]): Desired width of the output. If None, binding decides.
+            height (Optional[int]): Desired height of the output. If None, binding decides.
+            **kwargs: Additional binding-specific parameters (e.g., seed, steps, cfg_scale).
 
-    def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
-        common_args = {"torch_dtype": torch_dtype}
-        if "Qwen-Image-Edit-2509" in str(model_path): self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
-        elif "Qwen-Image-Edit" in str(model_path): self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
-        elif "Qwen/Qwen-Image" in str(model_path): self.pipeline = DiffusionPipeline.from_pretrained(model_path, **common_args)
-        else: self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **common_args)
-        self.pipeline.to(self.config["device"])
-        self.is_loaded = True
+        Returns:
+            bytes: The edited/generated image data (e.g., in PNG or JPEG format).
 
-    def _load_pipeline_for_task(self, task: str):
-        if self.pipeline and self.current_task == task: return
-        if self.pipeline: self._unload_pipeline()
-        model_name = self.config.get("model_name", "")
-        model_path = self._resolve_model_path(model_name)
-        torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config["torch_dtype_str"].lower())
-        try:
-            self._execute_load_pipeline(task, model_path, torch_dtype)
-        except Exception as e:
-            if "out of memory" in str(e).lower():
-                ASCIIColors.warning("OOM detected. Trying to free memory...")
-                self._execute_load_pipeline(task, model_path, torch_dtype)
-            else:
-                raise e
+        Raises:
+            Exception: If image editing fails.
+        """
+        pass
 
-    def _unload_pipeline(self):
-        if self.pipeline:
-            del self.pipeline; self.pipeline = None; gc.collect()
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            self.is_loaded = False
-            ASCIIColors.info(f"Model unloaded and VRAM cleared.")
-
-    def _generation_worker(self):
-        while not self._stop_event.is_set():
-            try:
-                job = self.queue.get(timeout=1)
-                if job is None: break
-                future, task, pipeline_args = job
-                output = None
-                try:
-                    with self.lock:
-                        self.last_used_time = time.time()
-                        if not self.is_loaded or self.current_task != task: self._load_pipeline_for_task(task)
-                    with torch.no_grad(): output = self.pipeline(**pipeline_args)
-                    pil = output.images[0]; buf = BytesIO(); pil.save(buf, format="PNG"); future.set_result(buf.getvalue())
-                except Exception as e: future.set_exception(e)
-                finally:
-                    self.queue.task_done()
-                    if output: del output
-                    if self.config.get("force_reload_between_generations"): self._unload_pipeline()
-                    else: gc.collect(); torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            except queue.Empty: continue
-
-class PipelineRegistry:
-    _instance = None; _lock = threading.Lock()
-    def __new__(cls, *args, **kwargs):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super().__new__(cls); cls._instance._managers = {}; cls._instance._registry_lock = threading.Lock()
-        return cls._instance
-    def get_manager(self, config: Dict[str, Any], models_path: Path) -> ModelManager:
-        key = hashlib.sha256(str(sorted(config.items())).encode()).hexdigest()
-        with self._registry_lock:
-            if key not in self._managers: self._managers[key] = ModelManager(config.copy(), models_path, self)
-            return self._managers[key].acquire()
-    def release_manager(self, config: Dict[str, Any]): pass
-
-class _DiffusersServerBindingImpl(LollmsTTIBinding):
-    QWEN_ASPECT_RATIOS = { "1:1": (1328, 1328), "16:9": (1664, 928), "9:16": (928, 1664), "4:3": (1472, 1104), "3:4": (1104, 1472) }
-    QWEN_POSITIVE_MAGIC = ", Ultra HD, 4K, cinematic composition."
-    DEFAULT_CONFIG = { "model_name": "", "device": "auto", "torch_dtype_str": "auto", "force_reload_between_generations": False, "server_port": 28374 }
-    HF_DEFAULT_MODELS = [
-        {"family": "SDXL", "model_name": "stabilityai/stable-diffusion-xl-base-1.0"},
-        {"family": "Qwen", "model_name": "Qwen/Qwen-Image"},
-        {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit"},
-        {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit-2509"}
-    ]
-    
-    def __init__(self, **kwargs):
-        super().__init__(binding_name="diffusers_server_impl")
-        if not DIFFUSERS_AVAILABLE: raise RuntimeError("Diffusers library not found.")
-        self.config = self.DEFAULT_CONFIG.copy(); self.config.update(kwargs)
-        self.model_name = self.config.get("model_name", "")
-        self.models_path = Path(self.config.get("models_path", str(Path(__file__).parent / "models")))
-        self.models_path.mkdir(parents=True, exist_ok=True)
-        self.registry = PipelineRegistry()
-        self._resolve_device_and_dtype()
-        self.manager: Optional[ModelManager] = None
-        if self.model_name: self._acquire_manager()
-
-    def _snap_to_qwen_aspect_ratio(self, width, height):
-        target_ratio = width / height; best_match = (width, height); min_diff = float('inf')
-        for dims in self.QWEN_ASPECT_RATIOS.values():
-            ratio = dims[0] / dims[1]; diff = abs(target_ratio - ratio)
-            if diff < min_diff: min_diff = diff; best_match = dims
-        return best_match
-
-    def _acquire_manager(self):
-        if self.manager: self.registry.release_manager(self.manager.config)
-        self.manager = self.registry.get_manager(self.config, self.models_path)
-
-    def _resolve_device_and_dtype(self):
-        if self.config["device"].lower() == "auto": self.config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-        if "Qwen" in self.config.get("model_name", "") and self.config["device"] == "cuda":
-            if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
-                self.config["torch_dtype_str"] = "bfloat16"; return
-        if self.config["torch_dtype_str"].lower() == "auto": self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
-
-    def _prepare_seed(self, kwargs: Dict[str, Any]) -> Optional[torch.Generator]:
-        seed = kwargs.pop("seed", self.config.get("seed",-1)); 
-        if seed == -1: return None
-        return torch.Generator(device=self.config["device"]).manual_seed(seed)
-
-    def generate_image(self, prompt: str, negative_prompt: str = "", width: int|None = None, height: int|None = None, **kwargs) -> bytes:
-        kwargs = kwargs.copy()
-        if not self.model_name: raise RuntimeError("No model name configured.")
-        if not self.manager: self._acquire_manager()
-        w = width or self.config.get("width", 512); h = height or self.config.get("height", 512)
-        is_qwen = "Qwen" in self.model_name
-        if is_qwen: w, h = self._snap_to_qwen_aspect_ratio(w, h)
-        if "Qwen-Image-Edit" in self.model_name:
-            noise = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
-            return self.edit_image(images=[Image.fromarray(noise, 'RGB')], prompt=prompt, negative_prompt=negative_prompt, width=w, height=h, **kwargs)
-        if "Qwen/Qwen-Image" in self.model_name:
-            pipeline_args = { "prompt": prompt + self.QWEN_POSITIVE_MAGIC, "negative_prompt": negative_prompt or " ", "width": w, "height": h, "num_inference_steps": kwargs.get("num_inference_steps", 50), "true_cfg_scale": kwargs.get("guidance_scale", 4.0), "generator": self._prepare_seed(kwargs) }
-        else:
-            pipeline_args = { "prompt": prompt, "negative_prompt": negative_prompt or "", "width": w, "height": h, "generator": self._prepare_seed(kwargs) }; pipeline_args.update(kwargs)
-        future = Future(); self.manager.queue.put((future, "text2image", pipeline_args)); return future.result()
-
-    def edit_image(self, images, prompt, negative_prompt="", mask=None, width=None, height=None, **kwargs) -> bytes:
-        kwargs = kwargs.copy()
-        if not self.model_name: raise RuntimeError("No model name configured.")
-        if not self.manager: self._acquire_manager()
-        w = width or self.config.get("width", 512); h = height or self.config.get("height", 512)
-        is_qwen = "Qwen" in self.model_name; is_qwen_2509 = "Qwen-Image-Edit-2509" in self.model_name
-        if is_qwen: w, h = self._snap_to_qwen_aspect_ratio(w, h)
-        base_args = { "prompt": prompt, "negative_prompt": negative_prompt, "width": w, "height": h, "num_inference_steps": kwargs.get("num_inference_steps", 50), "generator": self._prepare_seed(kwargs) }
-        if is_qwen:
-            base_args["true_cfg_scale"] = kwargs.get("guidance_scale", 4.0)
-            if is_qwen_2509: base_args["guidance_scale"] = kwargs.get("guidance_scale_plus", 1.0)
-        else: base_args["guidance_scale"] = kwargs.get("guidance_scale", 7.5)
-        if mask: pipeline_args = {**base_args, "image": images[0], "mask_image": mask}; task="inpainting"
-        else: pipeline_args = {**base_args, "image": images[0] if len(images)==1 else images}; task="image2image"
-        future = Future(); self.manager.queue.put((future, task, pipeline_args)); return future.result()
-
-    def list_models(self) -> list:
-        return self.HF_DEFAULT_MODELS + list(CIVITAI_MODELS.keys())
-
+    @abstractmethod
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
-        return [{"name": m["model_name"], "caption": m["model_name"]} for m in self.HF_DEFAULT_MODELS]
+        """Lists the available TTI services or models supported by the binding."""
+        pass
 
-    def set_settings(self, settings: Dict[str, Any]) -> bool:
-        self.config.update(settings)
-        if self.manager: self.manager.config.update(settings)
-        return True
+    @abstractmethod
+    def get_settings(self, **kwargs) -> Optional[Dict[str, Any]]:
+        """Retrieves the current settings for the active TTI service/model."""
+        pass
 
-    def get_settings(self) -> Dict[str, Any]: return self.config
-
-# =================================================================================================
-# == Server Process Logic ==
-# =================================================================================================
-_server_binding_instance: Optional[_DiffusersServerBindingImpl] = None
-
-class ServerGenerateRequest(BaseModel): prompt: str; negative_prompt: str; width: Optional[int]; height: Optional[int]; kwargs: dict
-class ServerEditRequest(BaseModel): images: List[str]; prompt: str; negative_prompt: str; mask: Optional[str]; width: Optional[int]; height: Optional[int]; kwargs: dict
-class ServerSettingsRequest(BaseModel): settings: dict
-
-def _run_server_process(port: int, **model_kwargs):
-    global _server_binding_instance; _server_binding_instance = _DiffusersServerBindingImpl(**model_kwargs)
-    app = FastAPI()
-    @app.post("/generate")
-    async def generate(req: ServerGenerateRequest):
-        try: return Response(content=_server_binding_instance.generate_image(req.prompt, req.negative_prompt, req.width, req.height, **req.kwargs), media_type="image/png")
-        except Exception as e: return Response(content=json.dumps({"error": str(e)}), status_code=500)
-    @app.post("/edit")
-    async def edit(req: ServerEditRequest):
-        images = [Image.open(BytesIO(base64.b64decode(i))) for i in req.images]
-        mask = Image.open(BytesIO(base64.b64decode(req.mask))) if req.mask else None
-        try: return Response(content=_server_binding_instance.edit_image(images, req.prompt, req.negative_prompt, mask, req.width, req.height, **req.kwargs), media_type="image/png")
-        except Exception as e: return Response(content=json.dumps({"error": str(e)}), status_code=500)
-    @app.post("/set_settings")
-    async def set_settings(req: ServerSettingsRequest): return {"success": _server_binding_instance.set_settings(req.settings)}
-    @app.get("/get_settings")
-    async def get_settings(): return _server_binding_instance.get_settings()
-    @app.get("/list_models")
-    async def list_models(): return _server_binding_instance.list_models()
-    @app.get("/list_services")
-    async def list_services(): return _server_binding_instance.list_services()
-    @app.get("/health")
-    async def health(): return {"status": "ok"}
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
-
-# =================================================================================================
-# == Public Facing Proxy Class ==
-# =================================================================================================
-_server_process = None
-_initialization_lock = multiprocessing.Lock()
-def _cleanup_server():
-    global _server_process
-    if _server_process and _server_process.is_alive(): _server_process.terminate(); _server_process.join()
-atexit.register(_cleanup_server)
-
-class DiffusersTTIBinding_Impl(LollmsTTIBinding):
-    DEFAULT_CONFIG = _DiffusersServerBindingImpl.DEFAULT_CONFIG
-
-    def __init__(self, **kwargs):
-        super().__init__(binding_name="diffusers")
-        self.config = kwargs
-        self.server_port = self.config.get("server_port", 28374)
-        self.server_url = f"http://127.0.0.1:{self.server_port}"
-        with _initialization_lock: self._check_and_start_server()
-        self.client = httpx.Client(timeout=600.0)
-
-    def _check_and_start_server(self):
-        global _server_process
-        try:
-            if httpx.get(f"{self.server_url}/health", timeout=1.0).status_code == 200: return
-        except httpx.ConnectError: pass
-        ASCIIColors.green(f"WORKER {os.getpid()}: Is leader. Starting dedicated model server...")
-        ctx = multiprocessing.get_context('spawn')
-        _server_process = ctx.Process(target=_run_server_process, args=(self.server_port,), kwargs=self.config, daemon=True)
-        _server_process.start()
-        self._wait_for_server()
-
-    def _wait_for_server(self):
-        for _ in range(60):
-            try:
-                if httpx.get(self.server_url + "/health", timeout=1.0).status_code == 200:
-                    ASCIIColors.green("Server is up!"); return
-            except httpx.ConnectError: time.sleep(1)
-        raise RuntimeError("Model server failed to start in time.")
-
-    def generate_image(self, prompt: str, negative_prompt: str = "", width: int|None = None, height: int|None = None, **kwargs) -> bytes:
-        payload = {"prompt": prompt, "negative_prompt": negative_prompt, "width": width, "height": height, "kwargs": kwargs}
-        response = self.client.post(f"{self.server_url}/generate", json=payload)
-        if response.status_code != 200: raise Exception(f"Error from model server: {response.text}")
-        return response.content
-
-    def edit_image(self, images: Union[str, List[str], Image.Image, List[Image.Image]], prompt: str, negative_prompt: Optional[str] = "", mask: Optional[str] = None, width: Optional[int] = None, height: Optional[int] = None, **kwargs) -> bytes:
-        def to_base64(img):
-            if isinstance(img, str) and Path(img).exists():
-                with open(img, "rb") as f: return base64.b64encode(f.read()).decode('utf-8')
-            elif isinstance(img, Image.Image):
-                buffered = BytesIO(); img.save(buffered, format="PNG"); return base64.b64encode(buffered.getvalue()).decode('utf-8')
-            elif isinstance(img, str): return img
-            return None
-        images_b64 = [to_base64(i) for i in (images if isinstance(images, list) else [images])]
-        mask_b64 = to_base64(mask) if mask else None
-        payload = {"images": images_b64, "prompt": prompt, "negative_prompt": negative_prompt, "mask": mask_b64, "width": width, "height": height, "kwargs": kwargs}
-        response = self.client.post(f"{self.server_url}/edit", json=payload)
-        if response.status_code != 200: raise Exception(f"Error from model server: {response.text}")
-        return response.content
-        
-    def set_settings(self, settings: Dict[str, Any]) -> bool:
-        response = self.client.post(f"{self.server_url}/set_settings", json={"settings": settings})
-        return response.status_code == 200 and response.json().get("success", False)
-
-    def get_settings(self) -> Dict[str, Any]:
-        response = self.client.get(f"{self.server_url}/get_settings")
-        return response.json() if response.status_code == 200 else {}
-        
+    @abstractmethod
     def list_models(self) -> list:
-        response = self.client.get(f"{self.server_url}/list_models")
-        return response.json() if response.status_code == 200 else []
+        """Lists models"""
+        pass
 
-    def list_services(self, **kwargs) -> List[Dict[str, str]]:
-        response = self.client.get(f"{self.server_url}/list_services")
-        return response.json() if response.status_code == 200 else []
+    @abstractmethod
+    def set_settings(self, settings: Dict[str, Any], **kwargs) -> bool:
+        """Applies new settings to the active TTI service/model."""
+        pass
+
+
+class LollmsTTIBindingManager:
+    """Manages TTI binding discovery and instantiation."""
+
+    def __init__(self, tti_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "tti_bindings"):
+        self.tti_bindings_dir = Path(tti_bindings_dir)
+        self.available_bindings = {}
+
+    def _load_binding(self, binding_name: str):
+        binding_dir = self.tti_bindings_dir / binding_name
+        if binding_dir.is_dir() and (binding_dir / "__init__.py").exists():
+            try:
+                module = importlib.import_module(f"lollms_client.tti_bindings.{binding_name}")
+                binding_class = getattr(module, module.BindingName) # Assumes BindingName is defined
+                self.available_bindings[binding_name] = binding_class
+            except Exception as e:
+                trace_exception(e)
+                print(f"Failed to load TTI binding {binding_name}: {str(e)}")
+
+    def create_binding(self,
+                      binding_name: str,
+                      **kwargs) -> Optional[LollmsTTIBinding]:
+        if binding_name not in self.available_bindings:
+            self._load_binding(binding_name)
+
+        binding_class = self.available_bindings.get(binding_name)
+        if binding_class:
+            try:
+                return binding_class(**kwargs)
+            except Exception as e:
+                trace_exception(e)
+                print(f"Failed to instantiate TTI binding {binding_name}: {str(e)}")
+                return None
+        return None
+
+    def _get_fallback_description(binding_name: str) -> Dict:
+        return {
+            "binding_name": binding_name,
+            "title": binding_name.replace("_", " ").title(),
+            "author": "Unknown",
+            "creation_date": "N/A",
+            "last_update_date": "N/A",
+            "description": f"A binding for {binding_name}. No description.yaml file was found, so common parameters are shown as a fallback.",
+            "input_parameters": [
+                {
+                    "name": "model_name",
+                    "type": "str",
+                    "description": "The model name, ID, or filename to be used.",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "host_address",
+                    "type": "str",
+                    "description": "The host address of the service (for API-based bindings).",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "models_path",
+                    "type": "str",
+                    "description": "The path to the models directory (for local bindings).",
+                    "mandatory": False,
+                    "default": ""
+                },
+                {
+                    "name": "service_key",
+                    "type": "str",
+                    "description": "The API key or service key for authentication (if applicable).",
+                    "mandatory": False,
+                    "default": ""
+                }
+            ]
+        }
+
+    @staticmethod
+    def get_bindings_list(llm_bindings_dir: Union[str, Path]) -> List[Dict]:
+        bindings_dir = Path(llm_bindings_dir)
+        if not bindings_dir.is_dir():
+            return []
+
+        bindings_list = []
+        for binding_folder in bindings_dir.iterdir():
+            if binding_folder.is_dir() and (binding_folder / "__init__.py").exists():
+                binding_name = binding_folder.name
+                description_file = binding_folder / "description.yaml"
+                
+                binding_info = {}
+                if description_file.exists():
+                    try:
+                        with open(description_file, 'r', encoding='utf-8') as f:
+                            binding_info = yaml.safe_load(f)
+                        binding_info['binding_name'] = binding_name
+                    except Exception as e:
+                        print(f"Error loading description.yaml for {binding_name}: {e}")
+                        binding_info = LollmsTTIBindingManager._get_fallback_description(binding_name)
+                else:
+                    binding_info = LollmsTTIBindingManager._get_fallback_description(binding_name)
+                
+                bindings_list.append(binding_info)
+
+        return sorted(bindings_list, key=lambda b: b.get('title', b['binding_name']))
+
+    def get_available_bindings(self) -> list[str]:
+        return [binding_dir.name for binding_dir in self.tti_bindings_dir.iterdir()
+                if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
+
+
+def get_available_bindings(tti_bindings_dir: Union[str, Path] = None) -> List[Dict]:
+    if tti_bindings_dir is None:
+        tti_bindings_dir = Path(__file__).parent / "tti_bindings"
+    return LollmsTTIBindingManager.get_bindings_list(tti_bindings_dir)
