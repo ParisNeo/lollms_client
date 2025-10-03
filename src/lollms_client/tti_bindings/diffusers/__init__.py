@@ -703,6 +703,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 "generator": generator
             }
             pipeline_args.update(kwargs)
+            pipeline_args.pop('size', None)
             future = Future()
             self.manager.queue.put((future, "image2image", pipeline_args))
             ASCIIColors.info(f"Job (multi-image fusion with {len(pil_images)} images) queued.")
@@ -725,6 +726,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 "generator": generator
             }
             pipeline_args.update(kwargs)
+            pipeline_args.pop('size', None)
             if "Qwen-Image-Edit" in self.model_name:
                 pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
                 if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
@@ -747,6 +749,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 "generator": generator
             }
             pipeline_args.update(kwargs)
+            pipeline_args.pop('size', None)
             if "Qwen-Image-Edit" in self.model_name:
                 pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
                 if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
@@ -772,6 +775,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 "width": out_w, "height": out_h
             }
             pipeline_args.update(kwargs)
+            pipeline_args.pop('size', None)
             future = Future()
             self.manager.queue.put((future, "text2image", pipeline_args))
             ASCIIColors.info("Job (t2i with init latents) queued.")
