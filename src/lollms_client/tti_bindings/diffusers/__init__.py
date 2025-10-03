@@ -215,9 +215,10 @@ SCHEDULER_USES_KARRAS_SIGMAS = [
 ]
 
 class ModelManager:
-    def __init__(self, config: Dict[str, Any], models_path: Path):
+    def __init__(self, config: Dict[str, Any], models_path: Path, registry: 'PipelineRegistry'):
         self.config = config
         self.models_path = models_path
+        self.registry = registry
         self.pipeline: Optional[DiffusionPipeline] = None
         self.current_task: Optional[str] = None
         self.ref_count = 0
@@ -324,17 +325,8 @@ class ModelManager:
             except Exception as e:
                 ASCIIColors.warning(f"Could not switch scheduler to {scheduler_name_key}: {e}. Using current default.")
 
-    def _load_pipeline_for_task(self, task: str):
-        if self.pipeline and self.current_task == task:
-            return
-        if self.pipeline:
-            self._unload_pipeline()
+    def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
         model_name = self.config.get("model_name", "")
-        if not model_name:
-            raise ValueError("Model name cannot be empty for loading.")
-        ASCIIColors.info(f"Loading Diffusers model: {model_name} for task: {task}")
-        model_path = self._resolve_model_path(model_name)
-        torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config["torch_dtype_str"].lower())
         try:
             load_args = {}
             if self.config.get("hf_cache_path"):
@@ -398,6 +390,57 @@ class ModelManager:
         self.last_used_time = time.time()
         ASCIIColors.green(f"Model '{model_name}' loaded successfully on '{self.config['device']}' for task '{task}'.")
 
+    def _load_pipeline_for_task(self, task: str):
+        if self.pipeline and self.current_task == task:
+            return
+        if self.pipeline:
+            self._unload_pipeline()
+        
+        model_name = self.config.get("model_name", "")
+        if not model_name:
+            raise ValueError("Model name cannot be empty for loading.")
+        
+        ASCIIColors.info(f"Loading Diffusers model: {model_name} for task: {task}")
+        model_path = self._resolve_model_path(model_name)
+        torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config["torch_dtype_str"].lower())
+        
+        try:
+            self._execute_load_pipeline(task, model_path, torch_dtype)
+            return
+        except Exception as e:
+            is_oom = "out of memory" in str(e).lower()
+            if not is_oom or not hasattr(self, 'registry'):
+                raise e
+        
+        ASCIIColors.warning(f"Failed to load '{model_name}' due to OOM. Attempting to unload other models to free VRAM.")
+        
+        candidates_to_unload = [
+            m for m in self.registry.get_all_managers()
+            if m is not self and m.is_loaded
+        ]
+        candidates_to_unload.sort(key=lambda m: m.last_used_time)
+
+        if not candidates_to_unload:
+            ASCIIColors.error("OOM error, but no other models are available to unload.")
+            raise e
+
+        for victim in candidates_to_unload:
+            ASCIIColors.info(f"Unloading '{victim.config['model_name']}' (last used: {time.ctime(victim.last_used_time)}) to free VRAM.")
+            victim._unload_pipeline()
+            
+            try:
+                ASCIIColors.info(f"Retrying to load '{model_name}'...")
+                self._execute_load_pipeline(task, model_path, torch_dtype)
+                ASCIIColors.green(f"Successfully loaded '{model_name}' after freeing VRAM.")
+                return
+            except Exception as retry_e:
+                is_oom_retry = "out of memory" in str(retry_e).lower()
+                if not is_oom_retry:
+                    raise retry_e from e
+        
+        ASCIIColors.error(f"Could not load '{model_name}' even after unloading all other models.")
+        raise e
+
     def _unload_pipeline(self):
         if self.pipeline:
             model_name = self.config.get('model_name', 'Unknown')
@@ -460,7 +503,7 @@ class PipelineRegistry:
         key = self._get_config_key(config)
         with self._registry_lock:
             if key not in self._managers:
-                self._managers[key] = ModelManager(config.copy(), models_path)
+                self._managers[key] = ModelManager(config.copy(), models_path, self)
             return self._managers[key].acquire()
     def release_manager(self, config: Dict[str, Any]):
         key = self._get_config_key(config)
@@ -477,6 +520,9 @@ class PipelineRegistry:
     def get_active_managers(self) -> List[ModelManager]:
         with self._registry_lock:
             return [m for m in self._managers.values() if m.is_loaded]
+    def get_all_managers(self) -> List[ModelManager]:
+        with self._registry_lock:
+            return list(self._managers.values())
 
 class DiffusersTTIBinding_Impl(LollmsTTIBinding):
     DEFAULT_CONFIG = {
@@ -635,11 +681,15 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         if not self.manager:
             self._acquire_manager()
         generator = self._prepare_seed(kwargs)
+        
+        w = width if width is not None else self.config.get("width", 512)
+        h = height if height is not None else self.config.get("height", 512)
+
         pipeline_args = {
             "prompt": prompt,
             "negative_prompt": negative_prompt or self.config.get("negative_prompt", ""),
-            "width": width if width is not None else self.config.get("width", 512),
-            "height": height if height is not None else self.config.get("height", 512),
+            "width": w,
+            "height": h,
             "num_inference_steps": kwargs.pop("num_inference_steps", self.config.get("num_inference_steps",25)),
             "guidance_scale": kwargs.pop("guidance_scale", self.config.get("guidance_scale",6.5)),
             "generator": generator
@@ -647,13 +697,30 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         pipeline_args.update(kwargs)
         pipeline_args.pop('size', None)
 
+        task = "text2image"
+        
+        # Special handling for Qwen models
+        if "Qwen" in self.model_name:
+            pipeline_args.pop('mu', None)
+
+        # Special handling for editor models used for generation
+        if "Qwen-Image-Edit" in self.model_name:
+            from PIL import Image
+            pipeline_args["image"] = Image.new('RGB', (w, h)) # Black canvas
+            # Adjust params for Qwen editor convention
+            pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
+            if not pipeline_args.get("negative_prompt"):
+                pipeline_args["negative_prompt"] = " "
+            # Queue as an i2i task since that's what the pipeline expects
+            task = "image2image"
+
         future = Future()
-        self.manager.queue.put((future, "text2image", pipeline_args))
-        ASCIIColors.info(f"Job (t2i) '{prompt[:50]}...' queued.")
+        self.manager.queue.put((future, task, pipeline_args))
+        log_task = "t2i-from-blank" if task == "image2image" else "t2i"
+        ASCIIColors.info(f"Job ({log_task}) '{prompt[:50]}...' queued.")
         try:
             return future.result()
         except Exception as e:
-            trace_exception(e)
             raise Exception(f"Image generation failed: {e}") from e
 
     def _encode_image_to_latents(self, pil: Image.Image, width: int, height: int) -> Tuple[torch.Tensor, Tuple[int,int]]:
@@ -705,6 +772,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             }
             pipeline_args.update(kwargs)
             pipeline_args.pop('size', None)
+            pipeline_args.pop('mu', None)
             future = Future()
             self.manager.queue.put((future, "image2image", pipeline_args))
             ASCIIColors.info(f"Job (multi-image fusion with {len(pil_images)} images) queued.")
@@ -731,6 +799,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             if "Qwen-Image-Edit" in self.model_name:
                 pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
                 if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
+                pipeline_args.pop('mu', None)
 
             future = Future()
             self.manager.queue.put((future, "inpainting", pipeline_args))
@@ -754,6 +823,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             if "Qwen-Image-Edit" in self.model_name:
                 pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
                 if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
+                pipeline_args.pop('mu', None)
 
             future = Future()
             self.manager.queue.put((future, "image2image", pipeline_args))
@@ -777,6 +847,8 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             }
             pipeline_args.update(kwargs)
             pipeline_args.pop('size', None)
+            if "Qwen" in self.model_name:
+                pipeline_args.pop('mu', None)
             future = Future()
             self.manager.queue.put((future, "text2image", pipeline_args))
             ASCIIColors.info("Job (t2i with init latents) queued.")
