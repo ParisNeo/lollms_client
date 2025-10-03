@@ -311,6 +311,9 @@ class ModelManager:
     def _set_scheduler(self):
         if not self.pipeline:
             return
+        if "Qwen" in self.config.get("model_name", ""):
+            ASCIIColors.info("Qwen model detected, skipping custom scheduler setup.")
+            return
         scheduler_name_key = self.config["scheduler_name"].lower()
         if scheduler_name_key == "default":
             return
@@ -359,6 +362,8 @@ class ModelManager:
                     self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
                 elif "Qwen-Image-Edit" in str(model_path):
                     self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
+                elif "Qwen/Qwen-Image" in str(model_path):
+                    self.pipeline = DiffusionPipeline.from_pretrained(model_path, **common_args)
                 elif task == "text2image":
                     self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **common_args)
                 elif task == "image2image":
@@ -681,33 +686,41 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         if not self.manager:
             self._acquire_manager()
 
-        if "Qwen" in self.model_name:
-            kwargs.pop('mu', None)
-
         w = width if width is not None else self.config.get("width", 512)
         h = height if height is not None else self.config.get("height", 512)
 
         if "Qwen-Image-Edit" in self.model_name:
             from PIL import Image
-            blank_image = Image.new('RGB', (w, h), color = 'black')
+            blank_image = Image.new('RGB', (w, h), color='black')
             return self.edit_image(
-                images=[blank_image],
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=w,
-                height=h,
-                **kwargs
+                images=[blank_image], prompt=prompt, negative_prompt=negative_prompt,
+                width=w, height=h, **kwargs
             )
-        
+
+        if "Qwen/Qwen-Image" in self.model_name:
+            generator = self._prepare_seed(kwargs)
+            pipeline_args = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt or " ",
+                "width": w, "height": h,
+                "num_inference_steps": kwargs.get("num_inference_steps", self.config.get("num_inference_steps", 50)),
+                "true_cfg_scale": kwargs.get("guidance_scale", self.config.get("guidance_scale", 4.0)),
+                "generator": generator
+            }
+            future = Future()
+            self.manager.queue.put((future, "text2image", pipeline_args))
+            ASCIIColors.info(f"Job (t2i-qwen) '{prompt[:50]}...' queued.")
+            try:
+                return future.result()
+            except Exception as e:
+                raise Exception(f"Qwen image generation failed: {e}") from e
+
         generator = self._prepare_seed(kwargs)
-        
         pipeline_args = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt or self.config.get("negative_prompt", ""),
-            "width": w,
-            "height": h,
-            "num_inference_steps": kwargs.pop("num_inference_steps", self.config.get("num_inference_steps",25)),
-            "guidance_scale": kwargs.pop("guidance_scale", self.config.get("guidance_scale",6.5)),
+            "prompt": prompt, "negative_prompt": negative_prompt or self.config.get("negative_prompt", ""),
+            "width": w, "height": h,
+            "num_inference_steps": kwargs.pop("num_inference_steps", self.config.get("num_inference_steps", 25)),
+            "guidance_scale": kwargs.pop("guidance_scale", self.config.get("guidance_scale", 6.5)),
             "generator": generator
         }
         pipeline_args.update(kwargs)
@@ -719,8 +732,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         try:
             return future.result()
         except Exception as e:
-            trace_exception(e)
-            raise Exception(f"Image generation failed: {e}")
+            raise Exception(f"Image generation failed: {e}") from e
 
     def _encode_image_to_latents(self, pil: Image.Image, width: int, height: int) -> Tuple[torch.Tensor, Tuple[int,int]]:
         pil = pil.convert("RGB").resize((width, height))
@@ -738,125 +750,59 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             latents = latents * sf
         return latents, (pil.width, pil.height)
 
-    def edit_image(self,
-                   images: Union[str, List[str], Image.Image],
-                   prompt: str,
-                   negative_prompt: Optional[str] = "",
-                   mask: Optional[str] = None,
-                   width: Optional[int] = None,
-                   height: Optional[int] = None,
-                   **kwargs) -> bytes:
+    def edit_image(
+        self, images: Union[str, List[str], Image.Image, List[Image.Image]],
+        prompt: str, negative_prompt: Optional[str] = "", mask: Optional[str] = None,
+        width: Optional[int] = None, height: Optional[int] = None, **kwargs
+    ) -> bytes:
         if not self.model_name:
             raise RuntimeError("No model_name configured. Please select a model in settings.")
         if not self.manager:
             self._acquire_manager()
 
-        if "Qwen" in self.model_name:
-            kwargs.pop('mu', None)
-
         imgs = [images] if not isinstance(images, list) else images
-        if len(imgs) > 0 and not isinstance(imgs[0], str):
-            pil_images = imgs
-        else:
-            pil_images = [self._decode_image_input(s) for s in imgs]
+        pil_images = [img if not isinstance(img, str) else self._decode_image_input(img) for img in imgs]
 
         out_w = width if width is not None else self.config["width"]
         out_h = height if height is not None else self.config["height"]
         generator = self._prepare_seed(kwargs)
-        steps = kwargs.pop("num_inference_steps", self.config["num_inference_steps"])
-        guidance = kwargs.pop("guidance_scale", self.config["guidance_scale"])
+        steps = kwargs.get("num_inference_steps", self.config["num_inference_steps"])
+        guidance = kwargs.get("guidance_scale", self.config["guidance_scale"])
+        
+        is_qwen_edit = "Qwen-Image-Edit" in self.model_name
+        base_args = {
+            "prompt": prompt, "negative_prompt": negative_prompt, "width": out_w, "height": out_h,
+            "num_inference_steps": steps, "generator": generator
+        }
+        
+        if is_qwen_edit:
+            base_args["true_cfg_scale"] = guidance
+            if not base_args.get("negative_prompt"): base_args["negative_prompt"] = " "
+        else:
+            base_args["guidance_scale"] = guidance
 
-        # Handle multi-image fusion for Qwen-Image-Edit-2509
-        if "Qwen-Image-Edit-2509" in self.model_name and len(pil_images) > 1:
-            pipeline_args = {
-                "image": pil_images,
-                "prompt": prompt,
-                "negative_prompt": negative_prompt or " ",
-                "width": out_w, "height": out_h,
-                "num_inference_steps": steps,
-                "true_cfg_scale": guidance,
-                "generator": generator
-            }
-            pipeline_args.update(kwargs)
-            pipeline_args.pop('size', None)
-            future = Future()
-            self.manager.queue.put((future, "image2image", pipeline_args))
-            ASCIIColors.info(f"Job (multi-image fusion with {len(pil_images)} images) queued.")
-            return future.result()
+        if is_qwen_edit and len(pil_images) > 1:
+            pipeline_args = base_args
+            pipeline_args["image"] = pil_images
+            task, log_msg = "image2image", f"Job (multi-image fusion with {len(pil_images)} images) queued."
+        elif mask and len(pil_images) == 1:
+            pipeline_args = base_args
+            pipeline_args["image"] = pil_images[0]
+            pipeline_args["mask_image"] = self._decode_image_input(mask).convert("L")
+            task, log_msg = "inpainting", "Job (inpaint) queued."
+        elif pil_images:
+            pipeline_args = base_args
+            pipeline_args["image"] = pil_images[0]
+            if not is_qwen_edit:
+                pipeline_args["strength"] = kwargs.get("strength", 0.6)
+            task, log_msg = "image2image", "Job (i2i) queued."
+        else:
+            raise ValueError("edit_image called with no images.")
 
-        # Handle inpainting (single image with mask)
-        if mask is not None and len(pil_images) == 1:
-            try:
-                mask_img = self._decode_image_input(mask).convert("L")
-            except Exception as e:
-                raise ValueError(f"Failed to decode mask image: {e}") from e
-            pipeline_args = {
-                "image": pil_images[0],
-                "mask_image": mask_img,
-                "prompt": prompt,
-                "negative_prompt": negative_prompt or None,
-                "width": out_w, "height": out_h,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance,
-                "generator": generator
-            }
-            pipeline_args.update(kwargs)
-            pipeline_args.pop('size', None)
-            if "Qwen-Image-Edit" in self.model_name:
-                pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
-                if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
-
-            future = Future()
-            self.manager.queue.put((future, "inpainting", pipeline_args))
-            ASCIIColors.info("Job (inpaint) queued.")
-            return future.result()
-
-        # Handle standard image-to-image (single image)
-        try:
-            pipeline_args = {
-                "image": pil_images[0],
-                "prompt": prompt,
-                "negative_prompt": negative_prompt or None,
-                "strength": kwargs.pop("strength", 0.6),
-                "width": out_w, "height": out_h,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance,
-                "generator": generator
-            }
-            pipeline_args.update(kwargs)
-            pipeline_args.pop('size', None)
-            if "Qwen-Image-Edit" in self.model_name:
-                pipeline_args["true_cfg_scale"] = pipeline_args.pop("guidance_scale", 7.0)
-                if not pipeline_args.get("negative_prompt"): pipeline_args["negative_prompt"] = " "
-
-            future = Future()
-            self.manager.queue.put((future, "image2image", pipeline_args))
-            ASCIIColors.info("Job (i2i) queued.")
-            return future.result()
-        except Exception:
-            pass
-
-        # Fallback to latent-based generation if i2i fails for some reason
-        try:
-            base = pil_images[0]
-            latents, _ = self._encode_image_to_latents(base, out_w, out_h)
-            pipeline_args = {
-                "prompt": prompt,
-                "negative_prompt": negative_prompt or None,
-                "latents": latents,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance,
-                "generator": generator,
-                "width": out_w, "height": out_h
-            }
-            pipeline_args.update(kwargs)
-            pipeline_args.pop('size', None)
-            future = Future()
-            self.manager.queue.put((future, "text2image", pipeline_args))
-            ASCIIColors.info("Job (t2i with init latents) queued.")
-            return future.result()
-        except Exception as e:
-            raise Exception(f"Image edit failed: {e}") from e
+        future = Future()
+        self.manager.queue.put((future, task, pipeline_args))
+        ASCIIColors.info(log_msg)
+        return future.result()
 
 
     def list_local_models(self) -> List[str]:
