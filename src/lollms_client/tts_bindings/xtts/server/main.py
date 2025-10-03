@@ -306,7 +306,7 @@ try:
     if __name__ == '__main__':
         parser = argparse.ArgumentParser(description="XTTS TTS Server")
         parser.add_argument("--host", type=str, default="localhost", help="Host to bind the server to.")
-        parser.add_argument("--port", type=int, default="9641", help="Port to bind the server to.")
+        parser.add_argument("--port", type=int, default="96", help="Port to bind the server to.")
         
         args = parser.parse_args()
 

@@ -27,8 +27,6 @@ from pydantic import BaseModel
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import trace_exception, ASCIIColors
 
-
-BindingName = "DiffusersTTIBinding_Impl"
 # --- Dependency Management ---
 pm.ensure_packages(["torch","torchvision"],index_url="https://download.pytorch.org/whl/cu126")
 pm.ensure_packages(["pillow","transformers","safetensors","requests","tqdm", "fastapi", "uvicorn", "httpx"])
@@ -56,7 +54,7 @@ CIVITAI_MODELS = {
     "absolute-reality": { "display_name": "Absolute Reality", "url": "https://civitai.com/api/download/models/132760?type=Model&format=SafeTensor&size=pruned&fp=fp16", "filename": "absolutereality_v181.safetensors", "description": "General realistic SD1.5.", "owned_by": "civitai" },
     "dreamshaper-8": { "display_name": "DreamShaper 8", "url": "https://civitai.com/api/download/models/128713", "filename": "dreamshaper_8.safetensors", "description": "Versatile SD1.5 style model.", "owned_by": "civitai" },
     "juggernaut-xl": { "display_name": "Juggernaut XL", "url": "https://civitai.com/api/download/models/133005", "filename": "juggernautXL_version6Rundiffusion.safetensors", "description": "Artistic SDXL.", "owned_by": "civitai" },
-
+    
    "lyriel-v1.6": {
         "display_name": "Lyriel v1.6",
         "url": "https://civitai.com/api/download/models/72396?type=Model&format=SafeTensor&size=full&fp=fp16",
@@ -136,7 +134,7 @@ CIVITAI_MODELS = {
     },
 }
 TORCH_DTYPE_MAP_STR_TO_OBJ = { "float16": getattr(torch, 'float16', 'float16'), "bfloat16": getattr(torch, 'bfloat16', 'bfloat16'), "float32": getattr(torch, 'float32', 'float32'), "auto": "auto" }
-SCHEDULER_MAPPING = { "default": None, "ddim": "DDIMScheduler", "ddpm": "DDPMScheduler", "euler_discrete": "EulerDiscreteScheduler", "lms_discrete": "LMSDiscreteScheduler" } # Simplified for example
+SCHEDULER_MAPPING = { "default": None, "ddim": "DDIMScheduler", "ddpm": "DDPMScheduler", "euler_discrete": "EulerDiscreteScheduler", "lms_discrete": "LMSDiscreteScheduler" }
 SCHEDULER_USES_KARRAS_SIGMAS = []
 
 class ModelManager:
@@ -155,29 +153,26 @@ class ModelManager:
         self._stop_event = threading.Event()
         self.worker_thread = threading.Thread(target=self._generation_worker, daemon=True)
         self.worker_thread.start()
-        # Inactivity monitor logic is omitted for brevity but would be here
 
-    def acquire(self): #... Full implementation
+    def acquire(self):
         with self.lock: self.ref_count += 1
         return self
 
-    def release(self): #... Full implementation
+    def release(self):
         with self.lock: self.ref_count -= 1
         return self.ref_count
         
-    def stop(self): #... Full implementation
+    def stop(self):
         self._stop_event.set()
         self.queue.put(None)
         self.worker_thread.join(timeout=5)
 
-    def _resolve_model_path(self, model_name: str) -> Union[str, Path]: #... Full implementation
+    def _resolve_model_path(self, model_name: str) -> Union[str, Path]:
         if model_name in CIVITAI_MODELS:
-            # Download logic would be here
             pass
         return model_name
 
-    def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any): #... Full implementation
-        # This contains all the from_pretrained/from_single_file logic for all model types
+    def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
         common_args = {"torch_dtype": torch_dtype}
         if "Qwen-Image-Edit-2509" in str(model_path): self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
         elif "Qwen-Image-Edit" in str(model_path): self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
@@ -186,7 +181,7 @@ class ModelManager:
         self.pipeline.to(self.config["device"])
         self.is_loaded = True
 
-    def _load_pipeline_for_task(self, task: str): #... Full implementation with OOM retry loop
+    def _load_pipeline_for_task(self, task: str):
         if self.pipeline and self.current_task == task: return
         if self.pipeline: self._unload_pipeline()
         model_name = self.config.get("model_name", "")
@@ -197,19 +192,18 @@ class ModelManager:
         except Exception as e:
             if "out of memory" in str(e).lower():
                 ASCIIColors.warning("OOM detected. Trying to free memory...")
-                # Unload other models logic would be here
-                self._execute_load_pipeline(task, model_path, torch_dtype) # Retry
+                self._execute_load_pipeline(task, model_path, torch_dtype)
             else:
                 raise e
 
-    def _unload_pipeline(self): #... Full implementation
+    def _unload_pipeline(self):
         if self.pipeline:
             del self.pipeline; self.pipeline = None; gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
             self.is_loaded = False
             ASCIIColors.info(f"Model unloaded and VRAM cleared.")
 
-    def _generation_worker(self): #... Full implementation with aggressive cleanup
+    def _generation_worker(self):
         while not self._stop_event.is_set():
             try:
                 job = self.queue.get(timeout=1)
@@ -230,7 +224,7 @@ class ModelManager:
                     else: gc.collect(); torch.cuda.empty_cache() if torch.cuda.is_available() else None
             except queue.Empty: continue
 
-class PipelineRegistry: #... Full implementation
+class PipelineRegistry:
     _instance = None; _lock = threading.Lock()
     def __new__(cls, *args, **kwargs):
         with cls._lock:
@@ -242,14 +236,18 @@ class PipelineRegistry: #... Full implementation
         with self._registry_lock:
             if key not in self._managers: self._managers[key] = ModelManager(config.copy(), models_path, self)
             return self._managers[key].acquire()
-    def release_manager(self, config: Dict[str, Any]): pass # Simplified
+    def release_manager(self, config: Dict[str, Any]): pass
 
-# This is the full-featured class that will run in the background
 class _DiffusersServerBindingImpl(LollmsTTIBinding):
-    # All constants from before are here
     QWEN_ASPECT_RATIOS = { "1:1": (1328, 1328), "16:9": (1664, 928), "9:16": (928, 1664), "4:3": (1472, 1104), "3:4": (1104, 1472) }
     QWEN_POSITIVE_MAGIC = ", Ultra HD, 4K, cinematic composition."
-    DEFAULT_CONFIG = { "model_name": "", "device": "auto", "torch_dtype_str": "auto", "force_reload_between_generations": False, "server_port": 28374 } # etc.
+    DEFAULT_CONFIG = { "model_name": "", "device": "auto", "torch_dtype_str": "auto", "force_reload_between_generations": False, "server_port": 28374 }
+    HF_DEFAULT_MODELS = [
+        {"family": "SDXL", "model_name": "stabilityai/stable-diffusion-xl-base-1.0"},
+        {"family": "Qwen", "model_name": "Qwen/Qwen-Image"},
+        {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit"},
+        {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit-2509"}
+    ]
     
     def __init__(self, **kwargs):
         super().__init__(binding_name="diffusers_server_impl")
@@ -263,25 +261,25 @@ class _DiffusersServerBindingImpl(LollmsTTIBinding):
         self.manager: Optional[ModelManager] = None
         if self.model_name: self._acquire_manager()
 
-    def _snap_to_qwen_aspect_ratio(self, width, height): #... Full implementation
+    def _snap_to_qwen_aspect_ratio(self, width, height):
         target_ratio = width / height; best_match = (width, height); min_diff = float('inf')
         for dims in self.QWEN_ASPECT_RATIOS.values():
             ratio = dims[0] / dims[1]; diff = abs(target_ratio - ratio)
             if diff < min_diff: min_diff = diff; best_match = dims
         return best_match
 
-    def _acquire_manager(self): #... Full implementation
+    def _acquire_manager(self):
         if self.manager: self.registry.release_manager(self.manager.config)
         self.manager = self.registry.get_manager(self.config, self.models_path)
 
-    def _resolve_device_and_dtype(self): #... Full implementation
+    def _resolve_device_and_dtype(self):
         if self.config["device"].lower() == "auto": self.config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
         if "Qwen" in self.config.get("model_name", "") and self.config["device"] == "cuda":
             if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
                 self.config["torch_dtype_str"] = "bfloat16"; return
         if self.config["torch_dtype_str"].lower() == "auto": self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
 
-    def _prepare_seed(self, kwargs: Dict[str, Any]) -> Optional[torch.Generator]: #... Full implementation
+    def _prepare_seed(self, kwargs: Dict[str, Any]) -> Optional[torch.Generator]:
         seed = kwargs.pop("seed", self.config.get("seed",-1)); 
         if seed == -1: return None
         return torch.Generator(device=self.config["device"]).manual_seed(seed)
@@ -295,39 +293,37 @@ class _DiffusersServerBindingImpl(LollmsTTIBinding):
         if is_qwen: w, h = self._snap_to_qwen_aspect_ratio(w, h)
         if "Qwen-Image-Edit" in self.model_name:
             noise = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
-            initial_image = Image.fromarray(noise, 'RGB')
-            return self.edit_image(images=[initial_image], prompt=prompt, negative_prompt=negative_prompt, width=w, height=h, **kwargs)
+            return self.edit_image(images=[Image.fromarray(noise, 'RGB')], prompt=prompt, negative_prompt=negative_prompt, width=w, height=h, **kwargs)
         if "Qwen/Qwen-Image" in self.model_name:
             pipeline_args = { "prompt": prompt + self.QWEN_POSITIVE_MAGIC, "negative_prompt": negative_prompt or " ", "width": w, "height": h, "num_inference_steps": kwargs.get("num_inference_steps", 50), "true_cfg_scale": kwargs.get("guidance_scale", 4.0), "generator": self._prepare_seed(kwargs) }
         else:
-            pipeline_args = { "prompt": prompt, "negative_prompt": negative_prompt or "", "width": w, "height": h, "generator": self._prepare_seed(kwargs) }
-            pipeline_args.update(kwargs)
+            pipeline_args = { "prompt": prompt, "negative_prompt": negative_prompt or "", "width": w, "height": h, "generator": self._prepare_seed(kwargs) }; pipeline_args.update(kwargs)
         future = Future(); self.manager.queue.put((future, "text2image", pipeline_args)); return future.result()
 
     def edit_image(self, images, prompt, negative_prompt="", mask=None, width=None, height=None, **kwargs) -> bytes:
         kwargs = kwargs.copy()
         if not self.model_name: raise RuntimeError("No model name configured.")
         if not self.manager: self._acquire_manager()
-        pil_images = [Image.open(BytesIO(base64.b64decode(i))) if isinstance(i, str) else i for i in images]
         w = width or self.config.get("width", 512); h = height or self.config.get("height", 512)
-        is_qwen = "Qwen" in self.model_name
-        is_qwen_2509 = "Qwen-Image-Edit-2509" in self.model_name
+        is_qwen = "Qwen" in self.model_name; is_qwen_2509 = "Qwen-Image-Edit-2509" in self.model_name
         if is_qwen: w, h = self._snap_to_qwen_aspect_ratio(w, h)
         base_args = { "prompt": prompt, "negative_prompt": negative_prompt, "width": w, "height": h, "num_inference_steps": kwargs.get("num_inference_steps", 50), "generator": self._prepare_seed(kwargs) }
         if is_qwen:
             base_args["true_cfg_scale"] = kwargs.get("guidance_scale", 4.0)
             if is_qwen_2509: base_args["guidance_scale"] = kwargs.get("guidance_scale_plus", 1.0)
         else: base_args["guidance_scale"] = kwargs.get("guidance_scale", 7.5)
-        if mask:
-            mask_img = Image.open(BytesIO(base64.b64decode(mask)))
-            pipeline_args = {**base_args, "image": pil_images[0], "mask_image": mask_img}; task="inpainting"
-        else:
-            pipeline_args = {**base_args, "image": pil_images[0] if len(pil_images)==1 else pil_images}; task="image2image"
+        if mask: pipeline_args = {**base_args, "image": images[0], "mask_image": mask}; task="inpainting"
+        else: pipeline_args = {**base_args, "image": images[0] if len(images)==1 else images}; task="image2image"
         future = Future(); self.manager.queue.put((future, task, pipeline_args)); return future.result()
+
+    def list_models(self) -> list:
+        return self.HF_DEFAULT_MODELS + list(CIVITAI_MODELS.keys())
+
+    def list_services(self, **kwargs) -> List[Dict[str, str]]:
+        return [{"name": m["model_name"], "caption": m["model_name"]} for m in self.HF_DEFAULT_MODELS]
 
     def set_settings(self, settings: Dict[str, Any]) -> bool:
         self.config.update(settings)
-        # In a real scenario, this would trigger a model swap if critical params changed
         if self.manager: self.manager.config.update(settings)
         return True
 
@@ -338,16 +334,12 @@ class _DiffusersServerBindingImpl(LollmsTTIBinding):
 # =================================================================================================
 _server_binding_instance: Optional[_DiffusersServerBindingImpl] = None
 
-class ServerGenerateRequest(BaseModel):
-    prompt: str; negative_prompt: str; width: Optional[int]; height: Optional[int]; kwargs: dict
-class ServerEditRequest(BaseModel):
-    images: List[str]; prompt: str; negative_prompt: str; mask: Optional[str]; width: Optional[int]; height: Optional[int]; kwargs: dict
-class ServerSettingsRequest(BaseModel):
-    settings: dict
+class ServerGenerateRequest(BaseModel): prompt: str; negative_prompt: str; width: Optional[int]; height: Optional[int]; kwargs: dict
+class ServerEditRequest(BaseModel): images: List[str]; prompt: str; negative_prompt: str; mask: Optional[str]; width: Optional[int]; height: Optional[int]; kwargs: dict
+class ServerSettingsRequest(BaseModel): settings: dict
 
 def _run_server_process(port: int, **model_kwargs):
-    global _server_binding_instance
-    _server_binding_instance = _DiffusersServerBindingImpl(**model_kwargs)
+    global _server_binding_instance; _server_binding_instance = _DiffusersServerBindingImpl(**model_kwargs)
     app = FastAPI()
     @app.post("/generate")
     async def generate(req: ServerGenerateRequest):
@@ -355,12 +347,18 @@ def _run_server_process(port: int, **model_kwargs):
         except Exception as e: return Response(content=json.dumps({"error": str(e)}), status_code=500)
     @app.post("/edit")
     async def edit(req: ServerEditRequest):
-        try: return Response(content=_server_binding_instance.edit_image(req.images, req.prompt, req.negative_prompt, req.mask, req.width, req.height, **req.kwargs), media_type="image/png")
+        images = [Image.open(BytesIO(base64.b64decode(i))) for i in req.images]
+        mask = Image.open(BytesIO(base64.b64decode(req.mask))) if req.mask else None
+        try: return Response(content=_server_binding_instance.edit_image(images, req.prompt, req.negative_prompt, mask, req.width, req.height, **req.kwargs), media_type="image/png")
         except Exception as e: return Response(content=json.dumps({"error": str(e)}), status_code=500)
     @app.post("/set_settings")
     async def set_settings(req: ServerSettingsRequest): return {"success": _server_binding_instance.set_settings(req.settings)}
     @app.get("/get_settings")
     async def get_settings(): return _server_binding_instance.get_settings()
+    @app.get("/list_models")
+    async def list_models(): return _server_binding_instance.list_models()
+    @app.get("/list_services")
+    async def list_services(): return _server_binding_instance.list_services()
     @app.get("/health")
     async def health(): return {"status": "ok"}
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
@@ -376,6 +374,8 @@ def _cleanup_server():
 atexit.register(_cleanup_server)
 
 class DiffusersTTIBinding_Impl(LollmsTTIBinding):
+    DEFAULT_CONFIG = _DiffusersServerBindingImpl.DEFAULT_CONFIG
+
     def __init__(self, **kwargs):
         super().__init__(binding_name="diffusers")
         self.config = kwargs
@@ -387,8 +387,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
     def _check_and_start_server(self):
         global _server_process
         try:
-            if httpx.get(f"{self.server_url}/health", timeout=1.0).status_code == 200:
-                ASCIIColors.cyan(f"WORKER {os.getpid()}: Server already running. Connecting as client."); return
+            if httpx.get(f"{self.server_url}/health", timeout=1.0).status_code == 200: return
         except httpx.ConnectError: pass
         ASCIIColors.green(f"WORKER {os.getpid()}: Is leader. Starting dedicated model server...")
         ctx = multiprocessing.get_context('spawn')
@@ -416,12 +415,10 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
                 with open(img, "rb") as f: return base64.b64encode(f.read()).decode('utf-8')
             elif isinstance(img, Image.Image):
                 buffered = BytesIO(); img.save(buffered, format="PNG"); return base64.b64encode(buffered.getvalue()).decode('utf-8')
-            elif isinstance(img, str): return img # Assume it's already base64
+            elif isinstance(img, str): return img
             return None
-        
         images_b64 = [to_base64(i) for i in (images if isinstance(images, list) else [images])]
         mask_b64 = to_base64(mask) if mask else None
-        
         payload = {"images": images_b64, "prompt": prompt, "negative_prompt": negative_prompt, "mask": mask_b64, "width": width, "height": height, "kwargs": kwargs}
         response = self.client.post(f"{self.server_url}/edit", json=payload)
         if response.status_code != 200: raise Exception(f"Error from model server: {response.text}")
@@ -429,10 +426,16 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         
     def set_settings(self, settings: Dict[str, Any]) -> bool:
         response = self.client.post(f"{self.server_url}/set_settings", json={"settings": settings})
-        if response.status_code != 200: return False
-        return response.json().get("success", False)
+        return response.status_code == 200 and response.json().get("success", False)
 
     def get_settings(self) -> Dict[str, Any]:
         response = self.client.get(f"{self.server_url}/get_settings")
-        if response.status_code != 200: return {}
-        return response.json()
+        return response.json() if response.status_code == 200 else {}
+        
+    def list_models(self) -> list:
+        response = self.client.get(f"{self.server_url}/list_models")
+        return response.json() if response.status_code == 200 else []
+
+    def list_services(self, **kwargs) -> List[Dict[str, str]]:
+        response = self.client.get(f"{self.server_url}/list_services")
+        return response.json() if response.status_code == 200 else []
