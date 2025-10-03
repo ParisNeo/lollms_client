@@ -531,6 +531,10 @@ class PipelineRegistry:
             return list(self._managers.values())
 
 class DiffusersTTIBinding_Impl(LollmsTTIBinding):
+    QWEN_ASPECT_RATIOS = {
+        "1:1": (1328, 1328), "16:9": (1664, 928), "9:16": (928, 1664),
+        "4:3": (1472, 1140), "3:4": (1140, 1472)
+    }
     DEFAULT_CONFIG = {
         "model_name": "",
         "device": "auto",
@@ -580,6 +584,23 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         self._resolve_device_and_dtype()
         if self.model_name:
             self._acquire_manager()
+
+    def _snap_to_qwen_aspect_ratio(self, width: int, height: int) -> Tuple[int, int]:
+        target_ratio = width / height
+        best_match = None
+        min_diff = float('inf')
+
+        for name, dims in self.QWEN_ASPECT_RATIOS.items():
+            supported_ratio = dims[0] / dims[1]
+            diff = abs(target_ratio - supported_ratio)
+            if diff < min_diff:
+                min_diff = diff
+                best_match = dims
+        
+        if best_match != (width, height):
+            ASCIIColors.warning(f"Requested dimensions ({width}x{height}) are not optimal for Qwen. Snapping to nearest supported size: {best_match[0]}x{best_match[1]}.")
+        
+        return best_match
 
     def ps(self) -> List[dict]:
         if not self.registry:
@@ -690,6 +711,10 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         w = width if width is not None else self.config.get("width", 512)
         h = height if height is not None else self.config.get("height", 512)
 
+        is_qwen = "Qwen" in self.model_name
+        if is_qwen:
+            w, h = self._snap_to_qwen_aspect_ratio(w, h)
+
         if "Qwen-Image-Edit" in self.model_name:
             noise = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
             initial_image = Image.fromarray(noise, 'RGB')
@@ -766,23 +791,27 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
 
         out_w = width if width is not None else self.config["width"]
         out_h = height if height is not None else self.config["height"]
+
+        is_qwen = "Qwen" in self.model_name
+        if is_qwen:
+            out_w, out_h = self._snap_to_qwen_aspect_ratio(out_w, out_h)
+        
         generator = self._prepare_seed(kwargs)
         steps = kwargs.get("num_inference_steps", self.config["num_inference_steps"])
         guidance = kwargs.get("guidance_scale", self.config["guidance_scale"])
         
-        is_qwen_edit = "Qwen-Image-Edit" in self.model_name
         base_args = {
             "prompt": prompt, "negative_prompt": negative_prompt, "width": out_w, "height": out_h,
             "num_inference_steps": steps, "generator": generator
         }
         
-        if is_qwen_edit:
+        if is_qwen:
             base_args["true_cfg_scale"] = guidance
             if not base_args.get("negative_prompt"): base_args["negative_prompt"] = " "
         else:
             base_args["guidance_scale"] = guidance
 
-        if is_qwen_edit and len(pil_images) > 1:
+        if is_qwen and len(pil_images) > 1:
             pipeline_args = base_args
             pipeline_args["image"] = pil_images
             task, log_msg = "image2image", f"Job (multi-image fusion with {len(pil_images)} images) queued."
@@ -794,7 +823,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         elif pil_images:
             pipeline_args = base_args
             pipeline_args["image"] = pil_images[0]
-            if not is_qwen_edit:
+            if not is_qwen:
                 pipeline_args["strength"] = kwargs.get("strength", 0.6)
             task, log_msg = "image2image", "Job (i2i) queued."
         else:
