@@ -443,7 +443,7 @@ class ModelManager:
             except Exception as retry_e:
                 is_oom_retry = "out of memory" in str(retry_e).lower()
                 if not is_oom_retry:
-                    raise retry_e
+                    raise retry_e 
         
         ASCIIColors.error(f"Could not load '{model_name}' even after unloading all other models.")
         raise e
@@ -467,6 +467,7 @@ class ModelManager:
                 if job is None:
                     break
                 future, task, pipeline_args = job
+                output = None
                 try:
                     with self.lock:
                         self.last_used_time = time.time()
@@ -483,6 +484,12 @@ class ModelManager:
                     future.set_exception(e)
                 finally:
                     self.queue.task_done()
+                    # Aggressive cleanup
+                    if output is not None:
+                        del output
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             except queue.Empty:
                 continue
 
