@@ -533,8 +533,10 @@ class PipelineRegistry:
 class DiffusersTTIBinding_Impl(LollmsTTIBinding):
     QWEN_ASPECT_RATIOS = {
         "1:1": (1328, 1328), "16:9": (1664, 928), "9:16": (928, 1664),
-        "4:3": (1472, 1140), "3:4": (1140, 1472)
+        "4:3": (1472, 1104), "3:4": (1104, 1472), "3:2": (1584, 1056),
+        "2:3": (1056, 1584)
     }
+    QWEN_POSITIVE_MAGIC = ", Ultra HD, 4K, cinematic composition."
     DEFAULT_CONFIG = {
         "model_name": "",
         "device": "auto",
@@ -726,7 +728,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         if "Qwen/Qwen-Image" in self.model_name:
             generator = self._prepare_seed(kwargs)
             pipeline_args = {
-                "prompt": prompt,
+                "prompt": prompt + self.QWEN_POSITIVE_MAGIC,
                 "negative_prompt": negative_prompt or " ",
                 "width": w, "height": h,
                 "num_inference_steps": kwargs.get("num_inference_steps", self.config.get("num_inference_steps", 50)),
@@ -811,9 +813,12 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         else:
             base_args["guidance_scale"] = guidance
 
-        if is_qwen and len(pil_images) > 1:
+        # Specific handling for the newest multi-image editor
+        if "Qwen-Image-Edit-2509" in self.model_name and len(pil_images) > 1:
             pipeline_args = base_args
             pipeline_args["image"] = pil_images
+            # This specific model uses both params according to docs
+            pipeline_args["guidance_scale"] = kwargs.get("guidance_scale_plus", 1.0)
             task, log_msg = "image2image", f"Job (multi-image fusion with {len(pil_images)} images) queued."
         elif mask and len(pil_images) == 1:
             pipeline_args = base_args
