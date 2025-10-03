@@ -307,7 +307,7 @@ class ModelManager:
         except Exception as e:
             if temp_path.exists():
                 temp_path.unlink()
-            raise Exception(f"Failed to download model {filename}: {e}") 
+            raise Exception(f"Failed to download model {filename}: {e}") from e
 
     def _set_scheduler(self):
         if not self.pipeline:
@@ -378,7 +378,7 @@ class ModelManager:
                     f"AUTHENTICATION FAILED for model '{model_name}'. "
                     "Please ensure you accepted the model license and provided a valid HF token."
                 )
-                raise RuntimeError(msg) 
+                raise RuntimeError(msg) from e
             raise e
         self._set_scheduler()
         self.pipeline.to(self.config["device"])
@@ -442,7 +442,7 @@ class ModelManager:
             except Exception as retry_e:
                 is_oom_retry = "out of memory" in str(retry_e).lower()
                 if not is_oom_retry:
-                    raise retry_e 
+                    raise retry_e from e
         
         ASCIIColors.error(f"Could not load '{model_name}' even after unloading all other models.")
         raise e
@@ -648,10 +648,11 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             self.config["device"] = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         
         # Prioritize bfloat16 for Qwen models on supported hardware, as it's more stable
-        if "Qwen" in self.config.get("model_name", "") and self.config["device"] == "cuda" and torch.cuda.is_bf16_supported():
-            self.config["torch_dtype_str"] = "bfloat16"
-            ASCIIColors.info("Qwen model detected on compatible hardware. Forcing dtype to bfloat16 for stability.")
-            return
+        if "Qwen" in self.config.get("model_name", "") and self.config["device"] == "cuda":
+            if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+                self.config["torch_dtype_str"] = "bfloat16"
+                ASCIIColors.info("Qwen model detected on compatible hardware. Forcing dtype to bfloat16 for stability.")
+                return
 
         if self.config["torch_dtype_str"].lower() == "auto":
             self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
@@ -748,8 +749,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             try:
                 return future.result()
             except Exception as e:
-                trace_exception(e)
-                raise Exception(f"Qwen image generation failed: {e}")
+                raise Exception(f"Qwen image generation failed: {e}") from e
 
         generator = self._prepare_seed(kwargs)
         pipeline_args = {
@@ -768,7 +768,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         try:
             return future.result()
         except Exception as e:
-            raise Exception(f"Image generation failed: {e}") 
+            raise Exception(f"Image generation failed: {e}") from e
 
     def _encode_image_to_latents(self, pil: Image.Image, width: int, height: int) -> Tuple[torch.Tensor, Tuple[int,int]]:
         pil = pil.convert("RGB").resize((width, height))
@@ -803,6 +803,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         out_h = height if height is not None else self.config["height"]
 
         is_qwen = "Qwen" in self.model_name
+        is_qwen_2509 = "Qwen-Image-Edit-2509" in self.model_name
         if is_qwen:
             out_w, out_h = self._snap_to_qwen_aspect_ratio(out_w, out_h)
         
@@ -818,15 +819,14 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         if is_qwen:
             base_args["true_cfg_scale"] = guidance
             if not base_args.get("negative_prompt"): base_args["negative_prompt"] = " "
+            if is_qwen_2509:
+                base_args["guidance_scale"] = kwargs.get("guidance_scale_plus", 1.0)
         else:
             base_args["guidance_scale"] = guidance
 
-        # Specific handling for the newest multi-image editor
-        if "Qwen-Image-Edit-2509" in self.model_name and len(pil_images) > 1:
+        if is_qwen_2509 and len(pil_images) > 1:
             pipeline_args = base_args
             pipeline_args["image"] = pil_images
-            # This specific model uses both params according to docs
-            pipeline_args["guidance_scale"] = kwargs.get("guidance_scale_plus", 1.0)
             task, log_msg = "image2image", f"Job (multi-image fusion with {len(pil_images)} images) queued."
         elif mask and len(pil_images) == 1:
             pipeline_args = base_args
