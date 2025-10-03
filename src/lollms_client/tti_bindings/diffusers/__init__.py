@@ -713,6 +713,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
             self.manager = None
 
     def generate_image(self, prompt: str, negative_prompt: str = "", width: int|None = None, height: int|None = None, **kwargs) -> bytes:
+        kwargs = kwargs.copy()
         if not self.model_name:
             raise RuntimeError("No model_name configured. Please select a model in settings.")
         if not self.manager:
@@ -791,6 +792,7 @@ class DiffusersTTIBinding_Impl(LollmsTTIBinding):
         prompt: str, negative_prompt: Optional[str] = "", mask: Optional[str] = None,
         width: Optional[int] = None, height: Optional[int] = None, **kwargs
     ) -> bytes:
+        kwargs = kwargs.copy()
         if not self.model_name:
             raise RuntimeError("No model_name configured. Please select a model in settings.")
         if not self.manager:
