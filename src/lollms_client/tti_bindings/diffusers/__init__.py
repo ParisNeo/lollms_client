@@ -16,6 +16,7 @@ from tqdm import tqdm
 import json
 import shutil
 import numpy as np
+import gc
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import trace_exception, ASCIIColors
 
@@ -452,6 +453,7 @@ class ModelManager:
             model_name = self.config.get('model_name', 'Unknown')
             del self.pipeline
             self.pipeline = None
+            gc.collect()
             if torch and torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self.is_loaded = False
