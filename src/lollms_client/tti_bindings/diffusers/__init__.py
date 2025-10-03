@@ -364,8 +364,10 @@ class ModelManager:
                     common_args["cache_dir"] = str(self.config["hf_cache_path"])
 
                 if "Qwen-Image-Edit-2509" in str(model_path):
+                    common_args.pop('size', None)
                     self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
                 elif "Qwen-Image-Edit" in str(model_path):
+                    common_args.pop('size', None)
                     self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
                 elif task == "text2image":
                     self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **common_args)
