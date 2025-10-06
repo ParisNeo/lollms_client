@@ -180,11 +180,7 @@ class ModelManager:
 
     def _start_unload_monitor(self):
         unload_after = self.config.get("unload_inactive_model_after", 0)
-        if unload_after > 0:
-            if self._unload_monitor_thread and self._unload_monitor_thread.is_alive():
-                self._stop_monitor_event.set()
-                self._unload_monitor_thread.join()
-
+        if unload_after > 0 and self._unload_monitor_thread is None:
             self._stop_monitor_event.clear()
             self._unload_monitor_thread = threading.Thread(target=self._unload_monitor, daemon=True)
             self._unload_monitor_thread.start()
@@ -196,12 +192,11 @@ class ModelManager:
         ASCIIColors.info(f"Starting inactivity monitor for '{self.config['model_name']}' (timeout: {unload_after}s).")
         while not self._stop_monitor_event.wait(timeout=5.0):
             with self.lock:
-                if self.ref_count > 0 or not self.is_loaded:
+                if not self.is_loaded:
                     continue
                 if time.time() - self.last_used_time > unload_after:
-                    ASCIIColors.info(f"Model '{self.config['model_name']}' has been inactive for {unload_after} seconds. Unloading.")
+                    ASCIIColors.info(f"Model '{self.config['model_name']}' has been inactive. Unloading.")
                     self._unload_pipeline()
-                    break # End the monitor thread once unloaded
 
     def _resolve_model_path(self, model_name: str) -> Union[str, Path]:
         path_obj = Path(model_name)
@@ -224,9 +219,9 @@ class ModelManager:
         filename = model_info["filename"]
         dest_path = self.models_path / filename
         temp_path = dest_path.with_suffix(".temp")
-        ASCIIColors.cyan(f"Downloading '{filename}' from Civitai to {dest_path}...")
+        ASCIIColors.cyan(f"Downloading '{filename}' from Civitai...")
         try:
-            with requests.get(url, stream=True, timeout=300) as r:
+            with requests.get(url, stream=True) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
                 with open(temp_path, 'wb') as f, tqdm(total=total_size, unit='iB', unit_scale=True, desc=f"Downloading {filename}") as bar:
@@ -238,19 +233,23 @@ class ModelManager:
         except Exception as e:
             if temp_path.exists():
                 temp_path.unlink()
-            raise Exception(f"Failed to download model {filename}: {e}")
+            raise Exception(f"Failed to download model {filename}: {e}") 
 
     def _set_scheduler(self):
-        if not self.pipeline: return
+        if not self.pipeline:
+            return
+        if "Qwen" in self.config.get("model_name", ""):
+            ASCIIColors.info("Qwen model detected, skipping custom scheduler setup.")
+            return
         scheduler_name_key = self.config["scheduler_name"].lower()
-        if scheduler_name_key == "default": return
+        if scheduler_name_key == "default":
+            return
         scheduler_class_name = SCHEDULER_MAPPING.get(scheduler_name_key)
         if scheduler_class_name:
             try:
                 SchedulerClass = getattr(importlib.import_module("diffusers.schedulers"), scheduler_class_name)
                 scheduler_config = self.pipeline.scheduler.config
-                if "karras" in scheduler_name_key:
-                    scheduler_config["use_karras_sigmas"] = True
+                scheduler_config["use_karras_sigmas"] = scheduler_name_key in SCHEDULER_USES_KARRAS_SIGMAS
                 self.pipeline.scheduler = SchedulerClass.from_config(scheduler_config)
                 ASCIIColors.info(f"Switched scheduler to {scheduler_class_name}")
             except Exception as e:
@@ -259,48 +258,79 @@ class ModelManager:
     def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
         model_name = self.config.get("model_name", "")
         try:
-            load_args = {"cache_dir": str(self.config.get("hf_cache_path"))} if self.config.get("hf_cache_path") else {}
-            
-            if str(model_path).endswith((".safetensors", ".ckpt")):
-                # Use the base DiffusionPipeline for single files
-                self.pipeline = DiffusionPipeline.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
+            load_args = {}
+            if self.config.get("hf_cache_path"):
+                load_args["cache_dir"] = str(self.config["hf_cache_path"])
+            if str(model_path).endswith(".safetensors"):
+                if task == "text2image":
+                    try:
+                        self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
+                    except AttributeError:
+                        self.pipeline = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
+                elif task == "image2image":
+                    self.pipeline = AutoPipelineForImage2Image.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
+                elif task == "inpainting":
+                    self.pipeline = AutoPipelineForInpainting.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
             else:
-                common_args = {"torch_dtype": torch_dtype, "use_safetensors": self.config.get("use_safetensors", True)}
-                pipeline_class = {
-                    "text2image": AutoPipelineForText2Image,
-                    "image2image": AutoPipelineForImage2Image,
-                    "inpainting": AutoPipelineForInpainting
-                }.get(task, AutoPipelineForText2Image)
-                self.pipeline = pipeline_class.from_pretrained(model_path, **common_args, **load_args)
-            
-            self._set_scheduler()
-            self.pipeline.to(self.config["device"])
+                common_args = {
+                    "torch_dtype": torch_dtype,
+                    "use_safetensors": self.config["use_safetensors"],
+                    "token": self.config["hf_token"],
+                    "local_files_only": self.config["local_files_only"]
+                }
+                if self.config["hf_variant"]:
+                    common_args["variant"] = self.config["hf_variant"]
+                if not self.config["safety_checker_on"]:
+                    common_args["safety_checker"] = None
+                if self.config.get("hf_cache_path"):
+                    common_args["cache_dir"] = str(self.config["hf_cache_path"])
 
-            if self.config.get("enable_xformers"):
-                try:
-                    self.pipeline.enable_xformers_memory_efficient_attention()
-                    ASCIIColors.green("xFormers memory efficient attention enabled.")
-                except Exception as e:
-                    ASCIIColors.warning(f"Could not enable xFormers: {e}.")
-
-            self.is_loaded = True
-            self.current_task = task
-            self.last_used_time = time.time()
-            ASCIIColors.green(f"Model '{model_name}' loaded successfully on '{self.config['device']}' for task '{task}'.")
-
+                if "Qwen-Image-Edit-2509" in str(model_path):
+                    self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
+                elif "Qwen-Image-Edit" in str(model_path):
+                    self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
+                elif "Qwen/Qwen-Image" in str(model_path):
+                    self.pipeline = DiffusionPipeline.from_pretrained(model_path, **common_args)
+                elif task == "text2image":
+                    self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **common_args)
+                elif task == "image2image":
+                    self.pipeline = AutoPipelineForImage2Image.from_pretrained(model_path, **common_args)
+                elif task == "inpainting":
+                    self.pipeline = AutoPipelineForInpainting.from_pretrained(model_path, **common_args)
         except Exception as e:
             error_str = str(e).lower()
-            if "401" in error_str or "gated" in error_str:
-                msg = f"AUTHENTICATION FAILED for model '{model_name}'. Ensure you have accepted the license and provided a valid Hugging Face token."
-                raise RuntimeError(msg)
+            if "401" in error_str or "gated" in error_str or "authorization" in error_str:
+                msg = (
+                    f"AUTHENTICATION FAILED for model '{model_name}'. "
+                    "Please ensure you accepted the model license and provided a valid HF token."
+                )
+                raise RuntimeError(msg) 
             raise e
+        self._set_scheduler()
+        self.pipeline.to(self.config["device"])
+        if self.config["enable_xformers"]:
+            try:
+                self.pipeline.enable_xformers_memory_efficient_attention()
+            except Exception as e:
+                ASCIIColors.warning(f"Could not enable xFormers: {e}.")
+        if self.config["enable_cpu_offload"] and self.config["device"] != "cpu":
+            self.pipeline.enable_model_cpu_offload()
+        elif self.config["enable_sequential_cpu_offload"] and self.config["device"] != "cpu":
+            self.pipeline.enable_sequential_cpu_offload()
+        self.is_loaded = True
+        self.current_task = task
+        self.last_used_time = time.time()
+        ASCIIColors.green(f"Model '{model_name}' loaded successfully on '{self.config['device']}' for task '{task}'.")
 
     def _load_pipeline_for_task(self, task: str):
-        if self.pipeline and self.current_task == task: return
-        if self.pipeline: self._unload_pipeline()
+        if self.pipeline and self.current_task == task:
+            return
+        if self.pipeline:
+            self._unload_pipeline()
         
-        model_name = self.config.get("model_name")
-        if not model_name: raise ValueError("Model name cannot be empty for loading.")
+        model_name = self.config.get("model_name", "")
+        if not model_name:
+            raise ValueError("Model name cannot be empty for loading.")
         
         ASCIIColors.info(f"Loading Diffusers model: {model_name} for task: {task}")
         model_path = self._resolve_model_path(model_name)
@@ -308,10 +338,40 @@ class ModelManager:
         
         try:
             self._execute_load_pipeline(task, model_path, torch_dtype)
+            return
         except Exception as e:
-            ASCIIColors.error(f"Failed to load pipeline for {model_name}: {e}")
-            trace_exception(e)
+            is_oom = "out of memory" in str(e).lower()
+            if not is_oom or not hasattr(self, 'registry'):
+                raise e
+        
+        ASCIIColors.warning(f"Failed to load '{model_name}' due to OOM. Attempting to unload other models to free VRAM.")
+        
+        candidates_to_unload = [
+            m for m in self.registry.get_all_managers()
+            if m is not self and m.is_loaded
+        ]
+        candidates_to_unload.sort(key=lambda m: m.last_used_time)
+
+        if not candidates_to_unload:
+            ASCIIColors.error("OOM error, but no other models are available to unload.")
             raise e
+
+        for victim in candidates_to_unload:
+            ASCIIColors.info(f"Unloading '{victim.config['model_name']}' (last used: {time.ctime(victim.last_used_time)}) to free VRAM.")
+            victim._unload_pipeline()
+            
+            try:
+                ASCIIColors.info(f"Retrying to load '{model_name}'...")
+                self._execute_load_pipeline(task, model_path, torch_dtype)
+                ASCIIColors.green(f"Successfully loaded '{model_name}' after freeing VRAM.")
+                return
+            except Exception as retry_e:
+                is_oom_retry = "out of memory" in str(retry_e).lower()
+                if not is_oom_retry:
+                    raise retry_e 
+        
+        ASCIIColors.error(f"Could not load '{model_name}' even after unloading all other models.")
+        raise e
 
     def _unload_pipeline(self):
         if self.pipeline:
@@ -319,7 +379,7 @@ class ModelManager:
             del self.pipeline
             self.pipeline = None
             gc.collect()
-            if torch and hasattr(torch, 'cuda') and torch.cuda.is_available():
+            if torch and torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self.is_loaded = False
             self.current_task = None
@@ -329,8 +389,9 @@ class ModelManager:
         while not self._stop_event.is_set():
             try:
                 job = self.queue.get(timeout=1)
-                if job is None: break
-                task, future, pipeline_args = job # Corrected unpacking order
+                if job is None:
+                    break
+                future, task, pipeline_args = job
                 output = None
                 try:
                     with self.lock:
@@ -339,18 +400,20 @@ class ModelManager:
                             self._load_pipeline_for_task(task)
                     with torch.no_grad():
                         output = self.pipeline(**pipeline_args)
-                    pil_image = output.images[0]
-                    buffer = BytesIO()
-                    pil_image.save(buffer, format="PNG")
-                    future.set_result(buffer.getvalue())
+                    pil = output.images[0]
+                    buf = BytesIO()
+                    pil.save(buf, format="PNG")
+                    future.set_result(buf.getvalue())
                 except Exception as e:
                     trace_exception(e)
                     future.set_exception(e)
                 finally:
                     self.queue.task_done()
-                    if output is not None: del output
+                    # Aggressive cleanup
+                    if output is not None:
+                        del output
                     gc.collect()
-                    if hasattr(torch, 'cuda') and torch.cuda.is_available():
+                    if torch.cuda.is_available():
                         torch.cuda.empty_cache()
             except queue.Empty:
                 continue
@@ -358,53 +421,49 @@ class ModelManager:
 class PipelineRegistry:
     _instance = None
     _lock = threading.Lock()
-
     def __new__(cls, *args, **kwargs):
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
-                cls._instance._managers: Dict[str, ModelManager] = {}
+                cls._instance._managers = {}
                 cls._instance._registry_lock = threading.Lock()
         return cls._instance
-
     @staticmethod
     def _get_critical_keys():
         return [
             "model_name","device","torch_dtype_str","use_safetensors",
             "safety_checker_on","hf_variant","enable_cpu_offload",
             "enable_sequential_cpu_offload","enable_xformers",
-            "local_files_only","hf_cache_path"
+            "local_files_only","hf_cache_path","unload_inactive_model_after"
         ]
-
     def _get_config_key(self, config: Dict[str, Any]) -> str:
         key_data = tuple(sorted((k, config.get(k)) for k in self._get_critical_keys()))
         return hashlib.sha256(str(key_data).encode('utf-8')).hexdigest()
-
     def get_manager(self, config: Dict[str, Any], models_path: Path) -> ModelManager:
         key = self._get_config_key(config)
         with self._registry_lock:
             if key not in self._managers:
                 self._managers[key] = ModelManager(config.copy(), models_path, self)
-            manager = self._managers[key]
-            # Ensure manager's config is up-to-date with any non-critical keys
-            manager.config.update(config)
-            manager._start_unload_monitor() # Restart monitor with potentially new timeout
-            return manager.acquire()
-
+            return self._managers[key].acquire()
     def release_manager(self, config: Dict[str, Any]):
         key = self._get_config_key(config)
         with self._registry_lock:
             if key in self._managers:
                 manager = self._managers[key]
-                if manager.release() == 0:
-                    ASCIIColors.info(f"Reference count for manager of '{config.get('model_name')}' is zero.")
-                    # Let the inactivity monitor handle the unloading.
-
+                ref_count = manager.release()
+                if ref_count == 0:
+                    ASCIIColors.info(f"Reference count for model '{config.get('model_name')}' is zero. Cleaning up manager.")
+                    manager.stop()
+                    with manager.lock:
+                        manager._unload_pipeline()
+                    del self._managers[key]
+    def get_active_managers(self) -> List[ModelManager]:
+        with self._registry_lock:
+            return [m for m in self._managers.values() if m.is_loaded]
     def get_all_managers(self) -> List[ModelManager]:
         with self._registry_lock:
             return list(self._managers.values())
 
-# --- Global Server State ---
 class ServerState:
     def __init__(self, models_path: Path):
         self.models_path = models_path
@@ -432,7 +491,7 @@ class ServerState:
             "guidance_scale": 7.0, "width": 512, "height": 512, "seed": -1,
             "enable_cpu_offload": False, "enable_sequential_cpu_offload": False, "enable_xformers": False,
             "hf_variant": None, "hf_token": None, "hf_cache_path": None, "local_files_only": False,
-            "unload_inactive_model_after": 300 # Default 5 min inactivity unload
+            "unload_inactive_model_after": 0
         }
 
     def save_config(self):
@@ -466,7 +525,15 @@ class ServerState:
     def _resolve_device_and_dtype(self):
         if self.config.get("device", "auto").lower() == "auto":
             self.config["device"] = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-        if self.config.get("torch_dtype_str", "auto").lower() == "auto":
+        
+        # Prioritize bfloat16 for Qwen models on supported hardware, as it's more stable
+        if "Qwen" in self.config.get("model_name", "") and self.config["device"] == "cuda":
+            if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+                self.config["torch_dtype_str"] = "bfloat16"
+                ASCIIColors.info("Qwen model detected on compatible hardware. Forcing dtype to bfloat16 for stability.")
+                return
+
+        if self.config["torch_dtype_str"].lower() == "auto":
             self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
 
     def update_settings(self, new_settings: Dict[str, Any]):
@@ -540,7 +607,7 @@ async def generate_image(request: T2IRequest):
         }
         
         future = Future()
-        manager.queue.put(("text2image", future, pipeline_args))
+        manager.queue.put((future,"text2image", pipeline_args))
         result_bytes = future.result()
         return Response(content=result_bytes, media_type="image/png")
     except Exception as e:
@@ -574,7 +641,7 @@ async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []
         }
         
         future = Future()
-        manager.queue.put((task, future, pipeline_args))
+        manager.queue.put((future, task, pipeline_args))
         result_bytes = future.result()
         return Response(content=result_bytes, media_type="image/png")
     except Exception as e:
