@@ -30,4 +30,4 @@ generate_audio_parameters:
     description: "The text to synthesize. Can include sounds like [laughter]."
   - name: "voice"
     type: "str"
-    description: "The preset speaker ID to use (e.g., 'v2/en_speaker_6'). If None, a default English voice is used."```
+    description: "The preset speaker ID to use (e.g., 'v2/en_speaker_6'). If None, a default English voice is used."

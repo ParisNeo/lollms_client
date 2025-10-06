@@ -98,7 +98,7 @@ class XTTSClientBinding(LollmsTTSBinding):
         server_script = self.server_dir / "main.py"
 
         # 1. Ensure a virtual environment and dependencies
-        venv_path = self.server_dir / "venv"
+        venv_path = Path("./venv/xtts_venv")
 
         if not venv_path.exists():
             self.install(venv_path, requirements_file)

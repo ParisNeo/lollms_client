@@ -26,10 +26,6 @@ description: |
   or per-request at runtime. Runtime overrides global, which overrides defaults.
 
 input_parameters:
-  - name: "model"
-    type: "str"
-    default: "runwayml/stable-diffusion-v1-5"
-    description: "The Hugging Face model ID to use (e.g., 'stabilityai/stable-diffusion-xl-base-1.0')."
 
   - name: "device"
     type: "str"

@@ -658,6 +658,9 @@ class OllamaBinding(LollmsLLMBinding):
         """
         if model_name is None:
             model_name = self.model_name
+            if not model_name:
+                ASCIIColors.warning("Model name not specified and no default model set.")
+                return None
             
         try:
             info = ollama.show(model_name)

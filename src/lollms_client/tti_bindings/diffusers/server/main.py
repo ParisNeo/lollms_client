@@ -1,0 +1,663 @@
+import os
+import importlib
+from io import BytesIO
+from typing import Optional, List, Dict, Any, Union, Tuple
+from pathlib import Path
+import base64
+import threading
+import queue
+from concurrent.futures import Future
+import time
+import hashlib
+import requests
+from tqdm import tqdm
+import json
+import shutil
+import numpy as np
+import gc
+import argparse
+import uvicorn
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, Form
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
+import sys
+
+# Add binding root to sys.path to ensure local modules can be imported if structured that way.
+binding_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(binding_root))
+
+# --- Dependency Check and Imports ---
+try:
+    import torch
+    from diffusers import (
+        AutoPipelineForText2Image, AutoPipelineForImage2Image, AutoPipelineForInpainting,
+        DiffusionPipeline, StableDiffusionPipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline
+    )
+    from diffusers.utils import load_image
+    from PIL import Image
+    from ascii_colors import trace_exception, ASCIIColors
+    DIFFUSERS_AVAILABLE = True
+except ImportError as e:
+    print(f"FATAL: A required package is missing from the server's venv: {e}.")
+    DIFFUSERS_AVAILABLE = False
+    # Define dummy classes to allow server to start and report error via API
+    class Dummy: pass
+    torch = Dummy()
+    torch.cuda = Dummy()
+    torch.cuda.is_available = lambda: False
+    torch.backends = Dummy()
+    torch.backends.mps = Dummy()
+    torch.backends.mps.is_available = lambda: False
+    AutoPipelineForText2Image = AutoPipelineForImage2Image = AutoPipelineForInpainting = DiffusionPipeline = StableDiffusionPipeline = QwenImageEditPipeline = QwenImageEditPlusPipeline = Image = load_image = ASCIIColors = trace_exception = Dummy
+
+# --- Server Setup ---
+app = FastAPI(title="Diffusers TTI Server")
+router = APIRouter()
+MODELS_PATH = Path("./models") # Default, will be overridden by command-line arg
+
+# --- START: Core Logic (Complete and Unabridged) ---
+CIVITAI_MODELS = {
+    "realistic-vision-v6": {
+        "display_name": "Realistic Vision V6.0", "url": "https://civitai.com/api/download/models/501240?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "realisticVisionV60_v60B1.safetensors", "description": "Photorealistic SD1.5 checkpoint.", "owned_by": "civitai"
+    },
+    "absolute-reality": {
+        "display_name": "Absolute Reality", "url": "https://civitai.com/api/download/models/132760?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "absolutereality_v181.safetensors", "description": "General realistic SD1.5.", "owned_by": "civitai"
+    },
+    "dreamshaper-8": {
+        "display_name": "DreamShaper 8", "url": "https://civitai.com/api/download/models/128713",
+        "filename": "dreamshaper_8.safetensors", "description": "Versatile SD1.5 style model.", "owned_by": "civitai"
+    },
+    "juggernaut-xl": {
+        "display_name": "Juggernaut XL", "url": "https://civitai.com/api/download/models/133005",
+        "filename": "juggernautXL_version6Rundiffusion.safetensors", "description": "Artistic SDXL.", "owned_by": "civitai"
+    },
+    "lyriel-v1.6": {
+        "display_name": "Lyriel v1.6", "url": "https://civitai.com/api/download/models/72396?type=Model&format=SafeTensor&size=full&fp=fp16",
+        "filename": "lyriel_v16.safetensors", "description": "Fantasy/stylized SD1.5.", "owned_by": "civitai"
+    },
+    "ui_icons": {
+        "display_name": "UI Icons", "url": "https://civitai.com/api/download/models/367044?type=Model&format=SafeTensor&size=full&fp=fp16",
+        "filename": "uiIcons_v10.safetensors", "description": "A model for generating UI icons.", "owned_by": "civitai"
+    },
+    "meinamix": {
+        "display_name": "MeinaMix", "url": "https://civitai.com/api/download/models/948574?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "meinamix_meinaV11.safetensors", "description": "Anime/illustration SD1.5.", "owned_by": "civitai"
+    },
+    "rpg-v5": {
+        "display_name": "RPG v5", "url": "https://civitai.com/api/download/models/124626?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "rpg_v5.safetensors", "description": "RPG assets SD1.5.", "owned_by": "civitai"
+    },
+    "pixel-art-xl": {
+        "display_name": "Pixel Art XL", "url": "https://civitai.com/api/download/models/135931?type=Model&format=SafeTensor",
+        "filename": "pixelartxl_v11.safetensors", "description": "Pixel art SDXL.", "owned_by": "civitai"
+    },
+    "lowpoly-world": {
+        "display_name": "Lowpoly World", "url": "https://civitai.com/api/download/models/146502?type=Model&format=SafeTensor",
+        "filename": "LowpolySDXL.safetensors", "description": "Lowpoly style SD1.5.", "owned_by": "civitai"
+    },
+    "toonyou": {
+        "display_name": "ToonYou", "url": "https://civitai.com/api/download/models/125771?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "toonyou_beta6.safetensors", "description": "Cartoon/Disney SD1.5.", "owned_by": "civitai"
+    },
+    "papercut": {
+        "display_name": "Papercut", "url": "https://civitai.com/api/download/models/133503?type=Model&format=SafeTensor",
+        "filename": "papercut.safetensors", "description": "Paper cutout SD1.5.", "owned_by": "civitai"
+    },
+    "fantassifiedIcons": {
+        "display_name": "Fantassified Icons", "url": "https://civitai.com/api/download/models/67584?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "fantassifiedIcons_fantassifiedIconsV20.safetensors", "description": "Flat, modern Icons.", "owned_by": "civitai"
+    },
+    "game_icon_institute": {
+        "display_name": "Game icon institute", "url": "https://civitai.com/api/download/models/158776?type=Model&format=SafeTensor&size=full&fp=fp16",
+        "filename": "gameIconInstituteV10_v10.safetensors", "description": "Flat, modern game Icons.", "owned_by": "civitai"
+    },
+    "M4RV3LS_DUNGEONS": {
+        "display_name": "M4RV3LS & DUNGEONS", "url": "https://civitai.com/api/download/models/139417?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "M4RV3LSDUNGEONSNEWV40COMICS_mD40.safetensors", "description": "comics.", "owned_by": "civitai"
+    },
+}
+
+TORCH_DTYPE_MAP_STR_TO_OBJ = {
+    "float16": getattr(torch, 'float16', 'float16'), "bfloat16": getattr(torch, 'bfloat16', 'bfloat16'),
+    "float32": getattr(torch, 'float32', 'float32'), "auto": "auto"
+}
+
+SCHEDULER_MAPPING = {
+    "default": None, "ddim": "DDIMScheduler", "ddpm": "DDPMScheduler", "deis_multistep": "DEISMultistepScheduler",
+    "dpm_multistep": "DPMSolverMultistepScheduler", "dpm_multistep_karras": "DPMSolverMultistepScheduler", "dpm_single": "DPMSolverSinglestepScheduler",
+    "dpm_adaptive": "DPMSolverPlusPlusScheduler", "dpm++_2m": "DPMSolverMultistepScheduler", "dpm++_2m_karras": "DPMSolverMultistepScheduler",
+    "dpm++_2s_ancestral": "DPMSolverAncestralDiscreteScheduler", "dpm++_2s_ancestral_karras": "DPMSolverAncestralDiscreteScheduler", "dpm++_sde": "DPMSolverSDEScheduler",
+    "dpm++_sde_karras": "DPMSolverSDEScheduler", "euler_ancestral_discrete": "EulerAncestralDiscreteScheduler", "euler_discrete": "EulerDiscreteScheduler",
+    "heun_discrete": "HeunDiscreteScheduler", "heun_karras": "HeunDiscreteScheduler", "lms_discrete": "LMSDiscreteScheduler",
+    "lms_karras": "LMSDiscreteScheduler", "pndm": "PNDMScheduler", "unipc_multistep": "UniPCMultistepScheduler",
+    "dpm++_2m_sde": "DPMSolverMultistepScheduler", "dpm++_2m_sde_karras": "DPMSolverMultistepScheduler", "dpm2": "KDPM2DiscreteScheduler",
+    "dpm2_karras": "KDPM2DiscreteScheduler", "dpm2_a": "KDPM2AncestralDiscreteScheduler", "dpm2_a_karras": "KDPM2AncestralDiscreteScheduler",
+    "euler": "EulerDiscreteScheduler", "euler_a": "EulerAncestralDiscreteScheduler", "heun": "HeunDiscreteScheduler", "lms": "LMSDiscreteScheduler"
+}
+SCHEDULER_USES_KARRAS_SIGMAS = [
+    "dpm_multistep_karras","dpm++_2m_karras","dpm++_2s_ancestral_karras", "dpm++_sde_karras","heun_karras","lms_karras",
+    "dpm++_2m_sde_karras","dpm2_karras","dpm2_a_karras"
+]
+
+class ModelManager:
+    def __init__(self, config: Dict[str, Any], models_path: Path, registry: 'PipelineRegistry'):
+        self.config = config
+        self.models_path = models_path
+        self.registry = registry
+        self.pipeline: Optional[DiffusionPipeline] = None
+        self.current_task: Optional[str] = None
+        self.ref_count = 0
+        self.lock = threading.Lock()
+        self.queue = queue.Queue()
+        self.is_loaded = False
+        self.last_used_time = time.time()
+        self._stop_event = threading.Event()
+        self.worker_thread = threading.Thread(target=self._generation_worker, daemon=True)
+        self.worker_thread.start()
+        self._stop_monitor_event = threading.Event()
+        self._unload_monitor_thread = None
+        self._start_unload_monitor()
+
+    def acquire(self):
+        with self.lock:
+            self.ref_count += 1
+            return self
+
+    def release(self):
+        with self.lock:
+            self.ref_count -= 1
+            return self.ref_count
+
+    def stop(self):
+        self._stop_event.set()
+        if self._unload_monitor_thread:
+            self._stop_monitor_event.set()
+            self._unload_monitor_thread.join(timeout=2)
+        self.queue.put(None)
+        self.worker_thread.join(timeout=5)
+
+    def _start_unload_monitor(self):
+        unload_after = self.config.get("unload_inactive_model_after", 0)
+        if unload_after > 0:
+            if self._unload_monitor_thread and self._unload_monitor_thread.is_alive():
+                self._stop_monitor_event.set()
+                self._unload_monitor_thread.join()
+
+            self._stop_monitor_event.clear()
+            self._unload_monitor_thread = threading.Thread(target=self._unload_monitor, daemon=True)
+            self._unload_monitor_thread.start()
+
+    def _unload_monitor(self):
+        unload_after = self.config.get("unload_inactive_model_after", 0)
+        if unload_after <= 0:
+            return
+        ASCIIColors.info(f"Starting inactivity monitor for '{self.config['model_name']}' (timeout: {unload_after}s).")
+        while not self._stop_monitor_event.wait(timeout=5.0):
+            with self.lock:
+                if self.ref_count > 0 or not self.is_loaded:
+                    continue
+                if time.time() - self.last_used_time > unload_after:
+                    ASCIIColors.info(f"Model '{self.config['model_name']}' has been inactive for {unload_after} seconds. Unloading.")
+                    self._unload_pipeline()
+                    break # End the monitor thread once unloaded
+
+    def _resolve_model_path(self, model_name: str) -> Union[str, Path]:
+        path_obj = Path(model_name)
+        if path_obj.is_absolute() and path_obj.exists():
+            return model_name
+        if model_name in CIVITAI_MODELS:
+            filename = CIVITAI_MODELS[model_name]["filename"]
+            local_path = self.models_path / filename
+            if not local_path.exists():
+                self._download_civitai_model(model_name)
+            return local_path
+        local_path = self.models_path / model_name
+        if local_path.exists():
+            return local_path
+        return model_name
+
+    def _download_civitai_model(self, model_key: str):
+        model_info = CIVITAI_MODELS[model_key]
+        url = model_info["url"]
+        filename = model_info["filename"]
+        dest_path = self.models_path / filename
+        temp_path = dest_path.with_suffix(".temp")
+        ASCIIColors.cyan(f"Downloading '{filename}' from Civitai to {dest_path}...")
+        try:
+            with requests.get(url, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+                with open(temp_path, 'wb') as f, tqdm(total=total_size, unit='iB', unit_scale=True, desc=f"Downloading {filename}") as bar:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            shutil.move(temp_path, dest_path)
+            ASCIIColors.green(f"Model '{filename}' downloaded successfully.")
+        except Exception as e:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise Exception(f"Failed to download model {filename}: {e}")
+
+    def _set_scheduler(self):
+        if not self.pipeline: return
+        scheduler_name_key = self.config["scheduler_name"].lower()
+        if scheduler_name_key == "default": return
+        scheduler_class_name = SCHEDULER_MAPPING.get(scheduler_name_key)
+        if scheduler_class_name:
+            try:
+                SchedulerClass = getattr(importlib.import_module("diffusers.schedulers"), scheduler_class_name)
+                scheduler_config = self.pipeline.scheduler.config
+                if "karras" in scheduler_name_key:
+                    scheduler_config["use_karras_sigmas"] = True
+                self.pipeline.scheduler = SchedulerClass.from_config(scheduler_config)
+                ASCIIColors.info(f"Switched scheduler to {scheduler_class_name}")
+            except Exception as e:
+                ASCIIColors.warning(f"Could not switch scheduler to {scheduler_name_key}: {e}. Using current default.")
+
+    def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
+        model_name = self.config.get("model_name", "")
+        try:
+            load_args = {"cache_dir": str(self.config.get("hf_cache_path"))} if self.config.get("hf_cache_path") else {}
+            
+            if str(model_path).endswith((".safetensors", ".ckpt")):
+                # Use the base DiffusionPipeline for single files
+                self.pipeline = DiffusionPipeline.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
+            else:
+                common_args = {"torch_dtype": torch_dtype, "use_safetensors": self.config.get("use_safetensors", True)}
+                pipeline_class = {
+                    "text2image": AutoPipelineForText2Image,
+                    "image2image": AutoPipelineForImage2Image,
+                    "inpainting": AutoPipelineForInpainting
+                }.get(task, AutoPipelineForText2Image)
+                self.pipeline = pipeline_class.from_pretrained(model_path, **common_args, **load_args)
+            
+            self._set_scheduler()
+            self.pipeline.to(self.config["device"])
+
+            if self.config.get("enable_xformers"):
+                try:
+                    self.pipeline.enable_xformers_memory_efficient_attention()
+                    ASCIIColors.green("xFormers memory efficient attention enabled.")
+                except Exception as e:
+                    ASCIIColors.warning(f"Could not enable xFormers: {e}.")
+
+            self.is_loaded = True
+            self.current_task = task
+            self.last_used_time = time.time()
+            ASCIIColors.green(f"Model '{model_name}' loaded successfully on '{self.config['device']}' for task '{task}'.")
+
+        except Exception as e:
+            error_str = str(e).lower()
+            if "401" in error_str or "gated" in error_str:
+                msg = f"AUTHENTICATION FAILED for model '{model_name}'. Ensure you have accepted the license and provided a valid Hugging Face token."
+                raise RuntimeError(msg)
+            raise e
+
+    def _load_pipeline_for_task(self, task: str):
+        if self.pipeline and self.current_task == task: return
+        if self.pipeline: self._unload_pipeline()
+        
+        model_name = self.config.get("model_name")
+        if not model_name: raise ValueError("Model name cannot be empty for loading.")
+        
+        ASCIIColors.info(f"Loading Diffusers model: {model_name} for task: {task}")
+        model_path = self._resolve_model_path(model_name)
+        torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config["torch_dtype_str"].lower())
+        
+        try:
+            self._execute_load_pipeline(task, model_path, torch_dtype)
+        except Exception as e:
+            ASCIIColors.error(f"Failed to load pipeline for {model_name}: {e}")
+            trace_exception(e)
+            raise e
+
+    def _unload_pipeline(self):
+        if self.pipeline:
+            model_name = self.config.get('model_name', 'Unknown')
+            del self.pipeline
+            self.pipeline = None
+            gc.collect()
+            if torch and hasattr(torch, 'cuda') and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.is_loaded = False
+            self.current_task = None
+            ASCIIColors.info(f"Model '{model_name}' unloaded and VRAM cleared.")
+
+    def _generation_worker(self):
+        while not self._stop_event.is_set():
+            try:
+                job = self.queue.get(timeout=1)
+                if job is None: break
+                task, future, pipeline_args = job # Corrected unpacking order
+                output = None
+                try:
+                    with self.lock:
+                        self.last_used_time = time.time()
+                        if not self.is_loaded or self.current_task != task:
+                            self._load_pipeline_for_task(task)
+                    with torch.no_grad():
+                        output = self.pipeline(**pipeline_args)
+                    pil_image = output.images[0]
+                    buffer = BytesIO()
+                    pil_image.save(buffer, format="PNG")
+                    future.set_result(buffer.getvalue())
+                except Exception as e:
+                    trace_exception(e)
+                    future.set_exception(e)
+                finally:
+                    self.queue.task_done()
+                    if output is not None: del output
+                    gc.collect()
+                    if hasattr(torch, 'cuda') and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            except queue.Empty:
+                continue
+
+class PipelineRegistry:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._managers: Dict[str, ModelManager] = {}
+                cls._instance._registry_lock = threading.Lock()
+        return cls._instance
+
+    @staticmethod
+    def _get_critical_keys():
+        return [
+            "model_name","device","torch_dtype_str","use_safetensors",
+            "safety_checker_on","hf_variant","enable_cpu_offload",
+            "enable_sequential_cpu_offload","enable_xformers",
+            "local_files_only","hf_cache_path"
+        ]
+
+    def _get_config_key(self, config: Dict[str, Any]) -> str:
+        key_data = tuple(sorted((k, config.get(k)) for k in self._get_critical_keys()))
+        return hashlib.sha256(str(key_data).encode('utf-8')).hexdigest()
+
+    def get_manager(self, config: Dict[str, Any], models_path: Path) -> ModelManager:
+        key = self._get_config_key(config)
+        with self._registry_lock:
+            if key not in self._managers:
+                self._managers[key] = ModelManager(config.copy(), models_path, self)
+            manager = self._managers[key]
+            # Ensure manager's config is up-to-date with any non-critical keys
+            manager.config.update(config)
+            manager._start_unload_monitor() # Restart monitor with potentially new timeout
+            return manager.acquire()
+
+    def release_manager(self, config: Dict[str, Any]):
+        key = self._get_config_key(config)
+        with self._registry_lock:
+            if key in self._managers:
+                manager = self._managers[key]
+                if manager.release() == 0:
+                    ASCIIColors.info(f"Reference count for manager of '{config.get('model_name')}' is zero.")
+                    # Let the inactivity monitor handle the unloading.
+
+    def get_all_managers(self) -> List[ModelManager]:
+        with self._registry_lock:
+            return list(self._managers.values())
+
+# --- Global Server State ---
+class ServerState:
+    def __init__(self, models_path: Path):
+        self.models_path = models_path
+        self.models_path.mkdir(parents=True, exist_ok=True)
+        self.config_path = self.models_path.parent / "diffusers_server_config.json"
+        self.registry = PipelineRegistry()
+        self.manager: Optional[ModelManager] = None
+        self.config = {}
+        self.load_config() # This will set self.config
+        self._resolve_device_and_dtype()
+
+        # Eagerly acquire manager at startup if a model is configured
+        if self.config.get("model_name"):
+            try:
+                ASCIIColors.info(f"Acquiring initial model manager for '{self.config['model_name']}' on startup.")
+                self.manager = self.registry.get_manager(self.config, self.models_path)
+            except Exception as e:
+                ASCIIColors.error(f"Failed to acquire model manager on startup: {e}")
+                self.manager = None # Ensure manager is None on failure
+
+    def get_default_config(self) -> Dict[str, Any]:
+        return {
+            "model_name": "", "device": "auto", "torch_dtype_str": "auto", "use_safetensors": True,
+            "scheduler_name": "default", "safety_checker_on": True, "num_inference_steps": 25,
+            "guidance_scale": 7.0, "width": 512, "height": 512, "seed": -1,
+            "enable_cpu_offload": False, "enable_sequential_cpu_offload": False, "enable_xformers": False,
+            "hf_variant": None, "hf_token": None, "hf_cache_path": None, "local_files_only": False,
+            "unload_inactive_model_after": 300 # Default 5 min inactivity unload
+        }
+
+    def save_config(self):
+        """Saves the current configuration to a JSON file."""
+        try:
+            with open(self.config_path, 'w') as f:
+                json.dump(self.config, f, indent=4)
+            ASCIIColors.info(f"Server config saved to {self.config_path}")
+        except Exception as e:
+            ASCIIColors.error(f"Failed to save server config: {e}")
+
+    def load_config(self):
+        """Loads configuration from JSON file, falling back to defaults."""
+        default_config = self.get_default_config()
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, 'r') as f:
+                    loaded_config = json.load(f)
+                # Merge loaded config into defaults to ensure all keys are present
+                default_config.update(loaded_config)
+                self.config = default_config
+                ASCIIColors.info(f"Loaded server configuration from {self.config_path}")
+            except (json.JSONDecodeError, IOError) as e:
+                ASCIIColors.warning(f"Could not load config file, using defaults. Error: {e}")
+                self.config = default_config
+        else:
+            self.config = default_config
+        # Save back to ensure file exists and is up-to-date with all keys
+        self.save_config()
+
+    def _resolve_device_and_dtype(self):
+        if self.config.get("device", "auto").lower() == "auto":
+            self.config["device"] = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        if self.config.get("torch_dtype_str", "auto").lower() == "auto":
+            self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
+
+    def update_settings(self, new_settings: Dict[str, Any]):
+        """Updates settings, swaps the manager if critical settings change, and saves the config."""
+        if 'model' in new_settings and 'model_name' not in new_settings:
+            new_settings['model_name'] = new_settings.pop('model')
+
+        # Safeguard: If a model is already configured and the new settings don't specify one,
+        # keep the old one. This prevents a misconfigured client from wiping a valid server state.
+        if self.config.get("model_name") and not new_settings.get("model_name"):
+            ASCIIColors.info("Incoming settings have no model_name. Preserving existing model.")
+            new_settings["model_name"] = self.config["model_name"]
+
+        # Release old manager if it exists
+        if self.manager:
+            self.registry.release_manager(self.manager.config)
+            self.manager = None
+
+        # Update the config in memory
+        self.config.update(new_settings)
+        ASCIIColors.info(f"Server config updated. Current model_name: {self.config.get('model_name')}")
+        
+        self._resolve_device_and_dtype()
+
+        # Acquire new manager with the updated config
+        if self.config.get("model_name"):
+            ASCIIColors.info("Acquiring model manager with updated configuration...")
+            self.manager = self.registry.get_manager(self.config, self.models_path)
+        else:
+            ASCIIColors.warning("No model_name in config after update, manager not acquired.")
+        
+        self.save_config() # Persist the new state
+        return True
+
+    def get_active_manager(self) -> ModelManager:
+        if self.manager:
+            return self.manager
+        raise HTTPException(status_code=400, detail="No model is configured or manager is not active. Please set a model using the /set_settings endpoint.")
+
+state: Optional[ServerState] = None
+
+# --- Pydantic Models for API ---
+class T2IRequest(BaseModel):
+    prompt: str
+    negative_prompt: str = ""
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+class EditRequestPayload(BaseModel):
+    prompt: str
+    image_paths: List[str] = Field(default_factory=list)
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+# --- API Endpoints ---
+@router.post("/generate_image")
+async def generate_image(request: T2IRequest):
+    try:
+        manager = state.get_active_manager()
+        params = request.params
+        seed = int(params.get("seed", state.config.get("seed", -1)))
+        generator = None
+        if seed != -1:
+            generator = torch.Generator(device=state.config["device"]).manual_seed(seed)
+
+        pipeline_args = {
+            "prompt": request.prompt, "negative_prompt": request.negative_prompt,
+            "width": int(params.get("width", state.config.get("width", 512))),
+            "height": int(params.get("height", state.config.get("height", 512))),
+            "num_inference_steps": int(params.get("num_inference_steps", state.config.get("num_inference_steps", 25))),
+            "guidance_scale": float(params.get("guidance_scale", state.config.get("guidance_scale", 7.0))),
+            "generator": generator
+        }
+        
+        future = Future()
+        manager.queue.put(("text2image", future, pipeline_args))
+        result_bytes = future.result()
+        return Response(content=result_bytes, media_type="image/png")
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/edit_image")
+async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []):
+    try:
+        data = EditRequestPayload.parse_raw(json_payload)
+        manager = state.get_active_manager()
+
+        pil_images = []
+        for file in files:
+            contents = await file.read()
+            pil_images.append(Image.open(BytesIO(contents)).convert("RGB"))
+        
+        for path in data.image_paths:
+             pil_images.append(load_image(path).convert("RGB"))
+
+        if not pil_images:
+            raise HTTPException(status_code=400, detail="No images provided for editing.")
+        
+        task = "inpainting" if data.params.get("mask") else "image2image"
+
+        pipeline_args = {
+            "prompt": data.prompt,
+            "image": pil_images[0], # Simple i2i for now
+            "strength": float(data.params.get("strength", 0.8)),
+            # Add other params like mask etc.
+        }
+        
+        future = Future()
+        manager.queue.put((task, future, pipeline_args))
+        result_bytes = future.result()
+        return Response(content=result_bytes, media_type="image/png")
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/list_models")
+def list_models_endpoint():
+    civitai = [{'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']} for key, info in CIVITAI_MODELS.items()]
+    local = [{'model_name': f.name, 'display_name': f.stem, 'description': 'Local safetensors file.', 'owned_by': 'local_user'} for f in state.models_path.glob("*.safetensors")]
+    return civitai + local
+
+@router.get("/list_local_models")
+def list_local_models_endpoint():
+    return sorted([f.name for f in state.models_path.glob("*.safetensors")])
+
+@router.get("/list_available_models")
+def list_available_models_endpoint():
+    discoverable = [m['model_name'] for m in list_models_endpoint()]
+    return sorted(list(set(discoverable)))
+
+@router.get("/get_settings")
+def get_settings_endpoint():
+    settings_list = []
+    # Add options for dropdowns
+    available_models = list_available_models_endpoint()
+    schedulers = list(SCHEDULER_MAPPING.keys())
+    config_to_display = state.config or state.get_default_config()
+    for name, value in config_to_display.items():
+        setting = {"name": name, "type": str(type(value).__name__), "value": value}
+        if name == "model_name": setting["options"] = available_models
+        if name == "scheduler_name": setting["options"] = schedulers
+        settings_list.append(setting)
+    return settings_list
+
+@router.post("/set_settings")
+def set_settings_endpoint(settings: Dict[str, Any]):
+    try:
+        success = state.update_settings(settings)
+        return {"success": success}
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/status")
+def status_endpoint():
+    return {"status": "running", "diffusers_available": DIFFUSERS_AVAILABLE, "model_loaded": state.manager.is_loaded if state.manager else False}
+    
+@router.post("/unload_model")
+def unload_model_endpoint():
+    if state.manager:
+        state.manager._unload_pipeline()
+        state.registry.release_manager(state.manager.config)
+        state.manager = None
+    return {"status": "unloaded"}
+
+@router.get("/ps")
+def ps_endpoint():
+    managers = state.registry.get_all_managers()
+    return [{
+            "model_name": m.config.get("model_name"), "is_loaded": m.is_loaded,
+            "task": m.current_task, "device": m.config.get("device"), "ref_count": m.ref_count,
+            "queue_size": m.queue.qsize(), "last_used": time.ctime(m.last_used_time)
+        } for m in managers]
+
+app.include_router(router)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Diffusers TTI Server")
+    parser.add_argument("--host", type=str, default="localhost", help="Host to bind to.")
+    parser.add_argument("--port", type=int, default=9630, help="Port to bind to.")
+    parser.add_argument("--models-path", type=str, required=True, help="Path to the models directory.")
+    args = parser.parse_args()
+
+    MODELS_PATH = Path(args.models_path)
+    state = ServerState(MODELS_PATH)
+    
+    ASCIIColors.cyan(f"--- Diffusers TTI Server ---")
+    ASCIIColors.green(f"Starting server on http://{args.host}:{args.port}")
+    ASCIIColors.green(f"Serving models from: {MODELS_PATH.resolve()}")
+    if not DIFFUSERS_AVAILABLE:
+        ASCIIColors.error("Diffusers or its dependencies are not installed correctly in the server's environment!")
+    else:
+        ASCIIColors.info(f"Detected device: {state.config['device']}")
+
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)

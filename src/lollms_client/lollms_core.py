@@ -273,8 +273,8 @@ class LollmsClient():
             raise ValueError(f"Failed to update LLM binding: {binding_name}. Available: {available}")
 
     def get_ctx_size(self, model_name:str|None=None):
-        if self.llm:
-            ctx_size = self.llm.get_ctx_size(model_name)
+        if self.llm and self.llm.model_name:
+            ctx_size = self.llm.get_ctx_size(model_name or self.llm.model_name)
             return ctx_size if ctx_size else self.llm.default_ctx_size
         else:
             return None
