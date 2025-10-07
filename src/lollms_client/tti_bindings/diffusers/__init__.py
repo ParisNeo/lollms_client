@@ -52,7 +52,8 @@ class DiffusersBinding(LollmsTTIBinding):
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
         self.venv_dir = Path("./venv/tti_diffusers_venv")
-        self.models_path = Path(kwargs.get("models_path", "./diffusers_models")).resolve()
+        self.models_path = Path(kwargs.get("models_path", "./data/models/diffusers_models")).resolve()
+        self.models_path.mkdir(exist_ok=True, parents=True)
         if self.auto_start_server:
             self.ensure_server_is_running()
 
