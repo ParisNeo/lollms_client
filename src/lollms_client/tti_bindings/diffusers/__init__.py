@@ -67,7 +67,7 @@ class DiffusersBinding(LollmsTTIBinding):
         return False
 
 
-    def ensure_server_is_running(self, continue_if_locked: bool = False):
+    def ensure_server_is_running(self, continue_if_locked: bool = True):
         """
         Ensures the Diffusers server is running. If not, it attempts to start it
         in a process-safe manner using a file lock.
