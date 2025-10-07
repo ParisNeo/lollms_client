@@ -269,7 +269,7 @@ class ModelManager:
             except Exception as e:
                 ASCIIColors.warning(f"Could not switch scheduler to {scheduler_name_key}: {e}. Using current default.")
 
-def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
+    def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
         # Disable HF symlinks on Windows to avoid symlink creation errors
         if platform.system() == "Windows":
             os.environ["HF_HUB_ENABLE_SYMLINKS"] = "0"
