@@ -66,25 +66,35 @@ class DiffusersBinding(LollmsTTIBinding):
             return False
         return False
 
-    def ensure_server_is_running(self):
+
+    def ensure_server_is_running(self, continue_if_locked: bool = False):
         """
         Ensures the Diffusers server is running. If not, it attempts to start it
         in a process-safe manner using a file lock.
+
+        Args:
+            continue_if_locked (bool): If True, return immediately if another process
+                                    already holds the lock.
         """
         self.server_dir.mkdir(exist_ok=True)
-        lock_path = self.models_path / "diffusers_server.lock"  # Changed to models_path
-        lock = FileLock(lock_path, timeout=60) # Increased timeout for long installs
+        lock_path = self.models_path / "diffusers_server.lock"
+        lock = FileLock(lock_path)
 
         ASCIIColors.info("Attempting to start or connect to the Diffusers server...")
         try:
-            with lock:
+            # Try to acquire lock immediately if continue_if_locked=True
+            with lock.acquire(timeout=0 if continue_if_locked else 60):
                 if not self.is_server_running():
                     ASCIIColors.yellow("Lock acquired. Starting dedicated Diffusers server...")
                     self.start_server()
                 else:
                     ASCIIColors.green("Server was started by another process. Connected successfully.")
         except Timeout:
-            ASCIIColors.yellow("Could not acquire lock. Another process is likely starting the server. Waiting for it to become available...")
+            if continue_if_locked:
+                ASCIIColors.yellow("Lock held by another process. Skipping server startup and continuing execution.")
+                return
+            else:
+                ASCIIColors.yellow("Could not acquire lock within timeout. Waiting for server to become available...")
 
         self._wait_for_server()
 
