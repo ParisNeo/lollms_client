@@ -273,79 +273,114 @@ class ModelManager:
         # Disable HF symlinks on Windows to avoid symlink creation errors
         if platform.system() == "Windows":
             os.environ["HF_HUB_ENABLE_SYMLINKS"] = "0"
-        model_name = self.config.get("model_name", "")
-        try:
-            load_args = {}
-            if self.config.get("hf_cache_path"):
-                load_args["cache_dir"] = str(self.config["hf_cache_path"])
-            
-            # --- START OF THE DEFINITIVE FIX ---
-            use_device_map = False
-            # Check if this is a model known to require device_map for offloading, AND if offloading is enabled.
-            is_large_model = "Qwen" in model_name or "stable-diffusion-3" in model_name
-            should_offload = self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]
+        
+        # We need the original model name from the config to identify special models
+        model_name_from_config = self.config.get("model_name", "")
+        
+        # This flag will control all post-loading device placement logic
+        use_device_map = False
 
-            if is_large_model and should_offload:
-                ASCIIColors.info(f"Large model '{model_name}' detected with offload enabled. Forcing device_map='auto'.")
-                use_device_map = True
-            # --- END OF THE DEFINITIVE FIX ---
-            
-            if str(model_path).endswith(".safetensors"):
-                # .safetensors logic remains the same, as it doesn't use these offload mechanisms
-                if task == "text2image":
-                    try:
-                        self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
-                    except AttributeError:
-                        self.pipeline = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
-                elif task == "image2image":
-                    self.pipeline = AutoPipelineForImage2Image.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
-                elif task == "inpainting":
-                    self.pipeline = AutoPipelineForInpainting.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
-            else:
-                common_args = {
-                    "torch_dtype": torch_dtype,
+        try:
+            # --- Unified Argument Building ---
+            load_params = {}
+            if self.config.get("hf_cache_path"):
+                load_params["cache_dir"] = str(self.config["hf_cache_path"])
+            load_params["torch_dtype"] = torch_dtype
+
+            # --- START: New Prioritized Model Loading Logic ---
+
+            # 1. First, check if the model is a special case that needs a dedicated pipeline.
+            is_qwen_plus = "Qwen-Image-Edit-2509" in model_name_from_config
+            is_qwen_edit = "Qwen-Image-Edit" in model_name_from_config and not is_qwen_plus
+            is_qwen_image = "Qwen/Qwen-Image" in model_name_from_config
+            is_special_qwen_model = is_qwen_plus or is_qwen_edit or is_qwen_image
+
+            if is_special_qwen_model:
+                # If it's a Qwen model, we ALWAYS load it from its Hugging Face ID.
+                # This ignores any local .safetensors file and prevents mis-identification.
+                ASCIIColors.info(f"Special Qwen model '{model_name_from_config}' detected. Using dedicated pipeline loader.")
+                
+                # Add all necessary parameters for loading from the Hub
+                load_params.update({
                     "use_safetensors": self.config["use_safetensors"],
                     "token": self.config["hf_token"],
                     "local_files_only": self.config["local_files_only"]
-                }
+                })
                 if self.config["hf_variant"]:
-                    common_args["variant"] = self.config["hf_variant"]
+                    load_params["variant"] = self.config["hf_variant"]
                 if not self.config["safety_checker_on"]:
-                    common_args["safety_checker"] = None
-                if self.config.get("hf_cache_path"):
-                    common_args["cache_dir"] = str(self.config["hf_cache_path"])
-
-                if use_device_map:
-                    common_args["device_map"] = "auto"
+                    load_params["safety_checker"] = None
                 
-                # Now we call from_pretrained with the correct arguments decided ahead of time
-                if "Qwen-Image-Edit-2509" in str(model_path):
-                    self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
-                elif "Qwen-Image-Edit" in str(model_path):
-                    self.pipeline = QwenImageEditPipeline.from_pretrained(model_path, **common_args)
-                elif "Qwen/Qwen-Image" in str(model_path):
-                    self.pipeline = DiffusionPipeline.from_pretrained(model_path, **common_args)
-                elif task == "text2image":
-                    self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **common_args)
-                elif task == "image2image":
-                    self.pipeline = AutoPipelineForImage2Image.from_pretrained(model_path, **common_args)
-                elif task == "inpainting":
-                    self.pipeline = AutoPipelineForInpainting.from_pretrained(model_path, **common_args)
+                # Check if device_map is needed for this large model
+                should_offload = self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]
+                if should_offload:
+                    ASCIIColors.info("Offload enabled. Forcing device_map='auto' for Qwen model.")
+                    use_device_map = True
+                    load_params["device_map"] = "auto"
+
+                # Load the correct, specific pipeline for the Qwen model
+                if is_qwen_plus:
+                    self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_name_from_config, **load_params)
+                elif is_qwen_edit:
+                    self.pipeline = QwenImageEditPipeline.from_pretrained(model_name_from_config, **load_params)
+                elif is_qwen_image:
+                    self.pipeline = DiffusionPipeline.from_pretrained(model_name_from_config, **load_params)
+            
+            else:
+                # 2. If it's NOT a special model, proceed with standard loading logic.
+                is_safetensors_file = str(model_path).endswith(".safetensors")
+
+                if is_safetensors_file:
+                    # Standard loading from a local .safetensors file (e.g., Realistic Vision, DreamShaper)
+                    ASCIIColors.info(f"Loading standard model from local file: {model_path}")
+                    if task == "text2image":
+                        try:
+                            self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, **load_params)
+                        except AttributeError:
+                            self.pipeline = StableDiffusionPipeline.from_single_file(model_path, **load_params)
+                    elif task == "image2image":
+                        self.pipeline = AutoPipelineForImage2Image.from_single_file(model_path, **load_params)
+                    elif task == "inpainting":
+                        self.pipeline = AutoPipelineForInpainting.from_single_file(model_path, **load_params)
+                else:
+                    # Standard loading from a Hugging Face Hub ID (e.g., runwayml/stable-diffusion-v1-5)
+                    ASCIIColors.info(f"Loading standard model from Hub: {model_path}")
+                    load_params.update({
+                        "use_safetensors": self.config["use_safetensors"],
+                        "token": self.config["hf_token"],
+                        "local_files_only": self.config["local_files_only"]
+                    })
+                    if self.config["hf_variant"]:
+                        load_params["variant"] = self.config["hf_variant"]
+                    if not self.config["safety_checker_on"]:
+                        load_params["safety_checker"] = None
+                    
+                    # Check if device_map is needed for other large models like SD3
+                    is_large_model = "stable-diffusion-3" in str(model_path)
+                    should_offload = self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]
+                    if is_large_model and should_offload:
+                        ASCIIColors.info(f"Large model '{model_path}' detected with offload enabled. Using device_map='auto'.")
+                        use_device_map = True
+                        load_params["device_map"] = "auto"
+
+                    if task == "text2image":
+                        self.pipeline = AutoPipelineForText2Image.from_pretrained(model_path, **load_params)
+                    elif task == "image2image":
+                        self.pipeline = AutoPipelineForImage2Image.from_pretrained(model_path, **load_params)
+                    elif task == "inpainting":
+                        self.pipeline = AutoPipelineForInpainting.from_pretrained(model_path, **load_params)
+            # --- END: New Prioritized Model Loading Logic ---
+        
         except Exception as e:
             error_str = str(e).lower()
             if "401" in error_str or "gated" in error_str or "authorization" in error_str:
-                msg = (
-                    f"AUTHENTICATION FAILED for model '{model_name}'. "
-                    "Please ensure you accepted the model license and provided a valid HF token."
-                )
+                msg = (f"AUTHENTICATION FAILED for model '{model_name_from_config}'. Please ensure you accepted the model license and provided a valid HF token.")
                 raise RuntimeError(msg) 
             raise e
 
         self._set_scheduler()
 
-        # --- CRITICAL CHANGE: This entire block is now conditional ---
-        # If we used device_map, accelerate has already handled device placement.
-        # Running these other methods will cause the conflict and the error.
+        # This post-loading logic is now correctly controlled by the `use_device_map` flag
         if not use_device_map:
             self.pipeline.to(self.config["device"])
             if self.config["enable_xformers"]:
@@ -354,7 +389,6 @@ class ModelManager:
                 except Exception as e:
                     ASCIIColors.warning(f"Could not enable xFormers: {e}.")
             
-            # These are the conflicting calls that must be skipped for device_map models
             if self.config["enable_cpu_offload"] and self.config["device"] != "cpu":
                 self.pipeline.enable_model_cpu_offload()
             elif self.config["enable_sequential_cpu_offload"] and self.config["device"] != "cpu":
@@ -365,8 +399,7 @@ class ModelManager:
         self.is_loaded = True
         self.current_task = task
         self.last_used_time = time.time()
-        ASCIIColors.green(f"Model '{model_name}' loaded successfully using '{'device_map' if use_device_map else 'standard'}'' mode for task '{task}'.")
-
+        ASCIIColors.green(f"Model '{model_name_from_config}' loaded successfully using '{'device_map' if use_device_map else 'standard'}' mode for task '{task}'.")
     def _load_pipeline_for_task(self, task: str):
         if self.pipeline and self.current_task == task:
             return
