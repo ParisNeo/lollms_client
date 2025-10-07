@@ -1,4 +1,6 @@
 # lollms_client/lollms_core.py
+# author: ParisNeo
+# description: LollmsClient definition file
 import requests
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE, ELF_COMPLETION_FORMAT
@@ -519,7 +521,7 @@ class LollmsClient():
             Union[str, dict]: Generated text or error dictionary if failed.
         """
         if self.llm:
-            
+            images = [str(image) for image in images]
             ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size if self.llm.default_ctx_size else None
             if ctx_size is None:
                 ctx_size = self.llm.get_ctx_size()
