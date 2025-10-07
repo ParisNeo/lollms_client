@@ -44,7 +44,7 @@ class DiffusersBinding(LollmsTTIBinding):
             kwargs['model_name'] = kwargs.pop('model')
 
         self.config = kwargs
-        self.host = kwargs.get("host", "localhost") 
+        self.host = kwargs.get("host", "localhost")
         self.port = kwargs.get("port", 9630)
         self.auto_start_server = kwargs.get("auto_start_server", True)
         self.server_process = None
@@ -72,7 +72,7 @@ class DiffusersBinding(LollmsTTIBinding):
         in a process-safe manner using a file lock.
         """
         self.server_dir.mkdir(exist_ok=True)
-        lock_path = self.server_dir / "diffusers_server.lock"
+        lock_path = self.models_path / "diffusers_server.lock"  # Changed to models_path
         lock = FileLock(lock_path, timeout=60) # Increased timeout for long installs
 
         ASCIIColors.info("Attempting to start or connect to the Diffusers server...")
@@ -104,20 +104,19 @@ class DiffusersBinding(LollmsTTIBinding):
                 result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
                 ASCIIColors.green("NVIDIA GPU detected. Installing CUDA-enabled PyTorch.")
                 # Using a common and stable CUDA version. Adjust if needed.
-                torch_index_url = "https://download.pytorch.org/whl/cu121" 
+                torch_index_url = "https://download.pytorch.org/whl/cu121"
             except (FileNotFoundError, subprocess.CalledProcessError):
                 ASCIIColors.yellow("`nvidia-smi` not found or failed. Installing standard PyTorch. If you have an NVIDIA GPU, please ensure drivers are installed and in PATH.")
-        
+
         # Base packages including torch. pm.ensure_packages handles verbose output.
         pm_v.ensure_packages(["torch", "torchvision"], index_url=torch_index_url)
-
 
         # Standard dependencies
         pm_v.ensure_packages([
             "pillow", "transformers", "safetensors", "requests", "tqdm", "numpy",
             "accelerate", "uvicorn", "fastapi", "python-multipart", "filelock", "ascii_colors"
         ])
-        
+
         # Git-based diffusers to get the latest version
         pm_v.ensure_packages([
             {
@@ -167,7 +166,7 @@ class DiffusersBinding(LollmsTTIBinding):
         # Use DETACHED_PROCESS on Windows to allow the server to run independently of the parent process.
         # On Linux/macOS, the process will be daemonized enough to not be killed with the worker.
         creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
-        
+
         self.server_process = subprocess.Popen(command, creationflags=creationflags)
         ASCIIColors.info("Diffusers server process launched in the background.")
 
@@ -238,7 +237,7 @@ class DiffusersBinding(LollmsTTIBinding):
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
         files = {}
         image_paths = []
-        
+
         if not isinstance(images, list):
             images = [images]
 
@@ -272,19 +271,19 @@ class DiffusersBinding(LollmsTTIBinding):
         # FastAPI needs separate form fields for json and files
         response = self._post_request("/edit_image", data={"json_payload": json.dumps(data_payload)}, files=files)
         return response.content
-        
+
     def list_models(self) -> List[Dict[str, Any]]:
         return self._get_request("/list_models").json()
 
     def list_local_models(self) -> List[str]:
         return self._get_request("/list_local_models").json()
-        
+
     def list_available_models(self) -> List[str]:
         return self._get_request("/list_available_models").json()
-    
+
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
         return self._get_request("/list_models").json()
-    
+
     def get_settings(self, **kwargs) -> List[Dict[str, Any]]:
         # The server holds the state, so we fetch it.
         return self._get_request("/get_settings").json()
