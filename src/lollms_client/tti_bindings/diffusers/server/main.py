@@ -269,7 +269,7 @@ class ModelManager:
             except Exception as e:
                 ASCIIColors.warning(f"Could not switch scheduler to {scheduler_name_key}: {e}. Using current default.")
 
-    def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
+def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
         # Disable HF symlinks on Windows to avoid symlink creation errors
         if platform.system() == "Windows":
             os.environ["HF_HUB_ENABLE_SYMLINKS"] = "0"
@@ -278,16 +278,29 @@ class ModelManager:
             load_args = {}
             if self.config.get("hf_cache_path"):
                 load_args["cache_dir"] = str(self.config["hf_cache_path"])
+            
+            # --- START OF THE DEFINITIVE FIX ---
+            use_device_map = False
+            # Check if this is a model known to require device_map for offloading, AND if offloading is enabled.
+            is_large_model = "Qwen" in model_name or "stable-diffusion-3" in model_name
+            should_offload = self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]
+
+            if is_large_model and should_offload:
+                ASCIIColors.info(f"Large model '{model_name}' detected with offload enabled. Forcing device_map='auto'.")
+                use_device_map = True
+            # --- END OF THE DEFINITIVE FIX ---
+            
             if str(model_path).endswith(".safetensors"):
+                # .safetensors logic remains the same, as it doesn't use these offload mechanisms
                 if task == "text2image":
                     try:
-                        self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
+                        self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
                     except AttributeError:
-                        self.pipeline = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
+                        self.pipeline = StableDiffusionPipeline.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
                 elif task == "image2image":
-                    self.pipeline = AutoPipelineForImage2Image.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
+                    self.pipeline = AutoPipelineForImage2Image.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
                 elif task == "inpainting":
-                    self.pipeline = AutoPipelineForInpainting.from_single_file(model_path, torch_dtype=torch_dtype, cache_dir=load_args.get("cache_dir"))
+                    self.pipeline = AutoPipelineForInpainting.from_single_file(model_path, torch_dtype=torch_dtype, **load_args)
             else:
                 common_args = {
                     "torch_dtype": torch_dtype,
@@ -302,10 +315,10 @@ class ModelManager:
                 if self.config.get("hf_cache_path"):
                     common_args["cache_dir"] = str(self.config["hf_cache_path"])
 
-                if self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]:
-                    ASCIIColors.info("Using device_map='auto' for large model offloading.")
-                    common_args["device_map"] = "auto"                    
-
+                if use_device_map:
+                    common_args["device_map"] = "auto"
+                
+                # Now we call from_pretrained with the correct arguments decided ahead of time
                 if "Qwen-Image-Edit-2509" in str(model_path):
                     self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
                 elif "Qwen-Image-Edit" in str(model_path):
@@ -327,22 +340,32 @@ class ModelManager:
                 )
                 raise RuntimeError(msg) 
             raise e
+
         self._set_scheduler()
-        if "device_map" not in common_args:
+
+        # --- CRITICAL CHANGE: This entire block is now conditional ---
+        # If we used device_map, accelerate has already handled device placement.
+        # Running these other methods will cause the conflict and the error.
+        if not use_device_map:
             self.pipeline.to(self.config["device"])
             if self.config["enable_xformers"]:
                 try:
                     self.pipeline.enable_xformers_memory_efficient_attention()
                 except Exception as e:
                     ASCIIColors.warning(f"Could not enable xFormers: {e}.")
+            
+            # These are the conflicting calls that must be skipped for device_map models
             if self.config["enable_cpu_offload"] and self.config["device"] != "cpu":
                 self.pipeline.enable_model_cpu_offload()
             elif self.config["enable_sequential_cpu_offload"] and self.config["device"] != "cpu":
                 self.pipeline.enable_sequential_cpu_offload()
+        else:
+             ASCIIColors.info("Device map handled device placement. Skipping manual pipeline.to() and offload calls.")
+
         self.is_loaded = True
         self.current_task = task
         self.last_used_time = time.time()
-        ASCIIColors.green(f"Model '{model_name}' loaded successfully on '{self.config['device']}' for task '{task}'.")
+        ASCIIColors.green(f"Model '{model_name}' loaded successfully using '{'device_map' if use_device_map else 'standard'}'' mode for task '{task}'.")
 
     def _load_pipeline_for_task(self, task: str):
         if self.pipeline and self.current_task == task:
