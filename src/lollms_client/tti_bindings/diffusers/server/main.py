@@ -302,6 +302,10 @@ class ModelManager:
                 if self.config.get("hf_cache_path"):
                     common_args["cache_dir"] = str(self.config["hf_cache_path"])
 
+                if self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]:
+                    ASCIIColors.info("Using device_map='auto' for large model offloading.")
+                    common_args["device_map"] = "auto"                    
+
                 if "Qwen-Image-Edit-2509" in str(model_path):
                     self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_path, **common_args)
                 elif "Qwen-Image-Edit" in str(model_path):
@@ -324,16 +328,17 @@ class ModelManager:
                 raise RuntimeError(msg) 
             raise e
         self._set_scheduler()
-        self.pipeline.to(self.config["device"])
-        if self.config["enable_xformers"]:
-            try:
-                self.pipeline.enable_xformers_memory_efficient_attention()
-            except Exception as e:
-                ASCIIColors.warning(f"Could not enable xFormers: {e}.")
-        if self.config["enable_cpu_offload"] and self.config["device"] != "cpu":
-            self.pipeline.enable_model_cpu_offload()
-        elif self.config["enable_sequential_cpu_offload"] and self.config["device"] != "cpu":
-            self.pipeline.enable_sequential_cpu_offload()
+        if "device_map" not in common_args:
+            self.pipeline.to(self.config["device"])
+            if self.config["enable_xformers"]:
+                try:
+                    self.pipeline.enable_xformers_memory_efficient_attention()
+                except Exception as e:
+                    ASCIIColors.warning(f"Could not enable xFormers: {e}.")
+            if self.config["enable_cpu_offload"] and self.config["device"] != "cpu":
+                self.pipeline.enable_model_cpu_offload()
+            elif self.config["enable_sequential_cpu_offload"] and self.config["device"] != "cpu":
+                self.pipeline.enable_sequential_cpu_offload()
         self.is_loaded = True
         self.current_task = task
         self.last_used_time = time.time()
