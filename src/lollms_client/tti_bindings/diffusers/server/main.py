@@ -628,7 +628,11 @@ async def generate_image(request: T2IRequest):
         if "Qwen-Image-Edit" in model_name:
             # Create a blank image as a placeholder
             from PIL import Image
-            placeholder_image = Image.new("RGB", (pipeline_args["width"], pipeline_args["height"]))
+            rng_seed = seed if seed != -1 else None
+            rng = np.random.default_rng(seed=rng_seed)            
+            random_pixels = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+            placeholder_image = Image.fromarray(random_pixels, 'RGB')
+            # placeholder_image = Image.new("RGB", (pipeline_args["width"], pipeline_args["height"]))
             pipeline_args["image"] = placeholder_image
         future = Future()
         manager.queue.put((future,"text2image", pipeline_args))
