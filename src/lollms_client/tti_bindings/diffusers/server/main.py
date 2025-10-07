@@ -623,7 +623,13 @@ async def generate_image(request: T2IRequest):
             "guidance_scale": float(params.get("guidance_scale", state.config.get("guidance_scale", 7.0))),
             "generator": generator
         }
-        
+        # Check if the current model is a Qwen Edit model
+        model_name = manager.config.get("model_name", "")
+        if "Qwen-Image-Edit" in model_name:
+            # Create a blank image as a placeholder
+            from PIL import Image
+            placeholder_image = Image.new("RGB", (pipeline_args["width"], pipeline_args["height"]))
+            pipeline_args["image"] = placeholder_image
         future = Future()
         manager.queue.put((future,"text2image", pipeline_args))
         result_bytes = future.result()
