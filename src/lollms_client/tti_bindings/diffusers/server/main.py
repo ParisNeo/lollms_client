@@ -647,6 +647,7 @@ async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []
     try:
         data = EditRequestPayload.parse_raw(json_payload)
         manager = state.get_active_manager()
+        model_name = manager.config.get("model_name", "")
 
         pil_images = []
         for file in files:
@@ -659,15 +660,70 @@ async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []
         if not pil_images:
             raise HTTPException(status_code=400, detail="No images provided for editing.")
         
-        task = "inpainting" if data.params.get("mask") else "image2image"
+        # --- START OF REVISED LOGIC ---
 
-        pipeline_args = {
-            "prompt": data.prompt,
-            "image": pil_images[0], # Simple i2i for now
-            "strength": float(data.params.get("strength", 0.8)),
-            # Add other params like mask etc.
-        }
+        pipeline_args = {"prompt": data.prompt}
+        params = data.params
         
+        # Default task for standard models
+        task = "inpainting" if params.get("mask_image") else "image2image"
+
+        # Check if we are using the advanced Qwen Plus model
+        if "Qwen-Image-Edit-2509" in model_name:
+            # This model has specific modes of operation.
+            edit_mode = params.get("edit_mode", "fusion") # Default to fusion
+            task = "image2image" # Use the generic task type for the worker
+
+            if edit_mode == "fusion":
+                if len(pil_images) < 2:
+                    raise HTTPException(status_code=400, detail="Fusion mode requires at least 2 images.")
+                # The QwenImageEditPlusPipeline expects the 'image' argument to be a list for fusion
+                pipeline_args["image"] = pil_images 
+
+            elif edit_mode == "style_transfer":
+                if len(pil_images) != 2:
+                    raise HTTPException(status_code=400, detail="Style Transfer mode requires exactly 2 images (content, style).")
+                pipeline_args["image"] = pil_images[0] # Content image
+                pipeline_args["style_image"] = pil_images[1] # Style image
+
+            elif edit_mode == "pose_transfer":
+                if len(pil_images) != 2:
+                    raise HTTPException(status_code=400, detail="Pose Transfer mode requires exactly 2 images (content, pose).")
+                pipeline_args["image"] = pil_images[0] # Content image
+                pipeline_args["pose_image"] = pil_images[1] # Pose image
+            
+            elif edit_mode == "inpainting":
+                if "mask_image" not in params:
+                     raise HTTPException(status_code=400, detail="Inpainting mode requires a 'mask_image' in params.")
+                # Assuming mask_image is a base64 string or path in params
+                mask_content = params["mask_image"]
+                # This logic needs to be robust to handle how mask is sent (path, base64, etc.)
+                # For simplicity, let's assume it's a loadable path for now
+                mask = load_image(mask_content).convert("L")
+                pipeline_args["image"] = pil_images[0]
+                pipeline_args["mask_image"] = mask
+                task = "inpainting" # Set specific task for clarity
+            else:
+                 raise HTTPException(status_code=400, detail=f"Unsupported edit_mode for Qwen Plus: {edit_mode}")
+
+        else:
+            # --- This is the original logic for standard, single-image models ---
+            pipeline_args["image"] = pil_images[0] 
+            pipeline_args["strength"] = float(params.get("strength", 0.8))
+            
+            if task == "inpainting":
+                if "mask_image" not in params:
+                     raise HTTPException(status_code=400, detail="Inpainting requires a 'mask_image' in params.")
+                mask = load_image(params["mask_image"]).convert("L")
+                pipeline_args["mask_image"] = mask
+
+        # Add common parameters
+        pipeline_args.update({
+            k: v for k, v in params.items() 
+            if k not in ["edit_mode", "strength", "mask_image"] # Avoid duplicating processed params
+        })
+        # --- END OF REVISED LOGIC ---
+
         future = Future()
         manager.queue.put((future, task, pipeline_args))
         result_bytes = future.result()
