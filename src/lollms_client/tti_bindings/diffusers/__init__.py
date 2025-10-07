@@ -97,6 +97,24 @@ class DiffusersBinding(LollmsTTIBinding):
         pm_v = pm.PackageManager(venv_path=str(self.venv_dir))
 
         # --- PyTorch Installation ---
+        ASCIIColors.info(f"Installing server dependencies")
+        pm_v.ensure_packages([
+            "requests", "uvicorn", "fastapi", "python-multipart", "filelock"
+        ])
+        ASCIIColors.info(f"Installing parisneo libraries")
+        pm_v.ensure_packages([
+            "ascii_colors","pipmaster"
+        ])
+        ASCIIColors.info(f"Installing misc libraries (numpy, tqdm...)")
+        pm_v.ensure_packages([
+            "tqdm", "numpy"
+        ])
+        ASCIIColors.info(f"Installing Pillow")
+        pm_v.ensure_packages([
+            "pillow"
+        ])
+        
+        ASCIIColors.info(f"Installing pytorch")
         torch_index_url = None
         if sys.platform == "win32":
             try:
@@ -104,7 +122,7 @@ class DiffusersBinding(LollmsTTIBinding):
                 result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
                 ASCIIColors.green("NVIDIA GPU detected. Installing CUDA-enabled PyTorch.")
                 # Using a common and stable CUDA version. Adjust if needed.
-                torch_index_url = "https://download.pytorch.org/whl/cu121"
+                torch_index_url = "https://download.pytorch.org/whl/cu128"
             except (FileNotFoundError, subprocess.CalledProcessError):
                 ASCIIColors.yellow("`nvidia-smi` not found or failed. Installing standard PyTorch. If you have an NVIDIA GPU, please ensure drivers are installed and in PATH.")
 
@@ -112,12 +130,19 @@ class DiffusersBinding(LollmsTTIBinding):
         pm_v.ensure_packages(["torch", "torchvision"], index_url=torch_index_url)
 
         # Standard dependencies
+        ASCIIColors.info(f"Installing transformers dependencies")
         pm_v.ensure_packages([
-            "pillow", "transformers", "safetensors", "requests", "tqdm", "numpy",
-            "accelerate", "uvicorn", "fastapi", "python-multipart", "filelock", "ascii_colors"
+            "transformers", "safetensors", "accelerate"
         ])
-
+        ASCIIColors.info(f"[Optional] Installing xformers")
+        try:
+            pm_v.ensure_packages([
+                "xformers"
+            ])
+        except:
+            pass
         # Git-based diffusers to get the latest version
+        ASCIIColors.info(f"Installing diffusers library from github")
         pm_v.ensure_packages([
             {
                 "name": "diffusers",
@@ -125,14 +150,6 @@ class DiffusersBinding(LollmsTTIBinding):
                 "condition": ">=0.35.1"
             }
         ])
-
-        # XFormers (optional but recommended for NVIDIA)
-        if torch_index_url: # Only try to install xformers if CUDA is likely present
-            try:
-                ASCIIColors.info("Attempting to install xformers for performance optimization...")
-                pm_v.ensure_packages(["xformers"], upgrade=True)
-            except Exception as e:
-                ASCIIColors.warning(f"Could not install xformers. It's optional but recommended for performance on NVIDIA GPUs. Error: {e}")
 
         ASCIIColors.green("Server dependencies are satisfied.")
 
