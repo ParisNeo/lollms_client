@@ -21,6 +21,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import sys
+import platform
 
 # Add binding root to sys.path to ensure local modules can be imported if structured that way.
 binding_root = Path(__file__).resolve().parent.parent
@@ -118,6 +119,19 @@ CIVITAI_MODELS = {
         "filename": "M4RV3LSDUNGEONSNEWV40COMICS_mD40.safetensors", "description": "comics.", "owned_by": "civitai"
     },
 }
+
+HF_DEFAULT_MODELS = [
+    {"family": "SDXL", "model_name": "stabilityai/stable-diffusion-xl-base-1.0", "display_name": "SDXL Base 1.0", "desc": "Text2Image 1024 native."},
+    {"family": "SDXL", "model_name": "stabilityai/stable-diffusion-xl-refiner-1.0", "display_name": "SDXL Refiner 1.0", "desc": "Refiner for SDXL."},
+    {"family": "SD 1.x", "model_name": "runwayml/stable-diffusion-v1-5", "display_name": "Stable Diffusion 1.5", "desc": "Classic SD1.5."},
+    {"family": "SD 2.x", "model_name": "stabilityai/stable-diffusion-2-1", "display_name": "Stable Diffusion 2.1", "desc": "SD2.1 base."},
+    {"family": "SD3", "model_name": "stabilityai/stable-diffusion-3-medium-diffusers", "display_name": "Stable Diffusion 3 Medium", "desc": "SD3 medium."},
+    {"family": "Qwen", "model_name": "Qwen/Qwen-Image", "display_name": "Qwen Image", "desc": "Dedicated image generation."},
+    {"family": "Specialized", "model_name": "playgroundai/playground-v2.5-1024px-aesthetic", "display_name": "Playground v2.5", "desc": "High aesthetic 1024."},
+    {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit", "display_name": "Qwen Image Edit", "desc": "Dedicated image editing."},
+    {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit-2509", "display_name": "Qwen Image Edit Plus (Multi-Image)", "desc": "Advanced multi-image editing, fusion, and pose transfer."}
+]
+
 
 TORCH_DTYPE_MAP_STR_TO_OBJ = {
     "float16": getattr(torch, 'float16', 'float16'), "bfloat16": getattr(torch, 'bfloat16', 'bfloat16'),
@@ -219,7 +233,7 @@ class ModelManager:
         filename = model_info["filename"]
         dest_path = self.models_path / filename
         temp_path = dest_path.with_suffix(".temp")
-        ASCIIColors.cyan(f"Downloading '{filename}' from Civitai...")
+        ASCIIColors.cyan(f"Downloading '{filename}' from Civitai... to {dest_path}")
         try:
             with requests.get(url, stream=True) as r:
                 r.raise_for_status()
@@ -256,6 +270,9 @@ class ModelManager:
                 ASCIIColors.warning(f"Could not switch scheduler to {scheduler_name_key}: {e}. Using current default.")
 
     def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
+        # Disable HF symlinks on Windows to avoid symlink creation errors
+        if platform.system() == "Windows":
+            os.environ["HF_HUB_ENABLE_SYMLINKS"] = "0"
         model_name = self.config.get("model_name", "")
         try:
             load_args = {}
@@ -596,11 +613,12 @@ async def generate_image(request: T2IRequest):
         generator = None
         if seed != -1:
             generator = torch.Generator(device=state.config["device"]).manual_seed(seed)
-
+        width = params.get("width", state.config.get("width", 512))
+        height = params.get("width", state.config.get("width", 512))
         pipeline_args = {
             "prompt": request.prompt, "negative_prompt": request.negative_prompt,
-            "width": int(params.get("width", state.config.get("width", 512))),
-            "height": int(params.get("height", state.config.get("height", 512))),
+            "width": int(width if width else 512),
+            "height": int(height if height else 512),
             "num_inference_steps": int(params.get("num_inference_steps", state.config.get("num_inference_steps", 25))),
             "guidance_scale": float(params.get("guidance_scale", state.config.get("guidance_scale", 7.0))),
             "generator": generator
@@ -652,8 +670,10 @@ async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []
 def list_models_endpoint():
     civitai = [{'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']} for key, info in CIVITAI_MODELS.items()]
     local = [{'model_name': f.name, 'display_name': f.stem, 'description': 'Local safetensors file.', 'owned_by': 'local_user'} for f in state.models_path.glob("*.safetensors")]
-    return civitai + local
-
+    huggingface = [{'model_name': m['model_name'], 'display_name': m['display_name'], 'description': m['desc'], 'owned_by': 'huggingface'} 
+                   for m in HF_DEFAULT_MODELS]
+    # Combine lists, order as needed
+    return huggingface + civitai + local
 @router.get("/list_local_models")
 def list_local_models_endpoint():
     return sorted([f.name for f in state.models_path.glob("*.safetensors")])
