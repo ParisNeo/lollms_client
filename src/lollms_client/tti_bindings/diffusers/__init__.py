@@ -282,6 +282,7 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
+        return None
         files_to_upload = []
         if not isinstance(images, list):
             images = [images]
@@ -335,7 +336,6 @@ class DiffusersBinding(LollmsTTIBinding):
                 "params": kwargs
             })
         }
-        return None
         response = self._post_multipart_request("/edit_image", data=data_for_form, files=files_to_upload)
         return response.content
 
