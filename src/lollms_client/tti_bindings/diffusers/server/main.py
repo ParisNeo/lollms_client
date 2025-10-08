@@ -17,12 +17,12 @@ import numpy as np
 import gc
 import argparse
 import uvicorn
-from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, Form
+from fastapi import FastAPI, APouter, HTTPException, UploadFile, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import sys
 import platform
-import inspect # --- ARGUMENT FILTERING ---
+import inspect
 
 # Add binding root to sys.path to ensure local modules can be imported if structured that way.
 binding_root = Path(__file__).resolve().parent.parent
@@ -33,8 +33,7 @@ try:
     import torch
     from diffusers import (
         AutoPipelineForText2Image, AutoPipelineForImage2Image, AutoPipelineForInpainting,
-        DiffusionPipeline, StableDiffusionPipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline,
-        FluxSchnellPipeline, FluxDevPipeline
+        DiffusionPipeline, StableDiffusionPipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline
     )
     from diffusers.utils import load_image
     from PIL import Image
@@ -43,6 +42,7 @@ try:
 except ImportError as e:
     print(f"FATAL: A required package is missing from the server's venv: {e}.")
     DIFFUSERS_AVAILABLE = False
+    # Define dummy classes to allow server to start and report error via API
     class Dummy: pass
     torch = Dummy()
     torch.cuda = Dummy()
@@ -50,7 +50,7 @@ except ImportError as e:
     torch.backends = Dummy()
     torch.backends.mps = Dummy()
     torch.backends.mps.is_available = lambda: False
-    AutoPipelineForText2Image = AutoPipelineForImage2Image = AutoPipelineForInpainting = DiffusionPipeline = StableDiffusionPipeline = QwenImageEditPipeline = QwenImageEditPlusPipeline = FluxSchnellPipeline = FluxDevPipeline = Image = load_image = ASCIIColors = trace_exception = Dummy
+    AutoPipelineForText2Image = AutoPipelineForImage2Image = AutoPipelineForInpainting = DiffusionPipeline = StableDiffusionPipeline = QwenImageEditPipeline = QwenImageEditPlusPipeline = Image = load_image = ASCIIColors = trace_exception = Dummy
 
 # --- Server Setup ---
 app = FastAPI(title="Diffusers TTI Server")
@@ -59,7 +59,66 @@ MODELS_PATH = Path("./models")
 
 # --- START: Core Logic (Complete and Unabridged) ---
 CIVITAI_MODELS = {
-    # ... (Your Civitai models dictionary remains here) ...
+    "realistic-vision-v6": {
+        "display_name": "Realistic Vision V6.0", "url": "https://civitai.com/api/download/models/501240?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "realisticVisionV60_v60B1.safetensors", "description": "Photorealistic SD1.5 checkpoint.", "owned_by": "civitai"
+    },
+    "absolute-reality": {
+        "display_name": "Absolute Reality", "url": "https://civitai.com/api/download/models/132760?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "absolutereality_v181.safetensors", "description": "General realistic SD1.5.", "owned_by": "civitai"
+    },
+    "dreamshaper-8": {
+        "display_name": "DreamShaper 8", "url": "https://civitai.com/api/download/models/128713",
+        "filename": "dreamshaper_8.safetensors", "description": "Versatile SD1.5 style model.", "owned_by": "civitai"
+    },
+    "juggernaut-xl": {
+        "display_name": "Juggernaut XL", "url": "https://civitai.com/api/download/models/133005",
+        "filename": "juggernautXL_version6Rundiffusion.safetensors", "description": "Artistic SDXL.", "owned_by": "civitai"
+    },
+    "lyriel-v1.6": {
+        "display_name": "Lyriel v1.6", "url": "https://civitai.com/api/download/models/72396?type=Model&format=SafeTensor&size=full&fp=fp16",
+        "filename": "lyriel_v16.safetensors", "description": "Fantasy/stylized SD1.5.", "owned_by": "civitai"
+    },
+    "ui_icons": {
+        "display_name": "UI Icons", "url": "https://civitai.com/api/download/models/367044?type=Model&format=SafeTensor&size=full&fp=fp16",
+        "filename": "uiIcons_v10.safetensors", "description": "A model for generating UI icons.", "owned_by": "civitai"
+    },
+    "meinamix": {
+        "display_name": "MeinaMix", "url": "https://civitai.com/api/download/models/948574?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "meinamix_meinaV11.safetensors", "description": "Anime/illustration SD1.5.", "owned_by": "civitai"
+    },
+    "rpg-v5": {
+        "display_name": "RPG v5", "url": "https://civitai.com/api/download/models/124626?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "rpg_v5.safetensors", "description": "RPG assets SD1.5.", "owned_by": "civitai"
+    },
+    "pixel-art-xl": {
+        "display_name": "Pixel Art XL", "url": "https://civitai.com/api/download/models/135931?type=Model&format=SafeTensor",
+        "filename": "pixelartxl_v11.safetensors", "description": "Pixel art SDXL.", "owned_by": "civitai"
+    },
+    "lowpoly-world": {
+        "display_name": "Lowpoly World", "url": "https://civitai.com/api/download/models/146502?type=Model&format=SafeTensor",
+        "filename": "LowpolySDXL.safetensors", "description": "Lowpoly style SD1.5.", "owned_by": "civitai"
+    },
+    "toonyou": {
+        "display_name": "ToonYou", "url": "https://civitai.com/api/download/models/125771?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "toonyou_beta6.safetensors", "description": "Cartoon/Disney SD1.5.", "owned_by": "civitai"
+    },
+    "papercut": {
+        "display_name": "Papercut", "url": "https://civitai.com/api/download/models/133503?type=Model&format=SafeTensor",
+        "filename": "papercut.safetensors", "description": "Paper cutout SD1.5.", "owned_by": "civitai"
+    },
+    "fantassifiedIcons": {
+        "display_name": "Fantassified Icons", "url": "https://civitai.com/api/download/models/67584?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "fantassifiedIcons_fantassifiedIconsV20.safetensors", "description": "Flat, modern Icons.", "owned_by": "civitai"
+    },
+    "game_icon_institute": {
+        "display_name": "Game icon institute", "url": "https://civitai.com/api/download/models/158776?type=Model&format=SafeTensor&size=full&fp=fp16",
+        "filename": "gameIconInstituteV10_v10.safetensors", "description": "Flat, modern game Icons.", "owned_by": "civitai"
+    },
+    "M4RV3LS_DUNGEONS": {
+        "display_name": "M4RV3LS & DUNGEONS", "url": "https://civitai.com/api/download/models/139417?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+        "filename": "M4RV3LSDUNGEONSNEWV40COMICS_mD40.safetensors", "description": "comics.", "owned_by": "civitai"
+    },
 }
 
 HF_DEFAULT_MODELS = [
@@ -117,7 +176,6 @@ class ModelManager:
         self._stop_monitor_event = threading.Event()
         self._unload_monitor_thread = None
         self._start_unload_monitor()
-        # --- ARGUMENT FILTERING ---
         self.supported_args: Optional[set] = None
 
     def acquire(self):
@@ -248,11 +306,9 @@ class ModelManager:
                     ASCIIColors.info(f"Offload enabled. Forcing device_map='auto' for {model_name_from_config}.")
                     use_device_map = True
                     load_params["device_map"] = "auto"
-
-                if "FLUX.1-schnell" in model_name_from_config:
-                    self.pipeline = FluxSchnellPipeline.from_pretrained(model_name_from_config, **load_params)
-                elif "FLUX.1-dev" in model_name_from_config:
-                    self.pipeline = FluxDevPipeline.from_pretrained(model_name_from_config, **load_params)
+                
+                if is_flux_model:
+                    self.pipeline = AutoPipelineForText2Image.from_pretrained(model_name_from_config, **load_params)
                 elif "Qwen-Image-Edit-2509" in model_name_from_config:
                     self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_name_from_config, **load_params)
                 elif "Qwen-Image-Edit" in model_name_from_config:
@@ -319,8 +375,6 @@ class ModelManager:
         else:
              ASCIIColors.info("Device map handled device placement. Skipping manual pipeline.to() and offload calls.")
 
-        # --- ARGUMENT FILTERING ---
-        # After loading, inspect the pipeline's __call__ method to find supported arguments.
         if self.pipeline:
             sig = inspect.signature(self.pipeline.__call__)
             self.supported_args = {p.name for p in sig.parameters.values()}
@@ -384,7 +438,7 @@ class ModelManager:
             model_name = self.config.get('model_name', 'Unknown')
             del self.pipeline
             self.pipeline = None
-            self.supported_args = None # --- ARGUMENT FILTERING ---
+            self.supported_args = None
             gc.collect()
             if torch and torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -406,8 +460,6 @@ class ModelManager:
                         if not self.is_loaded or self.current_task != task:
                             self._load_pipeline_for_task(task)
                     
-                    # --- ARGUMENT FILTERING ---
-                    # Filter the arguments passed to the pipeline to only include what it supports.
                     if self.supported_args:
                         filtered_args = {k: v for k, v in pipeline_args.items() if k in self.supported_args}
                     else:
@@ -416,7 +468,6 @@ class ModelManager:
 
                     with torch.no_grad():
                         output = self.pipeline(**filtered_args)
-                    # ---
                     
                     pil = output.images[0]
                     buf = BytesIO()
@@ -436,7 +487,6 @@ class ModelManager:
                 continue
 
 class PipelineRegistry:
-    # ... (This class remains unchanged) ...
     _instance = None
     _lock = threading.Lock()
     def __new__(cls, *args, **kwargs):
@@ -483,7 +533,6 @@ class PipelineRegistry:
             return list(self._managers.values())
 
 class ServerState:
-    # ... (This class remains unchanged) ...
     def __init__(self, models_path: Path):
         self.models_path = models_path
         self.models_path.mkdir(parents=True, exist_ok=True)
@@ -606,11 +655,9 @@ async def generate_image(request: T2IRequest):
         width = int(params.get("width", state.config.get("width", 512)))
         height = int(params.get("height", state.config.get("height", 512)))
         
-        # --- ARGUMENT FILTERING ---
-        # The endpoint is now simpler. We build a superset of arguments and let the worker filter them.
         pipeline_args = {
             "prompt": request.prompt,
-            "negative_prompt": request.negative_prompt, # This will be safely ignored by models that don't use it
+            "negative_prompt": request.negative_prompt,
             "width": width,
             "height": height,
             "num_inference_steps": int(params.get("num_inference_steps", state.config.get("num_inference_steps", 25))),
@@ -640,8 +687,6 @@ async def generate_image(request: T2IRequest):
 
 @router.post("/edit_image")
 async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []):
-    # This endpoint remains the same, as its logic is already model-aware and robust.
-    # The new filtering mechanism in the worker will protect it from invalid argument errors.
     try:
         data = EditRequestPayload.model_validate_json(json_payload)
         manager = state.get_active_manager()
