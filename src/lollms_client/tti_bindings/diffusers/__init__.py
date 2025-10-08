@@ -245,13 +245,13 @@ class DiffusersBinding(LollmsTTIBinding):
         except requests.exceptions.RequestException as e:
             # (Error handling is the same as above)
             ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
-            # ASCIIColors.error(f"Error details: {e}")
-            # # if hasattr(e, 'response') and e.response:
-            # #     try:
-            # #         ASCIIColors.error(f"Server response: {e.response.json().get('detail', e.response.text)}")
-            # #     except json.JSONDecodeError:
-            # #         ASCIIColors.error(f"Server raw response: {e.response.text}")
-            # raise RuntimeError("Communication with the Diffusers server failed.") from e
+            ASCIIColors.error(f"Error details: {e}")
+            if hasattr(e, 'response') and e.response:
+                try:
+                    ASCIIColors.error(f"Server response: {e.response.json().get('detail', e.response.text)}")
+                except json.JSONDecodeError:
+                    ASCIIColors.error(f"Server raw response: {e.response.text}")
+            raise RuntimeError("Communication with the Diffusers server failed.") from e
         
     def _get_request(self, endpoint: str, params: Optional[dict] = None) -> requests.Response:
         """Helper to make GET requests to the server."""
@@ -290,12 +290,16 @@ class DiffusersBinding(LollmsTTIBinding):
             # 1. Check for PIL Image
             # 2. Check for string inputs (file path, Data URL, or raw base64)
             if isinstance(img, str):
-                # Try to treat it as a file path first
+                # --- START OF THE ROBUST FIX ---
+                # First, check if it's a valid file path
                 if Path(img).is_file():
                     file_path = Path(img)
-                    files_to_upload.append(('files', (file_path.name, open(file_path, 'rb'), 'image/png')))
-                
-                # Else, try to treat it as a base64 string (either Data URL or raw)
+                    # Safely open, read the bytes into memory, and then close the file.
+                    with open(file_path, 'rb') as f:
+                        file_bytes = f.read()
+                    # Pass the raw bytes, not the file handle. This is much safer.
+                    files_to_upload.append(('files', (file_path.name, file_bytes, 'image/png')))
+                # --- END OF THE ROBUST FIX ---
                 else:
                     try:
                         # Check if it's a Data URL and extract the data part
@@ -328,7 +332,7 @@ class DiffusersBinding(LollmsTTIBinding):
             raise ValueError("No valid images were provided to the edit_image function. Please provide a file path, PIL image, or base64 string.")
 
         if "mask" in kwargs and kwargs["mask"]:
-            kwargs["mask_image"] = kwargs.pop("mask")
+            aa = kwargs.pop("mask")
         data_for_form = {
             "json_payload": json.dumps({
                 "prompt": prompt,
