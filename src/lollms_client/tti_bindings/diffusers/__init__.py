@@ -337,6 +337,7 @@ class DiffusersBinding(LollmsTTIBinding):
                 "params": kwargs
             })
         }
+        return None
         response = self._post_multipart_request("/edit_image", data=data_for_form, files=files_to_upload)
         return response.content
 
