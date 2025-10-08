@@ -286,7 +286,7 @@ class DiffusersBinding(LollmsTTIBinding):
         if not isinstance(images, list):
             images = [images]
 
-        return None
+
         for img in images:
             # Case 1: Input is a PIL Image object
             if hasattr(img, 'save'):
@@ -310,7 +310,7 @@ class DiffusersBinding(LollmsTTIBinding):
                         ASCIIColors.warning(f"Warning: A string input was not a valid file path or base64. Skipping.")
             else:
                  raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
-
+        return None
         if not images_b64:
             raise ValueError("No valid images were provided to the edit_image function.")
 
