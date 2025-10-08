@@ -287,18 +287,9 @@ class DiffusersBinding(LollmsTTIBinding):
             images = [images]
 
         for i, img in enumerate(images):
-            if isinstance(img, str):
-                print("STR image")
-            continue
             # 1. Check for PIL Image
-            if hasattr(img, 'save'):
-                buffer = BytesIO()
-                img.save(buffer, format="PNG")
-                buffer.seek(0)
-                files_to_upload.append(('files', (f"image_{i}.png", buffer, "image/png")))
-            
             # 2. Check for string inputs (file path, Data URL, or raw base64)
-            elif isinstance(img, str):
+            if isinstance(img, str):
                 # Try to treat it as a file path first
                 if Path(img).is_file():
                     file_path = Path(img)
@@ -323,7 +314,12 @@ class DiffusersBinding(LollmsTTIBinding):
                         # We simply ignore it and continue.
                         ASCIIColors.warning(f"Warning: A string input was not a valid file path or base64 content. Skipping.")
                         pass
-            
+            elif hasattr(img, 'save'):
+                buffer = BytesIO()
+                img.save(buffer, format="PNG")
+                buffer.seek(0)
+                files_to_upload.append(('files', (f"image_{i}.png", buffer, "image/png")))
+
             # 3. Handle other unsupported types
             else:
                  raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
