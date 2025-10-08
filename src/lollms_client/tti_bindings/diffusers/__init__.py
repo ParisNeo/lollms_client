@@ -226,12 +226,12 @@ class DiffusersBinding(LollmsTTIBinding):
         """
         try:
             url = f"{self.base_url}{endpoint}"
-
-            # CRITICAL FIX:
-            # If 'files' are provided, we send a multipart request using the 'data' parameter for form fields.
-            # If 'files' is None, we send a standard JSON request using the 'json' parameter.
+            
+            # If 'files' are provided, we MUST send a multipart request.
+            # The 'data' parameter will be encoded as form fields.
             if files:
                 response = requests.post(url, data=data, files=files, timeout=3600)
+            # If 'files' is None, we send a standard application/json request.
             else:
                 response = requests.post(url, json=data, timeout=3600)
 
@@ -275,9 +275,8 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
-        # CRITICAL FIX: To send multiple files under the same field name 'files',
-        # we must create a list of tuples, not a dictionary with unique keys.
-        files_list = []
+        # This list will contain ALL parts of the multipart request.
+        multipart_payload = []
         image_paths = []
 
         if not isinstance(images, list):
@@ -288,36 +287,40 @@ class DiffusersBinding(LollmsTTIBinding):
                 buffer = BytesIO()
                 img.save(buffer, format="PNG")
                 buffer.seek(0)
-                # Append a tuple: ('field_name', ('file_name', file_data, 'content_type'))
-                files_list.append(('files', (f"image_{i}.png", buffer, "image/png")))
+                # Append a tuple for the file part
+                multipart_payload.append(('files', (f"image_{i}.png", buffer, "image/png")))
             elif isinstance(img, str) and Path(img).is_file():
-                # The server will load this path directly
                 image_paths.append(img)
             elif isinstance(img, str): # Handle base64 strings
                 try:
                     if img.startswith("data:image/") and ";base64," in img:
                         b64_data = img.split(";base64,")[1]
                         img_bytes = base64.b64decode(b64_data)
-                        files_list.append(('files', (f"image_{i}.png", img_bytes, "image/png")))
+                        multipart_payload.append(('files', (f"image_{i}.png", img_bytes, "image/png")))
                 except Exception:
                      raise ValueError(f"Unsupported string image format in edit_image: {img[:100]}")
             else:
                  raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
 
+        # Define the JSON data for the 'json_payload' part
         data_payload = {
             "prompt": prompt,
             "image_paths": image_paths,
             "params": kwargs
         }
+        json_payload_string = json.dumps(data_payload)
 
-        # This dictionary contains the non-file form fields.
-        form_data = {
-            "json_payload": json.dumps(data_payload)
-        }
+        # CRITICAL FIX: Add the json_payload as another part in the same list.
+        # We specify its Content-Type as 'application/json' for robustness.
+        # The 'None' for the filename tells 'requests' this is a data field, not a file.
+        multipart_payload.append(('json_payload', (None, json_payload_string, 'application/json')))
 
-        # Pass the form data and the list of file tuples to the corrected post request helper.
-        response = self._post_request("/edit_image", data=form_data, files=files_list)
+        # Make the request using ONLY the 'files' parameter, which now contains the complete payload.
+        # The 'data' parameter is not used.
+        response = self._post_request("/edit_image", files=multipart_payload)
         return response.content
+
+
     def list_models(self) -> List[Dict[str, Any]]:
         return self._get_request("/list_models").json()
 
