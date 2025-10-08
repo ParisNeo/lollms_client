@@ -297,23 +297,14 @@ class DiffusersBinding(LollmsTTIBinding):
             
             # Case 2: Input is a string (could be path or already base64)
             elif isinstance(img, str):
-                return None
-                if Path(img).is_file():
-                    with open(Path(img), 'rb') as f:
-                        b64_string = base64.b64encode(f.read()).decode('utf-8')
+                try:
+                    b64_string = img.split(";base64,")[1] if ";base64," in img else img
+                    base64.b64decode(b64_string) # Validate
                     images_b64.append(b64_string)
-                else:
-                    return None
-                    try:
-                        b64_string = img.split(";base64,")[1] if ";base64," in img else img
-                        base64.b64decode(b64_string) # Validate
-                        images_b64.append(b64_string)
-                    except Exception:
-                        ASCIIColors.warning(f"Warning: A string input was not a valid file path or base64. Skipping.")
+                except Exception:
+                    ASCIIColors.warning(f"Warning: A string input was not a valid file path or base64. Skipping.")
             else:
-                return None
                 raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
-        return None
         if not images_b64:
             raise ValueError("No valid images were provided to the edit_image function.")
 
