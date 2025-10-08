@@ -218,26 +218,32 @@ class DiffusersBinding(LollmsTTIBinding):
             time.sleep(2)
         raise RuntimeError("Failed to connect to the Diffusers server within the specified timeout.")
 
-    def _post_request(self, endpoint: str, data: Optional[dict] = None, files: Optional[Union[dict, list]] = None) -> requests.Response:
-        """
-        Helper to make POST requests to the server.
-        It intelligently handles content type, sending JSON for data-only requests
-        and multipart/form-data when files are present.
-        """
+    def _post_json_request(self, endpoint: str, data: Optional[dict] = None) -> requests.Response:
+        """Helper to make POST requests with a JSON body."""
         try:
             url = f"{self.base_url}{endpoint}"
-            
-            # If 'files' are provided, we MUST send a multipart request.
-            # The 'data' parameter will be encoded as form fields.
-            if files:
-                response = requests.post(url, data=data, files=files, timeout=3600)
-            # If 'files' is None, we send a standard application/json request.
-            else:
-                response = requests.post(url, json=data, timeout=3600)
-
+            response = requests.post(url, json=data, timeout=3600) # Long timeout for generation
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
+            ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
+            ASCIIColors.error(f"Error details: {e}")
+            if hasattr(e, 'response') and e.response:
+                try:
+                    ASCIIColors.error(f"Server response: {e.response.json().get('detail', e.response.text)}")
+                except json.JSONDecodeError:
+                    ASCIIColors.error(f"Server raw response: {e.response.text}")
+            raise RuntimeError("Communication with the Diffusers server failed.") from e
+
+    def _post_multipart_request(self, endpoint: str, data: Optional[dict] = None, files: Optional[list] = None) -> requests.Response:
+        """Helper to make multipart/form-data POST requests for file uploads."""
+        try:
+            url = f"{self.base_url}{endpoint}"
+            response = requests.post(url, data=data, files=files, timeout=3600)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            # (Error handling is the same as above)
             ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
             ASCIIColors.error(f"Error details: {e}")
             if hasattr(e, 'response') and e.response:
@@ -267,7 +273,8 @@ class DiffusersBinding(LollmsTTIBinding):
         pass
 
     def generate_image(self, prompt: str, negative_prompt: str = "", **kwargs) -> bytes:
-        response = self._post_request("/generate_image", data={
+        # This is a pure JSON request
+        response = self._post_json_request("/generate_image", data={
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "params": kwargs
@@ -275,49 +282,60 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
-        # This list will contain ALL parts of the multipart request.
-        multipart_payload = []
-        image_paths = []
-
+        files_to_upload = []
         if not isinstance(images, list):
             images = [images]
 
         for i, img in enumerate(images):
-            if hasattr(img, 'save'): # PIL Image
+            # 1. Check for PIL Image
+            if hasattr(img, 'save'):
                 buffer = BytesIO()
                 img.save(buffer, format="PNG")
                 buffer.seek(0)
-                # Append a tuple for the file part
-                multipart_payload.append(('files', (f"image_{i}.png", buffer, "image/png")))
-            elif isinstance(img, str) and Path(img).is_file():
-                image_paths.append(img)
-            elif isinstance(img, str): # Handle base64 strings
-                try:
-                    if img.startswith("data:image/") and ";base64," in img:
-                        b64_data = img.split(";base64,")[1]
+                files_to_upload.append(('files', (f"image_{i}.png", buffer, "image/png")))
+            
+            # 2. Check for string inputs (file path, Data URL, or raw base64)
+            elif isinstance(img, str):
+                # Try to treat it as a file path first
+                if Path(img).is_file():
+                    file_path = Path(img)
+                    files_to_upload.append(('files', (file_path.name, open(file_path, 'rb'), 'image/png')))
+                
+                # Else, try to treat it as a base64 string (either Data URL or raw)
+                else:
+                    try:
+                        # Check if it's a Data URL and extract the data part
+                        if img.startswith("data:image/") and ";base64," in img:
+                            b64_data = img.split(";base64,")[1]
+                        # --- THIS IS THE FIX ---
+                        # Otherwise, assume the whole string is raw base64 data
+                        else:
+                            b64_data = img
+                        
+                        # Attempt to decode it
                         img_bytes = base64.b64decode(b64_data)
-                        multipart_payload.append(('files', (f"image_{i}.png", img_bytes, "image/png")))
-                except Exception:
-                     raise ValueError(f"Unsupported string image format in edit_image: {img[:100]}")
+                        files_to_upload.append(('files', (f"image_{i}.png", img_bytes, "image/png")))
+                    except Exception:
+                        # If it's not a file path and decoding fails, it's an invalid string.
+                        # We simply ignore it and continue.
+                        ASCIIColors.warning(f"Warning: A string input was not a valid file path or base64 content. Skipping.")
+                        pass
+            
+            # 3. Handle other unsupported types
             else:
                  raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
 
-        # Define the JSON data for the 'json_payload' part
-        data_payload = {
-            "prompt": prompt,
-            "image_paths": image_paths,
-            "params": kwargs
+        if not files_to_upload:
+            raise ValueError("No valid images were provided to the edit_image function. Please provide a file path, PIL image, or base64 string.")
+
+        data_for_form = {
+            "json_payload": json.dumps({
+                "prompt": prompt,
+                "image_paths": [],
+                "params": kwargs
+            })
         }
-        json_payload_string = json.dumps(data_payload)
-
-        # CRITICAL FIX: Add the json_payload as another part in the same list.
-        # We specify its Content-Type as 'application/json' for robustness.
-        # The 'None' for the filename tells 'requests' this is a data field, not a file.
-        multipart_payload.append(('json_payload', (None, json_payload_string, 'application/json')))
-
-        # Make the request using ONLY the 'files' parameter, which now contains the complete payload.
-        # The 'data' parameter is not used.
-        response = self._post_request("/edit_image", files=multipart_payload)
+        response = self._post_multipart_request("/edit_image", data=data_for_form, files=files_to_upload)
         return response.content
 
 

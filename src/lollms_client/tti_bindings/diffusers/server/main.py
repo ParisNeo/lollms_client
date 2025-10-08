@@ -274,11 +274,8 @@ class ModelManager:
         if platform.system() == "Windows":
             os.environ["HF_HUB_ENABLE_SYMLINKS"] = "0"
         
-        # We need the original model name from the config to identify special models
         model_name_from_config = self.config.get("model_name", "")
-        
-        # This flag will control all post-loading device placement logic
-        use_device_map = False
+        use_device_map = False # This flag will control all post-loading device placement
 
         try:
             # --- Unified Argument Building ---
@@ -287,20 +284,16 @@ class ModelManager:
                 load_params["cache_dir"] = str(self.config["hf_cache_path"])
             load_params["torch_dtype"] = torch_dtype
 
-            # --- START: New Prioritized Model Loading Logic ---
+            # --- Prioritized Model Loading Logic ---
 
-            # 1. First, check if the model is a special case that needs a dedicated pipeline.
+            # 1. First, check for special models that require dedicated pipelines (e.g., Qwen)
             is_qwen_plus = "Qwen-Image-Edit-2509" in model_name_from_config
             is_qwen_edit = "Qwen-Image-Edit" in model_name_from_config and not is_qwen_plus
             is_qwen_image = "Qwen/Qwen-Image" in model_name_from_config
             is_special_qwen_model = is_qwen_plus or is_qwen_edit or is_qwen_image
 
             if is_special_qwen_model:
-                # If it's a Qwen model, we ALWAYS load it from its Hugging Face ID.
-                # This ignores any local .safetensors file and prevents mis-identification.
                 ASCIIColors.info(f"Special Qwen model '{model_name_from_config}' detected. Using dedicated pipeline loader.")
-                
-                # Add all necessary parameters for loading from the Hub
                 load_params.update({
                     "use_safetensors": self.config["use_safetensors"],
                     "token": self.config["hf_token"],
@@ -311,14 +304,12 @@ class ModelManager:
                 if not self.config["safety_checker_on"]:
                     load_params["safety_checker"] = None
                 
-                # Check if device_map is needed for this large model
                 should_offload = self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]
                 if should_offload:
                     ASCIIColors.info("Offload enabled. Forcing device_map='auto' for Qwen model.")
                     use_device_map = True
                     load_params["device_map"] = "auto"
 
-                # Load the correct, specific pipeline for the Qwen model
                 if is_qwen_plus:
                     self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_name_from_config, **load_params)
                 elif is_qwen_edit:
@@ -327,21 +318,18 @@ class ModelManager:
                     self.pipeline = DiffusionPipeline.from_pretrained(model_name_from_config, **load_params)
             
             else:
-                # 2. If it's NOT a special model, proceed with standard loading logic.
+                # 2. If not a special model, handle standard local files and Hub models
                 is_safetensors_file = str(model_path).endswith(".safetensors")
 
                 if is_safetensors_file:
-                    # Standard loading from a local .safetensors file (e.g., Realistic Vision, DreamShaper)
-                    ASCIIColors.info(f"Loading standard model from local file: {model_path}")
-                    if task == "text2image":
-                        try:
-                            self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, **load_params)
-                        except AttributeError:
-                            self.pipeline = StableDiffusionPipeline.from_single_file(model_path, **load_params)
-                    elif task == "image2image":
-                        self.pipeline = AutoPipelineForImage2Image.from_single_file(model_path, **load_params)
-                    elif task == "inpainting":
-                        self.pipeline = AutoPipelineForInpainting.from_single_file(model_path, **load_params)
+                    # THE FIX: ALWAYS load .safetensors using AutoPipelineForText2Image.
+                    # The resulting pipeline object is flexible and can handle all tasks (t2i, i2i, inpainting).
+                    ASCIIColors.info(f"Loading standard model from local .safetensors file: {model_path}")
+                    try:
+                        self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, **load_params)
+                    except Exception as e:
+                        ASCIIColors.warning(f"Failed to load with AutoPipeline, falling back to StableDiffusionPipeline: {e}")
+                        self.pipeline = StableDiffusionPipeline.from_single_file(model_path, **load_params)
                 else:
                     # Standard loading from a Hugging Face Hub ID (e.g., runwayml/stable-diffusion-v1-5)
                     ASCIIColors.info(f"Loading standard model from Hub: {model_path}")
@@ -355,7 +343,6 @@ class ModelManager:
                     if not self.config["safety_checker_on"]:
                         load_params["safety_checker"] = None
                     
-                    # Check if device_map is needed for other large models like SD3
                     is_large_model = "stable-diffusion-3" in str(model_path)
                     should_offload = self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]
                     if is_large_model and should_offload:
@@ -369,7 +356,6 @@ class ModelManager:
                         self.pipeline = AutoPipelineForImage2Image.from_pretrained(model_path, **load_params)
                     elif task == "inpainting":
                         self.pipeline = AutoPipelineForInpainting.from_pretrained(model_path, **load_params)
-            # --- END: New Prioritized Model Loading Logic ---
         
         except Exception as e:
             error_str = str(e).lower()
@@ -380,7 +366,7 @@ class ModelManager:
 
         self._set_scheduler()
 
-        # This post-loading logic is now correctly controlled by the `use_device_map` flag
+        # This entire post-loading block is now conditional on whether device_map was used.
         if not use_device_map:
             self.pipeline.to(self.config["device"])
             if self.config["enable_xformers"]:
@@ -400,6 +386,8 @@ class ModelManager:
         self.current_task = task
         self.last_used_time = time.time()
         ASCIIColors.green(f"Model '{model_name_from_config}' loaded successfully using '{'device_map' if use_device_map else 'standard'}' mode for task '{task}'.")
+        
+        
     def _load_pipeline_for_task(self, task: str):
         if self.pipeline and self.current_task == task:
             return
@@ -674,8 +662,13 @@ async def generate_image(request: T2IRequest):
         generator = None
         if seed != -1:
             generator = torch.Generator(device=state.config["device"]).manual_seed(seed)
+        
+        # --- START OF THE FIX ---
+        # Correctly get 'width' and 'height' from the incoming parameters
         width = params.get("width", state.config.get("width", 512))
-        height = params.get("width", state.config.get("width", 512))
+        height = params.get("height", state.config.get("height", 512)) # CORRECTED LINE
+        # --- END OF THE FIX ---
+
         pipeline_args = {
             "prompt": request.prompt, "negative_prompt": request.negative_prompt,
             "width": int(width if width else 512),
@@ -684,52 +677,55 @@ async def generate_image(request: T2IRequest):
             "guidance_scale": float(params.get("guidance_scale", state.config.get("guidance_scale", 7.0))),
             "generator": generator
         }
-        # Check if the current model is a Qwen Edit model
+        
         model_name = manager.config.get("model_name", "")
+        # Workaround for Qwen Edit models needing an image for T2I
         if "Qwen-Image-Edit" in model_name:
-            # Create a blank image as a placeholder
-            from PIL import Image
             rng_seed = seed if seed != -1 else None
-            rng = np.random.default_rng(seed=rng_seed)            
+            rng = np.random.default_rng(seed=rng_seed)
+            # Use the correctly parsed height and width for the placeholder
             random_pixels = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
             placeholder_image = Image.fromarray(random_pixels, 'RGB')
-            # placeholder_image = Image.new("RGB", (pipeline_args["width"], pipeline_args["height"]))
             pipeline_args["image"] = placeholder_image
+            pipeline_args["strength"] = float(params.get("strength", 1.0))
+            task = "image2image" 
+        else:
+            task = "text2image"
+        
         future = Future()
-        manager.queue.put((future,"text2image", pipeline_args))
+        manager.queue.put((future, task, pipeline_args))
         result_bytes = future.result()
         return Response(content=result_bytes, media_type="image/png")
     except Exception as e:
         trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
+    
 
 @router.post("/edit_image")
 async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []):
     try:
-        data = EditRequestPayload.parse_raw(json_payload)
+        # Use the corrected Pydantic V2 method
+        data = EditRequestPayload.model_validate_json(json_payload)
         manager = state.get_active_manager()
         model_name = manager.config.get("model_name", "")
 
+        # 1. Process all uploaded files into PIL images
         pil_images = []
         for file in files:
             contents = await file.read()
             pil_images.append(Image.open(BytesIO(contents)).convert("RGB"))
-        
-        for path in data.image_paths:
-             pil_images.append(load_image(path).convert("RGB"))
 
         if not pil_images:
-            raise HTTPException(status_code=400, detail="No images provided for editing.")
-        
-        # --- START OF REVISED LOGIC ---
+            raise HTTPException(status_code=400, detail="No images were uploaded for editing.")
 
+        # --- START: Your Correct Advanced Logic ---
         pipeline_args = {"prompt": data.prompt}
         params = data.params
         
         # Default task for standard models
         task = "inpainting" if params.get("mask_image") else "image2image"
 
-        # Check if we are using the advanced Qwen Plus model
+        # 2. Check if we are using the advanced Qwen Plus model
         if "Qwen-Image-Edit-2509" in model_name:
             # This model has specific modes of operation.
             edit_mode = params.get("edit_mode", "fusion") # Default to fusion
@@ -738,7 +734,6 @@ async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []
             if edit_mode == "fusion":
                 if len(pil_images) < 2:
                     raise HTTPException(status_code=400, detail="Fusion mode requires at least 2 images.")
-                # The QwenImageEditPlusPipeline expects the 'image' argument to be a list for fusion
                 pipeline_args["image"] = pil_images 
 
             elif edit_mode == "style_transfer":
@@ -755,35 +750,35 @@ async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []
             
             elif edit_mode == "inpainting":
                 if "mask_image" not in params:
-                     raise HTTPException(status_code=400, detail="Inpainting mode requires a 'mask_image' in params.")
-                # Assuming mask_image is a base64 string or path in params
+                     raise HTTPException(status_code=400, detail="Inpainting mode requires a 'mask_image' in the params.")
+                # NOTE: This assumes the client sends the mask as a base64 string or a URL that `load_image` can handle.
+                # A more robust solution would be to upload the mask as another file.
                 mask_content = params["mask_image"]
-                # This logic needs to be robust to handle how mask is sent (path, base64, etc.)
-                # For simplicity, let's assume it's a loadable path for now
                 mask = load_image(mask_content).convert("L")
                 pipeline_args["image"] = pil_images[0]
                 pipeline_args["mask_image"] = mask
-                task = "inpainting" # Set specific task for clarity
+                task = "inpainting"
             else:
                  raise HTTPException(status_code=400, detail=f"Unsupported edit_mode for Qwen Plus: {edit_mode}")
 
         else:
-            # --- This is the original logic for standard, single-image models ---
+            # 3. This is the fallback logic for standard, single-image models
             pipeline_args["image"] = pil_images[0] 
             pipeline_args["strength"] = float(params.get("strength", 0.8))
             
             if task == "inpainting":
                 if "mask_image" not in params:
                      raise HTTPException(status_code=400, detail="Inpainting requires a 'mask_image' in params.")
-                mask = load_image(params["mask_image"]).convert("L")
+                mask_content = params["mask_image"]
+                mask = load_image(mask_content).convert("L")
                 pipeline_args["mask_image"] = mask
 
-        # Add common parameters
+        # 4. Add any other common parameters from the client
         pipeline_args.update({
             k: v for k, v in params.items() 
-            if k not in ["edit_mode", "strength", "mask_image"] # Avoid duplicating processed params
+            if k not in ["edit_mode", "strength", "mask_image"]
         })
-        # --- END OF REVISED LOGIC ---
+        # --- END: Your Correct Advanced Logic ---
 
         future = Future()
         manager.queue.put((future, task, pipeline_args))
@@ -792,7 +787,7 @@ async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []
     except Exception as e:
         trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 @router.get("/list_models")
 def list_models_endpoint():
     civitai = [{'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']} for key, info in CIVITAI_MODELS.items()]
