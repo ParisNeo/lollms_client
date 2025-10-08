@@ -287,6 +287,7 @@ class DiffusersBinding(LollmsTTIBinding):
             images = [images]
 
         for i, img in enumerate(images):
+            continue
             # 1. Check for PIL Image
             if hasattr(img, 'save'):
                 buffer = BytesIO()
@@ -337,7 +338,6 @@ class DiffusersBinding(LollmsTTIBinding):
                 "params": kwargs
             })
         }
-        return None
         response = self._post_multipart_request("/edit_image", data=data_for_form, files=files_to_upload)
         return response.content
 
