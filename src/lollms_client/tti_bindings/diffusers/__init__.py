@@ -336,6 +336,7 @@ class DiffusersBinding(LollmsTTIBinding):
                 "params": kwargs
             })
         }
+        print("READY to send multipart request with images")
         response = self._post_multipart_request("/edit_image", data=data_for_form, files=files_to_upload)
         return response.content
 
