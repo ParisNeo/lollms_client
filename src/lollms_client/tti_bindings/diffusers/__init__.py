@@ -218,11 +218,23 @@ class DiffusersBinding(LollmsTTIBinding):
             time.sleep(2)
         raise RuntimeError("Failed to connect to the Diffusers server within the specified timeout.")
 
-    def _post_request(self, endpoint: str, data: Optional[dict] = None, files: Optional[dict] = None) -> requests.Response:
-        """Helper to make POST requests to the server."""
+    def _post_request(self, endpoint: str, data: Optional[dict] = None, files: Optional[Union[dict, list]] = None) -> requests.Response:
+        """
+        Helper to make POST requests to the server.
+        It intelligently handles content type, sending JSON for data-only requests
+        and multipart/form-data when files are present.
+        """
         try:
             url = f"{self.base_url}{endpoint}"
-            response = requests.post(url, json=data, files=files, timeout=3600) # Long timeout for generation
+
+            # CRITICAL FIX:
+            # If 'files' are provided, we send a multipart request using the 'data' parameter for form fields.
+            # If 'files' is None, we send a standard JSON request using the 'json' parameter.
+            if files:
+                response = requests.post(url, data=data, files=files, timeout=3600)
+            else:
+                response = requests.post(url, json=data, timeout=3600)
+
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
@@ -234,7 +246,7 @@ class DiffusersBinding(LollmsTTIBinding):
                 except json.JSONDecodeError:
                     ASCIIColors.error(f"Server raw response: {e.response.text}")
             raise RuntimeError("Communication with the Diffusers server failed.") from e
-
+        
     def _get_request(self, endpoint: str, params: Optional[dict] = None) -> requests.Response:
         """Helper to make GET requests to the server."""
         try:
@@ -263,7 +275,9 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
-        files = {}
+        # CRITICAL FIX: To send multiple files under the same field name 'files',
+        # we must create a list of tuples, not a dictionary with unique keys.
+        files_list = []
         image_paths = []
 
         if not isinstance(images, list):
@@ -274,17 +288,17 @@ class DiffusersBinding(LollmsTTIBinding):
                 buffer = BytesIO()
                 img.save(buffer, format="PNG")
                 buffer.seek(0)
-                files[f"image_{i}"] = (f"image_{i}.png", buffer, "image/png")
+                # Append a tuple: ('field_name', ('file_name', file_data, 'content_type'))
+                files_list.append(('files', (f"image_{i}.png", buffer, "image/png")))
             elif isinstance(img, str) and Path(img).is_file():
                 # The server will load this path directly
                 image_paths.append(img)
             elif isinstance(img, str): # Handle base64 strings
                 try:
-                    # Simple base64 check
                     if img.startswith("data:image/") and ";base64," in img:
                         b64_data = img.split(";base64,")[1]
                         img_bytes = base64.b64decode(b64_data)
-                        files[f"image_{i}"] = (f"image_{i}.png", img_bytes, "image/png")
+                        files_list.append(('files', (f"image_{i}.png", img_bytes, "image/png")))
                 except Exception:
                      raise ValueError(f"Unsupported string image format in edit_image: {img[:100]}")
             else:
@@ -296,10 +310,14 @@ class DiffusersBinding(LollmsTTIBinding):
             "params": kwargs
         }
 
-        # FastAPI needs separate form fields for json and files
-        response = self._post_request("/edit_image", data={"json_payload": json.dumps(data_payload)}, files=files)
-        return response.content
+        # This dictionary contains the non-file form fields.
+        form_data = {
+            "json_payload": json.dumps(data_payload)
+        }
 
+        # Pass the form data and the list of file tuples to the corrected post request helper.
+        response = self._post_request("/edit_image", data=form_data, files=files_list)
+        return response.content
     def list_models(self) -> List[Dict[str, Any]]:
         return self._get_request("/list_models").json()
 
