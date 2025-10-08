@@ -303,8 +303,8 @@ class DiffusersBinding(LollmsTTIBinding):
                         b64_string = base64.b64encode(f.read()).decode('utf-8')
                     images_b64.append(b64_string)
                 else:
+                    return None
                     try:
-                        return None
                         b64_string = img.split(";base64,")[1] if ";base64," in img else img
                         base64.b64decode(b64_string) # Validate
                         images_b64.append(b64_string)
