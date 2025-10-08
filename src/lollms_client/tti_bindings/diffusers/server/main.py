@@ -694,7 +694,7 @@ async def edit_image(request: Request):
     print("\n--- DEBUGGING /edit_image ---")
     content_type = request.headers.get('content-type', '').lower()
     print(f"Content-Type Header: {content_type}")
-
+    return
     try:
         # Check if the request is multipart/form-data
         if 'multipart/form-data' in content_type:
