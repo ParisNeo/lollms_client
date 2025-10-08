@@ -287,6 +287,8 @@ class DiffusersBinding(LollmsTTIBinding):
             images = [images]
 
         for i, img in enumerate(images):
+            ASCIIColors.info(f"Attempting to decode string input as base64 image data...")
+            return None
             # 1. Check for PIL Image
             if hasattr(img, 'save'):
                 buffer = BytesIO()
@@ -303,8 +305,6 @@ class DiffusersBinding(LollmsTTIBinding):
                 
                 # Else, try to treat it as a base64 string (either Data URL or raw)
                 else:
-                    ASCIIColors.info(f"Attempting to decode string input as base64 image data...")
-                    return None
                     try:
                         # Check if it's a Data URL and extract the data part
                         if img.startswith("data:image/") and ";base64," in img:
