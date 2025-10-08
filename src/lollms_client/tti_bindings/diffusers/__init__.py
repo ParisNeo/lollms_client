@@ -287,14 +287,13 @@ class DiffusersBinding(LollmsTTIBinding):
             images = [images]
 
         for i, img in enumerate(images):
-            ASCIIColors.info(f"Attempting to decode string input as base64 image data... {type(img)}")
-            return None
             # 1. Check for PIL Image
             if hasattr(img, 'save'):
-                buffer = BytesIO()
-                img.save(buffer, format="PNG")
-                buffer.seek(0)
-                files_to_upload.append(('files', (f"image_{i}.png", buffer, "image/png")))
+                print("here")
+                # buffer = BytesIO()
+                # img.save(buffer, format="PNG")
+                # buffer.seek(0)
+                # files_to_upload.append(('files', (f"image_{i}.png", buffer, "image/png")))
             
             # 2. Check for string inputs (file path, Data URL, or raw base64)
             elif isinstance(img, str):
@@ -330,6 +329,8 @@ class DiffusersBinding(LollmsTTIBinding):
         if not files_to_upload:
             raise ValueError("No valid images were provided to the edit_image function. Please provide a file path, PIL image, or base64 string.")
 
+        if "mask" in kwargs and kwargs["mask"]:
+            kwargs["mask_image"] = kwargs.pop("mask")
         data_for_form = {
             "json_payload": json.dumps({
                 "prompt": prompt,
