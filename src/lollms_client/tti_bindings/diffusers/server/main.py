@@ -688,6 +688,8 @@ async def generate_image(request: T2IRequest):
 @router.post("/edit_image")
 async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []):
     try:
+        print("Received something")
+        return
         data = EditRequestPayload.model_validate_json(json_payload)
         manager = state.get_active_manager()
         model_name = manager.config.get("model_name", "")
