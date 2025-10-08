@@ -680,26 +680,39 @@ def get_sanitized_request_for_logging(request_data: Any) -> Dict[str, Any]:
 # --- API Endpoints ---
 @router.post("/generate_image")
 async def generate_image(request: T2IRequest):
+    manager = None
+    temp_config = None
     try:
-        manager = state.get_active_manager()
         params = request.params
-        seed = int(params.get("seed", state.config.get("seed", -1)))
+        
+        # Determine which model manager to use for this specific request
+        if "model_name" in params and params["model_name"]:
+            temp_config = state.config.copy()
+            temp_config["model_name"] = params.pop("model_name") # Remove from params to avoid being passed to pipeline
+            manager = state.registry.get_manager(temp_config, state.models_path)
+            ASCIIColors.info(f"Using per-request model: {temp_config['model_name']}")
+        else:
+            manager = state.get_active_manager()
+            ASCIIColors.info(f"Using session-configured model: {manager.config.get('model_name')}")
+
+        seed = int(params.get("seed", manager.config.get("seed", -1)))
         generator = None
         if seed != -1:
-            generator = torch.Generator(device=state.config["device"]).manual_seed(seed)
+            generator = torch.Generator(device=manager.config["device"]).manual_seed(seed)
         
-        width = int(params.get("width", state.config.get("width", 512)))
-        height = int(params.get("height", state.config.get("height", 512)))
+        width = int(params.get("width", manager.config.get("width", 512)))
+        height = int(params.get("height", manager.config.get("height", 512)))
         
         pipeline_args = {
             "prompt": request.prompt,
             "negative_prompt": request.negative_prompt,
             "width": width,
             "height": height,
-            "num_inference_steps": int(params.get("num_inference_steps", state.config.get("num_inference_steps", 25))),
-            "guidance_scale": float(params.get("guidance_scale", state.config.get("guidance_scale", 7.0))),
+            "num_inference_steps": int(params.get("num_inference_steps", manager.config.get("num_inference_steps", 25))),
+            "guidance_scale": float(params.get("guidance_scale", manager.config.get("guidance_scale", 7.0))),
             "generator": generator
         }
+        pipeline_args.update(params)
         
         model_name = manager.config.get("model_name", "")
         task = "text2image"
@@ -720,11 +733,28 @@ async def generate_image(request: T2IRequest):
     except Exception as e:
         trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_config and manager:
+            state.registry.release_manager(temp_config)
+            ASCIIColors.info(f"Released per-request model: {temp_config['model_name']}")
+
 
 @router.post("/edit_image")
 async def edit_image(request: EditRequestJSON):
+    manager = None
+    temp_config = None
     try:
-        manager = state.get_active_manager()
+        params = request.params
+
+        if "model_name" in params and params["model_name"]:
+            temp_config = state.config.copy()
+            temp_config["model_name"] = params.pop("model_name")
+            manager = state.registry.get_manager(temp_config, state.models_path)
+            ASCIIColors.info(f"Using per-request model: {temp_config['model_name']}")
+        else:
+            manager = state.get_active_manager()
+            ASCIIColors.info(f"Using session-configured model: {manager.config.get('model_name')}")
+
         model_name = manager.config.get("model_name", "")
 
         pil_images = []
@@ -735,10 +765,9 @@ async def edit_image(request: EditRequestJSON):
 
         if not pil_images: raise HTTPException(status_code=400, detail="No valid images provided.")
 
-        params = request.params
         pipeline_args = {"prompt": request.prompt}
         seed = int(params.get("seed", -1))
-        if seed != -1: pipeline_args["generator"] = torch.Generator(device=state.config["device"]).manual_seed(seed)
+        if seed != -1: pipeline_args["generator"] = torch.Generator(device=manager.config["device"]).manual_seed(seed)
         
         if "mask_image" in params and params["mask_image"]:
             b64_mask = params["mask_image"]
@@ -753,20 +782,22 @@ async def edit_image(request: EditRequestJSON):
             pipeline_args.update({"true_cfg_scale": 4.0, "guidance_scale": 1.0, "num_inference_steps": 40, "negative_prompt": " "})
             edit_mode = params.get("edit_mode", "fusion")
             if edit_mode == "fusion": pipeline_args["image"] = pil_images
-            # Add other qwen modes here if needed
         else:
             pipeline_args.update({"image": pil_images[0], "strength": 0.8, "guidance_scale": 7.5, "num_inference_steps": 25})
 
-        pipeline_args.update(params) # Allow user overrides
+        pipeline_args.update(params)
         
         future = Future(); manager.queue.put((future, task, pipeline_args))
         return Response(content=future.result(), media_type="image/png")
     except Exception as e:
-        # --- THIS IS THE FIX ---
         sanitized_payload = get_sanitized_request_for_logging(request)
         ASCIIColors.error(f"Exception in /edit_image. Sanitized Payload: {json.dumps(sanitized_payload, indent=2)}")
-        trace_exception(e) # Now this will be readable
+        trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_config and manager:
+            state.registry.release_manager(temp_config)
+            ASCIIColors.info(f"Released per-request model: {temp_config['model_name']}")
 
 
 @router.get("/list_models")
