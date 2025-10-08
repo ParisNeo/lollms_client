@@ -18,6 +18,7 @@ import gc
 import argparse
 import uvicorn
 from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, Form
+from fastapi import Request, Response
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import sys
@@ -686,89 +687,56 @@ async def generate_image(request: T2IRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/edit_image")
-async def edit_image(json_payload: str = Form(...), files: List[UploadFile] = []):
+async def edit_image(request: Request):
+    """
+    IMPROVED DEBUGGING ENDPOINT: This version inspects both multipart and JSON requests.
+    """
+    print("\n--- DEBUGGING /edit_image ---")
+    content_type = request.headers.get('content-type', '').lower()
+    print(f"Content-Type Header: {content_type}")
+
     try:
-        print("Received something")
-        return
-        data = EditRequestPayload.model_validate_json(json_payload)
-        manager = state.get_active_manager()
-        model_name = manager.config.get("model_name", "")
+        # Check if the request is multipart/form-data
+        if 'multipart/form-data' in content_type:
+            print("[INFO] Request is Multipart. Attempting to parse form fields.")
+            form_data = await request.form()
+            print(f"Available Form Fields: {list(form_data.keys())}")
 
-        pil_images = []
-        for file in files:
-            contents = await file.read()
-            pil_images.append(Image.open(BytesIO(contents)).convert("RGB"))
+            if "json_payload" in form_data:
+                print("\n[SUCCESS] Found 'json_payload' field.")
+                print(f"Content: {form_data['json_payload']}")
+            else:
+                print("\n[FAILURE] Did NOT find 'json_payload' field.")
 
-        if not pil_images:
-            raise HTTPException(status_code=400, detail="No images were uploaded for editing.")
+            uploaded_files = form_data.getlist("files")
+            if uploaded_files:
+                print("\n[SUCCESS] Found 'files' field.")
+                print(f"Number of files received: {len(uploaded_files)}")
+            else:
+                print("\n[FAILURE] Did NOT find any data in the 'files' field.")
 
-        params = data.params
-        pipeline_args = {"prompt": data.prompt, "generator": None}
+        # Check if the request is application/json
+        elif 'application/json' in content_type:
+            print("[INFO] Request is JSON. Form fields are not applicable.")
+            body_bytes = await request.body()
+            print("[INFO] Raw JSON Body Received:")
+            print(body_bytes.decode('utf-8', errors='ignore'))
         
-        seed = int(params.get("seed", -1))
-        if seed != -1:
-            pipeline_args["generator"] = torch.Generator(device=state.config["device"]).manual_seed(seed)
-
-        # We must check for the mask BEFORE determining the task
-        mask_image_param = params.get("mask_image")
-
-        # --- START OF THE FIX: Robust Mask Handling ---
-        if mask_image_param:
-            try:
-                # Assume it's a base64 string and try to decode it
-                if isinstance(mask_image_param, str):
-                    # Handle both raw base64 and Data URLs
-                    if ";base64," in mask_image_param:
-                        b64_data = mask_image_param.split(";base64,")[1]
-                    else:
-                        b64_data = mask_image_param
-                    
-                    mask_bytes = base64.b64decode(b64_data)
-                    mask = Image.open(BytesIO(mask_bytes)).convert("L")
-                    pipeline_args["mask_image"] = mask
-                else:
-                    # If not a string, it might be something else load_image supports
-                    mask = load_image(mask_image_param).convert("L")
-                    pipeline_args["mask_image"] = mask
-
-            except Exception as e:
-                ASCIIColors.warning(f"Could not process mask_image parameter: {e}. Attempting to load as path.")
-                try:
-                    # Fallback for file paths or URLs
-                    mask = load_image(mask_image_param).convert("L")
-                    pipeline_args["mask_image"] = mask
-                except Exception as final_e:
-                     raise HTTPException(status_code=400, detail=f"Invalid 'mask_image' provided. Could not process as base64 or load from path. Error: {final_e}")
-        # --- END OF THE FIX ---
-
-        task = "inpainting" if "mask_image" in pipeline_args else "image2image"
-
-        if "Qwen-Image-Edit-2509" in model_name:
-            ASCIIColors.info("Qwen-Image-Edit-2509 detected. Applying model-specific parameters.")
-            task = "image2image" # Override task for Qwen
-            # (The rest of the Qwen-specific logic remains the same)
-            # ...
-            if edit_mode == "inpainting":
-                task = "inpainting" # Re-set task if specifically inpainting with Qwen
-
         else:
-            # Standard model logic
-            pipeline_args["image"] = pil_images[0] 
-            pipeline_args["strength"] = float(params.get("strength", state.config.get("strength", 0.8)))
-            # (The rest of the standard logic remains the same)
-        
-        # (The logic for adding remaining params and running the pipeline remains the same)
-        for k, v in params.items():
-            if k not in pipeline_args and k != "mask_image":
-                pipeline_args[k] = v
-        
-        future = Future()
-        manager.queue.put((future, task, pipeline_args))
-        result_bytes = future.result()
-        return Response(content=result_bytes, media_type="image/png")
+            print(f"[WARNING] Unknown or unsupported Content-Type: {content_type}")
+            print("[INFO] Raw Request Body:")
+            body_bytes = await request.body()
+            print(body_bytes.decode('utf-8', errors='ignore'))
+
+
+        print("--- END DEBUGGING ---\n")
+        # Return a success response so the client doesn't time out
+        return Response(content="Debug check complete. See server logs.", status_code=200)
+
     except Exception as e:
+        print(f"AN ERROR OCCURRED DURING DEBUGGING: {e}")
         trace_exception(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error while parsing debug request. Check server logs.")
 
 @router.get("/list_models")
 def list_models_endpoint():
