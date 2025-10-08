@@ -289,11 +289,10 @@ class DiffusersBinding(LollmsTTIBinding):
         for i, img in enumerate(images):
             # 1. Check for PIL Image
             if hasattr(img, 'save'):
-                print("here")
-                # buffer = BytesIO()
-                # img.save(buffer, format="PNG")
-                # buffer.seek(0)
-                # files_to_upload.append(('files', (f"image_{i}.png", buffer, "image/png")))
+                buffer = BytesIO()
+                img.save(buffer, format="PNG")
+                buffer.seek(0)
+                files_to_upload.append(('files', (f"image_{i}.png", buffer, "image/png")))
             
             # 2. Check for string inputs (file path, Data URL, or raw base64)
             elif isinstance(img, str):
@@ -324,6 +323,8 @@ class DiffusersBinding(LollmsTTIBinding):
             
             # 3. Handle other unsupported types
             else:
+                 print("done")
+                 return None
                  raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
 
         if not files_to_upload:
