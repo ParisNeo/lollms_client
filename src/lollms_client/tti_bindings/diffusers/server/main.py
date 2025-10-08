@@ -723,7 +723,6 @@ async def generate_image(request: T2IRequest):
 
 @router.post("/edit_image")
 async def edit_image(request: EditRequestJSON):
-    return
     try:
         manager = state.get_active_manager()
         model_name = manager.config.get("model_name", "")
