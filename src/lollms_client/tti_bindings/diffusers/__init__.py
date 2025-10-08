@@ -282,7 +282,6 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
-        return None
         files_to_upload = []
         if not isinstance(images, list):
             images = [images]
@@ -304,6 +303,8 @@ class DiffusersBinding(LollmsTTIBinding):
                 
                 # Else, try to treat it as a base64 string (either Data URL or raw)
                 else:
+                    ASCIIColors.info(f"Attempting to decode string input as base64 image data...")
+                    return None
                     try:
                         # Check if it's a Data URL and extract the data part
                         if img.startswith("data:image/") and ";base64," in img:
