@@ -246,11 +246,11 @@ class DiffusersBinding(LollmsTTIBinding):
             # (Error handling is the same as above)
             ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
             ASCIIColors.error(f"Error details: {e}")
-            if hasattr(e, 'response') and e.response:
-                try:
-                    ASCIIColors.error(f"Server response: {e.response.json().get('detail', e.response.text)}")
-                except json.JSONDecodeError:
-                    ASCIIColors.error(f"Server raw response: {e.response.text}")
+            # if hasattr(e, 'response') and e.response:
+            #     try:
+            #         ASCIIColors.error(f"Server response: {e.response.json().get('detail', e.response.text)}")
+            #     except json.JSONDecodeError:
+            #         ASCIIColors.error(f"Server raw response: {e.response.text}")
             raise RuntimeError("Communication with the Diffusers server failed.") from e
         
     def _get_request(self, endpoint: str, params: Optional[dict] = None) -> requests.Response:
