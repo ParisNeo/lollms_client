@@ -282,11 +282,11 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
-        return None
         images_b64 = []
         if not isinstance(images, list):
             images = [images]
 
+        return None
         for img in images:
             # Case 1: Input is a PIL Image object
             if hasattr(img, 'save'):
