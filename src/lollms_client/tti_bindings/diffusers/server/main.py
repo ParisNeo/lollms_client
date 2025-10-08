@@ -17,7 +17,7 @@ import numpy as np
 import gc
 import argparse
 import uvicorn
-from fastapi import FastAPI, APouter, HTTPException, UploadFile, Form
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import sys
