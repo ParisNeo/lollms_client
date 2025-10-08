@@ -287,6 +287,8 @@ class DiffusersBinding(LollmsTTIBinding):
             images = [images]
 
         for i, img in enumerate(images):
+            if isinstance(img, str):
+                print("STR image")
             continue
             # 1. Check for PIL Image
             if hasattr(img, 'save'):
