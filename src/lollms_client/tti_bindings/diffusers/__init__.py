@@ -322,7 +322,7 @@ class DiffusersBinding(LollmsTTIBinding):
             "images_b64": images_b64,
             "params": kwargs
         }
-        
+        return None
         response = self._post_json_request("/edit_image", data=json_payload)
         return response.content
 

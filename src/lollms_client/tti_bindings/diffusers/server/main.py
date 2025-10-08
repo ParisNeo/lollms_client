@@ -159,10 +159,6 @@ SCHEDULER_USES_KARRAS_SIGMAS = [
     "dpm++_2m_sde_karras","dpm2_karras","dpm2_a_karras"
 ]
 
-class EditRequestJSON(BaseModel):
-    prompt: str
-    images_b64: List[str] = Field(description="A list of Base64 encoded image strings.")
-    params: Dict[str, Any] = Field(default_factory=dict)
 
 class ModelManager:
     def __init__(self, config: Dict[str, Any], models_path: Path, registry: 'PipelineRegistry'):
@@ -647,6 +643,40 @@ class EditRequestPayload(BaseModel):
     image_paths: List[str] = Field(default_factory=list)
     params: Dict[str, Any] = Field(default_factory=dict)
 
+class EditRequestJSON(BaseModel):
+    prompt: str
+    images_b64: List[str] = Field(description="A list of Base64 encoded image strings.")
+    params: Dict[str, Any] = Field(default_factory=dict)
+def get_sanitized_request_for_logging(request_data: Any) -> Dict[str, Any]:
+    """
+    Takes a request object (Pydantic model or dict) and returns a 'safe' dictionary
+    for logging, with long base64 strings replaced by placeholders.
+    """
+    import copy
+
+    try:
+        if hasattr(request_data, 'model_dump'):
+            data = request_data.model_dump()
+        elif isinstance(request_data, dict):
+            data = copy.deepcopy(request_data)
+        else:
+            return {"error": "Unsupported data type for sanitization"}
+
+        # Sanitize the main list of images
+        if 'images_b64' in data and isinstance(data['images_b64'], list):
+            count = len(data['images_b64'])
+            data['images_b64'] = f"[<{count} base64 image(s) truncated>]"
+
+        # Sanitize a potential mask in the 'params' dictionary
+        if 'params' in data and isinstance(data.get('params'), dict):
+            if 'mask_image' in data['params'] and isinstance(data['params']['mask_image'], str):
+                original_len = len(data['params']['mask_image'])
+                data['params']['mask_image'] = f"[<base64 mask truncated, len={original_len}>]"
+        
+        return data
+    except Exception:
+        return {"error": "Failed to sanitize request data."}
+
 # --- API Endpoints ---
 @router.post("/generate_image")
 async def generate_image(request: T2IRequest):
@@ -693,6 +723,7 @@ async def generate_image(request: T2IRequest):
 
 @router.post("/edit_image")
 async def edit_image(request: EditRequestJSON):
+    return
     try:
         manager = state.get_active_manager()
         model_name = manager.config.get("model_name", "")
@@ -731,7 +762,14 @@ async def edit_image(request: EditRequestJSON):
         
         future = Future(); manager.queue.put((future, task, pipeline_args))
         return Response(content=future.result(), media_type="image/png")
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        # --- THIS IS THE FIX ---
+        sanitized_payload = get_sanitized_request_for_logging(request)
+        ASCIIColors.error(f"Exception in /edit_image. Sanitized Payload: {json.dumps(sanitized_payload, indent=2)}")
+        trace_exception(e) # Now this will be readable
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/list_models")
 def list_models_endpoint():
     civitai = [{'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']} for key, info in CIVITAI_MODELS.items()]
