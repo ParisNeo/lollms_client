@@ -2,6 +2,9 @@
 import sys
 from typing import Optional, List, Dict, Any, Union
 import os
+import io
+import base64
+import requests
 
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import trace_exception, ASCIIColors
@@ -10,16 +13,17 @@ import math
 # --- SDK & Dependency Management ---
 try:
     import pipmaster as pm
-    # Ensure both potential SDKs and Pillow are available
-    pm.ensure_packages(['google-cloud-aiplatform', 'google-generativeai', 'Pillow'])
+    # Ensure necessary packages are available
+    pm.ensure_packages(['google-cloud-aiplatform', 'google-generativeai', 'Pillow', 'requests'])
 except ImportError:
     pass # pipmaster is optional
 
 # Attempt to import Vertex AI (google-cloud-aiplatform)
 try:
     import vertexai
-    from vertexai.preview.vision_models import ImageGenerationModel
+    from vertexai.preview.vision_models import ImageGenerationModel, Image
     from google.api_core import exceptions as google_exceptions
+    from PIL import Image as PILImage
     VERTEX_AI_AVAILABLE = True
 except ImportError:
     VERTEX_AI_AVAILABLE = False
@@ -36,33 +40,51 @@ except ImportError:
 BindingName = "GeminiTTIBinding_Impl"
 
 # Known Imagen models for each service
-IMAGEN_VERTEX_MODELS = ["imagegeneration@006", "imagegeneration@005", "imagegeneration@002"]
-IMAGEN_GEMINI_API_MODELS = ["imagen-3", "gemini-1.5-flash-preview-0514"] # Short names are often aliases
+IMAGEN_VERTEX_MODELS = ["imagegeneration@006", "imagen-3.0-generate-002", "gemini-2.5-flash-image"]
+IMAGEN_GEMINI_API_MODELS = ["imagen-3", "gemini-1.5-flash-preview-0514", "gemini-2.5-flash-image"]
 GEMINI_API_KEY_ENV_VAR = "GEMINI_API_KEY"
+
+
+def _is_base64(s):
+    """Check if a string is a valid base64 encoded string."""
+    try:
+        # We don't need the result, just to see if it decodes
+        base64.b64decode(s.split(',')[-1], validate=True)
+        return True
+    except (TypeError, ValueError, binascii.Error):
+        return False
+
+def _load_image_from_str(image_str: str) -> bytes:
+    """Loads image data from a URL or a base64 encoded string."""
+    if image_str.startswith(('http://', 'https://')):
+        try:
+            response = requests.get(image_str)
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            raise IOError(f"Failed to download image from URL: {image_str}") from e
+    elif _is_base64(image_str):
+        # Handle data URLs (e.g., "data:image/png;base64,iVBOR...")
+        header, encoded = image_str.split(',', 1)
+        return base64.b64decode(encoded)
+    else:
+        raise ValueError("Image string is not a valid URL or base64 string.")
+
 
 class GeminiTTIBinding_Impl(LollmsTTIBinding):
     """
-    Concrete implementation of LollmsTTIBinding for Google's Imagen models.
+    Concrete implementation of LollmsTTIBinding for Google's Imagen and Gemini models.
     Supports both Vertex AI (project_id) and Gemini API (api_key) authentication.
+    Includes support for image generation, editing, and inpainting.
     """
     def __init__(self, **kwargs):
         """
         Initialize the Gemini (Vertex AI / API) TTI binding.
-
-        Args:
-            **kwargs: Configuration parameters.
-                      - auth_method (str): "vertex_ai" or "api_key". (Required)
-                      - project_id (str): Google Cloud project ID (for vertex_ai).
-                      - location (str): Google Cloud region (for vertex_ai).
-                      - service_key (str): Gemini API Key (for api_key).
-                      - model_name (str): The Imagen model to use.
-                      - default_seed (int): Default seed for generation (-1 for random).
-                      - default_guidance_scale (float): Default guidance scale (CFG).
         """
         super().__init__(binding_name="gemini")
 
         # Core settings
-        self.auth_method = kwargs.get("auth_method", "vertex_ai") # Default to vertex_ai for backward compatibility
+        self.auth_method = kwargs.get("auth_method", "vertex_ai")
 
         # Vertex AI specific settings
         self.project_id = kwargs.get("project_id")
@@ -77,13 +99,11 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
         self.default_guidance_scale = float(kwargs.get("default_guidance_scale", 7.5))
         self.client_id = kwargs.get("client_id", "gemini_client_user")
         
-        # The actual client/model instance
         self.client: Optional[Any] = None
 
-        # --- Validation and Initialization ---
         if self.auth_method == "vertex_ai":
             if not VERTEX_AI_AVAILABLE:
-                raise ImportError("Vertex AI authentication selected, but 'google-cloud-aiplatform' is not installed.")
+                raise ImportError("Vertex AI authentication selected, but 'google-cloud-aiplatform' or 'Pillow' are not installed.")
             if not self.project_id:
                 raise ValueError("For 'vertex_ai' auth, a Google Cloud 'project_id' is required.")
             if not self.model_name:
@@ -92,7 +112,6 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
             if not GEMINI_API_AVAILABLE:
                 raise ImportError("API Key authentication selected, but 'google-generativeai' is not installed.")
             
-            # Resolve API key from kwargs or environment variable
             if not self.gemini_api_key:
                 ASCIIColors.info(f"API key not provided directly, checking environment variable '{GEMINI_API_KEY_ENV_VAR}'...")
                 self.gemini_api_key = os.environ.get(GEMINI_API_KEY_ENV_VAR)
@@ -117,8 +136,6 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
                 ASCIIColors.green(f"Vertex AI initialized successfully. Project: '{self.project_id}', Model: '{self.model_name}'")
             elif self.auth_method == "api_key":
                 genai.configure(api_key=self.gemini_api_key)
-                # For the genai SDK, the "client" is the configured module itself,
-                # and we specify the model per-call. Let's store the genai module.
                 self.client = genai
                 ASCIIColors.green(f"Gemini API configured successfully. Model to be used: '{self.model_name}'")
         except google_exceptions.PermissionDenied as e:
@@ -139,7 +156,7 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
 
     def _get_aspect_ratio_for_api(self, width: int, height: int) -> str:
         """Finds the closest supported aspect ratio string for the Gemini API."""
-        ratios = {"1:1": 1.0, "16:9": 16/9, "9:16": 9/16, "4:3": 4/3, "3:4": 3/4}
+        ratios = {"1:1": 1.0, "16:9": 16/9, "9:16": 9/16, "4:3": 4/3, "3:4": 3/4, "21:9":21/9, "3:2":3/2, "2:3":2/3}
         target_ratio = width / height
         closest_ratio_name = min(ratios, key=lambda r: abs(ratios[r] - target_ratio))
         ASCIIColors.info(f"Converted {width}x{height} to closest aspect ratio: '{closest_ratio_name}' for Gemini API.")
@@ -151,33 +168,27 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
                        width: int = 1024,
                        height: int = 1024,
                        **kwargs) -> bytes:
-        """
-        Generates image data using the configured Google Imagen model.
-        """
         if not self.client:
             raise RuntimeError("Google client is not initialized. Cannot generate image.")
 
-        # Use overrides from kwargs, otherwise instance defaults
         seed = kwargs.get("seed", self.default_seed)
         guidance_scale = kwargs.get("guidance_scale", self.default_guidance_scale)
         gen_seed = seed if seed != -1 else None
 
-        final_prompt = prompt
-        if negative_prompt:
-            final_prompt = f"{prompt}. Do not include: {negative_prompt}."
-
-        ASCIIColors.info(f"Generating image with prompt: '{final_prompt[:100]}...'")
+        ASCIIColors.info(f"Generating image with prompt: '{prompt[:100]}...'")
 
         try:
             if self.auth_method == "vertex_ai":
                 self._validate_dimensions_vertex(width, height)
                 gen_params = {
-                    "prompt": final_prompt,
+                    "prompt": prompt,
                     "number_of_images": 1,
                     "width": width,
                     "height": height,
                     "guidance_scale": guidance_scale,
                 }
+                if negative_prompt:
+                    gen_params["negative_prompt"] = negative_prompt
                 if gen_seed is not None:
                     gen_params["seed"] = gen_seed
                 
@@ -190,13 +201,13 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
                 return response.images[0]._image_bytes
 
             elif self.auth_method == "api_key":
+                final_prompt = f"{prompt}. Do not include: {negative_prompt}." if negative_prompt else prompt
                 aspect_ratio = self._get_aspect_ratio_for_api(width, height)
                 gen_params = {
                     "model": self.model_name,
                     "prompt": final_prompt,
                     "number_of_images": 1,
                     "aspect_ratio": aspect_ratio
-                    # Note: seed and guidance_scale are not standard in this simpler API call
                 }
                 ASCIIColors.debug(f"Gemini API generation parameters: {gen_params}")
                 response = self.client.generate_image(**gen_params)
@@ -216,53 +227,99 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
             trace_exception(e)
             raise Exception(f"Imagen image generation failed: {e}") from e
 
+    def edit_image(self,
+                   images: Union[str, List[str]],
+                   prompt: str,
+                   negative_prompt: Optional[str] = "",
+                   mask: Optional[str] = None,
+                   width: Optional[int] = None,
+                   height: Optional[int] = None,
+                   **kwargs) -> bytes:
+        if self.auth_method != "vertex_ai":
+            raise NotImplementedError("Image editing is only supported via the 'vertex_ai' authentication method.")
+        if not self.client:
+            raise RuntimeError("Vertex AI client is not initialized.")
+
+        if isinstance(images, list):
+            if len(images) > 1:
+                raise ValueError("Vertex AI edit_image only supports a single base image.")
+            image_str = images[0]
+        else:
+            image_str = images
+
+        ASCIIColors.info(f"Editing image with prompt: '{prompt[:100]}...'")
+        
+        try:
+            image_bytes = _load_image_from_str(image_str)
+            base_image = Image(image_bytes=image_bytes)
+            
+            mask_image = None
+            if mask:
+                mask_bytes = _load_image_from_str(mask)
+                mask_image = Image(image_bytes=mask_bytes)
+
+            seed = kwargs.get("seed", self.default_seed)
+            gen_seed = seed if seed != -1 else None
+            
+            edit_params = {
+                "prompt": prompt,
+                "base_image": base_image,
+                "mask": mask_image,
+                "negative_prompt": negative_prompt if negative_prompt else None,
+                "number_of_images": 1
+            }
+            # Add any extra valid parameters from kwargs (like edit_mode)
+            if "edit_mode" in kwargs:
+                edit_params["edit_mode"] = kwargs["edit_mode"]
+
+            if gen_seed is not None:
+                edit_params["seed"] = gen_seed
+            
+            ASCIIColors.debug(f"Vertex AI edit parameters: {edit_params}")
+            response = self.client.edit_image(**edit_params)
+
+            if not response.images:
+                raise Exception("Image editing resulted in no images. Check safety filters.")
+            
+            return response.images[0]._image_bytes
+
+        except Exception as e:
+            trace_exception(e)
+            raise Exception(f"Imagen image editing failed: {e}") from e
+
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
-        """Lists available Imagen models for the current auth method."""
+        """Lists available models for the current auth method."""
         models = IMAGEN_VERTEX_MODELS if self.auth_method == "vertex_ai" else IMAGEN_GEMINI_API_MODELS
         service_name = "Vertex AI" if self.auth_method == "vertex_ai" else "Gemini API"
         return [
             {
                 "name": name,
-                "caption": f"Google Imagen ({name}) via {service_name}",
+                "caption": f"Google ({name}) via {service_name}",
                 "help": "High-quality text-to-image model from Google."
             } for name in models
         ]
 
-    def get_settings(self, **kwargs) -> List[Dict[str, Any]]:
+    def get_settings(self, **kwargs) -> Optional[Dict[str, Any]]:
         """Retrieves the current configurable settings for the binding."""
-        settings = [
-            {"name": "auth_method", "type": "str", "value": self.auth_method, "description": "Authentication method to use.", "options": ["vertex_ai", "api_key"], "category": "Authentication"},
-        ]
-        if self.auth_method == "vertex_ai":
-            settings.extend([
-                {"name": "project_id", "type": "str", "value": self.project_id, "description": "Your Google Cloud project ID.", "category": "Authentication"},
-                {"name": "location", "type": "str", "value": self.location, "description": "Google Cloud region (e.g., 'us-central1').", "category": "Authentication"},
-                {"name": "model_name", "type": "str", "value": self.model_name, "description": "Default Imagen model for generation.", "options": IMAGEN_VERTEX_MODELS, "category": "Model Configuration"},
-            ])
-        elif self.auth_method == "api_key":
-            settings.extend([
-                {"name": "api_key_status", "type": "str", "value": "Set" if self.gemini_api_key else "Not Set", "description": f"Gemini API Key status (set at initialization via service_key or '{GEMINI_API_KEY_ENV_VAR}').", "category": "Authentication", "read_only": True},
-                {"name": "model_name", "type": "str", "value": self.model_name, "description": "Default Imagen model for generation.", "options": IMAGEN_GEMINI_API_MODELS, "category": "Model Configuration"},
-            ])
-        
-        settings.extend([
-            {"name": "default_seed", "type": "int", "value": self.default_seed, "description": "Default seed (-1 for random).", "category": "Image Generation Defaults"},
-            {"name": "default_guidance_scale", "type": "float", "value": self.default_guidance_scale, "description": "Default guidance scale (CFG). (Vertex AI only)", "category": "Image Generation Defaults"},
-        ])
-        return settings
+        # Adheres to the Dict[str, Any] return type
+        return {
+            "auth_method": self.auth_method,
+            "project_id": self.project_id if self.auth_method == "vertex_ai" else None,
+            "location": self.location if self.auth_method == "vertex_ai" else None,
+            "model_name": self.model_name,
+            "default_seed": self.default_seed,
+            "default_guidance_scale": self.default_guidance_scale
+        }
 
-    def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
+    def set_settings(self, settings: Dict[str, Any], **kwargs) -> bool:
         """Applies new settings. Re-initializes the client if core settings change."""
+        # Adheres to the Dict[str, Any] input type
         applied_some_settings = False
-        settings_dict = {item["name"]: item["value"] for item in settings} if isinstance(settings, list) else settings
-
         needs_reinit = False
         
-        # Phase 1: Check for auth_method or core credential changes
-        if "auth_method" in settings_dict and self.auth_method != settings_dict["auth_method"]:
-            self.auth_method = settings_dict["auth_method"]
+        if "auth_method" in settings and self.auth_method != settings["auth_method"]:
+            self.auth_method = settings["auth_method"]
             ASCIIColors.info(f"Authentication method changed to: {self.auth_method}")
-            # Reset model to a valid default for the new method
             if self.auth_method == "vertex_ai":
                 self.model_name = IMAGEN_VERTEX_MODELS[0]
             else:
@@ -272,32 +329,29 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
             applied_some_settings = True
         
         if self.auth_method == "vertex_ai":
-            if "project_id" in settings_dict and self.project_id != settings_dict["project_id"]:
-                self.project_id = settings_dict["project_id"]
+            if "project_id" in settings and self.project_id != settings["project_id"]:
+                self.project_id = settings["project_id"]
                 needs_reinit = True; applied_some_settings = True
-            if "location" in settings_dict and self.location != settings_dict["location"]:
-                self.location = settings_dict["location"]
+            if "location" in settings and self.location != settings["location"]:
+                self.location = settings["location"]
                 needs_reinit = True; applied_some_settings = True
-        # API key is not settable after init, so we don't check for it here.
 
-        # Phase 2: Apply other settings
         current_models = IMAGEN_VERTEX_MODELS if self.auth_method == "vertex_ai" else IMAGEN_GEMINI_API_MODELS
-        if "model_name" in settings_dict:
-            new_model = settings_dict["model_name"]
+        if "model_name" in settings:
+            new_model = settings["model_name"]
             if new_model not in current_models:
                 ASCIIColors.warning(f"Invalid model '{new_model}' for auth method '{self.auth_method}'. Keeping '{self.model_name}'.")
             elif self.model_name != new_model:
                 self.model_name = new_model
                 needs_reinit = True; applied_some_settings = True
 
-        if "default_seed" in settings_dict and self.default_seed != int(settings_dict["default_seed"]):
-            self.default_seed = int(settings_dict["default_seed"])
+        if "default_seed" in settings and self.default_seed != int(settings["default_seed"]):
+            self.default_seed = int(settings["default_seed"])
             applied_some_settings = True
-        if "default_guidance_scale" in settings_dict and self.default_guidance_scale != float(settings_dict["default_guidance_scale"]):
-            self.default_guidance_scale = float(settings_dict["default_guidance_scale"])
+        if "default_guidance_scale" in settings and self.default_guidance_scale != float(settings["default_guidance_scale"]):
+            self.default_guidance_scale = float(settings["default_guidance_scale"])
             applied_some_settings = True
 
-        # Phase 3: Re-initialize if needed
         if needs_reinit:
             try:
                 self._initialize_client()
@@ -308,13 +362,13 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
         return applied_some_settings
 
     def list_models(self) -> list:
-        """Lists available Imagen models in a standardized format."""
+        """Lists available Imagen/Gemini models in a standardized format."""
         models = IMAGEN_VERTEX_MODELS if self.auth_method == "vertex_ai" else IMAGEN_GEMINI_API_MODELS
         return [
             {
                 'model_name': name,
-                'display_name': f"Imagen ({name})",
-                'description': f"Google's Imagen model, version {name}",
+                'display_name': f"Google ({name})",
+                'description': f"Google's Imagen/Gemini model, version {name}",
                 'owned_by': 'Google'
             } for name in models
         ]

@@ -1,29 +1,50 @@
-title: Google Vertex AI (Imagen) TTI Binding
+title: Google Gemini / Vertex AI TTI Binding
 author: ParisNeo
 creation_date: 2025-08-13
-last_update_date: 2025-08-13
+last_update_date: 2025-10-07
 description: |
-  A binding for Google's Imagen 2 models, available via the Vertex AI platform.
-  It uses the google-cloud-aiplatform SDK to connect to Vertex AI and generate high-quality images.
-  Authentication is handled via Application Default Credentials (ADC). Run 'gcloud auth application-default login' in your terminal to set it up.
+  A binding for Google's state-of-the-art text-to-image models, including Imagen 3 and Gemini 2.5 Flash.
+  This binding supports two methods of authentication:
+  1.  **Vertex AI**: For full-featured access, including image editing and inpainting. Requires a Google Cloud project and authentication via Application Default Credentials (ADC). To set this up, run 'gcloud auth application-default login' in your terminal.
+  2.  **Gemini API Key**: A simpler method for image generation using a Gemini API key.
+
 input_parameters:
+  - name: auth_method
+    type: str
+    description: "The authentication method to use. 'vertex_ai' offers more features like editing and inpainting, while 'api_key' is simpler for basic generation."
+    options: ["vertex_ai", "api_key"]
+    mandatory: true
+    default: "vertex_ai"
+
   - name: project_id
     type: str
-    description: "Your Google Cloud project ID."
-    mandatory: true
+    description: "Your Google Cloud project ID. (Required for 'vertex_ai' method)."
+    mandatory: false # Mandatory only if auth_method is 'vertex_ai'
+
   - name: location
     type: str
-    description: "The Google Cloud region for your project (e.g., 'us-central1')."
-    mandatory: true
+    description: "The Google Cloud region for your project (e.g., 'us-central1'). (Required for 'vertex_ai' method)."
+    mandatory: false # Mandatory only if auth_method is 'vertex_ai'
+    default: "us-central1"
+
+  - name: service_key
+    type: str
+    description: "Your Gemini API Key. (Required for 'api_key' method). Can also be set via the GEMINI_API_KEY environment variable."
+    mandatory: false # Mandatory only if auth_method is 'api_key'
+
   - name: model_name
     type: str
-    description: "The Imagen model version to use. Defaults to 'imagegeneration@006'."
+    description: "The model to use. The list of available models depends on the selected auth_method. Defaults to the latest recommended model for the chosen service."
     mandatory: false
+
   - name: seed
     type: int
     description: "The default seed for generation. Use -1 for a random seed."
     mandatory: false
+    default: -1
+
   - name: guidance_scale
     type: float
-    description: "The default guidance scale (CFG) for generation. Controls how closely the output follows the prompt."
+    description: "The default guidance scale (CFG). Controls how closely the output follows the prompt. (Primarily for 'vertex_ai' method)."
     mandatory: false
+    default: 7.5
