@@ -311,7 +311,8 @@ class DiffusersBinding(LollmsTTIBinding):
                     except Exception:
                         ASCIIColors.warning(f"Warning: A string input was not a valid file path or base64. Skipping.")
             else:
-                 raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
+                return None
+                raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
         return None
         if not images_b64:
             raise ValueError("No valid images were provided to the edit_image function.")
