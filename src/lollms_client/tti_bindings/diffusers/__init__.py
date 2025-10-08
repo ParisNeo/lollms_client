@@ -297,6 +297,7 @@ class DiffusersBinding(LollmsTTIBinding):
             
             # Case 2: Input is a string (could be path or already base64)
             elif isinstance(img, str):
+                return None
                 if Path(img).is_file():
                     with open(Path(img), 'rb') as f:
                         b64_string = base64.b64encode(f.read()).decode('utf-8')
