@@ -296,6 +296,9 @@ class DiffusersBinding(LollmsTTIBinding):
             
             # 2. Check for string inputs (file path, Data URL, or raw base64)
             elif isinstance(img, str):
+                print("done")
+                return None
+
                 # Try to treat it as a file path first
                 if Path(img).is_file():
                     file_path = Path(img)
@@ -323,8 +326,6 @@ class DiffusersBinding(LollmsTTIBinding):
             
             # 3. Handle other unsupported types
             else:
-                 print("done")
-                 return None
                  raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
 
         if not files_to_upload:
