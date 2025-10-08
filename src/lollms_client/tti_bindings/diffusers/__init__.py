@@ -332,7 +332,7 @@ class DiffusersBinding(LollmsTTIBinding):
             raise ValueError("No valid images were provided to the edit_image function. Please provide a file path, PIL image, or base64 string.")
 
         if "mask" in kwargs and kwargs["mask"]:
-            aa = kwargs.pop("mask")
+            kwargs["mask_image"] = kwargs.pop("mask")
         data_for_form = {
             "json_payload": json.dumps({
                 "prompt": prompt,
