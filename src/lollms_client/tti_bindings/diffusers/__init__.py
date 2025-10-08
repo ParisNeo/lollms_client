@@ -267,7 +267,7 @@ class DiffusersBinding(LollmsTTIBinding):
     def unload_model(self):
         ASCIIColors.info("Requesting server to unload the current model...")
         try:
-            self._post_request("/unload_model")
+            self._post_json_request("/unload_model")
         except Exception as e:
             ASCIIColors.warning(f"Could not send unload request to server: {e}")
         pass
@@ -363,7 +363,7 @@ class DiffusersBinding(LollmsTTIBinding):
     def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
         # Normalize settings from list of dicts to a single dict if needed
         parsed_settings = settings if isinstance(settings, dict) else {s["name"]: s["value"] for s in settings if "name" in s and "value" in s}
-        response = self._post_request("/set_settings", data=parsed_settings)
+        response = self._post_json_request("/set_settings", data=parsed_settings)
         return response.json().get("success", False)
 
     def ps(self) -> List[dict]:
