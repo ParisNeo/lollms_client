@@ -282,68 +282,49 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
-        files_to_upload = []
+        images_b64 = []
         if not isinstance(images, list):
             images = [images]
 
-        for i, img in enumerate(images):
-            # 1. Check for PIL Image
-            # 2. Check for string inputs (file path, Data URL, or raw base64)
-            if isinstance(img, str):
-                # --- START OF THE ROBUST FIX ---
-                # First, check if it's a valid file path
-                if Path(img).is_file():
-                    file_path = Path(img)
-                    # Safely open, read the bytes into memory, and then close the file.
-                    with open(file_path, 'rb') as f:
-                        file_bytes = f.read()
-                    # Pass the raw bytes, not the file handle. This is much safer.
-                    files_to_upload.append(('files', (file_path.name, file_bytes, 'image/png')))
-                # --- END OF THE ROBUST FIX ---
-                else:
-                    try:
-                        # Check if it's a Data URL and extract the data part
-                        if img.startswith("data:image/") and ";base64," in img:
-                            b64_data = img.split(";base64,")[1]
-                        # --- THIS IS THE FIX ---
-                        # Otherwise, assume the whole string is raw base64 data
-                        else:
-                            b64_data = img
-                        
-                        # Attempt to decode it
-                        img_bytes = base64.b64decode(b64_data)
-                        files_to_upload.append(('files', (f"image_{i}.png", img_bytes, "image/png")))
-                    except Exception:
-                        # If it's not a file path and decoding fails, it's an invalid string.
-                        # We simply ignore it and continue.
-                        ASCIIColors.warning(f"Warning: A string input was not a valid file path or base64 content. Skipping.")
-                        pass
-            elif hasattr(img, 'save'):
+        for img in images:
+            # Case 1: Input is a PIL Image object
+            if hasattr(img, 'save'):
                 buffer = BytesIO()
                 img.save(buffer, format="PNG")
-                buffer.seek(0)
-                files_to_upload.append(('files', (f"image_{i}.png", buffer, "image/png")))
-
-            # 3. Handle other unsupported types
+                b64_string = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                images_b64.append(b64_string)
+            
+            # Case 2: Input is a string (could be path or already base64)
+            elif isinstance(img, str):
+                if Path(img).is_file():
+                    with open(Path(img), 'rb') as f:
+                        b64_string = base64.b64encode(f.read()).decode('utf-8')
+                    images_b64.append(b64_string)
+                else:
+                    try:
+                        b64_string = img.split(";base64,")[1] if ";base64," in img else img
+                        base64.b64decode(b64_string) # Validate
+                        images_b64.append(b64_string)
+                    except Exception:
+                        ASCIIColors.warning(f"Warning: A string input was not a valid file path or base64. Skipping.")
             else:
                  raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
 
-        if not files_to_upload:
-            raise ValueError("No valid images were provided to the edit_image function. Please provide a file path, PIL image, or base64 string.")
+        if not images_b64:
+            raise ValueError("No valid images were provided to the edit_image function.")
 
+        # Translate "mask" to "mask_image" for server compatibility
         if "mask" in kwargs and kwargs["mask"]:
             kwargs["mask_image"] = kwargs.pop("mask")
-        data_for_form = {
-            "json_payload": json.dumps({
-                "prompt": prompt,
-                "image_paths": [],
-                "params": kwargs
-            })
-        }
-        print("READY to send multipart request with images")
-        response = self._post_multipart_request("/edit_image", data=data_for_form, files=files_to_upload)
-        return response.content
 
+        json_payload = {
+            "prompt": prompt,
+            "images_b64": images_b64,
+            "params": kwargs
+        }
+        
+        response = self._post_json_request("/edit_image", data=json_payload)
+        return response.content
 
     def list_models(self) -> List[Dict[str, Any]]:
         return self._get_request("/list_models").json()

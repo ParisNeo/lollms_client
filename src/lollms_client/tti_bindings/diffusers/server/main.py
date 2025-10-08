@@ -159,6 +159,11 @@ SCHEDULER_USES_KARRAS_SIGMAS = [
     "dpm++_2m_sde_karras","dpm2_karras","dpm2_a_karras"
 ]
 
+class EditRequestJSON(BaseModel):
+    prompt: str
+    images_b64: List[str] = Field(description="A list of Base64 encoded image strings.")
+    params: Dict[str, Any] = Field(default_factory=dict)
+
 class ModelManager:
     def __init__(self, config: Dict[str, Any], models_path: Path, registry: 'PipelineRegistry'):
         self.config = config
@@ -687,57 +692,46 @@ async def generate_image(request: T2IRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/edit_image")
-async def edit_image(request: Request):
-    """
-    IMPROVED DEBUGGING ENDPOINT: This version inspects both multipart and JSON requests.
-    """
-    print("\n--- DEBUGGING /edit_image ---")
-    content_type = request.headers.get('content-type', '').lower()
-    print(f"Content-Type Header: {content_type}")
-    return
+async def edit_image(request: EditRequestJSON):
     try:
-        # Check if the request is multipart/form-data
-        if 'multipart/form-data' in content_type:
-            print("[INFO] Request is Multipart. Attempting to parse form fields.")
-            form_data = await request.form()
-            print(f"Available Form Fields: {list(form_data.keys())}")
+        manager = state.get_active_manager()
+        model_name = manager.config.get("model_name", "")
 
-            if "json_payload" in form_data:
-                print("\n[SUCCESS] Found 'json_payload' field.")
-                print(f"Content: {form_data['json_payload']}")
-            else:
-                print("\n[FAILURE] Did NOT find 'json_payload' field.")
+        pil_images = []
+        for b64_string in request.images_b64:
+            b64_data = b64_string.split(";base64,")[1] if ";base64," in b64_string else b64_string
+            image_bytes = base64.b64decode(b64_data)
+            pil_images.append(Image.open(BytesIO(image_bytes)).convert("RGB"))
 
-            uploaded_files = form_data.getlist("files")
-            if uploaded_files:
-                print("\n[SUCCESS] Found 'files' field.")
-                print(f"Number of files received: {len(uploaded_files)}")
-            else:
-                print("\n[FAILURE] Did NOT find any data in the 'files' field.")
+        if not pil_images: raise HTTPException(status_code=400, detail="No valid images provided.")
 
-        # Check if the request is application/json
-        elif 'application/json' in content_type:
-            print("[INFO] Request is JSON. Form fields are not applicable.")
-            body_bytes = await request.body()
-            print("[INFO] Raw JSON Body Received:")
-            print(body_bytes.decode('utf-8', errors='ignore'))
+        params = request.params
+        pipeline_args = {"prompt": request.prompt}
+        seed = int(params.get("seed", -1))
+        if seed != -1: pipeline_args["generator"] = torch.Generator(device=state.config["device"]).manual_seed(seed)
         
+        if "mask_image" in params and params["mask_image"]:
+            b64_mask = params["mask_image"]
+            b64_data = b64_mask.split(";base64,")[1] if ";base64," in b64_mask else b64_mask
+            mask_bytes = base64.b64decode(b64_data)
+            pipeline_args["mask_image"] = Image.open(BytesIO(mask_bytes)).convert("L")
+        
+        task = "inpainting" if "mask_image" in pipeline_args else "image2image"
+        
+        if "Qwen-Image-Edit-2509" in model_name:
+            task = "image2image"
+            pipeline_args.update({"true_cfg_scale": 4.0, "guidance_scale": 1.0, "num_inference_steps": 40, "negative_prompt": " "})
+            edit_mode = params.get("edit_mode", "fusion")
+            if edit_mode == "fusion": pipeline_args["image"] = pil_images
+            # Add other qwen modes here if needed
         else:
-            print(f"[WARNING] Unknown or unsupported Content-Type: {content_type}")
-            print("[INFO] Raw Request Body:")
-            body_bytes = await request.body()
-            print(body_bytes.decode('utf-8', errors='ignore'))
+            pipeline_args.update({"image": pil_images[0], "strength": 0.8, "guidance_scale": 7.5, "num_inference_steps": 25})
 
-
-        print("--- END DEBUGGING ---\n")
-        # Return a success response so the client doesn't time out
-        return Response(content="Debug check complete. See server logs.", status_code=200)
-
-    except Exception as e:
-        print(f"AN ERROR OCCURRED DURING DEBUGGING: {e}")
-        trace_exception(e)
-        raise HTTPException(status_code=500, detail="Error while parsing debug request. Check server logs.")
-
+        pipeline_args.update(params) # Allow user overrides
+        
+        future = Future(); manager.queue.put((future, task, pipeline_args))
+        return Response(content=future.result(), media_type="image/png")
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 @router.get("/list_models")
 def list_models_endpoint():
     civitai = [{'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']} for key, info in CIVITAI_MODELS.items()]
