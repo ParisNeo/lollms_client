@@ -296,9 +296,6 @@ class DiffusersBinding(LollmsTTIBinding):
             
             # 2. Check for string inputs (file path, Data URL, or raw base64)
             elif isinstance(img, str):
-                print("done")
-                return None
-
                 # Try to treat it as a file path first
                 if Path(img).is_file():
                     file_path = Path(img)
