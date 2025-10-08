@@ -282,6 +282,7 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
+        return None
         images_b64 = []
         if not isinstance(images, list):
             images = [images]
@@ -322,7 +323,6 @@ class DiffusersBinding(LollmsTTIBinding):
             "images_b64": images_b64,
             "params": kwargs
         }
-        return None
         response = self._post_json_request("/edit_image", data=json_payload)
         return response.content
 
