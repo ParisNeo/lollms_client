@@ -287,7 +287,7 @@ class DiffusersBinding(LollmsTTIBinding):
             images = [images]
 
         for i, img in enumerate(images):
-            ASCIIColors.info(f"Attempting to decode string input as base64 image data...")
+            ASCIIColors.info(f"Attempting to decode string input as base64 image data... {type(img)}")
             return None
             # 1. Check for PIL Image
             if hasattr(img, 'save'):
