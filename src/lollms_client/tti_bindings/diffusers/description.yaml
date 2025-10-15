@@ -26,6 +26,15 @@ description: |
   or per-request at runtime. Runtime overrides global, which overrides defaults.
 
 input_parameters:
+  - name: "port"
+    type: "int"
+    default: 9630
+    description: "The port number on which the dedicated Diffusers server will run."
+
+  - name: "extra_models_path"
+    type: "str"
+    default: ""
+    description: "An optional path to an extra folder containing personalized models (.safetensors files)."
 
   - name: "device"
     type: "str"

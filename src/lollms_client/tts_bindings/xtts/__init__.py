@@ -1,38 +1,51 @@
-from lollms_client.lollms_tts_binding import LollmsTTSBinding
-from typing import Optional, List
-from pathlib import Path
+import os
+import sys
 import requests
 import subprocess
-import sys
 import time
-import pipmaster as pm
+from pathlib import Path
+from typing import Optional, List
 
-# New import for process-safe file locking
+# Ensure pipmaster is available.
+try:
+    import pipmaster as pm
+except ImportError:
+    print("FATAL: pipmaster is not installed. Please install it using: pip install pipmaster")
+    sys.exit(1)
+
+# Ensure filelock is available for process-safe server startup.
 try:
     from filelock import FileLock, Timeout
 except ImportError:
     print("FATAL: The 'filelock' library is required. Please install it by running: pip install filelock")
     sys.exit(1)
 
+from lollms_client.lollms_tts_binding import LollmsTTSBinding
+from ascii_colors import ASCIIColors
 
 BindingName = "XTTSClientBinding"
 
 class XTTSClientBinding(LollmsTTSBinding):
+    """
+    Client binding for a dedicated, managed XTTS server.
+    This architecture prevents the heavy XTTS model from being loaded into memory
+    by multiple worker processes, solving potential OOM errors and speeding up TTS generation.
+    """
     def __init__(self, 
-                 host: str = "localhost", 
-                 port: int = 8081, 
-                 auto_start_server: bool = True,
                  **kwargs):
         
         binding_name = "xtts"
         super().__init__(binding_name=binding_name, **kwargs)
-        self.host = host
-        self.port = port
-        self.auto_start_server = auto_start_server
+
+        self.config = kwargs
+        self.host = kwargs.get("host", "localhost")
+        self.port = kwargs.get("port", 8081)
+        self.auto_start_server = kwargs.get("auto_start_server", True)
         self.server_process = None
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
+        self.venv_dir = Path("./venv/tts_xtts_venv")
 
         if self.auto_start_server:
             self.ensure_server_is_running()
@@ -40,10 +53,10 @@ class XTTSClientBinding(LollmsTTSBinding):
     def is_server_running(self) -> bool:
         """Checks if the server is already running and responsive."""
         try:
-            response = requests.get(f"{self.base_url}/status", timeout=1)
+            response = requests.get(f"{self.base_url}/status", timeout=2)
             if response.status_code == 200 and response.json().get("status") == "running":
                 return True
-        except requests.ConnectionError:
+        except requests.exceptions.RequestException:
             return False
         return False
 
@@ -52,64 +65,69 @@ class XTTSClientBinding(LollmsTTSBinding):
         Ensures the XTTS server is running. If not, it attempts to start it
         in a process-safe manner using a file lock.
         """
+        self.server_dir.mkdir(exist_ok=True)
+        lock_path = self.server_dir / "xtts_server.lock"
+        lock = FileLock(lock_path)
+
+        ASCIIColors.info("Attempting to start or connect to the XTTS server...")
+        
         if self.is_server_running():
-            print("XTTS Server is already running.")
+            ASCIIColors.green("XTTS Server is already running and responsive.")
             return
 
-        lock_path = self.server_dir / "xtts_server.lock"
-        lock = FileLock(lock_path, timeout=10) # Wait a maximum of 10 seconds for the lock
-
-        print("Attempting to start or wait for the XTTS server...")
         try:
-            with lock:
-                # Double-check after acquiring the lock to handle race conditions
+            with lock.acquire(timeout=60):
                 if not self.is_server_running():
-                    print("Lock acquired. Starting dedicated XTTS server...")
+                    ASCIIColors.yellow("Lock acquired. Starting dedicated XTTS server...")
                     self.start_server()
+                    self._wait_for_server()
                 else:
-                    print("Server was started by another process while waiting for the lock.")
+                    ASCIIColors.green("Server was started by another process while we waited. Connected successfully.")
         except Timeout:
-            print("Could not acquire lock. Another process is likely starting the server. Waiting...")
+            ASCIIColors.yellow("Could not acquire lock, another process is starting the server. Waiting...")
+            self._wait_for_server(timeout=180)
 
-        # All workers (the one that started the server and those that waited) will verify the server is ready
-        self._wait_for_server()
+        if not self.is_server_running():
+            raise RuntimeError("Failed to start or connect to the XTTS server after all attempts.")
 
-    def install(self, venv_path, requirements_file):
-        print(f"Ensuring virtual environment and dependencies in: {venv_path}")
-        pm_v = pm.PackageManager(venv_path=str(venv_path))
 
-        success = pm_v.ensure_requirements(
-            str(requirements_file),
-            verbose=True
-        )
+    def install_server_dependencies(self):
+        """
+        Installs the server's dependencies into a dedicated virtual environment
+        using pipmaster, which handles complex packages like PyTorch.
+        """
+        ASCIIColors.info(f"Setting up virtual environment in: {self.venv_dir}")
+        pm_v = pm.PackageManager(venv_path=str(self.venv_dir))
+        
+        requirements_file = self.server_dir / "requirements.txt"
+        
+        ASCIIColors.info("Installing server dependencies from requirements.txt...")
+        success = pm_v.ensure_requirements(str(requirements_file), verbose=True)
 
         if not success:
-            print("FATAL: Failed to install server dependencies. Aborting launch.")
-            return
+            ASCIIColors.error("Failed to install server dependencies. Please check the console output for errors.")
+            raise RuntimeError("XTTS server dependency installation failed.")
 
-        print("Dependencies are satisfied. Proceeding to launch server...")
+        ASCIIColors.green("Server dependencies are satisfied.")
+
 
     def start_server(self):
         """
-        Installs dependencies and launches the server as a background subprocess.
+        Installs dependencies and launches the FastAPI server as a background subprocess.
         This method should only be called from within a file lock.
         """
-        requirements_file = self.server_dir / "requirements.txt"
         server_script = self.server_dir / "main.py"
+        if not server_script.exists():
+            raise FileNotFoundError(f"Server script not found at {server_script}.")
 
-        # 1. Ensure a virtual environment and dependencies
-        venv_path = Path("./venv/xtts_venv")
+        if not self.venv_dir.exists():
+            self.install_server_dependencies()
 
-        if not venv_path.exists():
-            self.install(venv_path, requirements_file)
-            
-        # 2. Get the python executable from the venv
         if sys.platform == "win32":
-            python_executable = venv_path / "Scripts" / "python.exe"
+            python_executable = self.venv_dir / "Scripts" / "python.exe"
         else:
-            python_executable = venv_path / "bin" / "python"
+            python_executable = self.venv_dir / "bin" / "python"
 
-        # 3. Launch the server as a detached subprocess
         command = [
             str(python_executable),
             str(server_script),
@@ -117,54 +135,61 @@ class XTTSClientBinding(LollmsTTSBinding):
             "--port", str(self.port)
         ]
         
-        # The server is started as a background process and is not tied to this specific worker's lifecycle
-        subprocess.Popen(command)
-        print("XTTS Server process launched in the background.")
+        # Use DETACHED_PROCESS on Windows to allow the server to run independently.
+        creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+        
+        self.server_process = subprocess.Popen(command, creationflags=creationflags)
+        ASCIIColors.info("XTTS server process launched in the background.")
 
-
-    def _wait_for_server(self, timeout=60):
-        print("Waiting for XTTS server to become available...")
+    def _wait_for_server(self, timeout=120):
+        """Waits for the server to become responsive."""
+        ASCIIColors.info("Waiting for XTTS server to become available...")
         start_time = time.time()
         while time.time() - start_time < timeout:
             if self.is_server_running():
-                print("XTTS Server is up and running.")
+                ASCIIColors.green("XTTS Server is up and running.")
                 return
-            time.sleep(1)
-        
+            time.sleep(2)
         raise RuntimeError("Failed to connect to the XTTS server within the specified timeout.")
 
-    def stop_server(self):
-        """
-        In a multi-worker setup, a single client instance should not stop the shared server.
-        The server will continue running until the main application is terminated.
-        """
-        if self.server_process:
-            print("XTTS Client: An instance is shutting down, but the shared server will remain active for other workers.")
-            self.server_process = None
-    
     def __del__(self):
-        """
-        The destructor does not stop the server to prevent disrupting other workers.
-        """
+        # The client destructor does not stop the server,
+        # as it is a shared resource for other processes.
         pass
 
     def generate_audio(self, text: str, voice: Optional[str] = None, **kwargs) -> bytes:
         """Generate audio by calling the server's API"""
-        payload = {"text": text, "voice": voice, **kwargs}
-        response = requests.post(f"{self.base_url}/generate_audio", json=payload)
-        response.raise_for_status()
-        return response.content
+        payload = {"text": text, "voice": voice}
+        # Pass other kwargs from the description file (language, split_sentences)
+        payload.update(kwargs)
+        
+        try:
+            response = requests.post(f"{self.base_url}/generate_audio", json=payload, timeout=300)
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.error(f"Failed to communicate with XTTS server at {self.base_url}.")
+            ASCIIColors.error(f"Error details: {e}")
+            raise RuntimeError("Communication with the XTTS server failed.") from e
+
 
     def list_voices(self, **kwargs) -> List[str]:
         """Get available voices from the server"""
-        response = requests.get(f"{self.base_url}/list_voices")
-        response.raise_for_status()
-        return response.json().get("voices", [])
+        try:
+            response = requests.get(f"{self.base_url}/list_voices")
+            response.raise_for_status()
+            return response.json().get("voices", [])
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.error(f"Failed to get voices from XTTS server: {e}")
+            return []
 
 
-    def list_models(self) -> list:
-        """Lists models"""
-        response = requests.get(f"{self.base_url}/list_models")
-        response.raise_for_status()
-        return response.json().get("models", [])
-        
+    def list_models(self, **kwargs) -> list:
+        """Lists models supported by the server"""
+        try:
+            response = requests.get(f"{self.base_url}/list_models")
+            response.raise_for_status()
+            return response.json().get("models", [])
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.error(f"Failed to get models from XTTS server: {e}")
+            return []

@@ -53,6 +53,7 @@ class DiffusersBinding(LollmsTTIBinding):
         self.server_dir = self.binding_root / "server"
         self.venv_dir = Path("./venv/tti_diffusers_venv")
         self.models_path = Path(kwargs.get("models_path", "./data/models/diffusers_models")).resolve()
+        self.extra_models_path = kwargs.get("extra_models_path")
         self.models_path.mkdir(exist_ok=True, parents=True)
         if self.auto_start_server:
             self.ensure_server_is_running()
@@ -68,36 +69,47 @@ class DiffusersBinding(LollmsTTIBinding):
         return False
 
 
-    def ensure_server_is_running(self, continue_if_locked: bool = True):
+    def ensure_server_is_running(self):
         """
         Ensures the Diffusers server is running. If not, it attempts to start it
-        in a process-safe manner using a file lock.
-
-        Args:
-            continue_if_locked (bool): If True, return immediately if another process
-                                    already holds the lock.
+        in a process-safe manner using a file lock. This method is designed to
+        prevent race conditions in multi-worker environments.
         """
         self.server_dir.mkdir(exist_ok=True)
-        lock_path = self.models_path / "diffusers_server.lock"
+        # Use a lock file in the binding's server directory for consistency across instances
+        lock_path = self.server_dir / "diffusers_server.lock"
         lock = FileLock(lock_path)
 
         ASCIIColors.info("Attempting to start or connect to the Diffusers server...")
+
+        # First, perform a quick check without the lock to avoid unnecessary waiting.
+        if self.is_server_running():
+            ASCIIColors.green("Diffusers Server is already running and responsive.")
+            return
+
         try:
-            # Try to acquire lock immediately if continue_if_locked=True
-            with lock.acquire(timeout=0 if continue_if_locked else 60):
+            # Try to acquire the lock with a timeout. If another process is starting
+            # the server, this will wait until it's finished.
+            with lock.acquire(timeout=60):
+                # After acquiring the lock, we MUST re-check if the server is running.
+                # Another process might have started it and released the lock while we were waiting.
                 if not self.is_server_running():
                     ASCIIColors.yellow("Lock acquired. Starting dedicated Diffusers server...")
                     self.start_server()
+                    # The process that starts the server is responsible for waiting for it to be ready
+                    # BEFORE releasing the lock. This is the key to preventing race conditions.
+                    self._wait_for_server()
                 else:
-                    ASCIIColors.green("Server was started by another process. Connected successfully.")
+                    ASCIIColors.green("Server was started by another process while we waited. Connected successfully.")
         except Timeout:
-            if continue_if_locked:
-                ASCIIColors.yellow("Lock held by another process. Skipping server startup and continuing execution.")
-                return
-            else:
-                ASCIIColors.yellow("Could not acquire lock within timeout. Waiting for server to become available...")
+            # This happens if the process holding the lock takes more than 60 seconds to start the server.
+            # We don't try to start another one. We just wait for the existing one to be ready.
+            ASCIIColors.yellow("Could not acquire lock, another process is taking a long time to start the server. Waiting...")
+            self._wait_for_server(timeout=300) # Give it a longer timeout here just in case.
 
-        self._wait_for_server()
+        # A final verification to ensure we are connected.
+        if not self.is_server_running():
+            raise RuntimeError("Failed to start or connect to the Diffusers server after all attempts.")
 
     def install_server_dependencies(self):
         """
@@ -191,6 +203,10 @@ class DiffusersBinding(LollmsTTIBinding):
             "--models-path", str(self.models_path.resolve()) # Pass models_path to server
         ]
 
+        if self.extra_models_path:
+            resolved_extra_path = Path(self.extra_models_path).resolve()
+            command.extend(["--extra-models-path", str(resolved_extra_path)])
+
         # Use DETACHED_PROCESS on Windows to allow the server to run independently of the parent process.
         # On Linux/macOS, the process will be daemonized enough to not be killed with the worker.
         creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
@@ -273,11 +289,14 @@ class DiffusersBinding(LollmsTTIBinding):
         pass
 
     def generate_image(self, prompt: str, negative_prompt: str = "", **kwargs) -> bytes:
-        # This is a pure JSON request
+        params = kwargs.copy()
+        if "model_name" not in params and self.config.get("model_name"):
+            params["model_name"] = self.config["model_name"]
+            
         response = self._post_json_request("/generate_image", data={
             "prompt": prompt,
             "negative_prompt": negative_prompt,
-            "params": kwargs
+            "params": params
         })
         return response.content
 
@@ -307,15 +326,19 @@ class DiffusersBinding(LollmsTTIBinding):
                 raise ValueError(f"Unsupported image type in edit_image: {type(img)}")
         if not images_b64:
             raise ValueError("No valid images were provided to the edit_image function.")
+        
+        params = kwargs.copy()
+        if "model_name" not in params and self.config.get("model_name"):
+            params["model_name"] = self.config["model_name"]
 
         # Translate "mask" to "mask_image" for server compatibility
-        if "mask" in kwargs and kwargs["mask"]:
-            kwargs["mask_image"] = kwargs.pop("mask")
+        if "mask" in params and params["mask"]:
+            params["mask_image"] = params.pop("mask")
 
         json_payload = {
             "prompt": prompt,
             "images_b64": images_b64,
-            "params": kwargs
+            "params": params
         }
         response = self._post_json_request("/edit_image", data=json_payload)
         return response.content

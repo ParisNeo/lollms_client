@@ -12,6 +12,14 @@ description: |
   to be passed in the `voice` parameter.
 
 input_parameters:
+  - name: "host"
+    type: "str"
+    default: "localhost"
+    description: "The host address on which the dedicated XTTS server is running or should be started."
+  - name: "port"
+    type: "int"
+    default: 9631
+    description: "The port number on which the dedicated XTTS server is running or should be started."
   - name: "model_name"
     type: "str"
     default: "tts_models/multilingual/multi-dataset/xtts_v2"

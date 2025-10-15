@@ -13,24 +13,26 @@ try:
     import wave
     import numpy as np
     import tempfile
+    
+    # Use ascii_colors for logging
+    from ascii_colors import ASCIIColors
 
     # --- XTTS Implementation ---
     try:
-        print("Server: Loading XTTS dependencies...")
+        ASCIIColors.info("Server: Loading XTTS dependencies...")
         import torch
-        import torchaudio
         from TTS.api import TTS
-        print("Server: XTTS dependencies loaded successfully")
+        ASCIIColors.green("Server: XTTS dependencies loaded successfully")
         
         # Check for CUDA availability
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Server: Using device: {device}")
+        ASCIIColors.info(f"Server: Using device: {device}")
         
         xtts_available = True
         
     except Exception as e:
-        print(f"Server: Failed to load XTTS dependencies: {e}")
-        print(f"Server: Traceback:\n{traceback.format_exc()}")
+        ASCIIColors.error(f"Server: Failed to load XTTS dependencies: {e}")
+        ASCIIColors.error(f"Server: Traceback:\n{traceback.format_exc()}")
         xtts_available = False
 
     # --- API Models ---
@@ -38,18 +40,21 @@ try:
         text: str
         voice: Optional[str] = None
         language: Optional[str] = "en"
-        speaker_wav: Optional[str] = None
+        # speaker_wav is kept for backward compatibility but voice is preferred
+        speaker_wav: Optional[str] = None 
+        split_sentences: Optional[bool] = True
 
     class XTTSServer:
         def __init__(self):
             self.model = None
             self.model_loaded = False
             self.model_loading = False  # Flag to prevent concurrent loading
+            self.available_models = ["tts_models/multilingual/multi-dataset/xtts_v2"]
+            self.voices_dir = Path(__file__).parent / "voices"
+            self.voices_dir.mkdir(exist_ok=True)
             self.available_voices = self._load_available_voices()
-            self.available_models = ["xtts_v2"]
             
-            # Don't initialize model here - do it lazily on first request
-            print("Server: XTTS server initialized (model will be loaded on first request)")
+            ASCIIColors.info("Server: XTTS server initialized (model will be loaded on first request)")
         
         async def _ensure_model_loaded(self):
             """Ensure the XTTS model is loaded (lazy loading)"""
@@ -63,171 +68,130 @@ try:
                 return
                 
             if not xtts_available:
-                raise RuntimeError("XTTS library not available")
+                raise RuntimeError("XTTS library not available. Please ensure all dependencies are installed correctly in the venv.")
                 
             try:
                 self.model_loading = True
-                print("Server: Loading XTTS model for the first time (this may take a few minutes)...")
+                ASCIIColors.yellow("Server: Loading XTTS model for the first time (this may take a few minutes)...")
                 
                 # Initialize XTTS model
-                self.model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+                self.model = TTS(self.available_models[0]).to(device)
                 
                 self.model_loaded = True
-                print("Server: XTTS model loaded successfully")
+                ASCIIColors.green("Server: XTTS model loaded successfully")
                 
             except Exception as e:
-                print(f"Server: Error loading XTTS model: {e}")
-                print(f"Server: Traceback:\n{traceback.format_exc()}")
+                ASCIIColors.error(f"Server: Error loading XTTS model: {e}")
+                ASCIIColors.error(f"Server: Traceback:\n{traceback.format_exc()}")
                 self.model_loaded = False
                 raise
             finally:
                 self.model_loading = False
         
         def _load_available_voices(self) -> List[str]:
-            """Load and return available voices"""
+            """Load and return available voices, ensuring 'default_voice' is always present."""
             try:
-                # Look for voice files in voices directory
-                voices_dir = Path(__file__).parent / "voices"
-                voices = []
+                self.voices_dir.mkdir(exist_ok=True)
                 
-                if voices_dir.exists():
-                    # Look for WAV files in voices directory
-                    for voice_file in voices_dir.glob("*.wav"):
-                        voices.append(voice_file.stem)
+                # Scan for case-insensitive .wav and .mp3 files and get their stems
+                found_voices = {p.stem for p in self.voices_dir.glob("*.[wW][aA][vV]")}
+                found_voices.update({p.stem for p in self.voices_dir.glob("*.[mM][pP]3")})
                 
-                # If no custom voices found, provide some default names
-                if not voices:
-                    voices = ["default", "female", "male"]
-                    
-                return voices
+                # GUARANTEE 'default_voice' is in the list for UI consistency.
+                all_voices = {"default_voice"}.union(found_voices)
+                
+                sorted_voices = sorted(list(all_voices))
+                ASCIIColors.info(f"Discovered voices: {sorted_voices}")
+                return sorted_voices
                 
             except Exception as e:
-                print(f"Server: Error loading voices: {e}")
-                return ["default"]
+                ASCIIColors.error(f"Server: Error scanning voices directory: {e}")
+                # If scanning fails, it's crucial to still return the default.
+                return ["default_voice"]
         
-        async def generate_audio(self, text: str, voice: Optional[str] = None, 
-                        language: str = "en", speaker_wav: Optional[str] = None) -> bytes:
+        def _get_speaker_wav_path(self, voice_name: str) -> Optional[str]:
+            """Find the path to a speaker wav/mp3 file from its name."""
+            if not voice_name:
+                return None
+            
+            # Case 1: voice_name is an absolute path that exists
+            if os.path.isabs(voice_name) and os.path.exists(voice_name):
+                return voice_name
+            
+            # Case 2: voice_name is a name in the voices directory (check for .mp3 then .wav)
+            mp3_path = self.voices_dir / f"{voice_name}.mp3"
+            if mp3_path.exists():
+                return str(mp3_path)
+
+            wav_path = self.voices_dir / f"{voice_name}.wav"
+            if wav_path.exists():
+                return str(wav_path)
+            
+            return None
+
+        async def generate_audio(self, req: GenerationRequest) -> bytes:
             """Generate audio from text using XTTS"""
-            # Ensure model is loaded before proceeding
             await self._ensure_model_loaded()
             
             if not self.model_loaded or self.model is None:
-                raise RuntimeError("XTTS model failed to load")
+                raise RuntimeError("XTTS model failed to load or is not available.")
             
             try:
-                print(f"Server: Generating audio for: '{text[:50]}{'...' if len(text) > 50 else ''}'")
-                print(f"Server: Using voice: {voice}, language: {language}")
+                text_to_generate = req.text
+                ASCIIColors.info(f"Server: Generating audio for: '{text_to_generate[:50]}{'...' if len(text_to_generate) > 50 else ''}'")
+                ASCIIColors.info(f"Server: Language: {req.language}, Requested Voice: {req.voice}")
+
+                # Determine which voice name to use. Priority: speaker_wav > voice > 'default_voice'
+                voice_to_find = req.speaker_wav or req.voice or "default_voice"
+                speaker_wav_path = self._get_speaker_wav_path(voice_to_find)
+
+                # If the chosen voice wasn't found and it wasn't the default, try the default as a fallback.
+                if not speaker_wav_path and voice_to_find != "default_voice":
+                    ASCIIColors.warning(f"Voice '{voice_to_find}' not found. Falling back to 'default_voice'.")
+                    speaker_wav_path = self._get_speaker_wav_path("default_voice")
+
+                # If still no path, it's a critical error because even the default is missing.
+                if not speaker_wav_path:
+                    available = self._get_all_available_voice_files()
+                    raise RuntimeError(
+                        f"XTTS requires a speaker reference file, but none could be found.\n"
+                        f"Attempted to use '{voice_to_find}' but it was not found, and the fallback 'default_voice.mp3' is also missing from the voices folder.\n"
+                        f"Please add audio files to the '{self.voices_dir.resolve()}' directory. Available files: {available or 'None'}"
+                    )
                 
-                # Handle voice/speaker selection
-                speaker_wav_path = None
+                ASCIIColors.info(f"Server: Using speaker reference: {speaker_wav_path}")
+
+                # Generate audio using XTTS
+                wav_chunks = self.model.tts(
+                    text=text_to_generate,
+                    speaker_wav=speaker_wav_path,
+                    language=req.language,
+                    split_sentences=req.split_sentences
+                )
                 
-                # First priority: use provided speaker_wav parameter
-                if speaker_wav:
-                    speaker_wav_path = speaker_wav
-                    print(f"Server: Using provided speaker_wav: {speaker_wav_path}")
+                # Combine chunks into a single audio stream
+                audio_data = np.array(wav_chunks, dtype=np.float32)
                 
-                # Second priority: check if voice parameter is a file path
-                elif voice and voice != "default":
-                    if os.path.exists(voice):
-                        # Voice parameter is a full file path
-                        speaker_wav_path = voice
-                        print(f"Server: Using voice as file path: {speaker_wav_path}")
-                    else:
-                        # Look for voice file in voices directory
-                        voices_dir = Path(__file__).parent / "voices"
-                        potential_voice_path = voices_dir / f"{voice}.wav"
-                        if potential_voice_path.exists():
-                            speaker_wav_path = str(potential_voice_path)
-                            print(f"Server: Using custom voice file: {speaker_wav_path}")
-                        else:
-                            print(f"Server: Voice '{voice}' not found in voices directory")
-                else:
-                    voice = "default_voice"
-                    # Look for voice file in voices directory
-                    voices_dir = Path(__file__).parent / "voices"
-                    potential_voice_path = voices_dir / f"{voice}.mp3"
-                    if potential_voice_path.exists():
-                        speaker_wav_path = str(potential_voice_path)
-                        print(f"Server: Using custom voice file: {speaker_wav_path}")
-                    else:
-                        print(f"Server: Voice '{voice}' not found in voices directory")
-                # Create a temporary file for output
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                    temp_output_path = temp_file.name
+                buffer = io.BytesIO()
+                with wave.open(buffer, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2) # 16-bit
+                    wf.setframerate(self.model.synthesizer.output_sample_rate)
+                    wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
                 
-                try:
-                    # Generate audio using XTTS
-                    if speaker_wav_path and os.path.exists(speaker_wav_path):
-                        print(f"Server: Generating with speaker reference: {speaker_wav_path}")
-                        self.model.tts_to_file(
-                            text=text,
-                            speaker_wav=speaker_wav_path,
-                            language=language,
-                            file_path=temp_output_path
-                        )
-                    else:
-                        print("Server: No valid speaker reference found, trying default")
-                        # For XTTS without speaker reference, try to find a default
-                        default_speaker = self._get_default_speaker_file()
-                        if default_speaker and os.path.exists(default_speaker):
-                            print(f"Server: Using default speaker: {default_speaker}")
-                            self.model.tts_to_file(
-                                text=text,
-                                speaker_wav=default_speaker,
-                                language=language,
-                                file_path=temp_output_path
-                            )
-                        else:
-                            # Create a more helpful error message
-                            available_voices = self._get_all_available_voice_files()
-                            error_msg = f"No speaker reference available. XTTS requires a speaker reference file.\n"
-                            error_msg += f"Attempted to use: {speaker_wav_path if speaker_wav_path else 'None'}\n"
-                            error_msg += f"Available voice files: {available_voices}"
-                            raise RuntimeError(error_msg)
-                    
-                    # Read the generated audio file
-                    with open(temp_output_path, 'rb') as f:
-                        audio_bytes = f.read()
-                    
-                    print(f"Server: Generated {len(audio_bytes)} bytes of audio")
-                    return audio_bytes
-                    
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(temp_output_path):
-                        os.unlink(temp_output_path)
+                audio_bytes = buffer.getvalue()
+
+                ASCIIColors.green(f"Server: Generated {len(audio_bytes)} bytes of audio.")
+                return audio_bytes
                 
             except Exception as e:
-                print(f"Server: Error generating audio: {e}")
-                print(f"Server: Traceback:\n{traceback.format_exc()}")
+                ASCIIColors.error(f"Server: Error generating audio: {e}")
+                ASCIIColors.error(f"Server: Traceback:\n{traceback.format_exc()}")
                 raise
         
         def _get_all_available_voice_files(self) -> List[str]:
             """Get list of all available voice files for debugging"""
-            voices_dir = Path(__file__).parent / "voices"
-            voice_files = []
-            
-            if voices_dir.exists():
-                voice_files = [str(f) for f in voices_dir.glob("*.wav")]
-                
-            return voice_files
-        
-        def _get_default_speaker_file(self) -> Optional[str]:
-            """Get path to default speaker file"""
-            voices_dir = Path(__file__).parent / "voices"
-            
-            # Look for a default speaker file
-            for filename in ["default.wav", "speaker.wav", "reference.wav"]:
-                potential_path = voices_dir / filename
-                if potential_path.exists():
-                    return str(potential_path)
-            
-            # If no default found, look for any wav file
-            wav_files = list(voices_dir.glob("*.wav"))
-            if wav_files:
-                return str(wav_files[0])
-            
-            return None
+            return [f.name for f in self.voices_dir.glob("*.*")]
         
         def list_voices(self) -> List[str]:
             """Return list of available voices"""
@@ -241,47 +205,36 @@ try:
     app = FastAPI(title="XTTS Server")
     router = APIRouter()
     xtts_server = XTTSServer()
-    model_lock = asyncio.Lock()  # Ensure thread-safe access
+    model_lock = asyncio.Lock()  # Ensure only one generation happens at a time on the model
 
     # --- API Endpoints ---
     @router.post("/generate_audio")
-    async def generate_audio(request: GenerationRequest):
+    async def api_generate_audio(request: GenerationRequest):
         async with model_lock:
             try:
-                print(f"request.language:{request.language}")
-                audio_bytes = await xtts_server.generate_audio(
-                    text=request.text,
-                    voice=request.voice,
-                    language=request.language,
-                    speaker_wav=request.speaker_wav
-                )
                 from fastapi.responses import Response
+                audio_bytes = await xtts_server.generate_audio(request)
                 return Response(content=audio_bytes, media_type="audio/wav")
             except Exception as e:
-                print(f"Server: ERROR in generate_audio endpoint: {e}")
-                print(f"Server: ERROR traceback:\n{traceback.format_exc()}")
+                ASCIIColors.error(f"Server: ERROR in generate_audio endpoint: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
     @router.get("/list_voices")
-    async def list_voices():
+    async def api_list_voices():
         try:
             voices = xtts_server.list_voices()
-            print(f"Server: Returning {len(voices)} voices: {voices}")
             return {"voices": voices}
         except Exception as e:
-            print(f"Server: ERROR in list_voices endpoint: {e}")
-            print(f"Server: ERROR traceback:\n{traceback.format_exc()}")
+            ASCIIColors.error(f"Server: ERROR in list_voices endpoint: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.get("/list_models")
-    async def list_models():
+    async def api_list_models():
         try:
             models = xtts_server.list_models()
-            print(f"Server: Returning {len(models)} models: {models}")
             return {"models": models}
         except Exception as e:
-            print(f"Server: ERROR in list_models endpoint: {e}")
-            print(f"Server: ERROR traceback:\n{traceback.format_exc()}")
+            ASCIIColors.error(f"Server: ERROR in list_models endpoint: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.get("/status")
@@ -290,41 +243,33 @@ try:
             "status": "running",
             "xtts_available": xtts_available,
             "model_loaded": xtts_server.model_loaded,
-            "model_loading": xtts_server.model_loading,
-            "voices_count": len(xtts_server.available_voices),
-            "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+            "device": device if xtts_available else "N/A"
         }
-
-    # Add a health check endpoint that responds immediately
-    @router.get("/health")
-    async def health_check():
-        return {"status": "healthy", "ready": True}
 
     app.include_router(router)
 
     # --- Server Startup ---
     if __name__ == '__main__':
-        parser = argparse.ArgumentParser(description="XTTS TTS Server")
+        parser = argparse.ArgumentParser(description="LoLLMs XTTS Server")
         parser.add_argument("--host", type=str, default="localhost", help="Host to bind the server to.")
-        parser.add_argument("--port", type=int, default="96", help="Port to bind the server to.")
+        parser.add_argument("--port", type=int, default=8081, help="Port to bind the server to.")
         
         args = parser.parse_args()
 
-        print(f"Server: Starting XTTS server on {args.host}:{args.port}")
-        print(f"Server: XTTS available: {xtts_available}")
-        print(f"Server: Model will be loaded on first audio generation request")
-        print(f"Server: Available voices: {len(xtts_server.available_voices)}")
-        if xtts_available:
-            print(f"Server: Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+        ASCIIColors.cyan("--- LoLLMs XTTS Server ---")
+        ASCIIColors.green(f"Starting server on http://{args.host}:{args.port}")
+        ASCIIColors.info(f"Voices directory: {xtts_server.voices_dir.resolve()}")
         
-        # Create voices directory if it doesn't exist
-        voices_dir = Path(__file__).parent / "voices"
-        voices_dir.mkdir(exist_ok=True)
-        print(f"Server: Voices directory: {voices_dir}")
-        try:
-            uvicorn.run(app, host=args.host, port=args.port)
-        except Exception as e:
-            print(f"Server: CRITICAL ERROR running server: {e}")
-            print(f"Server: Traceback:\n{traceback.format_exc()}")  
+        if not xtts_available:
+            ASCIIColors.red("Warning: XTTS dependencies not found. Server will run but generation will fail.")
+        else:
+            ASCIIColors.info(f"Detected device: {device}")
+        
+        uvicorn.run(app, host=args.host, port=args.port)
+
 except Exception as e:
-    print(f"Server: CRITICAL ERROR during startup: {e}")
+    # This will catch errors during initial imports
+    from ascii_colors import ASCIIColors
+    ASCIIColors.red(f"Server: CRITICAL ERROR during startup: {e}")
+    import traceback
+    ASCIIColors.red(f"Server: Traceback:\n{traceback.format_exc()}")```

@@ -62,7 +62,7 @@ MODELS_PATH = Path("./models")
 CIVITAI_MODELS = {
     "realistic-vision-v6": {
         "display_name": "Realistic Vision V6.0", "url": "https://civitai.com/api/download/models/501240?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "realisticVisionV60_v60B1.safetensors", "description": "Photorealistic SD1.5 checkpoint.", "owned_by": "civitai"
+        "filename": "realisticVisionV60_v60B1.safensors", "description": "Photorealistic SD1.5 checkpoint.", "owned_by": "civitai"
     },
     "absolute-reality": {
         "display_name": "Absolute Reality", "url": "https://civitai.com/api/download/models/132760?type=Model&format=SafeTensor&size=pruned&fp=fp16",
@@ -122,19 +122,45 @@ CIVITAI_MODELS = {
     },
 }
 
-HF_DEFAULT_MODELS = [
-    {"family": "FLUX", "model_name": "black-forest-labs/FLUX.1-schnell", "display_name": "FLUX.1 Schnell", "desc": "A fast and powerful next-gen T2I model."},
-    {"family": "FLUX", "model_name": "black-forest-labs/FLUX.1-dev", "display_name": "FLUX.1 Dev", "desc": "The larger, developer version of the FLUX.1 model."},
-    {"family": "SDXL", "model_name": "stabilityai/stable-diffusion-xl-base-1.0", "display_name": "SDXL Base 1.0", "desc": "Text2Image 1024 native."},
-    {"family": "SDXL", "model_name": "stabilityai/stable-diffusion-xl-refiner-1.0", "display_name": "SDXL Refiner 1.0", "desc": "Refiner for SDXL."},
-    {"family": "SD 1.x", "model_name": "runwayml/stable-diffusion-v1-5", "display_name": "Stable Diffusion 1.5", "desc": "Classic SD1.5."},
-    {"family": "SD 2.x", "model_name": "stabilityai/stable-diffusion-2-1", "display_name": "Stable Diffusion 2.1", "desc": "SD2.1 base."},
-    {"family": "SD3", "model_name": "stabilityai/stable-diffusion-3-medium-diffusers", "display_name": "Stable Diffusion 3 Medium", "desc": "SD3 medium."},
-    {"family": "Qwen", "model_name": "Qwen/Qwen-Image", "display_name": "Qwen Image", "desc": "Dedicated image generation."},
-    {"family": "Specialized", "model_name": "playgroundai/playground-v2.5-1024px-aesthetic", "display_name": "Playground v2.5", "desc": "High aesthetic 1024."},
-    {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit", "display_name": "Qwen Image Edit", "desc": "Dedicated image editing."},
-    {"family": "Editors", "model_name": "Qwen/Qwen-Image-Edit-2509", "display_name": "Qwen Image Edit Plus (Multi-Image)", "desc": "Advanced multi-image editing, fusion, and pose transfer."}
-]
+HF_PUBLIC_MODELS = {
+    "General Purpose & SDXL": [
+        {"model_name": "stabilityai/stable-diffusion-xl-base-1.0", "display_name": "Stable Diffusion XL 1.0", "desc": "Official 1024x1024 text-to-image model from Stability AI."},
+        {"model_name": "stabilityai/sdxl-turbo", "display_name": "SDXL Turbo", "desc": "A fast, real-time text-to-image model based on SDXL."},
+        {"model_name": "kandinsky-community/kandinsky-3", "display_name": "Kandinsky 3", "desc": "A powerful multilingual model with strong prompt understanding and aesthetic quality."},
+        {"model_name": "playgroundai/playground-v2.5-1024px-aesthetic", "display_name": "Playground v2.5", "desc": "A high-quality model focused on aesthetic outputs."},
+    ],
+    "Photorealistic": [
+        {"model_name": "emilianJR/epiCRealism", "display_name": "epiCRealism", "desc": "A popular community model for generating photorealistic images."},
+        {"model_name": "SG161222/Realistic_Vision_V5.1_noVAE", "display_name": "Realistic Vision 5.1", "desc": "One of the most popular realistic models, great for portraits and scenes."},
+        {"model_name": "Photon-v1", "display_name": "Photon", "desc": "A model known for high-quality, realistic images with good lighting and detail."},
+    ],
+    "Anime & Illustration": [
+        {"model_name": "hakurei/waifu-diffusion", "display_name": "Waifu Diffusion 1.4", "desc": "A widely-used model for generating high-quality anime-style images."},
+        {"model_name": "gsdf/Counterfeit-V3.0", "display_name": "Counterfeit V3.0", "desc": "A strong model for illustrative and 2.5D anime styles."},
+        {"model_name": "cagliostrolab/animagine-xl-3.0", "display_name": "Animagine XL 3.0", "desc": "A state-of-the-art anime model on the SDXL architecture."},
+    ],
+    "Artistic & Stylized": [
+        {"model_name": "wavymulder/Analog-Diffusion", "display_name": "Analog Diffusion", "desc": "Creates images with a vintage, analog film aesthetic."},
+        {"model_name": "dreamlike-art/dreamlike-photoreal-2.0", "display_name": "Dreamlike Photoreal 2.0", "desc": "Produces stunning, artistic, and photorealistic images."},
+    ],
+    "Image Editing Tools": [
+        {"model_name": "stabilityai/stable-diffusion-xl-refiner-1.0", "display_name": "SDXL Refiner 1.0", "desc": "A dedicated refiner model to improve details in SDXL generations."},
+        {"model_name": "Qwen/Qwen-Image-Edit", "display_name": "Qwen Image Edit", "desc": "An instruction-based model for various image editing tasks."},
+        {"model_name": "Qwen/Qwen-Image-Edit-2509", "display_name": "Qwen Image Edit Plus", "desc": "Advanced multi-image editing, fusion, and pose transfer."},
+    ],
+    "Legacy & Base Models": [
+        {"model_name": "runwayml/stable-diffusion-v1-5", "display_name": "Stable Diffusion 1.5", "desc": "The classic and versatile SD1.5 base model."},
+        {"model_name": "stabilityai/stable-diffusion-2-1", "display_name": "Stable Diffusion 2.1", "desc": "The 768x768 base model from the SD2.x series."},
+    ]
+}
+
+HF_GATED_MODELS = {
+    "Next-Generation (Gated Access Required)": [
+        {"model_name": "stabilityai/stable-diffusion-3-medium-diffusers", "display_name": "Stable Diffusion 3 Medium", "desc": "State-of-the-art model with advanced prompt understanding. Requires free registration."},
+        {"model_name": "black-forest-labs/FLUX.1-schnell", "display_name": "FLUX.1 Schnell", "desc": "A powerful and extremely fast next-generation model. Requires access request."},
+        {"model_name": "black-forest-labs/FLUX.1-dev", "display_name": "FLUX.1 Dev", "desc": "The larger developer version of the FLUX.1 model. Requires access request."},
+    ]
+}
 
 
 TORCH_DTYPE_MAP_STR_TO_OBJ = {
@@ -228,9 +254,25 @@ class ModelManager:
             if not local_path.exists():
                 self._download_civitai_model(model_name)
             return local_path
+
+        # Search in extra models path
+        if state.extra_models_path and state.extra_models_path.exists():
+            found_paths = list(state.extra_models_path.rglob(model_name))
+            if found_paths:
+                ASCIIColors.info(f"Found model in extra path: {found_paths[0]}")
+                return found_paths[0]
+
+        # Search in primary models path
+        found_paths = list(self.models_path.rglob(model_name))
+        if found_paths:
+            ASCIIColors.info(f"Found model in primary path: {found_paths[0]}")
+            return found_paths[0]
+
+        # Fallback for HF hub models that are folders, not single files.
         local_path = self.models_path / model_name
         if local_path.exists():
             return local_path
+
         return model_name
 
     def _download_civitai_model(self, model_key: str):
@@ -535,9 +577,12 @@ class PipelineRegistry:
             return list(self._managers.values())
 
 class ServerState:
-    def __init__(self, models_path: Path):
+    def __init__(self, models_path: Path, extra_models_path: Optional[Path] = None):
         self.models_path = models_path
+        self.extra_models_path = extra_models_path
         self.models_path.mkdir(parents=True, exist_ok=True)
+        if self.extra_models_path:
+            self.extra_models_path.mkdir(parents=True, exist_ok=True)
         self.config_path = self.models_path.parent / "diffusers_server_config.json"
         self.registry = PipelineRegistry()
         self.manager: Optional[ModelManager] = None
@@ -802,14 +847,49 @@ async def edit_image(request: EditRequestJSON):
 
 @router.get("/list_models")
 def list_models_endpoint():
-    civitai = [{'model_name': key, 'display_name': info['display_name'], 'description': info['description'], 'owned_by': info['owned_by']} for key, info in CIVITAI_MODELS.items()]
-    local = [{'model_name': f.name, 'display_name': f.stem, 'description': 'Local safetensors file.', 'owned_by': 'local_user'} for f in state.models_path.glob("*.safetensors")]
-    huggingface = [{'model_name': m['model_name'], 'display_name': m['display_name'], 'description': m['desc'], 'owned_by': 'huggingface'} for m in HF_DEFAULT_MODELS]
-    return huggingface + civitai + local
+    huggingface_models = []
+    # Add public models, organized by category
+    for category, models in HF_PUBLIC_MODELS.items():
+        for model_info in models:
+            huggingface_models.append({
+                'model_name': model_info['model_name'], 
+                'display_name': model_info['display_name'], 
+                'description': f"({category}) {model_info['desc']}", 
+                'owned_by': 'huggingface'
+            })
+
+    # Conditionally add gated models if an HF token is provided in the server config
+    if state.config.get("hf_token"):
+        ASCIIColors.info("HF token detected, including gated models in the list.")
+        for category, models in HF_GATED_MODELS.items():
+            for model_info in models:
+                huggingface_models.append({
+                    'model_name': model_info['model_name'], 
+                    'display_name': model_info['display_name'], 
+                    'description': f"({category}) {model_info['desc']}", 
+                    'owned_by': 'huggingface'
+                })
+    else:
+        ASCIIColors.info("No HF token found, showing public models only.")
+
+    civitai_models = [{'model_name': key, 'display_name': info['display_name'], 'description': f"(Civitai) {info['description']}", 'owned_by': info['owned_by']} for key, info in CIVITAI_MODELS.items()]
+    
+    local_files = list_local_models_endpoint()
+    local_models = [{'model_name': filename, 'display_name': Path(filename).stem, 'description': '(Local) Local safetensors file.', 'owned_by': 'local_user'} for filename in local_files]
+
+    return huggingface_models + civitai_models + local_models
 
 @router.get("/list_local_models")
 def list_local_models_endpoint():
-    return sorted([f.name for f in state.models_path.glob("*.safetensors")])
+    local_models = set()
+    # Main models path
+    for f in state.models_path.glob("**/*.safetensors"):
+        local_models.add(f.name)
+    # Extra models path
+    if state.extra_models_path and state.extra_models_path.exists():
+        for f in state.extra_models_path.glob("**/*.safetensors"):
+            local_models.add(f.name)
+    return sorted(list(local_models))
 
 @router.get("/list_available_models")
 def list_available_models_endpoint():
@@ -866,14 +946,18 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="localhost", help="Host to bind to.")
     parser.add_argument("--port", type=int, default=9630, help="Port to bind to.")
     parser.add_argument("--models-path", type=str, required=True, help="Path to the models directory.")
+    parser.add_argument("--extra-models-path", type=str, default=None, help="Path to an extra models directory.")
     args = parser.parse_args()
 
     MODELS_PATH = Path(args.models_path)
-    state = ServerState(MODELS_PATH)
+    EXTRA_MODELS_PATH = Path(args.extra_models_path) if args.extra_models_path else None
+    state = ServerState(MODELS_PATH, EXTRA_MODELS_PATH)
     
     ASCIIColors.cyan(f"--- Diffusers TTI Server ---")
     ASCIIColors.green(f"Starting server on http://{args.host}:{args.port}")
     ASCIIColors.green(f"Serving models from: {MODELS_PATH.resolve()}")
+    if EXTRA_MODELS_PATH:
+        ASCIIColors.green(f"Serving extra models from: {EXTRA_MODELS_PATH.resolve()}")
     if not DIFFUSERS_AVAILABLE:
         ASCIIColors.error("Diffusers or its dependencies are not installed correctly in the server's environment!")
     else:
