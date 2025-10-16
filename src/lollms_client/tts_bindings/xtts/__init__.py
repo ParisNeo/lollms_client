@@ -6,13 +6,6 @@ import time
 from pathlib import Path
 from typing import Optional, List
 
-# Ensure pipmaster is available.
-try:
-    import pipmaster as pm
-except ImportError:
-    print("FATAL: pipmaster is not installed. Please install it using: pip install pipmaster")
-    sys.exit(1)
-
 # Ensure filelock is available for process-safe server startup.
 try:
     from filelock import FileLock, Timeout
@@ -97,6 +90,12 @@ class XTTSClientBinding(LollmsTTSBinding):
         using pipmaster, which handles complex packages like PyTorch.
         """
         ASCIIColors.info(f"Setting up virtual environment in: {self.venv_dir}")
+        # Ensure pipmaster is available.
+        try:
+            import pipmaster as pm
+        except ImportError:
+            print("FATAL: pipmaster is not installed. Please install it using: pip install pipmaster")
+            raise Exception("pipmaster not found")
         pm_v = pm.PackageManager(venv_path=str(self.venv_dir))
         
         requirements_file = self.server_dir / "requirements.txt"
@@ -141,7 +140,7 @@ class XTTSClientBinding(LollmsTTSBinding):
         self.server_process = subprocess.Popen(command, creationflags=creationflags)
         ASCIIColors.info("XTTS server process launched in the background.")
 
-    def _wait_for_server(self, timeout=120):
+    def _wait_for_server(self, timeout=1):
         """Waits for the server to become responsive."""
         ASCIIColors.info("Waiting for XTTS server to become available...")
         start_time = time.time()

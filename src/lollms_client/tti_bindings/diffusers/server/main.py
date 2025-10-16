@@ -771,6 +771,23 @@ async def generate_image(request: T2IRequest):
             pipeline_args["strength"] = float(params.get("strength", 1.0))
             task = "image2image" 
         
+        # Create a copy for logging
+        log_args = pipeline_args.copy()
+        if 'generator' in log_args and log_args['generator'] is not None:
+            # Generator object is not JSON serializable, so we represent it with its seed.
+            log_args['generator'] = f"<torch.Generator(seed={seed})>"
+        if 'image' in log_args and log_args['image'] is not None:
+            log_args['image'] = "<PIL Image object>"
+
+        # Print the settings
+        ASCIIColors.cyan("--- Generating Image with Settings ---")
+        try:
+            print(json.dumps(log_args, indent=2, default=str)) # use default=str to handle potential non-serializable types
+        except Exception as e:
+            ASCIIColors.warning(f"Could not print all settings: {e}")
+            print(log_args)
+        ASCIIColors.cyan("------------------------------------")
+        
         future = Future()
         manager.queue.put((future, task, pipeline_args))
         result_bytes = future.result()
@@ -831,6 +848,29 @@ async def edit_image(request: EditRequestJSON):
             pipeline_args.update({"image": pil_images[0], "strength": 0.8, "guidance_scale": 7.5, "num_inference_steps": 25})
 
         pipeline_args.update(params)
+        
+        # Create a copy for logging
+        log_args = pipeline_args.copy()
+
+        # Sanitize non-serializable objects for logging
+        if 'generator' in log_args and log_args['generator'] is not None:
+            log_args['generator'] = f"<torch.Generator(seed={seed})>"
+        if 'image' in log_args:
+            if isinstance(log_args['image'], list):
+                log_args['image'] = f"[<{len(log_args['image'])} PIL Image(s)>]"
+            else:
+                log_args['image'] = "<PIL Image object>"
+        if 'mask_image' in log_args and log_args['mask_image'] is not None:
+            log_args['mask_image'] = "<PIL Image object>"
+
+        # Print the settings
+        ASCIIColors.cyan("--- Editing Image with Settings ---")
+        try:
+            print(json.dumps(log_args, indent=2, default=str))
+        except Exception as e:
+            ASCIIColors.warning(f"Could not print all settings: {e}")
+            print(log_args)
+        ASCIIColors.cyan("---------------------------------")
         
         future = Future(); manager.queue.put((future, task, pipeline_args))
         return Response(content=future.result(), media_type="image/png")

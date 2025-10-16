@@ -272,4 +272,4 @@ except Exception as e:
     from ascii_colors import ASCIIColors
     ASCIIColors.red(f"Server: CRITICAL ERROR during startup: {e}")
     import traceback
-    ASCIIColors.red(f"Server: Traceback:\n{traceback.format_exc()}")```
+    ASCIIColors.red(f"Server: Traceback:\n{traceback.format_exc()}")
