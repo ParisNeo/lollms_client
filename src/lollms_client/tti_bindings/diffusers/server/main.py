@@ -62,7 +62,7 @@ MODELS_PATH = Path("./models")
 CIVITAI_MODELS = {
     "realistic-vision-v6": {
         "display_name": "Realistic Vision V6.0", "url": "https://civitai.com/api/download/models/501240?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "realisticVisionV60_v60B1.safensors", "description": "Photorealistic SD1.5 checkpoint.", "owned_by": "civitai"
+        "filename": "realisticVisionV60_v60B1.safetensors", "description": "Photorealistic SD1.5 checkpoint.", "owned_by": "civitai"
     },
     "absolute-reality": {
         "display_name": "Absolute Reality", "url": "https://civitai.com/api/download/models/132760?type=Model&format=SafeTensor&size=pruned&fp=fp16",
@@ -145,8 +145,11 @@ HF_PUBLIC_MODELS = {
     ],
     "Image Editing Tools": [
         {"model_name": "stabilityai/stable-diffusion-xl-refiner-1.0", "display_name": "SDXL Refiner 1.0", "desc": "A dedicated refiner model to improve details in SDXL generations."},
-        {"model_name": "Qwen/Qwen-Image-Edit", "display_name": "Qwen Image Edit", "desc": "An instruction-based model for various image editing tasks."},
-        {"model_name": "Qwen/Qwen-Image-Edit-2509", "display_name": "Qwen Image Edit Plus", "desc": "Advanced multi-image editing, fusion, and pose transfer."},
+        {"model_name": "timbrooks/instruct-pix2pix", "display_name": "Instruct-Pix2Pix", "desc": "The original instruction-based image editing model (SD 1.5)."},
+        {"model_name": "kandinsky-community/kandinsky-2-2-instruct-pix2pix", "display_name": "Kandinsky 2.2 Instruct", "desc": "An instruction-based model with strong prompt adherence, based on Kandinsky 2.2."},
+        {"model_name": "diffusers/stable-diffusion-xl-1.0-inpainting-0.1", "display_name": "SDXL Inpainting", "desc": "A dedicated inpainting model based on SDXL 1.0 for filling in masked areas."},
+        {"model_name": "Qwen/Qwen-Image-Edit", "display_name": "Qwen Image Edit", "desc": "An instruction-based model for various image editing tasks. (Review License)."},
+        {"model_name": "Qwen/Qwen-Image-Edit-2509", "display_name": "Qwen Image Edit Plus", "desc": "Advanced multi-image editing and fusion. (Review License)."},
     ],
     "Legacy & Base Models": [
         {"model_name": "runwayml/stable-diffusion-v1-5", "display_name": "Stable Diffusion 1.5", "desc": "The classic and versatile SD1.5 base model."},
@@ -728,36 +731,33 @@ async def generate_image(request: T2IRequest):
     manager = None
     temp_config = None
     try:
-        params = request.params
-        
         # Determine which model manager to use for this specific request
-        if "model_name" in params and params["model_name"]:
+        if "model_name" in request.params and request.params["model_name"]:
             temp_config = state.config.copy()
-            temp_config["model_name"] = params.pop("model_name") # Remove from params to avoid being passed to pipeline
+            temp_config["model_name"] = request.params.pop("model_name") # Remove from params to avoid being passed to pipeline
             manager = state.registry.get_manager(temp_config, state.models_path)
             ASCIIColors.info(f"Using per-request model: {temp_config['model_name']}")
         else:
             manager = state.get_active_manager()
             ASCIIColors.info(f"Using session-configured model: {manager.config.get('model_name')}")
 
-        seed = int(params.get("seed", manager.config.get("seed", -1)))
-        generator = None
+        # Start with the manager's config (base settings)
+        pipeline_args = manager.config.copy()
+        # Override with per-request parameters
+        pipeline_args.update(request.params)
+
+        # Add prompts and ensure types for specific args
+        pipeline_args["prompt"] = request.prompt
+        pipeline_args["negative_prompt"] = request.negative_prompt
+        pipeline_args["width"] = int(pipeline_args.get("width", 512))
+        pipeline_args["height"] = int(pipeline_args.get("height", 512))
+        pipeline_args["num_inference_steps"] = int(pipeline_args.get("num_inference_steps", 25))
+        pipeline_args["guidance_scale"] = float(pipeline_args.get("guidance_scale", 7.0))
+
+        seed = int(pipeline_args.get("seed", -1))
+        pipeline_args["generator"] = None
         if seed != -1:
-            generator = torch.Generator(device=manager.config["device"]).manual_seed(seed)
-        
-        width = int(params.get("width", manager.config.get("width", 512)))
-        height = int(params.get("height", manager.config.get("height", 512)))
-        
-        pipeline_args = {
-            "prompt": request.prompt,
-            "negative_prompt": request.negative_prompt,
-            "width": width,
-            "height": height,
-            "num_inference_steps": int(params.get("num_inference_steps", manager.config.get("num_inference_steps", 25))),
-            "guidance_scale": float(params.get("guidance_scale", manager.config.get("guidance_scale", 7.0))),
-            "generator": generator
-        }
-        pipeline_args.update(params)
+            pipeline_args["generator"] = torch.Generator(device=manager.config["device"]).manual_seed(seed)
         
         model_name = manager.config.get("model_name", "")
         task = "text2image"
@@ -765,24 +765,19 @@ async def generate_image(request: T2IRequest):
         if "Qwen-Image-Edit" in model_name:
             rng_seed = seed if seed != -1 else None
             rng = np.random.default_rng(seed=rng_seed)
-            random_pixels = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+            random_pixels = rng.integers(0, 256, size=(pipeline_args["height"], pipeline_args["width"], 3), dtype=np.uint8)
             placeholder_image = Image.fromarray(random_pixels, 'RGB')
             pipeline_args["image"] = placeholder_image
-            pipeline_args["strength"] = float(params.get("strength", 1.0))
+            pipeline_args["strength"] = float(pipeline_args.get("strength", 1.0))
             task = "image2image" 
         
-        # Create a copy for logging
-        log_args = pipeline_args.copy()
-        if 'generator' in log_args and log_args['generator'] is not None:
-            # Generator object is not JSON serializable, so we represent it with its seed.
-            log_args['generator'] = f"<torch.Generator(seed={seed})>"
-        if 'image' in log_args and log_args['image'] is not None:
-            log_args['image'] = "<PIL Image object>"
-
-        # Print the settings
+        log_args = {k: v for k, v in pipeline_args.items() if k not in ['generator', 'image']}
+        if pipeline_args.get("generator"): log_args['generator'] = f"<torch.Generator(seed={seed})>"
+        if pipeline_args.get("image"): log_args['image'] = "<PIL Image object>"
+        
         ASCIIColors.cyan("--- Generating Image with Settings ---")
         try:
-            print(json.dumps(log_args, indent=2, default=str)) # use default=str to handle potential non-serializable types
+            print(json.dumps(log_args, indent=2, default=str))
         except Exception as e:
             ASCIIColors.warning(f"Could not print all settings: {e}")
             print(log_args)
@@ -806,17 +801,20 @@ async def edit_image(request: EditRequestJSON):
     manager = None
     temp_config = None
     try:
-        params = request.params
-
-        if "model_name" in params and params["model_name"]:
+        if "model_name" in request.params and request.params["model_name"]:
             temp_config = state.config.copy()
-            temp_config["model_name"] = params.pop("model_name")
+            temp_config["model_name"] = request.params.pop("model_name")
             manager = state.registry.get_manager(temp_config, state.models_path)
             ASCIIColors.info(f"Using per-request model: {temp_config['model_name']}")
         else:
             manager = state.get_active_manager()
             ASCIIColors.info(f"Using session-configured model: {manager.config.get('model_name')}")
 
+        # Start with manager's config, then override with request params
+        pipeline_args = manager.config.copy()
+        pipeline_args.update(request.params)
+        
+        pipeline_args["prompt"] = request.prompt
         model_name = manager.config.get("model_name", "")
 
         pil_images = []
@@ -827,43 +825,31 @@ async def edit_image(request: EditRequestJSON):
 
         if not pil_images: raise HTTPException(status_code=400, detail="No valid images provided.")
 
-        pipeline_args = {"prompt": request.prompt}
-        seed = int(params.get("seed", -1))
+        seed = int(pipeline_args.get("seed", -1))
+        pipeline_args["generator"] = None
         if seed != -1: pipeline_args["generator"] = torch.Generator(device=manager.config["device"]).manual_seed(seed)
         
-        if "mask_image" in params and params["mask_image"]:
-            b64_mask = params["mask_image"]
+        if "mask_image" in pipeline_args and pipeline_args["mask_image"]:
+            b64_mask = pipeline_args["mask_image"]
             b64_data = b64_mask.split(";base64,")[1] if ";base64," in b64_mask else b64_mask
             mask_bytes = base64.b64decode(b64_data)
             pipeline_args["mask_image"] = Image.open(BytesIO(mask_bytes)).convert("L")
         
-        task = "inpainting" if "mask_image" in pipeline_args else "image2image"
+        task = "inpainting" if "mask_image" in pipeline_args and pipeline_args["mask_image"] else "image2image"
         
         if "Qwen-Image-Edit-2509" in model_name:
             task = "image2image"
             pipeline_args.update({"true_cfg_scale": 4.0, "guidance_scale": 1.0, "num_inference_steps": 40, "negative_prompt": " "})
-            edit_mode = params.get("edit_mode", "fusion")
+            edit_mode = pipeline_args.get("edit_mode", "fusion")
             if edit_mode == "fusion": pipeline_args["image"] = pil_images
         else:
             pipeline_args.update({"image": pil_images[0], "strength": 0.8, "guidance_scale": 7.5, "num_inference_steps": 25})
 
-        pipeline_args.update(params)
-        
-        # Create a copy for logging
-        log_args = pipeline_args.copy()
+        log_args = {k: v for k, v in pipeline_args.items() if k not in ['generator', 'image', 'mask_image']}
+        if pipeline_args.get("generator"): log_args['generator'] = f"<torch.Generator(seed={seed})>"
+        if 'image' in pipeline_args: log_args['image'] = f"[<{len(pil_images)} PIL Image(s)>]"
+        if 'mask_image' in pipeline_args and pipeline_args['mask_image']: log_args['mask_image'] = "<PIL Mask Image>"
 
-        # Sanitize non-serializable objects for logging
-        if 'generator' in log_args and log_args['generator'] is not None:
-            log_args['generator'] = f"<torch.Generator(seed={seed})>"
-        if 'image' in log_args:
-            if isinstance(log_args['image'], list):
-                log_args['image'] = f"[<{len(log_args['image'])} PIL Image(s)>]"
-            else:
-                log_args['image'] = "<PIL Image object>"
-        if 'mask_image' in log_args and log_args['mask_image'] is not None:
-            log_args['mask_image'] = "<PIL Image object>"
-
-        # Print the settings
         ASCIIColors.cyan("--- Editing Image with Settings ---")
         try:
             print(json.dumps(log_args, indent=2, default=str))
