@@ -604,7 +604,7 @@ class ServerState:
         return {
             "model_name": "", "device": "auto", "torch_dtype_str": "auto", "use_safetensors": True,
             "scheduler_name": "default", "safety_checker_on": True, "num_inference_steps": 25,
-            "guidance_scale": 7.0, "width": 512, "height": 512, "seed": -1,
+            "guidance_scale": 7.0, "width": 1024, "height": 1024, "seed": -1,
             "enable_cpu_offload": False, "enable_sequential_cpu_offload": False, "enable_xformers": False,
             "hf_variant": None, "hf_token": None, "hf_cache_path": None, "local_files_only": False,
             "unload_inactive_model_after": 0
@@ -749,8 +749,8 @@ async def generate_image(request: T2IRequest):
         # Add prompts and ensure types for specific args
         pipeline_args["prompt"] = request.prompt
         pipeline_args["negative_prompt"] = request.negative_prompt
-        pipeline_args["width"] = int(pipeline_args.get("width", 512))
-        pipeline_args["height"] = int(pipeline_args.get("height", 512))
+        pipeline_args["width"] = int(pipeline_args.get("width", 1024))
+        pipeline_args["height"] = int(pipeline_args.get("height", 1024))
         pipeline_args["num_inference_steps"] = int(pipeline_args.get("num_inference_steps", 25))
         pipeline_args["guidance_scale"] = float(pipeline_args.get("guidance_scale", 7.0))
 
