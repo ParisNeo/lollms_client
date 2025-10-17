@@ -160,93 +160,119 @@ class LollmsClient():
             except Exception as e:
                 trace_exception(e)
                 ASCIIColors.warning(f"Exception occurred while creating TTS binding: {str(e)}")
+                self.tts = None
 
         if tti_binding_name:
-            if tti_binding_config:
-                self.tti = self.tti_binding_manager.create_binding(
-                    binding_name=tti_binding_name,
-                    **{
-                        k: v
-                        for k, v in (tti_binding_config or {}).items()
-                        if k != "binding_name"
-                    }
-                )
-            else:
-                self.tti = self.tti_binding_manager.create_binding(
-                    binding_name=tti_binding_name
-                )
-            if self.tti is None:
-                ASCIIColors.warning(f"Failed to create TTI binding: {tti_binding_name}. Available: {self.tti_binding_manager.get_available_bindings()}")
-
+            try:
+                if tti_binding_config:
+                    self.tti = self.tti_binding_manager.create_binding(
+                        binding_name=tti_binding_name,
+                        **{
+                            k: v
+                            for k, v in (tti_binding_config or {}).items()
+                            if k != "binding_name"
+                        }
+                    )
+                else:
+                    self.tti = self.tti_binding_manager.create_binding(
+                        binding_name=tti_binding_name
+                    )
+                if self.tti is None:
+                    ASCIIColors.warning(f"Failed to create TTI binding: {tti_binding_name}. Available: {self.tti_binding_manager.get_available_bindings()}")
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.warning(f"Exception occurred while creating TTI binding: {str(e)}")
+                self.tti = None
+                
         if stt_binding_name:
-            if stt_binding_config:
-                self.stt = self.stt_binding_manager.create_binding(
-                    binding_name=stt_binding_name,
-                    **{
-                        k: v
-                        for k, v in (stt_binding_config or {}).items()
-                        if k != "binding_name"
-                    }
-                )
+            try:
+                if stt_binding_config:
+                    self.stt = self.stt_binding_manager.create_binding(
+                        binding_name=stt_binding_name,
+                        **{
+                            k: v
+                            for k, v in (stt_binding_config or {}).items()
+                            if k != "binding_name"
+                        }
+                    )
 
-            else:
-                self.stt = self.stt_binding_manager.create_binding(
-                    binding_name=stt_binding_name,
-                )
-            if self.stt is None:
-                ASCIIColors.warning(f"Failed to create STT binding: {stt_binding_name}. Available: {self.stt_binding_manager.get_available_bindings()}")
+                else:
+                    self.stt = self.stt_binding_manager.create_binding(
+                        binding_name=stt_binding_name,
+                    )
+                if self.stt is None:
+                    ASCIIColors.warning(f"Failed to create STT binding: {stt_binding_name}. Available: {self.stt_binding_manager.get_available_bindings()}")
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.warning(f"Exception occurred while creating STT binding: {str(e)}")
+                self.stt = None
+                
         if ttv_binding_name:
-            if ttv_binding_config:
-                self.ttv = self.ttv_binding_manager.create_binding(
-                    binding_name=ttv_binding_name,
-                    **{
-                        k: v
-                        for k, v in ttv_binding_config.items()
-                        if k != "binding_name"
-                    }
-                )
+            try:
+                if ttv_binding_config:
+                    self.ttv = self.ttv_binding_manager.create_binding(
+                        binding_name=ttv_binding_name,
+                        **{
+                            k: v
+                            for k, v in ttv_binding_config.items()
+                            if k != "binding_name"
+                        }
+                    )
 
-            else:
-                self.ttv = self.ttv_binding_manager.create_binding(
-                    binding_name=ttv_binding_name
-                )
-            if self.ttv is None:
-                ASCIIColors.warning(f"Failed to create TTV binding: {ttv_binding_name}. Available: {self.ttv_binding_manager.get_available_bindings()}")
+                else:
+                    self.ttv = self.ttv_binding_manager.create_binding(
+                        binding_name=ttv_binding_name
+                    )
+                if self.ttv is None:
+                    ASCIIColors.warning(f"Failed to create TTV binding: {ttv_binding_name}. Available: {self.ttv_binding_manager.get_available_bindings()}")
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.warning(f"Exception occurred while creating TTV binding: {str(e)}")
+                self.ttv = None
 
         if ttm_binding_name:
-            if ttm_binding_config:
-                self.ttm = self.ttm_binding_manager.create_binding(
-                    binding_name=ttm_binding_name,
-                    **{
-                        k: v
-                        for k, v in (ttm_binding_config or {}).items()
-                        if k != "binding_name"
-                    }
-                )
-            else:
-                self.ttm = self.ttm_binding_manager.create_binding(
-                    binding_name=ttm_binding_name
-                )
-            if self.ttm is None:
-                ASCIIColors.warning(f"Failed to create TTM binding: {ttm_binding_name}. Available: {self.ttm_binding_manager.get_available_bindings()}")
+            try:
+                if ttm_binding_config:
+                    self.ttm = self.ttm_binding_manager.create_binding(
+                        binding_name=ttm_binding_name,
+                        **{
+                            k: v
+                            for k, v in (ttm_binding_config or {}).items()
+                            if k != "binding_name"
+                        }
+                    )
+                else:
+                    self.ttm = self.ttm_binding_manager.create_binding(
+                        binding_name=ttm_binding_name
+                    )
+                if self.ttm is None:
+                    ASCIIColors.warning(f"Failed to create TTM binding: {ttm_binding_name}. Available: {self.ttm_binding_manager.get_available_bindings()}")
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.warning(f"Exception occurred while creating TTM binding: {str(e)}")
+                self.ttm = None
 
         if mcp_binding_name:
-            if mcp_binding_config:
-                self.mcp = self.mcp_binding_manager.create_binding(
-                    binding_name=mcp_binding_name,
-                    **{
-                        k: v
-                        for k, v in (mcp_binding_config or {}).items()
-                        if k != "binding_name"
-                    }
-                )
-            else:
-                self.mcp = self.mcp_binding_manager.create_binding(
-                    mcp_binding_name
-                )
-            if self.mcp is None:
-                ASCIIColors.warning(f"Failed to create MCP binding: {mcp_binding_name}. Available: {self.mcp_binding_manager.get_available_bindings()}")
-
+            try:
+                if mcp_binding_config:
+                    self.mcp = self.mcp_binding_manager.create_binding(
+                        binding_name=mcp_binding_name,
+                        **{
+                            k: v
+                            for k, v in (mcp_binding_config or {}).items()
+                            if k != "binding_name"
+                        }
+                    )
+                else:
+                    self.mcp = self.mcp_binding_manager.create_binding(
+                        mcp_binding_name
+                    )
+                if self.mcp is None:
+                    ASCIIColors.warning(f"Failed to create MCP binding: {mcp_binding_name}. Available: {self.mcp_binding_manager.get_available_bindings()}")
+            except Exception as e:
+                trace_exception(e)
+                ASCIIColors.warning(f"Exception occurred while creating MCP binding: {str(e)}")
+                self.mcp = None            
         # --- Store Default Generation Parameters ---
 
         # --- Prompt Formatting Attributes ---
