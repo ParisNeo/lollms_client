@@ -4379,6 +4379,10 @@ Provide the final aggregated answer in {output_format} format, directly addressi
 
         if streaming_callback:
             streaming_callback(
+                f"Context size: {context_size} tokens",
+                MSG_TYPE.MSG_TYPE_STEP
+            )            
+            streaming_callback(
                 f"Context Budget: {FIXED_CHUNK_SIZE:,}/{total_budget:,} tokens per chunk (fixed)",
                 MSG_TYPE.MSG_TYPE_STEP,
                 {"fixed_chunk_size": FIXED_CHUNK_SIZE, "total_budget": total_budget}
