@@ -4440,6 +4440,16 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 ),
                 MSG_TYPE.MSG_TYPE_STEP
             )            
+            if FIXED_CHUNK_SIZE == 1024:
+                streaming_callback(
+                    "\n".join([
+                            f"⚠️  WARNING: Chunk size is at minimum (1024)!",
+                            f"⚠️  Budget exhausted: {used_tokens} used / {total_budget} available",
+                            f"⚠️  Consider reducing max_scratchpad_tokens or expected_generation_tokens"
+                            ]
+                    ),
+                    MSG_TYPE.MSG_TYPE_STEP
+                )
             streaming_callback(
                 f"Context Budget: {FIXED_CHUNK_SIZE:,}/{total_budget:,} tokens per chunk (fixed)",
                 MSG_TYPE.MSG_TYPE_STEP,
