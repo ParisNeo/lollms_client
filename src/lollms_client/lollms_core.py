@@ -4342,7 +4342,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
 
         # Get context size
         try:
-            context_size = ctx_size or self.default_ctx_size or self.llm.get_context_size() or 8192
+            context_size = ctx_size or self.llm.default_ctx_size or self.llm.get_context_size() or 8192
         except:
             context_size = 8192
 
