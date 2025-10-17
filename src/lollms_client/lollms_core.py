@@ -91,21 +91,6 @@ class LollmsClient():
             stt_binding_config (Optional[Dict]): Additional config for the STT binding.
             ttv_binding_config (Optional[Dict]): Additional config for the TTV binding.
             ttm_binding_config (Optional[Dict]): Additional config for the TTM binding.
-            service_key (Optional[str]): Shared authentication key or client_id.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates.
-            ctx_size (Optional[int]): Default context size for LLM.
-            n_predict (Optional[int]): Default max tokens for LLM.
-            stream (bool): Default streaming mode for LLM.
-            temperature (float): Default temperature for LLM.
-            top_k (int): Default top_k for LLM.
-            top_p (float): Default top_p for LLM.
-            repeat_penalty (float): Default repeat penalty for LLM.
-            repeat_last_n (int): Default repeat last n for LLM.
-            seed (Optional[int]): Default seed for LLM.
-            n_threads (int): Default threads for LLM.
-            streaming_callback (Optional[Callable]): Default streaming callback for LLM.
-            user_name (str): Default user name for prompts.
-            ai_name (str): Default AI name for prompts.
 
         Raises:
             ValueError: If the primary LLM binding cannot be created.
@@ -4340,6 +4325,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         streaming_callback: Optional[Callable] = None,
         return_scratchpad_only: bool = False,
         debug: bool = True,
+        ctx_size=None,
         **kwargs
     ) -> str:
         """
@@ -4355,7 +4341,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
 
         # Get context size
         try:
-            context_size = self.llm.get_context_size() or 8192
+            context_size = ctx_size or self.default_ctx_size or self.llm.get_context_size() or 8192
         except:
             context_size = 8192
 
@@ -4384,7 +4370,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         used_tokens = base_system_tokens + user_template_tokens + reserved_scratchpad_tokens + expected_generation_tokens
         
         # FIXED chunk size - never changes during processing
-        FIXED_CHUNK_SIZE = max(500, int(total_budget - used_tokens))
+        FIXED_CHUNK_SIZE = max(1024, int(total_budget - used_tokens))
         
         if debug:
             print(f"🔧 DEBUG: FIXED chunk size: {FIXED_CHUNK_SIZE} tokens (will not change)")
