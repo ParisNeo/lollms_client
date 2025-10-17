@@ -4682,7 +4682,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 streaming_callback("Returning scratchpad content", MSG_TYPE.MSG_TYPE_STEP, {})
             return final_scratchpad.strip()
 
-        # Final synthesis
+        # Final synthesis with STRONG objective reinforcement
         if streaming_callback:
             streaming_callback("Synthesizing final response...", MSG_TYPE.MSG_TYPE_STEP_START, {"progress": 95})
 
@@ -4696,22 +4696,47 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         synthesis_objective = contextual_prompt or "Provide a comprehensive, well-structured summary and analysis."
 
         if debug:
-            # ENHANCED: Use actual tokenizer
             final_scratchpad_tokens = len(self.tokenize(combined_scratchpad))
             print(f"🔧 DEBUG: Synthesizing from {len(combined_scratchpad):,} chars, {final_scratchpad_tokens} tokens, {len(chunk_summaries)} sections")
 
+        # ENHANCED: Strong objective-focused synthesis
         synthesis_system_prompt = (
-            "You are an expert at synthesizing information. "
-            "Consolidate the analysis sections into a coherent final response. "
-            "Eliminate redundancy, organize logically, and use markdown formatting."
+            f"You are completing a multi-step text processing task. "
+            f"Your role is to take analysis sections and produce the FINAL OUTPUT that directly fulfills the user's original objective.\n\n"
+            f"**CRITICAL:** Your output must DIRECTLY ADDRESS the user's objective, NOT just summarize the sections. "
+            f"The sections are intermediate work - transform them into the final deliverable the user requested."
         )
 
+        # ENHANCED: Explicit task reinforcement with examples of what NOT to do
+        task_type_hint = ""
+        if contextual_prompt:
+            lower_prompt = contextual_prompt.lower()
+            if any(word in lower_prompt for word in ['extract', 'list', 'identify', 'find']):
+                task_type_hint = "\n**Task Type:** This is an EXTRACTION/IDENTIFICATION task. Provide a structured list or catalog of items found, NOT a narrative summary."
+            elif any(word in lower_prompt for word in ['analyze', 'evaluate', 'assess', 'examine']):
+                task_type_hint = "\n**Task Type:** This is an ANALYSIS task. Provide insights, patterns, and evaluations, NOT just a description of content."
+            elif any(word in lower_prompt for word in ['compare', 'contrast', 'difference']):
+                task_type_hint = "\n**Task Type:** This is a COMPARISON task. Highlight similarities and differences, NOT separate summaries."
+            elif any(word in lower_prompt for word in ['answer', 'question', 'explain why', 'how does']):
+                task_type_hint = "\n**Task Type:** This is a QUESTION-ANSWERING task. Provide a direct answer, NOT a general overview."
+
         synthesis_user_prompt = (
-            f"--- Final Objective ---\n{synthesis_objective}\n\n"
-            f"--- Collected Analysis Sections ---\n{combined_scratchpad}\n\n"
-            f"--- Instructions ---\n"
-            f"Synthesize all information into a comprehensive response addressing the objective. "
-            f"Organize with markdown headers, remove repetition, create a polished final document."
+            f"=== ORIGINAL USER OBJECTIVE (MOST IMPORTANT) ===\n{synthesis_objective}\n"
+            f"{task_type_hint}\n\n"
+            f"=== ANALYSIS SECTIONS (Raw Working Material) ===\n{combined_scratchpad}\n\n"
+            f"=== YOUR TASK ===\n"
+            f"Transform the analysis sections above into a final output that DIRECTLY FULFILLS the original objective.\n\n"
+            f"**DO:**\n"
+            f"- Focus exclusively on satisfying the user's original objective stated above\n"
+            f"- Organize information in whatever format best serves that objective\n"
+            f"- Remove redundancy and consolidate related points\n"
+            f"- Use markdown formatting for clarity\n\n"
+            f"**DO NOT:**\n"
+            f"- Provide a generic summary of the sections\n"
+            f"- Describe what the sections contain\n"
+            f"- Create an overview of the analysis process\n"
+            f"- Change the task into something different\n\n"
+            f"Remember: The user asked for '{synthesis_objective}' - deliver exactly that."
         )
 
         try:
