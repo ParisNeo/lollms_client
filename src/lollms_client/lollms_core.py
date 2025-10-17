@@ -4361,7 +4361,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         # ========================================
         # ENHANCED: Dynamically calculate token sizes using actual tokenizer
         # ========================================
-        
+
         # Create template system prompt to measure its token size
         template_system_prompt = (
             f"You are a component in a multi-step text processing pipeline analyzing step 1 of 100.\n\n"
@@ -4371,46 +4371,73 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             f"If no new relevant information exists, respond with '[No new information found in this chunk.]'"
         )
         base_system_tokens = len(self.tokenize(template_system_prompt))
-        
-        # Create template user prompt to measure its token size
+
+        # Create MINIMAL template user prompt (structure only, without content placeholders)
         summarization_objective = contextual_prompt or "Create a comprehensive summary by extracting all key facts, concepts, and conclusions."
-        template_user_prompt = (
+
+        # Measure only the structural overhead (headers, formatting, instructions)
+        template_structure = (
             f"--- Global Objective ---\n{summarization_objective}\n\n"
-            f"--- Progress ---\nStep 1/100 | First chunk analysis\n\n"
-            f"--- Existing Scratchpad (for context) ---\n\n\n"
-            f"--- New Text Chunk ---\n\n\n"
+            f"--- Progress ---\nStep 100/100 | 10 sections completed, 4000 tokens\n\n"  # Worst-case progress text
+            f"--- Existing Scratchpad (for context) ---\n"
+            f"--- New Text Chunk ---\n"
             f"--- Instructions ---\n"
             f"Extract NEW key information from this chunk that aligns with the objective. "
             f"Be concise. Avoid repeating scratchpad content."
         )
-        user_template_tokens = len(self.tokenize(template_user_prompt))
-        
+        user_template_overhead = len(self.tokenize(template_structure))
+
         if debug:
             print(f"🔧 DEBUG: Computed system prompt tokens: {base_system_tokens}")
-            print(f"🔧 DEBUG: Computed user template tokens: {user_template_tokens}")
-        
+            print(f"🔧 DEBUG: Computed user template overhead: {user_template_overhead}")
+            print(f"🔧 DEBUG: (Note: Scratchpad and chunk content allocated separately)")
+
         # Reserve space for maximum expected scratchpad size
         reserved_scratchpad_tokens = max_scratchpad_tokens
-        
+
         total_budget = int(context_size * context_fill_percentage)
-        used_tokens = base_system_tokens + user_template_tokens + reserved_scratchpad_tokens + expected_generation_tokens
-        
+        # Only count overhead, not the actual chunk/scratchpad content (that's reserved separately)
+        used_tokens = base_system_tokens + user_template_overhead + reserved_scratchpad_tokens + expected_generation_tokens
+
         # FIXED chunk size - never changes during processing
         FIXED_CHUNK_SIZE = max(1024, int(total_budget - used_tokens))
+
         
         if debug:
-            print(f"🔧 DEBUG: Token budget breakdown:")
+            print(f"\n🔧 DEBUG: Token budget breakdown:")
+            print(f"  - Context size: {context_size} tokens")
+            print(f"  - Fill percentage: {context_fill_percentage} ({int(context_fill_percentage*100)}%)")
+            print(f"  - Total budget: {total_budget} tokens")
             print(f"  - System prompt: {base_system_tokens} tokens")
-            print(f"  - User template: {user_template_tokens} tokens")
+            print(f"  - User template overhead: {user_template_overhead} tokens")
             print(f"  - Reserved scratchpad: {reserved_scratchpad_tokens} tokens")
             print(f"  - Expected generation: {expected_generation_tokens} tokens")
-            print(f"  - Total used: {used_tokens} tokens")
-            print(f"🔧 DEBUG: FIXED chunk size: {FIXED_CHUNK_SIZE} tokens (will not change)")
-            print(f"🔧 DEBUG: Total budget: {total_budget} tokens")
+            print(f"  - Total overhead: {used_tokens} tokens")
+            print(f"  - Remaining for chunks: {total_budget - used_tokens} tokens")
+            print(f"🔧 DEBUG: FIXED chunk size: {FIXED_CHUNK_SIZE} tokens")
+            
+            # Safety check
+            if FIXED_CHUNK_SIZE == 1024:
+                print(f"⚠️  WARNING: Chunk size is at minimum (1024)!")
+                print(f"⚠️  Budget exhausted: {used_tokens} used / {total_budget} available")
+                print(f"⚠️  Consider reducing max_scratchpad_tokens or expected_generation_tokens")
 
         if streaming_callback:
             streaming_callback(
-                f"Context size: {context_size} tokens",
+                "\n".join([
+                        f"\n🔧 DEBUG: Token budget breakdown:",
+                        f"  - Context size: {context_size} tokens",
+                        f"  - Fill percentage: {context_fill_percentage} ({int(context_fill_percentage*100)}%)",
+                        f"  - Total budget: {total_budget} tokens",
+                        f"  - System prompt: {base_system_tokens} tokens",
+                        f"  - User template overhead: {user_template_overhead} tokens",
+                        f"  - Reserved scratchpad: {reserved_scratchpad_tokens} tokens",
+                        f"  - Expected generation: {expected_generation_tokens} tokens",
+                        f"  - Total overhead: {used_tokens} tokens",
+                        f"  - Remaining for chunks: {total_budget - used_tokens} tokens",
+                        f"🔧 DEBUG: FIXED chunk size: {FIXED_CHUNK_SIZE} tokens"
+                        ]
+                ),
                 MSG_TYPE.MSG_TYPE_STEP
             )            
             streaming_callback(
