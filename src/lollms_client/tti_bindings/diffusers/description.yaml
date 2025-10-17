@@ -74,12 +74,12 @@ input_parameters:
 
   - name: "width"
     type: "int"
-    default: "512"
+    default: "1024"
     description: "Image width."
 
   - name: "height"
     type: "int"
-    default: "512"
+    default: "1024"
     description: "Image height."
 
     
@@ -96,7 +96,7 @@ generate_image_parameters:
 
   - name: "size"
     type: "str"
-    default: "512x512"
+    default: "1024x1024"
     description: "Image size in WxH format. E.g., '512x512', '1024x1024'."
 
   - name: "n"
@@ -138,7 +138,7 @@ edit_image_parameters:
 
   - name: "size"
     type: "str"
-    default: "512x512"
+    default: "1024x1024"
     description: "Size of the output image."
 
   - name: "num_inference_steps"
