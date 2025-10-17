@@ -4337,8 +4337,8 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             print(f"\n🔧 DEBUG: Starting processing with {len(text_to_process):,} characters")
 
         # Validate context fill percentage
-        if not (0.1 <= context_fill_percentage <= 0.9):
-            raise ValueError(f"context_fill_percentage must be between 0.1 and 0.9, got {context_fill_percentage}")
+        if not (0.1 <= context_fill_percentage <= 1.0):
+            raise ValueError(f"context_fill_percentage must be between 0.1 and 1.0, got {context_fill_percentage}")
 
         # Get context size
         try:
