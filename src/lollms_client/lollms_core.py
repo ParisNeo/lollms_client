@@ -4312,7 +4312,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         callback("Deep analysis complete.", MSG_TYPE.MSG_TYPE_STEP_END)
         return final_output
 
-    def long_context_processing(
+def long_context_processing(
         self,
         text_to_process: str,
         contextual_prompt: Optional[str] = None,
@@ -4320,8 +4320,8 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         context_fill_percentage: float = 0.75,
         overlap_tokens: int = 150,
         expected_generation_tokens: int = 1500,
-        max_scratchpad_tokens: int = 4000,  # NEW: Hard limit for scratchpad
-        scratchpad_compression_threshold: int = 3000,  # NEW: When to compress
+        max_scratchpad_tokens: int = 4000,
+        scratchpad_compression_threshold: int = 3000,
         streaming_callback: Optional[Callable] = None,
         return_scratchpad_only: bool = False,
         debug: bool = True,
@@ -4330,6 +4330,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
     ) -> str:
         """
         Processes long text with FIXED chunk sizing and managed scratchpad growth.
+        Now uses dynamic token calculation based on actual model tokenizer.
         """
 
         if debug:
@@ -4358,10 +4359,35 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             print(f"🔧 DEBUG: Tokenized into {len(tokens):,} word tokens")
 
         # ========================================
-        # FIXED: Calculate chunk size ONCE upfront
+        # ENHANCED: Dynamically calculate token sizes using actual tokenizer
         # ========================================
-        base_system_tokens = 150
-        user_template_tokens = 250
+        
+        # Create template system prompt to measure its token size
+        template_system_prompt = (
+            f"You are a component in a multi-step text processing pipeline analyzing step 1 of 100.\n\n"
+            f"**Your Task:** Analyze the 'New Text Chunk' and extract key information relevant to the 'Global Objective'. "
+            f"Review the 'Existing Scratchpad' to avoid repetition. Add ONLY new insights.\n\n"
+            f"**CRITICAL:** Do NOT repeat information already in the scratchpad. "
+            f"If no new relevant information exists, respond with '[No new information found in this chunk.]'"
+        )
+        base_system_tokens = len(self.tokenize(template_system_prompt))
+        
+        # Create template user prompt to measure its token size
+        summarization_objective = contextual_prompt or "Create a comprehensive summary by extracting all key facts, concepts, and conclusions."
+        template_user_prompt = (
+            f"--- Global Objective ---\n{summarization_objective}\n\n"
+            f"--- Progress ---\nStep 1/100 | First chunk analysis\n\n"
+            f"--- Existing Scratchpad (for context) ---\n\n\n"
+            f"--- New Text Chunk ---\n\n\n"
+            f"--- Instructions ---\n"
+            f"Extract NEW key information from this chunk that aligns with the objective. "
+            f"Be concise. Avoid repeating scratchpad content."
+        )
+        user_template_tokens = len(self.tokenize(template_user_prompt))
+        
+        if debug:
+            print(f"🔧 DEBUG: Computed system prompt tokens: {base_system_tokens}")
+            print(f"🔧 DEBUG: Computed user template tokens: {user_template_tokens}")
         
         # Reserve space for maximum expected scratchpad size
         reserved_scratchpad_tokens = max_scratchpad_tokens
@@ -4373,8 +4399,13 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         FIXED_CHUNK_SIZE = max(1024, int(total_budget - used_tokens))
         
         if debug:
+            print(f"🔧 DEBUG: Token budget breakdown:")
+            print(f"  - System prompt: {base_system_tokens} tokens")
+            print(f"  - User template: {user_template_tokens} tokens")
+            print(f"  - Reserved scratchpad: {reserved_scratchpad_tokens} tokens")
+            print(f"  - Expected generation: {expected_generation_tokens} tokens")
+            print(f"  - Total used: {used_tokens} tokens")
             print(f"🔧 DEBUG: FIXED chunk size: {FIXED_CHUNK_SIZE} tokens (will not change)")
-            print(f"🔧 DEBUG: Reserved scratchpad space: {reserved_scratchpad_tokens} tokens")
             print(f"🔧 DEBUG: Total budget: {total_budget} tokens")
 
         if streaming_callback:
@@ -4432,7 +4463,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
             print(f"🔧 DEBUG: Total estimated steps: {total_steps}")
 
         # ========================================
-        # NEW: Scratchpad compression helper
+        # NEW: Scratchpad compression helper with dynamic token counting
         # ========================================
         def compress_scratchpad(scratchpad_sections: list) -> list:
             """Compress scratchpad when it gets too large"""
@@ -4440,7 +4471,8 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 return scratchpad_sections
                 
             combined = "\n\n---\n\n".join(scratchpad_sections)
-            current_size = len(combined.split())
+            # ENHANCED: Use actual tokenizer to count
+            current_size = len(self.tokenize(combined))
             
             if current_size <= scratchpad_compression_threshold:
                 return scratchpad_sections
@@ -4464,7 +4496,8 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                 )
                 
                 if debug:
-                    compressed_size = len(compressed.split())
+                    # ENHANCED: Use actual tokenizer
+                    compressed_size = len(self.tokenize(compressed))
                     print(f"🔧 DEBUG: Compressed to {compressed_size} tokens (reduction: {100*(1-compressed_size/current_size):.1f}%)")
                 
                 return [compressed]
@@ -4495,16 +4528,16 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                     {"step": step_number, "total_steps": total_steps, "progress": progress}
                 )
 
-            # Check and compress scratchpad if needed
+            # ENHANCED: Check and compress scratchpad with actual token counting
             current_scratchpad = "\n\n---\n\n".join(chunk_summaries)
-            scratchpad_size = len(current_scratchpad.split())
+            scratchpad_size = len(self.tokenize(current_scratchpad)) if current_scratchpad else 0
             
             if scratchpad_size > scratchpad_compression_threshold:
                 if debug:
                     print(f"🔧 DEBUG: Scratchpad size ({scratchpad_size}) exceeds threshold, compressing...")
                 chunk_summaries = compress_scratchpad(chunk_summaries)
                 current_scratchpad = "\n\n---\n\n".join(chunk_summaries)
-                scratchpad_size = len(current_scratchpad.split())
+                scratchpad_size = len(self.tokenize(current_scratchpad)) if current_scratchpad else 0
 
             try:
                 system_prompt = (
@@ -4528,8 +4561,15 @@ Provide the final aggregated answer in {output_format} format, directly addressi
                     f"Be concise. Avoid repeating scratchpad content."
                 )
 
+                # ENHANCED: Compute actual prompt size
+                actual_prompt_tokens = len(self.tokenize(user_prompt))
+                actual_system_tokens = len(self.tokenize(system_prompt))
+
                 if debug:
-                    print(f"🔧 DEBUG: Prompt size: {len(user_prompt)} chars, Scratchpad: {scratchpad_size} tokens")
+                    print(f"🔧 DEBUG: Actual prompt tokens: {actual_prompt_tokens}")
+                    print(f"🔧 DEBUG: Actual system tokens: {actual_system_tokens}")
+                    print(f"🔧 DEBUG: Total input tokens: {actual_prompt_tokens + actual_system_tokens}")
+                    print(f"🔧 DEBUG: Scratchpad: {scratchpad_size} tokens")
 
                 chunk_summary = self.remove_thinking_blocks(self.llm.generate_text(user_prompt, system_prompt=system_prompt, **kwargs))
 
@@ -4619,7 +4659,9 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         synthesis_objective = contextual_prompt or "Provide a comprehensive, well-structured summary and analysis."
 
         if debug:
-            print(f"🔧 DEBUG: Synthesizing from {len(combined_scratchpad):,} chars, {len(chunk_summaries)} sections")
+            # ENHANCED: Use actual tokenizer
+            final_scratchpad_tokens = len(self.tokenize(combined_scratchpad))
+            print(f"🔧 DEBUG: Synthesizing from {len(combined_scratchpad):,} chars, {final_scratchpad_tokens} tokens, {len(chunk_summaries)} sections")
 
         synthesis_system_prompt = (
             "You are an expert at synthesizing information. "
