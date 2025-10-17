@@ -90,7 +90,7 @@ class DiffusersBinding(LollmsTTIBinding):
         try:
             # Try to acquire the lock with a timeout. If another process is starting
             # the server, this will wait until it's finished.
-            with lock.acquire(timeout=60):
+            with lock.acquire(timeout=3):
                 # After acquiring the lock, we MUST re-check if the server is running.
                 # Another process might have started it and released the lock while we were waiting.
                 if not self.is_server_running():
