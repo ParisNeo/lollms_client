@@ -4312,7 +4312,7 @@ Provide the final aggregated answer in {output_format} format, directly addressi
         callback("Deep analysis complete.", MSG_TYPE.MSG_TYPE_STEP_END)
         return final_output
 
-def long_context_processing(
+    def long_context_processing(
         self,
         text_to_process: str,
         contextual_prompt: Optional[str] = None,
