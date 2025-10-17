@@ -28,7 +28,7 @@ description: |
 input_parameters:
   - name: "port"
     type: "int"
-    default: 9630
+    default: 9620
     description: "The port number on which the dedicated Diffusers server will run."
 
   - name: "extra_models_path"
