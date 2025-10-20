@@ -69,7 +69,7 @@ class XTTSClientBinding(LollmsTTSBinding):
             return
 
         try:
-            with lock.acquire(timeout=60):
+            with lock.acquire(timeout=10):
                 if not self.is_server_running():
                     ASCIIColors.yellow("Lock acquired. Starting dedicated XTTS server...")
                     self.start_server()
@@ -78,7 +78,7 @@ class XTTSClientBinding(LollmsTTSBinding):
                     ASCIIColors.green("Server was started by another process while we waited. Connected successfully.")
         except Timeout:
             ASCIIColors.yellow("Could not acquire lock, another process is starting the server. Waiting...")
-            self._wait_for_server(timeout=180)
+            self._wait_for_server(timeout=10)
 
         if not self.is_server_running():
             raise RuntimeError("Failed to start or connect to the XTTS server after all attempts.")

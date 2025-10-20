@@ -105,7 +105,7 @@ class DiffusersBinding(LollmsTTIBinding):
             # This happens if the process holding the lock takes more than 60 seconds to start the server.
             # We don't try to start another one. We just wait for the existing one to be ready.
             ASCIIColors.yellow("Could not acquire lock, another process is taking a long time to start the server. Waiting...")
-            self._wait_for_server(timeout=300) # Give it a longer timeout here just in case.
+            self._wait_for_server(timeout=10) # Give it a longer timeout here just in case.
 
         # A final verification to ensure we are connected.
         if not self.is_server_running():
