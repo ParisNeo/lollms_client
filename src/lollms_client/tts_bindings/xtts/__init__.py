@@ -32,7 +32,7 @@ class XTTSClientBinding(LollmsTTSBinding):
 
         self.config = kwargs
         self.host = kwargs.get("host", "localhost")
-        self.port = kwargs.get("port", 8081)
+        self.port = kwargs.get("port", 9633)
         self.auto_start_server = kwargs.get("auto_start_server", True)
         self.server_process = None
         self.base_url = f"http://{self.host}:{self.port}"
