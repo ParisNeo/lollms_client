@@ -18,7 +18,7 @@ input_parameters:
     description: "The host address on which the dedicated XTTS server is running or should be started."
   - name: "port"
     type: "int"
-    default: 9631
+    default: 9633
     description: "The port number on which the dedicated XTTS server is running or should be started."
   - name: "model_name"
     type: "str"
