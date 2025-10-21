@@ -1555,7 +1555,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             mcp_tools = self.mcp.discover_tools(force_refresh=True)
             if isinstance(use_mcps, list): 
                 filtered_tools = [t for t in mcp_tools if t["name"] in use_mcps]
-                tools_infos+=[f"    🛠️{f}" for f in filtered_tools]
+                tools_infos+=[f"    🛠️{f['name']}" for f in filtered_tools]
                 all_discovered_tools.extend(filtered_tools)
                 log_event(f"  ✅ Loaded {len(filtered_tools)} specific MCP tools: {', '.join(use_mcps)}", MSG_TYPE.MSG_TYPE_INFO)
             elif use_mcps is True: 
