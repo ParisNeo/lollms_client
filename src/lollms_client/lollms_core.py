@@ -1563,6 +1563,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         if use_data_store:
             log_event(f"  📚 Setting up {len(use_data_store)} knowledge bases...", MSG_TYPE.MSG_TYPE_INFO)
             for name, info in use_data_store.items():
+                ASCIIColors.info(f"use_data_store item:\n{name}\n{info}")
                 tool_name, description, call_fn = f"research::{name}", f"Queries the '{name}' knowledge base.", None
                 if callable(info): call_fn = info
                 elif isinstance(info, dict):
