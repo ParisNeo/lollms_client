@@ -31,6 +31,8 @@ class WhisperCppSTTBinding(LollmsSTTBinding):
         n_threads = kwargs.get("n_threads", 4)
         extra_whisper_args = kwargs.get("extra_whisper_args", [])  # e.g. ["--no-timestamps"]
 
+        self.default_model_name = "base"
+
         # --- Validate FFMPEG ---
         self.ffmpeg_exe = None
         if ffmpeg_path:
@@ -377,3 +379,7 @@ if __name__ == '__main__':
             except OSError: pass # Ignore if not empty or other issues
 
     ASCIIColors.yellow("\n--- WhisperCppSTTBinding Test Finished ---")
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        return ["base" , "small", "medium", "large"]
+

@@ -82,6 +82,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
                                     If None, `torch` will attempt to auto-detect. Defaults to None.
         """
         super().__init__(binding_name="whisper") # Not applicable
+        self.default_model_name = kwargs.get("model_name", "base")
 
         if not _whisper_installed:
             raise ImportError(f"Whisper STT binding dependencies not met. Please ensure 'openai-whisper' and 'torch' are installed. Error: {_whisper_installation_error}")
