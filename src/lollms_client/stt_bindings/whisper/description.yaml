@@ -1,26 +1,16 @@
-title: LoLLMs (OpenAI Compatible)
+title: Whisper STT Binding
 author: ParisNeo
-creation_date: 2025-08-13
-last_update_date: 2025-08-13
-description: Connects to a LoLLMs service or any other OpenAI-compatible API endpoint.
+creation_date: 2025-10-21
+last_update_date: 2025-10-21
+description: A Speech-To-Text (STT) binding for transcribing audio using OpenAI's Whisper model locally. It requires 'ffmpeg' to be installed on the system.
 input_parameters:
   - name: model_name
     type: str
-    description: "The name of the model to use from the remote service."
-    mandatory: true
-    default: ""
-  - name: host_address
-    type: str
-    description: "The base URL of the LoLLMs or OpenAI-compatible service (e.g., 'http://localhost:9600/v1')."
+    description: "The Whisper model size to use. Known sizes include 'tiny', 'base', 'small', 'medium', and 'large' variants (e.g., 'large-v3')."
     mandatory: false
-    default: "http://localhost:9600/v1"
-  - name: service_key
+    default: "base"
+  - name: device
     type: str
-    description: "The API key for the service. Can also be set via the LOLLMS_API_KEY environment variable."
+    description: "The device to run the model on ('cpu', 'cuda', 'mps'). If not specified, it will be auto-detected."
     mandatory: false
     default: ""
-  - name: verify_ssl_certificate
-    type: bool
-    description: "Whether to verify the SSL certificate of the server. Defaults to true."
-    mandatory: false
-    default: true

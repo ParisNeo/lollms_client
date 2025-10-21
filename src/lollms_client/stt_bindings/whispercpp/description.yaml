@@ -1,26 +1,41 @@
-title: LoLLMs (OpenAI Compatible)
+title: Whisper.cpp STT Binding
 author: ParisNeo
-creation_date: 2025-08-13
-last_update_date: 2025-08-13
-description: Connects to a LoLLMs service or any other OpenAI-compatible API endpoint.
+creation_date: 2025-10-21
+last_update_date: 2025-10-21
+description: Connects to a local whisper.cpp executable for speech-to-text transcription. Requires a pre-built whisper.cpp executable and a GGUF model file.
 input_parameters:
-  - name: model_name
+  - name: model_path
     type: str
-    description: "The name of the model to use from the remote service."
+    description: "The path to the Whisper GGUF model file (e.g., 'ggml-base.bin')."
     mandatory: true
     default: ""
-  - name: host_address
+  - name: whispercpp_exe_path
     type: str
-    description: "The base URL of the LoLLMs or OpenAI-compatible service (e.g., 'http://localhost:9600/v1')."
-    mandatory: false
-    default: "http://localhost:9600/v1"
-  - name: service_key
-    type: str
-    description: "The API key for the service. Can also be set via the LOLLMS_API_KEY environment variable."
+    description: "Path to the whisper.cpp executable. If not provided, it will be searched for in the system's PATH."
     mandatory: false
     default: ""
-  - name: verify_ssl_certificate
-    type: bool
-    description: "Whether to verify the SSL certificate of the server. Defaults to true."
+  - name: ffmpeg_path
+    type: str
+    description: "Path to the ffmpeg executable. Required for converting non-WAV files. If not provided, it is searched for in the system's PATH."
     mandatory: false
-    default: true
+    default: ""
+  - name: models_search_path
+    type: str
+    description: "An optional directory to search for models if a relative path is given for model_path."
+    mandatory: false
+    default: ""
+  - name: default_language
+    type: str
+    description: "The default language for transcription (e.g., 'en', 'fr'). Use 'auto' for automatic detection."
+    mandatory: false
+    default: "auto"
+  - name: n_threads
+    type: int
+    description: "The number of threads to use for processing."
+    mandatory: false
+    default: 4
+  - name: extra_whisper_args
+    type: list
+    description: "A list of extra command-line arguments to pass to the whisper.cpp executable (e.g., ['--no-timestamps'])."
+    mandatory: false
+    default: []
