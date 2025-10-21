@@ -65,19 +65,21 @@ class TaskPlanner:
     def __init__(self, llm_client):
         self.llm_client = llm_client
         
-    def decompose_task(self, user_request: str, context: str = "") -> ExecutionPlan:
+    def decompose_task(self, user_request: str, context: str = "", all_visible_tools:str="") -> ExecutionPlan:
         """Break down complex requests into manageable subtasks"""
         decomposition_prompt = f"""
 Analyze this user request and break it down into specific, actionable subtasks:
 
 USER REQUEST: "{user_request}"
 CONTEXT: {context}
+AVAILABLE TOOLS: {all_visible_tools}
 
 Create a JSON plan with subtasks that are:
 1. Specific and actionable
 2. Have clear success criteria  
 3. Include estimated complexity (1-5 scale)
 4. List required tool types
+5. The tasks should either be thought based, or use one of the available tools. Do not plan tasks we can not do.
 
 Output format:
 {{
