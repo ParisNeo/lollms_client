@@ -4,7 +4,7 @@ import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 from ascii_colors import trace_exception
-
+import yaml
 class LollmsSTTBinding(ABC):
     """Abstract base class for all LOLLMS Speech-to-Text bindings."""
 
@@ -123,3 +123,61 @@ class LollmsSTTBindingManager:
         """
         return [binding_dir.name for binding_dir in self.stt_bindings_dir.iterdir()
                 if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
+
+
+    @staticmethod
+    def _get_fallback_description(binding_name: str) -> Dict:
+        return {
+            "binding_name": binding_name,
+            "title": binding_name.replace("_", " ").title(),
+            "author": "Unknown",
+            "version": "N/A",
+            "description": f"A binding for {binding_name}. No description.yaml file was found.",
+            "input_parameters": [
+                 {
+                    "name": "model_name",
+                    "type": "str",
+                    "description": "The model name or ID to be used.",
+                    "mandatory": False,
+                    "default": ""
+                }
+            ],
+            "generate_audio_parameters": []
+        }
+    @staticmethod
+    def get_bindings_list(stt_bindings_dir: Union[str, Path]) -> List[Dict]:
+        bindings_dir = Path(stt_bindings_dir)
+        if not bindings_dir.is_dir():
+            return []
+
+        bindings_list = []
+        for binding_folder in bindings_dir.iterdir():
+            if binding_folder.is_dir() and (binding_folder / "__init__.py").exists():
+                binding_name = binding_folder.name
+                description_file = binding_folder / "description.yaml"
+                
+                binding_info = {}
+                if description_file.exists():
+                    try:
+                        with open(description_file, 'r', encoding='utf-8') as f:
+                            binding_info = yaml.safe_load(f)
+                        binding_info['binding_name'] = binding_name
+                    except Exception as e:
+                        print(f"Error loading description.yaml for {binding_name}: {e}")
+                        binding_info = LollmsSTTBindingManager._get_fallback_description(binding_name)
+                else:
+                    binding_info = LollmsSTTBindingManager._get_fallback_description(binding_name)
+                
+                bindings_list.append(binding_info)
+
+        return sorted(bindings_list, key=lambda b: b.get('title', b['binding_name']))
+    
+
+    def get_available_bindings(self) -> list[str]:
+        return [binding_dir.name for binding_dir in self.stt_bindings_dir.iterdir()
+                if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
+
+def get_available_bindings(stt_bindings_dir: Union[str, Path] = None) -> List[Dict]:
+    if stt_bindings_dir is None:
+        stt_bindings_dir = Path(__file__).resolve().parent / "stt_bindings"
+    return LollmsSTTBindingManager.get_bindings_list(stt_bindings_dir)
