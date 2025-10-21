@@ -1208,14 +1208,27 @@ class LollmsDiscussion:
             prompt_for_agent = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
             if debug:
                 ASCIIColors.cyan("\n" + "="*50 + "\n--- DEBUG: AGENTIC TURN TRIGGERED ---\n" + f"--- PROMPT FOR AGENT (from discussion history) ---\n{prompt_for_agent}\n" + "="*50 + "\n")
+            
+            
+            # Combine system prompt and data zones
+            system_prompt_part = (self._system_prompt or "").strip()
+            data_zone_part = self.get_full_data_zone() # This now returns a clean, multi-part block or an empty string
+            full_system_prompt = ""
 
+            # Combine them intelligently
+            if system_prompt_part and data_zone_part:
+                full_system_prompt = f"{system_prompt_part}\n\n{data_zone_part}"
+            elif system_prompt_part:
+                full_system_prompt = system_prompt_part
+            else:
+                full_system_prompt = data_zone_part
             agent_result = self.lollmsClient.generate_with_mcp_rag(
                 prompt=prompt_for_agent,
                 use_mcps=effective_use_mcps,
                 use_data_store=use_data_store,
                 max_reasoning_steps=max_reasoning_steps,
                 images=images,
-                system_prompt = self._system_prompt,
+                system_prompt = full_system_prompt,
                 debug=debug,
                 **kwargs
             )
