@@ -3120,6 +3120,7 @@ Generate a patch to apply these changes. Follow the format specified in your ins
             ASCIIColors.info("Generating structured content...")
 
         last_error = None
+        ASCIIColors.info(f"Final system prompt: {final_system_prompt}")
         for attempt in range(max_retries + 1):
             retry_system_prompt = final_system_prompt
             if attempt > 0 and not use_override:
