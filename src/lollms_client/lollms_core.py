@@ -1587,8 +1587,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         all_visible_tools = visible_tools + built_in_tools
         tool_summary = "\n".join([f"- **{t['name']}**: {t['description']}" for t in all_visible_tools[:20]])
         
+        log_event("\n".join([f"- {all_visible_tool['name']} total capabilities" for all_visible_tool in all_visible_tools]), MSG_TYPE.MSG_TYPE_INFO, event_id=discovery_step_id, meta={"tool_count": len(all_visible_tools), "mcp_tools": len(all_discovered_tools), "rag_tools": len(rag_registry)})
         log_event(f"✅ Ready with {len(all_visible_tools)} total capabilities", MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id, meta={"tool_count": len(all_visible_tools), "mcp_tools": len(all_discovered_tools), "rag_tools": len(rag_registry)})
-        log_event("\n".join([f"- {all_visible_tool['name']} total capabilities" for all_visible_tool in all_visible_tools]), MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id, meta={"tool_count": len(all_visible_tools), "mcp_tools": len(all_discovered_tools), "rag_tools": len(rag_registry)})
 
         # Enhanced triage with better prompting
         triage_step_id = log_event("🤔 Analyzing request complexity and optimal approach...", MSG_TYPE.MSG_TYPE_STEP_START)
@@ -1625,13 +1625,10 @@ Based on the request complexity and available tools, choose the optimal strategy
 Provide your analysis in JSON format:
 {{"thought": "Detailed reasoning about the request complexity and requirements", "strategy": "ONE_OF_THE_FOUR_OPTIONS", "confidence": 0.8, "text_output": "Direct answer or clarification question if applicable", "required_tool_name": "specific tool name if SINGLE_TOOL strategy", "estimated_steps": 3}}"""
             
-            log_prompt("Triage Prompt", triage_prompt)
-            
             triage_schema = {
                 "thought": "string", "strategy": "string", "confidence": "number",
                 "text_output": "string", "required_tool_name": "string", "estimated_steps": "number"
             }
-            ASCIIColors.info(f"Figuring out the best strategy. Using:\ntriage_prompt:{triage_prompt}\system_prompt:{system_prompt}")
             strategy_data = self.generate_structured_content(prompt=triage_prompt, schema=triage_schema, temperature=0.1, system_prompt=system_prompt, **llm_generation_kwargs)
             strategy = strategy_data.get("strategy") if strategy_data else "COMPLEX_PLAN"
             
