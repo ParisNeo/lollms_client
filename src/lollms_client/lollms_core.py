@@ -1583,6 +1583,9 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             {"name": "local_tools::request_clarification", "description": "Ask the user for more specific information when the request is ambiguous.", "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}},
             {"name": "local_tools::revise_plan", "description": "Update the execution plan based on new discoveries or changing requirements.", "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}, "new_plan": {"type": "array"}}, "required": ["reason", "new_plan"]}}
         ]
+        tools_infos+=[f"    🔨 final_answer","    🔨 request_clarification","    🔨 revise_plan"]
+        
+        
         if getattr(self, "tti", None): 
             built_in_tools.append({"name": "local_tools::generate_image", "description": "Generate an image from a text description.", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}})
         
