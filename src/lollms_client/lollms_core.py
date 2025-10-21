@@ -1629,7 +1629,7 @@ Provide your analysis in JSON format:
                 "thought": "string", "strategy": "string", "confidence": "number",
                 "text_output": "string", "required_tool_name": "string", "estimated_steps": "number"
             }
-            strategy_data = self.generate_structured_content(prompt=triage_prompt, schema=triage_schema, temperature=0.1, **llm_generation_kwargs)
+            strategy_data = self.generate_structured_content(prompt=triage_prompt, schema=triage_schema, temperature=0.1, system_prompt=system_prompt, **llm_generation_kwargs)
             strategy = strategy_data.get("strategy") if strategy_data else "COMPLEX_PLAN"
             
             log_event(f"Strategy analysis complete", MSG_TYPE.MSG_TYPE_INFO, meta={
