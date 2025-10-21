@@ -1629,6 +1629,7 @@ Provide your analysis in JSON format:
                 "thought": "string", "strategy": "string", "confidence": "number",
                 "text_output": "string", "required_tool_name": "string", "estimated_steps": "number"
             }
+            ASCIIColors.info(f"Figuring out the best strategy. Using:\ntriage_prompt:{triage_prompt}\system_prompt:{system_prompt}")
             strategy_data = self.generate_structured_content(prompt=triage_prompt, schema=triage_schema, temperature=0.1, system_prompt=system_prompt, **llm_generation_kwargs)
             strategy = strategy_data.get("strategy") if strategy_data else "COMPLEX_PLAN"
             
