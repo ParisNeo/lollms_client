@@ -1527,7 +1527,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             final_answer_temperature=0.7
         if rag_top_k is None:
             rag_top_k=5
-
+            
+        tools_infos = []
         def log_event(desc, event_type=MSG_TYPE.MSG_TYPE_CHUNK, meta=None, event_id=None) -> Optional[str]:
             if not streaming_callback: return None
             is_start = event_type == MSG_TYPE.MSG_TYPE_STEP_START
@@ -1554,9 +1555,11 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             mcp_tools = self.mcp.discover_tools(force_refresh=True)
             if isinstance(use_mcps, list): 
                 filtered_tools = [t for t in mcp_tools if t["name"] in use_mcps]
+                tools_infos+=[f"    🛠️{f}" for f in filtered_tools]
                 all_discovered_tools.extend(filtered_tools)
                 log_event(f"  ✅ Loaded {len(filtered_tools)} specific MCP tools: {', '.join(use_mcps)}", MSG_TYPE.MSG_TYPE_INFO)
             elif use_mcps is True: 
+                tools_infos+=[f"    🛠️{f['name']}" for f in mcp_tools]
                 all_discovered_tools.extend(mcp_tools)
                 log_event(f"  ✅ Loaded {len(mcp_tools)} MCP tools", MSG_TYPE.MSG_TYPE_INFO)
         
@@ -1568,13 +1571,12 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 if callable(info): call_fn = info
                 elif isinstance(info, dict):
                     if "callable" in info and callable(info["callable"]): call_fn = info["callable"]
-                    description = info.get("description", description)
+                    description = info.get("description", "This is a datastore with the following description: \n" + description)
                 if call_fn:
                     visible_tools.append({"name": tool_name, "description": description, "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}})
                     rag_registry[tool_name] = call_fn
                     rag_tool_specs[tool_name] = {"default_top_k": rag_top_k, "default_min_sim": rag_min_similarity_percent}
-                    log_event(f"    📖 Ready: {name}", MSG_TYPE.MSG_TYPE_INFO)
-        
+                    tools_infos.append(f"    📖 {name}")
         visible_tools.extend(all_discovered_tools)
         built_in_tools = [
             {"name": "local_tools::final_answer", "description": "Provide the final answer directly to the user.", "input_schema": {}},
@@ -1587,7 +1589,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         all_visible_tools = visible_tools + built_in_tools
         tool_summary = "\n".join([f"- **{t['name']}**: {t['description']}" for t in all_visible_tools[:20]])
         
-        log_event("\n".join([f"- {all_visible_tool['name']} total capabilities" for all_visible_tool in all_visible_tools]), MSG_TYPE.MSG_TYPE_INFO, event_id=discovery_step_id, meta={"tool_count": len(all_visible_tools), "mcp_tools": len(all_discovered_tools), "rag_tools": len(rag_registry)})
+        log_event("\n".join(tools_infos), MSG_TYPE.MSG_TYPE_INFO)
         log_event(f"✅ Ready with {len(all_visible_tools)} total capabilities", MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id, meta={"tool_count": len(all_visible_tools), "mcp_tools": len(all_discovered_tools), "rag_tools": len(rag_registry)})
 
         # Enhanced triage with better prompting
@@ -1607,7 +1609,7 @@ AVAILABLE CAPABILITIES:
 Based on the request complexity and available tools, choose the optimal strategy:
 
 1. **DIRECT_ANSWER**: For simple greetings, basic questions, or requests that don't require any tools
-   - Use when: The request can be fully answered with your existing knowledge
+   - Use when: The request can be fully answered with your existing knowledge with confidence, and no tool seems to add any significant value to the answer
    - Example: "Hello", "What is Python?", "Explain quantum physics"
 
 2. **REQUEST_CLARIFICATION**: When the request is too vague or ambiguous
