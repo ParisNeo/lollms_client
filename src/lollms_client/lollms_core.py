@@ -1845,7 +1845,7 @@ RESPONSE:"""
         
         # Enhanced planning phase
         planning_step_id = log_event_fn("📋 Creating adaptive execution plan...", MSG_TYPE.MSG_TYPE_STEP_START)
-        execution_plan = planner.decompose_task(original_user_prompt, context or "")
+        execution_plan = planner.decompose_task(original_user_prompt, context or "", "\n".join([f"{tool['name']}:{tool['description']}" for tool in all_visible_tools]))
         current_plan_version = 1
         
         log_event_fn(f"Initial plan created with {len(execution_plan.tasks)} tasks", MSG_TYPE.MSG_TYPE_INFO, meta={
