@@ -1587,6 +1587,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         tool_summary = "\n".join([f"- **{t['name']}**: {t['description']}" for t in all_visible_tools[:20]])
         
         log_event(f"✅ Ready with {len(all_visible_tools)} total capabilities", MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id, meta={"tool_count": len(all_visible_tools), "mcp_tools": len(all_discovered_tools), "rag_tools": len(rag_registry)})
+        log_event("\n".join([f"- {all_visible_tool} total capabilities" for all_visible_tool in all_visible_tools]), MSG_TYPE.MSG_TYPE_STEP_END, event_id=discovery_step_id, meta={"tool_count": len(all_visible_tools), "mcp_tools": len(all_discovered_tools), "rag_tools": len(rag_registry)})
 
         # Enhanced triage with better prompting
         triage_step_id = log_event("🤔 Analyzing request complexity and optimal approach...", MSG_TYPE.MSG_TYPE_STEP_START)
