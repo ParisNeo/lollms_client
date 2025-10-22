@@ -214,7 +214,7 @@ class DiffusersBinding(LollmsTTIBinding):
         self.server_process = subprocess.Popen(command, creationflags=creationflags)
         ASCIIColors.info("Diffusers server process launched in the background.")
 
-    def _wait_for_server(self, timeout=300):
+    def _wait_for_server(self, timeout=30):
         """Waits for the server to become responsive."""
         ASCIIColors.info("Waiting for Diffusers server to become available...")
         start_time = time.time()

@@ -140,7 +140,7 @@ class XTTSClientBinding(LollmsTTSBinding):
         self.server_process = subprocess.Popen(command, creationflags=creationflags)
         ASCIIColors.info("XTTS server process launched in the background.")
 
-    def _wait_for_server(self, timeout=1):
+    def _wait_for_server(self, timeout=10):
         """Waits for the server to become responsive."""
         ASCIIColors.info("Waiting for XTTS server to become available...")
         start_time = time.time()
