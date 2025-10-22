@@ -1476,7 +1476,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 return "🎨 Creating an image based on your request"
             
             # Handle RAG (data store) tools by their pattern
-            elif "research::" in tool_name:
+            elif "rag::" in tool_name:
                 # Extract the friendly name of the data source
                 source_name = tool_name.split("::")[-1].replace("_", " ").title()
                 return f"🔍 Searching {source_name} for relevant information"
@@ -1567,7 +1567,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
             log_event(f"  📚 Setting up {len(use_data_store)} knowledge bases...", MSG_TYPE.MSG_TYPE_INFO)
             for name, info in use_data_store.items():
                 ASCIIColors.info(f"use_data_store item:\n{name}\n{info}")
-                tool_name, description, call_fn = f"research::{name}", f"Queries the '{name}' knowledge base.", None
+                tool_name, description, call_fn = f"rag::{name}", f"Queries the '{name}' knowledge base.", None
                 if callable(info): call_fn = info
                 elif isinstance(info, dict):
                     if "callable" in info and callable(info["callable"]): call_fn = info["callable"]
@@ -1776,7 +1776,7 @@ RESPONSE:"""
             }
             if tool_name in descriptions:
                 return descriptions[tool_name]
-            if "research::" in tool_name: 
+            if "rag::" in tool_name: 
                 return f"🔍 Searching {tool_name.split('::')[-1]} knowledge base"
             if requires_code: 
                 return "💻 Processing code"
