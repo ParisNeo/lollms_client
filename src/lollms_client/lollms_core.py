@@ -1637,7 +1637,7 @@ Provide your analysis in JSON format:
             strategy_data = self.generate_structured_content(prompt=triage_prompt, schema=triage_schema, temperature=0.1, system_prompt=system_prompt, **llm_generation_kwargs)
             strategy = strategy_data.get("strategy") if strategy_data else "COMPLEX_PLAN"
             
-            log_event(f"Strategy analysis complete", MSG_TYPE.MSG_TYPE_INFO, meta={
+            log_event(f"Strategy analysis complete.\n**confidence**: {strategy_data.get('confidence', 0.5)}\n**reasoning**: {strategy_data.get('thought', 'None')}", MSG_TYPE.MSG_TYPE_INFO, meta={
                 "strategy": strategy,
                 "confidence": strategy_data.get("confidence", 0.5),
                 "estimated_steps": strategy_data.get("estimated_steps", 1),
