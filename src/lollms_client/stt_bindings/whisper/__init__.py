@@ -105,7 +105,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
 
     def _load_whisper_model(self, model_name_to_load: str):
         """Loads or reloads the Whisper model."""
-        if model_name_to_load not in self.WHISPER_MODEL_SIZES:
+        if model_name_to_load not in whisper.available_models():
             ASCIIColors.warning(f"'{model_name_to_load}' is not a standard Whisper model size. Attempting to load anyway. Known sizes: {self.WHISPER_MODEL_SIZES}")
 
         if self.model is not None and self.loaded_model_name == model_name_to_load:
@@ -203,7 +203,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
         Returns:
             List[str]: A list of available Whisper model size identifiers.
         """
-        return self.WHISPER_MODEL_SIZES.copy() # Return a copy
+        return whisper.available_models() # Return a copy
 
     def __del__(self):
         """Clean up: Unload the model to free resources."""
