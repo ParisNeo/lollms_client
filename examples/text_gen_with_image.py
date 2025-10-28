@@ -5,7 +5,7 @@ image_path = ""
 # Initialize the LollmsClient instance
 lc = LollmsClient(llm_binding_name="lollms", llm_binding_config={
         "model_name": "ollama/gemma3:12b",
-        "service_key": "lollms_m1fOU6eS_HXTc09wA9CtCl-yyJBGpaqcvPtOvMqANKPZL9_PEn18",# change this to your actual service key
+        "service_key": "lollms_0vWhQYNV__q6GMMfZ4_Ib2Crw8wnPTAXDu2KWrsKvsulpptxzfiY",# change this to your actual service key
     })
 
 def cb(chunk, type):
