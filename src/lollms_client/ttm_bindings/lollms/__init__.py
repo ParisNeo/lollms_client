@@ -11,23 +11,10 @@ class LollmsTTMBinding_Impl(LollmsTTMBinding):
     """Concrete implementation of the LollmsTTMBinding for the standard LOLLMS server (Placeholder)."""
 
     def __init__(self,
-                 host_address: Optional[str] = "http://localhost:9600", # Default LOLLMS host
-                 model_name: Optional[str] = None, # Default model (server decides if None)
-                 service_key: Optional[str] = None,
-                 verify_ssl_certificate: bool = True):
-        """
-        Initialize the LOLLMS TTM binding.
-
-        Args:
-            host_address (Optional[str]): Host address for the LOLLMS service.
-            model_name (Optional[str]): Default TTM model identifier.
-            service_key (Optional[str]): Authentication key.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates.
-        """
-        super().__init__(host_address=host_address,
-                         model_name=model_name,
-                         service_key=service_key,
-                         verify_ssl_certificate=verify_ssl_certificate)
+                 **kwargs):
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
         ASCIIColors.warning("LOLLMS TTM binding is not yet fully implemented in the client.")
         ASCIIColors.warning("Please ensure your LOLLMS server has a TTM service running.")
 

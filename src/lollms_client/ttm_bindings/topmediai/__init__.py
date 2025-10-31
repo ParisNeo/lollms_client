@@ -15,9 +15,12 @@ BindingName = "TopMediaiTTMBinding"
 class TopMediaiTTMBinding(LollmsTTMBinding):
     """A Text-to-Music binding for the TopMediai API."""
 
-    def __init__(self, **kwargs):
-        super().__init__(binding_name=BindingName, **kwargs)
-        self.api_key = self.settings.get("api_key") or os.environ.get("TOPMEDIAI_API_KEY")
+    def __init__(self,
+                 **kwargs):
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        self.api_key = self.config.get("api_key") or os.environ.get("TOPMEDIAI_API_KEY")
         if not self.api_key:
             raise ValueError("TopMediai API key is required. Please set it in config or as TOPMEDIAI_API_KEY env var.")
         self.base_url = "https://api.topmediai.com/v1"

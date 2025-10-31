@@ -36,14 +36,13 @@ class DiffusersBinding(LollmsTTIBinding):
     """
     def __init__(self,
                  **kwargs):
-
-        super().__init__(binding_name=BindingName)
-
         # Prioritize 'model_name' but accept 'model' as an alias from config files.
         if 'model' in kwargs and 'model_name' not in kwargs:
             kwargs['model_name'] = kwargs.pop('model')
+        super().__init__(binding_name=BindingName, config=kwargs)
 
-        self.config = kwargs
+
+
         self.host = kwargs.get("host", "localhost")
         self.port = kwargs.get("port", 9632)
         self.auto_start_server = kwargs.get("auto_start_server", True)

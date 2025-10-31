@@ -75,21 +75,16 @@ DEFAULT_AUDIOCRAFT_MODELS = [
 
 class AudioCraftTTMBinding(LollmsTTMBinding):
     def __init__(self,
-                 model_name: str = "facebook/musicgen-small", # HF ID or local path
-                 device: Optional[str] = None, # "cpu", "cuda", "mps", or None for auto
-                 output_format: str = "wav", # 'wav', 'mp3' (mp3 needs ffmpeg via audiocraft)
-                 # Catch LollmsTTMBinding standard args
-                 host_address: Optional[str] = None, # Not used by local binding
-                 service_key: Optional[str] = None,  # Not used by local binding
-                 verify_ssl_certificate: bool = True,# Not used by local binding
-                 **kwargs): # Catch-all for future compatibility or specific audiocraft params
-
-        super().__init__(binding_name="audiocraft")
+                 **kwargs):
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        super().__init__(binding_name=BindingName, config=kwargs)    
 
         if not _audiocraft_installed_with_correct_torch:
             raise ImportError(f"AudioCraft TTM binding dependencies not met. Please ensure 'audiocraft', 'torch', 'torchaudio', 'scipy', 'numpy' are installed. Error: {_audiocraft_installation_error}")
 
-        self.device = device
+        self.device = kwargs.get("device")  # "cuda", "mps", "cpu", or None for auto-detect
         if self.device is None: # Auto-detect if not specified by user
             if torch.cuda.is_available():
                 self.device = "cuda"
@@ -117,7 +112,7 @@ class AudioCraftTTMBinding(LollmsTTMBinding):
             ASCIIColors.warning(f"Unsupported output_format '{self.output_format}'. Defaulting to 'wav'.")
             self.output_format = "wav"
         
-        self._load_audiocraft_model(model_name)
+        self._load_audiocraft_model(kwargs.get("model_name") or "facebook/musicgen-small")
 
     def _load_audiocraft_model(self, model_name_to_load: str):
         if self.model is not None and self.loaded_model_name == model_name_to_load:

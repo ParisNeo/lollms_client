@@ -24,12 +24,15 @@ REPLICATE_MODELS = [
 class ReplicateTTMBinding(LollmsTTMBinding):
     """A Text-to-Music binding for models hosted on Replicate."""
 
-    def __init__(self, **kwargs):
-        super().__init__(binding_name=BindingName, **kwargs)
-        self.api_key = self.settings.get("api_key") or os.environ.get("REPLICATE_API_TOKEN")
+    def __init__(self,
+                 **kwargs):
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        self.api_key = self.config.get("api_key") or os.environ.get("REPLICATE_API_TOKEN")
         if not self.api_key:
             raise ValueError("Replicate API token is required. Please set it in config or as REPLICATE_API_TOKEN env var.")
-        self.model_version = self.settings.get("model_name", "meta/musicgen:b05b1dff1d8c6ac63d42422dd565e23b63869bf2d51acda751e04b5dd304535d")
+        self.model_version = self.config.get("model_name", "meta/musicgen:b05b1dff1d8c6ac63d42422dd565e23b63869bf2d51acda751e04b5dd304535d")
         self.base_url = "https://api.replicate.com/v1"
         self.headers = {"Authorization": f"Token {self.api_key}", "Content-Type": "application/json"}
 

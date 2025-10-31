@@ -9,7 +9,8 @@ class LollmsSTTBinding(ABC):
     """Abstract base class for all LOLLMS Speech-to-Text bindings."""
 
     def __init__(self,
-                 binding_name:str="unknown"):
+                 binding_name:str="unknown",
+                 config={}):
         """
         Initialize the LollmsSTTBinding base class.
 
@@ -17,6 +18,7 @@ class LollmsSTTBinding(ABC):
             binding_name (Optional[str]): The binding name
         """
         self.binding_name = binding_name
+        self.config = config
 
     @abstractmethod
     def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:
@@ -172,10 +174,6 @@ class LollmsSTTBindingManager:
 
         return sorted(bindings_list, key=lambda b: b.get('title', b['binding_name']))
     
-
-    def get_available_bindings(self) -> list[str]:
-        return [binding_dir.name for binding_dir in self.stt_bindings_dir.iterdir()
-                if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
 
 def get_available_bindings(stt_bindings_dir: Union[str, Path] = None) -> List[Dict]:
     if stt_bindings_dir is None:

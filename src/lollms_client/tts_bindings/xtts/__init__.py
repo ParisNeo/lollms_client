@@ -24,11 +24,11 @@ class XTTSClientBinding(LollmsTTSBinding):
     This architecture prevents the heavy XTTS model from being loaded into memory
     by multiple worker processes, solving potential OOM errors and speeding up TTS generation.
     """
-    def __init__(self, 
+    def __init__(self,
                  **kwargs):
-        
-        binding_name = "xtts"
-        super().__init__(binding_name=binding_name, **kwargs)
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
 
         self.config = kwargs
         self.host = kwargs.get("host", "localhost")

@@ -23,7 +23,10 @@ class LollmsWebuiTTIBinding_Impl(LollmsTTIBinding):
             service_key (Optional[str]): Authentication key (used for client_id verification).
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
         """
-        super().__init__(binding_name="lollms")
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        super().__init__(binding_name=BindingName, config=kwargs)
 
         # Extract parameters from kwargs, providing defaults
         self.host_address = kwargs.get("host_address", "http://localhost:9600")  # Default LOLLMS host

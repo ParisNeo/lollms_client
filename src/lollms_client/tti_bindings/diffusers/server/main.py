@@ -60,65 +60,13 @@ MODELS_PATH = Path("./models")
 
 # --- START: Core Logic (Complete and Unabridged) ---
 CIVITAI_MODELS = {
-    "realistic-vision-v6": {
-        "display_name": "Realistic Vision V6.0", "url": "https://civitai.com/api/download/models/501240?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "realisticVisionV60_v60B1.safetensors", "description": "Photorealistic SD1.5 checkpoint.", "owned_by": "civitai"
-    },
-    "absolute-reality": {
-        "display_name": "Absolute Reality", "url": "https://civitai.com/api/download/models/132760?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "absolutereality_v181.safetensors", "description": "General realistic SD1.5.", "owned_by": "civitai"
-    },
-    "dreamshaper-8": {
+    "DreamShaper-8": {
         "display_name": "DreamShaper 8", "url": "https://civitai.com/api/download/models/128713",
         "filename": "dreamshaper_8.safetensors", "description": "Versatile SD1.5 style model.", "owned_by": "civitai"
     },
-    "juggernaut-xl": {
+    "Juggernaut-xl": {
         "display_name": "Juggernaut XL", "url": "https://civitai.com/api/download/models/133005",
         "filename": "juggernautXL_version6Rundiffusion.safetensors", "description": "Artistic SDXL.", "owned_by": "civitai"
-    },
-    "lyriel-v1.6": {
-        "display_name": "Lyriel v1.6", "url": "https://civitai.com/api/download/models/72396?type=Model&format=SafeTensor&size=full&fp=fp16",
-        "filename": "lyriel_v16.safetensors", "description": "Fantasy/stylized SD1.5.", "owned_by": "civitai"
-    },
-    "ui_icons": {
-        "display_name": "UI Icons", "url": "https://civitai.com/api/download/models/367044?type=Model&format=SafeTensor&size=full&fp=fp16",
-        "filename": "uiIcons_v10.safetensors", "description": "A model for generating UI icons.", "owned_by": "civitai"
-    },
-    "meinamix": {
-        "display_name": "MeinaMix", "url": "https://civitai.com/api/download/models/948574?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "meinamix_meinaV11.safetensors", "description": "Anime/illustration SD1.5.", "owned_by": "civitai"
-    },
-    "rpg-v5": {
-        "display_name": "RPG v5", "url": "https://civitai.com/api/download/models/124626?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "rpg_v5.safetensors", "description": "RPG assets SD1.5.", "owned_by": "civitai"
-    },
-    "pixel-art-xl": {
-        "display_name": "Pixel Art XL", "url": "https://civitai.com/api/download/models/135931?type=Model&format=SafeTensor",
-        "filename": "pixelartxl_v11.safetensors", "description": "Pixel art SDXL.", "owned_by": "civitai"
-    },
-    "lowpoly-world": {
-        "display_name": "Lowpoly World", "url": "https://civitai.com/api/download/models/146502?type=Model&format=SafeTensor",
-        "filename": "LowpolySDXL.safetensors", "description": "Lowpoly style SD1.5.", "owned_by": "civitai"
-    },
-    "toonyou": {
-        "display_name": "ToonYou", "url": "https://civitai.com/api/download/models/125771?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "toonyou_beta6.safetensors", "description": "Cartoon/Disney SD1.5.", "owned_by": "civitai"
-    },
-    "papercut": {
-        "display_name": "Papercut", "url": "https://civitai.com/api/download/models/133503?type=Model&format=SafeTensor",
-        "filename": "papercut.safetensors", "description": "Paper cutout SD1.5.", "owned_by": "civitai"
-    },
-    "fantassifiedIcons": {
-        "display_name": "Fantassified Icons", "url": "https://civitai.com/api/download/models/67584?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "fantassifiedIcons_fantassifiedIconsV20.safetensors", "description": "Flat, modern Icons.", "owned_by": "civitai"
-    },
-    "game_icon_institute": {
-        "display_name": "Game icon institute", "url": "https://civitai.com/api/download/models/158776?type=Model&format=SafeTensor&size=full&fp=fp16",
-        "filename": "gameIconInstituteV10_v10.safetensors", "description": "Flat, modern game Icons.", "owned_by": "civitai"
-    },
-    "M4RV3LS_DUNGEONS": {
-        "display_name": "M4RV3LS & DUNGEONS", "url": "https://civitai.com/api/download/models/139417?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-        "filename": "M4RV3LSDUNGEONSNEWV40COMICS_mD40.safetensors", "description": "comics.", "owned_by": "civitai"
     },
 }
 
@@ -183,6 +131,7 @@ SCHEDULER_MAPPING = {
     "dpm2_karras": "KDPM2DiscreteScheduler", "dpm2_a": "KDPM2AncestralDiscreteScheduler", "dpm2_a_karras": "KDPM2AncestralDiscreteScheduler",
     "euler": "EulerDiscreteScheduler", "euler_a": "EulerAncestralDiscreteScheduler", "heun": "HeunDiscreteScheduler", "lms": "LMSDiscreteScheduler"
 }
+
 SCHEDULER_USES_KARRAS_SIGMAS = [
     "dpm_multistep_karras","dpm++_2m_karras","dpm++_2s_ancestral_karras", "dpm++_sde_karras","heun_karras","lms_karras",
     "dpm++_2m_sde_karras","dpm2_karras","dpm2_a_karras"
@@ -800,6 +749,8 @@ async def generate_image(request: T2IRequest):
 async def edit_image(request: EditRequestJSON):
     manager = None
     temp_config = None
+    ASCIIColors.info(f"Received /edit_image request with {len(request.images_b64)} image(s).")
+    ASCIIColors.info(request.params)
     try:
         if "model_name" in request.params and request.params["model_name"]:
             temp_config = state.config.copy()
@@ -843,7 +794,7 @@ async def edit_image(request: EditRequestJSON):
             edit_mode = pipeline_args.get("edit_mode", "fusion")
             if edit_mode == "fusion": pipeline_args["image"] = pil_images
         else:
-            pipeline_args.update({"image": pil_images[0], "strength": 0.8, "guidance_scale": 7.5, "num_inference_steps": 25})
+            pipeline_args.update({"image": pil_images[0]})
 
         log_args = {k: v for k, v in pipeline_args.items() if k not in ['generator', 'image', 'mask_image']}
         if pipeline_args.get("generator"): log_args['generator'] = f"<torch.Generator(seed={seed})>"

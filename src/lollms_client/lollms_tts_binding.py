@@ -8,9 +8,9 @@ from ascii_colors import trace_exception
 class LollmsTTSBinding(ABC):
     def __init__(self,
                  binding_name: str = "unknown",
-                 **kwargs):
+                 config={}):
         self.binding_name = binding_name
-        self.settings = kwargs
+        self.config = config
 
     @abstractmethod
     def generate_audio(self,

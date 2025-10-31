@@ -11,17 +11,14 @@ import pipmaster as pm
 BindingName = "BarkClientBinding"
 
 class BarkClientBinding(LollmsTTSBinding):
-    def __init__(self, 
-                 host: str = "localhost", 
-                 port: int = 8082, 
-                 auto_start_server: bool = True,
+    def __init__(self,
                  **kwargs):
-        
-        binding_name = "bark"
-        super().__init__(binding_name=binding_name, **kwargs)
-        self.host = host
-        self.port = port
-        self.auto_start_server = auto_start_server
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        self.host = self.config.get("host", "http://localhost")
+        self.port = self.config.get("port", 9632)
+        self.auto_start_server = self.config.get("auto_start_server", True)
         self.server_process = None
         self.base_url = f"http://{self.host}:{self.port}"
 

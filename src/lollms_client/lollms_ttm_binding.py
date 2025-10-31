@@ -9,7 +9,8 @@ class LollmsTTMBinding(ABC):
     """Abstract base class for all LOLLMS Text-to-Music bindings."""
 
     def __init__(self,
-                 binding_name:str="unknown"):
+                 binding_name:str="unknown",
+                 config={}):
         """
         Initialize the LollmsTTMBinding base class.
 
@@ -17,6 +18,7 @@ class LollmsTTMBinding(ABC):
             binding_name (Optional[str]): The binding name
         """
         self.binding_name = binding_name
+        self.config = config
 
 
     @abstractmethod

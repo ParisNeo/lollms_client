@@ -27,7 +27,10 @@ class NovitaAITTIBinding(LollmsTTIBinding):
     """Novita.ai TTI binding for LoLLMS"""
 
     def __init__(self, **kwargs):
-        super().__init__(binding_name=BindingName)
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        super().__init__(binding_name=BindingName, config=kwargs)
         self.config = kwargs
         self.api_key = self.config.get("api_key") or os.environ.get("NOVITA_API_KEY")
         if not self.api_key:

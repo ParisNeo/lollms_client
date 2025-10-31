@@ -16,9 +16,13 @@ BindingName = "BeatovenAITTMBinding"
 class BeatovenAITTMBinding(LollmsTTMBinding):
     """A Text-to-Music binding for the Beatoven.ai API."""
 
-    def __init__(self, **kwargs):
-        super().__init__(binding_name=BindingName, **kwargs)
-        self.api_key = self.settings.get("api_key") or os.environ.get("BEATOVEN_API_KEY")
+    def __init__(self,
+                 **kwargs):
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        super().__init__(binding_name=BindingName, config=kwargs)    
+        self.api_key = self.config.get("api_key") or os.environ.get("BEATOVEN_API_KEY")
         if not self.api_key:
             raise ValueError("Beatoven.ai API key is required. Please set it in config or as BEATOVEN_API_KEY env var.")
         self.base_url = "https://api.beatoven.ai/api/v1"

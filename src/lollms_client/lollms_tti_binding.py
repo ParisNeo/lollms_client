@@ -9,7 +9,8 @@ class LollmsTTIBinding(ABC):
     """Abstract base class for all LOLLMS Text-to-Image bindings."""
 
     def __init__(self,
-                 binding_name:str="unknown"):
+                 binding_name:str="unknown",
+                 config={}):
         """
         Initialize the LollmsTTIBinding base class.
 
@@ -17,6 +18,7 @@ class LollmsTTIBinding(ABC):
             binding_name (Optional[str]): The binding name
         """
         self.binding_name = binding_name
+        self.config = config
 
     @abstractmethod
     def generate_image(self,

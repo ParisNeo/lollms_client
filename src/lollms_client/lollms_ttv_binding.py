@@ -9,7 +9,8 @@ class LollmsTTVBinding(ABC):
     """Abstract base class for all LOLLMS Text-to-Video bindings."""
 
     def __init__(self,
-                 binding_name:str="unknown"):
+                 binding_name:str="unknown",
+                 config={}):
         """
         Initialize the LollmsTTVBinding base class.
 
@@ -17,6 +18,7 @@ class LollmsTTVBinding(ABC):
             binding_name (Optional[str]): The binding name
         """
         self.binding_name = binding_name
+        self.config = config
 
     @abstractmethod
     def generate_video(self, prompt: str, **kwargs) -> bytes:

@@ -23,12 +23,15 @@ STABILITY_AI_MODELS = [
 class StabilityAITTMBinding(LollmsTTMBinding):
     """A Text-to-Music binding for Stability AI's Stable Audio API."""
 
-    def __init__(self, **kwargs):
-        super().__init__(binding_name=BindingName, **kwargs)
-        self.api_key = self.settings.get("api_key") or os.environ.get("STABILITY_API_KEY")
+    def __init__(self,
+                 **kwargs):
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        self.api_key = self.config.get("api_key") or os.environ.get("STABILITY_API_KEY")
         if not self.api_key:
             raise ValueError("Stability AI API key is required. Please set it in the configuration or as STABILITY_API_KEY environment variable.")
-        self.model_name = self.settings.get("model_name", "stable-audio-2.0")
+        self.model_name = self.config.get("model_name", "stable-audio-2.0")
 
     def list_models(self, **kwargs) -> List[Dict[str, str]]:
         return STABILITY_AI_MODELS

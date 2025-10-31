@@ -6,7 +6,7 @@ from io import BytesIO
 from ascii_colors import trace_exception
 from openai import OpenAI
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
-
+import os
 BindingName = "OpenAITTIBinding"
 
 
@@ -50,19 +50,18 @@ class OpenAITTIBinding(LollmsTTIBinding):
 
     def __init__(
         self,
-        model: str = "gpt-image-1",
-        api_key: Optional[str] = None,
-        size: str = "1024x1024",
-        n: int = 1,
-        quality: str = "standard",
         **kwargs,
     ):
-        self.client = OpenAI(api_key=api_key)
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        super().__init__(binding_name=BindingName, config=kwargs)
+        self.client = OpenAI(api_key=kwargs.get("api_key" or os.environ.get("OPENAI_API_KEY")))
         self.global_params = {
-            "model": model,
-            "size": size,
-            "n": n,
-            "quality": quality,
+            "model": kwargs.get("model_name") or "gpt-image-1",
+            "size": kwargs.get("size", "1024x1024"),
+            "n": kwargs.get("n", 1),
+            "quality": kwargs.get("quality", "standard"),
         }
 
     def _resolve_param(self, name: str, kwargs: Dict[str, Any], default: Any) -> Any:

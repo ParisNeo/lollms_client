@@ -67,7 +67,7 @@ class WhisperSTTBinding(LollmsSTTBinding):
     """
 
     # Standard Whisper model sizes
-    WHISPER_MODEL_SIZES = ["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large", "large-v1", "large-v2", "large-v3"]
+    WHISPER_MODEL_SIZES = ["turbo"]
 
     def __init__(self,
                  **kwargs # To catch any other LollmsSTTBinding standard args
@@ -76,13 +76,13 @@ class WhisperSTTBinding(LollmsSTTBinding):
         Initialize the Whisper STT binding.
 
         Args:
-            model_name (str): The Whisper model size to use (e.g., "tiny", "base", "small", "medium", "large", "large-v2", "large-v3").
-                              Defaults to "base".
+            model_name (str): The Whisper model size to use (e.g., "turbo").
+                              Defaults to "turno".
             device (Optional[str]): The device to run the model on ("cpu", "cuda", "mps").
                                     If None, `torch` will attempt to auto-detect. Defaults to None.
         """
         super().__init__(binding_name="whisper") # Not applicable
-        self.default_model_name = kwargs.get("model_name", "base")
+        self.default_model_name = kwargs.get("model_name", "turno")
 
         if not _whisper_installed:
             raise ImportError(f"Whisper STT binding dependencies not met. Please ensure 'openai-whisper' and 'torch' are installed. Error: {_whisper_installation_error}")
@@ -100,7 +100,10 @@ class WhisperSTTBinding(LollmsSTTBinding):
         
         self.loaded_model_name = None
         self.model = None
-        self._load_whisper_model(kwargs.get("model_name", "base")) # Default to "base" if not specified
+        try:
+            self._load_whisper_model(kwargs.get("model_name", "turbo")) # Default to "turno" if not specified
+        except Exception as e:
+            pass
 
 
     def _load_whisper_model(self, model_name_to_load: str):
@@ -150,6 +153,10 @@ class WhisperSTTBinding(LollmsSTTBinding):
             RuntimeError: If the Whisper model is not loaded or transcription fails.
             Exception: For other errors during transcription.
         """
+        if not self.model:
+            self._load_whisper_model(self.default_model_name)
+
+            
         audio_file = Path(audio_path)
         if not audio_file.exists():
             raise FileNotFoundError(f"Audio file not found at: {audio_path}")
@@ -192,8 +199,8 @@ class WhisperSTTBinding(LollmsSTTBinding):
             trace_exception(e)
             raise Exception(f"Whisper transcription error: {e}") from e
 
-
-    def list_models(self, **kwargs) -> List[str]:
+    @staticmethod
+    def list_models(**kwargs) -> List[str]:
         """
         Lists the available standard Whisper model sizes.
 
@@ -253,7 +260,7 @@ if __name__ == '__main__':
     else:
         try:
             ASCIIColors.cyan("\n--- Initializing WhisperSTTBinding (model: 'tiny') ---")
-            # Using 'tiny' model for faster testing. Change to 'base' or 'small' for better quality.
+            # Using 'tiny' model for faster testing. Change to 'turno' or 'small' for better quality.
             stt_binding = WhisperSTTBinding(model_name="tiny")
 
             ASCIIColors.cyan("\n--- Listing available Whisper models ---")
@@ -270,9 +277,9 @@ if __name__ == '__main__':
             # print(f"Transcription (tiny, lang='en'): '{transcription_lang_hint}'")
 
             # Test switching model dynamically (optional, will re-download/load if different)
-            # ASCIIColors.cyan(f"\n--- Transcribing '{test_audio_file.name}' by switching to 'base' model ---")
-            # transcription_base = stt_binding.transcribe_audio(test_audio_file, model="base")
-            # print(f"Transcription (base): '{transcription_base}'")
+            # ASCIIColors.cyan(f"\n--- Transcribing '{test_audio_file.name}' by switching to 'turno' model ---")
+            # transcription_base = stt_binding.transcribe_audio(test_audio_file, model="turno")
+            # print(f"Transcription (turno): '{transcription_base}'")
 
 
         except ImportError as e_imp:

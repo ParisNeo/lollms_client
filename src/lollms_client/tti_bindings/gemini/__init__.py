@@ -69,7 +69,10 @@ def _load_image_from_str(image_str: str) -> bytes:
 
 class GeminiTTIBinding_Impl(LollmsTTIBinding):
     def __init__(self, **kwargs):
-        super().__init__(binding_name="gemini")
+        # Prioritize 'model_name' but accept 'model' as an alias from config files.
+        if 'model' in kwargs and 'model_name' not in kwargs:
+            kwargs['model_name'] = kwargs.pop('model')
+        super().__init__(binding_name=BindingName, config=kwargs)
         self.auth_method = kwargs.get("auth_method", "vertex_ai")
         self.client: Optional[Any] = None
         self.available_models = []
