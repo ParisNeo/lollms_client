@@ -410,7 +410,7 @@ class ModelManager:
 
         if not candidates_to_unload:
             ASCIIColors.error("OOM error, but no other models are available to unload.")
-            raise e
+            raise Exception("OOM error, but no other models are available to unload.")
 
         for victim in candidates_to_unload:
             ASCIIColors.info(f"Unloading '{victim.config['model_name']}' (last used: {time.ctime(victim.last_used_time)}) to free VRAM.")
