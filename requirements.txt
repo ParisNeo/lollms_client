@@ -6,3 +6,4 @@ pyyaml
 tiktoken
 pydantic
 numpy
+jsonschema
