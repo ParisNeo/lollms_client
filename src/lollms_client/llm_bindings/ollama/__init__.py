@@ -176,6 +176,8 @@ class OllamaBinding(LollmsLLMBinding):
                 for img_path in images:
                     # Assuming img_path is a file path. ollama-python will read and encode it.
                     # If images were base64 strings, they would need decoding to bytes first.
+                    if img_path.startswith("data:image/png;base64,"):
+                        img_path = img_path[len("data:image/png;base64,"):]
                     processed_images.append(img_path)
 
                 messages = [
