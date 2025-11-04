@@ -112,3 +112,31 @@ class LollmsTTMBindingManager:
         """
         return [binding_dir.name for binding_dir in self.ttm_bindings_dir.iterdir()
                 if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
+
+
+def list_binding_models(ttm_binding_name: str, ttm_binding_config: Optional[Dict[str, any]]|None = None, ttm_bindings_dir: str|Path = Path(__file__).parent / "ttm_bindings") -> List[Dict]:
+    """
+    Lists all available LLM bindings with their detailed descriptions.
+
+    This function serves as a primary entry point for discovering what bindings
+    are available and how to configure them.
+
+    Args:
+        ttm_bindings_dir (Union[str, Path], optional): 
+            The path to the LLM bindings directory. If None, it defaults to the
+            'ttm_bindings' subdirectory relative to this file. 
+            Defaults to None.
+
+    Returns:
+        List[Dict]: A list of dictionaries, each describing a binding.
+    """
+    binding = LollmsTTMBindingManager(ttm_bindings_dir).create_binding(
+        binding_name=ttm_binding_name,
+        **{
+            k: v
+            for k, v in (ttm_binding_config or {}).items()
+            if k != "binding_name"
+        }
+    )
+
+    return binding.list_models() if binding else []

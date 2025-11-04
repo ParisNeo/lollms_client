@@ -206,3 +206,30 @@ def get_available_bindings(tti_bindings_dir: Union[str, Path] = None) -> List[Di
     if tti_bindings_dir is None:
         tti_bindings_dir = Path(__file__).parent / "tti_bindings"
     return LollmsTTIBindingManager.get_bindings_list(tti_bindings_dir)
+
+def list_binding_models(tti_binding_name: str, tti_binding_config: Optional[Dict[str, any]]|None = None, tti_bindings_dir: str|Path = Path(__file__).parent / "tti_bindings") -> List[Dict]:
+    """
+    Lists all available LLM bindings with their detailed descriptions.
+
+    This function serves as a primary entry point for discovering what bindings
+    are available and how to configure them.
+
+    Args:
+        tti_bindings_dir (Union[str, Path], optional): 
+            The path to the LLM bindings directory. If None, it defaults to the
+            'tti_bindings' subdirectory relative to this file. 
+            Defaults to None.
+
+    Returns:
+        List[Dict]: A list of dictionaries, each describing a binding.
+    """
+    binding = LollmsTTIBindingManager(tti_bindings_dir).create_binding(
+        binding_name=tti_binding_name,
+        **{
+            k: v
+            for k, v in (tti_binding_config or {}).items()
+            if k != "binding_name"
+        }
+    )
+
+    return binding.list_models() if binding else []

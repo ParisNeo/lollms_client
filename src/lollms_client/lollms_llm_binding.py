@@ -575,3 +575,30 @@ def get_available_bindings(llm_bindings_dir: Union[str, Path] = None) -> List[Di
     if llm_bindings_dir is None:
         llm_bindings_dir = Path(__file__).parent / "llm_bindings"
     return LollmsLLMBindingManager.get_bindings_list(llm_bindings_dir)
+
+def list_binding_models(llm_binding_name: str, llm_binding_config: Optional[Dict[str, any]]|None = None, llm_bindings_dir: str|Path = Path(__file__).parent / "llm_bindings") -> List[Dict]:
+    """
+    Lists all available LLM bindings with their detailed descriptions.
+
+    This function serves as a primary entry point for discovering what bindings
+    are available and how to configure them.
+
+    Args:
+        llm_bindings_dir (Union[str, Path], optional): 
+            The path to the LLM bindings directory. If None, it defaults to the
+            'llm_bindings' subdirectory relative to this file. 
+            Defaults to None.
+
+    Returns:
+        List[Dict]: A list of dictionaries, each describing a binding.
+    """
+    binding = LollmsLLMBindingManager(llm_bindings_dir).create_binding(
+        binding_name=llm_binding_name,
+        **{
+            k: v
+            for k, v in (llm_binding_config or {}).items()
+            if k != "binding_name"
+        }
+    )
+
+    return binding.list_models() if binding else []

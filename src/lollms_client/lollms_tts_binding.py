@@ -127,3 +127,30 @@ def get_available_bindings(tts_bindings_dir: Union[str, Path] = None) -> List[Di
     if tts_bindings_dir is None:
         tts_bindings_dir = Path(__file__).resolve().parent / "tts_bindings"
     return LollmsTTSBindingManager.get_bindings_list(tts_bindings_dir)
+
+def list_binding_models(stt_binding_name: str, stt_binding_config: Optional[Dict[str, any]]|None = None, stt_bindings_dir: str|Path = Path(__file__).parent / "stt_bindings") -> List[Dict]:
+    """
+    Lists all available LLM bindings with their detailed descriptions.
+
+    This function serves as a primary entry point for discovering what bindings
+    are available and how to configure them.
+
+    Args:
+        stt_bindings_dir (Union[str, Path], optional): 
+            The path to the LLM bindings directory. If None, it defaults to the
+            'stt_bindings' subdirectory relative to this file. 
+            Defaults to None.
+
+    Returns:
+        List[Dict]: A list of dictionaries, each describing a binding.
+    """
+    binding = LollmsTTSBindingManager(stt_bindings_dir).create_binding(
+        binding_name=stt_binding_name,
+        **{
+            k: v
+            for k, v in (stt_binding_config or {}).items()
+            if k != "binding_name"
+        }
+    )
+
+    return binding.list_models() if binding else []

@@ -15,7 +15,8 @@ class LollmsMCPBinding(ABC):
     """
 
     def __init__(self,
-                 binding_name: str
+                 binding_name: str,
+                 **kwargs
                  ):
         """
         Initialize the LollmsMCPBinding.
@@ -24,6 +25,7 @@ class LollmsMCPBinding(ABC):
             binding_name (str): The unique name of this binding.
         """
         self.binding_name = binding_name
+        self.settings = kwargs
 
 
     @abstractmethod
@@ -84,7 +86,7 @@ class LollmsMCPBinding(ABC):
         Returns:
             Dict[str, Any]: The configuration dictionary.
         """
-        return self.config
+        return self.settings
 
 class LollmsMCPBindingManager:
     """
@@ -227,3 +229,30 @@ class LollmsMCPBindingManager:
             ASCIIColors.error(f"Error reading description.yaml for MCP binding '{binding_name}': {e}")
             trace_exception(e)
             return None
+
+def list_binding_models(mcp_binding_name: str, mcp_binding_config: Optional[Dict[str, any]]|None = None, mcp_bindings_dir: str|Path = Path(__file__).parent / "mcp_bindings") -> List[Dict]:
+    """
+    Lists all available LLM bindings with their detailed descriptions.
+
+    This function serves as a primary entry point for discovering what bindings
+    are available and how to configure them.
+
+    Args:
+        mcp_bindings_dir (Union[str, Path], optional): 
+            The path to the LLM bindings directory. If None, it defaults to the
+            'mcp_bindings' subdirectory relative to this file. 
+            Defaults to None.
+
+    Returns:
+        List[Dict]: A list of dictionaries, each describing a binding.
+    """
+    binding = LollmsMCPBindingManager(mcp_bindings_dir).create_binding(
+        binding_name=mcp_binding_name,
+        **{
+            k: v
+            for k, v in (mcp_binding_config or {}).items()
+            if k != "binding_name"
+        }
+    )
+
+    return binding.discover_tools() if binding else []
