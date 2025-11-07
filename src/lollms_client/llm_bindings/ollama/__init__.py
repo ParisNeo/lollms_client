@@ -110,25 +110,28 @@ class OllamaBinding(LollmsLLMBinding):
             raise ConnectionError(f"Could not connect or initialize Ollama client at {self.host_address}: {e}") from e
 
     def generate_text(self,
-                     prompt: str,
-                     images: Optional[List[str]] = None,
-                     system_prompt: str = "",
-                     n_predict: Optional[int] = None,
-                     stream: Optional[bool] = None,
-                     temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
-                     top_k: int = 40,          # Ollama default is 40
-                     top_p: float = 0.9,       # Ollama default is 0.9
-                     repeat_penalty: float = 1.1, # Ollama default is 1.1
-                     repeat_last_n: int = 64,  # Ollama default is 64
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     split:Optional[bool]=False, # put to true if the prompt is a discussion
-                     user_keyword:Optional[str]="!@>user:",
-                     ai_keyword:Optional[str]="!@>assistant:",
-                     think:Optional[bool]=False
-                     ) -> Union[str, dict]:
+                    prompt: str,
+                    images: Optional[List[str]] = None,
+                    system_prompt: str = "",
+                    n_predict: Optional[int] = None,
+                    stream: Optional[bool] = None,
+                    temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
+                    top_k: int = 40,          # Ollama default is 40
+                    top_p: float = 0.9,       # Ollama default is 0.9
+                    repeat_penalty: float = 1.1, # Ollama default is 1.1
+                    repeat_last_n: int = 64,  # Ollama default is 64
+                    seed: Optional[int] = None,
+                    n_threads: Optional[int] = None,
+                    ctx_size: int | None = None,
+                    streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                    split:Optional[bool]=False, # put to true if the prompt is a discussion
+                    user_keyword:Optional[str]="!@>user:",
+                    ai_keyword:Optional[str]="!@>assistant:",
+                    think: Optional[bool] = False,
+                    reasoning_effort: Optional[bool] = "low", # low, medium, high
+                    reasoning_summary: Optional[bool] = "auto", # auto
+                    **kwargs
+                    ) -> Union[str, dict]:
         """
         Generate text using the active LLM binding, using instance defaults if parameters are not provided.
 
@@ -300,7 +303,9 @@ class OllamaBinding(LollmsLLMBinding):
                         n_threads: Optional[int] = None,
                         ctx_size: int | None = None,
                         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                        think:Optional[bool]=False,
+                        think: Optional[bool] = False,
+                        reasoning_effort: Optional[bool] = "low", # low, medium, high
+                        reasoning_summary: Optional[bool] = "auto", # auto
                         **kwargs
                         ) -> Union[str, dict]:
         if not self.ollama_client:
@@ -419,21 +424,25 @@ class OllamaBinding(LollmsLLMBinding):
     
 
     def chat(self,
-             discussion: LollmsDiscussion,
-             branch_tip_id: Optional[str] = None,
-             n_predict: Optional[int] = None,
-             stream: Optional[bool] = None,
-             temperature: float = 0.7,
-             top_k: int = 40,
-             top_p: float = 0.9,
-             repeat_penalty: float = 1.1,
-             repeat_last_n: int = 64,
-             seed: Optional[int] = None,
-             n_threads: Optional[int] = None,
-             ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-             think:Optional[bool]=False
-             ) -> Union[str, dict]:
+            discussion: LollmsDiscussion,
+            branch_tip_id: Optional[str] = None,
+            n_predict: Optional[int] = None,
+            stream: Optional[bool] = None,
+            temperature: float = 0.7,
+            top_k: int = 40,
+            top_p: float = 0.9,
+            repeat_penalty: float = 1.1,
+            repeat_last_n: int = 64,
+            seed: Optional[int] = None,
+            n_threads: Optional[int] = None,
+            ctx_size: Optional[int] = None,
+            streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+            think: Optional[bool] = False,
+            reasoning_effort: Optional[bool] = "low", # low, medium, high
+            reasoning_summary: Optional[bool] = "auto", # auto
+            **kwargs
+            
+            ) -> Union[str, dict]:
         """
         Conduct a chat session with the Ollama model using a LollmsDiscussion object.
 
