@@ -505,6 +505,7 @@ class LollmsClient():
                      split:Optional[bool]=False, # put to true if the prompt is a discussion
                      user_keyword:Optional[str]="!@>user:",
                      ai_keyword:Optional[str]="!@>assistant:",
+                     think:Optional[bool]=True,
                      **kwargs
                      ) -> Union[str, dict]:
         """
@@ -527,6 +528,7 @@ class LollmsClient():
             split:Optional[bool]: put to true if the prompt is a discussion
             user_keyword:Optional[str]: when splitting we use this to extract user prompt 
             ai_keyword:Optional[str]": when splitting we use this to extract ai prompt
+            think:Optional[bool]: Activate thinking or deactivate it
 
         Returns:
             Union[str, dict]: Generated text or error dictionary if failed.
@@ -561,7 +563,8 @@ class LollmsClient():
                 streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback,
                 split= split,
                 user_keyword=user_keyword,
-                ai_keyword=ai_keyword
+                ai_keyword=ai_keyword,
+                think=think
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -578,6 +581,7 @@ class LollmsClient():
                      n_threads: Optional[int] = None,
                      ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     think: Optional[bool] = False,
                      **kwargs
                      ) -> Union[str, dict]:
         """
@@ -614,6 +618,7 @@ class LollmsClient():
                 n_threads=n_threads if n_threads is not None else self.llm.default_n_threads,
                 ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size,
                 streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback,
+                think=think,
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -631,6 +636,7 @@ class LollmsClient():
              n_threads: Optional[int] = None,
              ctx_size: Optional[int] = None,
              streaming_callback: Optional[Callable[[str, MSG_TYPE, Dict], bool]] = None,
+             think: Optional[bool] = False,
              **kwargs
              ) -> Union[str, dict]:
         """
@@ -672,7 +678,8 @@ class LollmsClient():
                 seed=seed if seed is not None else self.llm.default_seed,
                 n_threads=n_threads if n_threads is not None else self.llm.default_n_threads,
                 ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size,
-                streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback
+                streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback,
+                think = think,
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -727,6 +734,7 @@ class LollmsClient():
                         repeat_penalty=None,
                         repeat_last_n=None,
                         callback=None,
+                        think:Optional[bool]=False,
                         debug=False
                         ):
         """
@@ -769,7 +777,8 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
             top_p=top_p,
             repeat_penalty=repeat_penalty,
             repeat_last_n=repeat_last_n,
-            streaming_callback=callback # Assuming generate_text handles streaming callback
+            streaming_callback=callback, # Assuming generate_text handles streaming callback
+            think=think
             )
 
         if isinstance(response, dict) and not response.get("status", True): # Check for error dict
