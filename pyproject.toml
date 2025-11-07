@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lollms_client"
-dynamic = ["version"]
+    dynamic = ["version"]
 authors = [
     {name = "ParisNeo", email = "parisneoai@gmail.com"},
 ]
