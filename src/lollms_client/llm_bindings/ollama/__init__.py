@@ -57,7 +57,9 @@ def count_tokens_ollama(
     res = ollama_client.chat(
                         model=model_name,
                         messages=[{"role":"system","content":""},{"role":"user", "content":text_to_tokenize}],
-                        stream=False,options={"num_predict":1}                        
+                        stream=False,
+                        think=False,
+                        options={"num_predict":1}                        
                     )
     
     return res.prompt_eval_count-5
@@ -125,6 +127,7 @@ class OllamaBinding(LollmsLLMBinding):
                      split:Optional[bool]=False, # put to true if the prompt is a discussion
                      user_keyword:Optional[str]="!@>user:",
                      ai_keyword:Optional[str]="!@>assistant:",
+                     think:Optional[bool]=False
                      ) -> Union[str, dict]:
         """
         Generate text using the active LLM binding, using instance defaults if parameters are not provided.
@@ -194,24 +197,37 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=True,
+                        think=think,
                         options=options if options else None
                     )
-                    for chunk_dict in response_stream:
-                        chunk_content = chunk_dict.get('message', {}).get('content', '')
-                        if chunk_content: # Ensure there is content to process
+                    in_thinking = False
+                    for chunk in response_stream:
+                        if chunk.message.thinking and not in_thinking:
+                            full_response_text += "<think>\n"
+                            in_thinking = True
+                            
+                        if chunk.message.content:# Ensure there is content to process
+                            chunk_content = chunk.message.content
+                            if in_thinking:
+                                full_response_text += "\n</think>\n"                            
+                                in_thinking = False
                             full_response_text += chunk_content
                             if streaming_callback:
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
                                     break # Callback requested stop
                     return full_response_text
                 else: # Not streaming
-                    response_dict = self.ollama_client.chat(
+                    response = self.ollama_client.chat(
                         model=self.model_name,
                         messages=messages,
                         stream=False,
+                        think=think,
                         options=options if options else None
                     )
-                    return response_dict.get('message', {}).get('content', '')
+                    full_response_text = response.message.content
+                    if think:
+                        full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
+                    return full_response_text
             else: # Text-only
                 messages = [
                             {'role': 'system', 'content':system_prompt},
@@ -226,24 +242,38 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=True,
+                        think=think,
                         options=options if options else None
                     )
-                    for chunk_dict in response_stream:
-                        chunk_content = chunk_dict.message.content
-                        if chunk_content:
+                    in_thinking = False
+                    for chunk in response_stream:
+                        if chunk.message.thinking and not in_thinking:
+                            full_response_text += "<think>\n"
+                            in_thinking = True
+                            
+                        if chunk.message.content:# Ensure there is content to process
+                            chunk_content = chunk.message.content
+                            if in_thinking:
+                                full_response_text += "\n</think>\n"                            
+                                in_thinking = False
                             full_response_text += chunk_content
                             if streaming_callback:
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                    break
+                                    break # Callback requested stop
                     return full_response_text
                 else: # Not streaming
-                    response_dict = self.ollama_client.chat(
+                    response = self.ollama_client.chat(
                         model=self.model_name,
                         messages=messages,
                         stream=False,
+                        think=think,
                         options=options if options else None
                     )
-                    return response_dict.message.content
+                    full_response_text = response.message.content
+                    if think:
+                        full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
+                    return full_response_text
+                    
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
             ASCIIColors.error(error_message)
@@ -849,7 +879,7 @@ if __name__ == '__main__':
         ASCIIColors.cyan("\n--- Text Generation (Non-Streaming) ---")
         prompt_text = "Why is the sky blue?"
         ASCIIColors.info(f"Prompt: {prompt_text}")
-        generated_text = binding.generate_text(prompt_text, n_predict=50, stream=False)
+        generated_text = binding.generate_text(prompt_text, n_predict=50, stream=False, think=False)
         if isinstance(generated_text, str):
             ASCIIColors.green(f"Generated text: {generated_text}")
         else:
