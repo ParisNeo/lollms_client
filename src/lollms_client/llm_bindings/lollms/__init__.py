@@ -190,7 +190,9 @@ class LollmsBinding(LollmsLLMBinding):
                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                     split: Optional[bool] = False,
                     user_keyword: Optional[str] = "!@>user:",
-                    ai_keyword: Optional[str] = "!@>assistant:"
+                    ai_keyword: Optional[str] = "!@>assistant:",
+                    think: Optional[bool] = False,
+                    **kwargs
                     ) -> Union[str, dict]:
 
         count = 0
@@ -316,6 +318,7 @@ class LollmsBinding(LollmsLLMBinding):
                      n_threads: Optional[int] = None,
                      ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     think: Optional[bool] = False,
                      **kwargs
                      ) -> Union[str, dict]:
         # Build the request parameters
@@ -364,20 +367,22 @@ class LollmsBinding(LollmsLLMBinding):
         return output
     
     def chat(self,
-             discussion: LollmsDiscussion,
-             branch_tip_id: Optional[str] = None,
-             n_predict: Optional[int] = None,
-             stream: Optional[bool] = None,
-             temperature: float = 0.7,
-             top_k: int = 40,
-             top_p: float = 0.9,
-             repeat_penalty: float = 1.1,
-             repeat_last_n: int = 64,
-             seed: Optional[int] = None,
-             n_threads: Optional[int] = None,
-             ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
-             ) -> Union[str, dict]:
+            discussion: LollmsDiscussion,
+            branch_tip_id: Optional[str] = None,
+            n_predict: Optional[int] = None,
+            stream: Optional[bool] = None,
+            temperature: float = 0.7,
+            top_k: int = 40,
+            top_p: float = 0.9,
+            repeat_penalty: float = 1.1,
+            repeat_last_n: int = 64,
+            seed: Optional[int] = None,
+            n_threads: Optional[int] = None,
+            ctx_size: Optional[int] = None,
+            streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+            think: Optional[bool] = False,
+            **kwargs
+            ) -> Union[str, dict]:
         """
         Conduct a chat session with the OpenAI model using a LollmsDiscussion object.
 
