@@ -89,6 +89,8 @@ class LollmsLLMBinding(ABC):
                      split:Optional[bool]=False, # put to true if the prompt is a discussion
                      user_keyword:Optional[str]="!@>user:",
                      ai_keyword:Optional[str]="!@>assistant:",
+                     think:Optional[bool]=False,
+                     **kwargs
                      ) -> Union[str, dict]:
         """
         Generate text using the active LLM binding, using instance defaults if parameters are not provided.
@@ -131,6 +133,7 @@ class LollmsLLMBinding(ABC):
                      n_threads: Optional[int] = None,
                      ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     think:Optional[bool]=False,
                      **kwargs
                      ) -> Union[str, dict]:
         """
@@ -170,7 +173,9 @@ class LollmsLLMBinding(ABC):
              seed: Optional[int] = None,
              n_threads: Optional[int] = None,
              ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+             think:Optional[bool]=False,
+             **kwargs
              ) -> Union[str, dict]:
         """
         A method to conduct a chat session with the model using a LollmsDiscussion object.
