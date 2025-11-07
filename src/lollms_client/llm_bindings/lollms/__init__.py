@@ -149,6 +149,12 @@ class LollmsBinding(LollmsLLMBinding):
             "stop", "max_tokens", "presence_penalty", "frequency_penalty",
             "logit_bias", "stream", "user", "max_completion_tokens"
         }
+        if kwargs.get("think", False):
+            allowed_params.append("reasoning")
+            kwargs["reasoning"]={
+                "effort": allowed_params.append("reasoning_effort", "low"),
+                "summary": allowed_params.append("reasoning_summary", "auto")
+            }
 
         params = {
             "model": model,
@@ -192,6 +198,8 @@ class LollmsBinding(LollmsLLMBinding):
                     user_keyword: Optional[str] = "!@>user:",
                     ai_keyword: Optional[str] = "!@>assistant:",
                     think: Optional[bool] = False,
+                    reasoning_effort: Optional[bool] = "low", # low, medium, high
+                    reasoning_summary: Optional[bool] = "auto", # auto
                     **kwargs
                     ) -> Union[str, dict]:
 
@@ -229,7 +237,11 @@ class LollmsBinding(LollmsLLMBinding):
                                                 temperature=temperature,
                                                 top_p=top_p,
                                                 repeat_penalty=repeat_penalty,
-                                                seed=seed)
+                                                seed=seed,
+                                                think = think,
+                                                reasoning_effort=reasoning_effort,
+                                                reasoning_summary=reasoning_summary
+                                                )
                 try:
                     chat_completion = self.client.chat.completions.create(**params)
                 except Exception as ex:
@@ -265,7 +277,10 @@ class LollmsBinding(LollmsLLMBinding):
                                                 temperature=temperature,
                                                 top_p=top_p,
                                                 repeat_penalty=repeat_penalty,
-                                                seed=seed)
+                                                seed=seed,
+                                                think = think,
+                                                reasoning_effort=reasoning_effort,
+                                                reasoning_summary=reasoning_summary)
                 try:
                     completion =  self.client.completions.create(**params)
                 except Exception as ex:
@@ -319,6 +334,8 @@ class LollmsBinding(LollmsLLMBinding):
                      ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                      think: Optional[bool] = False,
+                     reasoning_effort: Optional[bool] = "low", # low, medium, high
+                     reasoning_summary: Optional[bool] = "auto", # auto
                      **kwargs
                      ) -> Union[str, dict]:
         # Build the request parameters
