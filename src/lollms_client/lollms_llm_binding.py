@@ -72,26 +72,28 @@ class LollmsLLMBinding(ABC):
     
     @abstractmethod
     def generate_text(self,
-                     prompt: str,
-                     images: Optional[List[str]] = None,
-                     system_prompt: str = "",
-                     n_predict: Optional[int] = None,
-                     stream: Optional[bool] = None,
-                     temperature: Optional[float] = None,
-                     top_k: Optional[int] = None,
-                     top_p: Optional[float] = None,
-                     repeat_penalty: Optional[float] = None,
-                     repeat_last_n: Optional[int] = None,
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     split:Optional[bool]=False, # put to true if the prompt is a discussion
-                     user_keyword:Optional[str]="!@>user:",
-                     ai_keyword:Optional[str]="!@>assistant:",
-                     think:Optional[bool]=False,
-                     **kwargs
-                     ) -> Union[str, dict]:
+                    prompt: str,
+                    images: Optional[List[str]] = None,
+                    system_prompt: str = "",
+                    n_predict: Optional[int] = None,
+                    stream: Optional[bool] = None,
+                    temperature: Optional[float] = None,
+                    top_k: Optional[int] = None,
+                    top_p: Optional[float] = None,
+                    repeat_penalty: Optional[float] = None,
+                    repeat_last_n: Optional[int] = None,
+                    seed: Optional[int] = None,
+                    n_threads: Optional[int] = None,
+                    ctx_size: int | None = None,
+                    streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                    split:Optional[bool]=False, # put to true if the prompt is a discussion
+                    user_keyword:Optional[str]="!@>user:",
+                    ai_keyword:Optional[str]="!@>assistant:",
+                    think: Optional[bool] = False,
+                    reasoning_effort: Optional[bool] = "low", # low, medium, high
+                    reasoning_summary: Optional[bool] = "auto", # auto
+                    **kwargs
+                    ) -> Union[str, dict]:
         """
         Generate text using the active LLM binding, using instance defaults if parameters are not provided.
 
@@ -121,21 +123,23 @@ class LollmsLLMBinding(ABC):
         pass
 
     def generate_from_messages(self,
-                     messages: List[Dict],
-                     n_predict: Optional[int] = None,
-                     stream: Optional[bool] = None,
-                     temperature: Optional[float] = None,
-                     top_k: Optional[int] = None,
-                     top_p: Optional[float] = None,
-                     repeat_penalty: Optional[float] = None,
-                     repeat_last_n: Optional[int] = None,
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     think:Optional[bool]=False,
-                     **kwargs
-                     ) -> Union[str, dict]:
+                    messages: List[Dict],
+                    n_predict: Optional[int] = None,
+                    stream: Optional[bool] = None,
+                    temperature: Optional[float] = None,
+                    top_k: Optional[int] = None,
+                    top_p: Optional[float] = None,
+                    repeat_penalty: Optional[float] = None,
+                    repeat_last_n: Optional[int] = None,
+                    seed: Optional[int] = None,
+                    n_threads: Optional[int] = None,
+                    ctx_size: int | None = None,
+                    streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                    think: Optional[bool] = False,
+                    reasoning_effort: Optional[bool] = "low", # low, medium, high
+                    reasoning_summary: Optional[bool] = "auto", # auto
+                    **kwargs
+                    ) -> Union[str, dict]:
         """
         Generate text using the active LLM binding, using instance defaults if parameters are not provided.
 
@@ -161,22 +165,24 @@ class LollmsLLMBinding(ABC):
 
     @abstractmethod
     def chat(self,
-             discussion: LollmsDiscussion,
-             branch_tip_id: Optional[str] = None,
-             n_predict: Optional[int] = None,
-             stream: Optional[bool] = None,
-             temperature: Optional[float] = None,
-             top_k: Optional[int] = None,
-             top_p: Optional[float] = None,
-             repeat_penalty: Optional[float] = None,
-             repeat_last_n: Optional[int] = None,
-             seed: Optional[int] = None,
-             n_threads: Optional[int] = None,
-             ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-             think:Optional[bool]=False,
-             **kwargs
-             ) -> Union[str, dict]:
+            discussion: LollmsDiscussion,
+            branch_tip_id: Optional[str] = None,
+            n_predict: Optional[int] = None,
+            stream: Optional[bool] = None,
+            temperature: Optional[float] = None,
+            top_k: Optional[int] = None,
+            top_p: Optional[float] = None,
+            repeat_penalty: Optional[float] = None,
+            repeat_last_n: Optional[int] = None,
+            seed: Optional[int] = None,
+            n_threads: Optional[int] = None,
+            ctx_size: Optional[int] = None,
+            streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+            think: Optional[bool] = False,
+            reasoning_effort: Optional[bool] = "low", # low, medium, high
+            reasoning_summary: Optional[bool] = "auto", # auto
+            **kwargs
+            ) -> Union[str, dict]:
         """
         A method to conduct a chat session with the model using a LollmsDiscussion object.
         This method is responsible for formatting the discussion into the specific
