@@ -300,6 +300,7 @@ class OllamaBinding(LollmsLLMBinding):
                         n_threads: Optional[int] = None,
                         ctx_size: int | None = None,
                         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                        think:Optional[bool]=False,
                         **kwargs
                         ) -> Union[str, dict]:
         if not self.ollama_client:
@@ -365,6 +366,7 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=ollama_messages,
                     stream=True,
+                    think = think,
                     options=options if options else None
                 )
                 for chunk_dict in response_stream:
@@ -376,13 +378,17 @@ class OllamaBinding(LollmsLLMBinding):
                                 break
                 return full_response_text
             else:
-                response_dict = self.ollama_client.chat(
+                response = self.ollama_client.chat(
                     model=self.model_name,
                     messages=ollama_messages,
                     stream=False,
+                    think=think,
                     options=options if options else None
                 )
-                return response_dict.get('message', {}).get('content', '')
+                full_response_text = response.message.content
+                if think:
+                    full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
+                return full_response_text
 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
@@ -425,7 +431,8 @@ class OllamaBinding(LollmsLLMBinding):
              seed: Optional[int] = None,
              n_threads: Optional[int] = None,
              ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+             think:Optional[bool]=False
              ) -> Union[str, dict]:
         """
         Conduct a chat session with the Ollama model using a LollmsDiscussion object.
@@ -479,24 +486,38 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=messages,
                     stream=True,
+                    think=think,
                     options=options if options else None
                 )
+                in_thinking = False
                 for chunk in response_stream:
-                    chunk_content = chunk.get('message', {}).get('content', '')
-                    if chunk_content:
+                    if chunk.message.thinking and not in_thinking:
+                        full_response_text += "<think>\n"
+                        in_thinking = True
+                        
+                    if chunk.message.content:# Ensure there is content to process
+                        chunk_content = chunk.message.content
+                        if in_thinking:
+                            full_response_text += "\n</think>\n"                            
+                            in_thinking = False
                         full_response_text += chunk_content
                         if streaming_callback:
                             if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
+                                break # Callback requested stop
+
                 return full_response_text
             else: # Not streaming
-                response_dict = self.ollama_client.chat(
+                response = self.ollama_client.chat(
                     model=self.model_name,
                     messages=messages,
                     stream=False,
+                    think=think,
                     options=options if options else None
                 )
-                return response_dict.get('message', {}).get('content', '')
+                full_response_text = response.message.content
+                if think:
+                    full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
+                return full_response_text
 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
