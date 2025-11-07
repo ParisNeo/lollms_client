@@ -1117,7 +1117,7 @@ class LollmsDiscussion:
                     if callback:
                         qg_id = callback("Generating query for dynamic personality data...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_query_gen"})
 
-                    context_for_query = self.export('markdown')
+                    context_for_query = self.export('markdown', suppress_system_prompt=True)
                     query_prompt = (
                         "You are an expert query generator. Based on the current conversation, formulate a concise and specific query to retrieve relevant information from a knowledge base. "
                         "The query will be used to fetch data that will help you answer the user's latest request.\n\n"
@@ -1205,7 +1205,7 @@ class LollmsDiscussion:
         final_content = ""
 
         if is_agentic_turn:
-            prompt_for_agent = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
+            prompt_for_agent = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id, suppress_system_prompt=True)
             if debug:
                 ASCIIColors.cyan("\n" + "="*50 + "\n--- DEBUG: AGENTIC TURN TRIGGERED ---\n" + f"--- PROMPT FOR AGENT (from discussion history) ---\n{prompt_for_agent}\n" + "="*50 + "\n")
             
@@ -1439,7 +1439,7 @@ class LollmsDiscussion:
         self.touch() # Mark for update and auto-save if configured
         print(f"Branch starting at {message_id} ({len(messages_to_delete_ids)} messages) removed. New active branch: {self.active_branch_id}")
         
-    def export(self, format_type: str, branch_tip_id: Optional[str] = None, max_allowed_tokens: Optional[int] = None) -> Union[List[Dict], str]:
+    def export(self, format_type: str, branch_tip_id: Optional[str] = None, max_allowed_tokens: Optional[int] = None, suppress_system_prompt=False) -> Union[List[Dict], str]:
         """Exports the discussion history into a specified format.
 
         This method can format the conversation for different backends like OpenAI,
@@ -1477,12 +1477,13 @@ class LollmsDiscussion:
         full_system_prompt = ""
 
         # Combine them intelligently
-        if system_prompt_part and data_zone_part:
-            full_system_prompt = f"{system_prompt_part}\n\n{data_zone_part}"
-        elif system_prompt_part:
-            full_system_prompt = system_prompt_part
-        else:
-            full_system_prompt = data_zone_part
+        if not suppress_system_prompt:
+            if system_prompt_part and data_zone_part:
+                full_system_prompt = f"{system_prompt_part}\n\n{data_zone_part}"
+            elif system_prompt_part:
+                full_system_prompt = system_prompt_part
+            else:
+                full_system_prompt = data_zone_part
 
 
         participants = self.participants or {}

@@ -1426,44 +1426,6 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         )
         new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
         return self.remove_thinking_blocks(new_scratchpad_text).strip()
-    def _synthesize_knowledge(
-        self,
-        previous_scratchpad: str,
-        tool_name: str,
-        tool_params: dict,
-        tool_result: dict
-    ) -> str:
-        """
-        A dedicated LLM call to interpret a tool's output and update the knowledge scratchpad.
-        """
-        # Sanitize tool_result for LLM to avoid sending large binary/base64 data
-        sanitized_result = tool_result.copy()
-        if 'image_path' in sanitized_result:
-            sanitized_result['summary'] = f"An image was successfully generated and saved to '{sanitized_result['image_path']}'."
-            # Remove keys that might contain large data if they exist
-            sanitized_result.pop('image_base64', None)
-        elif 'file_path' in sanitized_result and 'content' in sanitized_result:
-             sanitized_result['summary'] = f"Content was successfully written to '{sanitized_result['file_path']}'."
-             sanitized_result.pop('content', None)
-
-
-        synthesis_prompt = (
-            "You are a data analyst assistant. Your sole job is to interpret the output of a tool and integrate it into the existing research summary (knowledge scratchpad).\n\n"
-            "--- PREVIOUS KNOWLEDGE SCRATCHPAD ---\n"
-            f"{previous_scratchpad}\n\n"
-            "--- ACTION JUST TAKEN ---\n"
-            f"Tool Called: `{tool_name}`\n"
-            f"Parameters: {json.dumps(tool_params)}\n\n"
-            "--- RAW TOOL OUTPUT ---\n"
-            f"```json\n{json.dumps(sanitized_result, indent=2)}\n```\n\n"
-            "--- YOUR TASK ---\n"
-            "Read the 'RAW TOOL OUTPUT' and explain what it means in plain language. Then, integrate this new information with the 'PREVIOUS KNOWLEDGE SCRATCHPAD' to create a new, complete, and self-contained summary.\n"
-            "Your output should be ONLY the text of the new scratchpad, with no extra commentary or formatting.\n\n"
-            "--- NEW KNOWLEDGE SCRATCHPAD ---\n"
-        )
-        new_scratchpad_text = self.generate_text(prompt=synthesis_prompt, n_predict=1024, temperature=0.0)
-        return self.remove_thinking_blocks(new_scratchpad_text).strip()
-    
 
     def _get_friendly_action_description(self, tool_name: str, requires_code: bool, requires_image: bool) -> str:
             """Convert technical tool names to user-friendly descriptions for logging."""
@@ -1492,7 +1454,7 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
                 # Clean up the technical tool name for a more readable display
                 clean_name = tool_name.replace("_", " ").replace("::", " - ").title()
                 return f"🔧 Using the {clean_name} tool"
-            
+
     def generate_with_mcp_rag(
             self,
             prompt: str,
@@ -1602,7 +1564,8 @@ Provide your response as a single JSON object inside a JSON markdown tag. Use th
         try:
             triage_prompt = f"""Analyze this user request to determine the most efficient execution strategy.
 
-USER REQUEST: "{prompt}"
+DISCUSSION and Final Prompt:
+{prompt}
 CONTEXT: {context or "No additional context provided"}
 IMAGES PROVIDED: {"Yes" if images else "No"}
 
@@ -1628,7 +1591,7 @@ Based on the request complexity and available tools, choose the optimal strategy
    - Example: "Research X, then create a report comparing it to Y"
 
 Provide your analysis in JSON format:
-{{"thought": "Detailed reasoning about the request complexity and requirements", "strategy": "ONE_OF_THE_FOUR_OPTIONS", "confidence": 0.8, "text_output": "Direct answer or clarification question if applicable", "required_tool_name": "specific tool name if SINGLE_TOOL strategy", "estimated_steps": 3}}"""
+{{"thought": "Detailed reasoning about the request complexity and requirements", "strategy": "ONE_OF_THE_FOUR_OPTIONS", "confidence": percentage float value, eg 80, "text_output": "Direct answer or clarification question if applicable", "required_tool_name": "specific tool name if SINGLE_TOOL strategy", "estimated_steps": 3}}"""
             
             triage_schema = {
                 "thought": "string", "strategy": "string", "confidence": "number",
@@ -1639,7 +1602,7 @@ Provide your analysis in JSON format:
             
             log_event(f"Strategy analysis complete.\n**confidence**: {strategy_data.get('confidence', 0.5)}\n**reasoning**: {strategy_data.get('thought', 'None')}", MSG_TYPE.MSG_TYPE_INFO, meta={
                 "strategy": strategy,
-                "confidence": strategy_data.get("confidence", 0.5),
+                "confidence": strategy_data.get("confidence", 50),
                 "estimated_steps": strategy_data.get("estimated_steps", 1),
                 "reasoning": strategy_data.get("thought", "")
             })
@@ -1680,7 +1643,8 @@ Provide your analysis in JSON format:
                 # Enhanced parameter generation prompt
                 param_prompt = f"""Generate the optimal parameters for the selected tool to fulfill the user's request.
 
-USER REQUEST: "{prompt}"
+FULL discussion and USER REQUEST: 
+{prompt}
 SELECTED TOOL: {json.dumps(tool_spec, indent=2)}
 CONTEXT: {context or "None"}
 
@@ -1704,6 +1668,7 @@ Output the parameters as JSON: {{"tool_params": {{...}}}}"""
                     docs = [d for d in (raw_results.get("results", []) if isinstance(raw_results, dict) else raw_results or [])]
                     tool_result = {"status": "success", "results": docs}
                     sources = [{"title":d["title"], "content":d["content"], "source": tool_name, "metadata": d.get("metadata", {}), "score": d.get("score", 0.0)} for d in docs]
+                    log_event(sources, MSG_TYPE.MSG_TYPE_SOURCES_LIST)
                     log_event(f"Retrieved {len(docs)} relevant documents", MSG_TYPE.MSG_TYPE_INFO)
                 elif hasattr(self, "mcp") and "local_tools" not in tool_name:
                     log_event(f"Executing MCP tool: {tool_name}", MSG_TYPE.MSG_TYPE_TOOL_CALL, meta={"tool_name": tool_name, "params": tool_params})
@@ -1722,7 +1687,8 @@ Output the parameters as JSON: {{"tool_params": {{...}}}}"""
                 # Enhanced synthesis prompt
                 synthesis_prompt = f"""Create a comprehensive and user-friendly response based on the tool execution results.
 
-USER REQUEST: "{prompt}"
+FULL DISCUSSON and USER REQUEST:
+{prompt}
 TOOL USED: {tool_name}
 TOOL RESULT: {json.dumps(tool_result, indent=2)}
 
@@ -1927,7 +1893,7 @@ Provide your decision as JSON:
         "tool_name": "exact_tool_name",
         "requires_code_input": false,
         "requires_image_input": false,
-        "confidence": 0.8
+        "confidence": 80
     }},
     "plan_status": "on_track" // or "needs_revision" if you want to change the plan
 }}"""
@@ -1956,7 +1922,7 @@ Provide your decision as JSON:
                 tool_name = action.get("tool_name")
                 requires_code = action.get("requires_code_input", False)
                 requires_image = action.get("requires_image_input", False)
-                confidence = action.get("confidence", 0.5)
+                confidence = action.get("confidence", 50)
                 
                 # Track the decision
                 decision_history.append({

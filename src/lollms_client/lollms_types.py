@@ -41,8 +41,10 @@ class MSG_TYPE(Enum):
     MSG_TYPE_OBSERVATION            = 23# the ai shows its reasoning
 
     MSG_TYPE_ERROR                  = 24#a severe error hapened
-    MSG_TYPE_GENERATING_TITLE_START = 25#a severe error hapened
-    MSG_TYPE_GENERATING_TITLE_END   = 26#a severe error hapened
+    MSG_TYPE_GENERATING_TITLE_START = 25#title generation started
+    MSG_TYPE_GENERATING_TITLE_END   = 26#title generation done
+
+    MSG_TYPE_SOURCES_LIST           = 27# List of sources provided
 
 
 class SENDER_TYPES(Enum):
