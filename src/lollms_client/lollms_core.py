@@ -488,26 +488,28 @@ class LollmsClient():
         return self.llm_binding_manager.get_available_bindings()
 
     def generate_text(self,
-                     prompt: str,
-                     images: Optional[List[str]] = None,
-                     system_prompt: str = "",
-                     n_predict: Optional[int] = None,
-                     stream: Optional[bool] = None,
-                     temperature: Optional[float] = None,
-                     top_k: Optional[int] = None,
-                     top_p: Optional[float] = None,
-                     repeat_penalty: Optional[float] = None,
-                     repeat_last_n: Optional[int] = None,
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     split:Optional[bool]=False, # put to true if the prompt is a discussion
-                     user_keyword:Optional[str]="!@>user:",
-                     ai_keyword:Optional[str]="!@>assistant:",
-                     think:Optional[bool]=True,
-                     **kwargs
-                     ) -> Union[str, dict]:
+                    prompt: str,
+                    images: Optional[List[str]] = None,
+                    system_prompt: str = "",
+                    n_predict: Optional[int] = None,
+                    stream: Optional[bool] = None,
+                    temperature: Optional[float] = None,
+                    top_k: Optional[int] = None,
+                    top_p: Optional[float] = None,
+                    repeat_penalty: Optional[float] = None,
+                    repeat_last_n: Optional[int] = None,
+                    seed: Optional[int] = None,
+                    n_threads: Optional[int] = None,
+                    ctx_size: int | None = None,
+                    streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                    split:Optional[bool]=False, # put to true if the prompt is a discussion
+                    user_keyword:Optional[str]="!@>user:",
+                    ai_keyword:Optional[str]="!@>assistant:",
+                    think: Optional[bool] = False,
+                    reasoning_effort: Optional[bool] = "low", # low, medium, high
+                    reasoning_summary: Optional[bool] = "auto", # auto
+                    **kwargs
+                    ) -> Union[str, dict]:
         """
         Generate text using the active LLM binding, using instance defaults if parameters are not provided.
 
@@ -528,7 +530,9 @@ class LollmsClient():
             split:Optional[bool]: put to true if the prompt is a discussion
             user_keyword:Optional[str]: when splitting we use this to extract user prompt 
             ai_keyword:Optional[str]": when splitting we use this to extract ai prompt
-            think:Optional[bool]: Activate thinking or deactivate it
+            think: Optional[bool]: Activate thinking or deactivate it
+            reasoning_effort: Optional[bool]: If think is active, this specifies what effort to put into the thinking
+            reasoning_summary: Optional[bool]: If think is active, this specifies if a summary will be generated
 
         Returns:
             Union[str, dict]: Generated text or error dictionary if failed.
@@ -564,7 +568,10 @@ class LollmsClient():
                 split= split,
                 user_keyword=user_keyword,
                 ai_keyword=ai_keyword,
-                think=think
+                think=think,
+                reasoning_effort = reasoning_effort,
+                reasoning_summary=reasoning_summary
+                
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -582,6 +589,8 @@ class LollmsClient():
                      ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                      think: Optional[bool] = False,
+                     reasoning_effort: Optional[bool] = "low", # low, medium, high
+                     reasoning_summary: Optional[bool] = "auto", # auto
                      **kwargs
                      ) -> Union[str, dict]:
         """
@@ -619,26 +628,30 @@ class LollmsClient():
                 ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size,
                 streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback,
                 think=think,
+                reasoning_effort=reasoning_effort,
+                reasoning_summary=reasoning_summary
             )
         raise RuntimeError("LLM binding not initialized.")
 
     def chat(self,
-             discussion: LollmsDiscussion,
-             branch_tip_id: Optional[str] = None,
-             n_predict: Optional[int] = None,
-             stream: Optional[bool] = None,
-             temperature: Optional[float] = None,
-             top_k: Optional[int] = None,
-             top_p: Optional[float] = None,
-             repeat_penalty: Optional[float] = None,
-             repeat_last_n: Optional[int] = None,
-             seed: Optional[int] = None,
-             n_threads: Optional[int] = None,
-             ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE, Dict], bool]] = None,
-             think: Optional[bool] = False,
-             **kwargs
-             ) -> Union[str, dict]:
+            discussion: LollmsDiscussion,
+            branch_tip_id: Optional[str] = None,
+            n_predict: Optional[int] = None,
+            stream: Optional[bool] = None,
+            temperature: Optional[float] = None,
+            top_k: Optional[int] = None,
+            top_p: Optional[float] = None,
+            repeat_penalty: Optional[float] = None,
+            repeat_last_n: Optional[int] = None,
+            seed: Optional[int] = None,
+            n_threads: Optional[int] = None,
+            ctx_size: Optional[int] = None,
+            streaming_callback: Optional[Callable[[str, MSG_TYPE, Dict], bool]] = None,
+            think: Optional[bool] = False,
+            reasoning_effort: Optional[bool] = "low", # low, medium, high
+            reasoning_summary: Optional[bool] = "auto", # auto
+            **kwargs
+            ) -> Union[str, dict]:
         """
         High-level method to perform a chat generation using a LollmsDiscussion object.
 
@@ -680,6 +693,8 @@ class LollmsClient():
                 ctx_size = ctx_size if ctx_size is not None else self.llm.default_ctx_size,
                 streaming_callback=streaming_callback if streaming_callback is not None else self.llm.default_streaming_callback,
                 think = think,
+                reasoning_effort = reasoning_effort,
+                reasoning_summary = reasoning_summary,
             )
         raise RuntimeError("LLM binding not initialized.")
 
@@ -734,8 +749,11 @@ class LollmsClient():
                         repeat_penalty=None,
                         repeat_last_n=None,
                         callback=None,
-                        think:Optional[bool]=False,
-                        debug=False
+                        think: Optional[bool] = False,
+                        reasoning_effort: Optional[bool] = "low", # low, medium, high
+                        reasoning_summary: Optional[bool] = "auto", # auto
+                        debug=False,
+                        **kwargs
                         ):
         """
         Generates multiple code blocks based on a prompt.
@@ -778,7 +796,9 @@ Don't forget encapsulate the code inside a html code tag. This is mandatory.
             repeat_penalty=repeat_penalty,
             repeat_last_n=repeat_last_n,
             streaming_callback=callback, # Assuming generate_text handles streaming callback
-            think=think
+            think=think,
+            reasoning_effort = reasoning_effort,
+            reasoning_summary=reasoning_summary
             )
 
         if isinstance(response, dict) and not response.get("status", True): # Check for error dict
