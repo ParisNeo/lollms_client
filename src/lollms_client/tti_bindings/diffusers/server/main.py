@@ -698,12 +698,17 @@ async def generate_image(request: T2IRequest):
         # Add prompts and ensure types for specific args
         pipeline_args["prompt"] = request.prompt
         pipeline_args["negative_prompt"] = request.negative_prompt
-        pipeline_args["width"] = int(pipeline_args.get("width", 1024))
-        pipeline_args["height"] = int(pipeline_args.get("height", 1024))
-        pipeline_args["num_inference_steps"] = int(pipeline_args.get("num_inference_steps", 25))
-        pipeline_args["guidance_scale"] = float(pipeline_args.get("guidance_scale", 7.0))
+        width = pipeline_args.get("width", 1024)
+        height = pipeline_args.get("height", 1024)
+        num_inference_steps = pipeline_args.get("num_inference_steps", 25)
+        seed = pipeline_args.get("seed", -1)
+        guidance_scale = pipeline_args.get("guidance_scale", 7.0)
+        pipeline_args["width"] = int(width if width else 1024)
+        pipeline_args["height"] = int(height if height else 1024)
+        pipeline_args["num_inference_steps"] = int(num_inference_steps if num_inference_steps else 25)
+        pipeline_args["guidance_scale"] = float(guidance_scale if guidance_scale else 7.0)
 
-        seed = int(pipeline_args.get("seed", -1))
+        seed = int(seed if seed is not None else -1)
         pipeline_args["generator"] = None
         if seed != -1:
             pipeline_args["generator"] = torch.Generator(device=manager.config["device"]).manual_seed(seed)
