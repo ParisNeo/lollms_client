@@ -15,7 +15,7 @@ from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
 from ascii_colors import ASCIIColors, trace_exception
 
-# Ensure required packages are installed, including Pillow for image processing
+# Ensure required packages are installed
 pm.ensure_packages(["httpx", "tiktoken", "Pillow"])
 
 BindingName = "OpenWebUIBinding"
@@ -148,12 +148,13 @@ class OpenWebUIBinding(LollmsLLMBinding):
         try:
             if stream:
                 with self.client.stream("POST", "/api/chat/completions", json=params) as response:
+                    # This is the idiomatic way to check for HTTP errors with httpx
                     response.raise_for_status()
+                    
                     for line in response.iter_lines():
                         if not line:
                             continue
-
-                        # --- ROBUST DUAL-TYPE HANDLING ---
+                        
                         data_str = None
                         if isinstance(line, bytes):
                             if line.startswith(b"data:"):
@@ -164,7 +165,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
                         
                         if data_str is None:
                             continue
-                        # --- END OF FIX ---
 
                         if data_str == "[DONE]":
                             break
@@ -281,14 +281,14 @@ class OpenWebUIBinding(LollmsLLMBinding):
     def list_models(self) -> List[Dict]:
         models_info = []
         try:
-            response = self.client.get("/api/models")
+            response = self.client.get("/api/v1/models")
             if response.status_code == 403 and "API key is not enabled" in response.text:
                 temp_client = httpx.Client(
                     base_url=self.host_address,
                     headers={"Content-Type": "application/json"},
                     verify=self.verify_ssl_certificate, timeout=None,
                 )
-                response = temp_client.get("/api/models")
+                response = temp_client.get("/api/v1/models")
                 temp_client.close()
 
             response.raise_for_status()
@@ -343,7 +343,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
     def get_model_info(self) -> dict:
         return {
             "name": self.binding_name,
-            "version": "1.4",
+            "version": "1.5",
             "host_address": self.host_address,
             "model_name": self.model_name,
             "supports_structured_output": False,
