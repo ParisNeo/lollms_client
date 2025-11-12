@@ -85,15 +85,15 @@ class OpenWebUIBinding(LollmsLLMBinding):
 
         if not self.host_address:
             raise ValueError("OpenWebUI host address is required.")
-        if not self.service_key:
-            ASCIIColors.warning(
-                "No service key provided for OpenWebUI. Requests may fail."
-            )
 
-        headers = {
-            "Authorization": f"Bearer {self.service_key}",
-            "Content-Type": "application/json",
-        }
+        # Build headers – only include Authorization if a key is actually provided
+        headers = {"Content-Type": "application/json"}
+        if self.service_key:
+            headers["Authorization"] = f"Bearer {self.service_key}"
+        else:
+            ASCIIColors.warning(
+                "No service key provided for OpenWebUI. Requests will be made without Authorization header."
+            )
 
         self.client = httpx.Client(
             base_url=self.host_address,
@@ -299,40 +299,66 @@ class OpenWebUIBinding(LollmsLLMBinding):
         models_info = []
         try:
             response = self.client.get("/api/models")
-            # Detailed tracing before raising for status errors
+            # -----------------------------------------------------------------
+            # 1️⃣ If the server rejects the request because the API key is
+            #    disabled, retry **without** the Authorization header.
+            # -----------------------------------------------------------------
+            ASCIIColors.info(f"response.status_code: {response.status_code}")
+            ASCIIColors.info(f"response.text: {response.text}")
+            if response.status_code == 403 and "API key is not enabled" in response.text:
+                ASCIIColors.warning(
+                    "OpenWebUI rejected request with 403 (API key not enabled). "
+                    "Retrying without Authorization header."
+                )
+                # Temporary client without auth header
+                temp_client = httpx.Client(
+                    base_url=self.host_address,
+                    headers={"Content-Type": "application/json"},
+                    verify=self.verify_ssl_certificate,
+                    timeout=None,
+                )
+                response = temp_client.get("/api/models")
+                temp_client.close()
+
+            # -----------------------------------------------------------------
+            # 2️⃣ Detailed tracing for any non‑200 response.
+            # -----------------------------------------------------------------
             if response.status_code != 200:
-                # Capture full response details for debugging
                 ASCIIColors.error(
                     f"OpenWebUI /api/models returned status {response.status_code}. "
                     f"Response body: {response.text}"
                 )
-                # Trace the full exception context
+                # Trace the full exception context but **do not raise** – we simply
+                # return an empty list so the rest of the application can continue.
                 try:
                     response.raise_for_status()
                 except Exception as e:
                     trace_exception(e)
-                    raise  # Re‑raise to be caught by the outer handler
-            else:
-                # Successful response – parse model data
-                models_data = response.json().get("data", [])
-                for model in models_data:
-                    models_info.append(
-                        {
-                            "model_name": model.get("id", "N/A"),
-                            "owned_by": model.get("details", {}).get("family", "N/A"),
-                            "created": model.get("modified_at", "N/A"),
-                            "context_length": model.get("details", {}).get(
-                                "parameter_size", "unknown"
-                            ),
-                        }
-                    )
+                return models_info  # Empty list due to error
+
+            # -----------------------------------------------------------------
+            # 3️⃣ Successful response – parse model data.
+            # -----------------------------------------------------------------
+            models_data = response.json().get("data", [])
+            for model in models_data:
+                models_info.append(
+                    {
+                        "model_name": model.get("id", "N/A"),
+                        "owned_by": model.get("details", {}).get("family", "N/A"),
+                        "created": model.get("modified_at", "N/A"),
+                        "context_length": model.get("details", {}).get(
+                            "parameter_size", "unknown"
+                        ),
+                    }
+                )
         except Exception as e:
-            # Provide a rich error message and full traceback
             ASCIIColors.error(
                 f"Failed to list models from OpenWebUI: {e.__class__.__name__}: {e}"
             )
             trace_exception(e)
         return models_info
+
+
     def _get_encoding(self, model_name: str | None = None):
         """Fallback to tiktoken for generic tokenisation."""
         try:
