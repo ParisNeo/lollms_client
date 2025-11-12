@@ -298,7 +298,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
         """Return a list of models known to the OpenWebUI server."""
         models_info = []
         try:
-            response = self.client.get("/api/models")
+            response = self.client.get("/api/v1/models")
             # -----------------------------------------------------------------
             # 1️⃣ If the server rejects the request because the API key is
             #    disabled, retry **without** the Authorization header.
@@ -317,7 +317,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
                     verify=self.verify_ssl_certificate,
                     timeout=None,
                 )
-                response = temp_client.get("/api/models")
+                response = temp_client.get("/api/v1/models")
                 temp_client.close()
 
             # -----------------------------------------------------------------
@@ -325,7 +325,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
             # -----------------------------------------------------------------
             if response.status_code != 200:
                 ASCIIColors.error(
-                    f"OpenWebUI /api/models returned status {response.status_code}. "
+                    f"OpenWebUI /api/v1/models returned status {response.status_code}. "
                     f"Response body: {response.text}"
                 )
                 # Trace the full exception context but **do not raise** – we simply
