@@ -300,15 +300,17 @@ class OpenWebUIBinding(LollmsLLMBinding):
         try:
             response = self.client.get("/api/models")
             # -----------------------------------------------------------------
-            # 1️⃣  If the server rejects the request because the API key is
-            #     disabled, retry **without** the Authorization header.
+            # 1️⃣ If the server rejects the request because the API key is
+            #    disabled, retry **without** the Authorization header.
             # -----------------------------------------------------------------
-            if response.status_code == 403:
+            ASCIIColors.info(f"response.status_code: {response.status_code}")
+            ASCIIColors.info(f"response.text: {response.text}")
+            if response.status_code == 403 and "API key is not enabled" in response.text:
                 ASCIIColors.warning(
                     "OpenWebUI rejected request with 403 (API key not enabled). "
                     "Retrying without Authorization header."
                 )
-                # Create a temporary client without the auth header
+                # Temporary client without auth header
                 temp_client = httpx.Client(
                     base_url=self.host_address,
                     headers={"Content-Type": "application/json"},
@@ -319,38 +321,43 @@ class OpenWebUIBinding(LollmsLLMBinding):
                 temp_client.close()
 
             # -----------------------------------------------------------------
-            # 2️⃣  Detailed tracing for any non‑200 response.
+            # 2️⃣ Detailed tracing for any non‑200 response.
             # -----------------------------------------------------------------
             if response.status_code != 200:
                 ASCIIColors.error(
                     f"OpenWebUI /api/models returned status {response.status_code}. "
                     f"Response body: {response.text}"
                 )
+                # Trace the full exception context but **do not raise** – we simply
+                # return an empty list so the rest of the application can continue.
                 try:
                     response.raise_for_status()
                 except Exception as e:
                     trace_exception(e)
-                    raise  # Propagate to outer handler
-            else:
-                # Successful response – parse model data
-                models_data = response.json().get("data", [])
-                for model in models_data:
-                    models_info.append(
-                        {
-                            "model_name": model.get("id", "N/A"),
-                            "owned_by": model.get("details", {}).get("family", "N/A"),
-                            "created": model.get("modified_at", "N/A"),
-                            "context_length": model.get("details", {}).get(
-                                "parameter_size", "unknown"
-                            ),
-                        }
-                    )
+                return models_info  # Empty list due to error
+
+            # -----------------------------------------------------------------
+            # 3️⃣ Successful response – parse model data.
+            # -----------------------------------------------------------------
+            models_data = response.json().get("data", [])
+            for model in models_data:
+                models_info.append(
+                    {
+                        "model_name": model.get("id", "N/A"),
+                        "owned_by": model.get("details", {}).get("family", "N/A"),
+                        "created": model.get("modified_at", "N/A"),
+                        "context_length": model.get("details", {}).get(
+                            "parameter_size", "unknown"
+                        ),
+                    }
+                )
         except Exception as e:
             ASCIIColors.error(
                 f"Failed to list models from OpenWebUI: {e.__class__.__name__}: {e}"
             )
             trace_exception(e)
         return models_info
+
 
     def _get_encoding(self, model_name: str | None = None):
         """Fallback to tiktoken for generic tokenisation."""
