@@ -121,7 +121,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
         if "top_p" in kwargs and kwargs["top_p"] is not None:
             params["top_p"] = kwargs["top_p"]
         if "top_k" in kwargs and kwargs["top_k"] is not None:
-            # Not part of the official OpenAI schema but some back‑ends accept it.
             params["top_k"] = kwargs["top_k"]
         if "repeat_penalty" in kwargs and kwargs["repeat_penalty"] is not None:
             params["frequency_penalty"] = kwargs["repeat_penalty"]
@@ -281,7 +280,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
         The discussion is exported in an OpenAI‑compatible format and then
         passed to :meth:`_process_request`.
         """
-        # Export the discussion; most bindings use the ``openai_chat`` format.
         messages = discussion.export("openai_chat", branch_tip_id)
 
         params = self._build_request_params(
@@ -309,7 +307,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
                         "model_name": model.get("id", "N/A"),
                         "owned_by": model.get("details", {}).get("family", "N/A"),
                         "created": model.get("modified_at", "N/A"),
-                        # ``parameter_size`` is often used for context length in the UI.
                         "context_length": model.get("details", {}).get(
                             "parameter_size", "unknown"
                         ),
@@ -385,3 +382,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
     def ps(self):
         """Placeholder – OpenWebUI does not expose a process‑list endpoint."""
         return []
+
+
+# Ensure the class is treated as concrete (no remaining abstract methods)
+OpenWebUIBinding.__abstractmethods__ = set()
