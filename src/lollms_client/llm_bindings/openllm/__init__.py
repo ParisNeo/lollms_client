@@ -298,7 +298,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
         """Return a list of models known to the OpenWebUI server."""
         models_info = []
         try:
-            response = self.client.get("/api/v1/models")
+            response = self.client.get("/api/models")
             # -----------------------------------------------------------------
             # 1️⃣ If the server rejects the request because the API key is
             #    disabled, retry **without** the Authorization header.
