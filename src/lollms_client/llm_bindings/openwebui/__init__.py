@@ -148,7 +148,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
         try:
             if stream:
                 with self.client.stream("POST", "/api/chat/completions", json=params) as response:
-                    # This is the idiomatic way to check for HTTP errors with httpx
                     response.raise_for_status()
                     
                     for line in response.iter_lines():
@@ -188,13 +187,11 @@ class OpenWebUIBinding(LollmsLLMBinding):
                     streaming_callback(output, MSG_TYPE.MSG_TYPE_CHUNK)
 
         except httpx.HTTPStatusError as e:
-            # Must read the response to get the error message from the body
             try:
                 e.response.read()
                 response_text = e.response.text
             except Exception:
                 response_text = "(Could not read error response body)"
-
             err_msg = f"API Error: {e.response.status_code} - {response_text}"
             trace_exception(e)
             if streaming_callback:
@@ -227,16 +224,22 @@ class OpenWebUIBinding(LollmsLLMBinding):
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
-        user_content = [{"type": "text", "text": prompt}]
+        user_message = {"role": "user", "content": prompt}
         if images:
+            b64_images = []
             for img_path in images:
-                user_content.append(normalize_image_input(
+                normalized = normalize_image_input(
                     img_path,
                     cap_size=self.cap_image_size,
                     max_dim=self.image_downsizing_max_dimension
-                ))
-
-        messages.append({"role": "user", "content": user_content})
+                )
+                data_url = normalized["image_url"]["url"]
+                if "base64," in data_url:
+                    b64_images.append(data_url.split("base64,")[1])
+            if b64_images:
+                user_message["images"] = b64_images
+        
+        messages.append(user_message)
 
         params = self._build_request_params(
             messages=messages, n_predict=n_predict, stream=stream,
@@ -258,7 +261,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         **kwargs,
     ) -> Union[str, dict]:
-        messages = discussion.export("openai_chat", branch_tip_id)
+        messages = discussion.export("ollama_chat", branch_tip_id)
         params = self._build_request_params(
             messages=messages, n_predict=n_predict, stream=stream,
             temperature=temperature, top_k=top_k, top_p=top_p,
@@ -278,8 +281,32 @@ class OpenWebUIBinding(LollmsLLMBinding):
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         **kwargs,
     ) -> Union[str, dict]:
+        # Convert from OpenAI vision format to Ollama vision format
+        ollama_messages = []
+        for msg in messages:
+            content = msg.get("content")
+            role = msg.get("role")
+            
+            if isinstance(content, list):
+                text_parts = []
+                image_parts = []
+                for part in content:
+                    if part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif part.get("type") == "image_url":
+                        url = part.get("image_url", {}).get("url", "")
+                        if "base64," in url:
+                            image_parts.append(url.split("base64,")[1])
+                
+                new_msg = {"role": role, "content": "\n".join(text_parts)}
+                if image_parts:
+                    new_msg["images"] = image_parts
+                ollama_messages.append(new_msg)
+            else:
+                ollama_messages.append(msg)
+
         params = self._build_request_params(
-            messages=messages, n_predict=n_predict, stream=stream,
+            messages=ollama_messages, n_predict=n_predict, stream=stream,
             temperature=temperature, top_k=top_k, top_p=top_p,
             repeat_penalty=repeat_penalty, **kwargs,
         )
