@@ -188,7 +188,14 @@ class OpenWebUIBinding(LollmsLLMBinding):
                     streaming_callback(output, MSG_TYPE.MSG_TYPE_CHUNK)
 
         except httpx.HTTPStatusError as e:
-            err_msg = f"API Error: {e.response.status_code} - {e.response.text}"
+            # Must read the response to get the error message from the body
+            try:
+                e.response.read()
+                response_text = e.response.text
+            except Exception:
+                response_text = "(Could not read error response body)"
+
+            err_msg = f"API Error: {e.response.status_code} - {response_text}"
             trace_exception(e)
             if streaming_callback:
                 streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
