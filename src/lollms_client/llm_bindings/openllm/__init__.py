@@ -303,7 +303,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
             # 1️⃣  If the server rejects the request because the API key is
             #     disabled, retry **without** the Authorization header.
             # -----------------------------------------------------------------
-            if response.status_code == 403 and "API key is not enabled" in response.text:
+            if response.status_code == 403:
                 ASCIIColors.warning(
                     "OpenWebUI rejected request with 403 (API key not enabled). "
                     "Retrying without Authorization header."
