@@ -31,3 +31,13 @@ input_parameters:
     description: "If set to true, allows sending non-standard OpenAI API parameters like 'top_k'. Set this to false if your model backend (e.g., Mistral) throws errors about extra inputs."
     mandatory: false
     default: false
+  - name: cap_image_size
+    type: bool
+    description: "Enable to automatically downsize large images before sending them, preventing payload-too-large errors."
+    mandatory: false
+    default: true
+  - name: image_downsizing_max_dimension
+    type: int
+    description: "If capping is enabled, this is the maximum width or height (in pixels) an image can have. Larger images will be shrunk."
+    mandatory: false
+    default: 2048
