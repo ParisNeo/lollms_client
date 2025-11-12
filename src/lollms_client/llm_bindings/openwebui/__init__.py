@@ -3,7 +3,6 @@ import json
 import base64
 import os
 import mimetypes
-import math
 from typing import Optional, Callable, List, Union, Dict
 
 import httpx
@@ -11,9 +10,8 @@ import tiktoken
 import pipmaster as pm
 
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
-from lollms_client.lollms_types import MSG_TYPE, ELF_COMPLETION_FORMAT
+from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
-from lollms_client.lollms_utilities import encode_image
 from ascii_colors import ASCIIColors, trace_exception
 
 # Ensure required packages are installed
@@ -51,13 +49,12 @@ def normalize_image_input(img, default_mime="image/jpeg"):
     Accepts various input formats and converts them to a data URL.
     """
     if isinstance(img, str):
-        # Handle path‑like strings or raw base64
         s = _extract_markdown_path(img)
         if os.path.exists(s):
             b64 = _read_file_as_base64(s)
             mime = _guess_mime_from_name(s, default_mime)
             url = _to_data_url(b64, mime)
-        else:  # Assume it's a raw base64 string
+        else:
             url = _to_data_url(s, default_mime)
         return {"type": "image_url", "image_url": {"url": url}}
 
@@ -70,13 +67,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
     def __init__(self, **kwargs):
         """
         Initialize the OpenWebUI binding.
-
-        Args:
-            host_address (str): URL of the OpenWebUI server (e.g. ``http://localhost:8080``).
-            model_name (str): Name of the model to use.
-            service_key (str): Authentication token for the service.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates.
-            allow_non_standard_parameters (bool): Whether to allow sending non-standard parameters like 'top_k'.
         """
         super().__init__(BindingName, **kwargs)
         self.host_address = kwargs.get("host_address")
@@ -88,7 +78,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
         if not self.host_address:
             raise ValueError("OpenWebUI host address is required.")
 
-        # Build headers – only include Authorization if a key is actually provided
         headers = {"Content-Type": "application/json"}
         if self.service_key:
             headers["Authorization"] = f"Bearer {self.service_key}"
@@ -104,11 +93,8 @@ class OpenWebUIBinding(LollmsLLMBinding):
             timeout=None,
         )
 
-    # --------------------------------------------------------------------- #
-    # Helper methods
-    # --------------------------------------------------------------------- #
     def _build_request_params(self, messages: list, **kwargs) -> dict:
-        """Construct the JSON payload expected by the OpenWebUI /chat/completions endpoint."""
+        """Construct the JSON payload for the OpenWebUI /chat/completions endpoint."""
         params = {
             "model": kwargs.get("model", self.model_name),
             "messages": messages,
@@ -122,8 +108,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
             params["temperature"] = kwargs["temperature"]
         if "top_p" in kwargs and kwargs["top_p"] is not None:
             params["top_p"] = kwargs["top_p"]
-
-        # Conditionally add non-standard parameters to avoid errors with strict APIs
+        
         if self.allow_non_standard_parameters:
             if "top_k" in kwargs and kwargs["top_k"] is not None:
                 params["top_k"] = kwargs["top_k"]
@@ -141,26 +126,20 @@ class OpenWebUIBinding(LollmsLLMBinding):
         stream: Optional[bool],
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]],
     ) -> Union[str, dict]:
-        """Execute the request – handling both streaming and non‑streaming modes."""
+        """Execute the request, handling both streaming and non-streaming modes."""
         output = ""
         try:
             if stream:
-                with self.client.stream(
-                    "POST", "/api/chat/completions", json=params
-                ) as response:
+                with self.client.stream("POST", "/api/chat/completions", json=params) as response:
                     if response.status_code != 200:
                         err = response.read().decode("utf-8")
-                        raise Exception(
-                            f"API Error: {response.status_code} - {err}"
-                        )
+                        raise Exception(f"API Error: {response.status_code} - {err}")
 
                     for line in response.iter_lines():
                         if not line:
                             continue
-                        # --- FIX IS HERE ---
-                        # Use a bytes literal b"data:" to match the type of `line`
                         if line.startswith(b"data:"):
-                            data_str = line[len(b"data:") :].strip().decode("utf-8")
+                            data_str = line[len(b"data:"):].strip().decode("utf-8")
                             if data_str == "[DONE]":
                                 break
                             try:
@@ -170,20 +149,15 @@ class OpenWebUIBinding(LollmsLLMBinding):
                                     word = delta.get("content", "")
                                     if word:
                                         if streaming_callback:
-                                            if not streaming_callback(
-                                                word, MSG_TYPE.MSG_TYPE_CHUNK
-                                            ):
+                                            if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
                                                 break
                                         output += word
                             except json.JSONDecodeError:
-                                # Gracefully handle potential empty or malformed data chunks
                                 continue
             else:
                 response = self.client.post("/api/chat/completions", json=params)
                 if response.status_code != 200:
-                    raise Exception(
-                        f"API Error: {response.status_code} - {response.text}"
-                    )
+                    raise Exception(f"API Error: {response.status_code} - {response.text}")
                 data = response.json()
                 output = data["choices"][0]["message"]["content"]
                 if streaming_callback:
@@ -197,9 +171,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
             return {"status": "error", "message": err_msg}
 
         return output
-    # --------------------------------------------------------------------- #
-    # Public API required by LollmsLLMBinding
-    # --------------------------------------------------------------------- #
+
     def generate_text(
         self,
         prompt: str,
@@ -214,7 +186,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         **kwargs,
     ) -> Union[str, dict]:
-        """Generate text (or multimodal output) via OpenWebUI."""
+        """Generate text or multimodal output via OpenWebUI."""
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -250,7 +222,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         **kwargs,
     ) -> Union[str, dict]:
-        """Generate from a pre‑formatted list of OpenAI‑compatible messages."""
+        """Generate from a pre-formatted list of OpenAI-compatible messages."""
         params = self._build_request_params(
             messages=messages,
             n_predict=n_predict,
@@ -285,8 +257,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
     ) -> Union[str, dict]:
         """
         Conduct a chat session using a :class:`LollmsDiscussion` object.
-        The discussion is exported in an OpenAI‑compatible format and then
-        passed to :meth:`_process_request`.
         """
         messages = discussion.export("openai_chat", branch_tip_id)
 
@@ -306,69 +276,42 @@ class OpenWebUIBinding(LollmsLLMBinding):
         """Return a list of models known to the OpenWebUI server."""
         models_info = []
         try:
-            response = self.client.get("/api/v1/models")
-            # -----------------------------------------------------------------
-            # 1️⃣ If the server rejects the request because the API key is
-            #    disabled, retry **without** the Authorization header.
-            # -----------------------------------------------------------------
-            ASCIIColors.info(f"response.status_code: {response.status_code}")
-            ASCIIColors.info(f"response.text: {response.text}")
+            response = self.client.get("/api/models")
             if response.status_code == 403 and "API key is not enabled" in response.text:
                 ASCIIColors.warning(
-                    "OpenWebUI rejected request with 403 (API key not enabled). "
-                    "Retrying without Authorization header."
+                    "API key rejected. Retrying without Authorization header."
                 )
-                # Temporary client without auth header
                 temp_client = httpx.Client(
                     base_url=self.host_address,
                     headers={"Content-Type": "application/json"},
                     verify=self.verify_ssl_certificate,
                     timeout=None,
                 )
-                response = temp_client.get("/api/v1/models")
+                response = temp_client.get("/api/models")
                 temp_client.close()
 
-            # -----------------------------------------------------------------
-            # 2️⃣ Detailed tracing for any non‑200 response.
-            # -----------------------------------------------------------------
             if response.status_code != 200:
                 ASCIIColors.error(
-                    f"OpenWebUI /api/v1/models returned status {response.status_code}. "
+                    f"OpenWebUI /api/models returned status {response.status_code}. "
                     f"Response body: {response.text}"
                 )
-                # Trace the full exception context but **do not raise** – we simply
-                # return an empty list so the rest of the application can continue.
-                try:
-                    response.raise_for_status()
-                except Exception as e:
-                    trace_exception(e)
-                return models_info  # Empty list due to error
+                response.raise_for_status()
 
-            # -----------------------------------------------------------------
-            # 3️⃣ Successful response – parse model data.
-            # -----------------------------------------------------------------
             models_data = response.json().get("data", [])
             for model in models_data:
-                models_info.append(
-                    {
-                        "model_name": model.get("id", "N/A"),
-                        "owned_by": model.get("details", {}).get("family", "N/A"),
-                        "created": model.get("modified_at", "N/A"),
-                        "context_length": model.get("details", {}).get(
-                            "parameter_size", "unknown"
-                        ),
-                    }
-                )
+                models_info.append({
+                    "model_name": model.get("id", "N/A"),
+                    "owned_by": model.get("details", {}).get("family", "N/A"),
+                    "created": model.get("modified_at", "N/A"),
+                    "context_length": model.get("details", {}).get("parameter_size", "unknown"),
+                })
         except Exception as e:
-            ASCIIColors.error(
-                f"Failed to list models from OpenWebUI: {e.__class__.__name__}: {e}"
-            )
+            ASCIIColors.error(f"Failed to list models from OpenWebUI: {e}")
             trace_exception(e)
         return models_info
 
-
-    def _get_encoding(self, model_name: str | None = None):
-        """Fallback to tiktoken for generic tokenisation."""
+    def _get_encoding(self, model_name: str = None):
+        """Fallback to tiktoken for generic tokenization."""
         try:
             return tiktoken.encoding_for_model(model_name or self.model_name)
         except KeyError:
@@ -386,8 +329,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
     def embed(self, text: str | List[str], **kwargs) -> List:
         """
         Obtain embeddings via the OpenWebUI ``/embeddings`` endpoint.
-        If a single string is supplied, a single embedding vector is returned;
-        otherwise a list of vectors is returned.
         """
         embedding_model = kwargs.get("model", self.model_name)
         single_input = isinstance(text, str)
@@ -397,6 +338,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
         try:
             for t in inputs:
                 payload = {"model": embedding_model, "prompt": t}
+                # Note: The original code used /ollama/api/embeddings. This assumes the endpoint exists.
                 response = self.client.post("/ollama/api/embeddings", json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -410,7 +352,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
             )
             trace_exception(e)
             return []
-
+        
     def get_model_info(self) -> dict:
         """Return basic information about the current binding configuration."""
         return {
