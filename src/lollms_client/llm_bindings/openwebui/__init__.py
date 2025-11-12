@@ -299,23 +299,40 @@ class OpenWebUIBinding(LollmsLLMBinding):
         models_info = []
         try:
             response = self.client.get("/api/models")
-            response.raise_for_status()
-            models_data = response.json().get("data", [])
-            for model in models_data:
-                models_info.append(
-                    {
-                        "model_name": model.get("id", "N/A"),
-                        "owned_by": model.get("details", {}).get("family", "N/A"),
-                        "created": model.get("modified_at", "N/A"),
-                        "context_length": model.get("details", {}).get(
-                            "parameter_size", "unknown"
-                        ),
-                    }
+            # Detailed tracing before raising for status errors
+            if response.status_code != 200:
+                # Capture full response details for debugging
+                ASCIIColors.error(
+                    f"OpenWebUI /api/models returned status {response.status_code}. "
+                    f"Response body: {response.text}"
                 )
+                # Trace the full exception context
+                try:
+                    response.raise_for_status()
+                except Exception as e:
+                    trace_exception(e)
+                    raise  # Re‑raise to be caught by the outer handler
+            else:
+                # Successful response – parse model data
+                models_data = response.json().get("data", [])
+                for model in models_data:
+                    models_info.append(
+                        {
+                            "model_name": model.get("id", "N/A"),
+                            "owned_by": model.get("details", {}).get("family", "N/A"),
+                            "created": model.get("modified_at", "N/A"),
+                            "context_length": model.get("details", {}).get(
+                                "parameter_size", "unknown"
+                            ),
+                        }
+                    )
         except Exception as e:
-            ASCIIColors.error(f"Failed to list models from OpenWebUI: {e}")
+            # Provide a rich error message and full traceback
+            ASCIIColors.error(
+                f"Failed to list models from OpenWebUI: {e.__class__.__name__}: {e}"
+            )
+            trace_exception(e)
         return models_info
-
     def _get_encoding(self, model_name: str | None = None):
         """Fallback to tiktoken for generic tokenisation."""
         try:
