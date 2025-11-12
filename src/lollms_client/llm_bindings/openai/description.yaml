@@ -12,7 +12,7 @@ input_parameters:
   - name: service_key
     type: str
     description: "The API key for the OpenAI service. Can also be set via the OPENAI_API_KEY environment variable."
-    mandatory: true
+    mandatory: false
     default: ""
   - name: host_address
     type: str
