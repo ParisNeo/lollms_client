@@ -76,12 +76,14 @@ class OpenWebUIBinding(LollmsLLMBinding):
             model_name (str): Name of the model to use.
             service_key (str): Authentication token for the service.
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
+            allow_non_standard_parameters (bool): Whether to allow sending non-standard parameters like 'top_k'.
         """
         super().__init__(BindingName, **kwargs)
         self.host_address = kwargs.get("host_address")
         self.model_name = kwargs.get("model_name")
         self.service_key = kwargs.get("service_key", os.getenv("OPENWEBUI_API_KEY"))
         self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate", True)
+        self.allow_non_standard_parameters = kwargs.get("allow_non_standard_parameters", False)
 
         if not self.host_address:
             raise ValueError("OpenWebUI host address is required.")
@@ -120,8 +122,12 @@ class OpenWebUIBinding(LollmsLLMBinding):
             params["temperature"] = kwargs["temperature"]
         if "top_p" in kwargs and kwargs["top_p"] is not None:
             params["top_p"] = kwargs["top_p"]
-        if "top_k" in kwargs and kwargs["top_k"] is not None:
-            params["top_k"] = kwargs["top_k"]
+
+        # Conditionally add non-standard parameters to avoid errors with strict APIs
+        if self.allow_non_standard_parameters:
+            if "top_k" in kwargs and kwargs["top_k"] is not None:
+                params["top_k"] = kwargs["top_k"]
+
         if "repeat_penalty" in kwargs and kwargs["repeat_penalty"] is not None:
             params["frequency_penalty"] = kwargs["repeat_penalty"]
         if "seed" in kwargs and kwargs["seed"] is not None:

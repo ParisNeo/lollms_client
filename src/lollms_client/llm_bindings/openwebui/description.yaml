@@ -26,3 +26,8 @@ input_parameters:
     description: "Set to false if you are using a self-signed SSL certificate with your OpenWebUI instance."
     mandatory: false
     default: true
+  - name: allow_non_standard_parameters
+    type: bool
+    description: "If set to true, allows sending non-standard OpenAI API parameters like 'top_k'. Set this to false if your model backend (e.g., Mistral) throws errors about extra inputs."
+    mandatory: false
+    default: false
