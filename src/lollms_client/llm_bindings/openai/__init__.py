@@ -371,7 +371,8 @@ class OpenAIBinding(LollmsLLMBinding):
             seed: Optional[int] = None,
             n_threads: Optional[int] = None,
             ctx_size: Optional[int] = None,
-            streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+            streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+            **kwargs
             ) -> Union[str, dict]:
 
         messages = discussion.export("openai_chat", branch_tip_id)
