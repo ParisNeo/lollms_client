@@ -157,6 +157,8 @@ class OpenWebUIBinding(LollmsLLMBinding):
                     for line in response.iter_lines():
                         if not line:
                             continue
+                        # --- FIX IS HERE ---
+                        # Use a bytes literal b"data:" to match the type of `line`
                         if line.startswith(b"data:"):
                             data_str = line[len(b"data:") :].strip().decode("utf-8")
                             if data_str == "[DONE]":
@@ -174,6 +176,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
                                                 break
                                         output += word
                             except json.JSONDecodeError:
+                                # Gracefully handle potential empty or malformed data chunks
                                 continue
             else:
                 response = self.client.post("/api/chat/completions", json=params)
@@ -194,7 +197,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
             return {"status": "error", "message": err_msg}
 
         return output
-
     # --------------------------------------------------------------------- #
     # Public API required by LollmsLLMBinding
     # --------------------------------------------------------------------- #
