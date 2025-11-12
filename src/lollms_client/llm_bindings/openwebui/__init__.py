@@ -148,7 +148,10 @@ class OpenWebUIBinding(LollmsLLMBinding):
         try:
             if stream:
                 with self.client.stream("POST", "/api/chat/completions", json=params) as response:
-                    response.raise_for_status()
+                    if response.status_code != 200:
+                        err = response.read().decode("utf-8")
+                        raise Exception(f"API Error: {response.status_code} - {err}")
+
                     for line in response.iter_lines():
                         if not line:
                             continue
@@ -175,20 +178,50 @@ class OpenWebUIBinding(LollmsLLMBinding):
                 if streaming_callback:
                     streaming_callback(output, MSG_TYPE.MSG_TYPE_CHUNK)
 
-        except httpx.HTTPStatusError as e:
-            err_msg = f"API Error: {e.response.status_code} - {e.response.text}"
-            trace_exception(e)
-            if streaming_callback:
-                streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
-            return {"status": "error", "message": err_msg}
         except Exception as e:
-            err_msg = f"An error occurred with the OpenWebUI API: {e}"
             trace_exception(e)
+            err_msg = f"An error occurred with the OpenWebUI API: {e}"
             if streaming_callback:
                 streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
             return {"status": "error", "message": err_msg}
 
         return output
+
+    def generate_text(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+        system_prompt: str = "",
+        n_predict: Optional[int] = None,
+        stream: Optional[bool] = None,
+        temperature: float = 0.7,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repeat_penalty: float = 1.1,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+        **kwargs,
+    ) -> Union[str, dict]:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        user_content = [{"type": "text", "text": prompt}]
+        if images:
+            for img_path in images:
+                user_content.append(normalize_image_input(
+                    img_path,
+                    cap_size=self.cap_image_size,
+                    max_dim=self.image_downsizing_max_dimension
+                ))
+
+        messages.append({"role": "user", "content": user_content})
+
+        params = self._build_request_params(
+            messages=messages, n_predict=n_predict, stream=stream,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            repeat_penalty=repeat_penalty, **kwargs,
+        )
+        return self._process_request(params, stream, streaming_callback)
 
     def generate_text(
         self,
