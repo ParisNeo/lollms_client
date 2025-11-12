@@ -138,22 +138,46 @@ class OpenWebUIBinding(LollmsLLMBinding):
                     for line in response.iter_lines():
                         if not line:
                             continue
-                        if line.startswith(b"data:"):
-                            data_str = line[len(b"data:"):].strip().decode("utf-8")
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                                if chunk.get("choices"):
-                                    delta = chunk["choices"][0].get("delta", {})
-                                    word = delta.get("content", "")
-                                    if word:
-                                        if streaming_callback:
-                                            if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                                                break
-                                        output += word
-                            except json.JSONDecodeError:
-                                continue
+
+                        # --- YOUR SUGGESTION IMPLEMENTED HERE ---
+                        # First, we determine the type of the 'line' variable.
+
+                        if isinstance(line, bytes):
+                            # This is the case for httpx.iter_lines()
+                            # We use bytes literals (b"...") for comparison.
+                            if line.startswith(b"data:"):
+                                data_str = line[len(b"data:"):].strip().decode("utf-8")
+                            else:
+                                continue # Skip lines that are not data events
+                        
+                        elif isinstance(line, str):
+                            # This case is included for robustness but is not expected with httpx
+                            # We use string literals ("...") for comparison.
+                            if line.startswith("data:"):
+                                data_str = line[len("data:"):].strip()
+                            else:
+                                continue # Skip lines that are not data events
+                        
+                        else:
+                            # Skip if the line is of an unknown type
+                            continue
+
+                        # --- End of type-checking logic ---
+
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            if chunk.get("choices"):
+                                delta = chunk["choices"][0].get("delta", {})
+                                word = delta.get("content", "")
+                                if word:
+                                    if streaming_callback:
+                                        if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                                            break
+                                    output += word
+                        except json.JSONDecodeError:
+                            continue
             else:
                 response = self.client.post("/api/chat/completions", json=params)
                 if response.status_code != 200:
