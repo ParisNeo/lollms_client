@@ -757,6 +757,9 @@ class OllamaBinding(LollmsLLMBinding):
             'llama3.1': 131072,   # Llama 3.1 extended context
             'llama3.2': 131072,   # Llama 3.2 extended context
             'llama3.3': 131072,   # Assuming similar to 3.1/3.2
+            'codestral': 256000,  # Codestral
+            'mistralai-medium': 128000,  # Mistral medium
+            'mistralai-mini':   128000,  # Mistral medium
             'mistral': 32768,     # Mistral 7B v0.2+ default
             'mixtral': 32768,     # Mixtral 8x7B default
             'mixtral8x22b': 65536, # Mixtral 8x22B default
