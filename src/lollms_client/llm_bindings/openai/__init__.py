@@ -18,7 +18,7 @@ pm.ensure_packages(["openai","tiktoken"])
 import openai
 import tiktoken
 import os
-
+import base64
 BindingName = "OpenAIBinding"
 
 
