@@ -71,6 +71,7 @@ try:
         llm_binding_config={
             "host_address": "http://localhost:9642", # Default port for LoLLMs server
             # "service_key": "your_lollms_api_key_here" # Get key from LoLLMs UI -> User Settings if security is enabled
+            # "verify_ssl_certificate": True #if false the ssl certifcate verification will be ignored (only used when using https in lollms service address)
         }
     )
 
@@ -730,6 +731,7 @@ try:
     config = {
         "host_address": "http://localhost:9642",
         # "service_key": "your_lollms_api_key_here" # Uncomment and replace if security is enabled
+        # "verify_ssl_certificate": True #if false the ssl certifcate verification will be ignored (only used when using https in lollms service address)
     }
 
     lc = LollmsClient(
