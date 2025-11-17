@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from typing import Optional, List, Union, Dict, Any
 from ascii_colors import trace_exception, ASCIIColors
+import time
+import filelock
 
 # --- Package Management and Conditional Imports ---
 _whisper_installed = False
@@ -25,7 +27,7 @@ try:
         preferred_torch_device_for_install = "mps" # or keep cpu if mps detection is later
 
     torch_pkgs = ["torch", "torchaudio","xformers"]
-    audiocraft_core_pkgs = ["openai-whisper"]
+    audiocraft_core_pkgs = ["openai-whisper", "filelock"]
 
     torch_index_url = None
     if preferred_torch_device_for_install == "cuda":
@@ -82,13 +84,13 @@ class WhisperSTTBinding(LollmsSTTBinding):
                                     If None, `torch` will attempt to auto-detect. Defaults to None.
         """
         super().__init__(binding_name="whisper") # Not applicable
-        self.default_model_name = kwargs.get("model_name", "turno")
+        self.default_model_name = kwargs.get("model_name", "turbo")
 
         if not _whisper_installed:
             raise ImportError(f"Whisper STT binding dependencies not met. Please ensure 'openai-whisper' and 'torch' are installed. Error: {_whisper_installation_error}")
 
-        self.device = kwargs.get("device",None)
-        if self.device is None: # Auto-detect if not specified
+        self.device = kwargs.get("device", None)
+        if self.device is None or self.device == "": # Auto-detect if not specified or empty
             if torch.cuda.is_available():
                 self.device = "cuda"
             elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available(): # For Apple Silicon
@@ -96,18 +98,50 @@ class WhisperSTTBinding(LollmsSTTBinding):
             else:
                 self.device = "cpu"
         
+        # Validate device string
+        if not self.device or self.device.strip() == "":
+            ASCIIColors.warning("Device was empty or invalid, defaulting to 'cpu'")
+            self.device = "cpu"
+        
         ASCIIColors.info(f"WhisperSTTBinding: Using device '{self.device}'.")
         
         self.loaded_model_name = None
         self.model = None
         try:
-            self._load_whisper_model(kwargs.get("model_name", "turbo")) # Default to "turno" if not specified
+            self._load_whisper_model(kwargs.get("model_name", "turbo")) # Default to "turbo" if not specified
         except Exception as e:
             pass
 
 
+    def _get_whisper_cache_dir(self) -> Path:
+        """Get the Whisper cache directory."""
+        # Whisper uses the same cache location as specified in its code
+        cache_dir = os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+        return Path(cache_dir) / "whisper"
+
+    def _is_model_downloaded(self, model_name: str) -> bool:
+        """Check if a Whisper model is already downloaded and valid."""
+        cache_dir = self._get_whisper_cache_dir()
+        # Whisper models are stored as {model_name}.pt
+        model_file = cache_dir / f"{model_name}.pt"
+        
+        if not model_file.exists():
+            return False
+        
+        # Check if file size is reasonable (at least 1MB to catch partial downloads)
+        try:
+            file_size = model_file.stat().st_size
+            if file_size < 1_000_000:  # Less than 1MB is likely corrupted
+                ASCIIColors.warning(f"Model file {model_file} appears corrupted (size: {file_size} bytes). Will re-download.")
+                return False
+        except Exception as e:
+            ASCIIColors.warning(f"Could not check model file size: {e}")
+            return False
+        
+        return True
+
     def _load_whisper_model(self, model_name_to_load: str):
-        """Loads or reloads the Whisper model."""
+        """Loads or reloads the Whisper model with file locking to prevent concurrent downloads."""
         if model_name_to_load not in whisper.available_models():
             ASCIIColors.warning(f"'{model_name_to_load}' is not a standard Whisper model size. Attempting to load anyway. Known sizes: {self.WHISPER_MODEL_SIZES}")
 
@@ -115,21 +149,64 @@ class WhisperSTTBinding(LollmsSTTBinding):
             ASCIIColors.info(f"Whisper model '{model_name_to_load}' already loaded.")
             return
 
+        # Get the cache directory and create lock file path
+        cache_dir = self._get_whisper_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = cache_dir / f"{model_name_to_load}.lock"
+        model_file = cache_dir / f"{model_name_to_load}.pt"
+
         ASCIIColors.info(f"Loading Whisper model: '{model_name_to_load}' on device '{self.device}'...")
+        
+        # Use file lock to prevent concurrent downloads
+        lock = filelock.FileLock(lock_file, timeout=300)  # 5 minute timeout
+        
         try:
-            # Whisper's load_model might download the model if not already cached.
-            # Cache is typically in ~/.cache/whisper
-            self.model = whisper.load_model(model_name_to_load, device=self.device)
-            self.loaded_model_name = model_name_to_load
-            self.model_name = model_name_to_load # Update the binding's current model_name
-            ASCIIColors.green(f"Whisper model '{model_name_to_load}' loaded successfully.")
+            with lock:
+                # Check if model is already downloaded and valid
+                if self._is_model_downloaded(model_name_to_load):
+                    ASCIIColors.info(f"Model '{model_name_to_load}' already downloaded, loading from cache...")
+                else:
+                    ASCIIColors.info(f"Downloading model '{model_name_to_load}' (this process has the lock)...")
+                    # If model file exists but is corrupted, delete it first
+                    if model_file.exists():
+                        try:
+                            ASCIIColors.warning(f"Removing corrupted model file: {model_file}")
+                            model_file.unlink()
+                        except Exception as e:
+                            ASCIIColors.error(f"Could not remove corrupted model file: {e}")
+                
+                # Load the model (will download if not cached)
+                self.model = whisper.load_model(model_name_to_load, device=self.device)
+                self.loaded_model_name = model_name_to_load
+                self.model_name = model_name_to_load
+                ASCIIColors.green(f"Whisper model '{model_name_to_load}' loaded successfully.")
+                
+        except filelock.Timeout:
+            error_msg = f"Timeout waiting for model '{model_name_to_load}' download lock. Another process may be downloading."
+            ASCIIColors.error(error_msg)
+            self.model = None
+            self.loaded_model_name = None
+            raise RuntimeError(error_msg)
         except Exception as e:
             self.model = None
             self.loaded_model_name = None
             ASCIIColors.error(f"Failed to load Whisper model '{model_name_to_load}': {e}")
             trace_exception(e)
-            # Re-raise critical error for initialization or model switching
+            # If loading failed, try to clean up potentially corrupted file
+            if model_file.exists():
+                try:
+                    ASCIIColors.warning(f"Cleaning up potentially corrupted model file after error...")
+                    model_file.unlink()
+                except Exception as cleanup_error:
+                    ASCIIColors.error(f"Could not clean up model file: {cleanup_error}")
             raise RuntimeError(f"Failed to load Whisper model '{model_name_to_load}'") from e
+        finally:
+            # Clean up lock file if it exists and is not locked
+            try:
+                if lock_file.exists() and not lock.is_locked:
+                    lock_file.unlink()
+            except Exception:
+                pass  # Ignore cleanup errors
 
 
     def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:
@@ -260,7 +337,7 @@ if __name__ == '__main__':
     else:
         try:
             ASCIIColors.cyan("\n--- Initializing WhisperSTTBinding (model: 'tiny') ---")
-            # Using 'tiny' model for faster testing. Change to 'turno' or 'small' for better quality.
+            # Using 'tiny' model for faster testing. Change to 'turbo' or 'small' for better quality.
             stt_binding = WhisperSTTBinding(model_name="tiny")
 
             ASCIIColors.cyan("\n--- Listing available Whisper models ---")
@@ -277,9 +354,9 @@ if __name__ == '__main__':
             # print(f"Transcription (tiny, lang='en'): '{transcription_lang_hint}'")
 
             # Test switching model dynamically (optional, will re-download/load if different)
-            # ASCIIColors.cyan(f"\n--- Transcribing '{test_audio_file.name}' by switching to 'turno' model ---")
-            # transcription_base = stt_binding.transcribe_audio(test_audio_file, model="turno")
-            # print(f"Transcription (turno): '{transcription_base}'")
+            # ASCIIColors.cyan(f"\n--- Transcribing '{test_audio_file.name}' by switching to 'turbo' model ---")
+            # transcription_base = stt_binding.transcribe_audio(test_audio_file, model="turbo")
+            # print(f"Transcription (turbo): '{transcription_base}'")
 
 
         except ImportError as e_imp:
