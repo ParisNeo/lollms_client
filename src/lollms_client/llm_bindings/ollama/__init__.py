@@ -200,7 +200,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=True,
-                        think=think,
+                         think=think if "gpt-oss" not in self.model_name else reasoning_effort,
                         options=options if options else None
                     )
                     in_thinking = False
@@ -224,7 +224,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=False,
-                        think=think,
+                         think=think if "gpt-oss" not in self.model_name else reasoning_effort,
                         options=options if options else None
                     )
                     full_response_text = response.message.content
@@ -245,7 +245,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=True,
-                        think=think,
+                         think=think if "gpt-oss" not in self.model_name else reasoning_effort,
                         options=options if options else None
                     )
                     in_thinking = False
@@ -269,7 +269,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=False,
-                        think=think,
+                         think=think if "gpt-oss" not in self.model_name else reasoning_effort,
                         options=options if options else None
                     )
                     full_response_text = response.message.content
@@ -506,14 +506,16 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=messages,
                     stream=True,
-                    think=think,
+                    think=think if "gpt-oss" not in self.model_name else reasoning_effort,
                     options=options if options else None
                 )
                 in_thinking = False
                 for chunk in response_stream:
-                    if chunk.message.thinking and not in_thinking:
-                        full_response_text += "<think>\n"
-                        in_thinking = True
+                    if chunk.message.thinking:
+                        if not in_thinking:
+                            full_response_text += "<think>\n"
+                            in_thinking = True
+                        full_response_text += chunk_content
                         
                     if chunk.message.content:# Ensure there is content to process
                         chunk_content = chunk.message.content
@@ -531,7 +533,7 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=messages,
                     stream=False,
-                    think=think,
+                    think=think if "gpt-oss" not in self.model_name else reasoning_effort,
                     options=options if options else None
                 )
                 full_response_text = response.message.content
