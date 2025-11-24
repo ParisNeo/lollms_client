@@ -200,7 +200,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=True,
-                         think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        think=think,
                         options=options if options else None
                     )
                     in_thinking = False
@@ -224,7 +224,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=False,
-                         think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        think=think,
                         options=options if options else None
                     )
                     full_response_text = response.message.content
@@ -245,7 +245,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=True,
-                         think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        think=think,
                         options=options if options else None
                     )
                     in_thinking = False
@@ -269,7 +269,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=False,
-                         think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        think=think,
                         options=options if options else None
                     )
                     full_response_text = response.message.content
@@ -334,23 +334,12 @@ class OllamaBinding(LollmsLLMBinding):
                 for item in content:
                     if item.get("type") == "text":
                         text_parts.append(item.get("text", ""))
-                    elif item.get("type") == "input_image" or  item.get("type") == "image_url":
+                    elif item.get("type") == "input_image":
                         base64_data = item.get("image_url")
                         if base64_data:
-                            if isinstance(base64_data, str):
-                                # ⚠️ remove prefix "data:image/...;base64,"
-                                cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data)
-                                images.append(cleaned)
-                            elif base64_data and isinstance(base64_data, dict) :
-                                if "base64" in base64_data:
-                                    cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data["base64"])
-                                    images.append(cleaned)
-                                elif "url" in base64_data :
-                                    if "http" in base64_data["url"]:
-                                        images.append(base64_data["url"])
-                                    else:
-                                        cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data["url"])
-                                        images.append(cleaned)
+                            # ⚠️ remove prefix "data:image/...;base64,"
+                            cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data)
+                            images.append(cleaned)
 
 
             return {
@@ -382,7 +371,7 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=ollama_messages,
                     stream=True,
-                    think = think if "gpt-oss" not in self.model_name else reasoning_effort,
+                    think = think,
                     options=options if options else None
                 )
                 for chunk_dict in response_stream:
@@ -398,7 +387,7 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=ollama_messages,
                     stream=False,
-                    think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                    think=think,
                     options=options if options else None
                 )
                 full_response_text = response.message.content
@@ -506,16 +495,14 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=messages,
                     stream=True,
-                    think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                    think=think,
                     options=options if options else None
                 )
                 in_thinking = False
                 for chunk in response_stream:
-                    if chunk.message.thinking:
-                        if not in_thinking:
-                            full_response_text += "<think>\n"
-                            in_thinking = True
-                        full_response_text += chunk_content
+                    if chunk.message.thinking and not in_thinking:
+                        full_response_text += "<think>\n"
+                        in_thinking = True
                         
                     if chunk.message.content:# Ensure there is content to process
                         chunk_content = chunk.message.content
@@ -533,7 +520,7 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=messages,
                     stream=False,
-                    think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                    think=think,
                     options=options if options else None
                 )
                 full_response_text = response.message.content
@@ -785,6 +772,7 @@ class OllamaBinding(LollmsLLMBinding):
             'qwen': 8192,         # Qwen default
             'qwen2': 32768,       # Qwen2 default for 7B
             'qwen2.5': 131072,    # Qwen2.5 with 128K
+            'qwen3-coder': 256000, # Qwen3 with 256k
             'codellama': 16384,   # CodeLlama extended
             'codegemma': 8192,    # CodeGemma default
             'deepseek-coder': 16384,  # DeepSeek-Coder V1 default
