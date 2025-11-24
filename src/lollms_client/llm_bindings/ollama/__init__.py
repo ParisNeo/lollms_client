@@ -174,6 +174,8 @@ class OllamaBinding(LollmsLLMBinding):
         if ctx_size is not None: options['num_ctx'] = ctx_size
         
         full_response_text = ""
+        think = think if "gpt-oss" not in self.model_name else reasoning_effort
+        ASCIIColors.magenta(f"Generation with think: {think}")
 
         try:
             if images: # Multimodal
@@ -200,7 +202,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=True,
-                        think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        think=think,
                         options=options if options else None
                     )
                     in_thinking = False
@@ -224,7 +226,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=False,
-                        think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        think=think,
                         options=options if options else None
                     )
                     full_response_text = response.message.content
@@ -245,7 +247,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=True,
-                        think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        think=think,
                         options=options if options else None
                     )
                     in_thinking = False
@@ -269,7 +271,7 @@ class OllamaBinding(LollmsLLMBinding):
                         model=self.model_name,
                         messages=messages,
                         stream=False,
-                        think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        think=think,
                         options=options if options else None
                     )
                     full_response_text = response.message.content
@@ -487,6 +489,8 @@ class OllamaBinding(LollmsLLMBinding):
         options = {k: v for k, v in options.items() if v is not None}
 
         full_response_text = ""
+        think = think if "gpt-oss" not in self.model_name else reasoning_effort
+        ASCIIColors.magenta(f"Generation with think: {think}")
 
         try:
             # 3. Call the Ollama API
@@ -495,7 +499,7 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=messages,
                     stream=True,
-                    think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                    think=think,
                     options=options if options else None
                 )
                 in_thinking = False
@@ -520,7 +524,7 @@ class OllamaBinding(LollmsLLMBinding):
                     model=self.model_name,
                     messages=messages,
                     stream=False,
-                    think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                    think=think,
                     options=options if options else None
                 )
                 full_response_text = response.message.content
