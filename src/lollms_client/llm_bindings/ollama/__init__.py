@@ -334,12 +334,23 @@ class OllamaBinding(LollmsLLMBinding):
                 for item in content:
                     if item.get("type") == "text":
                         text_parts.append(item.get("text", ""))
-                    elif item.get("type") == "input_image":
+                    elif item.get("type") == "input_image" or  item.get("type") == "image_url":
                         base64_data = item.get("image_url")
                         if base64_data:
-                            # ⚠️ remove prefix "data:image/...;base64,"
-                            cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data)
-                            images.append(cleaned)
+                            if isinstance(base64_data, str):
+                                # ⚠️ remove prefix "data:image/...;base64,"
+                                cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data)
+                                images.append(cleaned)
+                            elif base64_data and isinstance(base64_data, dict) :
+                                if "base64" in base64_data:
+                                    cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data["base64"])
+                                    images.append(cleaned)
+                                elif "url" in base64_data :
+                                    if "http" in base64_data["url"]:
+                                        images.append(base64_data["url"])
+                                    else:
+                                        cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data["url"])
+                                        images.append(cleaned)
 
 
             return {

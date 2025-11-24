@@ -300,10 +300,66 @@ class OpenAIBinding(LollmsLLMBinding):
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                      **kwargs
                      ) -> Union[str, dict]:
-        # Build the request parameters
+        
+        # --- Standardize Messages for OpenAI ---
+        def normalize_message(msg: Dict) -> Dict:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            text_parts = []
+            images = []
+
+            # 1. Extract Text and Images from input
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") in ["input_image", "image_url"]:
+                        # Handle various internal representations of images
+                        val = item.get("image_url")
+                        if isinstance(val, dict):
+                            # Handle dicts like {"url": "..."} or {"base64": "..."}
+                            val = val.get("url") or val.get("base64")
+                        
+                        if isinstance(val, str) and val:
+                            images.append(val)
+
+            text_content = "\n".join([p for p in text_parts if p.strip()])
+
+            # 2. Format for OpenAI API
+            if not images:
+                # Simple text-only message
+                return {"role": role, "content": text_content}
+            else:
+                # Multimodal message
+                openai_content = []
+                if text_content:
+                    openai_content.append({"type": "text", "text": text_content})
+                
+                for img in images:
+                    # OpenAI STRICTLY requires the data URI prefix for base64
+                    # or a valid http/https URL.
+                    img_url = img
+                    if not img.startswith("http"):
+                        if not img.startswith("data:"):
+                            # If raw base64 is passed without header, add default jpeg header
+                            img_url = f"data:image/jpeg;base64,{img}"
+                    
+                    openai_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": img_url}
+                    })
+                
+                return {"role": role, "content": openai_content}
+
+        # Process and clean the list
+        openai_messages = [normalize_message(m) for m in messages]
+        
+        # --- Build Request ---
         params = {
             "model": self.model_name,
-            "messages": messages,
+            "messages": openai_messages, # Use the standardized list
             "max_tokens": n_predict,
             "n": 1,
             "temperature": temperature,
@@ -311,34 +367,39 @@ class OpenAIBinding(LollmsLLMBinding):
             "frequency_penalty": repeat_penalty,
             "stream": stream
         }
-        # Add seed if available, as it's supported by newer OpenAI models
+
+        # Add seed if available
         if seed is not None:
             params["seed"] = seed
 
-        # Remove None values, as the API expects them to be absent
+        # Remove None values
         params = {k: v for k, v in params.items() if v is not None}
         
         output = ""
-        # 2. Call the API
+        
+        # --- Call API ---
         try:
             try:
                 completion = self.client.chat.completions.create(**params)
             except Exception as ex:
-                # exception for new openai models
-                params["max_completion_tokens"]=params["max_tokens"]
-                params["temperature"]=1
-                try: del params["max_tokens"] 
-                except Exception: pass
-                try: del params["top_p"]
-                except Exception: pass
-                try: del params["frequency_penalty"]
-                except Exception: pass
-
+                # Fallback/Handling for 'reasoning' models (o1, o3-mini) 
+                # which don't support max_tokens, temperature, etc.
+                if "max_tokens" in params:
+                    params["max_completion_tokens"] = params["max_tokens"]
+                    del params["max_tokens"]
                 
+                # Set temperature to 1 (required for some o-series models) or remove it
+                params["temperature"] = 1
+                
+                keys_to_remove = ["top_p", "frequency_penalty", "presence_penalty"]
+                for k in keys_to_remove:
+                    if k in params:
+                        del params[k]
+
                 completion = self.client.chat.completions.create(**params)
+
             if stream:
                 for chunk in completion:
-                    # The streaming response for chat has a different structure
                     delta = chunk.choices[0].delta
                     if delta.content:
                         word = delta.content
@@ -350,7 +411,6 @@ class OpenAIBinding(LollmsLLMBinding):
                 output = completion.choices[0].message.content
         
         except Exception as e:
-            # Handle API errors gracefully
             error_message = f"An error occurred with the OpenAI API: {e}"
             if streaming_callback:
                 streaming_callback(error_message, MSG_TYPE.MSG_TYPE_EXCEPTION)
