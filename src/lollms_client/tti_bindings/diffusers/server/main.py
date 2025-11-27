@@ -25,6 +25,11 @@ import sys
 import platform
 import inspect
 
+class PullModelRequest(BaseModel):
+    hf_id: Optional[str] = Field(default=None, description="Hugging Face repo id or URL, e.g. 'stabilityai/sdxl-turbo'")
+    safetensors_url: Optional[str] = Field(default=None, description="Direct URL to a .safetensors file")
+    local_name: Optional[str] = Field(default=None, description="Optional name/folder under models/")
+
 # Add binding root to sys.path to ensure local modules can be imported if structured that way.
 binding_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(binding_root))
