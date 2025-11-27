@@ -826,52 +826,151 @@ async def edit_image(request: EditRequestJSON):
             state.registry.release_manager(temp_config)
             ASCIIColors.info(f"Released per-request model: {temp_config['model_name']}")
 
+@router.post("/pull_model")
+def pull_model_endpoint(payload: PullModelRequest):
+    if not payload.hf_id and not payload.safetensors_url:
+        raise HTTPException(status_code=400, detail="Provide either 'hf_id' or 'safetensors_url'.")
 
-@router.get("/list_models")
-def list_models_endpoint():
-    huggingface_models = []
-    # Add public models, organized by category
-    for category, models in HF_PUBLIC_MODELS.items():
-        for model_info in models:
-            huggingface_models.append({
-                'model_name': model_info['model_name'], 
-                'display_name': model_info['display_name'], 
-                'description': f"({category}) {model_info['desc']}", 
-                'owned_by': 'huggingface'
-            })
+    # 1) Pull Hugging Face model into a folder
+    if payload.hf_id:
+        model_id = payload.hf_id.strip()
+        folder_name = payload.local_name or model_id.replace("/", "__")
+        dest_dir = state.models_path / folder_name
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # Conditionally add gated models if an HF token is provided in the server config
-    if state.config.get("hf_token"):
-        ASCIIColors.info("HF token detected, including gated models in the list.")
-        for category, models in HF_GATED_MODELS.items():
-            for model_info in models:
-                huggingface_models.append({
-                    'model_name': model_info['model_name'], 
-                    'display_name': model_info['display_name'], 
-                    'description': f"({category}) {model_info['desc']}", 
-                    'owned_by': 'huggingface'
-                })
-    else:
-        ASCIIColors.info("No HF token found, showing public models only.")
+        try:
+            ASCIIColors.cyan(f"Pulling HF model '{model_id}' into {dest_dir}")
+            # Reuse config options for HF access
+            load_params: Dict[str, Any] = {}
+            if state.config.get("hf_cache_path"):
+                load_params["cache_dir"] = str(state.config["hf_cache_path"])
+            if state.config.get("hf_token"):
+                load_params["token"] = state.config["hf_token"]
+            # For a pull, we want to actually download:
+            load_params["local_files_only"] = False
 
-    civitai_models = [{'model_name': key, 'display_name': info['display_name'], 'description': f"(Civitai) {info['description']}", 'owned_by': info['owned_by']} for key, info in CIVITAI_MODELS.items()]
-    
-    local_files = list_local_models_endpoint()
-    local_models = [{'model_name': filename, 'display_name': Path(filename).stem, 'description': '(Local) Local safetensors file.', 'owned_by': 'local_user'} for filename in local_files]
+            # Use DiffusionPipeline (or AutoPipelineForText2Image) to download, then save_pretrained
+            pipe = DiffusionPipeline.from_pretrained(model_id, **load_params)
+            pipe.save_pretrained(dest_dir)
+            del pipe
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            ASCIIColors.green(f"Model '{model_id}' pulled to {dest_dir}")
+            return {"status": "ok", "model_name": folder_name}
+        except Exception as e:
+            trace_exception(e)
+            raise HTTPException(status_code=500, detail=f"Failed to pull HF model: {e}")
 
-    return huggingface_models + civitai_models + local_models
+    # 2) Pull raw .safetensors from URL
+    if payload.safetensors_url:
+        url = payload.safetensors_url.strip()
+        default_name = url.split("/")[-1] or "model.safetensors"
+        if not default_name.endswith(".safetensors"):
+            default_name += ".safetensors"
+        filename = payload.local_name or default_name
+
+        dest_path = state.models_path / filename
+        temp_path = dest_path.with_suffix(".temp")
+
+        ASCIIColors.cyan(f"Downloading safetensors from {url} to {dest_path}")
+        try:
+            with requests.get(url, stream=True) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get("content-length", 0))
+                with open(temp_path, "wb") as f, tqdm(total=total_size, unit="iB", unit_scale=True, desc=f"Downloading {filename}") as bar:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            shutil.move(temp_path, dest_path)
+            ASCIIColors.green(f"Safetensors file downloaded to {dest_path}")
+            return {"status": "ok", "model_name": filename}
+        except Exception as e:
+            if temp_path.exists():
+                temp_path.unlink()
+            trace_exception(e)
+            raise HTTPException(status_code=500, detail=f"Failed to download safetensors: {e}")
+
 
 @router.get("/list_local_models")
 def list_local_models_endpoint():
     local_models = set()
-    # Main models path
-    for f in state.models_path.glob("**/*.safetensors"):
+
+    # 1) Single-file models: top-level *.safetensors only
+    for f in state.models_path.glob("*.safetensors"):
         local_models.add(f.name)
-    # Extra models path
+
     if state.extra_models_path and state.extra_models_path.exists():
-        for f in state.extra_models_path.glob("**/*.safetensors"):
+        for f in state.extra_models_path.glob("*.safetensors"):
             local_models.add(f.name)
+
+    # 2) Folder-based HF/diffusers models: treat folder name as the model
+    def add_folder_models(base: Path):
+        if not base or not base.exists():
+            return
+        for entry in base.iterdir():
+            if not entry.is_dir():
+                continue
+            has_index = (entry / "model_index.json").exists()
+            has_safetensors = any(entry.glob("*.safetensors"))
+            if has_index or has_safetensors:
+                local_models.add(entry.name)
+
+    add_folder_models(state.models_path)
+    add_folder_models(state.extra_models_path)
+
     return sorted(list(local_models))
+
+@router.get("/list_models")
+def list_models_endpoint():
+    models = []
+
+    # 1) Add local models (single-file and folder)
+    local_files = list_local_models_endpoint()
+    for model_name in local_files:
+        display_name = model_name
+        description = "(Local) Folder model" if not model_name.endswith(".safetensors") else "(Local) Local safetensors file"
+        models.append({
+            "model_name": model_name,
+            "display_name": display_name,
+            "description": description,
+            "owned_by": "local_user"
+        })
+
+    # 2) Add public Hugging Face models organized by category
+    for category, hf_models in HF_PUBLIC_MODELS.items():
+        for model_info in hf_models:
+            models.append({
+                "model_name": model_info["model_name"],
+                "display_name": model_info["display_name"],
+                "description": f"({category}) {model_info['desc']}",
+                "owned_by": "huggingface"
+            })
+
+    # 3) Add gated Hugging Face models if HF token is available
+    if state.config.get("hf_token"):
+        for category, gated_models in HF_GATED_MODELS.items():
+            for model_info in gated_models:
+                models.append({
+                    "model_name": model_info["model_name"],
+                    "display_name": model_info["display_name"],
+                    "description": f"({category}) {model_info['desc']}",
+                    "owned_by": "huggingface"
+                })
+
+    # 4) Add Civitai models
+    for key, info in CIVITAI_MODELS.items():
+        models.append({
+            "model_name": key,
+            "display_name": info["display_name"],
+            "description": f"(Civitai) {info['description']}",
+            "owned_by": info["owned_by"]
+        })
+
+    return models
+
 
 @router.get("/list_available_models")
 def list_available_models_endpoint():
