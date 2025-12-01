@@ -772,6 +772,8 @@ class OllamaBinding(LollmsLLMBinding):
             'llama3.1': 131072,   # Llama 3.1 extended context
             'llama3.2': 131072,   # Llama 3.2 extended context
             'llama3.3': 131072,   # Assuming similar to 3.1/3.2
+            'gpt-oss:20b': 16000,     # GPT-OSS extended
+            'gpt-oss:120b': 128000,     # GPT-OSS extended
             'codestral': 256000,  # Codestral
             'mistralai-medium': 128000,  # Mistral medium
             'mistralai-mini':   128000,  # Mistral medium
@@ -787,6 +789,8 @@ class OllamaBinding(LollmsLLMBinding):
             'qwen': 8192,         # Qwen default
             'qwen2': 32768,       # Qwen2 default for 7B
             'qwen2.5': 131072,    # Qwen2.5 with 128K
+            'qwen3': 128000,       # Qwen3 with 128k
+            'qwen3-vl': 128000,       # Qwen3-vl with 128k
             'qwen3-coder': 256000, # Qwen3 with 256k
             'codellama': 16384,   # CodeLlama extended
             'codegemma': 8192,    # CodeGemma default
