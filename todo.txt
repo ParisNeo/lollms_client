@@ -1,1 +1,2 @@
-Create an extract structured data that uses pydentic validators
+- OK Create an extract structured data that uses pydentic validators
+- Add actions to bindings. Each action has its own parameters and can be called by the app. Define the parameters in the yaml
