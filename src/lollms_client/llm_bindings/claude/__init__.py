@@ -1,3 +1,4 @@
+# bindings/claude/__init__.py
 import base64
 import os
 from io import BytesIO
@@ -14,7 +15,6 @@ from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
 
 # Ensure the required packages are installed
-# Added 'requests' for dynamic model listing
 pm.ensure_packages(["anthropic", "pillow", "tiktoken", "requests"])
 
 import anthropic
@@ -28,8 +28,9 @@ ANTHROPIC_API_BASE_URL = "https://api.anthropic.com/v1"
 
 # A hardcoded list to be used as a fallback if the API call fails
 _FALLBACK_MODELS = [
-    {'model_name': 'claude-3-opus-20240229', 'display_name': 'Claude 3 Opus', 'description': 'Most powerful model for highly complex tasks.', 'owned_by': 'Anthropic'},
+    {'model_name': 'claude-3-7-sonnet-20250219', 'display_name': 'Claude 3.7 Sonnet', 'description': 'Most intelligent model with extended thinking capabilities.', 'owned_by': 'Anthropic'},
     {'model_name': 'claude-3-5-sonnet-20240620', 'display_name': 'Claude 3.5 Sonnet', 'description': 'Our most intelligent model, a new industry standard.', 'owned_by': 'Anthropic'},
+    {'model_name': 'claude-3-opus-20240229', 'display_name': 'Claude 3 Opus', 'description': 'Most powerful model for highly complex tasks.', 'owned_by': 'Anthropic'},
     {'model_name': 'claude-3-sonnet-20240229', 'display_name': 'Claude 3 Sonnet', 'description': 'Ideal balance of intelligence and speed for enterprise workloads.', 'owned_by': 'Anthropic'},
     {'model_name': 'claude-3-haiku-20240307', 'display_name': 'Claude 3 Haiku', 'description': 'Fastest and most compact model for near-instant responsiveness.', 'owned_by': 'Anthropic'},
     {'model_name': 'claude-2.1', 'display_name': 'Claude 2.1', 'description': 'Legacy model with a 200K token context window.', 'owned_by': 'Anthropic'},
@@ -124,6 +125,9 @@ class ClaudeBinding(LollmsLLMBinding):
                      split:Optional[bool]=False, # Not used in this direct method
                      user_keyword:Optional[str]="!@>user:", # Not used
                      ai_keyword:Optional[str]="!@>assistant:", # Not used
+                     think: Optional[bool] = False,
+                     reasoning_effort: Optional[str] = "low", # low, medium, high
+                     reasoning_summary: Optional[bool] = False, # auto
                      ) -> Union[str, dict]:
         """
         Generate text using the Claude model.
@@ -131,8 +135,34 @@ class ClaudeBinding(LollmsLLMBinding):
         if not self.client:
             return {"status": False, "error": "Anthropic client not initialized."}
 
+        # Handling Thinking / Reasoning
+        thinking_config = None
+        if think:
+            # Map reasoning_effort to budget_tokens
+            budget = 1024 # default/low
+            if reasoning_effort == "medium":
+                budget = 8192
+            elif reasoning_effort == "high":
+                budget = 16000
+            
+            # Constraint: max_tokens (n_predict) must be > budget_tokens
+            # If default n_predict (2048) is too low for reasoning, boost it.
+            required_min_tokens = budget + 2048 # Buffer for output
+            if n_predict is None or n_predict < required_min_tokens:
+                n_predict = required_min_tokens
+                ASCIIColors.info(f"Adjusting n_predict to {n_predict} to accommodate thinking budget of {budget}")
+
+            thinking_config = {"type": "enabled", "budget_tokens": budget}
+            # Temperature must be removed or handled differently when thinking is enabled? 
+            # Anthropic API usually allows temperature with thinking, but strict 1.0 might be enforced by API for some models. 
+            # We'll leave it unless it errors. Note: Some documentation says temp should be 1.0 or not present for reasoning models, 
+            # but Claude 3.7 supports it. We will let the API handle it.
+
         api_params = self._construct_parameters(temperature, top_p, top_k, n_predict)
-        
+        if thinking_config:
+            api_params["thinking"] = thinking_config
+            # Ensure max_tokens is set in params (it is set by _construct_parameters via n_predict)
+
         message_content = []
         if prompt and prompt.strip():
             message_content.append({"type": "text", "text": prompt})
@@ -140,7 +170,6 @@ class ClaudeBinding(LollmsLLMBinding):
         if images:
             for image_data in images:
                 try:
-                    # ... (image processing code is unchanged)
                     if is_image_path(image_data):
                         with open(image_data, "rb") as image_file:
                             b64_data = base64.b64encode(image_file.read()).decode('utf-8')
@@ -166,8 +195,6 @@ class ClaudeBinding(LollmsLLMBinding):
         messages = [{"role": "user", "content": message_content}]
         full_response_text = ""
 
-        # ---- CHANGE START ----
-        # Conditionally build the request arguments to avoid sending an empty `system` parameter.
         request_args = {
             "model": self.model_name,
             "messages": messages,
@@ -175,22 +202,49 @@ class ClaudeBinding(LollmsLLMBinding):
         }
         if system_prompt and system_prompt.strip():
             request_args["system"] = system_prompt
-        # ---- CHANGE END ----
 
         try:
             if stream:
+                # Use raw stream iteration to catch thinking events
                 with self.client.messages.stream(**request_args) as stream_response:
-                    for chunk in stream_response.text_stream:
-                        full_response_text += chunk
-                        if streaming_callback:
-                            if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
+                    in_thinking_block = False
+                    for event in stream_response:
+                        if event.type == "content_block_start" and event.content_block.type == "thinking":
+                            full_response_text += "<think>\n"
+                            if streaming_callback:
+                                streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            in_thinking_block = True
+                        elif event.type == "content_block_delta" and event.delta.type == "thinking_delta":
+                            chunk = event.delta.thinking
+                            full_response_text += chunk
+                            if streaming_callback:
+                                streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        elif event.type == "content_block_stop" and in_thinking_block:
+                            full_response_text += "\n</think>\n"
+                            if streaming_callback:
+                                streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            in_thinking_block = False
+                        elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                            chunk = event.delta.text
+                            full_response_text += chunk
+                            if streaming_callback:
+                                if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
+                                    break
                 return full_response_text
             else:
                 response = self.client.messages.create(**request_args)
                 if response.stop_reason == "error":
                      return {"status": False, "error": f"API returned an error: {response.stop_reason}"}
-                return response.content[0].text
+                
+                # Reconstruct full text including thinking
+                output_parts = []
+                for block in response.content:
+                    if block.type == "thinking":
+                        output_parts.append(f"<think>\n{block.thinking}\n</think>\n")
+                    elif block.type == "text":
+                        output_parts.append(block.text)
+                
+                return "".join(output_parts)
 
         except Exception as ex:
             error_message = f"An unexpected error occurred with Claude API: {str(ex)}"
@@ -210,7 +264,10 @@ class ClaudeBinding(LollmsLLMBinding):
              seed: Optional[int] = None, # Not supported
              n_threads: Optional[int] = None, # Not supported
              ctx_size: Optional[int] = None, # Not supported
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+             think: Optional[bool] = False,
+             reasoning_effort: Optional[str] = "low", # low, medium, high
+             reasoning_summary: Optional[bool] = False, # auto
              ) -> Union[str, dict]:
         """
         Conduct a chat session with the Claude model using a LollmsDiscussion object.
@@ -222,7 +279,6 @@ class ClaudeBinding(LollmsLLMBinding):
         messages = discussion.get_messages(branch_tip_id)
         
         history = []
-        # ... (history building code is unchanged)
         for msg in messages:
             role = 'user' if msg.sender_type == "user" else 'assistant'
             content_parts = []
@@ -252,11 +308,28 @@ class ClaudeBinding(LollmsLLMBinding):
         if not history:
             return {"status": "error", "message": "Cannot start chat with an empty discussion."}
 
+        # Handling Thinking / Reasoning
+        thinking_config = None
+        if think:
+            budget = 1024
+            if reasoning_effort == "medium":
+                budget = 8192
+            elif reasoning_effort == "high":
+                budget = 16000
+            
+            required_min_tokens = budget + 2048
+            if n_predict is None or n_predict < required_min_tokens:
+                n_predict = required_min_tokens
+                ASCIIColors.info(f"Adjusting n_predict to {n_predict} for thinking budget {budget}")
+
+            thinking_config = {"type": "enabled", "budget_tokens": budget}
+
         api_params = self._construct_parameters(temperature, top_p, top_k, n_predict)
+        if thinking_config:
+            api_params["thinking"] = thinking_config
+
         full_response_text = ""
 
-        # ---- CHANGE START ----
-        # Conditionally build the request arguments to avoid sending an empty `system` parameter.
         request_args = {
             "model": self.model_name,
             "messages": history,
@@ -264,29 +337,49 @@ class ClaudeBinding(LollmsLLMBinding):
         }
         if system_prompt and system_prompt.strip():
             request_args["system"] = system_prompt
-        # ---- CHANGE END ----
 
         try:
             if stream:
                 with self.client.messages.stream(**request_args) as stream_response:
-                    for chunk in stream_response.text_stream:
-                        full_response_text += chunk
-                        if streaming_callback:
-                            if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
+                    in_thinking_block = False
+                    for event in stream_response:
+                        if event.type == "content_block_start" and event.content_block.type == "thinking":
+                            full_response_text += "<think>\n"
+                            if streaming_callback: streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            in_thinking_block = True
+                        elif event.type == "content_block_delta" and event.delta.type == "thinking_delta":
+                            chunk = event.delta.thinking
+                            full_response_text += chunk
+                            if streaming_callback: streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        elif event.type == "content_block_stop" and in_thinking_block:
+                            full_response_text += "\n</think>\n"
+                            if streaming_callback: streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            in_thinking_block = False
+                        elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                            chunk = event.delta.text
+                            full_response_text += chunk
+                            if streaming_callback:
+                                if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
+                                    break
                 return full_response_text
             else:
                 response = self.client.messages.create(**request_args)
                 if response.stop_reason == "error":
                      return {"status": "error", "message": f"API returned an error: {response.stop_reason}"}
-                return response.content[0].text
+                
+                output_parts = []
+                for block in response.content:
+                    if block.type == "thinking":
+                        output_parts.append(f"<think>\n{block.thinking}\n</think>\n")
+                    elif block.type == "text":
+                        output_parts.append(block.text)
+                return "".join(output_parts)
 
         except Exception as ex:
             error_message = f"An unexpected error occurred with Claude API: {str(ex)}"
             trace_exception(ex)
             return {"status": "error", "message": error_message}
             
-    # ... (Rest of the file is unchanged) ...
     def tokenize(self, text: str) -> list:
         """
         Tokenize the input text.
@@ -329,7 +422,7 @@ class ClaudeBinding(LollmsLLMBinding):
                 model=self.model_name,
                 messages=[{"role": "user", "content": text}]
             )
-            return response.token_count # Updated to correct response attribute
+            return response.input_tokens # Updated to correct response attribute (it's usually 'input_tokens' in CountTokensResponse)
         except Exception as e:
             trace_exception(e)
             ASCIIColors.error(f"Failed to count tokens with Claude API: {e}")
@@ -368,8 +461,6 @@ class ClaudeBinding(LollmsLLMBinding):
             self._cached_models = _FALLBACK_MODELS
             return self._cached_models
 
-        # This part is complex and likely correct, leaving as is.
-        # It's good practice.
         headers = {
             "x-api-key": self.service_key,
             "anthropic-version": "2023-06-01", 
@@ -437,8 +528,8 @@ if __name__ == '__main__':
     ASCIIColors.yellow("--- Testing ClaudeBinding ---")
 
     # --- Configuration ---
-    test_model_name = "claude-3-haiku-20240307" # Use Haiku for speed in testing
-    test_vision_model_name = "claude-3-sonnet-20240229"
+    test_model_name = "claude-3-7-sonnet-20250219" # Use Haiku for speed in testing
+    test_vision_model_name = "claude-3-5-sonnet-20240620"
     
     full_streamed_text = ""
 
@@ -472,7 +563,7 @@ if __name__ == '__main__':
         ASCIIColors.cyan("\n--- Text Generation (Non-Streaming) ---")
         prompt_text = "Explain the importance of bees in one paragraph."
         ASCIIColors.info(f"Prompt: {prompt_text}")
-        generated_text = binding.generate_text(prompt_text, n_predict=100, stream=False, system_prompt=" ")
+        generated_text = binding.generate_text(prompt_text, n_predict=100, stream=False, system_prompt=" ", think=True)
         if isinstance(generated_text, str):
             ASCIIColors.green(f"Generated text:\n{generated_text}")
         else:
@@ -488,7 +579,7 @@ if __name__ == '__main__':
             return True
         
         ASCIIColors.info(f"Prompt: {prompt_text}")
-        result = binding.generate_text(prompt_text, n_predict=150, stream=True, streaming_callback=stream_callback)
+        result = binding.generate_text(prompt_text, n_predict=150, stream=True, streaming_callback=stream_callback, think=True)
         full_streamed_text = "".join(captured_chunks)
         print("\n--- End of Stream ---")
         ASCIIColors.green(f"Full streamed text (for verification): {result}")

@@ -1,16 +1,17 @@
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 import yaml
 from ascii_colors import trace_exception
+from lollms_client.lollms_base_binding import LollmsBaseBinding
 
-class LollmsTTSBinding(ABC):
+class LollmsTTSBinding(LollmsBaseBinding):
     def __init__(self,
                  binding_name: str = "unknown",
-                 config={}):
-        self.binding_name = binding_name
-        self.config = config
+                 **kwargs):
+        super().__init__(binding_name=binding_name, **kwargs)
+        self.settings = kwargs
 
     @abstractmethod
     def generate_audio(self,
@@ -54,20 +55,13 @@ class LollmsTTSBindingManager:
                       **kwargs) -> Optional[LollmsTTSBinding]:
         """
         Create an instance of a specific binding.
-
-        Args:
-            binding_name (str): Name of the binding to create.
-            kwargs: binding specific arguments
-
-        Returns:
-            Optional[LollmsLLMBinding]: Binding instance or None if creation failed.
         """
         if binding_name not in self.available_bindings:
             self._load_binding(binding_name)
         
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
-            return binding_class(**kwargs)
+            return binding_class(binding_name=binding_name, **kwargs)
         return None
 
 
@@ -130,19 +124,7 @@ def get_available_bindings(tts_bindings_dir: Union[str, Path] = None) -> List[Di
 
 def list_binding_models(stt_binding_name: str, stt_binding_config: Optional[Dict[str, any]]|None = None, stt_bindings_dir: str|Path = Path(__file__).parent / "stt_bindings") -> List[Dict]:
     """
-    Lists all available LLM bindings with their detailed descriptions.
-
-    This function serves as a primary entry point for discovering what bindings
-    are available and how to configure them.
-
-    Args:
-        stt_bindings_dir (Union[str, Path], optional): 
-            The path to the LLM bindings directory. If None, it defaults to the
-            'stt_bindings' subdirectory relative to this file. 
-            Defaults to None.
-
-    Returns:
-        List[Dict]: A list of dictionaries, each describing a binding.
+    Lists all available models for a specific binding.
     """
     binding = LollmsTTSBindingManager(stt_bindings_dir).create_binding(
         binding_name=stt_binding_name,

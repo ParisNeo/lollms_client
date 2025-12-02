@@ -1,24 +1,21 @@
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 from ascii_colors import trace_exception
 import yaml
+from lollms_client.lollms_base_binding import LollmsBaseBinding
 
-class LollmsTTIBinding(ABC):
+class LollmsTTIBinding(LollmsBaseBinding):
     """Abstract base class for all LOLLMS Text-to-Image bindings."""
 
     def __init__(self,
                  binding_name:str="unknown",
-                 config={}):
+                 **kwargs):
         """
         Initialize the LollmsTTIBinding base class.
-
-        Args:
-            binding_name (Optional[str]): The binding name
         """
-        self.binding_name = binding_name
-        self.config = config
+        super().__init__(binding_name=binding_name, **kwargs)
 
     @abstractmethod
     def generate_image(self,
@@ -29,19 +26,6 @@ class LollmsTTIBinding(ABC):
                        **kwargs) -> bytes:
         """
         Generates image data from the provided text prompt.
-
-        Args:
-            prompt (str): The positive text prompt describing the desired image.
-            negative_prompt (Optional[str]): Text prompt describing elements to avoid.
-            width (int): The desired width of the image.
-            height (int): The desired height of the image.
-            **kwargs: Additional binding-specific parameters (e.g., seed, steps, cfg_scale).
-
-        Returns:
-            bytes: The generated image data (e.g., in PNG or JPEG format).
-
-        Raises:
-            Exception: If image generation fails.
         """
         pass
 
@@ -56,21 +40,6 @@ class LollmsTTIBinding(ABC):
                    **kwargs) -> bytes:
         """
         Edits an image or a set of images based on the provided prompts.
-
-        Args:
-            images (Union[str, List[str]]): One or multiple images in URL or base64 format.
-            prompt (str): Positive prompt describing desired modifications.
-            negative_prompt (Optional[str]): Prompt describing elements to avoid.
-            mask (Optional[str]): A mask image (URL or base64). Only valid if a single image is provided.
-            width (Optional[int]): Desired width of the output. If None, binding decides.
-            height (Optional[int]): Desired height of the output. If None, binding decides.
-            **kwargs: Additional binding-specific parameters (e.g., seed, steps, cfg_scale).
-
-        Returns:
-            bytes: The edited/generated image data (e.g., in PNG or JPEG format).
-
-        Raises:
-            Exception: If image editing fails.
         """
         pass
 
@@ -122,7 +91,7 @@ class LollmsTTIBindingManager:
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
             try:
-                return binding_class(**kwargs)
+                return binding_class(binding_name=binding_name, **kwargs)
             except Exception as e:
                 trace_exception(e)
                 print(f"Failed to instantiate TTI binding {binding_name}: {str(e)}")
@@ -209,19 +178,7 @@ def get_available_bindings(tti_bindings_dir: Union[str, Path] = None) -> List[Di
 
 def list_binding_models(tti_binding_name: str, tti_binding_config: Optional[Dict[str, any]]|None = None, tti_bindings_dir: str|Path = Path(__file__).parent / "tti_bindings") -> List[Dict]:
     """
-    Lists all available LLM bindings with their detailed descriptions.
-
-    This function serves as a primary entry point for discovering what bindings
-    are available and how to configure them.
-
-    Args:
-        tti_bindings_dir (Union[str, Path], optional): 
-            The path to the LLM bindings directory. If None, it defaults to the
-            'tti_bindings' subdirectory relative to this file. 
-            Defaults to None.
-
-    Returns:
-        List[Dict]: A list of dictionaries, each describing a binding.
+    Lists all available models for a specific binding.
     """
     binding = LollmsTTIBindingManager(tti_bindings_dir).create_binding(
         binding_name=tti_binding_name,

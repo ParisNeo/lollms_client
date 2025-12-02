@@ -1,4 +1,4 @@
-# bindings/gemini/binding.py
+# bindings/gemini/__init__.py
 import base64
 import os
 from io import BytesIO
@@ -91,6 +91,9 @@ class GeminiBinding(LollmsLLMBinding):
                      split:Optional[bool]=False, 
                      user_keyword:Optional[str]="!@>user:",
                      ai_keyword:Optional[str]="!@>assistant:",
+                     think: Optional[bool] = False,
+                     reasoning_effort: Optional[str] = "low", # low, medium, high
+                     reasoning_summary: Optional[bool] = False, # auto
                      ) -> Union[str, dict]:
         """
         Generate text using the Gemini model.
@@ -107,11 +110,22 @@ class GeminiBinding(LollmsLLMBinding):
         if not self.client:
             return {"status": False, "error": "Gemini client not initialized."}
 
+        # Handle 'think' parameter:
+        # Currently, Gemini models like 'gemini-2.0-flash-thinking-exp' handle thinking automatically.
+        # There isn't a generic generation_config param for 'thinking' yet in the public SDK.
+        # We log if it's requested but the model might not support it explicitly via config.
+        if think:
+            if "thinking" not in str(self.model_name).lower():
+                ASCIIColors.info(f"Thinking requested but model '{self.model_name}' may not be a thinking model. Proceeding.")
+
         # Gemini uses 'system_instruction' for GenerativeModel, not part of the regular message list.
-        model = self.client.GenerativeModel(
-            model_name=self.model_name,
-            system_instruction=system_prompt if system_prompt else None
-        )
+        try:
+            model = self.client.GenerativeModel(
+                model_name=self.model_name,
+                system_instruction=system_prompt if system_prompt else None
+            )
+        except Exception as e:
+            return {"status": False, "error": f"Failed to initialize GenerativeModel: {e}"}
 
         generation_config = self.get_generation_config(temperature, top_p, top_k, n_predict)
 
@@ -135,6 +149,9 @@ class GeminiBinding(LollmsLLMBinding):
                     if is_image_path(image_data):
                         img = Image.open(image_data)
                     else: # Assume base64
+                        if image_data.startswith("data:image"):
+                             # Remove prefix if present
+                             image_data = image_data.split(",")[1]
                         img = Image.open(BytesIO(base64.b64decode(image_data)))
                     content_parts.append(img)
                 except Exception as e:
@@ -155,8 +172,9 @@ class GeminiBinding(LollmsLLMBinding):
                     try:
                         chunk_text = chunk.text
                     except ValueError:
-                        # Handle potential empty parts in the stream
+                        # Handle potential empty parts in the stream (e.g. safety blocks or pure thinking parts if structured)
                         chunk_text = ""
+                        # In some thinking models, thought might be in parts, but .text usually aggregates if possible.
 
                     if chunk_text:
                         full_response_text += chunk_text
@@ -190,7 +208,10 @@ class GeminiBinding(LollmsLLMBinding):
              seed: Optional[int] = None,
              n_threads: Optional[int] = None,
              ctx_size: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+             think: Optional[bool] = False,
+             reasoning_effort: Optional[str] = "low", # low, medium, high
+             reasoning_summary: Optional[bool] = False, # auto
              ) -> Union[str, dict]:
         """
         Conduct a chat session with the Gemini model using a LollmsDiscussion object.
@@ -206,7 +227,7 @@ class GeminiBinding(LollmsLLMBinding):
         
         history = []
         for msg in messages:
-            role = 'user' if msg.sender_type == "user" else 'assistant'
+            role = 'user' if msg.sender_type == "user" else 'model' # Gemini expects 'model' not 'assistant'
             
             # Handle multimodal content in the message
             content_parts = []
@@ -221,14 +242,26 @@ class GeminiBinding(LollmsLLMBinding):
                             content_parts.append(Image.open(file_path))
                          except Exception as e:
                             ASCIIColors.warning(f"Could not load image {file_path}: {e}")
+                     else:
+                        # Try base64
+                        try:
+                            b64_data = file_path
+                            if b64_data.startswith("data:image"):
+                                b64_data = b64_data.split(",")[1]
+                            content_parts.append(Image.open(BytesIO(base64.b64decode(b64_data))))
+                        except:
+                            pass
 
             if content_parts:
                 history.append({'role': role, 'parts': content_parts})
         
-        model = self.client.GenerativeModel(
-            model_name=self.model_name,
-            system_instruction=system_prompt
-        )
+        try:
+            model = self.client.GenerativeModel(
+                model_name=self.model_name,
+                system_instruction=system_prompt if system_prompt else None
+            )
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to initialize GenerativeModel: {e}"}
         
         # History must not be empty and should not contain consecutive roles of the same type.
         # We also need to separate the final prompt from the history.
@@ -237,15 +270,33 @@ class GeminiBinding(LollmsLLMBinding):
 
         chat_history = history[:-1] if len(history) > 1 else []
         last_prompt_parts = history[-1]['parts']
+        
+        # Ensure the last message is from user
+        if history[-1]['role'] != 'user':
+             # If last message was model, we can't really "chat" as we need a user prompt.
+             # However, Lollms logic usually ensures we are responding to a user.
+             # If not, we might be continuing generation? Gemini doesn't support continue directly in chat mode easily.
+             # We'll treat it as a user prompt with empty content if needed or error.
+             # But let's assume standard flow.
+             pass
 
         # Ensure history is valid (no consecutive same roles)
         valid_history = []
         if chat_history:
-            valid_history.append(chat_history[0])
-            for i in range(1, len(chat_history)):
-                if chat_history[i]['role'] != chat_history[i-1]['role']:
-                    valid_history.append(chat_history[i])
-        
+            current_role = None
+            current_parts = []
+            
+            for msg in chat_history:
+                if msg['role'] == current_role:
+                    # Append parts to current message
+                    current_parts.extend(msg['parts'])
+                    # Update the last added message in valid_history
+                    valid_history[-1]['parts'] = current_parts
+                else:
+                    current_role = msg['role']
+                    current_parts = list(msg['parts']) # Copy
+                    valid_history.append({'role': current_role, 'parts': current_parts})
+
         chat_session = model.start_chat(history=valid_history)
         
         generation_config = self.get_generation_config(temperature, top_p, top_k, n_predict)

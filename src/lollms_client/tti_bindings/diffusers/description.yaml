@@ -161,3 +161,19 @@ edit_image_parameters:
     default: "default"
     description: "Scheduler to use for this edit request. Overrides global scheduler if provided."
     options: ["default", "ddim", "ddpm", "deis_multistep", "dpm_multistep", "dpm_multistep_karras", "dpm_single", "dpm_adaptive", "dpm++_2m", "dpm++_2m_karras", "dpm++_2s_ancestral", "dpm++_2s_ancestral_karras", "dpm++_sde", "dpm++_sde_karras", "euler_ancestral_discrete", "euler_discrete", "heun_discrete", "heun_karras", "lms_discrete", "lms_karras", "pndm", "unipc_multistep", "dpm++_2m_sde", "dpm++_2m_sde_karras", "dpm2", "dpm2_karras", "dpm2_a", "dpm2_a_karras", "euler", "euler_a", "heun", "lms"]
+
+commands:
+  - name: pull_model
+    description: "Downloads a model from Hugging Face (repo_id) or a direct URL to a safetensors file."
+    parameters:
+      - name: model_name
+        type: str
+        description: "The Hugging Face repo ID (e.g. 'stabilityai/sdxl-turbo') or URL."
+        mandatory: true
+      - name: local_name
+        type: str
+        description: "Optional custom name for the model folder or file."
+        mandatory: false
+  - name: upgrade_diffusers
+    description: "Upgrades the diffusers library to the latest development version."
+    parameters: []

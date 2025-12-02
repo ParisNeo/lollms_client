@@ -672,6 +672,56 @@ class OllamaBinding(LollmsLLMBinding):
             "supports_vision": True # Many Ollama models (e.g. llava, bakllava) support vision
         }
 
+    def pull_model(self, model_name: str, progress_callback: Callable[[dict], None] = None, **kwargs) -> bool:
+        """
+        Pulls a model from the Ollama library.
+
+        Args:
+            model_name (str): The name of the model to pull.
+            progress_callback (Callable[[dict], None], optional): A callback function that receives progress updates. 
+                                                                  The dict typically contains 'status', 'completed', 'total'.
+
+        Returns:
+            bool: True if the model was pulled successfully, False otherwise.
+        """
+        if not self.ollama_client:
+             ASCIIColors.error("Ollama client not initialized. Cannot pull model.")
+             return False
+
+        try:
+            ASCIIColors.info(f"Pulling model {model_name}...")
+            # Stream the pull progress
+            for progress in self.ollama_client.pull(model_name, stream=True):
+                # Send raw progress to callback if provided
+                if progress_callback:
+                    progress_callback(progress)
+                
+                # Default console logging
+                status = progress.get('status', '')
+                completed = progress.get('completed')
+                total = progress.get('total')
+                
+                if completed and total:
+                    percent = (completed / total) * 100
+                    print(f"\r{status}: {percent:.2f}%", end="", flush=True)
+                else:
+                     print(f"\r{status}", end="", flush=True)
+            
+            print() # Clear line
+            ASCIIColors.success(f"Model {model_name} pulled successfully.")
+            return True
+
+        except ollama.ResponseError as e:
+            ASCIIColors.error(f"Ollama API Pull Error: {e.error or 'Unknown error'} (status code: {e.status_code})")
+            return False
+        except ollama.RequestError as e:
+            ASCIIColors.error(f"Ollama API Request Error: {str(e)}")
+            return False
+        except Exception as ex:
+            ASCIIColors.error(f"An unexpected error occurred while pulling model: {str(ex)}")
+            trace_exception(ex)
+            return False
+
     def list_models(self) -> List[Dict[str, str]]:
         """
         Lists available models from the Ollama service using the ollama-python library.

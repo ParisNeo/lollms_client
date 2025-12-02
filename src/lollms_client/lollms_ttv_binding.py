@@ -1,39 +1,26 @@
 # lollms_client/lollms_ttv_binding.py
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 from ascii_colors import trace_exception
+from lollms_client.lollms_base_binding import LollmsBaseBinding
 
-class LollmsTTVBinding(ABC):
+class LollmsTTVBinding(LollmsBaseBinding):
     """Abstract base class for all LOLLMS Text-to-Video bindings."""
 
     def __init__(self,
                  binding_name:str="unknown",
-                 config={}):
+                 **kwargs):
         """
         Initialize the LollmsTTVBinding base class.
-
-        Args:
-            binding_name (Optional[str]): The binding name
         """
-        self.binding_name = binding_name
-        self.config = config
+        super().__init__(binding_name=binding_name, **kwargs)
 
     @abstractmethod
     def generate_video(self, prompt: str, **kwargs) -> bytes:
         """
         Generates video data from the provided text prompt.
-
-        Args:
-            prompt (str): The text prompt describing the desired video content.
-            **kwargs: Additional binding-specific parameters (e.g., duration, fps, style, seed).
-
-        Returns:
-            bytes: The generated video data (e.g., in MP4 format).
-
-        Raises:
-            Exception: If video generation fails.
         """
         pass
 
@@ -41,12 +28,6 @@ class LollmsTTVBinding(ABC):
     def list_models(self, **kwargs) -> List[str]:
         """
         Lists the available TTV models or services supported by the binding.
-
-        Args:
-            **kwargs: Additional binding-specific parameters.
-
-        Returns:
-            List[str]: A list of available model/service identifiers.
         """
         pass
 
@@ -54,13 +35,6 @@ class LollmsTTVBindingManager:
     """Manages TTV binding discovery and instantiation."""
 
     def __init__(self, ttv_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "ttv_bindings"):
-        """
-        Initialize the LollmsTTVBindingManager.
-
-        Args:
-            ttv_bindings_dir (Union[str, Path]): Directory containing TTV binding implementations.
-                                                 Defaults to the "ttv_bindings" subdirectory.
-        """
         self.ttv_bindings_dir = Path(ttv_bindings_dir)
         self.available_bindings = {}
 
@@ -81,13 +55,6 @@ class LollmsTTVBindingManager:
                       **kwargs) -> Optional[LollmsTTVBinding]:
         """
         Create an instance of a specific TTV binding.
-
-        Args:
-            binding_name (str): Name of the TTV binding to create.
-            **kwargs: Additional parameters specific to the binding's __init__.
-
-        Returns:
-            Optional[LollmsTTVBinding]: Binding instance or None if creation failed.
         """
         if binding_name not in self.available_bindings:
             self._load_binding(binding_name)
@@ -95,7 +62,7 @@ class LollmsTTVBindingManager:
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
             try:
-                return binding_class(**kwargs)
+                return binding_class(binding_name=binding_name, **kwargs)
             except Exception as e:
                 trace_exception(e)
                 print(f"Failed to instantiate TTV binding {binding_name}: {str(e)}")
@@ -105,9 +72,6 @@ class LollmsTTVBindingManager:
     def get_available_bindings(self) -> list[str]:
         """
         Return list of available TTV binding names based on subdirectories.
-
-        Returns:
-            list[str]: List of binding names.
         """
         return [binding_dir.name for binding_dir in self.ttv_bindings_dir.iterdir()
                 if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
@@ -115,19 +79,7 @@ class LollmsTTVBindingManager:
 
 def list_binding_models(ttv_binding_name: str, ttv_binding_config: Optional[Dict[str, any]]|None = None, ttv_bindings_dir: str|Path = Path(__file__).parent / "ttv_bindings") -> List[Dict]:
     """
-    Lists all available LLM bindings with their detailed descriptions.
-
-    This function serves as a primary entry point for discovering what bindings
-    are available and how to configure them.
-
-    Args:
-        ttv_bindings_dir (Union[str, Path], optional): 
-            The path to the LLM bindings directory. If None, it defaults to the
-            'ttv_bindings' subdirectory relative to this file. 
-            Defaults to None.
-
-    Returns:
-        List[Dict]: A list of dictionaries, each describing a binding.
+    Lists all available models for a specific binding.
     """
     binding = LollmsTTVBindingManager(ttv_bindings_dir).create_binding(
         binding_name=ttv_binding_name,

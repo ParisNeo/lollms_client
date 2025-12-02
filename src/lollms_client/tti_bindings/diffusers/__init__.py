@@ -370,6 +370,61 @@ class DiffusersBinding(LollmsTTIBinding):
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
 
+    def pull_model(self, model_name: str, local_name: Optional[str] = None) -> bool:
+        """
+        Pulls a model from Hugging Face or URL via the server.
+        """
+        payload = {}
+        if model_name.startswith("http") and "huggingface.co" not in model_name:
+             # Assume direct file URL if not huggingface repo url (roughly)
+             if model_name.endswith(".safetensors"):
+                payload["safetensors_url"] = model_name
+             else:
+                payload["hf_id"] = model_name 
+        else:
+             # Clean up URL if provided as https://huggingface.co/publisher/model
+             if "huggingface.co/" in model_name:
+                 model_name = model_name.split("huggingface.co/")[-1]
+             payload["hf_id"] = model_name
+        
+        if local_name:
+            payload["local_name"] = local_name
+            
+        try:
+            ASCIIColors.info(f"Sending pull request for {model_name}...")
+            # Use a very long timeout as downloads can be huge (GBs)
+            response = requests.post(f"{self.base_url}/pull_model", json=payload, timeout=7200) 
+            response.raise_for_status()
+            ASCIIColors.success(f"Model pulled successfully.")
+            return True
+        except Exception as e:
+            ASCIIColors.error(f"Failed to pull model: {e}")
+            if hasattr(e, 'response') and e.response:
+                 ASCIIColors.error(f"Server response: {e.response.text}")
+            return False
+
+    def upgrade_diffusers(self) -> bool:
+        """
+        Upgrades the diffusers library in the virtual environment.
+        """
+        try:
+            ASCIIColors.info("Upgrading diffusers from GitHub...")
+            if sys.platform == "win32":
+                python_executable = self.venv_dir / "Scripts" / "python.exe"
+            else:
+                python_executable = self.venv_dir / "bin" / "python"
+
+            subprocess.check_call([
+                str(python_executable), "-m", "pip", "install", "--upgrade", 
+                "git+https://github.com/huggingface/diffusers.git"
+            ])
+            ASCIIColors.success("Diffusers upgraded successfully.")
+            ASCIIColors.info("Please restart the application/server to apply changes.")
+            return True
+        except Exception as e:
+            ASCIIColors.error(f"Failed to upgrade diffusers: {e}")
+            return False
+
     def __del__(self):
         # The client destructor does not stop the server,
         # as it is a shared resource for all worker processes.

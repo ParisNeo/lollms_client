@@ -19,8 +19,6 @@ BindingName = "NovitaAIBinding"
 API_BASE_URL = "https://api.novita.ai"
 
 # A hardcoded list of models based on Novita AI's documentation.
-# The API is OpenAI-compatible but does not provide a models listing endpoint.
-# Sourced from: https://docs.novita.ai/language-model/models
 _FALLBACK_MODELS = [
     {'model_name': 'meta-llama/Llama-3-8B-Instruct', 'display_name': 'Llama 3 8B Instruct', 'description': 'Meta\'s Llama 3 8B instruction-tuned model.', 'owned_by': 'Meta'},
     {'model_name': 'meta-llama/Llama-3-70B-Instruct', 'display_name': 'Llama 3 70B Instruct', 'description': 'Meta\'s Llama 3 70B instruction-tuned model.', 'owned_by': 'Meta'},
@@ -28,6 +26,7 @@ _FALLBACK_MODELS = [
     {'model_name': 'mistralai/Mistral-7B-Instruct-v0.2', 'display_name': 'Mistral 7B Instruct v0.2', 'description': 'Mistral AI\'s 7B instruction-tuned model.', 'owned_by': 'Mistral AI'},
     {'model_name': 'google/gemma-7b-it', 'display_name': 'Gemma 7B IT', 'description': 'Google\'s Gemma 7B instruction-tuned model.', 'owned_by': 'Google'},
     {'model_name': 'google/gemma-2-9b-it', 'display_name': 'Gemma 2 9B IT', 'description': 'Google\'s next-generation Gemma 2 9B instruction-tuned model.', 'owned_by': 'Google'},
+    {'model_name': 'deepseek/deepseek-r1', 'display_name': 'Deepseek R1', 'description': 'Deepseek R1 reasoning model.', 'owned_by': 'Deepseek AI'},
     {'model_name': 'deepseek-ai/deepseek-coder-33b-instruct', 'display_name': 'Deepseek Coder 33B Instruct', 'description': 'A powerful coding model from Deepseek AI.', 'owned_by': 'Deepseek AI'},
 ]
 
@@ -73,6 +72,119 @@ class NovitaAIBinding(LollmsLLMBinding):
         if frequency_penalty is not None: params['frequency_penalty'] = frequency_penalty
         return params
 
+    def generate_text(self,
+                     prompt: str,
+                     images: Optional[List[str]] = None,
+                     system_prompt: str = "",
+                     n_predict: Optional[int] = 2048,
+                     stream: Optional[bool] = False,
+                     temperature: float = 0.7,
+                     top_k: int = 50, # Not supported by Novita API
+                     top_p: float = 0.9,
+                     repeat_penalty: float = 1.1, # maps to frequency_penalty
+                     repeat_last_n: int = 64,   # Not supported
+                     seed: Optional[int] = None, # Not supported
+                     n_threads: Optional[int] = None, # Not applicable
+                     ctx_size: int | None = None, # Determined by model
+                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     split:Optional[bool]=False, 
+                     user_keyword:Optional[str]="!@>user:",
+                     ai_keyword:Optional[str]="!@>assistant:",
+                     think: Optional[bool] = False,
+                     reasoning_effort: Optional[str] = "low", # low, medium, high
+                     reasoning_summary: Optional[bool] = False, # auto
+                     ) -> Union[str, dict]:
+        """
+        Generate text using Novita AI.
+        """
+        # Build messages
+        messages = []
+        if system_prompt and system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt})
+        
+        if split:
+            # Simple split logic to support history if provided in prompt string
+            # This is a basic fallback; usually chat() is preferred for history
+            msgs = self.split_discussion(prompt, user_keyword, ai_keyword)
+            messages.extend(msgs)
+        else:
+            messages.append({"role": "user", "content": prompt})
+
+        if images:
+            ASCIIColors.warning("Novita AI API does not support images in this binding yet. They will be ignored.")
+
+        # Construct parameters
+        # Map repeat_penalty to frequency_penalty loosely if needed, or just pass as is if supported
+        # Novita supports standard OpenAI params
+        api_params = self._construct_parameters(
+            temperature, top_p, n_predict, 0.0, repeat_penalty
+        )
+
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "stream": stream,
+            **api_params
+        }
+        
+        url = f"{API_BASE_URL}/v1/chat/completions"
+        full_response_text = ""
+
+        try:
+            if stream:
+                with requests.post(url, headers=self.headers, json=payload, stream=True) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if line:
+                            decoded_line = line.decode('utf-8')
+                            if decoded_line.startswith("data:"):
+                                content = decoded_line[len("data: "):].strip()
+                                if content == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(content)
+                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                    text_chunk = delta.get("content", "")
+                                    # Deepseek R1 might output thinking in content or reasoning_content field
+                                    # Standard OpenAI compatible R1 usually puts thought in <think> tags or reasoning_content
+                                    reasoning_chunk = delta.get("reasoning_content", "")
+                                    
+                                    if reasoning_chunk:
+                                         # If we get reasoning content field, wrap it in <think> for lollms UI if think is enabled
+                                         if think:
+                                             formatted_reasoning = f"<think>{reasoning_chunk}</think>" # Naive streaming wrap, might be broken tags
+                                             # Better to just stream it if UI handles it, or just text
+                                             if streaming_callback:
+                                                streaming_callback(reasoning_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                                         else:
+                                             # If think disabled, we might skip reasoning or just show it?
+                                             # Typically we want to show it.
+                                             pass
+
+                                    if text_chunk:
+                                        full_response_text += text_chunk
+                                        if streaming_callback:
+                                            if not streaming_callback(text_chunk, MSG_TYPE.MSG_TYPE_CHUNK):
+                                                break
+                                except json.JSONDecodeError:
+                                    continue
+                return full_response_text
+            else:
+                response = requests.post(url, headers=self.headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                choice = data["choices"][0]["message"]
+                content = choice.get("content", "")
+                reasoning = choice.get("reasoning_content", "")
+                
+                if think and reasoning:
+                    return f"<think>\n{reasoning}\n</think>\n{content}"
+                return content
+                
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "error": str(e)}
+
     def chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
@@ -86,7 +198,10 @@ class NovitaAIBinding(LollmsLLMBinding):
              seed: Optional[int] = None, # Not supported
              n_threads: Optional[int] = None, # Not applicable
              ctx_size: Optional[int] = None, # Determined by model
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None
+             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+             think: Optional[bool] = False,
+             reasoning_effort: Optional[str] = "low", # low, medium, high
+             reasoning_summary: Optional[bool] = False, # auto
              ) -> Union[str, dict]:
         """
         Conduct a chat session with a Novita AI model using a LollmsDiscussion object.
@@ -139,6 +254,19 @@ class NovitaAIBinding(LollmsLLMBinding):
                                     chunk = json.loads(content)
                                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                                     text_chunk = delta.get("content", "")
+                                    
+                                    # Support for reasoning content if provided (e.g. Deepseek R1)
+                                    reasoning_chunk = delta.get("reasoning_content", "")
+                                    if reasoning_chunk and think:
+                                        # Simple handling: stream it as regular chunk or specific type if supported
+                                        # Lollms typically expects <think> tags in the text if it's mixed
+                                        # Since we can't easily inject tags in a stream without state, 
+                                        # we assume the model output might contain them or we just output reasoning.
+                                        # For now, append to text.
+                                        if streaming_callback:
+                                            # We could prefix with <think> if it's the start, but that's complex in stateless loop
+                                            streaming_callback(reasoning_chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+
                                     if text_chunk:
                                         full_response_text += text_chunk
                                         if streaming_callback:
@@ -152,7 +280,15 @@ class NovitaAIBinding(LollmsLLMBinding):
                 response = requests.post(url, headers=self.headers, json=payload)
                 response.raise_for_status()
                 data = response.json()
-                return data["choices"][0]["message"]["content"]
+                choice = data["choices"][0]["message"]
+                content = choice.get("content", "")
+                reasoning = choice.get("reasoning_content", "")
+                
+                if think and reasoning:
+                    return f"<think>\n{reasoning}\n</think>\n{content}"
+                    
+                return content
+
         except requests.exceptions.HTTPError as e:
             try:
                 error_details = e.response.json()

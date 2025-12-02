@@ -1,41 +1,27 @@
 # lollms_client/lollms_stt_binding.py
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 from ascii_colors import trace_exception
 import yaml
-class LollmsSTTBinding(ABC):
+from lollms_client.lollms_base_binding import LollmsBaseBinding
+
+class LollmsSTTBinding(LollmsBaseBinding):
     """Abstract base class for all LOLLMS Speech-to-Text bindings."""
 
     def __init__(self,
                  binding_name:str="unknown",
-                 config={}):
+                 **kwargs):
         """
         Initialize the LollmsSTTBinding base class.
-
-        Args:
-            binding_name (Optional[str]): The binding name
         """
-        self.binding_name = binding_name
-        self.config = config
+        super().__init__(binding_name=binding_name, **kwargs)
 
     @abstractmethod
     def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:
         """
         Transcribes the audio file at the given path into text.
-
-        Args:
-            audio_path (Union[str, Path]): The path to the audio file to transcribe.
-            model (Optional[str]): The specific STT model to use (if supported by the binding).
-                                  If None, a default model might be used.
-            **kwargs: Additional binding-specific parameters (e.g., language hint).
-
-        Returns:
-            str: The transcribed text.
-
-        Raises:
-            Exception: If audio transcription fails.
         """
         pass
 
@@ -43,12 +29,6 @@ class LollmsSTTBinding(ABC):
     def list_models(self, **kwargs) -> List[str]:
         """
         Lists the available STT models supported by the binding.
-
-        Args:
-            **kwargs: Additional binding-specific parameters.
-
-        Returns:
-            List[str]: A list of available STT model identifiers.
         """
         pass
 
@@ -56,13 +36,6 @@ class LollmsSTTBindingManager:
     """Manages STT binding discovery and instantiation."""
 
     def __init__(self, stt_bindings_dir: Union[str, Path] = Path(__file__).parent.parent / "stt_bindings"):
-        """
-        Initialize the LollmsSTTBindingManager.
-
-        Args:
-            stt_bindings_dir (Union[str, Path]): Directory containing STT binding implementations.
-                                                 Defaults to the "stt_bindings" subdirectory.
-        """
         self.stt_bindings_dir = Path(stt_bindings_dir)
         self.available_bindings = {}
 
@@ -87,17 +60,6 @@ class LollmsSTTBindingManager:
                       **kwargs) -> Optional[LollmsSTTBinding]:
         """
         Create an instance of a specific STT binding.
-
-        Args:
-            binding_name (str): Name of the STT binding to create.
-            host_address (Optional[str]): Host address for the service.
-            model_name (Optional[str]): Default model identifier.
-            service_key (Optional[str]): Authentication key for the service.
-            verify_ssl_certificate (bool): Whether to verify SSL certificates.
-            **kwargs: Additional parameters specific to the binding's __init__.
-
-        Returns:
-            Optional[LollmsSTTBinding]: Binding instance or None if creation failed.
         """
         if binding_name not in self.available_bindings:
             self._load_binding(binding_name)
@@ -105,11 +67,14 @@ class LollmsSTTBindingManager:
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
             try:
-                return binding_class(host_address=host_address,
-                                     model_name=model_name,
-                                     service_key=service_key,
-                                     verify_ssl_certificate=verify_ssl_certificate,
-                                     **kwargs)
+                # Merge specific args into kwargs to match unified init
+                kwargs.update({
+                    "host_address": host_address,
+                    "model_name": model_name,
+                    "service_key": service_key,
+                    "verify_ssl_certificate": verify_ssl_certificate
+                })
+                return binding_class(binding_name=binding_name, **kwargs)
             except Exception as e:
                 trace_exception(e)
                 print(f"Failed to instantiate STT binding {binding_name}: {str(e)}")
@@ -119,9 +84,6 @@ class LollmsSTTBindingManager:
     def get_available_bindings(self) -> list[str]:
         """
         Return list of available STT binding names based on subdirectories.
-
-        Returns:
-            list[str]: List of binding names.
         """
         return [binding_dir.name for binding_dir in self.stt_bindings_dir.iterdir()
                 if binding_dir.is_dir() and (binding_dir / "__init__.py").exists()]
@@ -182,19 +144,7 @@ def get_available_bindings(stt_bindings_dir: Union[str, Path] = None) -> List[Di
 
 def list_binding_models(stt_binding_name: str, stt_binding_config: Optional[Dict[str, any]]|None = None, stt_bindings_dir: str|Path = Path(__file__).parent / "stt_bindings") -> List[Dict]:
     """
-    Lists all available LLM bindings with their detailed descriptions.
-
-    This function serves as a primary entry point for discovering what bindings
-    are available and how to configure them.
-
-    Args:
-        stt_bindings_dir (Union[str, Path], optional): 
-            The path to the LLM bindings directory. If None, it defaults to the
-            'stt_bindings' subdirectory relative to this file. 
-            Defaults to None.
-
-    Returns:
-        List[Dict]: A list of dictionaries, each describing a binding.
+    Lists all available models for a specific binding.
     """
     binding = LollmsSTTBindingManager(stt_bindings_dir).create_binding(
         binding_name=stt_binding_name,

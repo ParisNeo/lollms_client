@@ -24,3 +24,11 @@ input_parameters:
     description: "Whether to verify the SSL certificate of the Ollama server. Defaults to true."
     mandatory: false
     default: true
+commands:
+  - name: pull_model
+    description: "Pulls a model from the Ollama library."
+    parameters:
+      - name: model_name
+        type: str
+        description: "The name of the model to pull."
+        mandatory: true

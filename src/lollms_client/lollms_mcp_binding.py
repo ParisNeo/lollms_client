@@ -1,17 +1,15 @@
 # lollms_client/lollms_mcp_binding.py
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 from ascii_colors import trace_exception, ASCIIColors
 import yaml
-class LollmsMCPBinding(ABC):
+from lollms_client.lollms_base_binding import LollmsBaseBinding
+
+class LollmsMCPBinding(LollmsBaseBinding):
     """
     Abstract Base Class for LOLLMS Model Context Protocol (MCP) Bindings.
-
-    MCP bindings are responsible for interacting with MCP-compliant tool servers
-    or emulating MCP tool interactions locally. They handle tool discovery
-    and execution based on requests, typically orchestrated by an LLM.
     """
 
     def __init__(self,
@@ -20,11 +18,8 @@ class LollmsMCPBinding(ABC):
                  ):
         """
         Initialize the LollmsMCPBinding.
-
-        Args:
-            binding_name (str): The unique name of this binding.
         """
-        self.binding_name = binding_name
+        super().__init__(binding_name=binding_name, **kwargs)
         self.settings = kwargs
 
 
@@ -32,22 +27,6 @@ class LollmsMCPBinding(ABC):
     def discover_tools(self, **kwargs) -> List[Dict[str, Any]]:
         """
         Discover available tools compliant with the MCP specification.
-
-        Each tool definition should follow the MCP standard, typically including:
-        - name (str): Unique name of the tool.
-        - description (str): Natural language description of what the tool does.
-        - input_schema (dict): JSON schema defining the tool's input parameters.
-        - output_schema (dict): JSON schema defining the tool's output.
-        (Other MCP fields like `prompts`, `resources` could be supported by specific bindings)
-
-        Args:
-            **kwargs: Additional arguments specific to the binding's discovery mechanism
-                      (e.g., tool_server_url, specific_tool_names_to_filter).
-
-        Returns:
-            List[Dict[str, Any]]: A list of tool definitions. Each dictionary
-                                  should conform to the MCP tool definition structure.
-                                  Returns an empty list if no tools are found or an error occurs.
         """
         pass
 
@@ -58,35 +37,21 @@ class LollmsMCPBinding(ABC):
                      **kwargs) -> Dict[str, Any]:
         """
         Execute a specified tool with the given parameters.
-
-        The execution should adhere to the input and output schemas defined in the
-        tool's MCP definition.
-
-        Args:
-            tool_name (str): The name of the tool to execute.
-            params (Dict[str, Any]): A dictionary of parameters to pass to the tool,
-                                     conforming to the tool's `input_schema`.
-            **kwargs: Additional arguments specific to the binding's execution mechanism
-                      (e.g., timeout, user_context).
-
-        Returns:
-            Dict[str, Any]: The result of the tool execution, conforming to the
-                            tool's `output_schema`. If an error occurs during
-                            execution, the dictionary should ideally include an 'error'
-                            key with a descriptive message.
-                            Example success: {"result": "Weather is sunny"}
-                            Example error: {"error": "API call failed", "details": "..."}
         """
         pass
 
     def get_binding_config(self) -> Dict[str, Any]:
         """
         Returns the configuration of the binding.
-
-        Returns:
-            Dict[str, Any]: The configuration dictionary.
         """
         return self.settings
+
+    def list_models(self) -> List[Any]:
+        """
+        For MCP, list_models returns an empty list as it primarily deals with tools.
+        Or could be implemented to return available tools as models if desired.
+        """
+        return []
 
 class LollmsMCPBindingManager:
     """
@@ -96,14 +61,9 @@ class LollmsMCPBindingManager:
     def __init__(self, mcp_bindings_dir: Union[str, Path] = Path(__file__).parent / "mcp_bindings"):
         """
         Initialize the LollmsMCPBindingManager.
-
-        Args:
-            mcp_bindings_dir (Union[str, Path]): Directory containing MCP binding implementations.
-                                                 Defaults to "mcp_bindings" subdirectory relative to this file.
         """
         self.mcp_bindings_dir = Path(mcp_bindings_dir)
         if not self.mcp_bindings_dir.is_absolute():
-             # If relative, assume it's relative to the parent of this file (lollms_client directory)
             self.mcp_bindings_dir = (Path(__file__).parent.parent / mcp_bindings_dir).resolve()
 
         self.available_bindings: Dict[str, type[LollmsMCPBinding]] = {}
@@ -112,9 +72,7 @@ class LollmsMCPBindingManager:
 
     def _load_binding_class(self, binding_name: str) -> Optional[type[LollmsMCPBinding]]:
         """
-        Dynamically load a specific MCP binding class from the mcp_bindings directory.
-        Assumes each binding is in a subdirectory named after the binding_name,
-        and has an __init__.py that defines a `BindingName` variable and the binding class.
+        Dynamically load a specific MCP binding class.
         """
         binding_dir = self.mcp_bindings_dir / binding_name
         if binding_dir.is_dir():
@@ -129,7 +87,6 @@ class LollmsMCPBindingManager:
                         module = importlib.util.module_from_spec(module_spec)
                         module_spec.loader.exec_module(module)
                         
-                        # Ensure BindingName is defined in the module, and it matches the class name
                         if not hasattr(module, 'BindingName'):
                             ASCIIColors.warning(f"Binding '{binding_name}' __init__.py does not define BindingName variable.")
                             return None
@@ -157,15 +114,6 @@ class LollmsMCPBindingManager:
                        ) -> Optional[LollmsMCPBinding]:
         """
         Create an instance of a specific MCP binding.
-
-        Args:
-            binding_name (str): Name of the MCP binding to create.
-            config (Optional[Dict[str, Any]]): Configuration for the binding.
-            lollms_paths (Optional[Dict[str, Union[str, Path]]]): LOLLMS specific paths.
-
-
-        Returns:
-            Optional[LollmsMCPBinding]: Binding instance or None if creation failed.
         """
         if binding_name not in self.available_bindings:
             binding_class = self._load_binding_class(binding_name)
@@ -179,6 +127,7 @@ class LollmsMCPBindingManager:
         if binding_class_to_instantiate:
             try:
                 return binding_class_to_instantiate(
+                    binding_name=binding_name,
                     **kwargs
                 )
             except Exception as e:
@@ -190,8 +139,7 @@ class LollmsMCPBindingManager:
 
     def get_available_bindings(self) -> List[str]:
         """
-        Return list of available MCP binding names based on subdirectories.
-        This method scans the directory structure.
+        Return list of available MCP binding names.
         """
         available = []
         if self.mcp_bindings_dir.is_dir():
@@ -203,12 +151,6 @@ class LollmsMCPBindingManager:
     def get_binding_description(self, binding_name: str) -> Optional[Dict[str, Any]]:
         """
         Loads and returns the content of the description.yaml file for a given binding.
-
-        Args:
-            binding_name (str): The name of the binding.
-
-        Returns:
-            Optional[Dict[str, Any]]: A dictionary with the parsed YAML content, or None if the file doesn't exist or is invalid.
         """
         binding_dir = self.mcp_bindings_dir / binding_name
         description_file = binding_dir / "description.yaml"
@@ -232,19 +174,7 @@ class LollmsMCPBindingManager:
 
 def list_binding_models(mcp_binding_name: str, mcp_binding_config: Optional[Dict[str, any]]|None = None, mcp_bindings_dir: str|Path = Path(__file__).parent / "mcp_bindings") -> List[Dict]:
     """
-    Lists all available LLM bindings with their detailed descriptions.
-
-    This function serves as a primary entry point for discovering what bindings
-    are available and how to configure them.
-
-    Args:
-        mcp_bindings_dir (Union[str, Path], optional): 
-            The path to the LLM bindings directory. If None, it defaults to the
-            'mcp_bindings' subdirectory relative to this file. 
-            Defaults to None.
-
-    Returns:
-        List[Dict]: A list of dictionaries, each describing a binding.
+    Lists all available models/tools for a specific binding.
     """
     binding = LollmsMCPBindingManager(mcp_bindings_dir).create_binding(
         binding_name=mcp_binding_name,
