@@ -26,9 +26,11 @@ GROK_API_BASE_URL = "https://api.x.ai/v1"
 
 # A hardcoded list to be used as a fallback if the API call fails
 _FALLBACK_MODELS = [
-    {'model_name': 'grok-1', 'display_name': 'Grok 1', 'description': 'The flagship conversational model from xAI.', 'owned_by': 'xAI'},
-    {'model_name': 'grok-1.5', 'display_name': 'Grok 1.5', 'description': 'The latest multimodal model from xAI.', 'owned_by': 'xAI'},
-    {'model_name': 'grok-1.5-vision-preview', 'display_name': 'Grok 1.5 Vision (Preview)', 'description': 'Multimodal model with vision capabilities (preview).', 'owned_by': 'xAI'},
+    {'model_name': 'grok-2-latest', 'display_name': 'Grok 2 Latest', 'description': 'The latest conversational model from xAI.', 'owned_by': 'xAI'},
+    {'model_name': 'grok-2', 'display_name': 'Grok 2', 'description': 'Grok 2 model.', 'owned_by': 'xAI'},
+    {'model_name': 'grok-2-vision-latest', 'display_name': 'Grok 2 Vision Latest', 'description': 'Latest multimodal model from xAI.', 'owned_by': 'xAI'},
+    {'model_name': 'grok-beta', 'display_name': 'Grok Beta', 'description': 'Beta model.', 'owned_by': 'xAI'},
+    {'model_name': 'grok-vision-beta', 'display_name': 'Grok Vision Beta', 'description': 'Beta vision model.', 'owned_by': 'xAI'},
 ]
 
 # Helper to check if a string is a valid path to an image
@@ -70,7 +72,7 @@ class GrokBinding(LollmsLLMBinding):
             service_key (str): xAI API key.
         """
         super().__init__(BindingName, **kwargs)
-        self.model_name = kwargs.get("model_name", "grok-1.5-vision-preview")
+        self.model_name = kwargs.get("model_name", "grok-2-latest")
         self.service_key = kwargs.get("service_key")
         self.base_url = kwargs.get("base_url", GROK_API_BASE_URL)
         self._cached_models: Optional[List[Dict[str, str]]] = None
@@ -101,7 +103,8 @@ class GrokBinding(LollmsLLMBinding):
     def _process_and_handle_stream(self,
                                   response: requests.Response,
                                   stream: bool,
-                                  streaming_callback: Optional[Callable[[str, MSG_TYPE], None]]
+                                  streaming_callback: Optional[Callable[[str, MSG_TYPE], None]],
+                                  think: bool = False
                                   ) -> Union[str, dict]:
         """Helper to process streaming responses from the API."""
         full_response_text = ""
@@ -119,6 +122,21 @@ class GrokBinding(LollmsLLMBinding):
                             if chunk['choices']:
                                 delta = chunk['choices'][0].get('delta', {})
                                 content = delta.get('content', '')
+                                # Check for reasoning content (DeepSeek-style) if Grok adopts it or if proxied
+                                reasoning = delta.get('reasoning_content', '')
+
+                                if reasoning:
+                                    # If thinking is requested and we get reasoning tokens
+                                    if think:
+                                        if streaming_callback:
+                                            # We just stream the reasoning as is, user UI typically handles tagging or we could inject <think>
+                                            # Here we assume just passing the text is safer unless we track state
+                                            streaming_callback(reasoning, MSG_TYPE.MSG_TYPE_CHUNK)
+                                    # We don't append reasoning to full_response_text usually if it's separate, 
+                                    # unless we want to return it in the final string wrapped.
+                                    # Let's wrap it for the final return string.
+                                    full_response_text += f"<think>{reasoning}</think>" # Naive wrapping for stream accumulation
+
                                 if content:
                                     full_response_text += content
                                     if stream and streaming_callback:
@@ -154,6 +172,9 @@ class GrokBinding(LollmsLLMBinding):
                      n_threads: Optional[int] = None, # Not applicable
                      ctx_size: int | None = None,     # Determined by model
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+                     think: Optional[bool] = False,
+                     reasoning_effort: Optional[str] = "low", # low, medium, high
+                     reasoning_summary: Optional[bool] = False, # auto
                      **kwargs
                      ) -> Union[str, dict]:
         """
@@ -181,7 +202,9 @@ class GrokBinding(LollmsLLMBinding):
                             b64_data = base64.b64encode(image_file.read()).decode('utf-8')
                     else: # Assume it's a base64 string
                         b64_data = image_data
-                        media_type = "image/png" # Assume PNG if raw base64
+                        if b64_data.startswith("data:image"):
+                             b64_data = b64_data.split(",")[1]
+                        media_type = "image/png" # Default assumption
 
                     user_content.append({
                         "type": "image_url",
@@ -214,7 +237,7 @@ class GrokBinding(LollmsLLMBinding):
             )
             response.raise_for_status()
             
-            return self._process_and_handle_stream(response, stream, streaming_callback)
+            return self._process_and_handle_stream(response, stream, streaming_callback, think=think)
 
         except requests.exceptions.RequestException as ex:
             error_message = f"Grok API request failed: {str(ex)}"
@@ -238,6 +261,9 @@ class GrokBinding(LollmsLLMBinding):
              temperature: float = 0.7,
              top_p: float = 0.9,
              streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+             think: Optional[bool] = False,
+             reasoning_effort: Optional[str] = "low", # low, medium, high
+             reasoning_summary: Optional[bool] = False, # auto
              **kwargs
              ) -> Union[str, dict]:
         """
@@ -273,6 +299,18 @@ class GrokBinding(LollmsLLMBinding):
                             })
                         except Exception as e:
                             ASCIIColors.warning(f"Could not load image {file_path}: {e}")
+                    else:
+                        # Attempt to handle base64
+                        try:
+                            b64_data = file_path
+                            if b64_data.startswith("data:image"):
+                                b64_data = b64_data.split(",")[1]
+                            content_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{b64_data}"}
+                            })
+                        except:
+                            pass
             
             # Grok API expects content to be a string for assistant, or list for user.
             if role == 'user':
@@ -303,7 +341,7 @@ class GrokBinding(LollmsLLMBinding):
             )
             response.raise_for_status()
             
-            return self._process_and_handle_stream(response, stream, streaming_callback)
+            return self._process_and_handle_stream(response, stream, streaming_callback, think=think)
 
         except requests.exceptions.RequestException as ex:
             error_message = f"Grok API request failed: {str(ex)}"
@@ -362,7 +400,7 @@ class GrokBinding(LollmsLLMBinding):
             "host_address": self.base_url,
             "model_name": self.model_name,
             "supports_structured_output": False,
-            "supports_vision": "vision" in self.model_name or "grok-1.5" == self.model_name,
+            "supports_vision": "vision" in self.model_name or "grok-1.5" in self.model_name or "grok-2" in self.model_name,
         }
 
     def list_models(self) -> List[Dict[str, str]]:
@@ -433,8 +471,8 @@ if __name__ == '__main__':
     ASCIIColors.yellow("--- Testing GrokBinding ---")
 
     # --- Configuration ---
-    test_model_name = "grok-1"
-    test_vision_model_name = "grok-1.5-vision-preview"
+    test_model_name = "grok-2-latest"
+    test_vision_model_name = "grok-2-vision-latest"
 
     try:
         # --- Initialization ---
@@ -462,7 +500,7 @@ if __name__ == '__main__':
         ASCIIColors.cyan("\n--- Text Generation (Non-Streaming) ---")
         prompt_text = "Explain who Elon Musk is in one sentence."
         ASCIIColors.info(f"Prompt: {prompt_text}")
-        generated_text = binding.generate_text(prompt_text, n_predict=100, stream=False, system_prompt="Be very concise.")
+        generated_text = binding.generate_text(prompt_text, n_predict=100, stream=False, system_prompt="Be very concise.", think=True)
         if isinstance(generated_text, str):
             ASCIIColors.green(f"Generated text:\n{generated_text}")
         else:
