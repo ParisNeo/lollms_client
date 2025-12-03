@@ -7,7 +7,7 @@ import time
 import json
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Callable
 
 # Ensure pipmaster is available.
 try:
@@ -370,7 +370,7 @@ class DiffusersBinding(LollmsTTIBinding):
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
 
-    def pull_model(self, model_name: str, local_name: Optional[str] = None) -> bool:
+    def pull_model(self, model_name: str, local_name: Optional[str] = None, progress_callback: Callable[[dict], None] = None) -> dict:
         """
         Pulls a model from Hugging Face or URL via the server.
         """
@@ -391,23 +391,36 @@ class DiffusersBinding(LollmsTTIBinding):
             payload["local_name"] = local_name
             
         try:
+            if progress_callback:
+                progress_callback({"status": "starting", "message": f"Sending pull request for {model_name}..."})
+            
             ASCIIColors.info(f"Sending pull request for {model_name}...")
             # Use a very long timeout as downloads can be huge (GBs)
             response = requests.post(f"{self.base_url}/pull_model", json=payload, timeout=7200) 
             response.raise_for_status()
-            ASCIIColors.success(f"Model pulled successfully.")
-            return True
+            
+            msg = "Model pulled successfully."
+            ASCIIColors.success(msg)
+            if progress_callback:
+                progress_callback({"status": "success", "message": msg, "completed": 100, "total": 100})
+            return {"status": True, "message": msg}
         except Exception as e:
-            ASCIIColors.error(f"Failed to pull model: {e}")
+            error_msg = f"Failed to pull model: {e}"
             if hasattr(e, 'response') and e.response:
-                 ASCIIColors.error(f"Server response: {e.response.text}")
-            return False
+                 error_msg += f" Server response: {e.response.text}"
+            ASCIIColors.error(error_msg)
+            if progress_callback:
+                progress_callback({"status": "error", "message": error_msg})
+            return {"status": False, "message": error_msg}
 
-    def upgrade_diffusers(self) -> bool:
+    def upgrade_diffusers(self, progress_callback: Callable[[dict], None] = None) -> dict:
         """
         Upgrades the diffusers library in the virtual environment.
         """
         try:
+            if progress_callback:
+                progress_callback({"status": "starting", "message": "Upgrading diffusers..."})
+
             ASCIIColors.info("Upgrading diffusers from GitHub...")
             if sys.platform == "win32":
                 python_executable = self.venv_dir / "Scripts" / "python.exe"
@@ -418,12 +431,19 @@ class DiffusersBinding(LollmsTTIBinding):
                 str(python_executable), "-m", "pip", "install", "--upgrade", 
                 "git+https://github.com/huggingface/diffusers.git"
             ])
-            ASCIIColors.success("Diffusers upgraded successfully.")
+            msg = "Diffusers upgraded successfully."
+            ASCIIColors.success(msg)
             ASCIIColors.info("Please restart the application/server to apply changes.")
-            return True
+            
+            if progress_callback:
+                progress_callback({"status": "success", "message": msg})
+            return {"status": True, "message": msg}
         except Exception as e:
-            ASCIIColors.error(f"Failed to upgrade diffusers: {e}")
-            return False
+            error_msg = f"Failed to upgrade diffusers: {e}"
+            ASCIIColors.error(error_msg)
+            if progress_callback:
+                progress_callback({"status": "error", "message": error_msg})
+            return {"status": False, "message": error_msg}
 
     def __del__(self):
         # The client destructor does not stop the server,

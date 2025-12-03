@@ -26,9 +26,27 @@ input_parameters:
     default: true
 commands:
   - name: pull_model
+    title: Pull Model
     description: "Pulls a model from the Ollama library."
     parameters:
       - name: model_name
         type: str
         description: "The name of the model to pull."
         mandatory: true
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation (true for success, false for failure)"
+      - name: message
+        type: str
+        description: "Message describing the operation result"
+    callback:
+      - name: status
+        type: str
+        description: "Current status of the download"
+      - name: completed
+        type: int
+        description: "Bytes downloaded so far"
+      - name: total
+        type: int
+        description: "Total bytes to download"

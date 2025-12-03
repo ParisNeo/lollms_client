@@ -164,6 +164,7 @@ edit_image_parameters:
 
 commands:
   - name: pull_model
+    title: Pull Model
     description: "Downloads a model from Hugging Face (repo_id) or a direct URL to a safetensors file."
     parameters:
       - name: model_name
@@ -174,6 +175,36 @@ commands:
         type: str
         description: "Optional custom name for the model folder or file."
         mandatory: false
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation (true for success, false for failure)"
+      - name: message
+        type: str
+        description: "Message describing the operation result"
+    callback:
+      - name: status
+        type: str
+        description: "Current status of the download"
+      - name: completed
+        type: int
+        description: "Bytes or percentage downloaded"
+      - name: total
+        type: int
+        description: "Total bytes or percentage"
+
   - name: upgrade_diffusers
+    title: Upgrade Diffusers
     description: "Upgrades the diffusers library to the latest development version."
     parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation"
+      - name: message
+        type: str
+        description: "Result message"
+    callback:
+      - name: status
+        type: str
+        description: "Status of the upgrade process"

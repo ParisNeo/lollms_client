@@ -672,7 +672,7 @@ class OllamaBinding(LollmsLLMBinding):
             "supports_vision": True # Many Ollama models (e.g. llava, bakllava) support vision
         }
 
-    def pull_model(self, model_name: str, progress_callback: Callable[[dict], None] = None, **kwargs) -> bool:
+    def pull_model(self, model_name: str, progress_callback: Callable[[dict], None] = None, **kwargs) -> dict:
         """
         Pulls a model from the Ollama library.
 
@@ -682,11 +682,12 @@ class OllamaBinding(LollmsLLMBinding):
                                                                   The dict typically contains 'status', 'completed', 'total'.
 
         Returns:
-            bool: True if the model was pulled successfully, False otherwise.
+            dict: Dictionary with status (bool) and message (str).
         """
         if not self.ollama_client:
-             ASCIIColors.error("Ollama client not initialized. Cannot pull model.")
-             return False
+             msg = "Ollama client not initialized. Cannot pull model."
+             ASCIIColors.error(msg)
+             return {"status": False, "message": msg}
 
         try:
             ASCIIColors.info(f"Pulling model {model_name}...")
@@ -708,19 +709,23 @@ class OllamaBinding(LollmsLLMBinding):
                      print(f"\r{status}", end="", flush=True)
             
             print() # Clear line
-            ASCIIColors.success(f"Model {model_name} pulled successfully.")
-            return True
+            msg = f"Model {model_name} pulled successfully."
+            ASCIIColors.success(msg)
+            return {"status": True, "message": msg}
 
         except ollama.ResponseError as e:
-            ASCIIColors.error(f"Ollama API Pull Error: {e.error or 'Unknown error'} (status code: {e.status_code})")
-            return False
+            msg = f"Ollama API Pull Error: {e.error or 'Unknown error'} (status code: {e.status_code})"
+            ASCIIColors.error(msg)
+            return {"status": False, "message": msg}
         except ollama.RequestError as e:
-            ASCIIColors.error(f"Ollama API Request Error: {str(e)}")
-            return False
+            msg = f"Ollama API Request Error: {str(e)}"
+            ASCIIColors.error(msg)
+            return {"status": False, "message": msg}
         except Exception as ex:
-            ASCIIColors.error(f"An unexpected error occurred while pulling model: {str(ex)}")
+            msg = f"An unexpected error occurred while pulling model: {str(ex)}"
+            ASCIIColors.error(msg)
             trace_exception(ex)
-            return False
+            return {"status": False, "message": msg}
 
     def list_models(self) -> List[Dict[str, str]]:
         """
