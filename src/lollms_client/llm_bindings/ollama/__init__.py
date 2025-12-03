@@ -14,6 +14,11 @@ import pipmaster as pm
 from lollms_client.lollms_utilities import ImageTokenizer
 pm.ensure_packages(["ollama","pillow","tiktoken"])
 import re
+import platform
+import subprocess
+import urllib.request
+import zipfile
+import os
 
 import ollama
 import tiktoken
@@ -420,20 +425,6 @@ class OllamaBinding(LollmsLLMBinding):
             error_message = f"An unexpected error occurred: {str(ex)}"
             trace_exception(ex)
             return {"status": False, "error": error_message}
-
-
-        except ollama.ResponseError as e:
-            error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
-            ASCIIColors.error(error_message)
-            return {"status": False, "error": error_message, "status_code": e.status_code}
-        except ollama.RequestError as e: # Covers connection errors, timeouts during request
-            error_message = f"Ollama API RequestError: {str(e)}"
-            ASCIIColors.error(error_message)
-            return {"status": False, "error": error_message}
-        except Exception as ex:
-            error_message = f"An unexpected error occurred: {str(ex)}"
-            trace_exception(ex)
-            return {"status": False, "error": error_message}
     
 
     def chat(self,
@@ -727,6 +718,88 @@ class OllamaBinding(LollmsLLMBinding):
             trace_exception(ex)
             return {"status": False, "message": msg}
 
+    def install_ollama(self, callback: Callable[[dict], None] = None, **kwargs) -> dict:
+        """
+        Installs Ollama based on the operating system.
+        """
+        system = platform.system()
+        
+        def report_progress(status, message, completed=0, total=100):
+            if callback:
+                callback({"status": status, "message": message, "completed": completed, "total": total})
+            else:
+                print(f"{status}: {message}")
+
+        try:
+            if system == "Linux":
+                report_progress("working", "Detected Linux. Running installation script...", 10, 100)
+                # Use the official install script
+                cmd = "curl -fsSL https://ollama.com/install.sh | sh"
+                process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stdout, stderr = process.communicate()
+                
+                if process.returncode == 0:
+                    report_progress("success", "Ollama installed successfully on Linux.", 100, 100)
+                    return {"status": True, "message": "Ollama installed successfully."}
+                else:
+                    msg = f"Installation failed: {stderr}"
+                    report_progress("error", msg, 0, 0)
+                    return {"status": False, "error": msg}
+
+            elif system == "Windows":
+                report_progress("working", "Detected Windows. Downloading OllamaSetup.exe...", 10, 100)
+                url = "https://ollama.com/download/OllamaSetup.exe"
+                filename = "OllamaSetup.exe"
+                
+                # Download with progress
+                try:
+                    def dl_callback(count, block_size, total_size):
+                        percent = int(count * block_size * 100 / total_size)
+                        report_progress("working", f"Downloading... {percent}%", percent, 100)
+                    
+                    urllib.request.urlretrieve(url, filename, dl_callback)
+                except Exception as e:
+                    return {"status": False, "error": f"Failed to download installer: {e}"}
+
+                report_progress("working", "Running installer...", 90, 100)
+                try:
+                    subprocess.run([filename], check=True) # Runs the installer GUI
+                    # We can't easily wait for the GUI installer to finish unless we block or it has silent flags.
+                    # Ollama installer is usually simple.
+                    report_progress("success", "Installer launched. Please complete the installation.", 100, 100)
+                    return {"status": True, "message": "Installer launched."}
+                except Exception as e:
+                    return {"status": False, "error": f"Failed to launch installer: {e}"}
+
+            elif system == "Darwin": # macOS
+                report_progress("working", "Detected macOS. Downloading Ollama...", 10, 100)
+                url = "https://ollama.com/download/Ollama-darwin.zip"
+                filename = "Ollama-darwin.zip"
+                
+                 # Download with progress
+                try:
+                    def dl_callback(count, block_size, total_size):
+                        percent = int(count * block_size * 100 / total_size)
+                        report_progress("working", f"Downloading... {percent}%", percent, 100)
+                    
+                    urllib.request.urlretrieve(url, filename, dl_callback)
+                except Exception as e:
+                     return {"status": False, "error": f"Failed to download: {e}"}
+
+                report_progress("working", "Unzipping...", 80, 100)
+                with zipfile.ZipFile(filename, 'r') as zip_ref:
+                    zip_ref.extractall("Ollama_Install")
+                
+                report_progress("success", "Ollama downloaded and extracted to 'Ollama_Install'. Please move 'Ollama.app' to Applications.", 100, 100)
+                return {"status": True, "message": "Downloaded and extracted. Please install Ollama.app manually."}
+
+            else:
+                return {"status": False, "error": f"Unsupported OS: {system}"}
+
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "error": str(e)}
+
     def list_models(self) -> List[Dict[str, str]]:
         """
         Lists available models from the Ollama service using the ollama-python library.
@@ -832,6 +905,7 @@ class OllamaBinding(LollmsLLMBinding):
             'codestral': 256000,  # Codestral
             'mistralai-medium': 128000,  # Mistral medium
             'mistralai-mini':   128000,  # Mistral medium
+            'ministral':   256000,  # Mistral medium
             'mistral': 32768,     # Mistral 7B v0.2+ default
             'mixtral': 32768,     # Mixtral 8x7B default
             'mixtral8x22b': 65536, # Mixtral 8x22B default
@@ -890,18 +964,6 @@ class OllamaBinding(LollmsLLMBinding):
         Returns:
             list[dict]: A list of dictionaries, each representing a running model with a standardized set of keys.
                         Returns an empty list if the client is not initialized or if an error occurs.
-        
-        Example of a returned model dictionary:
-        {
-            "model_name": "gemma3:12b",
-            "size": 13861175232,
-            "vram_size": 10961479680,
-            "parameters_size": "12.2B",
-            "quantization_level": "Q4_K_M",
-            "context_size": 32000,
-            "parent_model": "",
-            "expires_at": "2025-08-20T22:28:18.6708784+02:00"
-        }
         """
         if not self.ollama_client:
             ASCIIColors.warning("Ollama client not initialized. Cannot list running models.")
@@ -916,10 +978,22 @@ class OllamaBinding(LollmsLLMBinding):
             for model_data in models_list:
                 details = model_data.get('details', {})
                 
+                size = model_data.get("size", 0)
+                size_vram = model_data.get("size_vram", 0)
+                
+                # Calculate spread
+                gpu_usage = 0
+                cpu_usage = 0
+                if size > 0:
+                    gpu_usage = min(100, (size_vram / size) * 100)
+                    cpu_usage = max(0, 100 - gpu_usage)
+
                 flat_model_info = {
                     "model_name": model_data.get("name"),
-                    "size": model_data.get("size"),
-                    "vram_size": model_data.get("size_vram"),
+                    "size": size,
+                    "vram_size": size_vram,
+                    "gpu_usage_percent": round(gpu_usage, 2),
+                    "cpu_usage_percent": round(cpu_usage, 2),
                     "expires_at": model_data.get("expires_at"),
                     "parameters_size": details.get("parameter_size"),
                     "quantization_level": details.get("quantization_level"),

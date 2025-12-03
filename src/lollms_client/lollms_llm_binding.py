@@ -257,7 +257,39 @@ class LollmsLLMBinding(LollmsBaseBinding):
             if messages[-1]["content"]=="":
                 del messages[-1]
         return messages
-
+    
+    def ps(self):
+        """
+        List models (simulating a process status command).
+        Since Lollms/OpenAI API doesn't have a specific 'ps' endpoint for running models with memory stats,
+        we list available models and populate structure with available info, leaving hardware stats empty.
+        """
+        # Since there is no dedicated ps endpoint to see *running* models in the standard OpenAI API,
+        # we list available models and try to map relevant info.
+        models = self.list_models()
+        standardized_models = []
+        for m in models:
+            standardized_models.append({
+                "model_name": m.get("model_name"),
+                "size": None,
+                "vram_size": None,
+                "gpu_usage_percent": None,
+                "cpu_usage_percent": None,
+                "expires_at": None,
+                "parameters_size": None,
+                "quantization_level": None,
+                "parent_model": None,
+                "context_size": m.get("context_length"),
+                "owned_by": m.get("owned_by"),
+                "created": m.get("created")
+            })
+        return standardized_models
+        
+    def get_context_size(self) -> Optional[int]:
+        """
+        Returns the default context size for the binding.
+        """
+        return self.default_ctx_size
 
 class LollmsLLMBindingManager:
     """Manages binding discovery and instantiation"""

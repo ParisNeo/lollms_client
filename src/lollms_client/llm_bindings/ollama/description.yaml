@@ -50,3 +50,24 @@ commands:
       - name: total
         type: int
         description: "Total bytes to download"
+  - name: install_ollama
+    title: Install Ollama
+    description: "Installs the Ollama server software on the host system (Linux, Windows, macOS)."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation"
+      - name: message
+        type: str
+        description: "Result message"
+    callback:
+      - name: status
+        type: str
+        description: "Current status"
+      - name: completed
+        type: int
+        description: "Percentage completed"
+      - name: total
+        type: int
+        description: "Total percentage (100)"

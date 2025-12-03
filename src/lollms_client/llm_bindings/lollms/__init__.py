@@ -1,4 +1,4 @@
-# bindings/Lollms_chat/binding.py
+# bindings/lollms/__init__.py
 import requests
 import json
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
@@ -94,6 +94,7 @@ class LollmsBinding(LollmsLLMBinding):
             service_key (str): Authentication key for the service. Defaults to None. This is a key generated 
                                on the lollms interface (it is advised to use LOLLMS_API_KEY environment variable instead)
             verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
+            certificate_file_path (str): Path to a specific certificate file for SSL verification.
             personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
         """
         super().__init__(BindingName, **kwargs)
@@ -103,11 +104,16 @@ class LollmsBinding(LollmsLLMBinding):
         self.model_name=kwargs.get("model_name")
         self.service_key=kwargs.get("service_key")
         self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
+        self.certificate_file_path=kwargs.get("certificate_file_path")
         self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
 
         if not self.service_key:
             self.service_key = os.getenv("LOLLMS_API_KEY", self.service_key)
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=self.verify_ssl_certificate))
+        
+        # Determine verification strategy: specific file takes precedence, otherwise boolean flag
+        verify = self.certificate_file_path if self.certificate_file_path else self.verify_ssl_certificate
+
+        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=verify))
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     def lollms_listMountedPersonalities(self, host_address:str|None=None):
@@ -665,3 +671,30 @@ class LollmsBinding(LollmsLLMBinding):
         self.model = model_name
         self.model_name = model_name
         return True
+    
+    def ps(self):
+        """
+        List models (simulating a process status command).
+        Since Lollms/OpenAI API doesn't have a specific 'ps' endpoint for running models with memory stats,
+        we list available models and populate structure with available info, leaving hardware stats empty.
+        """
+        # Since there is no dedicated ps endpoint to see *running* models in the standard OpenAI API,
+        # we list available models and try to map relevant info.
+        models = self.list_models()
+        standardized_models = []
+        for m in models:
+            standardized_models.append({
+                "model_name": m.get("model_name"),
+                "size": None,
+                "vram_size": None,
+                "gpu_usage_percent": None,
+                "cpu_usage_percent": None,
+                "expires_at": None,
+                "parameters_size": None,
+                "quantization_level": None,
+                "parent_model": None,
+                "context_size": m.get("context_length"),
+                "owned_by": m.get("owned_by"),
+                "created": m.get("created")
+            })
+        return standardized_models

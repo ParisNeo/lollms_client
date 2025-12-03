@@ -11,9 +11,9 @@ input_parameters:
     default: ""
   - name: host_address
     type: str
-    description: "The base URL of the LoLLMs or OpenAI-compatible service (e.g., 'http://localhost:9600/v1')."
+    description: "The base URL of the LoLLMs or OpenAI-compatible service (e.g., 'http://localhost:9642/v1')."
     mandatory: false
-    default: "http://localhost:9600/v1"
+    default: "http://localhost:9642/v1"
   - name: service_key
     type: str
     description: "The API key for the service. Can also be set via the LOLLMS_API_KEY environment variable."
@@ -24,3 +24,8 @@ input_parameters:
     description: "Whether to verify the SSL certificate of the server. Defaults to true."
     mandatory: false
     default: true
+  - name: certificate_file_path
+    type: str
+    description: "Path to a specific SSL certificate file (.pem, .crt) for verifying the server identity. Useful for self-signed certificates."
+    mandatory: false
+    default: ""
