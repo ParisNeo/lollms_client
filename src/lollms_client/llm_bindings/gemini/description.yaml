@@ -1,8 +1,8 @@
 title: Google Gemini
 author: ParisNeo
 creation_date: 2025-08-13
-last_update_date: 2025-08-13
-description: A binding for Google's Gemini family of models (e.g., Gemini 1.5 Pro) via the Google AI Studio API.
+last_update_date: 2025-12-05
+description: A binding for Google's Gemini family of models (e.g., Gemini 1.5 Pro, Flash) via the Google AI Studio API. Fully supports text generation, chat history, and multimodal inputs (images/vision).
 input_parameters:
   - name: model_name
     type: str
@@ -14,3 +14,37 @@ input_parameters:
     description: "The API key for the Google AI Studio service. Can also be set via the GOOGLE_API_KEY environment variable."
     mandatory: true
     default: ""
+commands:
+  - name: test_connection
+    title: Test Connection
+    description: "Validates the API key by attempting a lightweight connection to Google servers."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "True if the key is valid and service is reachable."
+      - name: message
+        type: str
+        description: "Status message."
+  - name: list_tuned_models
+    title: List Tuned Models
+    description: "Lists any custom fine-tuned models associated with your account/API Key."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "Operation status."
+      - name: models
+        type: list
+        description: "A list of tuned model names found."
+  - name: get_active_model_info
+    title: Get Active Model Info
+    description: "Retrieves technical details (context window, output limits) for the currently selected model."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "Operation status."
+      - name: info
+        type: dict
+        description: "Dictionary containing limits and model details."
