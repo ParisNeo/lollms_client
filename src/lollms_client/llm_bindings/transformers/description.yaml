@@ -2,16 +2,21 @@ title: Hugging Face Transformers
 author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-12-06
-description: Run Hugging Face models locally with smart memory management, batching, direct download, and LoRA merging capabilities.
+description: Run, Pull, and Train Hugging Face models locally. Supports QLoRA fine-tuning, smart memory management, LoRA merging, and custom model storage.
 input_parameters:
   - name: model_name
     type: str
-    description: "Default model to load on startup (HF ID or Local Name)."
+    description: "Default model to load. Can be a HF ID (e.g. 'meta-llama/Llama-2-7b') or a folder name in your local models path."
+    mandatory: false
+    default: ""
+  - name: local_models_path
+    type: str
+    description: "Custom path to store models. If empty, uses 'lollms_personal_path/models/huggingface'."
     mandatory: false
     default: ""
   - name: max_active_models
     type: int
-    description: "Maximum number of models to keep in VRAM/RAM simultaneously."
+    description: "Max models in VRAM/RAM."
     mandatory: false
     default: 1
   - name: device
@@ -21,7 +26,7 @@ input_parameters:
     default: "auto"
   - name: quantize
     type: str
-    description: "Quantization for CUDA ('4bit', '8bit', false)."
+    description: "Inference quantization ('4bit', '8bit', false)."
     mandatory: false
     default: false
   - name: trust_remote_code
@@ -29,10 +34,20 @@ input_parameters:
     description: "Trust remote code (required for some models like Phi/Qwen)."
     mandatory: false
     default: false
+  - name: use_flash_attention_2
+    type: bool
+    description: "Enable Flash Attention 2 (Requires CUDA and flash-attn installed)."
+    mandatory: false
+    default: false
+  - name: embedding_model_name
+    type: str
+    description: "Model used for generating embeddings."
+    mandatory: false
+    default: "sentence-transformers/all-MiniLM-L6-v2"
 commands:
   - name: pull_model
     title: Pull Model
-    description: "Download a model from Hugging Face Hub."
+    description: "Download a model from Hugging Face Hub into your local models folder."
     parameters:
       - name: model_name
         type: str
@@ -42,34 +57,56 @@ commands:
         type: bool
       - name: path
         type: str
-  - name: merge_lora
-    title: Merge LoRA Adapter
-    description: "Combine a base model with a LoRA adapter and save it as a new local model."
+  - name: train
+    title: Train (Fine-Tune)
+    description: "Fine-tune a model using QLoRA on a local dataset."
     parameters:
       - name: base_model_name
         type: str
-        description: "The HF ID of the base model (e.g., 'meta-llama/Llama-2-7b-hf')."
-      - name: lora_model_name
+        description: "Base model ID or local name."
+      - name: dataset_path
         type: str
-        description: "The HF ID of the LoRA adapter (e.g., 'tloen/alpaca-lora-7b')."
+        description: "Path to the dataset JSON file."
       - name: new_model_name
         type: str
-        description: "The name for the new custom model (e.g., 'MyAlpaca')."
+        description: "Name for the output folder."
+      - name: num_epochs
+        type: int
+        default: 1
+      - name: batch_size
+        type: int
+        default: 1
+      - name: learning_rate
+        type: float
+        default: 0.0002
     output:
       - name: status
         type: bool
       - name: message
         type: str
-  - name: ps
-    title: Process Status
-    description: "List currently loaded models and memory usage."
+  - name: merge_lora
+    title: Merge LoRA
+    description: "Merge a LoRA adapter into a base model."
+    parameters:
+      - name: base_model_name
+        type: str
+      - name: lora_model_name
+        type: str
+      - name: new_model_name
+        type: str
+    output:
+      - name: status
+        type: bool
+  - name: list_models
+    title: List Models
+    description: "List models in your local folder."
     parameters: []
     output:
       - name: models
         type: list
-  - name: list_models
-    title: List Available Models
-    description: "Scan local cache and merged models."
+  - name: ps
+    title: Process Status
+    description: "Show loaded models and memory usage."
     parameters: []
     output:
       - name: models

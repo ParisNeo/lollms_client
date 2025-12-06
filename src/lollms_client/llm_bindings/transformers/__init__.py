@@ -15,45 +15,34 @@ from lollms_client.lollms_discussion import LollmsDiscussion
 from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
 
-# --- Pipmaster: Ensure dependencies ---
+# --- Dependencies ---
 pm.ensure_packages([
-    "torch",
-    "transformers",
-    "accelerate",
-    "bitsandbytes",
-    "sentence_transformers", 
-    "pillow",
-    "scipy",
-    "huggingface_hub",
-    "psutil",
-    "peft" # Added for LoRA
+    "torch", "transformers", "accelerate", "bitsandbytes",
+    "sentence_transformers", "pillow", "scipy", "huggingface_hub",
+    "psutil", "peft", "trl", "datasets"
 ])
 
 try:
     import torch
     from transformers import (
-        AutoTokenizer, 
-        AutoModelForCausalLM, 
-        TextIteratorStreamer,
-        BitsAndBytesConfig, 
-        AutoConfig, 
-        AutoProcessor, 
-        LlavaForConditionalGeneration, 
-        LlavaNextForConditionalGeneration,
-        StoppingCriteria
+        AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer,
+        BitsAndBytesConfig, AutoConfig, AutoProcessor, 
+        LlavaForConditionalGeneration, LlavaNextForConditionalGeneration,
+        TrainingArguments
     )
-    from peft import PeftModel # Logic for LoRA
+    from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from trl import SFTTrainer
+    from datasets import load_dataset
     from sentence_transformers import SentenceTransformer
-    from huggingface_hub import snapshot_download, scan_cache_dir
+    from huggingface_hub import snapshot_download
     from PIL import Image
 except ImportError as e:
     ASCIIColors.error(f"Failed to import core libraries: {e}")
     torch = None 
     transformers = None
 
-# --- Helper Classes ---
+# --- Container ---
 class ModelContainer:
-    """Holds a loaded model, its tokenizer, and metadata."""
     def __init__(self, model_id, model, tokenizer, processor=None, device="cpu", quant=None):
         self.model_id = model_id
         self.model = model
@@ -77,12 +66,10 @@ class HuggingFace(LollmsLLMBinding):
         "max_new_tokens": 4096, 
         "temperature": 0.7,
         "trust_remote_code": False, 
-        "use_flash_attention_2": False, 
-        "embedding_model_name": "sentence-transformers/all-MiniLM-L6-v2", 
+        "use_flash_attention_2": False,
+        "embedding_model_name": "sentence-transformers/all-MiniLM-L6-v2",
         "max_active_models": 1,
-        # Path where we save merged models. 
-        # By default, we try to use the binding's local path provided by Lollms
-        "local_models_path": "models/huggingface_merged" 
+        "local_models_path": "" # If empty, dynamic default is used
     }
 
     def __init__(self, **kwargs):
@@ -93,25 +80,29 @@ class HuggingFace(LollmsLLMBinding):
 
         self.config = {**self.DEFAULT_CONFIG_ARGS, **kwargs.get("config", {}), **kwargs}
         
-        # Determine local storage path
-        # If lollms_paths is passed (standard in Lollms), use it
-        lollms_paths = kwargs.get("lollms_paths")
-        if lollms_paths:
-            # Create a dedicated folder for merged models
-            self.local_models_path = Path(lollms_paths.personal_models_path) / "huggingface"
+        # --- 1. Setup Local Models Path ---
+        # Priority: Config Override -> Lollms Personal Path -> Default relative path
+        if self.config["local_models_path"]:
+             self.local_models_path = Path(self.config["local_models_path"])
+        elif kwargs.get("lollms_paths"):
+            self.local_models_path = Path(kwargs["lollms_paths"].personal_models_path) / "huggingface"
         else:
-            self.local_models_path = Path(self.config["local_models_path"])
+            self.local_models_path = Path("models/huggingface")
         
         self.local_models_path.mkdir(parents=True, exist_ok=True)
+        ASCIIColors.info(f"HuggingFace Local Storage: {self.local_models_path}")
 
-        # Smart Management
+        # State
         self.loaded_models: Dict[str, ModelContainer] = {} 
         self.active_model_id: Optional[str] = None
         self.inference_lock = threading.Lock()
+        self.is_training = False
         
+        # Load Embeddings
         self.embedding_model = None
         self.load_embedding_model()
 
+        # Initial Load
         model_name = kwargs.get("model_name")
         if model_name:
             self.load_model(model_name)
@@ -120,94 +111,112 @@ class HuggingFace(LollmsLLMBinding):
         name = self.config.get("embedding_model_name")
         if name:
             try:
+                ASCIIColors.info(f"Loading embedding model: {name}")
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 self.embedding_model = SentenceTransformer(name, device=device)
             except Exception as e:
                 ASCIIColors.warning(f"Failed to load embedding model: {e}")
 
-    def _get_device_and_dtype(self):
-        device_pref = self.config.get("device", "auto")
-        if device_pref == "auto":
-            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-        else:
-            device = device_pref
-        
-        dtype_pref = self.config.get("torch_dtype", "auto")
-        if dtype_pref == "auto":
-            dtype = torch.float16 if device == "cuda" else torch.float32
-        elif dtype_pref == "bfloat16": dtype = torch.bfloat16
-        else: dtype = torch.float32
-        return device, dtype
-
     def _manage_memory(self):
         max_models = int(self.config.get("max_active_models", 1))
         while len(self.loaded_models) >= max_models:
             lru_id = min(self.loaded_models, key=lambda k: self.loaded_models[k].last_used)
+            # Avoid unloading the active one if possible, unless it's the only one and we need a swap
             if lru_id == self.active_model_id and len(self.loaded_models) == 1:
-                pass
-            ASCIIColors.info(f"Smart Manager: Unloading {lru_id} to free memory.")
+                pass 
+            ASCIIColors.info(f"Unloading {lru_id} to free memory.")
             self.unload_model_by_id(lru_id)
 
     def load_model(self, model_name_or_id: str) -> bool:
-        # Check if it is a local path first
-        possible_local_path = self.local_models_path / model_name_or_id
-        if possible_local_path.exists():
-            model_name_or_id = str(possible_local_path)
-            ASCIIColors.info(f"Found local merged model: {model_name_or_id}")
-
+        """
+        Loads a model. Priorities:
+        1. Local folder (self.local_models_path / model_name_or_id)
+        2. Hugging Face Hub (download/cache automatically)
+        """
+        # --- Resolve Path ---
+        # Clean naming for folder lookup
+        folder_name = model_name_or_id.replace("/", "_") # Sanitize potential subdirs if user types "meta-llama/Llama-2"
+        
+        # Check standard path mapping
+        possible_paths = [
+            self.local_models_path / model_name_or_id, # Exact match (subfolders)
+            self.local_models_path / folder_name,      # Flattened match
+            Path(model_name_or_id)                     # Absolute path provided by user
+        ]
+        
+        model_path_to_use = model_name_or_id # Default to ID for HF Hub
+        
+        for p in possible_paths:
+            if p.exists() and p.is_dir() and (p / "config.json").exists():
+                ASCIIColors.info(f"Found local model at: {p}")
+                model_path_to_use = str(p)
+                break
+        
+        # Check if already loaded
         if model_name_or_id in self.loaded_models:
             self.active_model_id = model_name_or_id
             self.loaded_models[model_name_or_id].update_usage()
-            ASCIIColors.success(f"Switched to loaded model: {model_name_or_id}")
             return True
 
         self._manage_memory()
+        if self.is_training:
+            ASCIIColors.error("Training in progress. Cannot load new model.")
+            return False
 
-        ASCIIColors.info(f"Loading {model_name_or_id}...")
-        device, dtype = self._get_device_and_dtype()
+        ASCIIColors.info(f"Loading {model_name_or_id} (Path/ID: {model_path_to_use})...")
         
-        quant_mode = self.config.get("quantize", False)
-        bnb_config = None
-        load_in_8bit = str(quant_mode) == "8bit"
-        load_in_4bit = str(quant_mode) == "4bit"
+        # --- Config & Device ---
+        device = "cuda" if torch.cuda.is_available() and self.config["device"]=="auto" else "cpu"
+        if self.config["device"] != "auto": device = self.config["device"]
 
+        dtype_map = {"auto": torch.float16 if device=="cuda" else torch.float32, 
+                     "float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+        dtype = dtype_map.get(self.config["torch_dtype"], torch.float32)
+
+        quant_mode = self.config.get("quantize", False)
+        load_in_4bit = str(quant_mode) == "4bit"
+        load_in_8bit = str(quant_mode) == "8bit"
+        
+        bnb_config = None
         if device == "cuda" and load_in_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True, bnb_4bit_quant_type="nf4", 
-                bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=dtype
-            )
+            bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", 
+                                            bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=dtype)
 
         model_args = {
             "trust_remote_code": self.config.get("trust_remote_code", False),
-            "torch_dtype": dtype if not (load_in_8bit or load_in_4bit) else None,
+            "torch_dtype": dtype if not (load_in_4bit or load_in_8bit) else None,
+            "device_map": "auto" if device == "cuda" else None
         }
-        
+
         if self.config.get("use_flash_attention_2") and device == "cuda":
             try:
                 import flash_attn
                 model_args["attn_implementation"] = "flash_attention_2"
-            except: pass
+            except ImportError:
+                ASCIIColors.warning("Flash Attention 2 enabled but not installed.")
 
-        if load_in_8bit: model_args["load_in_8bit"] = True
         if load_in_4bit: model_args["quantization_config"] = bnb_config
-        if device == "cuda" and (load_in_8bit or load_in_4bit or torch.cuda.device_count() > 1):
-            model_args["device_map"] = "auto"
+        if load_in_8bit: model_args["load_in_8bit"] = True
 
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name_or_id, trust_remote_code=model_args["trust_remote_code"])
+            # Tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(model_path_to_use, trust_remote_code=model_args["trust_remote_code"])
             if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-            
-            config = AutoConfig.from_pretrained(model_name_or_id, trust_remote_code=model_args["trust_remote_code"])
-            
-            processor = None
-            if "llava" in config.model_type or "Llava" in str(getattr(config, "architectures", [])):
-                processor = AutoProcessor.from_pretrained(model_name_or_id, trust_remote_code=model_args["trust_remote_code"])
-                ModelClass = LlavaNextForConditionalGeneration if "LlavaNext" in str(getattr(config, "architectures", [])) else LlavaForConditionalGeneration
-                model = ModelClass.from_pretrained(model_name_or_id, **model_args)
-            else:
-                model = AutoModelForCausalLM.from_pretrained(model_name_or_id, **model_args)
 
-            if "device_map" not in model_args and device != "cpu":
+            # Architecture Detection
+            config = AutoConfig.from_pretrained(model_path_to_use, trust_remote_code=model_args["trust_remote_code"])
+            processor = None
+            
+            # LLaVA Check
+            if "llava" in config.model_type.lower() or "Llava" in str(getattr(config, "architectures", [])):
+                processor = AutoProcessor.from_pretrained(model_path_to_use, trust_remote_code=model_args["trust_remote_code"])
+                ModelClass = LlavaNextForConditionalGeneration if "next" in config.model_type.lower() else LlavaForConditionalGeneration
+                model = ModelClass.from_pretrained(model_path_to_use, **model_args)
+            else:
+                model = AutoModelForCausalLM.from_pretrained(model_path_to_use, **model_args)
+
+            # Fallback for device placement
+            if not model_args.get("device_map") and device != "cpu" and not (load_in_4bit or load_in_8bit):
                 model.to(device)
             
             model.eval()
@@ -215,43 +224,39 @@ class HuggingFace(LollmsLLMBinding):
             container = ModelContainer(model_name_or_id, model, tokenizer, processor, device, quant_mode)
             self.loaded_models[model_name_or_id] = container
             self.active_model_id = model_name_or_id
-            
-            ASCIIColors.success(f"Model {model_name_or_id} loaded successfully.")
+            ASCIIColors.success(f"Loaded {model_name_or_id}")
             return True
-
+            
         except Exception as e:
-            ASCIIColors.error(f"Failed to load model: {e}")
+            ASCIIColors.error(f"Load failed: {e}")
             trace_exception(e)
             return False
 
     def unload_model_by_id(self, model_id: str):
         if model_id in self.loaded_models:
             del self.loaded_models[model_id]
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            import gc
-            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            import gc; gc.collect()
 
-    def get_container(self) -> Optional[ModelContainer]:
-        if self.active_model_id and self.active_model_id in self.loaded_models:
-            return self.loaded_models[self.active_model_id]
-        return None
+    def get_container(self):
+        return self.loaded_models.get(self.active_model_id)
 
-    def generate_text(self, prompt: str, images: List[str] = None, system_prompt: str = "", 
-                      stream: bool = False, streaming_callback=None, split=False, 
-                      n_predict=None, **kwargs) -> Union[str, Dict]:
+    # --- Generation ---
+    def generate_text(self, prompt, images=None, system_prompt="", stream=False, streaming_callback=None, split=False, n_predict=None, **kwargs):
+        if self.is_training: return {"status": False, "error": "Training in progress."}
         
         container = self.get_container()
-        if not container:
-            return {"status": False, "error": "No model loaded."}
+        if not container: return {"status": False, "error": "No model loaded."}
         
         container.update_usage()
 
         with self.inference_lock:
             inputs = {}
+            # Vision
             if container.supports_vision and images:
                 pil_images = [Image.open(p).convert("RGB") for p in images]
                 inputs = container.processor(text=prompt, images=pil_images, return_tensors="pt").to(container.model.device)
+            # Text / Chat
             else:
                 if hasattr(container.tokenizer, 'apply_chat_template') and not split:
                     messages = []
@@ -271,22 +276,20 @@ class HuggingFace(LollmsLLMBinding):
                 "do_sample": kwargs.get("temperature", 0.7) > 0,
                 "pad_token_id": container.tokenizer.eos_token_id
             }
-            
+
             try:
                 if stream and streaming_callback:
                     streamer = TextIteratorStreamer(container.tokenizer, skip_prompt=True, skip_special_tokens=True)
                     gen_kwargs["streamer"] = streamer
-                    
                     t = threading.Thread(target=container.model.generate, kwargs={**inputs, **gen_kwargs})
                     t.start()
                     
-                    full_text = ""
+                    full = ""
                     for chunk in streamer:
-                        full_text += chunk
-                        if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK):
-                            break 
+                        full += chunk
+                        if not streaming_callback(chunk, MSG_TYPE.MSG_TYPE_CHUNK): break
                     t.join()
-                    return full_text
+                    return full
                 else:
                     outputs = container.model.generate(**inputs, **gen_kwargs)
                     text = container.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
@@ -295,121 +298,206 @@ class HuggingFace(LollmsLLMBinding):
                 trace_exception(e)
                 return {"status": False, "error": str(e)}
 
-    # --- Management Commands ---
+    # --- Commands ---
 
     def list_models(self) -> List[Dict[str, str]]:
-        """Lists models from HF Cache AND Local Merged Storage."""
+        """Scans the designated local_models_path."""
         models = []
-        
-        # 1. Scan Local Merged Models
         if self.local_models_path.exists():
             for item in self.local_models_path.iterdir():
-                if item.is_dir() and (item / "config.json").exists():
-                    models.append({
-                        "model_name": item.name,
-                        "source": "Local Merged",
-                        "size": "N/A",
-                        "path": str(item)
-                    })
-
-        # 2. Scan HF Cache
-        try:
-            hf_cache_info = scan_cache_dir()
-            for repo in hf_cache_info.repos:
-                size_gb = repo.size_on_disk / (1024**3)
-                models.append({
-                    "model_name": repo.repo_id,
-                    "source": "HF Cache",
-                    "size": f"{size_gb:.2f} GB",
-                    "path": str(repo.repo_path)
-                })
-        except Exception:
-            pass 
-
+                if item.is_dir():
+                    # Simple heuristic to check if it's a valid HF model folder
+                    if (item / "config.json").exists() or (item / "adapter_config.json").exists():
+                        try:
+                            size_gb = sum(f.stat().st_size for f in item.rglob('*') if f.is_file()) / (1024**3)
+                        except: size_gb = 0
+                        
+                        models.append({
+                            "model_name": item.name,
+                            "path": str(item),
+                            "size": f"{size_gb:.2f} GB",
+                            "source": "Local Storage"
+                        })
         return models
 
     def pull_model(self, model_name: str) -> dict:
+        """Downloads model files directly to self.local_models_path."""
         try:
-            ASCIIColors.info(f"Downloading {model_name}...")
-            path = snapshot_download(repo_id=model_name)
-            msg = f"Model {model_name} downloaded."
+            ASCIIColors.info(f"Downloading {model_name} to {self.local_models_path}...")
+            
+            # We preserve the folder structure simply using the last part of the repo name
+            # e.g. 'meta-llama/Llama-2-7b' -> 'Llama-2-7b' folder in local path.
+            # OR use the full 'meta-llama_Llama-2-7b' to avoid name collisions.
+            folder_name = model_name.replace("/", "_")
+            target_dir = self.local_models_path / folder_name
+            
+            # local_dir ensures actual files are downloaded, not just cache pointers
+            path = snapshot_download(repo_id=model_name, local_dir=target_dir, local_dir_use_symlinks=False)
+            
+            msg = f"Model downloaded successfully to {path}"
             ASCIIColors.success(msg)
-            return {"status": True, "message": msg, "path": path}
+            return {"status": True, "message": msg, "path": str(path)}
         except Exception as e:
             return {"status": False, "message": str(e)}
 
-    def merge_lora(self, base_model_name: str, lora_model_name: str, new_model_name: str) -> dict:
-        """
-        Loads a base model and a LoRA adapter, merges them, and saves to disk.
-        """
-        try:
-            ASCIIColors.info(f"Starting merge: {base_model_name} + {lora_model_name} -> {new_model_name}")
-            
-            # Destination path
-            save_path = self.local_models_path / new_model_name
-            if save_path.exists():
-                return {"status": False, "message": f"Model '{new_model_name}' already exists locally."}
+    def train(self, base_model_name: str, dataset_path: str, new_model_name: str, num_epochs=1, batch_size=1, learning_rate=2e-4) -> dict:
+        if self.is_training: return {"status": False, "message": "Busy."}
+        
+        # Output to local path
+        output_dir = self.local_models_path / new_model_name
+        if output_dir.exists(): return {"status": False, "message": "Model exists."}
+        
+        # Resolve base model path (is it local or remote?)
+        # Reuse logic from load_model's resolution if strictly needed, or let HF handle it.
+        # But for QLoRA, we usually want the base model weights. 
+        # We pass 'base_model_name' directly; if it matches a local folder in `load_model`, 
+        # the user should probably pass that full path or we resolve it here.
+        # Let's resolve it against local path:
+        possible_local = self.local_models_path / base_model_name
+        if possible_local.exists():
+            base_model_path = str(possible_local)
+        else:
+            base_model_path = base_model_name
 
-            # 1. Load Base Model (Low CPU Memory usage to prevent OOM)
-            # We usually merge on CPU or CUDA but strictly without quantization for correct saving
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            ASCIIColors.info(f"Loading base model {base_model_name} on {device} (no quantization)...")
+        t = threading.Thread(target=self._run_training_job, args=(base_model_path, dataset_path, str(output_dir), num_epochs, batch_size, learning_rate))
+        t.start()
+        return {"status": True, "message": f"Training started. Output: {output_dir}"}
+
+    def _run_training_job(self, base_model, dataset_path, output_dir, epochs, batch_size, lr):
+        self.is_training = True
+        self.inference_lock.acquire()
+        try:
+            ASCIIColors.info(f"Training Base: {base_model}")
             
-            base_model = AutoModelForCausalLM.from_pretrained(
-                base_model_name,
-                return_dict=True,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                device_map=device,
-                low_cpu_mem_usage=True,
+            # Dataset
+            ext = "json" if dataset_path.endswith("json") else "text"
+            dataset = load_dataset(ext, data_files=dataset_path, split="train")
+
+            # QLoRA Setup
+            bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model, quantization_config=bnb_config, device_map="auto",
                 trust_remote_code=self.config.get("trust_remote_code", False)
             )
+            model.config.use_cache = False
+            model = prepare_model_for_kbit_training(model)
             
-            tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=self.config.get("trust_remote_code", False))
+            tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+            if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "right"
 
-            # 2. Load LoRA
-            ASCIIColors.info(f"Loading LoRA adapter {lora_model_name}...")
-            model_to_merge = PeftModel.from_pretrained(base_model, lora_model_name)
+            peft_config = LoraConfig(r=64, lora_alpha=16, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM", bias="none", lora_dropout=0.1)
+            model = get_peft_model(model, peft_config)
 
-            # 3. Merge
-            ASCIIColors.info("Merging weights...")
-            model_to_merge = model_to_merge.merge_and_unload()
-            
-            # 4. Save
-            ASCIIColors.info(f"Saving to {save_path}...")
-            model_to_merge.save_pretrained(save_path)
-            tokenizer.save_pretrained(save_path)
-            
-            # Cleanup
-            del model_to_merge
-            del base_model
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            # Formatting
+            def format_prompts(examples):
+                texts = []
+                for i in range(len(examples.get("instruction", []))):
+                    ins = examples["instruction"][i]
+                    inp = examples.get("input", [""])[i]
+                    out = examples.get("output", [""])[i]
+                    if inp: text = f"### Instruction:\n{ins}\n\n### Input:\n{inp}\n\n### Response:\n{out}<|endoftext|>"
+                    else: text = f"### Instruction:\n{ins}\n\n### Response:\n{out}<|endoftext|>"
+                    texts.append(text)
+                return texts if texts else examples.get("text", [])
 
-            msg = f"Successfully created '{new_model_name}'. It is now available in your model list."
-            ASCIIColors.success(msg)
-            return {"status": True, "message": msg, "path": str(save_path)}
-
+            trainer = SFTTrainer(
+                model=model, train_dataset=dataset, peft_config=peft_config,
+                formatting_func=format_prompts, tokenizer=tokenizer,
+                args=TrainingArguments(
+                    output_dir=output_dir, num_train_epochs=epochs,
+                    per_device_train_batch_size=batch_size, gradient_accumulation_steps=4,
+                    learning_rate=lr, fp16=True, logging_steps=10, save_strategy="epoch", optim="paged_adamw_32bit"
+                )
+            )
+            trainer.train()
+            trainer.save_model(output_dir)
+            ASCIIColors.success("Training Finished.")
         except Exception as e:
+            ASCIIColors.error(f"Training error: {e}")
             trace_exception(e)
-            return {"status": False, "message": f"Merge failed: {str(e)}"}
+        finally:
+            self.inference_lock.release()
+            self.is_training = False
 
-    def ps(self) -> List[Dict]:
-        status_list = []
-        system_ram = psutil.virtual_memory()
+    def merge_lora(self, base_model_name, lora_model_name, new_model_name):
+        # Resolve Base
+        possible_base = self.local_models_path / base_model_name
+        base_path = str(possible_base) if possible_base.exists() else base_model_name
         
-        gpu_info = "N/A"
+        # Resolve LoRA (Usually local if trained here)
+        possible_lora = self.local_models_path / lora_model_name
+        lora_path = str(possible_lora) if possible_lora.exists() else lora_model_name
+
+        save_path = self.local_models_path / new_model_name
+        
+        try:
+            ASCIIColors.info(f"Merging {base_path} + {lora_path} -> {save_path}")
+            base = AutoModelForCausalLM.from_pretrained(base_path, return_dict=True, torch_dtype=torch.float16, device_map="auto", trust_remote_code=self.config.get("trust_remote_code"))
+            tokenizer = AutoTokenizer.from_pretrained(base_path)
+            
+            merged = PeftModel.from_pretrained(base, lora_path).merge_and_unload()
+            merged.save_pretrained(save_path)
+            tokenizer.save_pretrained(save_path)
+            return {"status": True, "message": "Merged."}
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
+def ps(self) -> Dict[str, List[Dict]]:
+        """
+        Returns the process status of loaded models, including memory usage.
+        """
+        models_status = []
+        
+        # Get global GPU info once
+        gpu_total_mem = 0
         if torch.cuda.is_available():
-            gpu_mem = torch.cuda.memory_allocated() / (1024**3)
-            gpu_res = torch.cuda.memory_reserved() / (1024**3)
-            gpu_info = f"{gpu_mem:.2f}GB / {gpu_res:.2f}GB"
+            try:
+                gpu_total_mem = torch.cuda.get_device_properties(0).total_memory
+            except:
+                gpu_total_mem = 0
+
+        system_mem = psutil.virtual_memory()
 
         for mid, container in self.loaded_models.items():
-            status_list.append({
-                "model_name": mid,
+            # 1. Calculate Model Size (Bytes)
+            try:
+                # Hugging Face models track their own footprint
+                size_bytes = container.model.get_memory_footprint()
+            except Exception:
+                size_bytes = 0
+            
+            # 2. Split into VRAM/RAM based on device
+            size_vram = 0
+            size_ram = 0
+            
+            if container.device == "cuda":
+                size_vram = size_bytes
+            else:
+                size_ram = size_bytes
+            
+            # 3. Calculate Percentages
+            gpu_usage_percent = 0
+            if gpu_total_mem > 0:
+                gpu_usage_percent = (size_vram / gpu_total_mem) * 100
+            
+            # For CPU, we compare against total system RAM
+            cpu_usage_percent = 0
+            if system_mem.total > 0:
+                cpu_usage_percent = (size_ram / system_mem.total) * 100
+
+            models_status.append({
+                "model_name": mid,            # UI Standard: 'model_name'
                 "active": mid == self.active_model_id,
+                "size": size_bytes,           # Total size in bytes
+                "size_vram": size_vram,       # GPU memory usage in bytes
+                "size_ram": size_ram,         # RAM usage in bytes
                 "device": container.device,
-                "quantization": container.quantization,
-                "system_ram_usage": f"{system_ram.percent}%",
-                "gpu_memory": gpu_info,
+                "gpu_usage_percent": round(gpu_usage_percent, 2),
+                "cpu_usage_percent": round(cpu_usage_percent, 2),
+                "loader": "HuggingFace"
             })
-        
-        return status_list or [{"model_name": "No models loaded.", "active": False}]
+            
+        # Return a dictionary matching the YAML output definition
+        return {"models": models_status}
