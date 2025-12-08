@@ -1,0 +1,69 @@
+title: 'VibeVoice Realtime'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'vibevoice'
+
+description: |
+  VibeVoice is a low-latency, real-time speech synthesis binding designed for 
+  conversational AI. It supports immediate audio streaming and session management.
+
+input_parameters:
+  - name: "host"
+    type: "str"
+    default: "localhost"
+    description: "The host address on which the VibeVoice server is running."
+  - name: "port"
+    type: "int"
+    default: 9634
+    description: "The port number for the VibeVoice server."
+  - name: "gpu_id"
+    type: "int"
+    default: 0
+    description: "The GPU ID to use (if available)."
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The text to synthesize."
+  - name: "voice"
+    type: "str"
+    default: "default_female"
+    description: "The voice profile to use."
+  - name: "speed"
+    type: "float"
+    default: 1.0
+    description: "Speech speed multiplier."
+
+# ACTIONS DEFINITION
+actions:
+  - name: start_conversation
+    title: "Start Conversation Session"
+    description: "Initializes a real-time conversation session, warming up the model buffer."
+    parameters: 
+      - name: session_id
+        type: str
+        description: "Unique identifier for the conversation session."
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
+
+  - name: stop_conversation
+    title: "Stop Conversation Session"
+    description: "Ends the current session and clears audio buffers."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+
+  - name: change_voice_tone
+    title: "Change Voice Tone"
+    description: "Adjusts the emotional tone of the voice in real-time."
+    parameters:
+      - name: emotion
+        type: str
+        options: ["neutral", "happy", "sad", "angry", "excited"]
+    output:
+      - name: success
+        type: bool

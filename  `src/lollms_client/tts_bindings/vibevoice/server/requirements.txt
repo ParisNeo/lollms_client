@@ -1,0 +1,6 @@
+fastapi==0.109.2
+uvicorn==0.27.1
+ascii_colors
+numpy
+# Add your real-time TTS engine here (e.g., edge-tts, pyttsx3, or torch/transformers for heavy models)
+# For this template, we keep it minimal.
