@@ -1096,6 +1096,27 @@ class LollmsDiscussion:
         callback = kwargs.get("streaming_callback")
         collected_sources = []
         
+
+        # Step 1: Add user message, now including any images.
+        if add_user_message:
+            user_msg = self.add_message(
+                sender=kwargs.get("user_name", "user"), 
+                sender_type="user", 
+                content=user_message,
+                images=images,
+                **kwargs
+            )
+        else: # Regeneration logic
+            # _validate_and_set_active_branch ensures active_branch_id is valid and a leaf.
+            # So, if we are regenerating, active_branch_id must be valid.
+            if self.active_branch_id not in self._message_index: # Redundant check, but safe
+                 raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
+            user_msg_orm = self._message_index[self.active_branch_id]
+            if user_msg_orm.sender_type != 'user':
+                raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
+            user_msg = LollmsMessage(self, user_msg_orm)
+            images = user_msg.images
+                    
         # extract personality data
         if personality is not None:
             object.__setattr__(self, '_system_prompt', personality.system_prompt)
@@ -1182,26 +1203,6 @@ class LollmsDiscussion:
             
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
-
-        # Step 1: Add user message, now including any images.
-        if add_user_message:
-            user_msg = self.add_message(
-                sender=kwargs.get("user_name", "user"), 
-                sender_type="user", 
-                content=user_message,
-                images=images,
-                **kwargs
-            )
-        else: # Regeneration logic
-            # _validate_and_set_active_branch ensures active_branch_id is valid and a leaf.
-            # So, if we are regenerating, active_branch_id must be valid.
-            if self.active_branch_id not in self._message_index: # Redundant check, but safe
-                 raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
-            user_msg_orm = self._message_index[self.active_branch_id]
-            if user_msg_orm.sender_type != 'user':
-                raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
-            user_msg = LollmsMessage(self, user_msg_orm)
-            images = user_msg.images
 
         is_agentic_turn = (effective_use_mcps is not None and effective_use_mcps) or (use_data_store is not None and use_data_store)
         
