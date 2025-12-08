@@ -34,8 +34,7 @@ if False:
 
 from lollms_client.lollms_utilities import build_image_dicts, robust_json_parser
 from ascii_colors import ASCIIColors, trace_exception
-# Assuming lollms_types is a local module providing MSG_TYPE enum/constants
-# from .lollms_types import MSG_TYPE 
+from lollms_client.lollms_types import MSG_TYPE 
 
 class EncryptedString(TypeDecorator):
     """A SQLAlchemy TypeDecorator for field-level database encryption.
@@ -1095,14 +1094,14 @@ class LollmsDiscussion:
             where the 'ai_message' will contain rich metadata if an agentic turn was used.
         """
         callback = kwargs.get("streaming_callback")
+        collected_sources = []
+        
         # extract personality data
         if personality is not None:
             object.__setattr__(self, '_system_prompt', personality.system_prompt)
 
             # --- New Data Source Handling Logic ---
             if hasattr(personality, 'data_source') and personality.data_source is not None:
-                # Placeholder for MSG_TYPE if not imported
-                MSG_TYPE = SimpleNamespace(MSG_TYPE_STEP="step", MSG_TYPE_STEP_START="step_start", MSG_TYPE_STEP_END="step_end", MSG_TYPE_EXCEPTION="exception")
 
                 if isinstance(personality.data_source, str):
                     # --- Static Data Source ---
@@ -1154,6 +1153,15 @@ class LollmsDiscussion:
                                 
                                 if retrieved_data:
                                     self.personality_data_zone = retrieved_data.strip()
+                                    source_item = {
+                                        "title": "Personality Data Source",
+                                        "content": retrieved_data,
+                                        "source": personality.name if hasattr(personality, 'name') else "Personality",
+                                        "query": generated_query
+                                    }
+                                    collected_sources.append(source_item)
+                                    if callback:
+                                        callback([source_item], MSG_TYPE.MSG_TYPE_SOURCES_LIST)
 
                             except Exception as e:
                                 trace_exception(e)
@@ -1262,8 +1270,11 @@ class LollmsDiscussion:
         message_meta = {}
         if is_agentic_turn and isinstance(agent_result, dict):
             if "tool_calls" in agent_result: message_meta["tool_calls"] = agent_result["tool_calls"]
-            if "sources" in agent_result: message_meta["sources"] = agent_result["sources"]
+            if "sources" in agent_result: collected_sources.extend(agent_result["sources"])
             if agent_result.get("clarification_required", False): message_meta["clarification_required"] = True
+
+        if collected_sources:
+             message_meta["sources"] = collected_sources
 
         ai_message_obj = self.add_message(
             sender=personality.name if personality else "assistant",
