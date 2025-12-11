@@ -1053,7 +1053,7 @@ class LollmsDiscussion:
         debug: bool = False,
         remove_thinking_blocks:bool = True,
         **kwargs
-    ) -> Dict[str, 'LollmsMessage']:
+    ) -> Dict[str, Any]:
         """Main interaction method that can invoke the dynamic, multi-modal agent.
 
         This method orchestrates the entire response generation process. It can
@@ -1294,9 +1294,9 @@ class LollmsDiscussion:
         if self._is_db_backed and self.autosave:
             self.commit()
             
-        return {"user_message": user_msg, "ai_message": ai_message_obj}
+        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
 
-    def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, 'LollmsMessage']:
+    def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Regenerates the AI response for a given message or the active branch's AI response.
 
         If the target is an AI message, it's deleted and its children are re-parented to its parent

@@ -46,6 +46,7 @@ class DiffusersBinding(LollmsTTIBinding):
         self.host = kwargs.get("host", "localhost")
         self.port = kwargs.get("port", 9632)
         self.auto_start_server = kwargs.get("auto_start_server", True)
+        self.wait_for_server = kwargs.get("wait_for_server", False)
         self.server_process = None
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
@@ -85,27 +86,29 @@ class DiffusersBinding(LollmsTTIBinding):
         if self.is_server_running():
             ASCIIColors.green("Diffusers Server is already running and responsive.")
             return
-
-        try:
-            # Try to acquire the lock with a timeout. If another process is starting
-            # the server, this will wait until it's finished.
-            with lock.acquire(timeout=3):
-                # After acquiring the lock, we MUST re-check if the server is running.
-                # Another process might have started it and released the lock while we were waiting.
-                if not self.is_server_running():
-                    ASCIIColors.yellow("Lock acquired. Starting dedicated Diffusers server...")
+        else:
+            if self.wait_for_server:
+                try:
+                    # Try to acquire the lock with a timeout. If another process is starting
+                    # the server, this will wait until it's finished.
+                    with lock.acquire(timeout=1):
+                        # After acquiring the lock, we MUST re-check if the server is running.
+                        # Another process might have started it and released the lock while we were waiting.
+                        if not self.is_server_running():
+                            ASCIIColors.yellow("Lock acquired. Starting dedicated Diffusers server...")
+                            self.start_server()
+                            # The process that starts the server is responsible for waiting for it to be ready
+                            # BEFORE releasing the lock. This is the key to preventing race conditions.
+                            self._wait_for_server()
+                        else:
+                            ASCIIColors.green("Server was started by another process while we waited. Connected successfully.")
+                except Timeout:
+                    # This happens if the process holding the lock takes more than 60 seconds to start the server.
+                    # We don't try to start another one. We just wait for the existing one to be ready.
+                    ASCIIColors.yellow("Could not acquire lock, another process is taking a long time to start the server. Waiting...")
+            else:
+                with lock.acquire(timeout=0.01):
                     self.start_server()
-                    # The process that starts the server is responsible for waiting for it to be ready
-                    # BEFORE releasing the lock. This is the key to preventing race conditions.
-                    self._wait_for_server()
-                else:
-                    ASCIIColors.green("Server was started by another process while we waited. Connected successfully.")
-        except Timeout:
-            # This happens if the process holding the lock takes more than 60 seconds to start the server.
-            # We don't try to start another one. We just wait for the existing one to be ready.
-            ASCIIColors.yellow("Could not acquire lock, another process is taking a long time to start the server. Waiting...")
-            self._wait_for_server(timeout=60) # Give it a longer timeout here just in case.
-
         # A final verification to ensure we are connected.
         if not self.is_server_running():
             raise RuntimeError("Failed to start or connect to the Diffusers server after all attempts.")
