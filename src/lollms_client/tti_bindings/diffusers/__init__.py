@@ -26,26 +26,19 @@ except ImportError:
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import ASCIIColors
 
-BindingName = "DiffusersBinding"
+BindingName = "DiffusersTTIBinding"
 
-class DiffusersBinding(LollmsTTIBinding):
-    """
-    Client binding for a dedicated, managed Diffusers server.
-    This architecture prevents multiple models from being loaded into memory
-    in a multi-worker environment, solving OOM errors.
-    """
-    def __init__(self,
-                 **kwargs):
+class DiffusersTTIBinding(LollmsTTIBinding):
+    def __init__(self, **kwargs):
         # Prioritize 'model_name' but accept 'model' as an alias from config files.
         if 'model' in kwargs and 'model_name' not in kwargs:
             kwargs['model_name'] = kwargs.pop('model')
         super().__init__(binding_name=BindingName, config=kwargs)
 
-
-
+        self.config = kwargs
         self.host = kwargs.get("host", "localhost")
         self.port = kwargs.get("port", 9632)
-        self.auto_start_server = kwargs.get("auto_start_server", True)
+        self.auto_start_server = kwargs.get("auto_start_server", False)
         self.wait_for_server = kwargs.get("wait_for_server", False)
         self.server_process = None
         self.base_url = f"http://{self.host}:{self.port}"
@@ -54,9 +47,11 @@ class DiffusersBinding(LollmsTTIBinding):
         self.venv_dir = Path("./venv/tti_diffusers_venv")
         self.models_path = Path(kwargs.get("models_path", "./data/models/diffusers_models")).resolve()
         self.extra_models_path = kwargs.get("extra_models_path")
+        self.hf_token = kwargs.get("hf_token", "")  # NEW
         self.models_path.mkdir(exist_ok=True, parents=True)
         if self.auto_start_server:
-            self.ensure_server_is_running()
+            self.ensure_server_is_running(self.wait_for_server)
+
 
     def is_server_running(self) -> bool:
         """Checks if the server is already running and responsive."""
@@ -69,17 +64,13 @@ class DiffusersBinding(LollmsTTIBinding):
         return False
 
 
-    def ensure_server_is_running(self):
+    def ensure_server_is_running(self, wait= False):
         """
         Ensures the Diffusers server is running. If not, it attempts to start it
         in a process-safe manner using a file lock. This method is designed to
         prevent race conditions in multi-worker environments.
         """
         self.server_dir.mkdir(exist_ok=True)
-        # Use a lock file in the binding's server directory for consistency across instances
-        lock_path = self.server_dir / "diffusers_server.lock"
-        lock = FileLock(lock_path)
-
         ASCIIColors.info("Attempting to start or connect to the Diffusers server...")
 
         # First, perform a quick check without the lock to avoid unnecessary waiting.
@@ -87,31 +78,7 @@ class DiffusersBinding(LollmsTTIBinding):
             ASCIIColors.green("Diffusers Server is already running and responsive.")
             return
         else:
-            if self.wait_for_server:
-                try:
-                    # Try to acquire the lock with a timeout. If another process is starting
-                    # the server, this will wait until it's finished.
-                    with lock.acquire(timeout=1):
-                        # After acquiring the lock, we MUST re-check if the server is running.
-                        # Another process might have started it and released the lock while we were waiting.
-                        if not self.is_server_running():
-                            ASCIIColors.yellow("Lock acquired. Starting dedicated Diffusers server...")
-                            self.start_server()
-                            # The process that starts the server is responsible for waiting for it to be ready
-                            # BEFORE releasing the lock. This is the key to preventing race conditions.
-                            self._wait_for_server()
-                        else:
-                            ASCIIColors.green("Server was started by another process while we waited. Connected successfully.")
-                except Timeout:
-                    # This happens if the process holding the lock takes more than 60 seconds to start the server.
-                    # We don't try to start another one. We just wait for the existing one to be ready.
-                    ASCIIColors.yellow("Could not acquire lock, another process is taking a long time to start the server. Waiting...")
-            else:
-                with lock.acquire(timeout=0.01):
-                    self.start_server()
-        # A final verification to ensure we are connected.
-        if not self.is_server_running():
-            raise RuntimeError("Failed to start or connect to the Diffusers server after all attempts.")
+            self.start_server(wait)
 
     def install_server_dependencies(self):
         """
@@ -178,43 +145,70 @@ class DiffusersBinding(LollmsTTIBinding):
 
         ASCIIColors.green("Server dependencies are satisfied.")
 
-    def start_server(self):
+    def start_server(self, wait=True, timeout_s=20):
         """
-        Installs dependencies and launches the FastAPI server as a background subprocess.
+        Launches the FastAPI server in a background thread and returns immediately.
         This method should only be called from within a file lock.
         """
-        server_script = self.server_dir / "main.py"
-        if not server_script.exists():
-            # Fallback for old structure
-            server_script = self.binding_root / "server.py"
-            if not server_script.exists():
-                raise FileNotFoundError(f"Server script not found at {server_script}. Make sure it's in a 'server' subdirectory.")
-        if not self.venv_dir.exists():
-            self.install_server_dependencies()
+        import threading
+        
 
-        if sys.platform == "win32":
-            python_executable = self.venv_dir / "Scripts" / "python.exe"
-        else:
-            python_executable = self.venv_dir / "bin" / "python"
+        def _start_server_background():
+            """Helper method to start the server in a background thread."""
+            # Use a lock file in the binding's server directory for consistency across instances
+            lock_path = self.server_dir / "diffusers_server.lock"
+            lock = FileLock(lock_path)
+            with lock.acquire(timeout=0):
+                try:
+                    server_script = self.server_dir / "main.py"
+                    if not server_script.exists():
+                        # Fallback for old structure
+                        server_script = self.binding_root / "server.py"
+                        if not server_script.exists():
+                            raise FileNotFoundError(f"Server script not found at {server_script}. Make sure it's in a 'server' subdirectory.")
+                    if not self.venv_dir.exists():
+                        self.install_server_dependencies()
 
-        command = [
-            str(python_executable),
-            str(server_script),
-            "--host", self.host,
-            "--port", str(self.port),
-            "--models-path", str(self.models_path.resolve()) # Pass models_path to server
-        ]
+                    if sys.platform == "win32":
+                        python_executable = self.venv_dir / "Scripts" / "python.exe"
+                    else:
+                        python_executable = self.venv_dir / "bin" / "python"
 
-        if self.extra_models_path:
-            resolved_extra_path = Path(self.extra_models_path).resolve()
-            command.extend(["--extra-models-path", str(resolved_extra_path)])
+                    command = [
+                        str(python_executable),
+                        str(server_script),
+                        "--host", self.host,
+                        "--port", str(self.port),
+                        "--models-path", str(self.models_path.resolve())
+                    ]
 
-        # Use DETACHED_PROCESS on Windows to allow the server to run independently of the parent process.
-        # On Linux/macOS, the process will be daemonized enough to not be killed with the worker.
-        creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+                    if self.extra_models_path:
+                        resolved_extra_path = Path(self.extra_models_path).resolve()
+                        command.extend(["--extra-models-path", str(resolved_extra_path)])
 
-        self.server_process = subprocess.Popen(command, creationflags=creationflags)
-        ASCIIColors.info("Diffusers server process launched in the background.")
+                    if self.hf_token:
+                        command.extend(["--hf-token", self.hf_token])
+
+                    if self.extra_models_path:
+                        resolved_extra_path = Path(self.extra_models_path).resolve()
+                        command.extend(["--extra-models-path", str(resolved_extra_path)])
+
+                    creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+                    self.server_process = subprocess.Popen(command, creationflags=creationflags)
+                    ASCIIColors.info("Diffusers server process launched in the background.")
+                    while(not self.is_server_running()):
+                        time.sleep(1)
+                    
+                except Exception as e:
+                    ASCIIColors.error(f"Failed to start Diffusers server: {e}")
+                    raise
+
+        # Start the server in a background thread
+        thread = threading.Thread(target=_start_server_background, daemon=True)
+        thread.start()
+        if wait:
+            thread.join()
+
 
     def _wait_for_server(self, timeout=30):
         """Waits for the server to become responsive."""
@@ -291,6 +285,7 @@ class DiffusersBinding(LollmsTTIBinding):
         pass
 
     def generate_image(self, prompt: str, negative_prompt: str = "", **kwargs) -> bytes:
+        self.ensure_server_is_running(True)
         params = kwargs.copy()
         if "model_name" not in params and self.config.get("model_name"):
             params["model_name"] = self.config["model_name"]
@@ -303,6 +298,7 @@ class DiffusersBinding(LollmsTTIBinding):
         return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
+        self.ensure_server_is_running(True)
         images_b64 = []
         if not isinstance(images, list):
             images = [images]
@@ -345,24 +341,48 @@ class DiffusersBinding(LollmsTTIBinding):
         response = self._post_json_request("/edit_image", data=json_payload)
         return response.content
 
-    def list_models(self) -> List[Dict[str, Any]]:
-        return self._get_request("/list_models").json()
+    def list_models(self) -> list:
+        """
+        Lists only models that are available locally on disk.
+
+        The Diffusers server scans `models_path` and `extra_models_path` for:
+          - Diffusers pipeline folders (with model_index.json, etc.)
+          - .safetensors checkpoints and associated configs.
+
+        Returns list of dicts: {"model_name": str, "display_name": str, "description": str}
+        """
+        self.ensure_server_is_running(True)
+        try:
+            response = self._get_request("/list_models")
+            data = response.json()
+            if not isinstance(data, list):
+                return []
+            return data
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to list local Diffusers models: {e}")
+            return []
+
 
     def list_local_models(self) -> List[str]:
+        self.ensure_server_is_running(True)
         return self._get_request("/list_local_models").json()
 
     def list_available_models(self) -> List[str]:
+        self.ensure_server_is_running(True)
         return self._get_request("/list_available_models").json()
 
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
+        self.ensure_server_is_running(True)
         return self._get_request("/list_models").json()
 
     def get_settings(self, **kwargs) -> List[Dict[str, Any]]:
+        self.ensure_server_is_running(True)
         # The server holds the state, so we fetch it.
         return self._get_request("/get_settings").json()
 
     def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
-        # Normalize settings from list of dicts to a single dict if needed
+        self.ensure_server_is_running(True)
+            # Normalize settings from list of dicts to a single dict if needed
         parsed_settings = settings if isinstance(settings, dict) else {s["name"]: s["value"] for s in settings if "name" in s and "value" in s}
         response = self._post_json_request("/set_settings", data=parsed_settings)
         return response.json().get("success", False)

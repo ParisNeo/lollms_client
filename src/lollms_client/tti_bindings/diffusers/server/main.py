@@ -835,7 +835,7 @@ async def edit_image(request: EditRequestJSON):
 def pull_model_endpoint(payload: PullModelRequest):
     if not payload.hf_id and not payload.safetensors_url:
         raise HTTPException(status_code=400, detail="Provide either 'hf_id' or 'safetensors_url'.")
-
+    
     # 1) Pull Hugging Face model into a folder
     if payload.hf_id:
         model_id = payload.hf_id.strip()
@@ -928,51 +928,37 @@ def list_local_models_endpoint():
 
     return sorted(list(local_models))
 
-@router.get("/list_models")
-def list_models_endpoint():
-    models = []
+@app.get("/list_models")
+def list_models() -> list[dict]:
+    models_root = Path(args.models_path)
+    extra_root = Path(args.extra_models_path) if args.extra_models_path else None
+    result = []
 
-    # 1) Local models - ensure dict format
-    local_files = list_local_models_endpoint()
-    for model_name in local_files:
-        models.append({
-            "model_name": model_name,
-            "display_name": model_name,
-            "description": "(Local) Folder model" if not model_name.endswith(".safetensors") else "(Local) Local safetensors file",
-            "owned_by": "local_user"
-        })
-
-    # 2) HF Public models - already dicts from HF_PUBLIC_MODELS
-    for category, hf_models in HF_PUBLIC_MODELS.items():
-        for model_info in hf_models:
-            models.append({
-                "model_name": model_info["model_name"],
-                "display_name": model_info["display_name"],
-                "description": f"({category}) {model_info['desc']}",
-                "owned_by": "huggingface"
+    def scan_root(root: Path):
+        if not root or not root.exists():
+            return
+        # Diffusers folders
+        for p in root.iterdir():
+            if p.is_dir() and (p / "model_index.json").exists():
+                name = p.name
+                result.append({
+                    "model_name": str(p.resolve()),
+                    "display_name": name,
+                    "description": "Local Diffusers pipeline"
+                })
+        # Safetensors files
+        for safepath in root.rglob("*.safetensors"):
+            name = safepath.stem
+            result.append({
+                "model_name": str(safepath.resolve()),
+                "display_name": name,
+                "description": "Local .safetensors checkpoint"
             })
 
-    # 3) Gated models - same
-    if state.config.get("hf_token"):
-        for category, gated_models in HF_GATED_MODELS.items():
-            for model_info in gated_models:
-                models.append({
-                    "model_name": model_info["model_name"],
-                    "display_name": model_info["display_name"],
-                    "description": f"({category}) {model_info['desc']}",
-                    "owned_by": "huggingface"
-                })
+    scan_root(models_root)
+    scan_root(extra_root)
+    return result
 
-    # 4) Civitai models - ensure dict format
-    for key, info in CIVITAI_MODELS.items():
-        models.append({
-            "model_name": key,
-            "display_name": info["display_name"],
-            "description": f"(Civitai) {info['description']}",
-            "owned_by": info["owned_by"]
-        })
-
-    return models  # Plain list of dicts - JSON serializable
 
 
 
@@ -1032,12 +1018,21 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=9630, help="Port to bind to.")
     parser.add_argument("--models-path", type=str, required=True, help="Path to the models directory.")
     parser.add_argument("--extra-models-path", type=str, default=None, help="Path to an extra models directory.")
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help="Optional Hugging Face access token used to download private or gated repos."
+    )
+
     args = parser.parse_args()
 
     MODELS_PATH = Path(args.models_path)
     EXTRA_MODELS_PATH = Path(args.extra_models_path) if args.extra_models_path else None
     state = ServerState(MODELS_PATH, EXTRA_MODELS_PATH)
-    
+    if args.hf_token:
+        state.config["hf_token"] = args.hf_token
+        ASCIIColors.info("Hugging Face token received via CLI and stored in server config.")
     ASCIIColors.cyan(f"--- Diffusers TTI Server ---")
     ASCIIColors.green(f"Starting server on http://{args.host}:{args.port}")
     ASCIIColors.green(f"Serving models from: {MODELS_PATH.resolve()}")

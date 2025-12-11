@@ -1,6 +1,6 @@
 title: 'Diffusers TTI'
 author: 'ParisNeo'
-version: 1.0.1
+version: 1.1.0
 binding_name: 'diffusers'
 supported_file_types: []
 
@@ -8,9 +8,16 @@ description: |
   This binding integrates Hugging Face's Diffusers library into LoLLMS
   for Text-to-Image (TTI) and Image-to-Image (ITI) tasks.
 
-  It supports a wide range of diffusion-based models (e.g., Stable Diffusion,
-  Stable Diffusion XL, Kandinsky, etc.), as provided through the `diffusers`
-  ecosystem.
+  It supports a wide range of diffusion-based models, including:
+    - Stable Diffusion & SDXL (e.g. https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
+    - Stable Diffusion 3 and SD3 variants (e.g. https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers)
+    - FLUX-style models (e.g. https://huggingface.co/black-forest-labs/FLUX.1-dev)
+    - Qwen-based vision or diffusion models where compatible (e.g. https://huggingface.co/Qwen)
+    - Community models such as RealVis, DreamShaper, Juggernaut, etc. from the Hugging Face Hub.
+
+  Any compatible Diffusers or .safetensors pipeline can be installed via
+  the provided management commands, and only locally downloaded models
+  will appear in the binding's model list.
 
   Two main operations are supported:
 
@@ -35,6 +42,12 @@ input_parameters:
     type: "str"
     default: ""
     description: "An optional path to an extra folder containing personalized models (.safetensors files)."
+
+  - name: "hf_token"
+    type: "str"
+    default: ""
+    description: "Optional Hugging Face access token used by the Diffusers server to download private or gated models."
+    is_secret: true
 
   - name: "device"
     type: "str"
@@ -81,86 +94,6 @@ input_parameters:
     type: "int"
     default: "1024"
     description: "Image height."
-
-    
-generate_image_parameters:
-  - name: "prompt"
-    type: "str"
-    default: ""
-    description: "The text prompt describing the image to generate."
-
-  - name: "negative_prompt"
-    type: "str"
-    default: ""
-    description: "Optional negative prompt to avoid unwanted features."
-
-  - name: "size"
-    type: "str"
-    default: "1024x1024"
-    description: "Image size in WxH format. E.g., '512x512', '1024x1024'."
-
-  - name: "n"
-    type: "int"
-    default: 1
-    description: "Number of images to generate per request."
-
-  - name: "num_inference_steps"
-    type: "int"
-    default: 50
-    description: "Number of denoising steps (more steps = higher quality, slower)."
-
-  - name: "guidance_scale"
-    type: "float"
-    default: 7.5
-    description: "Classifier-free guidance scale. Higher = more prompt adherence."
-
-  - name: "scheduler_name"
-    type: "str"
-    default: "default"
-    description: "Scheduler to use for this generation request. Overrides global scheduler if provided."
-    options: ["default", "ddim", "ddpm", "deis_multistep", "dpm_multistep", "dpm_multistep_karras", "dpm_single", "dpm_adaptive", "dpm++_2m", "dpm++_2m_karras", "dpm++_2s_ancestral", "dpm++_2s_ancestral_karras", "dpm++_sde", "dpm++_sde_karras", "euler_ancestral_discrete", "euler_discrete", "heun_discrete", "heun_karras", "lms_discrete", "lms_karras", "pndm", "unipc_multistep", "dpm++_2m_sde", "dpm++_2m_sde_karras", "dpm2", "dpm2_karras", "dpm2_a", "dpm2_a_karras", "euler", "euler_a", "heun", "lms"]
-
-edit_image_parameters:
-  - name: "prompt"
-    type: "str"
-    default: ""
-    description: "The prompt describing the edit or transformation."
-
-  - name: "image"
-    type: "str"
-    default: ""
-    description: "The input image to edit. Can be a base64 string, URL, or local file path."
-
-  - name: "mask"
-    type: "str"
-    default: ""
-    description: "Optional mask image for inpainting. White areas = editable."
-
-  - name: "size"
-    type: "str"
-    default: "1024x1024"
-    description: "Size of the output image."
-
-  - name: "num_inference_steps"
-    type: "int"
-    default: 50
-    description: "Number of denoising steps."
-
-  - name: "guidance_scale"
-    type: "float"
-    default: 7.5
-    description: "Prompt adherence strength."
-
-  - name: "strength"
-    type: "float"
-    default: 0.8
-    description: "Strength of transformation when editing an image."
-
-  - name: "scheduler_name"
-    type: "str"
-    default: "default"
-    description: "Scheduler to use for this edit request. Overrides global scheduler if provided."
-    options: ["default", "ddim", "ddpm", "deis_multistep", "dpm_multistep", "dpm_multistep_karras", "dpm_single", "dpm_adaptive", "dpm++_2m", "dpm++_2m_karras", "dpm++_2s_ancestral", "dpm++_2s_ancestral_karras", "dpm++_sde", "dpm++_sde_karras", "euler_ancestral_discrete", "euler_discrete", "heun_discrete", "heun_karras", "lms_discrete", "lms_karras", "pndm", "unipc_multistep", "dpm++_2m_sde", "dpm++_2m_sde_karras", "dpm2", "dpm2_karras", "dpm2_a", "dpm2_a_karras", "euler", "euler_a", "heun", "lms"]
 
 commands:
   - name: pull_model

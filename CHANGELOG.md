@@ -2,6 +2,10 @@
 # CHANGELOG
 
 All notable changes to this project will be documented in this file.
+## [Unreleased]
+
+- refactor(bindings): update diffusers and xtts bindings
+
 ## v0.31.0  (2025-08-03)
 *   **Bug Fix:** Resolved issue causing discussion level images to be difficult to use by apps.
 *   **Refactor:** Reorganized LollmsDiscussion class.
