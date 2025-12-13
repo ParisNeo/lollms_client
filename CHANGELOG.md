@@ -2,7 +2,8 @@
 # CHANGELOG
 
 All notable changes to this project will be documented in this file.
-## [Unreleased]
+#
+- refactor(lollms_client): update pathlib imports# [Unreleased]
 
 - refactor(bindings): update diffusers and xtts bindings
 

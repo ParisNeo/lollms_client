@@ -379,6 +379,36 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         self.ensure_server_is_running(True)
         # The server holds the state, so we fetch it.
         return self._get_request("/get_settings").json()
+    
+    def get_zoo(self):
+        return [
+            {"name": "Stable Diffusion 1.5", "description": "The classic and versatile SD1.5 base model.", "size": "4GB", "type": "checkpoint", "link": "runwayml/stable-diffusion-v1-5"},
+            {"name": "Stable Diffusion 2.1", "description": "The 768x768 base model from the SD2.x series.", "size": "5GB", "type": "checkpoint", "link": "stabilityai/stable-diffusion-2-1"},
+            {"name": "Stable Diffusion XL 1.0", "description": "Official 1024x1024 text-to-image model from Stability AI.", "size": "7GB", "type": "checkpoint", "link": "stabilityai/stable-diffusion-xl-base-1.0"},
+            {"name": "SDXL Turbo", "description": "A fast, real-time text-to-image model based on SDXL.", "size": "7GB", "type": "checkpoint", "link": "stabilityai/sdxl-turbo"},
+            {"name": "Kandinsky 3", "description": "A powerful multilingual model with strong prompt understanding.", "size": "Unknown", "type": "checkpoint", "link": "kandinsky-community/kandinsky-3"},
+            {"name": "Playground v2.5", "description": "A high-quality model focused on aesthetic outputs.", "size": "Unknown", "type": "checkpoint", "link": "playgroundai/playground-v2.5-1024px-aesthetic"},
+            {"name": "epiCRealism", "description": "A popular community model for generating photorealistic images.", "size": "2GB", "type": "checkpoint", "link": "emilianJR/epiCRealism"},
+            {"name": "Realistic Vision 5.1", "description": "One of the most popular realistic models, great for portraits.", "size": "2GB", "type": "checkpoint", "link": "SG161222/Realistic_Vision_V5.1_noVAE"},
+            {"name": "Photon", "description": "A model known for high-quality, realistic images with good lighting.", "size": "2GB", "type": "checkpoint", "link": "Photon-v1"},
+            {"name": "Waifu Diffusion 1.4", "description": "A widely-used model for generating high-quality anime-style images.", "size": "2GB", "type": "checkpoint", "link": "hakurei/waifu-diffusion"},
+            {"name": "Counterfeit V3.0", "description": "A strong model for illustrative and 2.5D anime styles.", "size": "2GB", "type": "checkpoint", "link": "gsdf/Counterfeit-V3.0"},
+            {"name": "Animagine XL 3.0", "description": "A state-of-the-art anime model on the SDXL architecture.", "size": "7GB", "type": "checkpoint", "link": "cagliostrolab/animagine-xl-3.0"},
+            {"name": "DreamShaper 8", "description": "Versatile SD1.5 style model (CivitAI).", "size": "2GB", "type": "checkpoint", "link": "https://civitai.com/api/download/models/128713"},
+            {"name": "Juggernaut XL", "description": "Artistic SDXL (CivitAI).", "size": "7GB", "type": "checkpoint", "link": "https://civitai.com/api/download/models/133005"},
+            {"name": "Stable Diffusion 3 Medium", "description": "SOTA model with advanced prompt understanding (Gated).", "size": "Unknown", "type": "checkpoint", "link": "stabilityai/stable-diffusion-3-medium-diffusers"},
+            {"name": "FLUX.1 Schnell", "description": "Powerful and fast next-gen model (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.1-schnell"},
+            {"name": "FLUX.1 Dev", "description": "Larger developer version of FLUX.1 (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.1-dev"},
+        ]
+
+    def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            msg = "Index out of bounds"
+            ASCIIColors.error(msg)
+            return {"status": False, "message": msg}
+        item = zoo[index]
+        return self.pull_model(item["link"], progress_callback=progress_callback)
 
     def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
         self.ensure_server_is_running(True)

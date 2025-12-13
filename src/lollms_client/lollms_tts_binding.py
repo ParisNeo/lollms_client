@@ -1,7 +1,7 @@
 from abc import abstractmethod
 import importlib
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Callable
 import yaml
 from ascii_colors import trace_exception
 from lollms_client.lollms_base_binding import LollmsBaseBinding
@@ -27,7 +27,21 @@ class LollmsTTSBinding(LollmsBaseBinding):
     @abstractmethod
     def list_models(self, **kwargs) -> List[str]:
         pass
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        """
+        Returns a list of models available for download.
+        each entry is a dict with:
+        name, description, size, type, link
+        """
+        return []
         
+    def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
+        """
+        Downloads a model from the zoo using its index.
+        """
+        return {"status": False, "message": "Not implemented"}
+
     def get_settings(self, **kwargs) -> Dict[str, Any]:
         return self.settings
 

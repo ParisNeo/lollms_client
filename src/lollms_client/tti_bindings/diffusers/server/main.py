@@ -902,30 +902,28 @@ def pull_model_endpoint(payload: PullModelRequest):
 @router.get("/list_local_models")
 def list_local_models_endpoint():
     local_models = set()
+    models_root = Path(args.models_path)
+    extra_root = Path(args.extra_models_path) if args.extra_models_path else None
 
-    # 1) Single-file models: top-level *.safetensors only
-    for f in state.models_path.glob("*.safetensors"):
-        local_models.add(f.name)
-
-    if state.extra_models_path and state.extra_models_path.exists():
-        for f in state.extra_models_path.glob("*.safetensors"):
-            local_models.add(f.name)
-
-    # 2) Folder-based HF/diffusers models: treat folder name as the model
-    def add_folder_models(base: Path):
-        if not base or not base.exists():
+    def scan_root(root: Path):
+        if not root or not root.exists():
             return
-        for entry in base.iterdir():
-            if not entry.is_dir():
+        
+        # 1. Diffusers folders (Recursive)
+        for model_index in root.rglob("model_index.json"):
+             # For listing just the name, we probably want the folder name or relative path
+             # Keeping it simple: folder name.
+             local_models.add(model_index.parent.name)
+
+        # 2. Safetensors files (Recursive)
+        for safepath in root.rglob("*.safetensors"):
+            if (safepath.parent / "model_index.json").exists():
                 continue
-            has_index = (entry / "model_index.json").exists()
-            has_safetensors = any(entry.glob("*.safetensors"))
-            if has_index or has_safetensors:
-                local_models.add(entry.name)
-
-    add_folder_models(state.models_path)
-    add_folder_models(state.extra_models_path)
-
+            local_models.add(safepath.name)
+            
+    scan_root(models_root)
+    scan_root(extra_root)
+    
     return sorted(list(local_models))
 
 @app.get("/list_models")
@@ -933,25 +931,41 @@ def list_models() -> list[dict]:
     models_root = Path(args.models_path)
     extra_root = Path(args.extra_models_path) if args.extra_models_path else None
     result = []
+    seen_paths = set()
 
     def scan_root(root: Path):
         if not root or not root.exists():
             return
-        # Diffusers folders
-        for p in root.iterdir():
-            if p.is_dir() and (p / "model_index.json").exists():
-                name = p.name
-                result.append({
-                    "model_name": str(p.resolve()),
-                    "display_name": name,
-                    "description": "Local Diffusers pipeline"
-                })
-        # Safetensors files
+        
+        # 1. Diffusers folders (Recursive)
+        # We look for model_index.json
+        for model_index in root.rglob("model_index.json"):
+             folder = model_index.parent
+             resolved_path = str(folder.resolve())
+             if resolved_path in seen_paths:
+                 continue
+             seen_paths.add(resolved_path)
+             
+             result.append({
+                "model_name": resolved_path,
+                "display_name": folder.name,
+                "description": "Local Diffusers pipeline"
+             })
+
+        # 2. Safetensors files (Recursive)
         for safepath in root.rglob("*.safetensors"):
-            name = safepath.stem
+            # Skip if part of a diffusers folder
+            if (safepath.parent / "model_index.json").exists():
+                continue
+            
+            resolved_path = str(safepath.resolve())
+            if resolved_path in seen_paths:
+                continue
+            seen_paths.add(resolved_path)
+
             result.append({
-                "model_name": str(safepath.resolve()),
-                "display_name": name,
+                "model_name": resolved_path,
+                "display_name": safepath.stem,
                 "description": "Local .safetensors checkpoint"
             })
 
@@ -964,7 +978,9 @@ def list_models() -> list[dict]:
 
 @router.get("/list_available_models")
 def list_available_models_endpoint():
-    discoverable = [m['model_name'] for m in list_models_endpoint()]
+    # Use list_models() to get all available models (dicts) then extract names
+    models_dicts = list_models()
+    discoverable = [m['model_name'] for m in models_dicts]
     return sorted(list(set(discoverable)))
 
 @router.get("/get_settings")

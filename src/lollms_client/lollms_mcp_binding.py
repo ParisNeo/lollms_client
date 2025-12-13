@@ -2,7 +2,7 @@
 from abc import abstractmethod
 import importlib
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Callable
 from ascii_colors import trace_exception, ASCIIColors
 import yaml
 from lollms_client.lollms_base_binding import LollmsBaseBinding
@@ -52,6 +52,20 @@ class LollmsMCPBinding(LollmsBaseBinding):
         Or could be implemented to return available tools as models if desired.
         """
         return []
+    
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        """
+        Returns a list of models available for download.
+        each entry is a dict with:
+        name, description, size, type, link
+        """
+        return []
+
+    def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
+        """
+        Downloads a model from the zoo using its index.
+        """
+        return {"status": False, "message": "Not implemented"}
 
 class LollmsMCPBindingManager:
     """
