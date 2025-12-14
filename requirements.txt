@@ -1,5 +1,5 @@
 requests>=2.25.1
-ascii-colors
+ascii-colors>=0.11.5
 pillow
 pipmaster>=1.0.6
 pyyaml

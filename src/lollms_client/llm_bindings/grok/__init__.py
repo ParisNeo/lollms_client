@@ -418,7 +418,6 @@ class GrokBinding(LollmsLLMBinding):
             return self._cached_models
 
         try:
-            ASCIIColors.info("Fetching available models from xAI API...")
             response = requests.get(f"{self.base_url}/models", headers=self.headers, timeout=15)
             response.raise_for_status()
             

@@ -7,6 +7,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(bindings): update diffusers and xtts bindings
 
+## [Unreleased]
+
+- feat(ollama): add model zoo with download helper
+
 ## v0.31.0  (2025-08-03)
 *   **Bug Fix:** Resolved issue causing discussion level images to be difficult to use by apps.
 *   **Refactor:** Reorganized LollmsDiscussion class.

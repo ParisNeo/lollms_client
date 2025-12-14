@@ -7,7 +7,7 @@ from lollms_client.lollms_types import MSG_TYPE
 # from lollms_client.lollms_utilities import encode_image 
 from lollms_client.lollms_types import ELF_COMPLETION_FORMAT
 from lollms_client.lollms_discussion import LollmsDiscussion
-from typing import Optional, Callable, List, Union, Dict
+from typing import Optional, Callable, List, Union, Dict, Any
 
 from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
@@ -717,6 +717,44 @@ class OllamaBinding(LollmsLLMBinding):
             ASCIIColors.error(msg)
             trace_exception(ex)
             return {"status": False, "message": msg}
+
+    def get_zoo(self) -> List[Dict[str, Any]]:
+        """
+        Returns a list of models available for download.
+        each entry is a dict with:
+        name, description, size, type, link
+        """
+        return [
+            {"name": "Llama3 8B", "description": "Meta's Llama 3 8B model. Good for general purpose chat.", "size": "4.7GB", "type": "model", "link": "llama3"},
+            {"name": "Llama3 70B", "description": "Meta's Llama 3 70B model. High capability.", "size": "40GB", "type": "model", "link": "llama3:70b"},
+            {"name": "Phi-3 Mini", "description": "Microsoft's Phi-3 Mini 3.8B model. Lightweight and capable.", "size": "2.3GB", "type": "model", "link": "phi3"},
+            {"name": "Phi-3 Medium", "description": "Microsoft's Phi-3 Medium 14B model.", "size": "7.9GB", "type": "model", "link": "phi3:medium"},
+            {"name": "Mistral 7B", "description": "Mistral AI's 7B model v0.3.", "size": "4.1GB", "type": "model", "link": "mistral"},
+            {"name": "Mixtral 8x7B", "description": "Mistral AI's Mixture of Experts model.", "size": "26GB", "type": "model", "link": "mixtral"},
+            {"name": "Gemma 2 9B", "description": "Google's Gemma 2 9B model.", "size": "5.4GB", "type": "model", "link": "gemma2"},
+            {"name": "Gemma 2 27B", "description": "Google's Gemma 2 27B model.", "size": "16GB", "type": "model", "link": "gemma2:27b"},
+            {"name": "Qwen 2.5 7B", "description": "Alibaba Cloud's Qwen2.5 7B model.", "size": "4.5GB", "type": "model", "link": "qwen2.5"},
+            {"name": "Qwen 2.5 Coder 7B", "description": "Alibaba Cloud's Qwen2.5 Coder 7B model.", "size": "4.5GB", "type": "model", "link": "qwen2.5-coder"},
+            {"name": "CodeLlama 7B", "description": "Meta's CodeLlama 7B model.", "size": "3.8GB", "type": "model", "link": "codellama"},
+            {"name": "LLaVA 7B", "description": "Visual instruction tuning model (Vision).", "size": "4.5GB", "type": "model", "link": "llava"},
+            {"name": "Nomic Embed Text", "description": "A high-performing open embedding model.", "size": "274MB", "type": "embedding", "link": "nomic-embed-text"},
+            {"name": "DeepSeek Coder V2", "description": "DeepSeek Coder V2 model.", "size": "8.9GB", "type": "model", "link": "deepseek-coder-v2"},
+            {"name": "OpenHermes 2.5 Mistral", "description": "High quality finetune of Mistral 7B.", "size": "4.1GB", "type": "model", "link": "openhermes"},
+            {"name": "Dolphin Phi", "description": "Uncensored Dolphin fine-tune of Phi-2.", "size": "1.6GB", "type": "model", "link": "dolphin-phi"},
+            {"name": "TinyLlama", "description": "A compact 1.1B model.", "size": "637MB", "type": "model", "link": "tinyllama"},
+        ]
+
+    def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
+        """
+        Downloads a model from the zoo using its index.
+        """
+        zoo = self.get_zoo()
+        if index < 0 or index >= len(zoo):
+            msg = "Index out of bounds"
+            ASCIIColors.error(msg)
+            return {"status": False, "message": msg}
+        item = zoo[index]
+        return self.pull_model(item["link"], progress_callback=progress_callback)
 
     def install_ollama(self, callback: Callable[[dict], None] = None, **kwargs) -> dict:
         """

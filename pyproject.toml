@@ -45,7 +45,7 @@ Homepage = "https://github.com/ParisNeo/lollms_client"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-exclude = ["lollms_client.egg-info*"]
+exclude = ["lollms_client.egg-info*", "lollms_client.llm_bindings.llama_cpp_server.bin"]
 
 [tool.setuptools.dynamic]
 version = {attr = "lollms_client.__version__"}

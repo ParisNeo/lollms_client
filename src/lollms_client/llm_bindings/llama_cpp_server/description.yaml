@@ -1,0 +1,82 @@
+title: LlamaCpp Server
+author: ParisNeo
+creation_date: 2025-12-13
+last_update_date: 2025-12-13
+description: |
+  Runs a local llama.cpp server compatible with OpenAI API.
+  Supports GGUF models loaded from a local folder.
+  
+  **Process Safety:**
+  The server process is shared among multiple binding instances. A file lock is used to ensuring only one server instance runs on the configured port (default 9624).
+  
+  **Multi-file GGUF Support:**
+  This binding supports split GGUF models (e.g., `model-00001-of-00005.gguf`).
+  When pulling a model from Hugging Face, simply specify the filename of the first part.
+  
+input_parameters:
+  - name: model_name
+    type: str
+    description: "The filename of the GGUF model to load."
+    mandatory: true
+    default: ""
+  - name: host
+    type: str
+    description: "Host to bind the server to."
+    mandatory: false
+    default: "localhost"
+  - name: port
+    type: int
+    description: "Port to bind the server to (default 9624)."
+    mandatory: false
+    default: 9624
+  - name: ctx_size
+    type: int
+    description: "Context window size."
+    mandatory: false
+    default: 4096
+  - name: n_gpu_layers
+    type: int
+    description: "Number of layers to offload to GPU (-1 for all)."
+    mandatory: false
+    default: -1
+  - name: n_threads
+    type: int
+    description: "Number of CPU threads (leave empty for auto)."
+    mandatory: false
+    default: null
+  - name: n_parallel
+    type: int
+    description: "Number of parallel sequences to decode."
+    mandatory: false
+    default: 1
+  - name: models_path
+    type: str
+    description: "Path to the directory containing GGUF models."
+    mandatory: false
+    default: "models/llama_cpp_models"
+
+commands:
+  - name: pull_model
+    title: Pull Model (HF)
+    description: "Downloads a GGUF model from Hugging Face."
+    parameters:
+      - name: repo_id
+        type: str
+        description: "The Hugging Face repo ID."
+        mandatory: true
+      - name: filename
+        type: str
+        description: "The specific GGUF filename to download."
+        mandatory: true
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
+    callback:
+      - name: status
+        type: str
+      - name: completed
+        type: int
+      - name: total
+        type: int

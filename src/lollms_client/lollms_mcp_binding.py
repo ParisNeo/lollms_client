@@ -81,7 +81,6 @@ class LollmsMCPBindingManager:
             self.mcp_bindings_dir = (Path(__file__).parent.parent / mcp_bindings_dir).resolve()
 
         self.available_bindings: Dict[str, type[LollmsMCPBinding]] = {}
-        ASCIIColors.info(f"LollmsMCPBindingManager initialized. Bindings directory: {self.mcp_bindings_dir}")
 
 
     def _load_binding_class(self, binding_name: str) -> Optional[type[LollmsMCPBinding]]:

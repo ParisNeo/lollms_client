@@ -469,7 +469,6 @@ class ClaudeBinding(LollmsLLMBinding):
         url = f"{ANTHROPIC_API_BASE_URL}/models"
         
         try:
-            ASCIIColors.info("Fetching available models from Anthropic API...")
             response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             
