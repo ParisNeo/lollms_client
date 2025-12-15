@@ -199,7 +199,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             # Verify process is alive
             if psutil.pid_exists(info['pid']):
                 # Verify it's actually llama-server (optional but safe)
-                # This prevents picking up a reused PID from a different app
                 try:
                     p = psutil.Process(info['pid'])
                     if "llama" in p.name().lower() or "server" in p.name().lower():
@@ -307,40 +306,40 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             **kwargs
         )
         
-        # Wait for health check
+        # Wait for health check (WAIT until STATUS 200 OK)
         url = f"http://{self.host}:{port}/v1"
         start_time = time.time()
-        while time.time() - start_time < 60:
+        # Increased timeout to 120s for larger models
+        while time.time() - start_time < 120:
             try:
-                requests.get(f"{url}/models", timeout=1)
-                return proc.pid, port, url
+                res = requests.get(f"{url}/models", timeout=1)
+                # STRICTLY check for 200, as 503 means loading
+                if res.status_code == 200:
+                    return proc.pid, port, url
             except:
-                if proc.poll() is not None:
-                    raise RuntimeError(f"Server process exited immediately with code {proc.returncode}")
-                time.sleep(0.5)
+                pass
+            
+            if proc.poll() is not None:
+                raise RuntimeError(f"Server process exited immediately with code {proc.returncode}")
+                
+            time.sleep(0.5)
                 
         # Timeout
         proc.terminate()
-        raise TimeoutError(f"Server for {model_name} failed to become responsive.")
+        raise TimeoutError(f"Server for {model_name} failed to become responsive (timeout).")
 
 
     def load_model(self, model_name: str) -> bool:
         """
         Thread-safe and Process-safe model loading.
-        1. Acquires global file lock.
-        2. Checks if model is running.
-        3. If running, updates heartbeat (mtime).
-        4. If not running, frees space (LRU) and spawns new server.
         """
-        # Create lock file if it doesn't exist
         if not self.global_lock_path.parent.exists():
             self.global_lock_path.parent.mkdir(parents=True)
             
         lock = FileLock(str(self.global_lock_path))
         
         try:
-            with lock.acquire(timeout=60): # Wait up to 60s for other processes to finish loading/unloading
-                # 1. Check if already running
+            with lock.acquire(timeout=60): 
                 info = self._get_server_info(model_name)
                 
                 if info:
@@ -352,13 +351,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     self.model_name = model_name
                     return True
                 
-                # 2. Not running. Prepare to launch.
                 self._ensure_capacity_locked()
-                
-                # 3. Spawn
                 pid, port, url = self._spawn_server_detached(model_name)
                 
-                # 4. Write Registry
                 reg_file = self._get_registry_file(model_name)
                 with open(reg_file, 'w') as f:
                     json.dump({
@@ -382,19 +377,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         if not target_model:
             raise ValueError("No model specified.")
             
-        # Optimization: Try to read without lock first to be fast
-        # (OS file reads are atomic enough for just reading URL)
         info = self._get_server_info(target_model)
         
-        # If not found or dead, do the full load_model ritual with locks
         if not info:
             if self.load_model(target_model):
                 info = self._get_server_info(target_model)
             else:
                 raise RuntimeError(f"Could not load model {target_model}")
         else:
-             # Just touch it to keep it alive (heartbeat)
-             # We catch error in case race condition deleted it just now
             try:
                 self._get_registry_file(target_model).touch()
             except:
@@ -405,22 +395,51 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         return openai.OpenAI(base_url=info['url'], api_key="sk-no-key-required")
 
+    def _execute_with_retry(self, func: Callable, *args, **kwargs):
+        """
+        Executes an API call with retries for 503 (Model Loading) errors.
+        """
+        retries = 60 # Wait up to ~2 minutes
+        for i in range(retries):
+            try:
+                return func(*args, **kwargs)
+            except openai.InternalServerError as e:
+                # Catch 503 Loading model
+                if e.status_code == 503:
+                    if i % 10 == 0: # Reduce log spam
+                        ASCIIColors.warning(f"Model is loading (503). Waiting... ({i+1}/{retries})")
+                    time.sleep(2)
+                    continue
+                raise e
+            except openai.APIConnectionError:
+                # Server might be briefly unreachable during heavy load or restart
+                if i % 10 == 0:
+                    ASCIIColors.warning(f"Connection error. Waiting... ({i+1}/{retries})")
+                time.sleep(2)
+                continue
+        # Final attempt
+        return func(*args, **kwargs)
+
     def generate_text(self, prompt: str, n_predict: int = None, stream: bool = False, **kwargs) -> Union[str, Dict]:
         try:
             client = self._get_client()
-            completion = client.completions.create(
-                model=self.model_name,
-                prompt=prompt,
-                max_tokens=n_predict if n_predict else 1024,
-                temperature=kwargs.get("temperature", 0.7),
-                top_p=kwargs.get("top_p", 0.9),
-                stream=stream,
-                extra_body={
-                    "top_k": kwargs.get("top_k", 40),
-                    "repeat_penalty": kwargs.get("repeat_penalty", 1.1),
-                    "n_predict": n_predict
-                }
-            )
+            
+            def do_gen():
+                return client.completions.create(
+                    model=self.model_name,
+                    prompt=prompt,
+                    max_tokens=n_predict if n_predict else 1024,
+                    temperature=kwargs.get("temperature", 0.7),
+                    top_p=kwargs.get("top_p", 0.9),
+                    stream=stream,
+                    extra_body={
+                        "top_k": kwargs.get("top_k", 40),
+                        "repeat_penalty": kwargs.get("repeat_penalty", 1.1),
+                        "n_predict": n_predict
+                    }
+                )
+
+            completion = self._execute_with_retry(do_gen)
 
             if stream:
                 full_text = ""
@@ -441,17 +460,21 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         try:
             client = self._get_client()
             messages = discussion.export("openai_chat")
-            response = client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                max_tokens=kwargs.get("n_predict", 1024),
-                temperature=kwargs.get("temperature", 0.7),
-                stream=kwargs.get("stream", False),
-                extra_body={
-                    "top_k": kwargs.get("top_k", 40),
-                    "repeat_penalty": kwargs.get("repeat_penalty", 1.1)
-                }
-            )
+            
+            def do_chat():
+                return client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    max_tokens=kwargs.get("n_predict", 1024),
+                    temperature=kwargs.get("temperature", 0.7),
+                    stream=kwargs.get("stream", False),
+                    extra_body={
+                        "top_k": kwargs.get("top_k", 40),
+                        "repeat_penalty": kwargs.get("repeat_penalty", 1.1)
+                    }
+                )
+
+            response = self._execute_with_retry(do_chat)
             
             if kwargs.get("stream", False):
                 full_text = ""
@@ -468,7 +491,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             trace_exception(e)
             return {"status": False, "error": str(e)}
 
-    # ... [Same list_models, get_zoo, download logic as before] ...
     def list_models(self) -> List[Dict[str, Any]]:
         models = []
         if self.models_dir.exists():
@@ -486,11 +508,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
     def tokenize(self, text: str) -> list:
         try:
-            client = self._get_client() # ensures loaded
+            client = self._get_client() 
             url = client.base_url
-            res = requests.post(f"{url}tokenize", json={"content": text}) # base_url usually ends in /v1/, we strip or adjust
-            if res.status_code == 404: # try without v1
-                 res = requests.post(str(url).replace("/v1/", "/tokenize"), json={"content": text})
+            
+            def do_tokenize():
+                # Llama-server specific endpoint
+                ep = f"{url}tokenize"
+                # Strip v1/ if present because tokenize is often at root in older llama-server, 
+                # but in recent versions it might be under v1 or root. We try robustly.
+                res = requests.post(ep, json={"content": text})
+                if res.status_code == 404:
+                     res = requests.post(str(url).replace("/v1/", "/tokenize"), json={"content": text})
+                
+                if res.status_code == 503:
+                    raise openai.InternalServerError("Loading model", response=res, body=None)
+                return res
+
+            res = self._execute_with_retry(do_tokenize)
             if res.status_code == 200: return res.json().get("tokens", [])
         except: pass
         return list(text)
@@ -499,9 +533,18 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         try:
             client = self._get_client()
             url = client.base_url
-            res = requests.post(f"{url}detokenize", json={"tokens": tokens}) # standard is /tokenize but llama has extras
-            if res.status_code == 404:
-                 res = requests.post(str(url).replace("/v1/", "/detokenize"), json={"tokens": tokens})
+            
+            def do_detokenize():
+                ep = f"{url}detokenize"
+                res = requests.post(ep, json={"tokens": tokens})
+                if res.status_code == 404:
+                     res = requests.post(str(url).replace("/v1/", "/detokenize"), json={"tokens": tokens})
+                
+                if res.status_code == 503:
+                    raise openai.InternalServerError("Loading model", response=res, body=None)
+                return res
+
+            res = self._execute_with_retry(do_detokenize)
             if res.status_code == 200: return res.json().get("content", "")
         except: pass
         return "".join(map(str, tokens))
@@ -510,7 +553,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
     def embed(self, text: str, **kwargs) -> List[float]:
         client = self._get_client()
-        res = client.embeddings.create(input=text, model=self.model_name)
+        def do_embed():
+            return client.embeddings.create(input=text, model=self.model_name)
+        res = self._execute_with_retry(do_embed)
         return res.data[0].embedding
         
     def get_zoo(self) -> List[Dict[str, Any]]:
@@ -554,14 +599,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             return {"status": False, "error": str(e)}
 
     def cleanup_orphans_if_needed(self):
-        """
-        Optional cleanup hook. 
-        Since processes are shared/detached, we usually don't want to kill them on exit 
-        unless they are explicitly owned by this specific script execution context.
-        With the new registry system, we rely on LRU eviction or explicit timeouts 
-        (handled by a separate maintenance script or future logic) rather than atexit 
-        killing, to allow model persistence across client restarts.
-        """
         pass
 
     def __del__(self):
