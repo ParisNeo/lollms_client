@@ -567,7 +567,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 "size": "2.2 GB (Q4_K_M)",
                 "type": "gguf",
                 "link": "bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF",
-                "filename": "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
+                "filename": "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
             },
             # Devstral 2 Mini: Agentic coding specialist (24B)
             {
@@ -576,7 +576,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 "size": "14.8 GB (Q4_K_M)",
                 "type": "gguf",
                 "link": "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF",
-                "filename": "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"
+                "filename": "mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"
             },
             # Llama 4 Scout: Meta's efficient MoE (17B)
             {
