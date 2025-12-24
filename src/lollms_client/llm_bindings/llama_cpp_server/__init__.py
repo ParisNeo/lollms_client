@@ -9,6 +9,7 @@ import platform
 import zipfile
 import tarfile
 import json
+import yaml
 import atexit
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
@@ -20,7 +21,7 @@ from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion
 
 # Ensure dependencies
-pm.ensure_packages(["openai", "huggingface_hub", "filelock", "requests", "tqdm", "psutil"])
+pm.ensure_packages(["openai", "huggingface_hub", "filelock", "requests", "tqdm", "psutil", "pyyaml"])
 import openai
 from huggingface_hub import hf_hub_download
 from filelock import FileLock
@@ -66,6 +67,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         self.binding_dir = Path(__file__).parent
         self.bin_dir = self.binding_dir / "bin"
         self.models_dir = Path(kwargs.get("models_path", "models/llama_cpp_models")).resolve()
+        
+        # Multimodal Registry
+        self.mm_registry_path = self.models_dir / "multimodal_bindings.yaml"
         
         # Registry directory for inter-process coordination
         self.servers_dir = self.models_dir / "servers"
@@ -265,6 +269,86 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             ASCIIColors.warning(f"Max active models ({self.max_active_models}) reached. Unloading LRU model: {model_to_kill}")
             self._kill_server(model_to_kill, oldest_info)
 
+    def _load_mm_registry(self) -> Dict[str, str]:
+        if not self.mm_registry_path.exists():
+            return {}
+        try:
+            with open(self.mm_registry_path, 'r') as f:
+                registry = yaml.safe_load(f) or {}
+            
+            # Self-healing: remove missing files
+            updated = False
+            to_remove = []
+            for m, p in registry.items():
+                if not (self.models_dir / m).exists() or not (self.models_dir / p).exists():
+                    to_remove.append(m)
+                    updated = True
+            
+            for m in to_remove:
+                del registry[m]
+            
+            if updated:
+                self._save_mm_registry(registry)
+            return registry
+        except Exception as e:
+            ASCIIColors.error(f"Failed to load multimodal registry: {e}")
+            return {}
+
+    def _save_mm_registry(self, registry: Dict[str, str]):
+        try:
+            with open(self.mm_registry_path, 'w') as f:
+                yaml.dump(registry, f)
+        except Exception as e:
+            ASCIIColors.error(f"Failed to save multimodal registry: {e}")
+
+    def bind_multimodal_model(self, model_name: str, mmproj_name: str) -> dict:
+        """Explicitly binds a model to an mmproj file."""
+        if not (self.models_dir / model_name).exists():
+            return {"status": False, "error": f"Model {model_name} not found."}
+        if not (self.models_dir / mmproj_name).exists():
+            return {"status": False, "error": f"Projector {mmproj_name} not found."}
+        
+        registry = self._load_mm_registry()
+        registry[model_name] = mmproj_name
+        self._save_mm_registry(registry)
+        
+        ASCIIColors.success(f"Bound {model_name} with {mmproj_name}")
+        return {"status": True, "message": f"Bound {model_name} with {mmproj_name}"}
+
+    def _find_mmproj(self, model_path: Path) -> Optional[Path]:
+        """Finds a corresponding mmproj file for a given model path."""
+        # 1. Check registry first
+        registry = self._load_mm_registry()
+        if model_path.name in registry:
+            proj_path = self.models_dir / registry[model_path.name]
+            if proj_path.exists():
+                return proj_path
+
+        # 2. Automatic detection patterns
+        stem = model_path.stem
+        clean_stem = re.sub(r'\.(Q\d_.*|f16|f32)$', '', stem)
+        patterns = [
+            f"{stem}.mmproj", f"{stem}-mmproj.gguf", f"{stem}.mmproj.gguf",
+            f"{clean_stem}.mmproj", f"{clean_stem}-mmproj.gguf",
+            f"mmproj-{stem}.gguf", "mmproj.gguf"
+        ]
+        
+        for p in patterns:
+            pot = model_path.parent / p
+            if pot.exists():
+                return pot
+        
+        # 3. Last resort: simple scan
+        try:
+            for f in model_path.parent.iterdir():
+                if f.is_file() and "mmproj" in f.name.lower() and f.name != model_path.name:
+                    if f.suffix in [".gguf", ".mmproj", ".bin"]:
+                        return f
+        except:
+            pass
+            
+        return None
+
     def _spawn_server_detached(self, model_name: str):
         """Spawns the server process detached so it survives if this python script ends."""
         exe_path = self._get_server_executable()
@@ -286,6 +370,12 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             "--batch-size", str(self.batch_size),
             "--embedding"
         ]
+
+        # Automatic detection or Registry-based mmproj
+        mmproj_path = self._find_mmproj(model_path)
+        if mmproj_path:
+            ASCIIColors.info(f"Detected multimodal projector: {mmproj_path}")
+            cmd.extend(["--mmproj", str(mmproj_path)])
         
         if self.n_threads:
             cmd.extend(["--threads", str(self.n_threads)])
@@ -306,14 +396,12 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             **kwargs
         )
         
-        # Wait for health check (WAIT until STATUS 200 OK)
+        # Wait for health check
         url = f"http://{self.host}:{port}/v1"
         start_time = time.time()
-        # Increased timeout to 120s for larger models
         while time.time() - start_time < 120:
             try:
                 res = requests.get(f"{url}/models", timeout=1)
-                # STRICTLY check for 200, as 503 means loading
                 if res.status_code == 200:
                     return proc.pid, port, url
             except:
@@ -321,29 +409,21 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             
             if proc.poll() is not None:
                 raise RuntimeError(f"Server process exited immediately with code {proc.returncode}")
-                
             time.sleep(0.5)
                 
-        # Timeout
         proc.terminate()
-        raise TimeoutError(f"Server for {model_name} failed to become responsive (timeout).")
-
+        raise TimeoutError(f"Server for {model_name} failed to become responsive.")
 
     def load_model(self, model_name: str) -> bool:
-        """
-        Thread-safe and Process-safe model loading.
-        """
+        """Thread-safe and Process-safe model loading."""
         if not self.global_lock_path.parent.exists():
             self.global_lock_path.parent.mkdir(parents=True)
             
         lock = FileLock(str(self.global_lock_path))
-        
         try:
             with lock.acquire(timeout=60): 
                 info = self._get_server_info(model_name)
-                
                 if info:
-                    # Update heartbeat
                     try:
                         self._get_registry_file(model_name).touch()
                     except:
@@ -357,16 +437,11 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 reg_file = self._get_registry_file(model_name)
                 with open(reg_file, 'w') as f:
                     json.dump({
-                        "model_name": model_name,
-                        "pid": pid,
-                        "port": port,
-                        "url": url,
-                        "started_at": time.time()
+                        "model_name": model_name, "pid": pid, "port": port, "url": url, "started_at": time.time()
                     }, f)
                 
                 self.model_name = model_name
                 return True
-                
         except Exception as e:
             ASCIIColors.error(f"Error loading model {model_name}: {e}")
             trace_exception(e)
@@ -376,9 +451,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         target_model = model_name or self.model_name
         if not target_model:
             raise ValueError("No model specified.")
-            
         info = self._get_server_info(target_model)
-        
         if not info:
             if self.load_model(target_model):
                 info = self._get_server_info(target_model)
@@ -389,58 +462,41 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 self._get_registry_file(target_model).touch()
             except:
                 pass
-
         if not info:
              raise RuntimeError(f"Model {target_model} failed to load.")
-
         return openai.OpenAI(base_url=info['url'], api_key="sk-no-key-required")
 
     def _execute_with_retry(self, func: Callable, *args, **kwargs):
-        """
-        Executes an API call with retries for 503 (Model Loading) errors.
-        """
-        retries = 60 # Wait up to ~2 minutes
+        retries = 60
         for i in range(retries):
             try:
                 return func(*args, **kwargs)
             except openai.InternalServerError as e:
-                # Catch 503 Loading model
                 if e.status_code == 503:
-                    if i % 10 == 0: # Reduce log spam
+                    if i % 10 == 0:
                         ASCIIColors.warning(f"Model is loading (503). Waiting... ({i+1}/{retries})")
                     time.sleep(2)
                     continue
                 raise e
             except openai.APIConnectionError:
-                # Server might be briefly unreachable during heavy load or restart
                 if i % 10 == 0:
                     ASCIIColors.warning(f"Connection error. Waiting... ({i+1}/{retries})")
                 time.sleep(2)
                 continue
-        # Final attempt
         return func(*args, **kwargs)
 
     def generate_text(self, prompt: str, n_predict: int = None, stream: bool = False, **kwargs) -> Union[str, Dict]:
         try:
             client = self._get_client()
-            
             def do_gen():
                 return client.completions.create(
-                    model=self.model_name,
-                    prompt=prompt,
+                    model=self.model_name, prompt=prompt,
                     max_tokens=n_predict if n_predict else 1024,
                     temperature=kwargs.get("temperature", 0.7),
-                    top_p=kwargs.get("top_p", 0.9),
-                    stream=stream,
-                    extra_body={
-                        "top_k": kwargs.get("top_k", 40),
-                        "repeat_penalty": kwargs.get("repeat_penalty", 1.1),
-                        "n_predict": n_predict
-                    }
+                    top_p=kwargs.get("top_p", 0.9), stream=stream,
+                    extra_body={"top_k": kwargs.get("top_k", 40), "repeat_penalty": kwargs.get("repeat_penalty", 1.1), "n_predict": n_predict}
                 )
-
             completion = self._execute_with_retry(do_gen)
-
             if stream:
                 full_text = ""
                 for chunk in completion:
@@ -460,22 +516,15 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         try:
             client = self._get_client()
             messages = discussion.export("openai_chat")
-            
             def do_chat():
                 return client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
+                    model=self.model_name, messages=messages,
                     max_tokens=kwargs.get("n_predict", 1024),
                     temperature=kwargs.get("temperature", 0.7),
                     stream=kwargs.get("stream", False),
-                    extra_body={
-                        "top_k": kwargs.get("top_k", 40),
-                        "repeat_penalty": kwargs.get("repeat_penalty", 1.1)
-                    }
+                    extra_body={"top_k": kwargs.get("top_k", 40), "repeat_penalty": kwargs.get("repeat_penalty", 1.1)}
                 )
-
             response = self._execute_with_retry(do_chat)
-            
             if kwargs.get("stream", False):
                 full_text = ""
                 for chunk in response:
@@ -495,6 +544,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         models = []
         if self.models_dir.exists():
             for f in self.models_dir.glob("*.gguf"):
+                # Hide files explicitly containing 'mmproj' as they are not standalone models
+                if "mmproj" in f.name.lower():
+                    continue
+                    
                 if re.search(r'-\d{5}-of-\d{5}\.gguf$', f.name):
                     if "00001-of-" not in f.name: continue 
                 models.append({"model_name": f.name, "owned_by": "local", "created": time.ctime(f.stat().st_ctime), "size": f.stat().st_size})
@@ -510,20 +563,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         try:
             client = self._get_client() 
             url = client.base_url
-            
             def do_tokenize():
-                # Llama-server specific endpoint
                 ep = f"{url}tokenize"
-                # Strip v1/ if present because tokenize is often at root in older llama-server, 
-                # but in recent versions it might be under v1 or root. We try robustly.
                 res = requests.post(ep, json={"content": text})
                 if res.status_code == 404:
                      res = requests.post(str(url).replace("/v1/", "/tokenize"), json={"content": text})
-                
                 if res.status_code == 503:
                     raise openai.InternalServerError("Loading model", response=res, body=None)
                 return res
-
             res = self._execute_with_retry(do_tokenize)
             if res.status_code == 200: return res.json().get("tokens", [])
         except: pass
@@ -533,17 +580,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         try:
             client = self._get_client()
             url = client.base_url
-            
             def do_detokenize():
                 ep = f"{url}detokenize"
                 res = requests.post(ep, json={"tokens": tokens})
                 if res.status_code == 404:
                      res = requests.post(str(url).replace("/v1/", "/detokenize"), json={"tokens": tokens})
-                
                 if res.status_code == 503:
                     raise openai.InternalServerError("Loading model", response=res, body=None)
                 return res
-
             res = self._execute_with_retry(do_detokenize)
             if res.status_code == 200: return res.json().get("content", "")
         except: pass
@@ -570,9 +614,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         zoo = self.get_zoo(); 
         if index < 0 or index >= len(zoo): return {"status": False, "message": "Index out of bounds"}
         item = zoo[index]
-        return self.pull_model(item["link"], item.get("filename"), progress_callback)
+        return self.pull_model(item["link"], item.get("filename"), progress_callback=progress_callback)
 
-    def pull_model(self, repo_id: str, filename: str, progress_callback: Callable[[dict], None] = None) -> dict:
+    def pull_model(self, repo_id: str, filename: str, mmproj_repo_id: str = None, mmproj_filename: str = None, progress_callback: Callable[[dict], None] = None) -> dict:
         try:
             match = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", filename)
             files = []
@@ -582,7 +626,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 for i in range(1, total + 1): files.append(f"{base}-{i:05d}-of-{total:05d}.gguf")
             else:
                 files.append(filename)
-
             paths = []
             for f in files:
                 ASCIIColors.info(f"Downloading {f} from {repo_id}...")
@@ -591,7 +634,16 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 paths.append(p)
                 ASCIIColors.success(f"Downloaded {f}")
             
+            if mmproj_filename:
+                proj_repo = mmproj_repo_id if mmproj_repo_id else repo_id
+                ASCIIColors.info(f"Downloading mmproj {mmproj_filename} from {proj_repo}...")
+                hf_hub_download(repo_id=proj_repo, filename=mmproj_filename, local_dir=self.models_dir, local_dir_use_symlinks=False, resume_download=True)
+                ASCIIColors.success(f"Downloaded mmproj {mmproj_filename}")
+                # Automatically bind the model with its projector
+                self.bind_multimodal_model(filename, mmproj_filename)
+                
             msg = f"Successfully downloaded model: {filename}"
+            if mmproj_filename: msg += f" and bound with projector: {mmproj_filename}"
             if progress_callback: progress_callback({"status": "success", "message": msg, "completed": 100, "total": 100})
             return {"status": True, "message": msg, "path": paths[0]}
         except Exception as e:

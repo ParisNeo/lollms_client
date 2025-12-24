@@ -7,7 +7,8 @@ All notable changes to this project will be documented in this file.
 
 - refactor(bindings): update diffusers and xtts bindings
 
-## [Unreleased]
+#
+- chore(lollms_client): update bindings and server initialization# [Unreleased]
 
 - feat(ollama): add model zoo with download helper
 

@@ -140,7 +140,6 @@ class LollmsMCPBindingManager:
         if binding_class_to_instantiate:
             try:
                 return binding_class_to_instantiate(
-                    binding_name=binding_name,
                     **kwargs
                 )
             except Exception as e:

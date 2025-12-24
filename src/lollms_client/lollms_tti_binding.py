@@ -105,7 +105,7 @@ class LollmsTTIBindingManager:
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
             try:
-                return binding_class(binding_name=binding_name, **kwargs)
+                return binding_class(**kwargs)
             except Exception as e:
                 trace_exception(e)
                 print(f"Failed to instantiate TTI binding {binding_name}: {str(e)}")

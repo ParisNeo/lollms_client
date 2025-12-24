@@ -75,7 +75,7 @@ class LollmsTTSBindingManager:
         
         binding_class = self.available_bindings.get(binding_name)
         if binding_class:
-            return binding_class(binding_name=binding_name, **kwargs)
+            return binding_class(**kwargs)
         return None
 
 

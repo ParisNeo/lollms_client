@@ -88,7 +88,7 @@ class LollmsSTTBindingManager:
                     "service_key": service_key,
                     "verify_ssl_certificate": verify_ssl_certificate
                 })
-                return binding_class(binding_name=binding_name, **kwargs)
+                return binding_class(**kwargs)
             except Exception as e:
                 trace_exception(e)
                 print(f"Failed to instantiate STT binding {binding_name}: {str(e)}")

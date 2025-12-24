@@ -1,7 +1,7 @@
 title: LlamaCpp Server
 author: ParisNeo
 creation_date: 2025-12-13
-last_update_date: 2025-12-13
+last_update_date: 2025-12-24
 description: |
   Runs a local llama.cpp server compatible with OpenAI API.
   Supports GGUF models loaded from a local folder.
@@ -12,6 +12,11 @@ description: |
   **Multi-file GGUF Support:**
   This binding supports split GGUF models (e.g., `model-00001-of-00005.gguf`).
   When pulling a model from Hugging Face, simply specify the filename of the first part.
+
+  **Multimodal Support:**
+  The binding automatically detects `.mmproj` files in the model folder or via a local registry. 
+  Association is handled automatically when pulling both model and projector from Hugging Face.
+  Projector files are hidden from the standalone model list for clarity.
   
 input_parameters:
   - name: model_name
@@ -68,6 +73,14 @@ commands:
         type: str
         description: "The specific GGUF filename to download."
         mandatory: true
+      - name: mmproj_repo_id
+        type: str
+        description: "The Hugging Face repo ID for the mmproj file (optional)."
+        mandatory: false
+      - name: mmproj_filename
+        type: str
+        description: "The specific mmproj filename to download (optional)."
+        mandatory: false
     output:
       - name: status
         type: bool
@@ -80,3 +93,20 @@ commands:
         type: int
       - name: total
         type: int
+  - name: bind_multimodal_model
+    title: Bind Projector
+    description: "Explicitly associate a model file with a multimodal projector file."
+    parameters:
+      - name: model_name
+        type: str
+        description: "The GGUF model filename."
+        mandatory: true
+      - name: mmproj_name
+        type: str
+        description: "The mmproj GGUF filename."
+        mandatory: true
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
