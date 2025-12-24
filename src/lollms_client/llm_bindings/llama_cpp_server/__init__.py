@@ -601,14 +601,83 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             return client.embeddings.create(input=text, model=self.model_name)
         res = self._execute_with_retry(do_embed)
         return res.data[0].embedding
-        
+            
     def get_zoo(self) -> List[Dict[str, Any]]:
         return [
-            {"name": "Llama-3-8B-Instruct-v0.1-GGUF", "description": "Meta Llama 3 8B Instruct (Quantized)", "size": "5.7 GB (Q5_K_M)", "type": "gguf", "link": "MaziyarPanahi/Meta-Llama-3-8B-Instruct-GGUF", "filename": "Meta-Llama-3-8B-Instruct.Q5_K_M.gguf"},
-            {"name": "Phi-3-mini-4k-instruct-GGUF", "description": "Microsoft Phi 3 Mini 4k (Quantized)", "size": "2.4 GB (Q4_K_M)", "type": "gguf", "link": "microsoft/Phi-3-mini-4k-instruct-gguf", "filename": "Phi-3-mini-4k-instruct-q4.gguf"},
-            {"name": "Mistral-7B-Instruct-v0.3-GGUF", "description": "Mistral 7B Instruct v0.3 (Quantized)", "size": "4.6 GB (Q4_K_M)", "type": "gguf", "link": "MaziyarPanahi/Mistral-7B-Instruct-v0.3-GGUF", "filename": "Mistral-7B-Instruct-v0.3.Q4_K_M.gguf"},
-            {"name": "Qwen2.5-7B-Instruct-GGUF", "description": "Qwen 2.5 7B Instruct (Quantized)", "size": "4.7 GB (Q5_K_M)", "type": "gguf", "link": "Qwen/Qwen2.5-7B-Instruct-GGUF", "filename": "qwen2.5-7b-instruct-q5_k_m.gguf"}
+            # Ministral 3: High-performance edge model (3B)
+            {
+                "name": "Ministral-3-3B-Instruct-2512-GGUF",
+                "description": "Mistral AI Ministral 3 3B Instruct (Bartowski Quant) - Efficient Edge Model",
+                "size": "2.2 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF",
+                "filename": "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
+            },
+            # Devstral 2 Mini: Agentic coding specialist (24B)
+            {
+                "name": "Devstral-Small-2-24B-Instruct-GGUF",
+                "description": "Mistral AI Devstral Small 2 24B Instruct (Bartowski Quant) - Coding Specialist",
+                "size": "14.8 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF",
+                "filename": "mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"
+            },
+            # Llama 4 Scout: Meta's efficient MoE (17B)
+            {
+                "name": "Llama-4-Scout-17B-Instruct-GGUF",
+                "description": "Meta Llama 4 Scout 17B Instruct (Bartowski Quant) - 16-Expert MoE",
+                "size": "11.2 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/meta-llama_Llama-4-Scout-17B-16E-Instruct-old-GGUF",
+                "filename": "meta-llama_Llama-4-Scout-17B-16E-Instruct-Q4_K_M.gguf"
+            },
+            # Qwen 3 VL: Vision-Language with "Thinking" (32B)
+            {
+                "name": "Qwen3-VL-32B-Thinking-GGUF",
+                "description": "Qwen 3 VL 32B Thinking (Bartowski Quant) - Vision CoT Reasoning",
+                "size": "19.5 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/Qwen_Qwen3-VL-32B-Thinking-GGUF",
+                "filename": "Qwen_Qwen3-VL-32B-Thinking-Q4_K_M.gguf"
+            },
+            # Qwen 3: Dense reasoning powerhouse (72B)
+            {
+                "name": "Qwen3-72B-Embiggened-GGUF",
+                "description": "Qwen 3 72B Embiggened (Bartowski Quant) - Enhanced Reasoning Dense Model",
+                "size": "43.1 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/cognitivecomputations_Qwen3-72B-Embiggened-GGUF",
+                "filename": "Qwen3-72B-Embiggened-Q4_K_M.gguf"
+            },
+            # Devstral 2: Massive coding architecture (123B)
+            {
+                "name": "Devstral-2-123B-Instruct-GGUF",
+                "description": "Mistral AI Devstral 2 123B Instruct (Bartowski Quant) - Heavy Duty Coding",
+                "size": "71.4 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/mistralai_Devstral-2-123B-Instruct-2512-GGUF",
+                "filename": "Devstral-2-123B-Instruct-2512-Q4_K_M.gguf"
+            },
+            # ChatGPT OSS: Open weights rival (120B)
+            {
+                "name": "ChatGPT-OSS-120B-GGUF",
+                "description": "OpenAI GPT-OSS 120B (Bartowski Quant) - Open Weight Research Model",
+                "size": "69.8 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/openai_gpt-oss-120b-GGUF",
+                "filename": "gpt-oss-120b-Q4_K_M.gguf"
+            },
+            # DeepSeek V3: The MoE Giant (671B Base / 37B Active)
+            {
+                "name": "DeepSeek-V3-0324-GGUF",
+                "description": "DeepSeek V3 0324 (Bartowski Quant) - 671B MoE",
+                "size": "365 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/deepseek-ai_DeepSeek-V3-0324-GGUF",
+                "filename": "DeepSeek-V3-0324-Q4_K_M.gguf"
+            }
         ]
+
 
     def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
         zoo = self.get_zoo(); 
