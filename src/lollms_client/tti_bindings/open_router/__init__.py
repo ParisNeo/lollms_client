@@ -131,7 +131,6 @@ class OpenRouterTTIBinding(LollmsTTIBinding):
             tti_keywords = ["flux", "dall-e", "imagen", "stable-diffusion", "midjourney", "riverflow"]
             
             for m in models:
-                ASCIIColors.magenta(m)
                 m_id = m.get("id", "").lower()
                 description = m.get("description", "").lower()
                 # OpenRouter sometimes provides output_modalities in the architecture block
