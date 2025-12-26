@@ -474,7 +474,8 @@ class LollmsMessage:
     def toggle_image_activation(self, index: int, active: Optional[bool] = None):
         """
         Toggles or sets the activation status of an image at a given index.
-        This change is committed to the database if the discussion is DB-backed.
+        This handles groups/packs: if the image belongs to a group, enabling it
+        will disable others in that group.
         
         Args:
             index: The index of the image in the 'images' list.
@@ -489,12 +490,96 @@ class LollmsMessage:
         else:
             new_active_images = self.active_images.copy()
 
+        # Determine desired state
         if active is None:
-            new_active_images[index] = not new_active_images[index]
+            target_state = not new_active_images[index]
         else:
-            new_active_images[index] = bool(active) # Ensure it's a boolean
+            target_state = bool(active)
+
+        # Check grouping logic via metadata
+        # We look for 'image_groups' or 'image_generation_groups' in metadata
+        metadata = self.metadata or {}
+        all_groups = (metadata.get("image_generation_groups", []) + metadata.get("image_groups", []))
+        
+        target_group = next((g for g in all_groups if index in g.get("indices", [])), None)
+        
+        if target_group:
+            if target_state:
+                # If turning ON, disable all others in this group
+                for i in target_group["indices"]:
+                    if 0 <= i < len(new_active_images):
+                        new_active_images[i] = (i == index)
+            else:
+                # If turning OFF, just deactivate it.
+                # (Assuming it's allowed to have no selection in a group)
+                new_active_images[index] = False
+        else:
+            # Simple toggle for ungrouped images
+            new_active_images[index] = target_state
         
         self.active_images = new_active_images
+        if self._discussion._is_db_backed:
+            self._discussion.commit()
+
+    def add_image_pack(self, images: List[str], group_type: str = "generated", active_by_default: bool = True, title: str = None) -> None:
+        """
+        Adds a list of images as a new pack/group.
+        
+        - The new images are appended to the existing images list.
+        - The first image in the pack is set to Active (if active_by_default is True), others to Inactive.
+        - A new group entry is added to 'image_groups' metadata.
+        
+        Args:
+            images: List of base64 image strings.
+            group_type: Type label for the group (e.g., 'generated', 'upload').
+            active_by_default: If True, the first image in the pack is activated. If False, all are inactive.
+            title: Optional title for the image pack (e.g., the prompt).
+        """
+        if not images:
+            return
+            
+        current_images = self.images or []
+        start_index = len(current_images)
+        
+        # Append new images
+        current_images.extend(images)
+        self.images = current_images
+        
+        # Sync active_images list
+        current_active = self.active_images or [True] * start_index
+        # If active_images was shorter than images for some reason, pad it
+        if len(current_active) < start_index:
+             current_active.extend([True] * (start_index - len(current_active)))
+             
+        # Determine activation states for new images
+        new_active_flags = [False] * len(images)
+        if active_by_default and len(images) > 0:
+            new_active_flags[0] = True
+            
+        current_active.extend(new_active_flags)
+        self.active_images = current_active
+        
+        # Update Metadata with Group info
+        metadata = (self.metadata or {}).copy()
+        groups = metadata.get("image_groups", [])
+        
+        new_indices = list(range(start_index, start_index + len(images)))
+        
+        group_entry = {
+            "id": str(uuid.uuid4()),
+            "type": group_type,
+            "indices": new_indices,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        if title:
+            group_entry["title"] = title
+        
+        groups.append(group_entry)
+        
+        metadata["image_groups"] = groups
+        self.metadata = metadata
+        
         if self._discussion._is_db_backed:
             self._discussion.commit()
     
@@ -1115,7 +1200,9 @@ class LollmsDiscussion:
             if user_msg_orm.sender_type != 'user':
                 raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
             user_msg = LollmsMessage(self, user_msg_orm)
-            images = user_msg.images
+            # FIX: Use get_active_images() to ensure we get a list of strings, not potentially objects/dicts.
+            # This prevents errors if the underlying 'images' field contains new-style structured data.
+            images = user_msg.get_active_images()
                     
         # extract personality data
         if personality is not None:
@@ -1249,7 +1336,7 @@ class LollmsDiscussion:
                 prompt_for_chat = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
                 ASCIIColors.cyan("\n" + "="*50 + f"\n--- DEBUG: SIMPLE CHAT PROMPT ---\n{prompt_for_chat}\n" + "="*50 + "\n")
 
-            final_raw_response = self.lollmsClient.chat(self, images=images, **kwargs) or ""
+            final_raw_response = self.lollmsClient.chat(self, images=images, branch_tip_id=branch_tip_id, **kwargs) or ""
             
             if debug:
                 ASCIIColors.cyan("\n" + "="*50 + f"\n--- DEBUG: RAW SIMPLE CHAT RESPONSE ---\n{final_raw_response}\n" + "="*50 + "\n")
@@ -1299,10 +1386,8 @@ class LollmsDiscussion:
     def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Regenerates the AI response for a given message or the active branch's AI response.
 
-        If the target is an AI message, it's deleted and its children are re-parented to its parent
-        (the user message). A new AI response is then generated from that user message.
-        If the target is a user message, all its existing AI children are deleted, and their
-        descendants are re-parented to the user message. A new AI response is then generated.
+        Instead of deleting the old response, this method simply starts a new generation
+        from the parent message, creating a new branch (sibling to the original response).
 
         Args:
             branch_tip_id (Optional[str]): The ID of the message to regenerate from.
@@ -1332,23 +1417,6 @@ class LollmsDiscussion:
             user_parent_id = user_msg_to_regenerate_from.id
         else:
             raise ValueError(f"Regeneration failed: Target message '{target_id}' is of an unexpected sender type '{target_message_orm.sender_type}'.")
-
-        ai_messages_to_overwrite_ids = set()
-        if target_message_orm.sender_type == 'assistant':
-            # If target is an AI, we only remove this specific AI message.
-            ai_messages_to_overwrite_ids.add(target_message_orm.id)
-        elif target_message_orm.sender_type == 'user':
-            # If target is a user, we remove ALL AI children of this user message.
-            for msg_obj in self._db_discussion.messages:
-                if msg_obj.parent_id == user_msg_to_regenerate_from.id and msg_obj.sender_type == 'assistant':
-                    ai_messages_to_overwrite_ids.add(msg_obj.id)
-        
-        if not ai_messages_to_overwrite_ids:
-            ASCIIColors.warning(f"No AI messages found to regenerate from '{target_id}'. This might be unintended.")
-            # If no AI messages to overwrite, just proceed with generation from user message.
-            # No changes to existing messages needed, so skip the cleanup phase.
-            self.active_branch_id = user_msg_to_regenerate_from.id # Ensure active branch is correct for chat
-            return self.chat(user_message="", add_user_message=False, branch_tip_id=user_msg_to_regenerate_from.id, **kwargs)
 
         # --- Phase 1: Generate new AI response ---
         # The user message for the new generation is user_msg_to_regenerate_from
