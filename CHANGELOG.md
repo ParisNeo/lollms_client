@@ -17,7 +17,8 @@ All notable changes to this project will be documented in this file.
 
 - chore(lollms_client): bump version to 1.8.1 and remove debug output
 
-## [Unreleased]
+#
+- refactor(lollms_client): clean up imports and extend discussion handling# [Unreleased]
 
 - feat(lollms_discussion): add new discussion features and update changelog
 

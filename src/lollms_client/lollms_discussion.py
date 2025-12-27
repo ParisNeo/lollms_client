@@ -471,53 +471,101 @@ class LollmsMessage:
             if i < len(self.active_images) and self.active_images[i]
         ]
 
+    def _sync_active_images_flags(self):
+        """Re-calculates active_images boolean list based on image_groups metadata."""
+        current_images = self.images or []
+        if not current_images:
+            self.active_images = []
+            return
+
+        metadata = self.metadata or {}
+        # Support legacy key "image_generation_groups" by merging or checking both
+        groups = metadata.get("image_groups", []) + metadata.get("image_generation_groups", [])
+        
+        new_active_flags = [False] * len(current_images)
+        
+        grouped_indices = set()
+        
+        for group in groups:
+            indices = group.get("indices", [])
+            for i in indices:
+                grouped_indices.add(i)
+            
+            # Group is active by default unless explicitly False
+            is_group_active = group.get("is_active", True)
+            
+            if is_group_active:
+                main_idx = group.get("main_image_index")
+                # Fallback: if main_idx invalid, use first index
+                if main_idx is None or main_idx not in indices:
+                    if indices:
+                        main_idx = indices[0]
+                
+                if main_idx is not None and 0 <= main_idx < len(new_active_flags):
+                    new_active_flags[main_idx] = True
+        
+        # Legacy/Ungrouped images are active by default
+        for i in range(len(current_images)):
+            if i not in grouped_indices:
+                new_active_flags[i] = True
+                
+        self.active_images = new_active_flags
+
     def toggle_image_activation(self, index: int, active: Optional[bool] = None):
         """
         Toggles or sets the activation status of an image at a given index.
         This handles groups/packs: if the image belongs to a group, enabling it
-        will disable others in that group.
+        will disable others in that group and set it as main.
         
         Args:
             index: The index of the image in the 'images' list.
-            active: If provided, sets the status to this boolean. If None, toggles the current status.
+            active: If provided, sets the status to this boolean. If None, toggles.
         """
-        if not self.images or index >= len(self.images):
-            raise IndexError("Image index out of range.")
-
-        # Initialize active_images if it's missing or mismatched
-        if self.active_images is None or not isinstance(self.active_images, list) or len(self.active_images) != len(self.images):
-            new_active_images = [True] * len(self.images)
-        else:
-            new_active_images = self.active_images.copy()
-
-        # Determine desired state
-        if active is None:
-            target_state = not new_active_images[index]
-        else:
-            target_state = bool(active)
-
-        # Check grouping logic via metadata
-        # We look for 'image_groups' or 'image_generation_groups' in metadata
-        metadata = self.metadata or {}
-        all_groups = (metadata.get("image_generation_groups", []) + metadata.get("image_groups", []))
+        metadata = (self.metadata or {}).copy()
+        groups = metadata.get("image_groups", []) + metadata.get("image_generation_groups", [])
         
-        target_group = next((g for g in all_groups if index in g.get("indices", [])), None)
+        target_group = next((g for g in groups if index in g.get("indices", [])), None)
         
         if target_group:
-            if target_state:
-                # If turning ON, disable all others in this group
-                for i in target_group["indices"]:
-                    if 0 <= i < len(new_active_images):
-                        new_active_images[i] = (i == index)
+            # If explicit active state provided
+            if active is not None:
+                if active:
+                    target_group["is_active"] = True
+                    target_group["main_image_index"] = index
+                else:
+                    # If setting specific image to inactive
+                    if target_group.get("main_image_index") == index:
+                        target_group["is_active"] = False
             else:
-                # If turning OFF, just deactivate it.
-                # (Assuming it's allowed to have no selection in a group)
-                new_active_images[index] = False
+                # Toggle logic
+                # If clicking the currently active main image -> toggle group active state
+                if target_group.get("main_image_index") == index:
+                    target_group["is_active"] = not target_group.get("is_active", True)
+                else:
+                    # Select new image and ensure group is active
+                    target_group["main_image_index"] = index
+                    target_group["is_active"] = True
+            
+            self.metadata = metadata
+            self._sync_active_images_flags()
+            
         else:
-            # Simple toggle for ungrouped images
-            new_active_images[index] = target_state
-        
-        self.active_images = new_active_images
+            # Ungrouped image - wrap in a new single-item group to persist state
+            new_group = {
+                "id": str(uuid.uuid4()),
+                "type": "upload",
+                "indices": [index],
+                "created_at": datetime.utcnow().isoformat(),
+                "main_image_index": index,
+                "is_active": active if active is not None else not (self.active_images and self.active_images[index])
+            }
+            if "image_groups" not in metadata:
+                metadata["image_groups"] = []
+            metadata["image_groups"].append(new_group)
+            
+            self.metadata = metadata
+            self._sync_active_images_flags()
+
         if self._discussion._is_db_backed:
             self._discussion.commit()
 
@@ -526,13 +574,12 @@ class LollmsMessage:
         Adds a list of images as a new pack/group.
         
         - The new images are appended to the existing images list.
-        - The first image in the pack is set to Active (if active_by_default is True), others to Inactive.
-        - A new group entry is added to 'image_groups' metadata.
+        - A new group entry is added to 'image_groups' metadata with 'main_image_index' and 'is_active'.
         
         Args:
             images: List of base64 image strings.
             group_type: Type label for the group (e.g., 'generated', 'upload').
-            active_by_default: If True, the first image in the pack is activated. If False, all are inactive.
+            active_by_default: If True, the pack is activated.
             title: Optional title for the image pack (e.g., the prompt).
         """
         if not images:
@@ -545,31 +592,22 @@ class LollmsMessage:
         current_images.extend(images)
         self.images = current_images
         
-        # Sync active_images list
-        current_active = self.active_images or [True] * start_index
-        # If active_images was shorter than images for some reason, pad it
-        if len(current_active) < start_index:
-             current_active.extend([True] * (start_index - len(current_active)))
-             
-        # Determine activation states for new images
-        new_active_flags = [False] * len(images)
-        if active_by_default and len(images) > 0:
-            new_active_flags[0] = True
-            
-        current_active.extend(new_active_flags)
-        self.active_images = current_active
-        
         # Update Metadata with Group info
         metadata = (self.metadata or {}).copy()
         groups = metadata.get("image_groups", [])
         
         new_indices = list(range(start_index, start_index + len(images)))
         
+        # Default main image is the first one in the pack
+        main_image_idx = new_indices[0] if new_indices else None
+        
         group_entry = {
             "id": str(uuid.uuid4()),
             "type": group_type,
             "indices": new_indices,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.utcnow().isoformat(),
+            "main_image_index": main_image_idx,
+            "is_active": active_by_default
         }
         
         if title:
@@ -579,6 +617,9 @@ class LollmsMessage:
         
         metadata["image_groups"] = groups
         self.metadata = metadata
+        
+        # Sync active_images list based on new group data
+        self._sync_active_images_flags()
         
         if self._discussion._is_db_backed:
             self._discussion.commit()
@@ -1047,11 +1088,34 @@ class LollmsDiscussion:
         else:
             new_msg_orm = SimpleNamespace(**message_data)
             self._db_discussion.messages.append(new_msg_orm)
+        
+        # Wrap the new message immediately to perform updates
+        wrapped_msg = LollmsMessage(self, new_msg_orm)
+        
+        # Automatically group user uploaded images if present and not already grouped
+        images_list = kwargs.get('images', [])
+        if images_list and kwargs.get('sender_type') == 'user':
+            meta = wrapped_msg.metadata or {}
+            # Check if groups already exist (e.g. if loaded from JSON backup)
+            if not meta.get('image_groups'):
+                groups = []
+                for i in range(len(images_list)):
+                    groups.append({
+                        "id": str(uuid.uuid4()),
+                        "type": "upload",
+                        "indices": [i],
+                        "created_at": datetime.utcnow().isoformat(),
+                        "main_image_index": i,
+                        "is_active": True
+                    })
+                meta["image_groups"] = groups
+                wrapped_msg.metadata = meta
+                wrapped_msg._sync_active_images_flags()
             
         self.active_branch_id = msg_id # New message is always a leaf
         self._message_index[msg_id] = new_msg_orm
         self.touch()
-        return LollmsMessage(self, new_msg_orm)
+        return wrapped_msg
     
     def get_branch(self, leaf_id: Optional[str]) -> List[LollmsMessage]:
         """Traces a branch of the conversation from a leaf message back to the root.
