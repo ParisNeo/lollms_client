@@ -511,15 +511,17 @@ class LollmsMessage:
                 
         self.active_images = new_active_flags
 
-    def toggle_image_activation(self, index: int, active: Optional[bool] = None):
+    def toggle_image_pack_activation(self, index: int, active: Optional[bool] = None):
         """
-        Toggles or sets the activation status of an image at a given index.
-        This handles groups/packs: if the image belongs to a group, enabling it
-        will disable others in that group and set it as main.
+        Toggles or sets the activation status of an image pack containing the image at the given index.
+        If the image is part of a pack:
+          - If the pack is active and the clicked image is the main image, it toggles the pack's activation.
+          - If the pack is active and the clicked image is NOT the main image, it sets this image as main (pack remains active).
+          - If the pack is inactive, it activates the pack and sets this image as main.
         
         Args:
             index: The index of the image in the 'images' list.
-            active: If provided, sets the status to this boolean. If None, toggles.
+            active: If provided, sets the status to this boolean. If None, toggles based on context.
         """
         metadata = (self.metadata or {}).copy()
         groups = metadata.get("image_groups", []) + metadata.get("image_generation_groups", [])
@@ -534,6 +536,7 @@ class LollmsMessage:
                     target_group["main_image_index"] = index
                 else:
                     # If setting specific image to inactive
+                    # We deactivate the whole pack if the target image is the main one
                     if target_group.get("main_image_index") == index:
                         target_group["is_active"] = False
             else:
@@ -551,6 +554,7 @@ class LollmsMessage:
             
         else:
             # Ungrouped image - wrap in a new single-item group to persist state
+            # This effectively creates a pack of 1.
             new_group = {
                 "id": str(uuid.uuid4()),
                 "type": "upload",
@@ -569,7 +573,7 @@ class LollmsMessage:
         if self._discussion._is_db_backed:
             self._discussion.commit()
 
-    def add_image_pack(self, images: List[str], group_type: str = "generated", active_by_default: bool = True, title: str = None) -> None:
+    def add_image_pack(self, images: List[str], group_type: str = "generated", active_by_default: bool = True, title: str  | None= None, prompt: str | None = "") -> None:
         """
         Adds a list of images as a new pack/group.
         
@@ -581,6 +585,7 @@ class LollmsMessage:
             group_type: Type label for the group (e.g., 'generated', 'upload').
             active_by_default: If True, the pack is activated.
             title: Optional title for the image pack (e.g., the prompt).
+            prompt: Optional prompt for images that were generated from a prompt. One prompt per pack.
         """
         if not images:
             return
@@ -612,6 +617,8 @@ class LollmsMessage:
         
         if title:
             group_entry["title"] = title
+        if prompt:
+            group_entry["prompt"] = prompt
         
         groups.append(group_entry)
         
@@ -1262,7 +1269,9 @@ class LollmsDiscussion:
                  raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
             user_msg_orm = self._message_index[self.active_branch_id]
             if user_msg_orm.sender_type != 'user':
-                raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
+                user_msg_orm = self._message_index.get(user_msg_orm.parent_id)
+                if user_msg_orm and user_msg_orm.sender_type != 'user':
+                    raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
             user_msg = LollmsMessage(self, user_msg_orm)
             # FIX: Use get_active_images() to ensure we get a list of strings, not potentially objects/dicts.
             # This prevents errors if the underlying 'images' field contains new-style structured data.

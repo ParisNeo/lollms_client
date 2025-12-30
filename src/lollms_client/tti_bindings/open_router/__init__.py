@@ -179,6 +179,33 @@ class OpenRouterTTIBinding(LollmsTTIBinding):
             self.model_name = settings["model_name"]
         return True
 
+    def get_credits(self) -> Optional[Dict[str, float]]:
+        """
+        Get total credits purchased and used for the authenticated user.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.service_key}",
+            "HTTP-Referer": "https://github.com/ParisNeo/lollms_client",
+            "X-Title": "LoLLMS Client"
+        }
+        
+        try:
+            response = requests.get(
+                f"{self.host_address}/credits",
+                headers=headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json().get("data", {})
+            return {
+                "total_credits": float(data.get("total_credits", 0.0)),
+                "total_usage": float(data.get("total_usage", 0.0))
+            }
+        except Exception as e:
+            ASCIIColors.error(f"Open Router Credits Error: {e}")
+            trace_exception(e)
+            return None
+
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
 
         model = kwargs.get("model_name", self.model_name)
@@ -336,6 +363,13 @@ if __name__ == "__main__":
         print("Please set OPENROUTER_API_KEY env var.")
     else:
         binding = OpenRouterTTIBinding(service_key=key)
-        img = binding.generate_image("A cute robot painting a picture")
-        if img:
-            with open("output.png", "wb") as f: f.write(img)
+        
+        # Test generation
+        # img = binding.generate_image("A cute robot painting a picture")
+        # if img:
+        #     with open("output.png", "wb") as f: f.write(img)
+            
+        # Test credits
+        credits = binding.get_credits()
+        if credits:
+            print(f"Credits: {credits}")

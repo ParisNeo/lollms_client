@@ -43,3 +43,11 @@ commands:
     output:
       - name: models
         type: list
+
+  - name: get_credits
+    title: "Get Credits"
+    description: "Get total credits purchased and used."
+    parameters: []
+    output:
+      - name: credits
+        type: dict

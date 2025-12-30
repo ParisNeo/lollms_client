@@ -66,13 +66,13 @@ input_parameters:
 
   - name: "scheduler_name"
     type: "str"
-    default: "default"
+    default: "dpm++_2m_karras"
     description: "Default scheduler to use for denoising steps. Can be overridden per generation."
     options: ["default", "ddim", "ddpm", "deis_multistep", "dpm_multistep", "dpm_multistep_karras", "dpm_single", "dpm_adaptive", "dpm++_2m", "dpm++_2m_karras", "dpm++_2s_ancestral", "dpm++_2s_ancestral_karras", "dpm++_sde", "dpm++_sde_karras", "euler_ancestral_discrete", "euler_discrete", "heun_discrete", "heun_karras", "lms_discrete", "lms_karras", "pndm", "unipc_multistep", "dpm++_2m_sde", "dpm++_2m_sde_karras", "dpm2", "dpm2_karras", "dpm2_a", "dpm2_a_karras", "euler", "euler_a", "heun", "lms"]
 
   - name: "num_inference_steps"
     type: "int"
-    default: 50
+    default: 30
     description: "Number of denoising steps (more steps = higher quality, slower)."
 
   - name: "guidance_scale"

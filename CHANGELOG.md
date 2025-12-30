@@ -22,6 +22,10 @@ All notable changes to this project will be documented in this file.
 
 - feat(lollms_discussion): add new discussion features and update changelog
 
+## [Unreleased]
+
+- feat(discussion, tti-bindings): enhance image handling and expand Diffusers/OpenRouter support
+
 ## v0.31.0  (2025-08-03)
 *   **Bug Fix:** Resolved issue causing discussion level images to be difficult to use by apps.
 *   **Refactor:** Reorganized LollmsDiscussion class.
