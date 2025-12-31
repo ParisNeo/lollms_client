@@ -86,7 +86,7 @@ class PerplexityBinding(LollmsLLMBinding):
         if frequency_penalty is not None: params['frequency_penalty'] = frequency_penalty
         return params
 
-    def chat(self,
+    def _chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
              n_predict: Optional[int] = 2048,

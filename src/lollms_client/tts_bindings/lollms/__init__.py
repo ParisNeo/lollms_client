@@ -10,12 +10,7 @@ BindingName = "LollmsTTSBinding_Impl"
 
 class LollmsTTSBinding_Impl(LollmsTTSBinding):
     """Concrete implementation of the LollmsTTSBinding for the standard LOLLMS server."""
-
-    def __init__(self,
-                 host_address: Optional[str] = "http://localhost:9600",
-                 model_name: Optional[str] = "main_voice",
-                 service_key: Optional[str] = None, # This will be used as client_id
-                 verify_ssl_certificate: bool = True):
+    def __init__(self, **kwargs):
         """
         Initialize the LOLLMS TTS binding.
 
@@ -25,12 +20,12 @@ class LollmsTTSBinding_Impl(LollmsTTSBinding):
             service_key (Optional[str]): Authentication key, used as client_id for LOLLMS server.
             verify_ssl_certificate (bool): Whether to verify SSL certificates.
         """
-        super().__init__(host_address=host_address,
-                         model_name=model_name,
-                         service_key=service_key, # Stored in the parent class
-                         verify_ssl_certificate=verify_ssl_certificate)
-        self.host_address = host_address
-        # self.client_id = service_key # Can access via self.service_key from parent
+        super().__init__("lollms")
+        self.host_address = kwargs.get("host_address","http://localhost:9600")
+        self.model_name =  kwargs.get("model_name","main_voice")
+        self.service_key =  kwargs.get("service_key",None) # This will be used as client_id
+        self.verify_ssl_certificate =  kwargs.get("verify_ssl_certificate",True)
+       
 
     def generate_audio(self, text: str, voice: Optional[str] = None, **kwargs) -> bytes:
         """

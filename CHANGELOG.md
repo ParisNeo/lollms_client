@@ -22,7 +22,8 @@ All notable changes to this project will be documented in this file.
 
 - feat(lollms_discussion): add new discussion features and update changelog
 
-## [Unreleased]
+#
+- feat(bindings): update multiple LLM bindings and context size definitions# [Unreleased]
 
 - feat(discussion, tti-bindings): enhance image handling and expand Diffusers/OpenRouter support
 

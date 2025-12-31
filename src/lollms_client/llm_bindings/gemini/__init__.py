@@ -305,7 +305,7 @@ class GeminiBinding(LollmsLLMBinding):
             trace_exception(ex)
             return {"status": False, "error": error_message}
 
-    def chat(self,
+    def _chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
              n_predict: Optional[int] = 2048,
@@ -329,6 +329,8 @@ class GeminiBinding(LollmsLLMBinding):
         if not self.client:
              return {"status": "error", "message": "Gemini client not initialized."}
 
+        if streaming_callback:
+            stream = True
         system_prompt = discussion.system_prompt
         messages = discussion.get_messages(branch_tip_id)
         

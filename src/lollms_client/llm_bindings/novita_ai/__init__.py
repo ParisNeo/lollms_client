@@ -185,7 +185,7 @@ class NovitaAIBinding(LollmsLLMBinding):
             trace_exception(e)
             return {"status": False, "error": str(e)}
 
-    def chat(self,
+    def _chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
              n_predict: Optional[int] = 2048,

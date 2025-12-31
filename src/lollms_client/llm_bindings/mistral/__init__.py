@@ -124,7 +124,7 @@ class MistralBinding(LollmsLLMBinding):
                         ai_keyword=ai_keyword,
                         **kwargs)
 
-    def chat(self,
+    def _chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
              n_predict: Optional[int] = 2048,

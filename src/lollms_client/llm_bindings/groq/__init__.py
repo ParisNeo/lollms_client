@@ -93,7 +93,7 @@ class GroqBinding(LollmsLLMBinding):
         
         return self.chat(temp_discussion, **kwargs)
 
-    def chat(self,
+    def _chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
              n_predict: Optional[int] = 2048,

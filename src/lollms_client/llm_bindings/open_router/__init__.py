@@ -7,6 +7,7 @@ from lollms_client.lollms_types import MSG_TYPE
 from ascii_colors import ASCIIColors, trace_exception
 
 import pipmaster as pm
+import requests
 
 # Ensure the required packages are installed
 pm.ensure_packages(["openai", "pillow", "tiktoken"])
@@ -39,15 +40,15 @@ class OpenRouterBinding(LollmsLLMBinding):
         """
         super().__init__(BindingName, **kwargs)
         self.model_name = kwargs.get("model_name","google/gemini-flash-1.5")
-        self.api_key = kwargs.get("service_key") or os.getenv("OPENROUTER_API_KEY")
+        self.service_key = kwargs.get("service_key") or os.getenv("OPENROUTER_service_key")
 
-        if not self.api_key:
-            raise ValueError("OpenRouter API key is required. Set it via 'open_router_api_key' or OPENROUTER_API_KEY env var.")
+        if not self.service_key:
+            raise ValueError("OpenRouter API key is required. Set it via 'open_router_service_key' or OPENROUTER_service_key env var.")
 
         try:
             self.client = openai.OpenAI(
                 base_url=self.BASE_URL,
-                api_key=self.api_key,
+                api_key=self.service_key,
             )
         except Exception as e:
             ASCIIColors.error(f"Failed to configure OpenRouter client: {e}")
@@ -127,7 +128,7 @@ class OpenRouterBinding(LollmsLLMBinding):
                         ai_keyword=ai_keyword,
                         **kwargs)
 
-    def chat(self,
+    def _chat(self,
              discussion: LollmsDiscussion,
              branch_tip_id: Optional[str] = None,
              n_predict: Optional[int] = 2048,
@@ -254,12 +255,40 @@ class OpenRouterBinding(LollmsLLMBinding):
         ASCIIColors.info(f"OpenRouter model set to: {model_name}. It will be used on the next API call.")
         return True
 
+    def get_credits(self) -> Optional[Dict[str, float]]:
+        """
+        Get total credits purchased and used for the authenticated user.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.service_key}",
+            "HTTP-Referer": "https://github.com/ParisNeo/lollms_client",
+            "X-Title": "LoLLMS Client"
+        }
+        
+        try:
+            response = requests.get(
+                f"{self.BASE_URL}/credits",
+                headers=headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json().get("data", {})
+            return {
+                "total_credits": float(data.get("total_credits", 0.0)),
+                "total_usage": float(data.get("total_usage", 0.0))
+            }
+        except Exception as e:
+            ASCIIColors.error(f"Open Router Credits Error: {e}")
+            trace_exception(e)
+            return None
+        
+        
 if __name__ == '__main__':
     # Environment variable to set for testing:
-    # OPENROUTER_API_KEY: Your OpenRouter API key (starts with sk-or-...)
+    # OPENROUTER_service_key: Your OpenRouter API key (starts with sk-or-...)
 
-    if "OPENROUTER_API_KEY" not in os.environ:
-        ASCIIColors.red("Error: OPENROUTER_API_KEY environment variable not set.")
+    if "OPENROUTER_service_key" not in os.environ:
+        ASCIIColors.red("Error: OPENROUTER_service_key environment variable not set.")
         print("Please get your key from https://openrouter.ai/keys and set it.")
         exit(1)
 

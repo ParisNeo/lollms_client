@@ -14,3 +14,20 @@ input_parameters:
     description: "The API key for the OpenRouter service. Can also be set via the OPENROUTER_API_KEY environment variable."
     mandatory: true
     default: ""
+
+commands:
+  - name: list_models
+    title: "Refresh Models"
+    description: "Fetches the current list of image-capable models from Open Router."
+    parameters: []
+    output:
+      - name: models
+        type: list
+        
+  - name: get_credits
+    title: "Get Credits"
+    description: "Get total credits purchased and used."
+    parameters: []
+    output:
+      - name: credits
+        type: dict

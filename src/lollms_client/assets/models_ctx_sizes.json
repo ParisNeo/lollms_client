@@ -232,6 +232,8 @@
     "gpt-5-chat": 200000,
     "gpt-5-mini": 200000,
     "gpt-5-nano": 200000,
+    "gpt-oss:120b": 128000,
+    "gpt-oss:20b": 128000,
     "gpt-oss-120b": 128000,
     "gpt-oss-20b": 128000,
     "gpt-oss-20b:free": 128000,

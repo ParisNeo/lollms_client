@@ -248,7 +248,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
         )
         return self._process_request(params, stream, streaming_callback)
 
-    def chat(
+    def _chat(
         self,
         discussion: LollmsDiscussion,
         branch_tip_id: Optional[str] = None,

@@ -444,7 +444,7 @@ class HuggingFace(LollmsLLMBinding):
         except Exception as e:
             return {"status": False, "message": str(e)}
 
-def ps(self) -> Dict[str, List[Dict]]:
+    def ps(self) -> Dict[str, List[Dict]]:
         """
         Returns the process status of loaded models, including memory usage.
         """

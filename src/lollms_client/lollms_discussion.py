@@ -2240,7 +2240,7 @@ class LollmsDiscussion:
         try:
             if self.metadata is None:
                 self.metadata = {}
-            discussion = self.export("markdown")[0:1000]
+            discussion = self.export("markdown", suppress_system_prompt=True)[0:1000]
             system_prompt="You are a title builder out of a discussion."
             prompt = f"""Build a title for the following discussion:
 {discussion}

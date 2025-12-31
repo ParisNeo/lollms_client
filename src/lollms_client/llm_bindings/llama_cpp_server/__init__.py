@@ -512,7 +512,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             trace_exception(e)
             return {"status": False, "error": str(e)}
 
-    def chat(self, discussion: LollmsDiscussion, **kwargs) -> Union[str, Dict]:
+    def _chat(self, discussion: LollmsDiscussion, **kwargs) -> Union[str, Dict]:
         try:
             client = self._get_client()
             messages = discussion.export("openai_chat")
@@ -525,7 +525,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     extra_body={"top_k": kwargs.get("top_k", 40), "repeat_penalty": kwargs.get("repeat_penalty", 1.1)}
                 )
             response = self._execute_with_retry(do_chat)
-            if kwargs.get("stream", False):
+            if kwargs.get("stream", True if kwargs.get("streaming_callback") else False):
                 full_text = ""
                 for chunk in response:
                     content = chunk.choices[0].delta.content or ""

@@ -133,8 +133,8 @@ class OllamaBinding(LollmsLLMBinding):
                     user_keyword:Optional[str]="!@>user:",
                     ai_keyword:Optional[str]="!@>assistant:",
                     think: Optional[bool] = False,
-                    reasoning_effort: Optional[bool] = "low", # low, medium, high
-                    reasoning_summary: Optional[bool] = "auto", # auto
+                    reasoning_effort: Optional[str] = "low", # low, medium, high
+                    reasoning_summary: Optional[str] = "auto", # auto
                     **kwargs
                     ) -> Union[str, dict]:
         """
@@ -166,6 +166,9 @@ class OllamaBinding(LollmsLLMBinding):
 
         if not self.ollama_client:
              return {"status": False, "error": "Ollama client not initialized."}
+
+        if streaming_callback:
+            stream = True
 
         options = {}
         if n_predict is not None: options['num_predict'] = n_predict
@@ -427,7 +430,7 @@ class OllamaBinding(LollmsLLMBinding):
             return {"status": False, "error": error_message}
     
 
-    def chat(self,
+    def _chat(self,
             discussion: LollmsDiscussion,
             branch_tip_id: Optional[str] = None,
             n_predict: Optional[int] = None,
@@ -938,6 +941,7 @@ class OllamaBinding(LollmsLLMBinding):
             'llama3.1': 131072,   # Llama 3.1 extended context
             'llama3.2': 131072,   # Llama 3.2 extended context
             'llama3.3': 131072,   # Assuming similar to 3.1/3.2
+            'gpt-oss': 128000,     # GPT-OSS extended
             'gpt-oss:20b': 16000,     # GPT-OSS extended
             'gpt-oss:120b': 128000,     # GPT-OSS extended
             'codestral': 256000,  # Codestral
