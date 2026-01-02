@@ -94,7 +94,35 @@ input_parameters:
     type: "int"
     default: "1024"
     description: "Image height."
-
+  - name: "watermark_path"
+    type: "str"
+    default: ""
+    description: "Visible watermark image (link, base64, or local path)."
+  - name: "watermark_size_x"
+    type: "int"
+    default: 128
+    description: "Watermark width."
+  - name: "watermark_size_y"
+    type: "int"
+    default: 128
+    description: "Watermark height."
+  - name: "watermark_pos_x"
+    type: "int"
+    default: 10
+    description: "Watermark X position."
+  - name: "watermark_pos_y"
+    type: "int"
+    default: 10
+    description: "Watermark Y position."
+  - name: "author"
+    type: "str"
+    default: "ParisNeo"
+    description: "Author name for image metadata."
+  - name: "system"
+    type: "str"
+    default: "LoLLMS"
+    description: "System name for image metadata."
+    
 commands:
   - name: pull_model
     title: Pull Model

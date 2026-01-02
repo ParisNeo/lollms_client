@@ -295,7 +295,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             "negative_prompt": negative_prompt,
             "params": params
         })
-        return response.content
+        # Process image before returning to apply metadata/watermarks
+        return self.process_image(response.content, **kwargs)
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
         self.ensure_server_is_running(True)
@@ -339,7 +340,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             "params": params
         }
         response = self._post_json_request("/edit_image", data=json_payload)
-        return response.content
+        # Process image before returning to apply metadata/watermarks
+        return self.process_image(response.content, **kwargs)
 
     def list_models(self) -> list:
         """
@@ -414,6 +416,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         self.ensure_server_is_running(True)
             # Normalize settings from list of dicts to a single dict if needed
         parsed_settings = settings if isinstance(settings, dict) else {s["name"]: s["value"] for s in settings if "name" in s and "value" in s}
+        parsed_settings.update(kwargs)
         response = self._post_json_request("/set_settings", data=parsed_settings)
         return response.json().get("success", False)
 

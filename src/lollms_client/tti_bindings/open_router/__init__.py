@@ -345,7 +345,20 @@ class OpenRouterTTIBinding(LollmsTTIBinding):
                 if content:
                     raise ValueError(f"Model returned text instead of image: {content}")
                     
-            raise ValueError(f"No image found in Open Router response: {result}")
+            error_msg = f"""
+No image found in Open Router response:
+```json
+{json.dumps(result, indent=2)}
+```
+
+Debug Info:
+- Model: {result.get('model', 'N/A')}
+- Provider: {result.get('provider', 'N/A')}
+- Completion Tokens: {result.get('usage', {}).get('completion_tokens', 'N/A')}
+- Message Content: '{message.get('content', '')}'
+- Has 'images' field: {('images' in message)}
+"""
+            raise ValueError(error_msg)
 
         except ValueError as ve:
             # Re-raise ValueError with the message for user feedback
