@@ -158,6 +158,7 @@ class XTTSClientBinding(LollmsTTSBinding):
 
     def generate_audio(self, text: str, voice: Optional[str] = None, **kwargs) -> bytes:
         """Generate audio by calling the server's API"""
+        self.ensure_server_is_running()
         payload = {"text": text, "voice": voice}
         # Pass other kwargs from the description file (language, split_sentences)
         payload.update(kwargs)
@@ -174,6 +175,7 @@ class XTTSClientBinding(LollmsTTSBinding):
 
     def list_voices(self, **kwargs) -> List[str]:
         """Get available voices from the server"""
+        self.ensure_server_is_running()
         try:
             response = requests.get(f"{self.base_url}/list_voices")
             response.raise_for_status()
@@ -185,6 +187,7 @@ class XTTSClientBinding(LollmsTTSBinding):
 
     def list_models(self, **kwargs) -> list:
         """Lists models supported by the server"""
+        self.ensure_server_is_running()
         try:
             response = requests.get(f"{self.base_url}/list_models")
             response.raise_for_status()

@@ -32,7 +32,8 @@ All notable changes to this project will be documented in this file.
 
 - feat(tti): refactor and clean up TTI bindings
 
-## [Unreleased]
+#
+- feat(xtts): ensure server is running before making API calls# [Unreleased]
 
 - feat: bump package version to 1.9.2
 
