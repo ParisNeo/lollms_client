@@ -136,15 +136,15 @@ def get_available_bindings(tts_bindings_dir: Union[str, Path] = None) -> List[Di
         tts_bindings_dir = Path(__file__).resolve().parent / "tts_bindings"
     return LollmsTTSBindingManager.get_bindings_list(tts_bindings_dir)
 
-def list_binding_models(stt_binding_name: str, stt_binding_config: Optional[Dict[str, any]]|None = None, stt_bindings_dir: str|Path = Path(__file__).parent / "stt_bindings") -> List[Dict]:
+def list_binding_models(tts_binding_name: str, tts_binding_config: Optional[Dict[str, any]]|None = None, tts_bindings_dir: str|Path = Path(__file__).parent / "tts_bindings") -> List[Dict]:
     """
     Lists all available models for a specific binding.
     """
-    binding = LollmsTTSBindingManager(stt_bindings_dir).create_binding(
-        binding_name=stt_binding_name,
+    binding = LollmsTTSBindingManager(tts_bindings_dir).create_binding(
+        binding_name=tts_binding_name,
         **{
             k: v
-            for k, v in (stt_binding_config or {}).items()
+            for k, v in (tts_binding_config or {}).items()
             if k != "binding_name"
         }
     )

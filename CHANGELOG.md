@@ -32,6 +32,10 @@ All notable changes to this project will be documented in this file.
 
 - feat(tti): refactor and clean up TTI bindings
 
+## [Unreleased]
+
+- feat: bump package version to 1.9.2
+
 ## v0.31.0  (2025-08-03)
 *   **Bug Fix:** Resolved issue causing discussion level images to be difficult to use by apps.
 *   **Refactor:** Reorganized LollmsDiscussion class.
