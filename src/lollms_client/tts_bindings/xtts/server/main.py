@@ -13,6 +13,11 @@ try:
     import wave
     import numpy as np
     import tempfile
+    import warnings
+
+    # Suppress transformers warnings about generation mixin and attention masks to clean up logs
+    warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+    warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
     
     # Use ascii_colors for logging
     from ascii_colors import ASCIIColors
@@ -140,6 +145,10 @@ try:
                 text_to_generate = req.text
                 ASCIIColors.info(f"Server: Generating audio for: '{text_to_generate[:50]}{'...' if len(text_to_generate) > 50 else ''}'")
                 ASCIIColors.info(f"Server: Language: {req.language}, Requested Voice: {req.voice}")
+
+                # Heuristic warning for language mismatch causing truncation
+                if len(text_to_generate) > 250 and req.language == "en":
+                    ASCIIColors.warning("Server: Text length > 250 chars with language='en'. XTTS may truncate. Ensure correct language code (e.g. 'fr', 'es') is passed if text is not English.")
 
                 # Determine which voice name to use. Priority: speaker_wav > voice > 'default_voice'
                 voice_to_find = req.speaker_wav or req.voice or "default_voice"

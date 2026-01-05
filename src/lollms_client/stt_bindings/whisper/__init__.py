@@ -1,5 +1,6 @@
 # lollms_client/stt_bindings/whisper/__init__.py
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional, List, Union, Dict, Any
 from ascii_colors import trace_exception, ASCIIColors
@@ -209,12 +210,12 @@ class WhisperSTTBinding(LollmsSTTBinding):
                 pass  # Ignore cleanup errors
 
 
-    def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:
+    def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:
         """
-        Transcribes the audio file at the given path using Whisper.
+        Transcribes audio using Whisper.
 
         Args:
-            audio_path (Union[str, Path]): The path to the audio file to transcribe.
+            audio_source (Union[str, Path, bytes]): Path to the audio file or raw audio bytes.
             model (Optional[str]): The specific Whisper model size to use.
                                   If None, uses the model loaded during initialization.
             **kwargs: Additional parameters for Whisper's transcribe method, e.g.:
@@ -233,48 +234,58 @@ class WhisperSTTBinding(LollmsSTTBinding):
         if not self.model:
             self._load_whisper_model(self.default_model_name)
 
-            
-        audio_file = Path(audio_path)
-        if not audio_file.exists():
-            raise FileNotFoundError(f"Audio file not found at: {audio_path}")
-
-        if model and model != self.loaded_model_name:
-            ASCIIColors.info(f"Switching Whisper model to '{model}' for this transcription.")
-            try:
-                self._load_whisper_model(model) # Attempt to load the new model
-            except RuntimeError as e:
-                 # If switching fails, keep using the old model if available, or raise if none loaded
-                if self.model is None:
-                    raise RuntimeError(f"Failed to switch to Whisper model '{model}' and no model currently loaded.") from e
-                else:
-                    ASCIIColors.warning(f"Failed to switch to Whisper model '{model}'. Using previously loaded model '{self.loaded_model_name}'. Error: {e}")
-
-
-        if self.model is None:
-            raise RuntimeError("Whisper model is not loaded. Cannot transcribe.")
-
-        # Prepare Whisper-specific options from kwargs
-        whisper_options = {}
-        if "language" in kwargs:
-            whisper_options["language"] = kwargs["language"]
-        if "fp16" in kwargs: # Typically handled by device selection, but allow override
-            whisper_options["fp16"] = kwargs["fp16"]
-        else: # Default fp16 based on device
-            whisper_options["fp16"] = (self.device == "cuda")
-        if "task" in kwargs: # "transcribe" or "translate"
-            whisper_options["task"] = kwargs["task"]
-
-
-        ASCIIColors.info(f"Transcribing '{audio_file.name}' with Whisper model '{self.loaded_model_name}' (options: {whisper_options})...")
+        temp_audio_file = None
         try:
+            if isinstance(audio_source, (str, Path)):
+                audio_file = Path(audio_source)
+                if not audio_file.exists():
+                    raise FileNotFoundError(f"Audio file not found at: {audio_source}")
+            elif isinstance(audio_source, bytes):
+                temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                temp_audio_file.write(audio_source)
+                temp_audio_file.close()
+                audio_file = Path(temp_audio_file.name)
+            else:
+                raise ValueError("audio_source must be str, Path, or bytes")
+
+            if model and model != self.loaded_model_name:
+                ASCIIColors.info(f"Switching Whisper model to '{model}' for this transcription.")
+                try:
+                    self._load_whisper_model(model)
+                except RuntimeError as e:
+                    if self.model is None:
+                        raise RuntimeError(f"Failed to switch to Whisper model '{model}' and no model currently loaded.") from e
+                    else:
+                        ASCIIColors.warning(f"Failed to switch to Whisper model '{model}'. Using previously loaded model '{self.loaded_model_name}'. Error: {e}")
+
+            if self.model is None:
+                raise RuntimeError("Whisper model is not loaded. Cannot transcribe.")
+
+            # Prepare Whisper-specific options from kwargs
+            whisper_options = {}
+            if "language" in kwargs:
+                whisper_options["language"] = kwargs["language"]
+            if "fp16" in kwargs:
+                whisper_options["fp16"] = kwargs["fp16"]
+            else:
+                whisper_options["fp16"] = (self.device == "cuda")
+            if "task" in kwargs:
+                whisper_options["task"] = kwargs["task"]
+
+            ASCIIColors.info(f"Transcribing '{audio_file.name}' with Whisper model '{self.loaded_model_name}' (options: {whisper_options})...")
+            
             result = self.model.transcribe(str(audio_file), **whisper_options)
             transcribed_text = result.get("text", "")
             ASCIIColors.green("Transcription successful.")
             return transcribed_text.strip()
+
         except Exception as e:
-            ASCIIColors.error(f"Whisper transcription failed for '{audio_file.name}': {e}")
+            ASCIIColors.error(f"Whisper transcription failed: {e}")
             trace_exception(e)
             raise Exception(f"Whisper transcription error: {e}") from e
+        finally:
+            if temp_audio_file:
+                Path(temp_audio_file.name).unlink(missing_ok=True)
 
     @staticmethod
     def list_models(**kwargs) -> List[str]:

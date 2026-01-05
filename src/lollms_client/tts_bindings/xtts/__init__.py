@@ -156,11 +156,24 @@ class XTTSClientBinding(LollmsTTSBinding):
         # as it is a shared resource for other processes.
         pass
 
-    def generate_audio(self, text: str, voice: Optional[str] = None, **kwargs) -> bytes:
-        """Generate audio by calling the server's API"""
+    def generate_audio(self, text: str, voice: Optional[str] = None, language: str = "en", **kwargs) -> bytes:
+        """Generate audio by calling the server's API
+        
+        Args:
+            text: The text to synthesize
+            voice: The voice file to use (wav/mp3)
+            language: The language code (e.g., 'en', 'fr', 'es'). Defaults to 'en'.
+            **kwargs: Additional parameters
+        """
         self.ensure_server_is_running()
-        payload = {"text": text, "voice": voice}
-        # Pass other kwargs from the description file (language, split_sentences)
+        
+        # Construct payload with explicit language support
+        payload = {
+            "text": text, 
+            "voice": voice,
+            "language": language
+        }
+        # Pass other kwargs from the description file (split_sentences)
         payload.update(kwargs)
         
         try:

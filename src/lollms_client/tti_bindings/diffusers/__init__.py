@@ -5,6 +5,7 @@ import requests
 import subprocess
 import time
 import json
+import yaml
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
@@ -28,6 +29,9 @@ from ascii_colors import ASCIIColors
 
 BindingName = "DiffusersTTIBinding"
 
+# Substrings identifying auxiliary files to be ignored/filtered
+AUXILIARY_KEYWORDS = ['mmproj', 'vae', 'adapter', 'lora', 'encoder', 'clip', 'controlnet']
+
 class DiffusersTTIBinding(LollmsTTIBinding):
     def __init__(self, **kwargs):
         # Prioritize 'model_name' but accept 'model' as an alias from config files.
@@ -47,10 +51,152 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         self.venv_dir = Path("./venv/tti_diffusers_venv")
         self.models_path = Path(kwargs.get("models_path", "./data/tti_models/diffusers")).resolve()
         self.extra_models_path = kwargs.get("extra_models_path")
-        self.hf_token = kwargs.get("hf_token", "")  # NEW
+        self.hf_token = kwargs.get("hf_token", "")
         self.models_path.mkdir(exist_ok=True, parents=True)
+        
+        self.diagnose()
+        
         if self.auto_start_server:
             self.ensure_server_is_running(self.wait_for_server)
+
+    def diagnose(self):
+        """
+        Diagnoses the environment, listing all found models with full paths (for debugging)
+        and their call-names (relative paths). Also checks for GGUF bindings.
+        """
+        ASCIIColors.cyan("="*60)
+        ASCIIColors.cyan("       Diffusers Binding Diagnosis")
+        ASCIIColors.cyan("="*60)
+        
+        models_path = self.models_path
+        extra_models_path = Path(self.extra_models_path).resolve() if self.extra_models_path else None
+        
+        ASCIIColors.info(f"Main Models Path: {models_path}")
+        if extra_models_path:
+            ASCIIColors.info(f"Extra Models Path: {extra_models_path}")
+
+        # 1. Check GGUF Bindings
+        yaml_path = models_path / "gguf_bindings.yaml"
+        gguf_bindings = {}
+        if yaml_path.exists():
+            ASCIIColors.success(f"GGUF Bindings Registry found at: {yaml_path}")
+            try:
+                with open(yaml_path, 'r') as f:
+                    gguf_bindings = yaml.safe_load(f) or {}
+                ASCIIColors.info("Registered Bindings:")
+                if gguf_bindings:
+                    for k, v in gguf_bindings.items():
+                        base = v.get('base_model', 'N/A')
+                        vae = v.get('vae_path', 'None')
+                        mmproj = v.get('other_component_path', 'None')
+                        print(f"  - Key/File: {k}")
+                        print(f"    Base Model: {base}")
+                        print(f"    VAE: {vae}")
+                        print(f"    MMPROJ: {mmproj}")
+                else:
+                    print("  (Empty registry)")
+            except Exception as e:
+                ASCIIColors.error(f"Error reading bindings file: {e}")
+        else:
+            ASCIIColors.warning(f"No gguf_bindings.yaml found at {models_path}. GGUF models may not work without binding.")
+
+        # 2. Scan Models
+        ASCIIColors.info("\nScanning for models on disk...")
+        roots = [models_path]
+        if extra_models_path and extra_models_path.exists():
+            roots.append(extra_models_path)
+            
+        found_count = 0
+        for root in roots:
+            if not root.exists():
+                ASCIIColors.warning(f"Skipping non-existent root: {root}")
+                continue
+            
+            ASCIIColors.info(f"Scanning root: {root}")
+            
+            # Helper to get relative path safely
+            def get_rel_path(p):
+                try:
+                    return str(p.relative_to(root))
+                except ValueError:
+                    return p.name
+
+            # Diffusers Pipelines
+            for model_index in root.rglob("model_index.json"):
+                folder = model_index.parent
+                rel_name = get_rel_path(folder)
+                ASCIIColors.green(f"  [Pipeline] {rel_name}")
+                print(f"     Full Path: {folder}")
+                print(f"     Call As:   {rel_name}")
+                found_count += 1
+
+            # Safetensors
+            for safepath in root.rglob("*.safetensors"):
+                if (safepath.parent / "model_index.json").exists(): continue
+                rel_name = get_rel_path(safepath)
+                
+                # Check for auxiliary keywords
+                fname_lower = safepath.name.lower()
+                is_aux = any(kw in fname_lower for kw in AUXILIARY_KEYWORDS)
+                
+                if is_aux:
+                    ASCIIColors.yellow(f"  [Auxiliary - Ignored] {rel_name}")
+                else:
+                    ASCIIColors.blue(f"  [Checkpoint] {rel_name}")
+                
+                print(f"     Full Path: {safepath}")
+                if not is_aux:
+                    print(f"     Call As:   {rel_name}")
+                    found_count += 1
+
+            # GGUF
+            for gguf_path in root.rglob("*.gguf"):
+                rel_name = get_rel_path(gguf_path)
+                filename = gguf_path.name
+                
+                # Check for auxiliary keywords
+                fname_lower = filename.lower()
+                is_aux = any(kw in fname_lower for kw in AUXILIARY_KEYWORDS)
+                
+                if is_aux:
+                    ASCIIColors.yellow(f"  [Auxiliary - Ignored] {rel_name}")
+                    print(f"     Full Path: {gguf_path}")
+                    continue
+
+                # Check binding status
+                is_bound = False
+                bound_info = ""
+                
+                # Check 1: Exact filename in bindings
+                if filename in gguf_bindings:
+                    is_bound = True
+                    bound_info = f"[Bound to {gguf_bindings[filename].get('base_model')}]"
+                # Check 2: Case insensitive
+                elif filename.lower() in {k.lower(): k for k in gguf_bindings}.keys():
+                    is_bound = True
+                    bound_info = f"[Bound (Case-insensitive)]"
+                # Check 3: Substring/Stem match (Server logic)
+                else:
+                    for k in gguf_bindings:
+                        if k.lower() in filename.lower():
+                            is_bound = True
+                            bound_info = f"[Bound (Matched '{k}')]"
+                            break
+                
+                if is_bound:
+                    ASCIIColors.magenta(f"  [GGUF] {rel_name} {bound_info}")
+                else:
+                    ASCIIColors.red(f"  [GGUF] {rel_name} [Unbound - Needs binding configuration]")
+                
+                print(f"     Full Path: {gguf_path}")
+                print(f"     Call As:   {rel_name}")
+                found_count += 1
+
+        if found_count == 0:
+            ASCIIColors.warning("No valid models found.")
+        else:
+            ASCIIColors.info(f"\nTotal valid models found: {found_count}")
+        ASCIIColors.cyan("="*60 + "\n")
 
 
     def is_server_running(self) -> bool:
@@ -99,7 +245,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         ])
         ASCIIColors.info(f"Installing misc libraries (numpy, tqdm...)")
         pm_v.ensure_packages([
-            "tqdm", "numpy"
+            "tqdm", "numpy", "pyyaml"
         ])
         ASCIIColors.info(f"Installing Pillow")
         pm_v.ensure_packages([
@@ -124,7 +270,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         # Standard dependencies
         ASCIIColors.info(f"Installing transformers dependencies")
         pm_v.ensure_packages([
-            "transformers", "safetensors", "accelerate"
+            "transformers", "safetensors", "accelerate", "huggingface_hub", "gguf"
         ])
         ASCIIColors.info(f"[Optional] Installing xformers")
         try:
@@ -133,7 +279,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ])
         except:
             pass
-        # Git-based diffusers to get the latest version
+        # Git-based diffusers to get the latest version (needed for GGUF support)
         ASCIIColors.info(f"Installing diffusers library from github")
         pm_v.ensure_packages([
             {
@@ -188,10 +334,6 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
                     if self.hf_token:
                         command.extend(["--hf-token", self.hf_token])
-
-                    if self.extra_models_path:
-                        resolved_extra_path = Path(self.extra_models_path).resolve()
-                        command.extend(["--extra-models-path", str(resolved_extra_path)])
 
                     creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
                     self.server_process = subprocess.Popen(command, creationflags=creationflags)
@@ -276,13 +418,27 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
             raise RuntimeError("Communication with the Diffusers server failed.") from e
 
-    def unload_model(self):
+    def unload_model(self) -> dict:
         ASCIIColors.info("Requesting server to unload the current model...")
         try:
-            self._post_json_request("/unload_model")
+            response = self._post_json_request("/unload_model")
+            return {"status": True, "message": "Model unloaded successfully."}
         except Exception as e:
-            ASCIIColors.warning(f"Could not send unload request to server: {e}")
-        pass
+            trace_exception(e)
+            return {"status": False, "message": f"Could not send unload request to server: {e}"}
+
+    def shutdown(self) -> dict:
+        ASCIIColors.info("Requesting server shutdown...")
+        try:
+            # Send request but don't wait long for response as server kills itself
+            try:
+                requests.post(f"{self.base_url}/shutdown", timeout=1)
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError):
+                pass
+            return {"status": True, "message": "Server shutdown initiated."}
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": f"Failed to shutdown server: {e}"}
 
     def generate_image(self, prompt: str, negative_prompt: str = "", **kwargs) -> bytes:
         self.ensure_server_is_running(True)
@@ -401,6 +557,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             {"name": "Stable Diffusion 3 Medium", "description": "SOTA model with advanced prompt understanding (Gated).", "size": "Unknown", "type": "checkpoint", "link": "stabilityai/stable-diffusion-3-medium-diffusers"},
             {"name": "FLUX.1 Schnell", "description": "Powerful and fast next-gen model (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.1-schnell"},
             {"name": "FLUX.1 Dev", "description": "Larger developer version of FLUX.1 (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.1-dev"},
+            {"name": "Qwen-Image-Edit-GGUF", "description": "Quantized Qwen Image Edit (GGUF). High quality editing.", "size": "13GB (Q4_K_M)", "type": "gguf", "link": "QuantStack/Qwen-Image-Edit-GGUF", "filename": "qwen-image-edit-q4_k_m.gguf"},
         ]
 
     def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
@@ -410,7 +567,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ASCIIColors.error(msg)
             return {"status": False, "message": msg}
         item = zoo[index]
-        return self.pull_model(item["link"], progress_callback=progress_callback)
+        return self.pull_model(item["link"], filename=item.get("filename"), progress_callback=progress_callback)
 
     def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
         self.ensure_server_is_running(True)
@@ -426,14 +583,15 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
 
-    def pull_model(self, model_name: str, local_name: Optional[str] = None, progress_callback: Callable[[dict], None] = None) -> dict:
+    def pull_model(self, model_name: str, filename: Optional[str] = None, local_name: Optional[str] = None, progress_callback: Callable[[dict], None] = None) -> dict:
         """
         Pulls a model from Hugging Face or URL via the server.
+        If 'filename' is provided, it tries to download just that file (good for GGUF repos).
         """
         payload = {}
         if model_name.startswith("http") and "huggingface.co" not in model_name:
              # Assume direct file URL if not huggingface repo url (roughly)
-             if model_name.endswith(".safetensors"):
+             if model_name.endswith(".safetensors") or model_name.endswith(".gguf"):
                 payload["safetensors_url"] = model_name
              else:
                 payload["hf_id"] = model_name 
@@ -445,6 +603,9 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         
         if local_name:
             payload["local_name"] = local_name
+        
+        if filename:
+            payload["filename"] = filename
             
         try:
             if progress_callback:
@@ -459,6 +620,15 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ASCIIColors.success(msg)
             if progress_callback:
                 progress_callback({"status": "success", "message": msg, "completed": 100, "total": 100})
+            
+            # If it's the Qwen GGUF model from zoo, auto-bind it
+            if "qwen-image-edit" in model_name.lower() and filename and filename.endswith(".gguf"):
+                ASCIIColors.info("Detected Qwen-Image-Edit GGUF. Attempting automatic binding...")
+                try:
+                    self.bind_model_components(filename, "Qwen/Qwen-Image-Edit")
+                except:
+                    ASCIIColors.warning("Auto-binding failed. You may need to bind manually.")
+
             return {"status": True, "message": msg}
         except Exception as e:
             error_msg = f"Failed to pull model: {e}"
@@ -500,6 +670,25 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             if progress_callback:
                 progress_callback({"status": "error", "message": error_msg})
             return {"status": False, "message": error_msg}
+
+    def bind_model_components(self, model_name: str, base_model: str, vae_path: Optional[str] = None, other_component_path: Optional[str] = None) -> dict:
+        """
+        Binds a GGUF/safetensors main model to a base pipeline architecture and optional auxiliary files.
+        """
+        self.ensure_server_is_running(True)
+        payload = {
+            "model_name": model_name,
+            "base_model": base_model,
+            "vae_path": vae_path,
+            "other_component_path": other_component_path
+        }
+        try:
+            ASCIIColors.info(f"Binding {model_name} to base {base_model}...")
+            response = self._post_json_request("/bind_model_components", data=payload)
+            return response.json()
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": str(e)}
 
     def __del__(self):
         # The client destructor does not stop the server,

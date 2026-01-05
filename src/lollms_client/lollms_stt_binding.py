@@ -19,9 +19,17 @@ class LollmsSTTBinding(LollmsBaseBinding):
         super().__init__(binding_name=binding_name, **kwargs)
 
     @abstractmethod
-    def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:
+    def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:
         """
-        Transcribes the audio file at the given path into text.
+        Transcribes the audio source into text.
+        
+        Args:
+            audio_source (Union[str, Path, bytes]): Path to the audio file or raw audio bytes.
+            model (Optional[str]): The model to use for transcription.
+            **kwargs: Additional parameters.
+            
+        Returns:
+            str: The transcribed text.
         """
         pass
 

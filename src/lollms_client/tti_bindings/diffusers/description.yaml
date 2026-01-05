@@ -14,6 +14,7 @@ description: |
     - FLUX-style models (e.g. https://huggingface.co/black-forest-labs/FLUX.1-dev)
     - Qwen-based vision or diffusion models where compatible (e.g. https://huggingface.co/Qwen)
     - Community models such as RealVis, DreamShaper, Juggernaut, etc. from the Hugging Face Hub.
+    - **GGUF Support:** Capable of loading quantized GGUF checkpoints (e.g. Flux, Qwen-Image-Edit) by binding them to a base model architecture.
 
   Any compatible Diffusers or .safetensors pipeline can be installed via
   the provided management commands, and only locally downloaded models
@@ -132,6 +133,10 @@ commands:
         type: str
         description: "The Hugging Face repo ID (e.g. 'stabilityai/sdxl-turbo') or URL."
         mandatory: true
+      - name: filename
+        type: str
+        description: "Specific filename to download (e.g. 'model.gguf'). If empty, tries to download the whole repo."
+        mandatory: false
       - name: local_name
         type: str
         description: "Optional custom name for the model folder or file."
@@ -154,6 +159,34 @@ commands:
         type: int
         description: "Total bytes or percentage"
 
+  - name: bind_model_components
+    title: Bind Components
+    description: "Associates a GGUF model with a base pipeline architecture and optional auxiliary files (VAE, Projector)."
+    parameters:
+      - name: model_name
+        type: str
+        description: "The filename of the GGUF model (the main transformer/unet)."
+        mandatory: true
+      - name: base_model
+        type: str
+        description: "The Hugging Face repo ID of the base model to use for config/scheduler/tokenizer (e.g. 'Qwen/Qwen-Image-Edit')."
+        mandatory: true
+      - name: vae_path
+        type: str
+        description: "Optional: Filename of a VAE to use."
+        mandatory: false
+      - name: other_component_path
+        type: str
+        description: "Optional: Filename of another component (e.g. mmproj/text_encoder)."
+        mandatory: false
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation"
+      - name: message
+        type: str
+        description: "Result message"
+
   - name: upgrade_diffusers
     title: Upgrade Diffusers
     description: "Upgrades the diffusers library to the latest development version."
@@ -169,3 +202,27 @@ commands:
       - name: status
         type: str
         description: "Status of the upgrade process"
+
+  - name: unload_model
+    title: Unload Model
+    description: "Unloads the currently loaded model from VRAM."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation"
+      - name: message
+        type: str
+        description: "Result message"
+
+  - name: shutdown
+    title: Shutdown Server
+    description: "Stops the background Diffusers server process."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "Status of the operation"
+      - name: message
+        type: str
+        description: "Result message"

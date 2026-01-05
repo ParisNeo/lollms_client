@@ -283,7 +283,7 @@ class OllamaBinding(LollmsLLMBinding):
                         options=options if options else None
                     )
                     full_response_text = response.message.content
-                    if think:
+                    if think and response.message.thinking:
                         full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
                     return full_response_text
                     

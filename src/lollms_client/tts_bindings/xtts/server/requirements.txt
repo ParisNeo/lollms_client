@@ -5,7 +5,8 @@ torchaudio==2.1.2+cu118
 
 # Extra index pour les wheels CUDA
 --extra-index-url https://download.pytorch.org/whl/cu118
-transformers==4.56.0
+# Stable version compatible with XTTS to avoid warnings
+transformers==4.46.0
 
 # TTS with torch compatible CUDA 11.8
 TTS

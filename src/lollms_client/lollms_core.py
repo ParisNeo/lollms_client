@@ -31,6 +31,7 @@ from lollms_client.lollms_agentic import (
     SubTask, ExecutionPlan
 )
 
+
 class LollmsClient():
     """
     Core client class for interacting with LOLLMS services, including LLM, TTS, TTI, STT, TTV, and TTM.
@@ -258,47 +259,47 @@ class LollmsClient():
 
     # --- High Level Text Operations (Delegated to LLM Binding) ---
     def generate_codes(self, *args, **kwargs):
-        if self.llm: return self.llm.generate_codes(*args, **kwargs)
+        if self.llm: return self.llm.tp.generate_codes(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def generate_code(self, *args, **kwargs):
-        if self.llm: return self.llm.generate_code(*args, **kwargs)
+        if self.llm: return self.llm.tp.generate_code(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def update_code(self, *args, **kwargs):
-        if self.llm: return self.llm.update_code(*args, **kwargs)
+        if self.llm: return self.llm.tp.update_code(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def generate_structured_content(self, *args, **kwargs):
-        if self.llm: return self.llm.generate_structured_content(*args, **kwargs)
+        if self.llm: return self.llm.tp.generate_structured_content(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def generate_structured_content_pydantic(self, *args, **kwargs):
-        if self.llm: return self.llm.generate_structured_content_pydantic(*args, **kwargs)
+        if self.llm: return self.llm.tp.generate_structured_content_pydantic(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def yes_no(self, *args, **kwargs):
-        if self.llm: return self.llm.yes_no(*args, **kwargs)
+        if self.llm: return self.llm.tp.yes_no(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def multichoice_question(self, *args, **kwargs):
-        if self.llm: return self.llm.multichoice_question(*args, **kwargs)
+        if self.llm: return self.llm.tp.multichoice_question(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def multichoice_ranking(self, *args, **kwargs):
-        if self.llm: return self.llm.multichoice_ranking(*args, **kwargs)
+        if self.llm: return self.llm.tp.multichoice_ranking(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def extract_code_blocks(self, *args, **kwargs):
-        if self.llm: return self.llm.extract_code_blocks(*args, **kwargs)
+        if self.llm: return self.llm.tp.extract_code_blocks(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def extract_thinking_blocks(self, *args, **kwargs):
-        if self.llm: return self.llm.extract_thinking_blocks(*args, **kwargs)
+        if self.llm: return self.llm.tp.extract_thinking_blocks(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def remove_thinking_blocks(self, *args, **kwargs):
-        if self.llm: return self.llm.remove_thinking_blocks(*args, **kwargs)
+        if self.llm: return self.llm.tp.remove_thinking_blocks(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     # --- Wrappers for other Modality Bindings ---
@@ -538,7 +539,15 @@ Output the parameters as JSON: {{"tool_params": {{...}}}}"""
                     raw_results = rag_fn(query=query, rag_top_k=rag_top_k, rag_min_similarity_percent=rag_min_similarity_percent)
                     docs = [d for d in (raw_results.get("results", []) if isinstance(raw_results, dict) else raw_results or [])]
                     tool_result = {"status": "success", "results": docs}
-                    sources = [{"title":d["title"], "content":d["content"], "source": tool_name, "metadata": d.get("metadata", {}), "score": d.get("score", 0.0)} for d in docs]
+                    sources = [
+                                {
+                                    "title":d["title"], 
+                                    "content":d["content"], 
+                                    "source": tool_name, 
+                                    "metadata": d.get("metadata", {}), 
+                                    "score": d.get("score", 0.0)
+                                } 
+                                for d in docs]
                     log_event(sources, MSG_TYPE.MSG_TYPE_SOURCES_LIST)
                     log_event(f"Retrieved {len(docs)} relevant documents", MSG_TYPE.MSG_TYPE_INFO)
                 elif hasattr(self, "mcp") and "local_tools" not in tool_name:
@@ -580,6 +589,7 @@ RESPONSE:"""
                 return {"final_answer": final_answer, "tool_calls": tool_calls_this_turn, "sources": sources, "error": None, "clarification_required": False, "final_scratchpad": f"Strategy: SINGLE_TOOL\nTool: {tool_name}\nResult: Success\nResponse Time: {response_time:.2f}s"}
 
             except Exception as e:
+                trace_exception(e)
                 log_event(f"Single-tool execution failed: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, event_id=synthesis_id)
                 log_event("Escalating to complex planning approach", MSG_TYPE.MSG_TYPE_INFO)
 
@@ -1083,61 +1093,9 @@ Output format: {{"tool_params": {{...}}}}"""
             "error": None
         }
 
-    def sequential_summarize(self, text:str, chunk_processing_prompt:str="Extract relevant information...", chunk_processing_output_format="markdown", final_memory_processing_prompt="Create final summary...", final_output_format="markdown", ctx_size:int=None, chunk_size:int=None, overlap:int=None, bootstrap_chunk_size:int=None, bootstrap_steps:int=None, callback = None, debug:bool= False):
-        if not self.llm: raise RuntimeError("LLM binding not initialized.")
-        if not callback: callback = self.sink
-        
-        ctx_size = ctx_size or self.llm.get_context_size() or 8192
-        chunk_size = chunk_size or (ctx_size // 4)
-        overlap = overlap or (chunk_size // 10)
-        
-        tokens = self.tokenize(text)
-        memory = ""
-        start = 0
-        
-        while start < len(tokens):
-            end = min(start + chunk_size, len(tokens))
-            chunk_text = self.detokenize(tokens[start:end])
-            
-            prompt = f"Memory: {memory}\nChunk: {chunk_text}\n{chunk_processing_prompt}\nOutput in {chunk_processing_output_format} block."
-            resp = self.generate_text(prompt)
-            blocks = self.extract_code_blocks(resp, chunk_processing_output_format)
-            if blocks: memory = blocks[0]['content']
-            else: memory = resp # fallback
-            
-            start = max(start + chunk_size - overlap, end) if end < len(tokens) else len(tokens)
-            if callback: callback(f"Processed chunk ending at {end}/{len(tokens)}", MSG_TYPE.MSG_TYPE_STEP)
-
-        final_prompt = f"Memory: {memory}\n{final_memory_processing_prompt}"
-        final = self.generate_text(final_prompt)
-        return self.remove_thinking_blocks(final)
-
-    def deep_analyze(self, query: str, text: str = None, files: Optional[List[Union[str, Path]]] = None, **kwargs):
-        if not text and not files: return "No input"
-        content = text or ""
-        if files:
-            for f in files:
-                try: content += f"\nFile: {f}\n" + Path(f).read_text(errors='ignore')
-                except: pass
-        
-        # Reuse sequential summarize logic but with query focus
-        return self.sequential_summarize(content, chunk_processing_prompt=f"Extract info related to: {query}", final_memory_processing_prompt=f"Answer '{query}' based on memory.", **kwargs)
-
     def long_context_processing(self, text_to_process: str, contextual_prompt: str, **kwargs) -> str:
-        if not self.llm: raise RuntimeError("LLM binding not initialized.")
-        
-        ctx_size = self.llm.get_context_size() or 8192
-        if self.count_tokens(text_to_process) < ctx_size * 0.7:
-            return self.generate_text(f"{contextual_prompt}\n\n{text_to_process}", **kwargs)
-            
-        # Naive map-reduce
-        chunks = chunk_text(text_to_process, self.tokenize, self.detokenize, ctx_size // 2, 100)
-        summaries = []
-        for c in chunks:
-            summaries.append(self.generate_text(f"Summarize relevant to '{contextual_prompt}':\n{c}", **kwargs))
-        
-        combined = "\n".join(summaries)
-        return self.generate_text(f"{contextual_prompt}\n\nContext:\n{combined}", **kwargs)
+        if self.llm:
+            return self.llm.tp.long_context_processing(text_to_process, contextual_prompt, **kwargs)
 
 def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators=True):
     tokens = tokenizer(text)

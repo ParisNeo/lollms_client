@@ -122,100 +122,108 @@ class WhisperCppSTTBinding(LollmsSTTBinding):
             trace_exception(e)
             return False
 
-    def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:
-        input_audio_p = Path(audio_path)
-        if not input_audio_p.exists():
-            raise FileNotFoundError(f"Input audio file not found: {input_audio_p}")
-
-        current_model_path = self.model_path
-        if model: # User specified a different model for this transcription
-            potential_model_p = Path(model)
-            if potential_model_p.is_absolute() and potential_model_p.is_file():
-                current_model_path = potential_model_p
-            elif self.models_search_path and (self.models_search_path / model).is_file():
-                current_model_path = self.models_search_path / model
-            elif Path(model).is_file(): # Relative to current working directory?
-                 current_model_path = Path(model)
+    def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:
+        temp_input_file = None
+        try:
+            if isinstance(audio_source, (str, Path)):
+                input_audio_p = Path(audio_source)
+                if not input_audio_p.exists():
+                    raise FileNotFoundError(f"Input audio file not found: {input_audio_p}")
+            elif isinstance(audio_source, bytes):
+                # Write bytes to temp file for processing
+                temp_input_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                temp_input_file.write(audio_source)
+                temp_input_file.close()
+                input_audio_p = Path(temp_input_file.name)
             else:
-                ASCIIColors.warning(f"Specified model '{model}' not found as absolute path, in models_search_path, or current dir. Using default: {self.model_path.name}")
-        
-        language = kwargs.get("language", self.default_language)
-        threads = kwargs.get("n_threads", self.n_threads)
-        extra_args_call = kwargs.get("extra_whisper_args", self.extra_whisper_args)
+                raise ValueError("audio_source must be str, Path, or bytes")
 
-        with tempfile.TemporaryDirectory(prefix="lollms_whispercpp_") as tmpdir:
-            tmp_dir_path = Path(tmpdir)
-            
-            # Always convert to ensure 16kHz mono WAV, unless explicitly told not to by a kwarg (e.g. assume_wav=True)
-            force_conversion = not kwargs.get("assume_compatible_wav", False)
-            
-            if force_conversion or input_audio_p.suffix.lower() != ".wav":
-                if not self.ffmpeg_exe:
-                    raise RuntimeError("ffmpeg is required for audio pre-processing but is not configured. "
-                                       "Please provide a 16kHz mono WAV file or configure ffmpeg.")
-                converted_wav_path = tmp_dir_path / (input_audio_p.stem + "_16khz_mono.wav")
-                if not self._convert_to_wav(input_audio_p, converted_wav_path):
-                    raise Exception(f"Audio conversion to compatible WAV failed for {input_audio_p}.")
-                target_audio_file = converted_wav_path
-            else: # Input is WAV, assume it's compatible (user's responsibility if assume_compatible_wav=True)
-                target_audio_file = input_audio_p
-            
-            command = [
-                self.whispercpp_exe,
-                "-m", str(current_model_path),
-                "-f", str(target_audio_file),
-                "-l", language,
-                "-t", str(threads),
-                "-otxt" # Output as a .txt file in the same dir as input wav
-            ]
-            if isinstance(extra_args_call, list):
-                command.extend(extra_args_call)
-            elif isinstance(extra_args_call, str):
-                command.extend(extra_args_call.split())
-
-            ASCIIColors.info(f"Executing Whisper.cpp: {' '.join(command)}")
-            try:
-                # Run whisper.cpp, making it output its .txt file into our temp directory.
-                # To do this, we can copy the target_audio_file into tmp_dir_path if it's not already there,
-                # then run whisper.cpp with CWD as tmp_dir_path.
-                
-                final_target_audio_in_tmp: Path
-                if target_audio_file.parent != tmp_dir_path:
-                    final_target_audio_in_tmp = tmp_dir_path / target_audio_file.name
-                    shutil.copy2(target_audio_file, final_target_audio_in_tmp)
-                    # Update command to use the path within tmp_dir_path if we copied it.
-                    # The -f argument should be relative to the CWD if CWD is set.
-                    command[command.index("-f")+1] = str(final_target_audio_in_tmp.name) 
+            current_model_path = self.model_path
+            if model: # User specified a different model for this transcription
+                potential_model_p = Path(model)
+                if potential_model_p.is_absolute() and potential_model_p.is_file():
+                    current_model_path = potential_model_p
+                elif self.models_search_path and (self.models_search_path / model).is_file():
+                    current_model_path = self.models_search_path / model
+                elif Path(model).is_file(): # Relative to current working directory?
+                     current_model_path = Path(model)
                 else:
-                    final_target_audio_in_tmp = target_audio_file
-                    command[command.index("-f")+1] = str(final_target_audio_in_tmp.name) 
+                    ASCIIColors.warning(f"Specified model '{model}' not found as absolute path, in models_search_path, or current dir. Using default: {self.model_path.name}")
+            
+            language = kwargs.get("language", self.default_language)
+            threads = kwargs.get("n_threads", self.n_threads)
+            extra_args_call = kwargs.get("extra_whisper_args", self.extra_whisper_args)
 
-
-                process = subprocess.run(command, capture_output=True, text=True, check=True, cwd=str(tmp_dir_path))
+            with tempfile.TemporaryDirectory(prefix="lollms_whispercpp_") as tmpdir:
+                tmp_dir_path = Path(tmpdir)
                 
-                output_txt_file = tmp_dir_path / (final_target_audio_in_tmp.name + ".txt")
+                # Always convert to ensure 16kHz mono WAV, unless explicitly told not to by a kwarg (e.g. assume_wav=True)
+                force_conversion = not kwargs.get("assume_compatible_wav", False)
+                
+                if force_conversion or input_audio_p.suffix.lower() != ".wav":
+                    if not self.ffmpeg_exe:
+                        raise RuntimeError("ffmpeg is required for audio pre-processing but is not configured. "
+                                           "Please provide a 16kHz mono WAV file or configure ffmpeg.")
+                    converted_wav_path = tmp_dir_path / (input_audio_p.stem + "_16khz_mono.wav")
+                    if not self._convert_to_wav(input_audio_p, converted_wav_path):
+                        raise Exception(f"Audio conversion to compatible WAV failed for {input_audio_p}.")
+                    target_audio_file = converted_wav_path
+                else: # Input is WAV, assume it's compatible (user's responsibility if assume_compatible_wav=True)
+                    target_audio_file = input_audio_p
+                
+                command = [
+                    self.whispercpp_exe,
+                    "-m", str(current_model_path),
+                    "-f", str(target_audio_file),
+                    "-l", language,
+                    "-t", str(threads),
+                    "-otxt" # Output as a .txt file in the same dir as input wav
+                ]
+                if isinstance(extra_args_call, list):
+                    command.extend(extra_args_call)
+                elif isinstance(extra_args_call, str):
+                    command.extend(extra_args_call.split())
 
-                if output_txt_file.exists():
-                    transcribed_text = output_txt_file.read_text(encoding='utf-8').strip()
-                    ASCIIColors.green(f"Whisper.cpp transcription successful for {input_audio_p.name}.")
-                    return transcribed_text
-                else:
-                    ASCIIColors.error(f"Whisper.cpp did not produce the expected output file: {output_txt_file.name} in {tmp_dir_path}")
-                    ASCIIColors.info(f"Whisper.cpp stdout:\n{process.stdout}")
-                    ASCIIColors.info(f"Whisper.cpp stderr:\n{process.stderr}")
-                    raise Exception("Whisper.cpp execution failed to produce output text file.")
+                ASCIIColors.info(f"Executing Whisper.cpp: {' '.join(command)}")
+                try:
+                    # Run whisper.cpp, making it output its .txt file into our temp directory.
+                    final_target_audio_in_tmp: Path
+                    if target_audio_file.parent != tmp_dir_path:
+                        final_target_audio_in_tmp = tmp_dir_path / target_audio_file.name
+                        shutil.copy2(target_audio_file, final_target_audio_in_tmp)
+                        command[command.index("-f")+1] = str(final_target_audio_in_tmp.name) 
+                    else:
+                        final_target_audio_in_tmp = target_audio_file
+                        command[command.index("-f")+1] = str(final_target_audio_in_tmp.name) 
 
-            except subprocess.CalledProcessError as e:
-                ASCIIColors.error(f"Whisper.cpp execution failed with exit code {e.returncode} for {input_audio_p.name}")
-                ASCIIColors.error(f"Command: {' '.join(e.cmd)}")
-                ASCIIColors.error(f"Stdout:\n{e.stdout}")
-                ASCIIColors.error(f"Stderr:\n{e.stderr}")
-                trace_exception(e)
-                raise Exception(f"Whisper.cpp execution error: {e.stderr or e.stdout or 'Unknown whisper.cpp error'}") from e
-            except Exception as e:
-                ASCIIColors.error(f"An error occurred during Whisper.cpp transcription for {input_audio_p.name}: {e}")
-                trace_exception(e)
-                raise
+                    process = subprocess.run(command, capture_output=True, text=True, check=True, cwd=str(tmp_dir_path))
+                    
+                    output_txt_file = tmp_dir_path / (final_target_audio_in_tmp.name + ".txt")
+
+                    if output_txt_file.exists():
+                        transcribed_text = output_txt_file.read_text(encoding='utf-8').strip()
+                        ASCIIColors.green(f"Whisper.cpp transcription successful for {input_audio_p.name}.")
+                        return transcribed_text
+                    else:
+                        ASCIIColors.error(f"Whisper.cpp did not produce the expected output file: {output_txt_file.name} in {tmp_dir_path}")
+                        ASCIIColors.info(f"Whisper.cpp stdout:\n{process.stdout}")
+                        ASCIIColors.info(f"Whisper.cpp stderr:\n{process.stderr}")
+                        raise Exception("Whisper.cpp execution failed to produce output text file.")
+
+                except subprocess.CalledProcessError as e:
+                    ASCIIColors.error(f"Whisper.cpp execution failed with exit code {e.returncode} for {input_audio_p.name}")
+                    ASCIIColors.error(f"Command: {' '.join(e.cmd)}")
+                    ASCIIColors.error(f"Stdout:\n{e.stdout}")
+                    ASCIIColors.error(f"Stderr:\n{e.stderr}")
+                    trace_exception(e)
+                    raise Exception(f"Whisper.cpp execution error: {e.stderr or e.stdout or 'Unknown whisper.cpp error'}") from e
+        except Exception as e:
+            ASCIIColors.error(f"An error occurred during Whisper.cpp transcription: {e}")
+            trace_exception(e)
+            raise
+        finally:
+            if temp_input_file:
+                Path(temp_input_file.name).unlink(missing_ok=True)
 
     def list_models(self, **kwargs) -> List[str]:
         models = []
@@ -382,4 +390,3 @@ if __name__ == '__main__':
 
     def list_models(self) -> List[Dict[str, Any]]:
         return ["base" , "small", "medium", "large"]
-

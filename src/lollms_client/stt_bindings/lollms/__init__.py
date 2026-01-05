@@ -5,7 +5,7 @@ from pathlib import Path
 from lollms_client.lollms_stt_binding import LollmsSTTBinding
 from typing import Optional, List, Union
 from ascii_colors import trace_exception, ASCIIColors
-import json # Added for potential error parsing
+import json 
 
 # Defines the binding name for the manager
 BindingName = "LollmsSTTBinding_Impl"
@@ -31,13 +31,13 @@ class LollmsSTTBinding_Impl(LollmsSTTBinding):
         self.service_key=kwargs.get("service_key")
         self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate")
 
-    def transcribe_audio(self, audio_path: Union[str, Path], model: Optional[str] = None, **kwargs) -> str:
+    def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:
         """
         Transcribes audio using an assumed LOLLMS /audio2text endpoint.
         Sends audio data as base64 encoded string.
 
         Args:
-            audio_path (Union[str, Path]): Path to the audio file.
+            audio_source (Union[str, Path, bytes]): Path to the audio file or raw audio bytes.
             model (Optional[str]): Specific STT model to use. If None, uses default from init.
             **kwargs: Additional parameters (e.g., language hint - passed if provided).
 
@@ -51,20 +51,27 @@ class LollmsSTTBinding_Impl(LollmsSTTBinding):
         endpoint = f"{self.host_address}/audio2text" # Assumed endpoint
         model_to_use = model if model else self.model_name
 
-        audio_file = Path(audio_path)
-        if not audio_file.exists():
-            raise FileNotFoundError(f"Audio file not found at: {audio_path}")
-
         try:
-            # Read audio file and encode as base64
-            with open(audio_file, "rb") as f:
-                audio_data = f.read()
+            if isinstance(audio_source, (str, Path)):
+                audio_file = Path(audio_source)
+                if not audio_file.exists():
+                    raise FileNotFoundError(f"Audio file not found at: {audio_source}")
+                # Read audio file and encode as base64
+                with open(audio_file, "rb") as f:
+                    audio_data = f.read()
+                filename = audio_file.name
+            elif isinstance(audio_source, bytes):
+                audio_data = audio_source
+                filename = "audio.wav" # Default filename for bytes
+            else:
+                raise ValueError("audio_source must be str, Path, or bytes")
+
             audio_base64 = base64.b64encode(audio_data).decode('utf-8')
 
             request_data = {
-                "audio_data": audio_base64, # Sending data instead of path
+                "audio_data": audio_base64,
                 "model": model_to_use,
-                "file_name": audio_file.name # Send filename as metadata if server supports it
+                "file_name": filename
             }
             # Add language hint if provided in kwargs
             if "language" in kwargs:

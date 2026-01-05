@@ -1276,6 +1276,257 @@ try:
 except Exception as e:
     ASCIIColors.error(f"An error occurred during long context processing: {e}")
 ```
+## low level text processing
+Here is the **English, README-ready version**, clean and aligned with LOLLMS documentation standards.
+
+---
+
+## 🧠 Lollms Text Processor
+
+The **Lollms Text Processor** is a high-level utility designed to turn raw LLM generations into **production-ready workflows**.
+It handles long documents, structured outputs, robust code generation, intelligent editing, and reliable parsing.
+
+It is directly accessible via:
+
+```python
+lc.llm.tp
+```
+
+---
+
+## 🔧 Initialization
+
+```python
+from lollms_client import LollmsClient
+
+lc = LollmsClient(
+    llm_binding_name="lollms",
+    llm_binding_config={
+        "model_name": "llama3",
+        "host_address": "http://localhost:9642",
+        "service_key": "the service key"
+    }
+)
+
+llm = lc.llm
+tp = lc.llm.tp
+```
+
+* `llm` provides low-level text generation primitives
+* `tp` is the **Text Processor**, ready to use out of the box
+
+---
+
+## 📚 1. Long Context Processing
+
+The Text Processor automatically handles documents that exceed the model’s context window by chunking, synthesizing intermediate results, and producing a final consolidated output.
+
+### Text generation from a very long document
+
+```python
+summary = tp.long_context_processing(
+    text_to_process=long_document,
+    contextual_prompt="Summarize the main findings about climate change",
+    processing_type="text"
+)
+```
+
+### Structured extraction from long context
+
+```python
+result = tp.long_context_processing(
+    text_to_process=long_document,
+    contextual_prompt="Extract all people mentioned with their roles",
+    processing_type="structured",
+    schema={
+        "type": "object",
+        "properties": {
+            "people": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "role": {"type": "string"}
+                    }
+                }
+            }
+        }
+    }
+)
+```
+
+### Yes / No question over long documents
+
+```python
+answer = tp.long_context_processing(
+    text_to_process=long_document,
+    contextual_prompt="Does this document mention Marie Curie?",
+    processing_type="yes_no",
+    return_explanation=True
+)
+```
+
+---
+
+## 💻 2. Code Generation and Editing
+
+### Single-file code generation
+
+```python
+code = tp.generate_code(
+    prompt="Create a binary search function",
+    language="python"
+)
+```
+
+### Multi-file project generation
+
+```python
+files = tp.generate_codes(
+    prompt="Create a Flask web app with an HTML frontend"
+)
+```
+
+### Efficient code editing (non-destructive)
+
+```python
+updated_code = tp.edit_code(
+    original_code=existing_code,
+    edit_instruction="Add error handling and logging",
+    language="python"
+)
+```
+
+Unlike naïve prompting, edits are **structural**, not full rewrites.
+
+---
+
+## 🧩 3. Structured Content Generation
+
+### Using JSON Schema
+
+```python
+data = tp.generate_structured_content(
+    prompt="Create a presentation about AI",
+    schema={
+        "type": "object",
+        "properties": {
+            "slides": {
+                "type": "array",
+                "items": {"type": "object"}
+            }
+        }
+    }
+)
+```
+
+### Using Pydantic models
+
+```python
+from pydantic import BaseModel
+
+class Person(BaseModel):
+    name: str
+    age: int
+
+person = tp.generate_structured_content_pydantic(
+    prompt="Create a person named Alice, age 30",
+    pydantic_model=Person
+)
+```
+
+✔ Automatic validation
+✔ Truncation recovery
+✔ Agent-friendly outputs
+
+---
+
+## 🧠 4. LLM Helper Utilities
+
+### Yes / No questions
+
+```python
+answer = tp.yes_no(
+    question="Is Marie Curie a scientist?",
+    context="Marie Curie was a physicist...",
+    return_explanation=True
+)
+```
+
+### Multiple-choice questions
+
+```python
+choice = tp.multichoice_question(
+    question="What field did Marie Curie work in?",
+    possible_answers=["Biology", "Physics", "Chemistry"]
+)
+```
+
+### Text summarization
+
+```python
+summary = tp.summerize_text(text="Long article...")
+```
+
+### Keyword extraction
+
+```python
+keywords = tp.extract_keywords(
+    text="Long article...",
+    num_keywords=5
+)
+```
+
+---
+
+## 🧪 5. Response Parsing and Cleanup
+
+### Extract reasoning / thinking blocks
+
+```python
+thoughts = tp.extract_thinking_blocks(llm_response)
+```
+
+### Remove reasoning blocks
+
+```python
+clean_text = tp.remove_thinking_blocks(llm_response)
+```
+
+### Extract code blocks (legacy support)
+
+```python
+blocks = tp.extract_code_blocks(
+    text=llm_response,
+    format="markdown"
+)
+```
+
+---
+
+## ✨ Key Features
+
+* ✅ Automatic **long-context handling**
+* ✅ XML-based code generation (no fragile backticks)
+* ✅ Truncation recovery for JSON and code
+* ✅ Non-destructive, structured code editing
+* ✅ JSON Schema & Pydantic support
+* ✅ Decision helpers (yes/no, multichoice, ranking)
+* ✅ Graceful fallback strategies
+
+---
+
+## 🏁 Summary
+
+The **Lollms Text Processor** turns a raw LLM into a **reliable production tool**.
+
+> `lc.llm` generates
+> `lc.llm.tp` structures, validates, and secures
+
+A core component of **LOLLMS — one tool to rule them all** 🚀
+
+
 
 ## Contributing
 
