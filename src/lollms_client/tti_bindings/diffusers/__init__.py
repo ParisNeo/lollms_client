@@ -9,7 +9,7 @@ import yaml
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
-
+from ascii_colors import trace_exception
 # Ensure pipmaster is available.
 try:
     import pipmaster as pm
@@ -87,12 +87,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                 if gguf_bindings:
                     for k, v in gguf_bindings.items():
                         base = v.get('base_model', 'N/A')
-                        vae = v.get('vae_path', 'None')
-                        mmproj = v.get('other_component_path', 'None')
-                        print(f"  - Key/File: {k}")
-                        print(f"    Base Model: {base}")
-                        print(f"    VAE: {vae}")
-                        print(f"    MMPROJ: {mmproj}")
+                        print(f"  - Key: {k} -> Base: {base}")
                 else:
                     print("  (Empty registry)")
             except Exception as e:
@@ -100,102 +95,11 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         else:
             ASCIIColors.warning(f"No gguf_bindings.yaml found at {models_path}. GGUF models may not work without binding.")
 
-        # 2. Scan Models
-        ASCIIColors.info("\nScanning for models on disk...")
-        roots = [models_path]
-        if extra_models_path and extra_models_path.exists():
-            roots.append(extra_models_path)
-            
-        found_count = 0
-        for root in roots:
-            if not root.exists():
-                ASCIIColors.warning(f"Skipping non-existent root: {root}")
-                continue
-            
-            ASCIIColors.info(f"Scanning root: {root}")
-            
-            # Helper to get relative path safely
-            def get_rel_path(p):
-                try:
-                    return str(p.relative_to(root))
-                except ValueError:
-                    return p.name
-
-            # Diffusers Pipelines
-            for model_index in root.rglob("model_index.json"):
-                folder = model_index.parent
-                rel_name = get_rel_path(folder)
-                ASCIIColors.green(f"  [Pipeline] {rel_name}")
-                print(f"     Full Path: {folder}")
-                print(f"     Call As:   {rel_name}")
-                found_count += 1
-
-            # Safetensors
-            for safepath in root.rglob("*.safetensors"):
-                if (safepath.parent / "model_index.json").exists(): continue
-                rel_name = get_rel_path(safepath)
-                
-                # Check for auxiliary keywords
-                fname_lower = safepath.name.lower()
-                is_aux = any(kw in fname_lower for kw in AUXILIARY_KEYWORDS)
-                
-                if is_aux:
-                    ASCIIColors.yellow(f"  [Auxiliary - Ignored] {rel_name}")
-                else:
-                    ASCIIColors.blue(f"  [Checkpoint] {rel_name}")
-                
-                print(f"     Full Path: {safepath}")
-                if not is_aux:
-                    print(f"     Call As:   {rel_name}")
-                    found_count += 1
-
-            # GGUF
-            for gguf_path in root.rglob("*.gguf"):
-                rel_name = get_rel_path(gguf_path)
-                filename = gguf_path.name
-                
-                # Check for auxiliary keywords
-                fname_lower = filename.lower()
-                is_aux = any(kw in fname_lower for kw in AUXILIARY_KEYWORDS)
-                
-                if is_aux:
-                    ASCIIColors.yellow(f"  [Auxiliary - Ignored] {rel_name}")
-                    print(f"     Full Path: {gguf_path}")
-                    continue
-
-                # Check binding status
-                is_bound = False
-                bound_info = ""
-                
-                # Check 1: Exact filename in bindings
-                if filename in gguf_bindings:
-                    is_bound = True
-                    bound_info = f"[Bound to {gguf_bindings[filename].get('base_model')}]"
-                # Check 2: Case insensitive
-                elif filename.lower() in {k.lower(): k for k in gguf_bindings}.keys():
-                    is_bound = True
-                    bound_info = f"[Bound (Case-insensitive)]"
-                # Check 3: Substring/Stem match (Server logic)
-                else:
-                    for k in gguf_bindings:
-                        if k.lower() in filename.lower():
-                            is_bound = True
-                            bound_info = f"[Bound (Matched '{k}')]"
-                            break
-                
-                if is_bound:
-                    ASCIIColors.magenta(f"  [GGUF] {rel_name} {bound_info}")
-                else:
-                    ASCIIColors.red(f"  [GGUF] {rel_name} [Unbound - Needs binding configuration]")
-                
-                print(f"     Full Path: {gguf_path}")
-                print(f"     Call As:   {rel_name}")
-                found_count += 1
-
-        if found_count == 0:
-            ASCIIColors.warning("No valid models found.")
-        else:
-            ASCIIColors.info(f"\nTotal valid models found: {found_count}")
+        # 2. Check LoRA Bindings
+        lora_yaml_path = models_path / "lora_bindings.yaml"
+        if lora_yaml_path.exists():
+            ASCIIColors.success(f"LoRA Bindings Registry found at: {lora_yaml_path}")
+        
         ASCIIColors.cyan("="*60 + "\n")
 
 
@@ -210,21 +114,50 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         return False
 
 
-    def ensure_server_is_running(self, wait= False):
+    def ensure_server_is_running(self, wait=False, sync=True):
         """
         Ensures the Diffusers server is running. If not, it attempts to start it
-        in a process-safe manner using a file lock. This method is designed to
-        prevent race conditions in multi-worker environments.
+        in a process-safe manner using a file lock.
+        
+        Args:
+            wait (bool): If True, blocks until the server is fully responsive.
+            sync (bool): If True, checks and syncs settings if the server is already running.
+                         Set to False for read-only operations (listing models) to avoid spam.
         """
         self.server_dir.mkdir(exist_ok=True)
-        ASCIIColors.info("Attempting to start or connect to the Diffusers server...")
+        # Suppress spammy log
+        # ASCIIColors.info("Attempting to start or connect to the Diffusers server...")
 
         # First, perform a quick check without the lock to avoid unnecessary waiting.
         if self.is_server_running():
-            ASCIIColors.green("Diffusers Server is already running and responsive.")
+            # Suppress spammy log
+            # ASCIIColors.green("Diffusers Server is already running and responsive.")
+            if sync:
+                self._sync_settings_with_server()
             return
         else:
             self.start_server(wait)
+
+    def _sync_settings_with_server(self):
+        """Checks if server settings match client config and syncs if needed."""
+        try:
+            # Use direct request to avoid infinite recursion with self.get_settings() -> ensure_server -> sync
+            response = self._get_request("/get_settings")
+            server_settings = response.json()
+            
+            # Convert list to dict for easy lookup
+            server_config = {s['name']: s['value'] for s in server_settings}
+            
+            client_model = self.config.get("model_name")
+            server_model = server_config.get("model_name")
+            
+            # If client wants a specific model and server has something else (or nothing), sync.
+            if client_model and server_model != client_model:
+                ASCIIColors.info(f"Syncing client configuration to server (Model: {client_model})")
+                self.set_settings(self.config)
+        except Exception as e:
+            # Don't spam warnings if just checking
+            pass
 
     def install_server_dependencies(self):
         """
@@ -269,8 +202,9 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
         # Standard dependencies
         ASCIIColors.info(f"Installing transformers dependencies")
+        # Ensure latest transformers for Qwen2.5 support
         pm_v.ensure_packages([
-            "transformers", "safetensors", "accelerate", "huggingface_hub", "gguf"
+            "transformers>=4.45.0", "safetensors", "accelerate", "huggingface_hub", "gguf>=0.10.0", "protobuf", "sentencepiece"
         ])
         ASCIIColors.info(f"[Optional] Installing xformers")
         try:
@@ -279,6 +213,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ])
         except:
             pass
+        
         # Git-based diffusers to get the latest version (needed for GGUF support)
         ASCIIColors.info(f"Installing diffusers library from github")
         pm_v.ensure_packages([
@@ -289,7 +224,39 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             }
         ])
 
+        # Install kernels for GGUF acceleration if on CUDA
+        if torch_index_url:
+            ASCIIColors.info(f"Installing kernels for GGUF CUDA acceleration")
+            try:
+                pm_v.ensure_packages(["kernels"])
+            except Exception as e:
+                ASCIIColors.warning(f"Could not install kernels: {e}. GGUF might be slower.")
+
         ASCIIColors.green("Server dependencies are satisfied.")
+
+    def reinstall_server_dependencies(self, progress_callback: Callable[[dict], None] = None) -> dict:
+        """
+        Forces a reinstallation of all server dependencies.
+        """
+        try:
+            if progress_callback:
+                progress_callback({"status": "starting", "message": "Reinstalling dependencies..."})
+            
+            ASCIIColors.info("Reinstalling server dependencies...")
+            self.install_server_dependencies()
+            
+            msg = "Dependencies reinstalled successfully."
+            ASCIIColors.success(msg)
+            
+            if progress_callback:
+                progress_callback({"status": "success", "message": msg})
+            return {"status": True, "message": msg}
+        except Exception as e:
+            error_msg = f"Failed to reinstall dependencies: {e}"
+            ASCIIColors.error(error_msg)
+            if progress_callback:
+                progress_callback({"status": "error", "message": error_msg})
+            return {"status": False, "message": error_msg}
 
     def start_server(self, wait=True, timeout_s=20):
         """
@@ -341,6 +308,9 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     while(not self.is_server_running()):
                         time.sleep(1)
                     
+                    # Once started, sync settings
+                    self._sync_settings_with_server()
+
                 except Exception as e:
                     ASCIIColors.error(f"Failed to start Diffusers server: {e}")
                     raise
@@ -359,15 +329,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         while time.time() - start_time < timeout:
             if self.is_server_running():
                 ASCIIColors.green("Diffusers Server is up and running.")
-                # Set initial settings from the binding's config, but only if a model is specified.
-                if self.config.get("model_name"):
-                    try:
-                        ASCIIColors.info(f"Syncing initial client settings to server (model: {self.config['model_name']})...")
-                        self.set_settings(self.config)
-                    except Exception as e:
-                        ASCIIColors.warning(f"Could not sync initial settings to server: {e}")
-                else:
-                    ASCIIColors.warning("Client has no model_name configured, skipping initial settings sync.")
+                # Sync settings
+                self._sync_settings_with_server()
                 return
             time.sleep(2)
         raise RuntimeError("Failed to connect to the Diffusers server within the specified timeout.")
@@ -376,6 +339,15 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         """Helper to make POST requests with a JSON body."""
         try:
             url = f"{self.base_url}{endpoint}"
+            # Ensure data is serializable (remove callbacks/complex objects if present in params)
+            if data and "params" in data:
+                # Shallow copy to avoid modifying original dict
+                clean_params = {}
+                for k, v in data["params"].items():
+                    if isinstance(v, (str, int, float, bool, list, dict, type(None))):
+                         clean_params[k] = v
+                data["params"] = clean_params
+
             response = requests.post(url, json=data, timeout=3600) # Long timeout for generation
             response.raise_for_status()
             return response
@@ -441,21 +413,39 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             return {"status": False, "message": f"Failed to shutdown server: {e}"}
 
     def generate_image(self, prompt: str, negative_prompt: str = "", **kwargs) -> bytes:
-        self.ensure_server_is_running(True)
+        # Check model name in kwargs or config
+        if not kwargs.get("model_name") and not self.config.get("model_name"):
+            raise ValueError("No model configured. Please go to settings and select a model before generating.")
+        
+        self.ensure_server_is_running(True, sync=True)
         params = kwargs.copy()
-        if "model_name" not in params and self.config.get("model_name"):
+        if "model_name" not in params:
             params["model_name"] = self.config["model_name"]
             
-        response = self._post_json_request("/generate_image", data={
+        payload = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "params": params
-        })
+        }
+        
+        # DEBUG LOGGING FOR USER
+        ASCIIColors.yellow("--- DEBUG: GENERATE IMAGE PAYLOAD ---")
+        try:
+            ASCIIColors.yellow(json.dumps(payload, indent=2, default=str))
+        except Exception as e:
+            ASCIIColors.warning(f"Could not dump payload: {e}")
+        ASCIIColors.yellow("-------------------------------------")
+
+        response = self._post_json_request("/generate_image", data=payload)
         # Process image before returning to apply metadata/watermarks
         return self.process_image(response.content, **kwargs)
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
-        self.ensure_server_is_running(True)
+        # Check model name in kwargs or config
+        if not kwargs.get("model_name") and not self.config.get("model_name"):
+            raise ValueError("No model configured. Please go to settings and select a model before editing.")
+
+        self.ensure_server_is_running(True, sync=True)
         images_b64 = []
         if not isinstance(images, list):
             images = [images]
@@ -483,7 +473,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             raise ValueError("No valid images were provided to the edit_image function.")
         
         params = kwargs.copy()
-        if "model_name" not in params and self.config.get("model_name"):
+        if "model_name" not in params:
             params["model_name"] = self.config["model_name"]
 
         # Translate "mask" to "mask_image" for server compatibility
@@ -495,6 +485,18 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             "images_b64": images_b64,
             "params": params
         }
+
+        # DEBUG LOGGING FOR USER
+        ASCIIColors.yellow("--- DEBUG: EDIT IMAGE PAYLOAD ---")
+        try:
+            # Log params but suppress huge base64 strings
+            debug_payload = json_payload.copy()
+            debug_payload["images_b64"] = [f"<BASE64_STRING_LEN_{len(s)}>" for s in debug_payload["images_b64"]]
+            ASCIIColors.yellow(json.dumps(debug_payload, indent=2, default=str))
+        except Exception as e:
+            ASCIIColors.warning(f"Could not dump payload: {e}")
+        ASCIIColors.yellow("---------------------------------")
+
         response = self._post_json_request("/edit_image", data=json_payload)
         # Process image before returning to apply metadata/watermarks
         return self.process_image(response.content, **kwargs)
@@ -509,7 +511,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
         Returns list of dicts: {"model_name": str, "display_name": str, "description": str}
         """
-        self.ensure_server_is_running(True)
+        self.ensure_server_is_running(True, sync=False)
         try:
             response = self._get_request("/list_models")
             data = response.json()
@@ -522,19 +524,19 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
 
     def list_local_models(self) -> List[str]:
-        self.ensure_server_is_running(True)
+        self.ensure_server_is_running(True, sync=False)
         return self._get_request("/list_local_models").json()
 
     def list_available_models(self) -> List[str]:
-        self.ensure_server_is_running(True)
+        self.ensure_server_is_running(True, sync=False)
         return self._get_request("/list_available_models").json()
 
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
-        self.ensure_server_is_running(True)
+        self.ensure_server_is_running(True, sync=False)
         return self._get_request("/list_models").json()
 
     def get_settings(self, **kwargs) -> List[Dict[str, Any]]:
-        self.ensure_server_is_running(True)
+        self.ensure_server_is_running(True, sync=False)
         # The server holds the state, so we fetch it.
         return self._get_request("/get_settings").json()
     
@@ -570,7 +572,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         return self.pull_model(item["link"], filename=item.get("filename"), progress_callback=progress_callback)
 
     def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
-        self.ensure_server_is_running(True)
+        self.ensure_server_is_running(True, sync=False)
             # Normalize settings from list of dicts to a single dict if needed
         parsed_settings = settings if isinstance(settings, dict) else {s["name"]: s["value"] for s in settings if "name" in s and "value" in s}
         parsed_settings.update(kwargs)
@@ -625,7 +627,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             if "qwen-image-edit" in model_name.lower() and filename and filename.endswith(".gguf"):
                 ASCIIColors.info("Detected Qwen-Image-Edit GGUF. Attempting automatic binding...")
                 try:
-                    self.bind_model_components(filename, "Qwen/Qwen-Image-Edit")
+                    self.add_gguf_binding(filename, filename, "Qwen/Qwen-Image-Edit")
                 except:
                     ASCIIColors.warning("Auto-binding failed. You may need to bind manually.")
 
@@ -671,26 +673,79 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                 progress_callback({"status": "error", "message": error_msg})
             return {"status": False, "message": error_msg}
 
-    def bind_model_components(self, model_name: str, base_model: str, vae_path: Optional[str] = None, other_component_path: Optional[str] = None) -> dict:
-        """
-        Binds a GGUF/safetensors main model to a base pipeline architecture and optional auxiliary files.
-        """
-        self.ensure_server_is_running(True)
+    # --- New Binding Commands ---
+
+    def add_gguf_binding(self, binding_name: str, gguf_path: str, base_model: str, vae_path: Optional[str] = None, mmproj_path: Optional[str] = None) -> dict:
+        self.ensure_server_is_running(True, sync=False)
         payload = {
-            "model_name": model_name,
+            "binding_name": binding_name,
+            "gguf_path": gguf_path,
             "base_model": base_model,
             "vae_path": vae_path,
-            "other_component_path": other_component_path
+            "mmproj_path": mmproj_path
         }
         try:
-            ASCIIColors.info(f"Binding {model_name} to base {base_model}...")
-            response = self._post_json_request("/bind_model_components", data=payload)
+            ASCIIColors.info(f"Adding GGUF binding: {binding_name}...")
+            response = self._post_json_request("/add_gguf_binding", data=payload)
             return response.json()
         except Exception as e:
             trace_exception(e)
             return {"status": False, "message": str(e)}
 
+    def add_lora_binding(self, binding_name: str, base_model: str, lora_path: str, strength: float = 1.0) -> dict:
+        self.ensure_server_is_running(True, sync=False)
+        payload = {
+            "binding_name": binding_name,
+            "base_model": base_model,
+            "lora_path": lora_path,
+            "strength": strength
+        }
+        try:
+            ASCIIColors.info(f"Adding LoRA binding: {binding_name}...")
+            response = self._post_json_request("/add_lora_binding", data=payload)
+            return response.json()
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": str(e)}
+
+    def remove_binding(self, binding_name: str) -> dict:
+        self.ensure_server_is_running(True, sync=False)
+        payload = {"binding_name": binding_name}
+        try:
+            ASCIIColors.info(f"Removing binding: {binding_name}...")
+            response = self._post_json_request("/remove_binding", data=payload)
+            return response.json()
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": str(e)}
+
+    def list_bindings(self) -> dict:
+        self.ensure_server_is_running(True, sync=False)
+        try:
+            response = self._get_request("/list_bindings")
+            return response.json()
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": str(e), "bindings": []}
+
+    # Alias for backward compatibility
+    def bind_model_components(self, model_name: str, base_model: str, vae_path: Optional[str] = None, other_component_path: Optional[str] = None) -> dict:
+        return self.add_gguf_binding(model_name, model_name, base_model, vae_path, other_component_path)
+
     def __del__(self):
         # The client destructor does not stop the server,
         # as it is a shared resource for all worker processes.
         pass
+
+    def add_gguf_binding(self, binding_name: str, gguf_path: str, base_model: str, vae_path: str = None, mmproj_path: str = None, text_encoder_path: str = None, tokenizer_path: str = None) -> dict:
+        self.ensure_server_is_running(True, sync=False)
+        payload = {
+            "binding_name": binding_name,
+            "gguf_path": gguf_path,
+            "base_model": base_model,
+            "vae_path": vae_path,
+            "mmproj_path": mmproj_path,
+            "text_encoder_path": text_encoder_path,
+            "tokenizer_path": tokenizer_path
+        }
+        return self._post_json_request("/add_gguf_binding", payload).json()

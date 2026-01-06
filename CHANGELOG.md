@@ -37,7 +37,8 @@ All notable changes to this project will be documented in this file.
 
 - feat: bump package version to 1.9.2
 
-## [Unreleased]
+#
+- feat(diffusers): add TTI binding implementation# [Unreleased]
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
