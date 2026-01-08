@@ -1,0 +1,95 @@
+title: "GGUF Diffusion"
+author: "ParisNeo (Ported from City96)"
+version: 1.2.0
+binding_name: "gguf_diffusion"
+description: |
+  Native execution of GGUF Quantized Diffusion models (Flux, SDXL, etc.) using the Diffusers backend.
+  Supports dynamic GPU selection, CPU offloading, and full CPU inference.
+
+input_parameters:
+  - name: "base_model_id"
+    type: "str"
+    description: "HuggingFace ID for the base model (Config/VAE). E.g., 'black-forest-labs/FLUX.1-dev'"
+    default: "black-forest-labs/FLUX.1-dev"
+
+  - name: "gguf_path"
+    type: "str"
+    description: "Absolute path to the .gguf UNET/Transformer file."
+    default: ""
+
+  - name: "device"
+    type: "str"
+    description: "Compute Device"
+    default: "auto"
+    options: ["auto", "cuda:0", "cuda:1", "cpu"]
+
+  - name: "vram_policy"
+    type: "str"
+    description: "Memory Management Strategy"
+    default: "regular"
+    options: 
+      - "regular"     # Load fully to GPU (Fastest, High VRAM)
+      - "offload"     # Offload inactive models to CPU (Good balance)
+      - "sequential"  # Offload layer-by-layer (Slowest, Lowest VRAM)
+      - "cpu_mode"    # Force full execution on CPU
+
+  - name: "width"
+    type: "int"
+    description: "Image Width"
+    default: 1024
+
+  - name: "height"
+    type: "int"
+    description: "Image Height"
+    default: 1024
+
+  - name: "steps"
+    type: "int"
+    description: "Inference Steps"
+    default: 20
+
+  - name: "guidance_scale"
+    type: "float"
+    description: "Guidance Scale"
+    default: 3.5
+
+commands:
+  - name: install_dependencies
+    title: "Install Dependencies"
+    description: "Installs torch, diffusers, gguf, and other requirements."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
+
+  - name: load_flux
+    title: "Load Flux Model"
+    description: "Pre-loads the Flux model into memory based on current settings."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
+
+  - name: install_flux
+    title: "Install Flux.1-Dev GGUF"
+    description: "Downloads the Flux.1-Dev Q4_0 GGUF model (approx 12.7GB) to your models folder."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
+
+  - name: install_qwen_image
+    title: "Install Qwen Image GGUF"
+    description: "Downloads the Qwen Image Q4_K_S GGUF model (approx 12.1GB) to your models folder."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str

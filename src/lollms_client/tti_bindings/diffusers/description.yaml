@@ -1,24 +1,36 @@
 title: 'Diffusers TTI'
 author: 'ParisNeo'
-version: 1.2.0
+version: 1.1.0
 binding_name: 'diffusers'
 supported_file_types: []
 
 description: |
-  This binding integrates Hugging Face's Diffusers library into LoLLMS.
-  It supports Text-to-Image (TTI), Image-to-Image (ITI), Inpainting, and advanced model management.
+  This binding integrates Hugging Face's Diffusers library into LoLLMS
+  for Text-to-Image (TTI) and Image-to-Image (ITI) tasks.
 
-  **Features:**
-  - **Standard Models:** Run Stable Diffusion (1.5, 2.1, XL), Flux, and others directly from Hugging Face or local `.safetensors`.
-  - **GGUF Quantization:** Run massive models (like Flux Dev) on lower VRAM using GGUF quantization. Requires binding a GGUF file to a Base Model architecture.
-  - **LoRA Support:** Create custom bindings that apply LoRA adapters to base models.
+  It supports a wide range of diffusion-based models, including:
+    - Stable Diffusion & SDXL (e.g. https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
+    - Stable Diffusion 3 and SD3 variants (e.g. https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers)
+    - FLUX-style models (e.g. https://huggingface.co/black-forest-labs/FLUX.1-dev)
+    - Qwen-based vision or diffusion models where compatible (e.g. https://huggingface.co/Qwen)
+    - Community models such as RealVis, DreamShaper, Juggernaut, etc. from the Hugging Face Hub.
 
-  **Workflow:**
-  1. **Download:** Use `pull_model` to get checkpoints or GGUF files.
-  2. **Bind (Optional):**
-     - Use `add_gguf_binding` to configure a GGUF file (e.g., link `flux-dev-Q4.gguf` to `black-forest-labs/FLUX.1-dev`).
-     - Use `add_lora_binding` to create a virtual model that loads a base model + LoRA (e.g., `SDXL + PixelArtStyle`).
-  3. **Generate:** Select the model/binding in settings and generate images.
+  Any compatible Diffusers or .safetensors pipeline can be installed via
+  the provided management commands, and only locally downloaded models
+  will appear in the binding's model list.
+
+  Two main operations are supported:
+
+  1. generate_image:
+     - Generates one or multiple images from a text prompt.
+     - Supports configuration of model, size, guidance scale, inference steps, scheduler, etc.
+
+  2. edit_image (image-to-image / inpainting):
+     - Modifies an existing image based on a prompt and optional mask.
+     - Useful for inpainting, outpainting, or style transformation.
+
+  Parameters can be set globally at initialization (e.g., default model, steps, scheduler),
+  or per-request at runtime. Runtime overrides global, which overrides defaults.
 
 input_parameters:
   - name: "port"
@@ -34,7 +46,7 @@ input_parameters:
   - name: "hf_token"
     type: "str"
     default: ""
-    description: "Optional Hugging Face access token used to download private/gated models (like FLUX.1-dev)."
+    description: "Optional Hugging Face access token used by the Diffusers server to download private or gated models."
     is_secret: true
 
   - name: "device"
@@ -55,23 +67,23 @@ input_parameters:
   - name: "scheduler_name"
     type: "str"
     default: "dpm++_2m_karras"
-    description: "Default scheduler. Overridden automatically for some models (Flux/Qwen)."
+    description: "Default scheduler to use for denoising steps. Can be overridden per generation."
     options: ["default", "ddim", "ddpm", "deis_multistep", "dpm_multistep", "dpm_multistep_karras", "dpm_single", "dpm_adaptive", "dpm++_2m", "dpm++_2m_karras", "dpm++_2s_ancestral", "dpm++_2s_ancestral_karras", "dpm++_sde", "dpm++_sde_karras", "euler_ancestral_discrete", "euler_discrete", "heun_discrete", "heun_karras", "lms_discrete", "lms_karras", "pndm", "unipc_multistep", "dpm++_2m_sde", "dpm++_2m_sde_karras", "dpm2", "dpm2_karras", "dpm2_a", "dpm2_a_karras", "euler", "euler_a", "heun", "lms"]
 
   - name: "num_inference_steps"
     type: "int"
     default: 30
-    description: "Number of denoising steps."
+    description: "Number of denoising steps (more steps = higher quality, slower)."
 
   - name: "guidance_scale"
     type: "float"
     default: 7.5
-    description: "Classifier-free guidance scale. (Flux/Qwen typically use lower values like 3.5 or 1.0)."
+    description: "Classifier-free guidance scale. Higher = more prompt adherence."
 
   - name: "negative_prompt"
     type: "str"
     default: ""
-    description: "Optional negative prompt."
+    description: "Optional negative prompt to avoid unwanted features."
 
   - name: "width"
     type: "int"
@@ -82,181 +94,50 @@ input_parameters:
     type: "int"
     default: "1024"
     description: "Image height."
-  - name: "watermark_path"
-    type: "str"
-    default: ""
-    description: "Visible watermark image (link, base64, or local path)."
-  - name: "watermark_size_x"
-    type: "int"
-    default: 128
-    description: "Watermark width."
-  - name: "watermark_size_y"
-    type: "int"
-    default: 128
-    description: "Watermark height."
-  - name: "watermark_pos_x"
-    type: "int"
-    default: 10
-    description: "Watermark X position."
-  - name: "watermark_pos_y"
-    type: "int"
-    default: 10
-    description: "Watermark Y position."
-  - name: "author"
-    type: "str"
-    default: "ParisNeo"
-    description: "Author name for image metadata."
-  - name: "system"
-    type: "str"
-    default: "LoLLMS"
-    description: "System name for image metadata."
-    
+
 commands:
   - name: pull_model
     title: Pull Model
-    description: "Downloads a model from Hugging Face or a direct URL."
+    description: "Downloads a model from Hugging Face (repo_id) or a direct URL to a safetensors file."
     parameters:
       - name: model_name
         type: str
-        description: "The Hugging Face repo ID or URL."
+        description: "The Hugging Face repo ID (e.g. 'stabilityai/sdxl-turbo') or URL."
         mandatory: true
-      - name: filename
-        type: str
-        description: "Specific filename (e.g. 'model.gguf'). If empty, downloads repo."
-        mandatory: false
       - name: local_name
         type: str
-        description: "Optional custom name for the local folder."
+        description: "Optional custom name for the model folder or file."
         mandatory: false
     output:
       - name: status
         type: bool
+        description: "Status of the operation (true for success, false for failure)"
       - name: message
         type: str
+        description: "Message describing the operation result"
     callback:
       - name: status
         type: str
+        description: "Current status of the download"
       - name: completed
         type: int
+        description: "Bytes or percentage downloaded"
       - name: total
         type: int
-
-  - name: add_gguf_binding
-    title: Add GGUF Binding
-    description: "Configures a GGUF file to run with a specific pipeline architecture."
-    parameters:
-      - name: binding_name
-        type: str
-        description: "A unique name for this binding (e.g. 'Flux-Dev-Q4')."
-        mandatory: true
-      - name: gguf_path
-        type: str
-        description: "Path or filename of the GGUF weights (e.g. 'flux1-dev-Q4_0.gguf')."
-        mandatory: true
-      - name: base_model
-        type: str
-        description: "The HF Repo ID defining the architecture (e.g. 'black-forest-labs/FLUX.1-dev')."
-        mandatory: true
-      - name: vae_path
-        type: str
-        description: "Optional: Path to a specific VAE."
-        mandatory: false
-      - name: mmproj_path
-        type: str
-        description: "Optional: Path to a vision projector (for multimodal)."
-        mandatory: false
-    output:
-      - name: status
-        type: bool
-      - name: message
-        type: str
-
-  - name: add_lora_binding
-    title: Add LoRA Binding
-    description: "Creates a binding that loads a base model and applies a LoRA adapter."
-    parameters:
-      - name: binding_name
-        type: str
-        description: "A unique name for this setup (e.g. 'SDXL-PixelArt')."
-        mandatory: true
-      - name: base_model
-        type: str
-        description: "The base model/checkpoint to load first."
-        mandatory: true
-      - name: lora_path
-        type: str
-        description: "Path to the LoRA file (.safetensors)."
-        mandatory: true
-      - name: strength
-        type: float
-        description: "LoRA strength (default 1.0)."
-        default: 1.0
-        mandatory: false
-    output:
-      - name: status
-        type: bool
-      - name: message
-        type: str
-
-  - name: remove_binding
-    title: Remove Binding
-    description: "Deletes a GGUF or LoRA binding configuration (does not delete files)."
-    parameters:
-      - name: binding_name
-        type: str
-        description: "The name of the binding to remove."
-        mandatory: true
-    output:
-      - name: status
-        type: bool
-      - name: message
-        type: str
-
-  - name: list_bindings
-    title: List Bindings
-    description: "Lists all configured GGUF and LoRA bindings."
-    parameters: []
-    output:
-      - name: bindings
-        type: list
-        description: "List of binding objects."
+        description: "Total bytes or percentage"
 
   - name: upgrade_diffusers
     title: Upgrade Diffusers
-    description: "Upgrades the diffusers library from GitHub source."
+    description: "Upgrades the diffusers library to the latest development version."
     parameters: []
     output:
       - name: status
         type: bool
+        description: "Status of the operation"
       - name: message
         type: str
-
-  - name: reinstall_server_dependencies
-    title: Reinstall Dependencies
-    description: "Forces reinstallation of server dependencies (fixes GGUF/Torch issues)."
-    parameters: []
-    output:
+        description: "Result message"
+    callback:
       - name: status
-        type: bool
-      - name: message
         type: str
-
-  - name: unload_model
-    title: Unload Model
-    description: "Unloads the model from VRAM."
-    parameters: []
-    output:
-      - name: status
-        type: bool
-      - name: message
-        type: str
-
-  - name: shutdown
-    title: Shutdown Server
-    description: "Stops the background server."
-    parameters: []
-    output:
-      - name: status
-        type: bool
-      - name: message
-        type: str
+        description: "Status of the upgrade process"

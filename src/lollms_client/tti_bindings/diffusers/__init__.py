@@ -5,11 +5,10 @@ import requests
 import subprocess
 import time
 import json
-import yaml
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
-from ascii_colors import trace_exception
+
 # Ensure pipmaster is available.
 try:
     import pipmaster as pm
@@ -28,9 +27,6 @@ from lollms_client.lollms_tti_binding import LollmsTTIBinding
 from ascii_colors import ASCIIColors
 
 BindingName = "DiffusersTTIBinding"
-
-# Substrings identifying auxiliary files to be ignored/filtered
-AUXILIARY_KEYWORDS = ['mmproj', 'vae', 'adapter', 'lora', 'encoder', 'clip', 'controlnet']
 
 class DiffusersTTIBinding(LollmsTTIBinding):
     def __init__(self, **kwargs):
@@ -51,56 +47,10 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         self.venv_dir = Path("./venv/tti_diffusers_venv")
         self.models_path = Path(kwargs.get("models_path", "./data/tti_models/diffusers")).resolve()
         self.extra_models_path = kwargs.get("extra_models_path")
-        self.hf_token = kwargs.get("hf_token", "")
+        self.hf_token = kwargs.get("hf_token", "")  # NEW
         self.models_path.mkdir(exist_ok=True, parents=True)
-        
-        self.diagnose()
-        
         if self.auto_start_server:
             self.ensure_server_is_running(self.wait_for_server)
-
-    def diagnose(self):
-        """
-        Diagnoses the environment, listing all found models with full paths (for debugging)
-        and their call-names (relative paths). Also checks for GGUF bindings.
-        """
-        ASCIIColors.cyan("="*60)
-        ASCIIColors.cyan("       Diffusers Binding Diagnosis")
-        ASCIIColors.cyan("="*60)
-        
-        models_path = self.models_path
-        extra_models_path = Path(self.extra_models_path).resolve() if self.extra_models_path else None
-        
-        ASCIIColors.info(f"Main Models Path: {models_path}")
-        if extra_models_path:
-            ASCIIColors.info(f"Extra Models Path: {extra_models_path}")
-
-        # 1. Check GGUF Bindings
-        yaml_path = models_path / "gguf_bindings.yaml"
-        gguf_bindings = {}
-        if yaml_path.exists():
-            ASCIIColors.success(f"GGUF Bindings Registry found at: {yaml_path}")
-            try:
-                with open(yaml_path, 'r') as f:
-                    gguf_bindings = yaml.safe_load(f) or {}
-                ASCIIColors.info("Registered Bindings:")
-                if gguf_bindings:
-                    for k, v in gguf_bindings.items():
-                        base = v.get('base_model', 'N/A')
-                        print(f"  - Key: {k} -> Base: {base}")
-                else:
-                    print("  (Empty registry)")
-            except Exception as e:
-                ASCIIColors.error(f"Error reading bindings file: {e}")
-        else:
-            ASCIIColors.warning(f"No gguf_bindings.yaml found at {models_path}. GGUF models may not work without binding.")
-
-        # 2. Check LoRA Bindings
-        lora_yaml_path = models_path / "lora_bindings.yaml"
-        if lora_yaml_path.exists():
-            ASCIIColors.success(f"LoRA Bindings Registry found at: {lora_yaml_path}")
-        
-        ASCIIColors.cyan("="*60 + "\n")
 
 
     def is_server_running(self) -> bool:
@@ -114,50 +64,21 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         return False
 
 
-    def ensure_server_is_running(self, wait=False, sync=True):
+    def ensure_server_is_running(self, wait= False):
         """
         Ensures the Diffusers server is running. If not, it attempts to start it
-        in a process-safe manner using a file lock.
-        
-        Args:
-            wait (bool): If True, blocks until the server is fully responsive.
-            sync (bool): If True, checks and syncs settings if the server is already running.
-                         Set to False for read-only operations (listing models) to avoid spam.
+        in a process-safe manner using a file lock. This method is designed to
+        prevent race conditions in multi-worker environments.
         """
         self.server_dir.mkdir(exist_ok=True)
-        # Suppress spammy log
-        # ASCIIColors.info("Attempting to start or connect to the Diffusers server...")
+        ASCIIColors.info("Attempting to start or connect to the Diffusers server...")
 
         # First, perform a quick check without the lock to avoid unnecessary waiting.
         if self.is_server_running():
-            # Suppress spammy log
-            # ASCIIColors.green("Diffusers Server is already running and responsive.")
-            if sync:
-                self._sync_settings_with_server()
+            ASCIIColors.green("Diffusers Server is already running and responsive.")
             return
         else:
             self.start_server(wait)
-
-    def _sync_settings_with_server(self):
-        """Checks if server settings match client config and syncs if needed."""
-        try:
-            # Use direct request to avoid infinite recursion with self.get_settings() -> ensure_server -> sync
-            response = self._get_request("/get_settings")
-            server_settings = response.json()
-            
-            # Convert list to dict for easy lookup
-            server_config = {s['name']: s['value'] for s in server_settings}
-            
-            client_model = self.config.get("model_name")
-            server_model = server_config.get("model_name")
-            
-            # If client wants a specific model and server has something else (or nothing), sync.
-            if client_model and server_model != client_model:
-                ASCIIColors.info(f"Syncing client configuration to server (Model: {client_model})")
-                self.set_settings(self.config)
-        except Exception as e:
-            # Don't spam warnings if just checking
-            pass
 
     def install_server_dependencies(self):
         """
@@ -178,7 +99,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         ])
         ASCIIColors.info(f"Installing misc libraries (numpy, tqdm...)")
         pm_v.ensure_packages([
-            "tqdm", "numpy", "pyyaml"
+            "tqdm", "numpy"
         ])
         ASCIIColors.info(f"Installing Pillow")
         pm_v.ensure_packages([
@@ -202,9 +123,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
         # Standard dependencies
         ASCIIColors.info(f"Installing transformers dependencies")
-        # Ensure latest transformers for Qwen2.5 support
         pm_v.ensure_packages([
-            "transformers>=4.45.0", "safetensors", "accelerate", "huggingface_hub", "gguf>=0.10.0", "protobuf", "sentencepiece"
+            "transformers", "safetensors", "accelerate"
         ])
         ASCIIColors.info(f"[Optional] Installing xformers")
         try:
@@ -213,8 +133,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ])
         except:
             pass
-        
-        # Git-based diffusers to get the latest version (needed for GGUF support)
+        # Git-based diffusers to get the latest version
         ASCIIColors.info(f"Installing diffusers library from github")
         pm_v.ensure_packages([
             {
@@ -224,39 +143,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             }
         ])
 
-        # Install kernels for GGUF acceleration if on CUDA
-        if torch_index_url:
-            ASCIIColors.info(f"Installing kernels for GGUF CUDA acceleration")
-            try:
-                pm_v.ensure_packages(["kernels"])
-            except Exception as e:
-                ASCIIColors.warning(f"Could not install kernels: {e}. GGUF might be slower.")
-
         ASCIIColors.green("Server dependencies are satisfied.")
-
-    def reinstall_server_dependencies(self, progress_callback: Callable[[dict], None] = None) -> dict:
-        """
-        Forces a reinstallation of all server dependencies.
-        """
-        try:
-            if progress_callback:
-                progress_callback({"status": "starting", "message": "Reinstalling dependencies..."})
-            
-            ASCIIColors.info("Reinstalling server dependencies...")
-            self.install_server_dependencies()
-            
-            msg = "Dependencies reinstalled successfully."
-            ASCIIColors.success(msg)
-            
-            if progress_callback:
-                progress_callback({"status": "success", "message": msg})
-            return {"status": True, "message": msg}
-        except Exception as e:
-            error_msg = f"Failed to reinstall dependencies: {e}"
-            ASCIIColors.error(error_msg)
-            if progress_callback:
-                progress_callback({"status": "error", "message": error_msg})
-            return {"status": False, "message": error_msg}
 
     def start_server(self, wait=True, timeout_s=20):
         """
@@ -302,15 +189,16 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     if self.hf_token:
                         command.extend(["--hf-token", self.hf_token])
 
+                    if self.extra_models_path:
+                        resolved_extra_path = Path(self.extra_models_path).resolve()
+                        command.extend(["--extra-models-path", str(resolved_extra_path)])
+
                     creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
                     self.server_process = subprocess.Popen(command, creationflags=creationflags)
                     ASCIIColors.info("Diffusers server process launched in the background.")
                     while(not self.is_server_running()):
                         time.sleep(1)
                     
-                    # Once started, sync settings
-                    self._sync_settings_with_server()
-
                 except Exception as e:
                     ASCIIColors.error(f"Failed to start Diffusers server: {e}")
                     raise
@@ -329,8 +217,15 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         while time.time() - start_time < timeout:
             if self.is_server_running():
                 ASCIIColors.green("Diffusers Server is up and running.")
-                # Sync settings
-                self._sync_settings_with_server()
+                # Set initial settings from the binding's config, but only if a model is specified.
+                if self.config.get("model_name"):
+                    try:
+                        ASCIIColors.info(f"Syncing initial client settings to server (model: {self.config['model_name']})...")
+                        self.set_settings(self.config)
+                    except Exception as e:
+                        ASCIIColors.warning(f"Could not sync initial settings to server: {e}")
+                else:
+                    ASCIIColors.warning("Client has no model_name configured, skipping initial settings sync.")
                 return
             time.sleep(2)
         raise RuntimeError("Failed to connect to the Diffusers server within the specified timeout.")
@@ -339,15 +234,6 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         """Helper to make POST requests with a JSON body."""
         try:
             url = f"{self.base_url}{endpoint}"
-            # Ensure data is serializable (remove callbacks/complex objects if present in params)
-            if data and "params" in data:
-                # Shallow copy to avoid modifying original dict
-                clean_params = {}
-                for k, v in data["params"].items():
-                    if isinstance(v, (str, int, float, bool, list, dict, type(None))):
-                         clean_params[k] = v
-                data["params"] = clean_params
-
             response = requests.post(url, json=data, timeout=3600) # Long timeout for generation
             response.raise_for_status()
             return response
@@ -390,62 +276,29 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
             raise RuntimeError("Communication with the Diffusers server failed.") from e
 
-    def unload_model(self) -> dict:
+    def unload_model(self):
         ASCIIColors.info("Requesting server to unload the current model...")
         try:
-            response = self._post_json_request("/unload_model")
-            return {"status": True, "message": "Model unloaded successfully."}
+            self._post_json_request("/unload_model")
         except Exception as e:
-            trace_exception(e)
-            return {"status": False, "message": f"Could not send unload request to server: {e}"}
-
-    def shutdown(self) -> dict:
-        ASCIIColors.info("Requesting server shutdown...")
-        try:
-            # Send request but don't wait long for response as server kills itself
-            try:
-                requests.post(f"{self.base_url}/shutdown", timeout=1)
-            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError):
-                pass
-            return {"status": True, "message": "Server shutdown initiated."}
-        except Exception as e:
-            trace_exception(e)
-            return {"status": False, "message": f"Failed to shutdown server: {e}"}
+            ASCIIColors.warning(f"Could not send unload request to server: {e}")
+        pass
 
     def generate_image(self, prompt: str, negative_prompt: str = "", **kwargs) -> bytes:
-        # Check model name in kwargs or config
-        if not kwargs.get("model_name") and not self.config.get("model_name"):
-            raise ValueError("No model configured. Please go to settings and select a model before generating.")
-        
-        self.ensure_server_is_running(True, sync=True)
+        self.ensure_server_is_running(True)
         params = kwargs.copy()
-        if "model_name" not in params:
+        if "model_name" not in params and self.config.get("model_name"):
             params["model_name"] = self.config["model_name"]
             
-        payload = {
+        response = self._post_json_request("/generate_image", data={
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "params": params
-        }
-        
-        # DEBUG LOGGING FOR USER
-        ASCIIColors.yellow("--- DEBUG: GENERATE IMAGE PAYLOAD ---")
-        try:
-            ASCIIColors.yellow(json.dumps(payload, indent=2, default=str))
-        except Exception as e:
-            ASCIIColors.warning(f"Could not dump payload: {e}")
-        ASCIIColors.yellow("-------------------------------------")
-
-        response = self._post_json_request("/generate_image", data=payload)
-        # Process image before returning to apply metadata/watermarks
-        return self.process_image(response.content, **kwargs)
+        })
+        return response.content
 
     def edit_image(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], prompt: str, **kwargs) -> bytes:
-        # Check model name in kwargs or config
-        if not kwargs.get("model_name") and not self.config.get("model_name"):
-            raise ValueError("No model configured. Please go to settings and select a model before editing.")
-
-        self.ensure_server_is_running(True, sync=True)
+        self.ensure_server_is_running(True)
         images_b64 = []
         if not isinstance(images, list):
             images = [images]
@@ -473,7 +326,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             raise ValueError("No valid images were provided to the edit_image function.")
         
         params = kwargs.copy()
-        if "model_name" not in params:
+        if "model_name" not in params and self.config.get("model_name"):
             params["model_name"] = self.config["model_name"]
 
         # Translate "mask" to "mask_image" for server compatibility
@@ -485,21 +338,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             "images_b64": images_b64,
             "params": params
         }
-
-        # DEBUG LOGGING FOR USER
-        ASCIIColors.yellow("--- DEBUG: EDIT IMAGE PAYLOAD ---")
-        try:
-            # Log params but suppress huge base64 strings
-            debug_payload = json_payload.copy()
-            debug_payload["images_b64"] = [f"<BASE64_STRING_LEN_{len(s)}>" for s in debug_payload["images_b64"]]
-            ASCIIColors.yellow(json.dumps(debug_payload, indent=2, default=str))
-        except Exception as e:
-            ASCIIColors.warning(f"Could not dump payload: {e}")
-        ASCIIColors.yellow("---------------------------------")
-
         response = self._post_json_request("/edit_image", data=json_payload)
-        # Process image before returning to apply metadata/watermarks
-        return self.process_image(response.content, **kwargs)
+        return response.content
 
     def list_models(self) -> list:
         """
@@ -511,7 +351,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
         Returns list of dicts: {"model_name": str, "display_name": str, "description": str}
         """
-        self.ensure_server_is_running(True, sync=False)
+        self.ensure_server_is_running(True)
         try:
             response = self._get_request("/list_models")
             data = response.json()
@@ -524,19 +364,19 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
 
     def list_local_models(self) -> List[str]:
-        self.ensure_server_is_running(True, sync=False)
+        self.ensure_server_is_running(True)
         return self._get_request("/list_local_models").json()
 
     def list_available_models(self) -> List[str]:
-        self.ensure_server_is_running(True, sync=False)
+        self.ensure_server_is_running(True)
         return self._get_request("/list_available_models").json()
 
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
-        self.ensure_server_is_running(True, sync=False)
+        self.ensure_server_is_running(True)
         return self._get_request("/list_models").json()
 
     def get_settings(self, **kwargs) -> List[Dict[str, Any]]:
-        self.ensure_server_is_running(True, sync=False)
+        self.ensure_server_is_running(True)
         # The server holds the state, so we fetch it.
         return self._get_request("/get_settings").json()
     
@@ -559,7 +399,6 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             {"name": "Stable Diffusion 3 Medium", "description": "SOTA model with advanced prompt understanding (Gated).", "size": "Unknown", "type": "checkpoint", "link": "stabilityai/stable-diffusion-3-medium-diffusers"},
             {"name": "FLUX.1 Schnell", "description": "Powerful and fast next-gen model (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.1-schnell"},
             {"name": "FLUX.1 Dev", "description": "Larger developer version of FLUX.1 (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.1-dev"},
-            {"name": "Qwen-Image-Edit-GGUF", "description": "Quantized Qwen Image Edit (GGUF). High quality editing.", "size": "13GB (Q4_K_M)", "type": "gguf", "link": "QuantStack/Qwen-Image-Edit-GGUF", "filename": "qwen-image-edit-q4_k_m.gguf"},
         ]
 
     def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
@@ -569,13 +408,12 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ASCIIColors.error(msg)
             return {"status": False, "message": msg}
         item = zoo[index]
-        return self.pull_model(item["link"], filename=item.get("filename"), progress_callback=progress_callback)
+        return self.pull_model(item["link"], progress_callback=progress_callback)
 
     def set_settings(self, settings: Union[Dict[str, Any], List[Dict[str, Any]]], **kwargs) -> bool:
-        self.ensure_server_is_running(True, sync=False)
+        self.ensure_server_is_running(True)
             # Normalize settings from list of dicts to a single dict if needed
         parsed_settings = settings if isinstance(settings, dict) else {s["name"]: s["value"] for s in settings if "name" in s and "value" in s}
-        parsed_settings.update(kwargs)
         response = self._post_json_request("/set_settings", data=parsed_settings)
         return response.json().get("success", False)
 
@@ -585,15 +423,14 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
 
-    def pull_model(self, model_name: str, filename: Optional[str] = None, local_name: Optional[str] = None, progress_callback: Callable[[dict], None] = None) -> dict:
+    def pull_model(self, model_name: str, local_name: Optional[str] = None, progress_callback: Callable[[dict], None] = None) -> dict:
         """
         Pulls a model from Hugging Face or URL via the server.
-        If 'filename' is provided, it tries to download just that file (good for GGUF repos).
         """
         payload = {}
         if model_name.startswith("http") and "huggingface.co" not in model_name:
              # Assume direct file URL if not huggingface repo url (roughly)
-             if model_name.endswith(".safetensors") or model_name.endswith(".gguf"):
+             if model_name.endswith(".safetensors"):
                 payload["safetensors_url"] = model_name
              else:
                 payload["hf_id"] = model_name 
@@ -605,9 +442,6 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         
         if local_name:
             payload["local_name"] = local_name
-        
-        if filename:
-            payload["filename"] = filename
             
         try:
             if progress_callback:
@@ -622,15 +456,6 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ASCIIColors.success(msg)
             if progress_callback:
                 progress_callback({"status": "success", "message": msg, "completed": 100, "total": 100})
-            
-            # If it's the Qwen GGUF model from zoo, auto-bind it
-            if "qwen-image-edit" in model_name.lower() and filename and filename.endswith(".gguf"):
-                ASCIIColors.info("Detected Qwen-Image-Edit GGUF. Attempting automatic binding...")
-                try:
-                    self.add_gguf_binding(filename, filename, "Qwen/Qwen-Image-Edit")
-                except:
-                    ASCIIColors.warning("Auto-binding failed. You may need to bind manually.")
-
             return {"status": True, "message": msg}
         except Exception as e:
             error_msg = f"Failed to pull model: {e}"
@@ -673,79 +498,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                 progress_callback({"status": "error", "message": error_msg})
             return {"status": False, "message": error_msg}
 
-    # --- New Binding Commands ---
-
-    def add_gguf_binding(self, binding_name: str, gguf_path: str, base_model: str, vae_path: Optional[str] = None, mmproj_path: Optional[str] = None) -> dict:
-        self.ensure_server_is_running(True, sync=False)
-        payload = {
-            "binding_name": binding_name,
-            "gguf_path": gguf_path,
-            "base_model": base_model,
-            "vae_path": vae_path,
-            "mmproj_path": mmproj_path
-        }
-        try:
-            ASCIIColors.info(f"Adding GGUF binding: {binding_name}...")
-            response = self._post_json_request("/add_gguf_binding", data=payload)
-            return response.json()
-        except Exception as e:
-            trace_exception(e)
-            return {"status": False, "message": str(e)}
-
-    def add_lora_binding(self, binding_name: str, base_model: str, lora_path: str, strength: float = 1.0) -> dict:
-        self.ensure_server_is_running(True, sync=False)
-        payload = {
-            "binding_name": binding_name,
-            "base_model": base_model,
-            "lora_path": lora_path,
-            "strength": strength
-        }
-        try:
-            ASCIIColors.info(f"Adding LoRA binding: {binding_name}...")
-            response = self._post_json_request("/add_lora_binding", data=payload)
-            return response.json()
-        except Exception as e:
-            trace_exception(e)
-            return {"status": False, "message": str(e)}
-
-    def remove_binding(self, binding_name: str) -> dict:
-        self.ensure_server_is_running(True, sync=False)
-        payload = {"binding_name": binding_name}
-        try:
-            ASCIIColors.info(f"Removing binding: {binding_name}...")
-            response = self._post_json_request("/remove_binding", data=payload)
-            return response.json()
-        except Exception as e:
-            trace_exception(e)
-            return {"status": False, "message": str(e)}
-
-    def list_bindings(self) -> dict:
-        self.ensure_server_is_running(True, sync=False)
-        try:
-            response = self._get_request("/list_bindings")
-            return response.json()
-        except Exception as e:
-            trace_exception(e)
-            return {"status": False, "message": str(e), "bindings": []}
-
-    # Alias for backward compatibility
-    def bind_model_components(self, model_name: str, base_model: str, vae_path: Optional[str] = None, other_component_path: Optional[str] = None) -> dict:
-        return self.add_gguf_binding(model_name, model_name, base_model, vae_path, other_component_path)
-
     def __del__(self):
         # The client destructor does not stop the server,
         # as it is a shared resource for all worker processes.
         pass
-
-    def add_gguf_binding(self, binding_name: str, gguf_path: str, base_model: str, vae_path: str = None, mmproj_path: str = None, text_encoder_path: str = None, tokenizer_path: str = None) -> dict:
-        self.ensure_server_is_running(True, sync=False)
-        payload = {
-            "binding_name": binding_name,
-            "gguf_path": gguf_path,
-            "base_model": base_model,
-            "vae_path": vae_path,
-            "mmproj_path": mmproj_path,
-            "text_encoder_path": text_encoder_path,
-            "tokenizer_path": tokenizer_path
-        }
-        return self._post_json_request("/add_gguf_binding", payload).json()

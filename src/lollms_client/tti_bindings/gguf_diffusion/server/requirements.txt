@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+torch>=2.1.0
+diffusers
+transformers
+accelerate
+gguf>=0.13.0
+sentencepiece
+protobuf
+numpy
+tqdm

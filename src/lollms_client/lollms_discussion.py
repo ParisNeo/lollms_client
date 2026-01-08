@@ -1592,7 +1592,7 @@ class LollmsDiscussion:
         self.touch() # Mark for update and auto-save if configured
         print(f"Branch starting at {message_id} ({len(messages_to_delete_ids)} messages) removed. New active branch: {self.active_branch_id}")
         
-    def export(self, format_type: str, branch_tip_id: Optional[str] = None, max_allowed_tokens: Optional[int] = None, suppress_system_prompt=False) -> Union[List[Dict], str]:
+    def export(self, format_type: str, branch_tip_id: Optional[str] = None, max_allowed_tokens: Optional[int] = None, suppress_system_prompt=False, suppress_images=False) -> Union[List[Dict], str]:
         """Exports the discussion history into a specified format.
 
         This method can format the conversation for different backends like OpenAI,
@@ -1731,10 +1731,11 @@ class LollmsDiscussion:
                 if full_system_prompt:
                     system_md_parts.append(f"system: {full_system_prompt}")
 
-                for img in discussion_level_images:
-                    img_data = img['data']
-                    url = f"![Image](data:image/jpeg;base64,{img_data})" if img['type'] == 'base64' else f"![Image]({img_data})"
-                    system_md_parts.append(f"\n{url}\n")
+                if not suppress_images:
+                    for img in discussion_level_images:
+                        img_data = img['data']
+                        url = f"![Image](data:image/jpeg;base64,{img_data})" if img['type'] == 'base64' else f"![Image]({img_data})"
+                        system_md_parts.append(f"\n{url}\n")
                 
                 if system_md_parts:
                     messages.append("".join(system_md_parts))
@@ -2240,7 +2241,7 @@ class LollmsDiscussion:
         try:
             if self.metadata is None:
                 self.metadata = {}
-            discussion = self.export("markdown", suppress_system_prompt=True)[0:1000]
+            discussion = self.export("markdown", suppress_system_prompt=True, suppress_images=True)[0:1000]
             system_prompt="You are a title builder out of a discussion."
             prompt = f"""Build a title for the following discussion:
 {discussion}
