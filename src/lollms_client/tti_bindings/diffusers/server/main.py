@@ -361,10 +361,10 @@ class ModelManager:
 
         # --- FIX START ---
         # Force VAE to float32 to prevent black/chunky artifacts on some GPUs when using float16
-        # if self.pipeline and hasattr(self.pipeline, 'vae') and hasattr(self.pipeline.vae, 'dtype'):
-        #     if self.pipeline.vae.dtype == torch.float16:
-        #        ASCIIColors.info("Upcasting VAE to float32 to prevent artifacts.")
-        #        self.pipeline.vae = self.pipeline.vae.to(dtype=torch.float32)
+        if self.pipeline and hasattr(self.pipeline, 'vae') and hasattr(self.pipeline.vae, 'dtype'):
+            if self.pipeline.vae.dtype == torch.float16:
+               ASCIIColors.info("Upcasting VAE to float32 to prevent artifacts.")
+               self.pipeline.vae = self.pipeline.vae.to(dtype=torch.float32)
         # --- FIX END ---
 
         self._set_scheduler()
