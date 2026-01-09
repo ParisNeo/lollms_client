@@ -809,7 +809,7 @@ async def edit_image(request: EditRequestJSON):
         
         if "Qwen-Image-Edit-2509" in model_name:
             task = "image2image"
-            pipeline_args.update({"true_cfg_scale": 4.0, "guidance_scale": 1.0, "num_inference_steps": 40, "negative_prompt": " "})
+            pipeline_args.update({"true_cfg_scale": pipeline_args.get("true_cfg_scale",4.0), "guidance_scale": pipeline_args.get("guidance_scale",1.0), "num_inference_steps": pipeline_args.get("num_inference_steps",40), "negative_prompt": pipeline_args.get("negative_prompt","")})
             edit_mode = pipeline_args.get("edit_mode", "fusion")
             if edit_mode == "fusion": pipeline_args["image"] = pil_images
         else:
