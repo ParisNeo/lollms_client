@@ -310,10 +310,11 @@ class ModelManager:
                 
                 if is_flux_model:
                     self.pipeline = AutoPipelineForText2Image.from_pretrained(model_name_from_config, **load_params)
-                elif "Qwen-Image-Edit-2509" in model_name_from_config:
-                    self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_name_from_config, **load_params)
                 elif "Qwen-Image-Edit" in model_name_from_config:
-                    self.pipeline = QwenImageEditPipeline.from_pretrained(model_name_from_config, **load_params)
+                    try:
+                        self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_name_from_config, **load_params)
+                    except:
+                        self.pipeline = QwenImageEditPipeline.from_pretrained(model_name_from_config, **load_params)
                 elif "Qwen/Qwen-Image" in model_name_from_config:
                     self.pipeline = DiffusionPipeline.from_pretrained(model_name_from_config, **load_params)
             
