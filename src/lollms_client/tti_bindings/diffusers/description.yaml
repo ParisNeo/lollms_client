@@ -58,6 +58,8 @@ input_parameters:
     type: "str"
     default: "float16"
     description: "Torch dtype to use for inference ('float16' recommended for GPU)."
+    options: ["float16", "bfloat16"]
+
 
   - name: "seed"
     type: "int"
