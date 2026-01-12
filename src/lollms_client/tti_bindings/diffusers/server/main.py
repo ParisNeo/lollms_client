@@ -315,7 +315,7 @@ class ModelManager:
                         self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_name_from_config, **load_params)
                     except:
                         self.pipeline = QwenImageEditPipeline.from_pretrained(model_name_from_config, **load_params)
-                elif "Qwen/Qwen-Image" in model_name_from_config:
+                else:#if "Qwen/Qwen-Image" in model_name_from_config:
                     self.pipeline = DiffusionPipeline.from_pretrained(model_name_from_config, **load_params)
             
             else:
