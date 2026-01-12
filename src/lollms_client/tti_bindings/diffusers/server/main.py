@@ -287,8 +287,8 @@ class ModelManager:
                 load_params["cache_dir"] = str(self.config["hf_cache_path"])
             load_params["torch_dtype"] = torch_dtype
 
-            is_qwen_model = "Qwen" in model_name_from_config
-            is_flux_model = "FLUX" in model_name_from_config
+            is_qwen_model = "Qwen".lower() in model_name_from_config.lower() 
+            is_flux_model = "FLUX".lower()  in model_name_from_config.lower() 
 
             if is_qwen_model or is_flux_model:
                 ASCIIColors.info(f"Special model '{model_name_from_config}' detected. Using dedicated pipeline loader.")
