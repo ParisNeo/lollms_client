@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-01-12 23:15]
+
+- feat(diffusers): add reinstall command and extra deps
+
 ## [2026-01-12 03:03]
 
 - feat(lollms): update LLM/STT/TTI/TTI bindings metadata

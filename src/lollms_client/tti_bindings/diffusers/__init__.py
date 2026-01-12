@@ -126,6 +126,14 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         pm_v.ensure_packages([
             "transformers", "safetensors", "accelerate"
         ])
+        ASCIIColors.info(f"Installing hugging face dependencies")
+        pm_v.ensure_packages([
+            "hf_xet"
+        ])
+        ASCIIColors.info(f"Installing bits and bytes for quantized models")
+        pm_v.ensure_packages([
+            "bitsandbytes"
+        ])
         ASCIIColors.info(f"[Optional] Installing xformers")
         try:
             pm_v.ensure_packages([
@@ -497,6 +505,68 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             if progress_callback:
                 progress_callback({"status": "error", "message": error_msg})
             return {"status": False, "message": error_msg}
+
+
+    def reinstall_dependencies(self):
+        """
+        Re‑install the Python packages required by the Diffusers server.
+
+        This method looks for a ``requirements.txt`` file located in the
+        same directory as this ``__init__.py``.  It then runs:
+
+            ``python -m pip install -r requirements.txt``
+
+        using the **same interpreter** that runs the current process,
+        ensuring that the correct virtual environment is targeted.
+
+        Returns
+        -------
+        dict
+            ``{'status': bool, 'message': str}`` – ``status`` is ``True`` on
+            success, ``False`` otherwise.  ``message`` contains a short
+            description or the error that occurred.
+        """
+        requirements_path = Path(__file__).parent / "requirements.txt"
+
+        if not requirements_path.is_file():
+            return {
+                "status": False,
+                "message": f"requirements.txt not found at {requirements_path}"
+            }
+
+        cmd = [sys.executable, "-m", "pip", "install", "-r", str(requirements_path)]
+
+        try:
+            ASCIIColors.cyan(
+                f"Re‑installing dependencies from {requirements_path} …"
+            )
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            # Log pip output – useful for debugging
+            if result.stdout:
+                ASCIIColors.info("pip stdout:\n" + result.stdout)
+            if result.stderr:
+                ASCIIColors.warning("pip stderr:\n" + result.stderr)
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"pip exited with code {result.returncode}"
+                )
+
+            return {
+                "status": True,
+                "message": "Dependencies reinstalled successfully.",
+            }
+
+        except Exception as e:
+            trace_exception(e)
+            return {"status": False, "message": str(e)}
+
 
     def __del__(self):
         # The client destructor does not stop the server,

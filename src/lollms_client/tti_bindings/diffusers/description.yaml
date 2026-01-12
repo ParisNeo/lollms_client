@@ -15,8 +15,8 @@ description: |
     - Qwen-based vision or diffusion models where compatible (e.g. https://huggingface.co/Qwen)
     - Community models such as RealVis, DreamShaper, Juggernaut, etc. from the Hugging Face Hub.
 
-  Any compatible Diffusers or .safetensors pipeline can be installed via
-  the provided management commands, and only locally downloaded models
+  Any compatible Diffusers or .safetensors pipeline can be installed via the
+  provided management commands, and only locally downloaded models
   will appear in the binding's model list.
 
   Two main operations are supported:
@@ -30,7 +30,7 @@ description: |
      - Useful for inpainting, outpainting, or style transformation.
 
   Parameters can be set globally at initialization (e.g., default model, steps, scheduler),
-  or per-request at runtime. Runtime overrides global, which overrides defaults.
+  or per‑request at runtime. Runtime overrides global, which overrides defaults.
 
 global_input_parameters:
   - name: "port"
@@ -55,7 +55,6 @@ global_input_parameters:
     description: "Device to run the model on (e.g., 'cuda', 'mps', 'cpu')."
 
 model_input_parameters:
-
   - name: "dtype"
     type: "str"
     default: "float16"
@@ -81,7 +80,7 @@ model_input_parameters:
   - name: "guidance_scale"
     type: "float"
     default: 7.5
-    description: "Classifier-free guidance scale. Higher = more prompt adherence."
+    description: "Classifier‑free guidance scale. Higher = more prompt adherence."
 
   - name: "negative_prompt"
     type: "str"
@@ -90,12 +89,12 @@ model_input_parameters:
 
   - name: "width"
     type: "int"
-    default: "1024"
+    default: 1024
     description: "Image width."
 
   - name: "height"
     type: "int"
-    default: "1024"
+    default: 1024
     description: "Image height."
 
 commands:
@@ -144,3 +143,15 @@ commands:
       - name: status
         type: str
         description: "Status of the upgrade process"
+
+  - name: reinstall_dependencies
+    title: Re‑install Dependencies
+    description: "Re‑installs the Python dependencies required by the Diffusers TTI server using the local requirements.txt."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+        description: "True if re‑installation succeeded."
+      - name: message
+        type: str
+        description: "Result message or error description."
