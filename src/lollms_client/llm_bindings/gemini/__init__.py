@@ -13,10 +13,11 @@ from ascii_colors import ASCIIColors, trace_exception
 
 import pipmaster as pm
 
-# Ensure the required packages are installed
-pm.ensure_packages(["google-generativeai", "pillow", "tiktoken", "protobuf"])
+# Ensure the required packages are installed - UPDATED PACKAGE
+pm.ensure_packages(["google-genai", "pillow", "tiktoken", "protobuf"])
 
-import google.generativeai as genai
+import google.genai as genai
+from google.genai import types
 from PIL import Image, ImageDraw 
 import tiktoken
 
@@ -44,7 +45,7 @@ class GeminiBinding(LollmsLLMBinding):
             service_key (str): Google AI Studio API key.
         """
         super().__init__(BindingName, **kwargs)
-        self.model_name = kwargs.get("model_name", "gemini-1.5-pro-latest")
+        self.model_name = kwargs.get("model_name", "gemini-1.5-pro")
         self.service_key = kwargs.get("service_key", None)
 
         if not self.service_key:
@@ -54,8 +55,8 @@ class GeminiBinding(LollmsLLMBinding):
             raise ValueError("Google API key is required. Please set it via the 'service_key' parameter or the GOOGLE_API_KEY environment variable.")
 
         try:
-            genai.configure(api_key=self.service_key)
-            self.client = genai # Alias for consistency
+            # NEW: Use Client-based initialization
+            self.client = genai.Client(api_key=self.service_key)
         except Exception as e:
             ASCIIColors.error(f"Failed to configure Gemini client: {e}")
             self.client = None
@@ -65,14 +66,14 @@ class GeminiBinding(LollmsLLMBinding):
                               temperature: float, 
                               top_p: float, 
                               top_k: int, 
-                              n_predict: int) -> genai.types.GenerationConfig:
-        """Builds a GenerationConfig object from parameters."""
+                              n_predict: int) -> types.GenerateContentConfig:
+        """Builds a GenerateContentConfig object from parameters."""
         config = {}
         if temperature is not None: config['temperature'] = float(temperature)
         if top_p is not None: config['top_p'] = top_p
         if top_k is not None: config['top_k'] = top_k
         if n_predict is not None: config['max_output_tokens'] = n_predict
-        return genai.types.GenerationConfig(**config)
+        return types.GenerateContentConfig(**config)
 
     def generate_text(self,
                      prompt: str,
@@ -83,18 +84,18 @@ class GeminiBinding(LollmsLLMBinding):
                      temperature: float = 0.7,
                      top_k: int = 40,
                      top_p: float = 0.9,
-                     repeat_penalty: float = 1.1, # Not directly supported by Gemini API
-                     repeat_last_n: int = 64,   # Not directly supported
-                     seed: Optional[int] = None,      # Not directly supported
-                     n_threads: Optional[int] = None, # Not applicable
-                     ctx_size: int | None = None,     # Determined by model, not settable per-call
+                     repeat_penalty: float = 1.1,
+                     repeat_last_n: int = 64,
+                     seed: Optional[int] = None,
+                     n_threads: Optional[int] = None,
+                     ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     split:Optional[bool]=False, 
-                     user_keyword:Optional[str]="!@>user:",
-                     ai_keyword:Optional[str]="!@>assistant:",
+                     split: Optional[bool] = False, 
+                     user_keyword: Optional[str] = "!@>user:",
+                     ai_keyword: Optional[str] = "!@>assistant:",
                      think: Optional[bool] = False,
-                     reasoning_effort: Optional[str] = "low", # low, medium, high
-                     reasoning_summary: Optional[bool] = False, # auto
+                     reasoning_effort: Optional[str] = "low",
+                     reasoning_summary: Optional[bool] = False,
                      ) -> Union[str, dict]:
         """
         Generate text using the Gemini model.
@@ -102,18 +103,8 @@ class GeminiBinding(LollmsLLMBinding):
         if not self.client:
             return {"status": False, "error": "Gemini client not initialized."}
 
-        # Handle 'think' parameter logging
         if think and "thinking" not in str(self.model_name).lower():
              ASCIIColors.info(f"Thinking requested but model '{self.model_name}' may not be a thinking model. Proceeding.")
-
-        # Gemini uses 'system_instruction' for GenerativeModel
-        try:
-            model = self.client.GenerativeModel(
-                model_name=self.model_name,
-                system_instruction=system_prompt if system_prompt else None
-            )
-        except Exception as e:
-            return {"status": False, "error": f"Failed to initialize GenerativeModel: {e}"}
 
         generation_config = self.get_generation_config(temperature, top_p, top_k, n_predict)
 
@@ -134,9 +125,8 @@ class GeminiBinding(LollmsLLMBinding):
                 try:
                     if is_image_path(image_data):
                         img = Image.open(image_data)
-                    else: # Assume base64
+                    else:
                         if image_data.startswith("data:image"):
-                             # Remove prefix if present
                              image_data = image_data.split(",")[1]
                         img = Image.open(BytesIO(base64.b64decode(image_data)))
                     content_parts.append(img)
@@ -147,17 +137,18 @@ class GeminiBinding(LollmsLLMBinding):
 
         full_response_text = ""
         try:
-            response = model.generate_content(
+            # NEW: Use client.models.generate_content
+            response = self.client.models.generate_content(
+                model=self.model_name,
                 contents=content_parts,
-                generation_config=generation_config,
-                stream=stream
+                config=generation_config
             )
 
             if stream:
                 for chunk in response:
                     try:
                         chunk_text = chunk.text
-                    except ValueError:
+                    except (ValueError, AttributeError):
                         chunk_text = ""
 
                     if chunk_text:
@@ -167,10 +158,12 @@ class GeminiBinding(LollmsLLMBinding):
                                 break 
                 return full_response_text
             else:
-                if response.prompt_feedback.block_reason:
-                    error_msg = f"Content blocked due to: {response.prompt_feedback.block_reason.name}"
-                    ASCIIColors.warning(error_msg)
-                    return {"status": False, "error": error_msg}
+                # Check for safety blocks
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                    if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason:
+                        error_msg = f"Content blocked due to: {response.prompt_feedback.block_reason}"
+                        ASCIIColors.warning(error_msg)
+                        return {"status": False, "error": error_msg}
                 return response.text
 
         except Exception as ex:
@@ -192,13 +185,12 @@ class GeminiBinding(LollmsLLMBinding):
                         ctx_size: int | None = None,
                         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                         think: Optional[bool] = False,
-                        reasoning_effort: Optional[bool] = "low", 
-                        reasoning_summary: Optional[bool] = "auto",
+                        reasoning_effort: Optional[str] = "low", 
+                        reasoning_summary: Optional[bool] = False,
                         **kwargs
                         ) -> Union[str, dict]:
         """
-        Generate content using a list of messages. This is the low-level method 
-        that handles chat history structure for Gemini.
+        Generate content using a list of messages.
         """
         if not self.client:
             return {"status": False, "error": "Gemini client not initialized."}
@@ -213,13 +205,10 @@ class GeminiBinding(LollmsLLMBinding):
             role = msg.get("role", "user")
             content = msg.get("content", "")
             
-            # Gemini specific role mapping
             if role == "system":
-                # Gemini takes system prompt at initialization, not in the content list
                 if isinstance(content, str):
                     system_instruction = content
                 elif isinstance(content, list):
-                     # Extract text from list if system prompt is complex (rare)
                      text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
                      system_instruction = "\n".join(text_parts)
                 continue
@@ -227,7 +216,6 @@ class GeminiBinding(LollmsLLMBinding):
             gemini_role = "model" if role == "assistant" else "user"
             parts = []
 
-            # Parse content (Text or List of multimodal)
             if isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, list):
@@ -236,12 +224,10 @@ class GeminiBinding(LollmsLLMBinding):
                     if item_type == "text":
                         parts.append(item.get("text", ""))
                     elif item_type in ["input_image", "image_url"]:
-                        # Extract Base64
                         base64_data = None
                         url_data = item.get("image_url", item.get("input_image"))
                         
                         if isinstance(url_data, dict):
-                            # Format: {"url": "data:image/..."} or {"base64": "..."}
                             if "base64" in url_data:
                                 base64_data = url_data["base64"]
                             elif "url" in url_data:
@@ -250,7 +236,6 @@ class GeminiBinding(LollmsLLMBinding):
                             base64_data = url_data
 
                         if base64_data:
-                            # Clean "data:image/png;base64," prefix
                             if "base64," in base64_data:
                                 base64_data = base64_data.split("base64,")[1]
                             try:
@@ -262,31 +247,22 @@ class GeminiBinding(LollmsLLMBinding):
             if parts:
                 gemini_contents.append({"role": gemini_role, "parts": parts})
 
-        # Initialize Model with system instruction
-        try:
-            model = self.client.GenerativeModel(
-                model_name=self.model_name,
-                system_instruction=system_instruction
-            )
-        except Exception as e:
-            return {"status": False, "error": f"Failed to initialize GenerativeModel: {e}"}
-
         full_response_text = ""
 
         try:
-            # Generate content based on the full history
-            response = model.generate_content(
+            # NEW: Use client.models.generate_content with system_instruction
+            response = self.client.models.generate_content(
+                model=self.model_name,
                 contents=gemini_contents,
-                generation_config=gen_config,
-                stream=stream
+                config=gen_config
             )
 
             if stream:
                 for chunk in response:
                     try:
                         chunk_text = chunk.text
-                    except ValueError:
-                        chunk_text = "" # Safety filter or empty chunk
+                    except (ValueError, AttributeError):
+                        chunk_text = ""
                     
                     if chunk_text:
                         full_response_text += chunk_text
@@ -295,9 +271,10 @@ class GeminiBinding(LollmsLLMBinding):
                                 break
                 return full_response_text
             else:
-                if response.prompt_feedback.block_reason:
-                    error_msg = f"Content blocked due to: {response.prompt_feedback.block_reason.name}"
-                    return {"status": False, "error": error_msg}
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                    if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason:
+                        error_msg = f"Content blocked due to: {response.prompt_feedback.block_reason}"
+                        return {"status": False, "error": error_msg}
                 return response.text
 
         except Exception as ex:
@@ -320,8 +297,8 @@ class GeminiBinding(LollmsLLMBinding):
              ctx_size: Optional[int] = None,
              streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
              think: Optional[bool] = False,
-             reasoning_effort: Optional[str] = "low", # low, medium, high
-             reasoning_summary: Optional[bool] = False, # auto
+             reasoning_effort: Optional[str] = "low",
+             reasoning_summary: Optional[bool] = False,
              ) -> Union[str, dict]:
         """
         Conduct a chat session with the Gemini model using a LollmsDiscussion object.
@@ -361,20 +338,10 @@ class GeminiBinding(LollmsLLMBinding):
             if content_parts:
                 history.append({'role': role, 'parts': content_parts})
         
-        try:
-            model = self.client.GenerativeModel(
-                model_name=self.model_name,
-                system_instruction=system_prompt if system_prompt else None
-            )
-        except Exception as e:
-            return {"status": "error", "message": f"Failed to initialize GenerativeModel: {e}"}
-        
-        # Organize history for chat session
-        # ChatSession expects history excluding the very last message if we use send_message
         if not history:
             return {"status": "error", "message": "Cannot start chat with an empty discussion."}
 
-        # Filter and consolidate consecutive roles
+        # Consolidate consecutive roles
         consolidated_history = []
         current_role = None
         current_parts = []
@@ -388,31 +355,22 @@ class GeminiBinding(LollmsLLMBinding):
                 current_parts = list(msg['parts']) 
                 consolidated_history.append({'role': current_role, 'parts': current_parts})
 
-        # Separate the last message for the send_message call
-        last_message = consolidated_history[-1]
-        chat_history = consolidated_history[:-1]
-
-        # Only 'user' can send_message in Gemini chat. 
-        # If the last message in history is from 'model', the flow is slightly broken for standard chat,
-        # but we assume the standard Lollms loop (User -> AI).
-        
-        chat_session = model.start_chat(history=chat_history)
-        
         generation_config = self.get_generation_config(temperature, top_p, top_k, n_predict)
         
         full_response_text = ""
         try:
-            response = chat_session.send_message(
-                content=last_message['parts'],
-                generation_config=generation_config,
-                stream=stream
+            # NEW: Use client.models.generate_content directly
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=consolidated_history,
+                config=generation_config
             )
             
             if stream:
                 for chunk in response:
                     try:
                         chunk_text = chunk.text
-                    except ValueError:
+                    except (ValueError, AttributeError):
                         chunk_text = ""
                         
                     if chunk_text:
@@ -422,10 +380,11 @@ class GeminiBinding(LollmsLLMBinding):
                                 break
                 return full_response_text
             else:
-                if response.prompt_feedback.block_reason:
-                    error_msg = f"Content blocked due to: {response.prompt_feedback.block_reason.name}"
-                    ASCIIColors.warning(error_msg)
-                    return {"status": "error", "message": error_msg}
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                    if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason:
+                        error_msg = f"Content blocked due to: {response.prompt_feedback.block_reason}"
+                        ASCIIColors.warning(error_msg)
+                        return {"status": "error", "message": error_msg}
                 return response.text
 
         except Exception as ex:
@@ -452,8 +411,12 @@ class GeminiBinding(LollmsLLMBinding):
             ASCIIColors.warning("Cannot count tokens, Gemini client or model_name not set.")
             return -1
         try:
-            model = self.client.GenerativeModel(self.model_name)
-            return model.count_tokens(text).total_tokens
+            # NEW: Use client.models.count_tokens
+            result = self.client.models.count_tokens(
+                model=self.model_name,
+                contents=text
+            )
+            return result.total_tokens
         except Exception as e:
             ASCIIColors.error(f"Failed to count tokens with Gemini API: {e}")
             return len(self.tokenize(text))
@@ -462,15 +425,15 @@ class GeminiBinding(LollmsLLMBinding):
         if not self.client:
              raise Exception("Gemini client not initialized.")
         
-        model_to_use = kwargs.get("model", "models/embedding-001")
+        model_to_use = kwargs.get("model", "models/text-embedding-004")
         
         try:
-            response = self.client.embed_content(
+            # NEW: Use client.models.embed_content
+            response = self.client.models.embed_content(
                 model=model_to_use,
-                content=text,
-                task_type="retrieval_document" 
+                contents=text
             )
-            return response['embedding']
+            return response.embeddings[0].values
         except Exception as ex:
             trace_exception(ex)
             raise Exception(f"Gemini embedding failed: {str(ex)}") from ex
@@ -492,14 +455,14 @@ class GeminiBinding(LollmsLLMBinding):
         try:
             ASCIIColors.debug("Listing Gemini models...")
             model_info_list = []
-            for m in self.client.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    model_info_list.append({
-                        'model_name': m.name,
-                        'display_name': m.display_name,
-                        'description': m.description,
-                        'owned_by': 'Google' 
-                    })
+            # NEW: Use client.models.list()
+            for m in self.client.models.list():
+                model_info_list.append({
+                    'model_name': m.name,
+                    'display_name': getattr(m, 'display_name', m.name),
+                    'description': getattr(m, 'description', ''),
+                    'owned_by': 'Google' 
+                })
             return model_info_list
         except Exception as ex:
             trace_exception(ex)
@@ -510,6 +473,45 @@ class GeminiBinding(LollmsLLMBinding):
         ASCIIColors.info(f"Gemini model set to: {model_name}. It will be used on the next API call.")
         return True
 
+    def test_connection(self) -> dict:
+        """
+        Tests the connection to the Gemini API using the provided key.
+        """
+        if not self.client:
+             return {"status": False, "message": "Client not configured. Check API Key."}
+        try:
+            # Attempt to list 1 model to verify auth
+            models = list(self.client.models.list())
+            if models:
+                return {"status": True, "message": "Connection successful! API Key is valid."}
+            return {"status": False, "message": "No models found."}
+        except Exception as e:
+            return {"status": False, "message": f"Connection failed: {str(e)}"}
+
+    def get_active_model_info(self) -> dict:
+        """
+        Retrieves details about the currently selected model name.
+        """
+        if not self.client or not self.model_name:
+            return {"status": False, "message": "Client or model name not set."}
+        
+        try:
+            # NEW: Use client.models.get
+            model_info = self.client.models.get(model=self.model_name)
+            
+            info = {
+                "display_name": getattr(model_info, 'display_name', ''),
+                "description": getattr(model_info, 'description', ''),
+                "input_token_limit": getattr(model_info, 'input_token_limit', 0),
+                "output_token_limit": getattr(model_info, 'output_token_limit', 0),
+            }
+            
+            msg = f"Input Limit: {info['input_token_limit']}, Output Limit: {info['output_token_limit']}"
+            return {"status": True, "message": msg, "info": info}
+        except Exception as e:
+            return {"status": False, "message": f"Failed to get info for {self.model_name}: {str(e)}"}
+
+
 if __name__ == '__main__':
     # Example Usage (requires GOOGLE_API_KEY environment variable)
     if 'GOOGLE_API_KEY' not in os.environ:
@@ -519,16 +521,12 @@ if __name__ == '__main__':
 
     ASCIIColors.yellow("--- Testing GeminiBinding ---")
 
-    # --- Configuration ---
-    test_model_name = "gemini-1.5-pro-latest"
-    full_streamed_text = ""
+    test_model_name = "gemini-1.5-pro"
 
     try:
-        # --- Initialization ---
         binding = GeminiBinding(model_name=test_model_name)
         ASCIIColors.green("Binding initialized successfully.")
 
-        # --- Test generate_from_messages ---
         ASCIIColors.cyan("\n--- Testing generate_from_messages ---")
         messages = [
             {"role": "system", "content": "You are a pirate."},
@@ -542,60 +540,3 @@ if __name__ == '__main__':
         trace_exception(e)
 
     ASCIIColors.yellow("\nGeminiBinding test finished.")
-
-    def test_connection(self) -> dict:
-        """
-        Tests the connection to the Gemini API using the provided key.
-        """
-        if not self.client:
-             return {"status": False, "message": "Client not configured. Check API Key."}
-        try:
-            # Attempt to list 1 model to verify auth
-            list(self.client.list_models(page_size=1))
-            return {"status": True, "message": "Connection successful! API Key is valid."}
-        except Exception as e:
-            return {"status": False, "message": f"Connection failed: {str(e)}"}
-
-    def list_tuned_models(self) -> dict:
-        """
-        Lists tuned models available for this API key.
-        """
-        if not self.client:
-             return {"status": False, "message": "Client not configured."}
-        try:
-            tuned_models = []
-            # iterate over the tuned models generator
-            for model in self.client.list_tuned_models():
-                tuned_models.append(model.name)
-            
-            if not tuned_models:
-                 return {"status": True, "message": "No tuned models found on this account.", "models": []}
-            
-            # Join them for a pretty message, but return the list for the UI
-            msg = f"Found: {', '.join(tuned_models)}"
-            return {"status": True, "message": msg, "models": tuned_models}
-        except Exception as e:
-            return {"status": False, "message": f"Could not list tuned models: {str(e)}", "models": []}
-
-    def get_active_model_info(self) -> dict:
-        """
-        Retrieves details about the currently selected model name.
-        """
-        if not self.client or not self.model_name:
-            return {"status": False, "message": "Client or model name not set."}
-        
-        try:
-            model_info = self.client.get_model(self.model_name)
-            
-            info = {
-                "display_name": model_info.display_name,
-                "description": model_info.description,
-                "input_token_limit": model_info.input_token_limit,
-                "output_token_limit": model_info.output_token_limit,
-                "supported_methods": model_info.supported_generation_methods
-            }
-            
-            msg = f"Input Limit: {info['input_token_limit']}, Output Limit: {info['output_token_limit']}"
-            return {"status": True, "message": msg, "info": info}
-        except Exception as e:
-            return {"status": False, "message": f"Failed to get info for {self.model_name}: {str(e)}"}

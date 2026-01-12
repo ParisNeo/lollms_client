@@ -3,14 +3,15 @@ author: ParisNeo
 creation_date: 2025-09-05
 last_update_date: 2025-09-05
 description: A binding for the Novita AI API, which provides access to a variety of open-source language models through an OpenAI-compatible interface. This allows for easy integration with models like Llama 3, Mixtral, and Gemma.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The name of the Novita AI model to use (e.g., 'meta-llama/Llama-3-8B-Instruct')."
-    mandatory: true
-    default: "meta-llama/Llama-3-8B-Instruct"
+global_input_parameters:
   - name: service_key
     type: str
     description: "The API key for the Novita AI service. Can also be set via the NOVITA_API_KEY environment variable."
     mandatory: true
     default: ""
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the Novita AI model to use (e.g., 'meta-llama/Llama-3-8B-Instruct')."
+    mandatory: true
+    default: "meta-llama/Llama-3-8B-Instruct"

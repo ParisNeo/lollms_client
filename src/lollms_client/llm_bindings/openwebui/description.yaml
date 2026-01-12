@@ -5,17 +5,12 @@ last_update_date: 2025-09-18
 description: >
   A binding for OpenWebUI, a user-friendly web interface for various LLM runners like Ollama, OpenAI, and more.
   This binding allows Lollms to communicate with any model served through an OpenWebUI instance using its OpenAI-compatible API.
-input_parameters:
+global_input_parameters:
   - name: host_address
     type: str
     description: "The full URL of your OpenWebUI server (e.g., 'http://127.0.0.1:8080')."
     mandatory: true
     default: "http://127.0.0.1:8080"
-  - name: model_name
-    type: str
-    description: "The name of the model to use as it is identified in OpenWebUI (e.g., 'llama3:latest')."
-    mandatory: true
-    default: "llama3:latest"
   - name: service_key
     type: str
     description: "The API key for your OpenWebUI service. Generate this in OpenWebUI under Settings > Account. Can also be set via the OPENWEBUI_API_KEY environment variable."
@@ -41,3 +36,9 @@ input_parameters:
     description: "If capping is enabled, this is the maximum width or height (in pixels) an image can have. Larger images will be shrunk."
     mandatory: false
     default: 2048
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the model to use as it is identified in OpenWebUI (e.g., 'llama3:latest')."
+    mandatory: true
+    default: "llama3:latest"

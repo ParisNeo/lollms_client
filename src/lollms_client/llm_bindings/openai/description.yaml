@@ -3,12 +3,7 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-08-13
 description: A binding for the official OpenAI API, providing access to models like GPT-4o, GPT-4, and GPT-3.5.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The name of the OpenAI model to use (e.g., 'gpt-4o')."
-    mandatory: true
-    default: "gpt-4o"
+global_input_parameters:
   - name: service_key
     type: str
     description: "The API key for the OpenAI service. Can also be set via the OPENAI_API_KEY environment variable."
@@ -19,3 +14,9 @@ input_parameters:
     description: "The base URL for the OpenAI API. Useful for proxies or custom endpoints. Defaults to the official OpenAI URL."
     mandatory: false
     default: ""
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the OpenAI model to use (e.g., 'gpt-4o')."
+    mandatory: true
+    default: "gpt-4o"

@@ -945,6 +945,8 @@ class OllamaBinding(LollmsLLMBinding):
             'gpt-oss:20b': 16000,     # GPT-OSS extended
             'gpt-oss:120b': 128000,     # GPT-OSS extended
             'codestral': 256000,  # Codestral
+            'mistralai-large': 128000,  # Mistral medium
+            'mistralai-large-3': 128000,  # Mistral medium
             'mistralai-medium': 128000,  # Mistral medium
             'mistralai-mini':   128000,  # Mistral medium
             'ministral':   256000,  # Mistral medium

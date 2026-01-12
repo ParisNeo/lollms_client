@@ -3,14 +3,15 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-08-13
 description: A binding for Mistral AI's official API, providing access to models like Mistral Large, Small, and open-weight models.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The name of the Mistral model to use (e.g., 'mistral-large-latest')."
-    mandatory: true
-    default: "mistral-large-latest"
+global_input_parameters:
   - name: service_key
     type: str
     description: "The API key for the Mistral AI service. Can also be set via the MISTRAL_API_KEY environment variable."
     mandatory: true
     default: ""
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the Mistral model to use (e.g., 'mistral-large-latest')."
+    mandatory: true
+    default: "mistral-large-latest"

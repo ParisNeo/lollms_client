@@ -14,7 +14,7 @@ from ascii_colors import trace_exception, ASCIIColors
 # --- SDK & Dependency Management ---
 try:
     import pipmaster as pm
-    pm.ensure_packages(['google-cloud-aiplatform', 'google-generativeai', 'Pillow', 'requests'])
+    pm.ensure_packages(['google-cloud-aiplatform', 'google-genai', 'Pillow', 'requests'])
 except ImportError:
     pass
 
@@ -28,14 +28,13 @@ try:
 except ImportError:
     VERTEX_AI_AVAILABLE = False
 
-# Attempt to import Gemini API
+# Attempt to import Gemini API (NEW SDK)
 try:
-    import google.generativeai as genai
-    from google.api_core.exceptions import ResourceExhausted
+    import google.genai as genai
+    from google.genai import types
     GEMINI_API_AVAILABLE = True
 except ImportError:
     GEMINI_API_AVAILABLE = False
-    ResourceExhausted = type('ResourceExhausted', (Exception,), {}) # Define dummy exception if import fails
 
 # Defines the binding name for the manager
 BindingName = "GeminiTTIBinding_Impl"
@@ -89,7 +88,7 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
 
         elif self.auth_method == "api_key":
             if not GEMINI_API_AVAILABLE:
-                raise ImportError("API Key selected, but 'google-generativeai' is not installed.")
+                raise ImportError("API Key selected, but 'google-genai' is not installed.")
             self.gemini_api_key = kwargs.get("service_key") or os.environ.get(GEMINI_API_KEY_ENV_VAR)
             if not self.gemini_api_key:
                 raise ValueError(f"For 'api_key' auth, 'service_key' or env var '{GEMINI_API_KEY_ENV_VAR}' is required.")
@@ -112,13 +111,17 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
                 ASCIIColors.green(f"Vertex AI initialized successfully. Project: '{self.project_id}', Model: '{self.model_name}'")
             
             elif self.auth_method == "api_key":
-                genai.configure(api_key=self.gemini_api_key)
+                # NEW: Use Client-based initialization
+                self.client = genai.Client(api_key=self.gemini_api_key)
                 
                 # --- DYNAMIC MODEL DISCOVERY ---
                 ASCIIColors.info("Discovering available image models for your API key...")
+                
+                # NEW: Use client.models.list()
+                all_models = list(self.client.models.list())
                 self.available_models = [
-                    m.name for m in genai.list_models() 
-                    if 'imagen' in m.name and 'generateContent' in m.supported_generation_methods
+                    m.name for m in all_models
+                    if 'imagen' in m.name.lower()
                 ]
                 
                 if not self.available_models:
@@ -134,7 +137,6 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
                 if not self.model_name:
                     self.model_name = self.available_models[0]
 
-                self.client = genai.GenerativeModel(self.model_name)
                 ASCIIColors.green(f"Gemini API configured successfully. Using Model: '{self.model_name}'")
 
         except Exception as e:
@@ -153,7 +155,7 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
             elif self.auth_method == "api_key":
                 return self._generate_with_api_key(prompt, negative_prompt, width, height, **kwargs)
         except Exception as e:
-            if "quota" in str(e).lower():
+            if "quota" in str(e).lower() or "resource_exhausted" in str(e).lower():
                  raise Exception(f"Image generation failed due to a quota error. This means you have exceeded the free tier limit for your API key. To fix this, please enable billing on your Google Cloud project. Original error: {e}")
             raise Exception(f"Image generation failed: {e}")
 
@@ -167,23 +169,47 @@ class GeminiTTIBinding_Impl(LollmsTTIBinding):
 
         for attempt in range(max_retries):
             try:
-                response = self.client.generate_content(full_prompt)
+                # NEW: Use client.models.generate_content
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=full_prompt
+                )
                 
-                if not response.parts or not hasattr(response.parts[0], 'file_data'):
-                    raise Exception(f"API response did not contain image data. Check safety filters in your Google AI Studio. Response: {response.text}")
+                # Check if response contains image data
+                if not response.candidates:
+                    raise Exception(f"API response did not contain any candidates. Response: {response}")
                 
-                return response.parts[0].file_data.data
+                candidate = response.candidates[0]
+                if not candidate.content or not candidate.content.parts:
+                    raise Exception(f"API response did not contain image data. Check safety filters in your Google AI Studio.")
+                
+                # Extract image data from response
+                for part in candidate.content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        return part.inline_data.data
+                    elif hasattr(part, 'file_data') and part.file_data:
+                        # If it's a file reference, we need to download it
+                        # For now, just return the data if available
+                        if hasattr(part.file_data, 'data'):
+                            return part.file_data.data
+                        else:
+                            raise Exception("File data returned but no direct data available")
+                
+                raise Exception("No image data found in response parts")
             
-            except ResourceExhausted as e:
-                if attempt < max_retries - 1:
-                    wait_time = initial_delay * (2 ** attempt)
-                    ASCIIColors.warning(f"Rate limit exceeded. Waiting {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                else:
-                    ASCIIColors.error(f"Failed to generate image after {max_retries} attempts due to rate limiting.")
-                    raise e
             except Exception as e:
-                raise e
+                # Check for rate limiting errors
+                error_str = str(e).lower()
+                if "resource_exhausted" in error_str or "quota" in error_str or "rate" in error_str:
+                    if attempt < max_retries - 1:
+                        wait_time = initial_delay * (2 ** attempt)
+                        ASCIIColors.warning(f"Rate limit exceeded. Waiting {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        ASCIIColors.error(f"Failed to generate image after {max_retries} attempts due to rate limiting.")
+                        raise e
+                else:
+                    raise e
 
     def _generate_with_vertex_ai(self, prompt, negative_prompt, width, height, **kwargs):
         self._validate_dimensions_vertex(width, height)

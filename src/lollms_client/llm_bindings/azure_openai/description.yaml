@@ -3,12 +3,7 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-08-13
 description: A binding for Microsoft Azure OpenAI services, allowing access to models like GPT-4, GPT-4o, etc., through an Azure deployment.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The name of the Azure OpenAI DEPLOYMENT to use (e.g., 'gpt-4o-deployment')."
-    mandatory: true
-    default: ""
+global_input_parameters:
   - name: service_key
     type: str
     description: "The API key for the Azure OpenAI service. Can also be set via the AZURE_OPENAI_API_KEY environment variable."
@@ -24,3 +19,9 @@ input_parameters:
     description: "The API version to use for the Azure OpenAI service. Defaults to '2024-02-01'. Can also be set via AZURE_OPENAI_API_VERSION."
     mandatory: false
     default: "2024-02-01"
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the Azure OpenAI DEPLOYMENT to use (e.g., 'gpt-4o-deployment')."
+    mandatory: true
+    default: ""

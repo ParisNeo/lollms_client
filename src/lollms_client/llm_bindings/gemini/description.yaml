@@ -3,17 +3,18 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-12-05
 description: A binding for Google's Gemini family of models (e.g., Gemini 1.5 Pro, Flash) via the Google AI Studio API. Fully supports text generation, chat history, and multimodal inputs (images/vision).
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The name of the Gemini model to use (e.g., 'gemini-1.5-pro-latest')."
-    mandatory: true
-    default: "gemini-1.5-pro-latest"
+global_input_parameters:
   - name: service_key
     type: str
     description: "The API key for the Google AI Studio service. Can also be set via the GOOGLE_API_KEY environment variable."
     mandatory: true
     default: ""
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the Gemini model to use (e.g., 'gemini-1.5-pro-latest')."
+    mandatory: true
+    default: "gemini-1.5-pro-latest"
 commands:
   - name: test_connection
     title: Test Connection

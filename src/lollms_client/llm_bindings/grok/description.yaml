@@ -3,12 +3,7 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-08-13
 description: A binding for xAI's Grok models via their official API, which is compatible with the OpenAI API format.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The name of the Grok model to use (e.g., 'grok-1.5-vision-preview')."
-    mandatory: true
-    default: "grok-1.5-vision-preview"
+global_input_parameters:
   - name: service_key
     type: str
     description: "The API key for the xAI service. Can also be set via the XAI_API_KEY environment variable."
@@ -19,3 +14,9 @@ input_parameters:
     description: "The base URL for the xAI API. Defaults to 'https://api.x.ai/v1'."
     mandatory: false
     default: "https://api.x.ai/v1"
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the Grok model to use (e.g., 'grok-1.5-vision-preview')."
+    mandatory: true
+    default: "grok-1.5-vision-preview"

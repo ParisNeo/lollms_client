@@ -3,12 +3,7 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-08-13
 description: Connects to a LoLLMs service or any other OpenAI-compatible API endpoint.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The name of the model to use from the remote service."
-    mandatory: true
-    default: ""
+global_input_parameters:
   - name: host_address
     type: str
     description: "The base URL of the LoLLMs or OpenAI-compatible service (e.g., 'http://localhost:9600/v1')."
@@ -24,3 +19,9 @@ input_parameters:
     description: "Whether to verify the SSL certificate of the server. Defaults to true."
     mandatory: false
     default: true
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the model to use from the remote service."
+    mandatory: true
+    default: ""

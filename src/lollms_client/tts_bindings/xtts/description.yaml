@@ -11,7 +11,7 @@ description: |
   The core function `generate_audio` requires a path to a reference WAV file
   to be passed in the `voice` parameter.
 
-input_parameters:
+global_input_parameters:
   - name: "host"
     type: "str"
     default: "localhost"
@@ -20,14 +20,16 @@ input_parameters:
     type: "int"
     default: 9633
     description: "The port number on which the dedicated XTTS server is running or should be started."
-  - name: "model_name"
-    type: "str"
-    default: "tts_models/multilingual/multi-dataset/xtts_v2"
-    description: "The Hugging Face model ID for the XTTS model to use."
   - name: "device"
     type: "str"
     default: "auto"
     description: "Device to run the model on ('cuda', 'cpu', 'auto'). 'auto' will detect GPU if available."
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "tts_models/multilingual/multi-dataset/xtts_v2"
+    description: "The Hugging Face model ID for the XTTS model to use."
 
 generate_audio_parameters:
   - name: "text"

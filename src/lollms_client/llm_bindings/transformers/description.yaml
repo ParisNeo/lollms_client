@@ -3,12 +3,7 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-12-06
 description: Run, Pull, and Train Hugging Face models locally. Supports QLoRA fine-tuning, smart memory management, LoRA merging, and custom model storage.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "Default model to load. Can be a HF ID (e.g. 'meta-llama/Llama-2-7b') or a folder name in your local models path."
-    mandatory: false
-    default: ""
+global_input_parameters:
   - name: local_models_path
     type: str
     description: "Custom path to store models. If empty, uses 'lollms_personal_path/models/huggingface'."
@@ -44,6 +39,12 @@ input_parameters:
     description: "Model used for generating embeddings."
     mandatory: false
     default: "sentence-transformers/all-MiniLM-L6-v2"
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "Default model to load. Can be a HF ID (e.g. 'meta-llama/Llama-2-7b') or a folder name in your local models path."
+    mandatory: false
+    default: ""
 commands:
   - name: pull_model
     title: Pull Model

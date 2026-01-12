@@ -32,7 +32,7 @@ description: |
   Parameters can be set globally at initialization (e.g., default model, steps, scheduler),
   or per-request at runtime. Runtime overrides global, which overrides defaults.
 
-input_parameters:
+global_input_parameters:
   - name: "port"
     type: "int"
     default: 9632
@@ -54,14 +54,17 @@ input_parameters:
     default: "cuda"
     description: "Device to run the model on (e.g., 'cuda', 'mps', 'cpu')."
 
+model_input_parameters:
+
   - name: "dtype"
     type: "str"
     default: "float16"
     description: "Torch dtype to use for inference ('float16' recommended for GPU)."
+    options: ["float16", "float32", "bfloat16"]
 
   - name: "seed"
     type: "int"
-    default: 42
+    default: -1
     description: "Random seed for reproducibility."
 
   - name: "scheduler_name"

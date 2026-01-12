@@ -604,6 +604,16 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             
     def get_zoo(self) -> List[Dict[str, Any]]:
         return [
+            
+            # Magistral-Small (2509): Mid range thinking model
+            {
+                "name": "Magistral-Small-2509-GGUF",
+                "description": "Mistral AI Magistral 2509 Bartowski Quant) - Efficient Thinking Model",
+                "size": "14.3 GB (Q4_K_M)",
+                "type": "gguf",
+                "link": "bartowski/mistralai_Magistral-Small-2509-GGUF",
+                "filename": "mistralai_Magistral-Small-2509-Q4_K_M.gguf"
+            },
             # Ministral 3: High-performance edge model (3B)
             {
                 "name": "Ministral-3-3B-Instruct-2512-GGUF",

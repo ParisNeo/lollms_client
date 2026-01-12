@@ -1,0 +1,61 @@
+title: "Diffusers TTV"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "diffusers"
+description: |
+  A binding for Text-to-Video generation using Hugging Face Diffusers.
+  Supports state-of-the-art models like LTX-Video (LTX-2) and CogVideoX.
+  
+  The binding runs a dedicated local server to manage heavy video models efficiently.
+
+global_input_parameters:
+  - name: "host"
+    type: "str"
+    default: "localhost"
+    description: "Server host."
+  - name: "port"
+    type: "int"
+    default: 9634
+    description: "Server port."
+  - name: "hf_token"
+    type: "str"
+    default: ""
+    description: "Hugging Face token (required for gated models)."
+    is_secret: true
+  - name: "models_path"
+    type: "str"
+    default: "./data/ttv_models/diffusers"
+    description: "Path to store downloaded models."
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "Lightricks/LTX-Video"
+    description: "The HF model ID (e.g., Lightricks/LTX-Video, THUDM/CogVideoX-2b)."
+    
+  - name: "width"
+    type: "int"
+    default: 768
+    description: "Video width (must be compatible with model resolution buckets)."
+    
+  - name: "height"
+    type: "int"
+    default: 512
+    description: "Video height."
+    
+  - name: "num_frames"
+    type: "int"
+    default: 24
+    description: "Number of frames to generate."
+    
+  - name: "num_inference_steps"
+    type: "int"
+    default: 30
+    description: "Number of denoising steps."
+    
+  - name: "guidance_scale"
+    type: "float"
+    default: 7.5
+    description: "CFG Scale."
+
+commands: []

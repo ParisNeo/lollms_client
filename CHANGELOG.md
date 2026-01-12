@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-01-12 03:03]
+
+- feat(lollms): update LLM/STT/TTI/TTI bindings metadata
+
 ## v0.31.0  (2025-08-03)
 *   **Bug Fix:** Resolved issue causing discussion level images to be difficult to use by apps.
 *   **Refactor:** Reorganized LollmsDiscussion class.

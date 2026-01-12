@@ -3,17 +3,18 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-08-13
 description: A binding for the OpenRouter service, an aggregator that provides access to a huge variety of models from different providers through a unified, OpenAI-compatible API.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The name of the model on OpenRouter, including the provider prefix (e.g., 'anthropic/claude-3-haiku-20240307')."
-    mandatory: true
-    default: "google/gemini-flash-1.5"
+global_input_parameters:
   - name: service_key
     type: str
     description: "The API key for the OpenRouter service. Can also be set via the OPENROUTER_API_KEY environment variable."
     mandatory: true
     default: ""
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the model on OpenRouter, including the provider prefix (e.g., 'anthropic/claude-3-haiku-20240307')."
+    mandatory: true
+    default: "google/gemini-flash-1.5"
 
 commands:
   - name: list_models

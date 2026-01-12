@@ -7,7 +7,7 @@ description: |
   This binding uses the /chat/completions endpoint with image modalities.
   Compatible with models like Gemini 2.0/2.5, FLUX, and DALL-E 3.
 
-input_parameters:
+global_input_parameters:
   - name: "service_key"
     type: "str"
     description: "Your Open Router API Key."
@@ -15,6 +15,7 @@ input_parameters:
     is_secret: true
     default: ""
 
+model_input_parameters:
   - name: "model_name"
     type: "str"
     description: "Model ID (e.g., 'google/gemini-2.0-flash-exp:free')."

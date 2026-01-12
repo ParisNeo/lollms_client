@@ -3,12 +3,7 @@ author: ParisNeo
 creation_date: 2025-10-21
 last_update_date: 2025-10-21
 description: Connects to a local whisper.cpp executable for speech-to-text transcription. Requires a pre-built whisper.cpp executable and a GGUF model file.
-input_parameters:
-  - name: model_path
-    type: str
-    description: "The path to the Whisper GGUF model file (e.g., 'ggml-base.bin')."
-    mandatory: true
-    default: ""
+global_input_parameters:
   - name: whispercpp_exe_path
     type: str
     description: "Path to the whisper.cpp executable. If not provided, it will be searched for in the system's PATH."
@@ -39,3 +34,9 @@ input_parameters:
     description: "A list of extra command-line arguments to pass to the whisper.cpp executable (e.g., ['--no-timestamps'])."
     mandatory: false
     default: []
+model_input_parameters:
+  - name: model_path
+    type: str
+    description: "The path to the Whisper GGUF model file (e.g., 'ggml-base.bin')."
+    mandatory: true
+    default: ""

@@ -8,7 +8,7 @@ description: |
   1.  **Vertex AI**: For full-featured access, including image editing and inpainting. Requires a Google Cloud project and authentication via Application Default Credentials (ADC). To set this up, run 'gcloud auth application-default login' in your terminal.
   2.  **Gemini API Key**: A simpler method for image generation using a Gemini API key.
 
-input_parameters:
+global_input_parameters:
   - name: auth_method
     type: str
     description: "The authentication method to use. 'vertex_ai' offers more features like editing and inpainting, while 'api_key' is simpler for basic generation."
@@ -32,6 +32,7 @@ input_parameters:
     description: "Your Gemini API Key. (Required for 'api_key' method). Can also be set via the GEMINI_API_KEY environment variable."
     mandatory: false # Mandatory only if auth_method is 'api_key'
 
+model_input_parameters:
   - name: model_name
     type: str
     description: "The model to use. The list of available models depends on the selected auth_method. Defaults to the latest recommended model for the chosen service."

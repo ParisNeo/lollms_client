@@ -3,17 +3,12 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-08-13
 description: A binding to connect to a LiteLLM proxy server, which can route requests to over 100 different LLM APIs.
-input_parameters:
+global_input_parameters:
   - name: host_address
     type: str
     description: "The base URL of the LiteLLM proxy server (e.g., 'http://localhost:4000')."
     mandatory: true
     default: "http://localhost:4000"
-  - name: model_name
-    type: str
-    description: "The name of the model to use as configured in the LiteLLM proxy (e.g., 'openai/gpt-4o')."
-    mandatory: true
-    default: "openai/gpt-4o"
   - name: service_key
     type: str
     description: "The API key for the LiteLLM proxy, if it's configured to require one."
@@ -24,3 +19,9 @@ input_parameters:
     description: "Whether to verify the SSL certificate of the LiteLLM server. Defaults to true."
     mandatory: false
     default: true
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the model to use as configured in the LiteLLM proxy (e.g., 'openai/gpt-4o')."
+    mandatory: true
+    default: "openai/gpt-4o"

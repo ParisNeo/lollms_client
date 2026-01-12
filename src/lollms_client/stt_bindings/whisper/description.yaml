@@ -3,14 +3,15 @@ author: ParisNeo
 creation_date: 2025-10-21
 last_update_date: 2025-10-21
 description: A Speech-To-Text (STT) binding for transcribing audio using OpenAI's Whisper model locally. It requires 'ffmpeg' to be installed on the system.
-input_parameters:
-  - name: model_name
-    type: str
-    description: "The Whisper model size to use. Known sizes include 'tiny', 'base', 'small', 'medium', and 'large' variants (e.g., 'large-v3')."
-    mandatory: false
-    default: "base"
+global_input_parameters:
   - name: device
     type: str
     description: "The device to run the model on ('cpu', 'cuda', 'mps'). If not specified, it will be auto-detected."
     mandatory: false
     default: ""
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The Whisper model size to use. Known sizes include 'tiny', 'base', 'small', 'medium', and 'large' variants (e.g., 'large-v3')."
+    mandatory: false
+    default: "base"

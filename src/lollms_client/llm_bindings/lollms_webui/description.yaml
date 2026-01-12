@@ -3,22 +3,12 @@ author: ParisNeo
 creation_date: 2025-08-13
 last_update_date: 2025-08-13
 description: Connects directly to a running lollms-webui instance, using its native endpoints for generation and other functionalities.
-input_parameters:
+global_input_parameters:
   - name: host_address
     type: str
     description: "The URL of the lollms-webui server (e.g., 'http://localhost:9600')."
     mandatory: true
     default: "http://localhost:9600"
-  - name: model_name
-    type: str
-    description: "The name of the model to use on the lollms-webui server. If not provided, the server's currently loaded model will be used."
-    mandatory: false
-    default: ""
-  - name: personality
-    type: int
-    description: "The ID of the personality to use for generation on the lollms-webui server."
-    mandatory: false
-    default: null
   - name: service_key
     type: str
     description: "The API key if the lollms-webui server is configured to require one."
@@ -29,3 +19,14 @@ input_parameters:
     description: "Whether to verify the SSL certificate of the lollms-webui server. Defaults to true."
     mandatory: false
     default: true
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the model to use on the lollms-webui server. If not provided, the server's currently loaded model will be used."
+    mandatory: false
+    default: ""
+  - name: personality
+    type: int
+    description: "The ID of the personality to use for generation on the lollms-webui server."
+    mandatory: false
+    default: null
