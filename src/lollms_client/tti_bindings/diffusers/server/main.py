@@ -310,10 +310,11 @@ class ModelManager:
                 
                 if is_flux_model:
                     self.pipeline = AutoPipelineForText2Image.from_pretrained(model_name_from_config, **load_params)
-                elif "Qwen-Image-Edit-2509" in model_name_from_config:
-                    self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_name_from_config, **load_params)
                 elif "Qwen-Image-Edit" in model_name_from_config:
-                    self.pipeline = QwenImageEditPipeline.from_pretrained(model_name_from_config, **load_params)
+                    try:
+                        self.pipeline = QwenImageEditPlusPipeline.from_pretrained(model_name_from_config, **load_params)
+                    except:
+                        self.pipeline = QwenImageEditPipeline.from_pretrained(model_name_from_config, **load_params)
                 elif "Qwen/Qwen-Image" in model_name_from_config:
                     self.pipeline = DiffusionPipeline.from_pretrained(model_name_from_config, **load_params)
             
@@ -362,9 +363,9 @@ class ModelManager:
         # --- FIX START ---
         # Force VAE to float32 to prevent black/chunky artifacts on some GPUs when using float16
         if self.pipeline and hasattr(self.pipeline, 'vae') and hasattr(self.pipeline.vae, 'dtype'):
-             if self.pipeline.vae.dtype == torch.float16:
-                ASCIIColors.info("Upcasting VAE to float32 to prevent artifacts.")
-                self.pipeline.vae = self.pipeline.vae.to(dtype=torch.float32)
+            if self.pipeline.vae.dtype == torch.float16:
+               ASCIIColors.info("Upcasting VAE to float32 to prevent artifacts.")
+               self.pipeline.vae = self.pipeline.vae.to(dtype=torch.float32)
         # --- FIX END ---
 
         self._set_scheduler()
@@ -808,7 +809,7 @@ async def edit_image(request: EditRequestJSON):
         
         if "Qwen-Image-Edit-2509" in model_name:
             task = "image2image"
-            pipeline_args.update({"true_cfg_scale": 4.0, "guidance_scale": 1.0, "num_inference_steps": 40, "negative_prompt": " "})
+            pipeline_args.update({"true_cfg_scale": pipeline_args.get("true_cfg_scale",4.0), "guidance_scale": pipeline_args.get("guidance_scale",1.0), "num_inference_steps": pipeline_args.get("num_inference_steps",40), "negative_prompt": pipeline_args.get("negative_prompt","")})
             edit_mode = pipeline_args.get("edit_mode", "fusion")
             if edit_mode == "fusion": pipeline_args["image"] = pil_images
         else:
