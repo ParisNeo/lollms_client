@@ -306,7 +306,7 @@ class ModelManager:
                 if should_offload:
                     ASCIIColors.info(f"Offload enabled. Forcing device_map='auto' for {model_name_from_config}.")
                     use_device_map = True
-                    load_params["device_map"] = "auto"
+                    load_params["device_map"] = "balanced"# "auto"
                 
                 if is_flux_model:
                     self.pipeline = AutoPipelineForText2Image.from_pretrained(model_name_from_config, **load_params)
