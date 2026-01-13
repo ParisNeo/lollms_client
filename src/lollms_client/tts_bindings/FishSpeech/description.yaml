@@ -1,0 +1,85 @@
+title: 'Fish Speech (OpenAudio S1)'
+author: 'ParisNeo & Fish Audio Community'
+version: 1.0.0
+binding_name: 'fish_speech'
+
+description: |
+  This binding integrates Fish Speech (OpenAudio S1), a state-of-the-art multilingual
+  TTS model achieving #1 ranking on TTS-Arena2. Based on the OpenAudio S1-mini 
+  (0.5B parameters) open-source model, it excels at zero-shot voice cloning with
+  10-30 second reference audio samples.
+  
+  Key Features:
+  - Ultra-low WER (0.8%) and CER (0.4%) for exceptional accuracy
+  - Multilingual support: English, Chinese, Japanese, Korean, French, German, 
+    Spanish, Arabic, and more
+  - No phoneme dependency - handles any language script
+  - Emotion markers: (happy), (sad), (angry), (laughing), etc.
+  - Fast inference with torch.compile (~10x speedup on GPU)
+  
+  License: Apache 2.0 (code), CC-BY-NC-SA-4.0 (models)
+
+global_input_parameters:
+  - name: "host"
+    type: "str"
+    default: "localhost"
+    description: "The host address for the Fish Speech API server."
+  - name: "port"
+    type: "int"
+    default: 8080
+    description: "The port number for the Fish Speech API server."
+  - name: "auto_start_server"
+    type: "bool"
+    default: false
+    description: "Automatically start the Fish Speech server if not running."
+  - name: "device"
+    type: "str"
+    default: "auto"
+    description: "Device to run the model on ('cuda', 'cpu', 'auto'). 'auto' detects GPU availability."
+  - name: "compile"
+    type: "bool"
+    default: true
+    description: "Enable torch.compile for ~10x faster inference (requires CUDA)."
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "fishaudio/openaudio-s1-mini"
+    description: "The Hugging Face model ID. Options: 'fishaudio/openaudio-s1-mini' (0.5B, open-source), 'fishaudio/fish-speech-1.5' (legacy)"
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The text to synthesize. Supports emotion markers like (happy), (sad), (angry), (laughing)."
+  - name: "voice"
+    type: "str"
+    default: null
+    description: "Optional. Path to reference WAV/MP3 audio file for voice cloning (10-30 seconds recommended)."
+  - name: "reference_text"
+    type: "str"
+    default: null
+    description: "Optional. Transcript of the reference audio for better voice cloning accuracy."
+  - name: "format"
+    type: "str"
+    default: "wav"
+    description: "Output audio format: 'wav', 'mp3', or 'pcm'."
+  - name: "top_p"
+    type: "float"
+    default: 0.9
+    description: "Nucleus sampling parameter. Lower values (0.1) = focused, higher values (1.0) = diverse. Range: 0.0-1.0"
+  - name: "temperature"
+    type: "float"
+    default: 0.9
+    description: "Sampling temperature. Lower values = deterministic, higher values = random. Range: 0.0-1.0"
+  - name: "repetition_penalty"
+    type: "float"
+    default: 1.2
+    description: "Penalty for repeating tokens. Higher values reduce repetition. Range: 1.0-2.0"
+  - name: "normalize"
+    type: "bool"
+    default: true
+    description: "Normalize the text before synthesis. Improves handling of numbers and dates."
+  - name: "chunk_length"
+    type: "int"
+    default: 200
+    description: "Maximum chunk length for processing long texts. Recommended: 100-300"

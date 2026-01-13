@@ -1,0 +1,20 @@
+# PyTorch (CUDA 12.1)
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# Fish Speech core
+git+https://github.com/fishaudio/fish-speech.git
+
+# Server
+fastapi==0.109.0
+uvicorn==0.27.0
+python-multipart==0.0.9
+
+# Audio processing
+numpy<2.0.0
+soundfile==0.12.1
+
+# Utilities
+ascii_colors
+pydantic>=2.0.0
+huggingface-hub[cli]

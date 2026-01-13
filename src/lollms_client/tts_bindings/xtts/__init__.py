@@ -39,6 +39,9 @@ class XTTSClientBinding(LollmsTTSBinding):
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
         self.venv_dir = Path("./venv/tts_xtts_venv")
+        
+        # Python version requirement for XTTS
+        self.target_python_version = "3.10"
 
         if self.auto_start_server:
             self.ensure_server_is_running()
@@ -87,27 +90,46 @@ class XTTSClientBinding(LollmsTTSBinding):
     def install_server_dependencies(self):
         """
         Installs the server's dependencies into a dedicated virtual environment
-        using pipmaster, which handles complex packages like PyTorch.
+        using pipmaster with Python 3.10, which handles complex packages like PyTorch.
         """
-        ASCIIColors.info(f"Setting up virtual environment in: {self.venv_dir}")
-        # Ensure pipmaster is available.
+        ASCIIColors.info(f"Setting up Python {self.target_python_version} virtual environment in: {self.venv_dir}")
+        
+        # Ensure pipmaster is available
         try:
             import pipmaster as pm
         except ImportError:
             print("FATAL: pipmaster is not installed. Please install it using: pip install pipmaster")
             raise Exception("pipmaster not found")
-        pm_v = pm.PackageManager(venv_path=str(self.venv_dir))
         
+        try:
+            # Use pipmaster's new portable Python version feature to ensure Python 3.10
+            ASCIIColors.info(f"Bootstrapping portable Python {self.target_python_version}...")
+            pm_instance = pm.get_pip_manager_for_version(
+                self.target_python_version, 
+                str(self.venv_dir)
+            )
+            
+            ASCIIColors.green(f"Portable Python {self.target_python_version} ready.")
+            ASCIIColors.info(f"Using interpreter: {pm_instance.target_python_executable}")
+            
+        except RuntimeError as e:
+            ASCIIColors.error(f"Failed to bootstrap portable Python {self.target_python_version}: {e}")
+            raise Exception(f"XTTS requires Python {self.target_python_version} but setup failed")
+        
+        # Install server dependencies
         requirements_file = self.server_dir / "requirements.txt"
         
         ASCIIColors.info("Installing server dependencies from requirements.txt...")
-        success = pm_v.ensure_requirements(str(requirements_file), verbose=True)
+        success = pm_instance.ensure_requirements(str(requirements_file), verbose=True)
 
         if not success:
             ASCIIColors.error("Failed to install server dependencies. Please check the console output for errors.")
             raise RuntimeError("XTTS server dependency installation failed.")
 
         ASCIIColors.green("Server dependencies are satisfied.")
+        
+        # Store the Python executable path for later use
+        self._python_executable = pm_instance.target_python_executable
 
 
     def start_server(self):
@@ -121,14 +143,25 @@ class XTTSClientBinding(LollmsTTSBinding):
 
         if not self.venv_dir.exists():
             self.install_server_dependencies()
-
-        if sys.platform == "win32":
-            python_executable = self.venv_dir / "Scripts" / "python.exe"
         else:
-            python_executable = self.venv_dir / "bin" / "python"
+            # Venv exists, get the Python executable path
+            try:
+                import pipmaster as pm
+                pm_instance = pm.get_pip_manager_for_version(
+                    self.target_python_version, 
+                    str(self.venv_dir)
+                )
+                self._python_executable = pm_instance.target_python_executable
+            except Exception as e:
+                ASCIIColors.warning(f"Could not verify Python version: {e}")
+                # Fallback to traditional path detection
+                if sys.platform == "win32":
+                    self._python_executable = str(self.venv_dir / "Scripts" / "python.exe")
+                else:
+                    self._python_executable = str(self.venv_dir / "bin" / "python")
 
         command = [
-            str(python_executable),
+            str(self._python_executable),
             str(server_script),
             "--host", self.host,
             "--port", str(self.port)

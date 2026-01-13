@@ -7,6 +7,7 @@ import time
 import json
 from io import BytesIO
 from pathlib import Path
+from ascii_colors import trace_exception
 from typing import Optional, List, Dict, Any, Union, Callable
 
 # Ensure pipmaster is available.
@@ -526,38 +527,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             success, ``False`` otherwise.  ``message`` contains a short
             description or the error that occurred.
         """
-        requirements_path = Path(__file__).parent / "requirements.txt"
-
-        if not requirements_path.is_file():
-            return {
-                "status": False,
-                "message": f"requirements.txt not found at {requirements_path}"
-            }
-
-        cmd = [sys.executable, "-m", "pip", "install", "-r", str(requirements_path)]
-
         try:
-            ASCIIColors.cyan(
-                f"Re‑installing dependencies from {requirements_path} …"
-            )
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-            # Log pip output – useful for debugging
-            if result.stdout:
-                ASCIIColors.info("pip stdout:\n" + result.stdout)
-            if result.stderr:
-                ASCIIColors.warning("pip stderr:\n" + result.stderr)
-
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"pip exited with code {result.returncode}"
-                )
-
+            self.install_server_dependencies()
             return {
                 "status": True,
                 "message": "Dependencies reinstalled successfully.",

@@ -42,6 +42,18 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-01-13 01:38]
+
+- chore(release): update changelog and bump pipmaster
+
+## [2026-01-13 00:30]
+
+- feat(xtts): add Python 3.10 support and portable env
+
+## [2026-01-12 23:16]
+
+- feat(xtts): add Python 3.10 support and portable env
+
 ## [2026-01-12 23:15]
 
 - feat(diffusers): add reinstall command and extra deps
