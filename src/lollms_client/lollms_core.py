@@ -66,11 +66,14 @@ class LollmsClient():
                  mcp_binding_config: Optional[Dict[str, any]] = None,
                  user_name ="user",
                  ai_name = "assistant",
+                 callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
                  **kwargs
                  ):
         """
         Initialize the LollmsClient with LLM and optional modality bindings.
         """
+        if callback: callback("🚀 Initializing **Lollms Client**...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
+        
         self.llm_binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
         self.tts_binding_manager = LollmsTTSBindingManager(tts_bindings_dir)
         self.tti_binding_manager = LollmsTTIBindingManager(tti_bindings_dir)
@@ -92,6 +95,7 @@ class LollmsClient():
         self.ai_name = ai_name
 
         if llm_binding_name:
+            if callback: callback(f"🤖 Initializing **LLM** binding: `{llm_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             config = llm_binding_config or {}
             config['user_name'] = self.user_name
             config['ai_name'] = self.ai_name
@@ -100,55 +104,103 @@ class LollmsClient():
                 **{k: v for k, v in config.items() if k != "binding_name"}
             )
             if self.llm is None:
-                ASCIIColors.warning(f"Failed to create LLM binding: {llm_binding_name}.")
+                msg = f"Failed to create LLM binding: {llm_binding_name}."
+                if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
+                ASCIIColors.warning(msg)
+            elif callback:
+                callback(f"✅ **LLM** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
 
         if tts_binding_name:
+            if callback: callback(f"🗣️ Initializing **TTS** binding: `{tts_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
                 self.tts = self.tts_binding_manager.create_binding(binding_name=tts_binding_name, **(tts_binding_config or {}))
-                if self.tts is None: ASCIIColors.warning(f"Failed to create TTS binding: {tts_binding_name}")
+                if self.tts is None: 
+                    msg = f"Failed to create TTS binding: {tts_binding_name}"
+                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
+                    ASCIIColors.warning(msg)
+                elif callback:
+                    callback(f"✅ **TTS** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             except Exception as e:
                 trace_exception(e)
                 self.tts = None
+                if callback: callback(f"❌ Error initializing TTS: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
 
         if tti_binding_name:
+            if callback: callback(f"🎨 Initializing **TTI** binding: `{tti_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
                 self.tti = self.tti_binding_manager.create_binding(binding_name=tti_binding_name, **(tti_binding_config or {}))
-                if self.tti is None: ASCIIColors.warning(f"Failed to create TTI binding: {tti_binding_name}")
+                if self.tti is None: 
+                    msg = f"Failed to create TTI binding: {tti_binding_name}"
+                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
+                    ASCIIColors.warning(msg)
+                elif callback:
+                    callback(f"✅ **TTI** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             except Exception as e:
                 trace_exception(e)
                 self.tti = None
+                if callback: callback(f"❌ Error initializing TTI: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
                 
         if stt_binding_name:
+            if callback: callback(f"👂 Initializing **STT** binding: `{stt_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
                 self.stt = self.stt_binding_manager.create_binding(binding_name=stt_binding_name, **(stt_binding_config or {}))
-                if self.stt is None: ASCIIColors.warning(f"Failed to create STT binding: {stt_binding_name}")
+                if self.stt is None: 
+                    msg = f"Failed to create STT binding: {stt_binding_name}"
+                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
+                    ASCIIColors.warning(msg)
+                elif callback:
+                    callback(f"✅ **STT** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             except Exception as e:
                 trace_exception(e)
                 self.stt = None
+                if callback: callback(f"❌ Error initializing STT: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
                 
         if ttv_binding_name:
+            if callback: callback(f"🎬 Initializing **TTV** binding: `{ttv_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
                 self.ttv = self.ttv_binding_manager.create_binding(binding_name=ttv_binding_name, **(ttv_binding_config or {}))
-                if self.ttv is None: ASCIIColors.warning(f"Failed to create TTV binding: {ttv_binding_name}")
+                if self.ttv is None: 
+                    msg = f"Failed to create TTV binding: {ttv_binding_name}"
+                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
+                    ASCIIColors.warning(msg)
+                elif callback:
+                    callback(f"✅ **TTV** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             except Exception as e:
                 trace_exception(e)
                 self.ttv = None
+                if callback: callback(f"❌ Error initializing TTV: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
 
         if ttm_binding_name:
+            if callback: callback(f"🎵 Initializing **TTM** binding: `{ttm_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
                 self.ttm = self.ttm_binding_manager.create_binding(binding_name=ttm_binding_name, **(ttm_binding_config or {}))
-                if self.ttm is None: ASCIIColors.warning(f"Failed to create TTM binding: {ttm_binding_name}")
+                if self.ttm is None: 
+                    msg = f"Failed to create TTM binding: {ttm_binding_name}"
+                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
+                    ASCIIColors.warning(msg)
+                elif callback:
+                    callback(f"✅ **TTM** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             except Exception as e:
                 trace_exception(e)
                 self.ttm = None
+                if callback: callback(f"❌ Error initializing TTM: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})
 
         if mcp_binding_name:
+            if callback: callback(f"🔌 Initializing **MCP** binding: `{mcp_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
                 self.mcp = self.mcp_binding_manager.create_binding(binding_name=mcp_binding_name, **(mcp_binding_config or {}))
-                if self.mcp is None: ASCIIColors.warning(f"Failed to create MCP binding: {mcp_binding_name}")
+                if self.mcp is None: 
+                    msg = f"Failed to create MCP binding: {mcp_binding_name}"
+                    if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})
+                    ASCIIColors.warning(msg)
+                elif callback:
+                    callback(f"✅ **MCP** binding ready.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             except Exception as e:
                 trace_exception(e)
-                self.mcp = None            
+                self.mcp = None  
+                if callback: callback(f"❌ Error initializing MCP: {e}", MSG_TYPE.MSG_TYPE_ERROR, {})   
+
+        if callback: callback("✨ **Lollms Client** Initialization Complete.", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})       
 
     # --- Properties delegating to LLM ---
     @property

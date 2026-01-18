@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-01-18 15:19]
+
+- refactor(lollms): update core and types enums
+
 ## [2026-01-13 01:38]
 
 - chore(release): update changelog and bump pipmaster

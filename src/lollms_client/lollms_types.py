@@ -46,6 +46,8 @@ class MSG_TYPE(Enum):
 
     MSG_TYPE_SOURCES_LIST           = 27# List of sources provided
 
+    MSG_TYPE_INIT_PROGRESS          = 28# Initialization progress
+
 
 class SENDER_TYPES(Enum):
     SENDER_TYPES_USER               = 0 # Sent by user
