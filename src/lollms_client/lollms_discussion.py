@@ -1210,49 +1210,10 @@ class LollmsDiscussion:
         remove_thinking_blocks:bool = True,
         **kwargs
     ) -> Dict[str, Any]:
-        """Main interaction method that can invoke the dynamic, multi-modal agent.
-
-        This method orchestrates the entire response generation process. It can
-        trigger a simple, direct chat with the language model, or it can invoke
-        the powerful `generate_with_mcp_rag` agent.
-
-        When an agentic turn is used, the agent's full reasoning process (the
-        `final_scratchpad`), tool calls, and any retrieved RAG sources are
-        automatically stored in the resulting AI message object for full persistence
-        and auditability. It also handles clarification requests from the agent.
-
-        Args:
-            user_message: The new message from the user.
-            personality: An optional LollmsPersonality to use for the response,
-                         which can influence system prompts and other behaviors.
-            use_mcps: Controls MCP tool usage for the agent. Can be None (disabled),
-                      True (all tools), or a list of specific tool names.
-            use_data_store: Controls RAG usage for the agent. A dictionary mapping
-                            store names to their query callables.
-            add_user_message: If True, a new user message is created from the prompt.
-                              If False, it assumes regeneration on the current active
-                              user message.
-            max_reasoning_steps: The maximum number of reasoning cycles for the agent
-                                 before it must provide a final answer.
-            images: A list of base64-encoded images provided by the user, which will
-                    be passed to the agent or a multi-modal LLM.
-            debug: If True, prints full prompts and raw AI responses to the console.
-            remove_thinking_blocks: If True, removes any thinking blocks from the final
-                                   response content, cleaning it up for user display.
-            branch_tip_id: If provided, this is the ID of the message to use as the
-                           starting point for the branch. If None, uses the current
-                           active branch tip.
-            **kwargs: Additional keyword arguments passed to the underlying generation
-                      methods, such as 'streaming_callback'.
-
-        Returns:
-            A dictionary with 'user_message' and 'ai_message' LollmsMessage objects,
-            where the 'ai_message' will contain rich metadata if an agentic turn was used.
-        """
+        """Main interaction method that can invoke the dynamic, multi-modal agent."""
         callback = kwargs.get("streaming_callback")
         collected_sources = []
         
-
         # Step 1: Add user message, now including any images.
         if add_user_message:
             user_msg = self.add_message(
@@ -1263,9 +1224,7 @@ class LollmsDiscussion:
                 **kwargs
             )
         else: # Regeneration logic
-            # _validate_and_set_active_branch ensures active_branch_id is valid and a leaf.
-            # So, if we are regenerating, active_branch_id must be valid.
-            if self.active_branch_id not in self._message_index: # Redundant check, but safe
+            if self.active_branch_id not in self._message_index:
                  raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
             user_msg_orm = self._message_index[self.active_branch_id]
             if user_msg_orm.sender_type != 'user':
@@ -1273,8 +1232,6 @@ class LollmsDiscussion:
                 if user_msg_orm and user_msg_orm.sender_type != 'user':
                     raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
             user_msg = LollmsMessage(self, user_msg_orm)
-            # FIX: Use get_active_images() to ensure we get a list of strings, not potentially objects/dicts.
-            # This prevents errors if the underlying 'images' field contains new-style structured data.
             images = user_msg.get_active_images()
                     
         # extract personality data
@@ -1295,23 +1252,24 @@ class LollmsDiscussion:
                     # --- Dynamic Data Source ---
                     qg_id = None
                     if callback:
-                        qg_id = callback("Generating query for dynamic personality data...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_query_gen"})
+                        qg_id = callback("Generating optimized search query...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_query_gen"})
 
                     context_for_query = self.export('markdown', suppress_system_prompt=True)
                     query_prompt = (
-                        "You are an expert query generator. Based on the current conversation, formulate a concise and specific query to retrieve relevant information from a knowledge base. "
-                        "The query will be used to fetch data that will help you answer the user's latest request.\n\n"
+                        "You are a fast, expert query generator. Based on the conversation history, formulate a single, specific search query to retrieve facts needed to answer the user's latest request.\n\n"
                         f"--- Conversation History ---\n{context_for_query}\n\n"
                         "--- Instructions ---\n"
-                        "Generate a single query string."
+                        "Return ONLY the JSON. Do not explain."
                     )
                     
                     try:
+                        # Optimization: specific schema, low temp, limited tokens for speed
                         query_json = self.lollmsClient.generate_structured_content(
                             prompt=query_prompt,
-                            schema={"query": "Your generated search query here."},
-                            system_prompt="You are an AI assistant that generates search queries in JSON format.",
-                            temperature=0.0
+                            schema={"query": "Your concise search query string."},
+                            system_prompt="Output only JSON.",
+                            temperature=0.1,
+                            n_predict=50 # Force brevity
                         )
 
                         if not query_json or "query" not in query_json:
@@ -1320,28 +1278,40 @@ class LollmsDiscussion:
                         else:
                             generated_query = query_json["query"]
                             if callback:
-                                callback(f"Generated query: '{generated_query}'", MSG_TYPE.MSG_TYPE_STEP_END, {"id": qg_id, "query": generated_query})
+                                callback(f"Query generated: '{generated_query}'", MSG_TYPE.MSG_TYPE_STEP_END, {"id": qg_id, "query": generated_query})
                             
                             dr_id = None
                             if callback:
-                                dr_id = callback("Retrieving dynamic data from personality source...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_retrieval"})
+                                dr_id = callback(f"Searching knowledge base for '{generated_query}'...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_retrieval"})
                             
                             try:
                                 retrieved_data = personality.data_source(generated_query)
-                                if callback:
-                                    callback(f"Retrieved data successfully.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id, "data_snippet": retrieved_data[:200]})
                                 
+                                # Optimization: Better status reporting on retrieval size
+                                data_len = len(retrieved_data) if retrieved_data else 0
+                                snippet_msg = f"Found {data_len} chars of context."
+                                
+                                if callback:
+                                    callback(snippet_msg, MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id, "data_snippet": retrieved_data[:200] if retrieved_data else ""})
                                 
                                 if retrieved_data:
-                                    self.personality_data_zone = retrieved_data.strip()
+                                    # Append explicit instructions to use citations
+                                    citation_instruction = "\n\nIMPORTANT: You have access to the following retrieved data. You must cite your sources in the text using format [1], [2], etc., corresponding to the provided source list."
+                                    self.personality_data_zone = retrieved_data.strip() + citation_instruction
+                                    
+                                    # Create source item metadata
                                     source_item = {
-                                        "title": "Personality Data Source",
+                                        "title": "RAG Context",
                                         "content": retrieved_data,
-                                        "source": personality.name if hasattr(personality, 'name') else "Personality",
-                                        "query": generated_query
+                                        "source": personality.name if hasattr(personality, 'name') else "Personality Knowledge Base",
+                                        "query": generated_query,
+                                        "index": 1 # Explicit index for citation reference
                                     }
                                     collected_sources.append(source_item)
+                                    
                                     if callback:
+                                        # Notify user about the specific source found
+                                        callback(f"Attached 1 source from {personality.name} RAG.", MSG_TYPE.MSG_TYPE_INFO)
                                         callback([source_item], MSG_TYPE.MSG_TYPE_SOURCES_LIST)
 
                             except Exception as e:
@@ -1378,10 +1348,9 @@ class LollmsDiscussion:
             if debug:
                 ASCIIColors.cyan("\n" + "="*50 + "\n--- DEBUG: AGENTIC TURN TRIGGERED ---\n" + f"--- PROMPT FOR AGENT (from discussion history) ---\n{prompt_for_agent}\n" + "="*50 + "\n")
             
-            
             # Combine system prompt and data zones
             system_prompt_part = (self._system_prompt or "").strip()
-            data_zone_part = self.get_full_data_zone() # This now returns a clean, multi-part block or an empty string
+            data_zone_part = self.get_full_data_zone() 
             full_system_prompt = ""
 
             # Combine them intelligently
@@ -1391,6 +1360,7 @@ class LollmsDiscussion:
                 full_system_prompt = system_prompt_part
             else:
                 full_system_prompt = data_zone_part
+            
             agent_result = self.lollmsClient.generate_with_mcp_rag(
                 prompt=prompt_for_agent,
                 use_mcps=effective_use_mcps,
