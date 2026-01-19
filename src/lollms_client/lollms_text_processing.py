@@ -1323,6 +1323,7 @@ Important:
 - Ensure the JSON is COMPLETE - close all arrays and objects properly"""
         
         final_system_prompt = f"{system_prompt}\n\n{base_system}" if system_prompt else base_system
+        kwargs["ctx_size"] = kwargs.get("ctx_size", self.llm.default_ctx_size)
         
         # Attempt generation with retries
         for attempt in range(max_retries):
