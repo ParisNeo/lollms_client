@@ -1207,7 +1207,7 @@ class LollmsDiscussion:
         max_reasoning_steps: int = 20,
         images: Optional[List[str]] = None,
         debug: bool = False,
-        remove_thinking_blocks: bool = True,
+        remove_thinking_blocks: bool = False,
         use_rlm: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
