@@ -1207,30 +1207,52 @@ class LollmsDiscussion:
         max_reasoning_steps: int = 20,
         images: Optional[List[str]] = None,
         debug: bool = False,
-        remove_thinking_blocks:bool = True,
+        remove_thinking_blocks: bool = True,
+        use_rlm: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
-        """Main interaction method that can invoke the dynamic, multi-modal agent."""
+        """
+        Main interaction method that can invoke the dynamic, multi-modal agent.
+        Supports Recursive Language Model (RLM) execution and robust RAG score normalization.
+        """
         callback = kwargs.get("streaming_callback")
         collected_sources = []
         
-        # Step 1: Add user message, now including any images.
+        # --- RLM Pre-processing: Context Offloading ---
+        rlm_context_var_name = "USER_INPUT_CONTEXT"
+        actual_user_content_for_llm = user_message
+        
+        if use_rlm:
+            if callback:
+                callback("Initializing Recursive Language Model Environment...", MSG_TYPE.MSG_TYPE_INFO)
+            
+            preview_length = 500
+            if len(user_message) > preview_length:
+                actual_user_content_for_llm = (
+                    f"<RLM_STUB>\n"
+                    f"The user has provided a large input ({len(user_message)} chars).\n"
+                    f"It has been loaded into your Python environment as the string variable `{rlm_context_var_name}`.\n"
+                    f"PREVIEW: {user_message[:preview_length]}...\n"
+                    f"</RLM_STUB>\n"
+                    f"DO NOT guess the content. Use python code to read `{rlm_context_var_name}`."
+                )
+
+        # Step 1: Add user message
         if add_user_message:
             user_msg = self.add_message(
                 sender=kwargs.get("user_name", "user"), 
                 sender_type="user", 
-                content=user_message,
+                content=actual_user_content_for_llm, 
                 images=images,
                 **kwargs
             )
+            if use_rlm:
+                user_msg.metadata["rlm_full_content"] = user_message
+                user_msg.save()
         else: # Regeneration logic
             if self.active_branch_id not in self._message_index:
                  raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
             user_msg_orm = self._message_index[self.active_branch_id]
-            if user_msg_orm.sender_type != 'user':
-                user_msg_orm = self._message_index.get(user_msg_orm.parent_id)
-                if user_msg_orm and user_msg_orm.sender_type != 'user':
-                    raise ValueError(f"Regeneration failed: active branch tip is a '{user_msg_orm.sender_type}' message, not 'user'.")
             user_msg = LollmsMessage(self, user_msg_orm)
             images = user_msg.get_active_images()
                     
@@ -1238,7 +1260,7 @@ class LollmsDiscussion:
         if personality is not None:
             object.__setattr__(self, '_system_prompt', personality.system_prompt)
 
-            # --- New Data Source Handling Logic ---
+            # --- Data Source Handling with Score Normalization ---
             if hasattr(personality, 'data_source') and personality.data_source is not None:
 
                 if isinstance(personality.data_source, str):
@@ -1255,21 +1277,23 @@ class LollmsDiscussion:
                         qg_id = callback("Generating optimized search query...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_query_gen"})
 
                     context_for_query = self.export('markdown', suppress_system_prompt=True)
+                    # Constraint added via text prompt instead of n_predict to ensure valid JSON
                     query_prompt = (
-                        "You are a fast, expert query generator. Based on the conversation history, formulate a single, specific search query to retrieve facts needed to answer the user's latest request.\n\n"
+                        "You are a fast, expert query generator. Based on the conversation history, formulate a single, VERY CONCISE search query to retrieve facts needed to answer the user's latest request.\n\n"
                         f"--- Conversation History ---\n{context_for_query}\n\n"
                         "--- Instructions ---\n"
-                        "Return ONLY the JSON. Do not explain."
+                        "1. Return ONLY the JSON object.\n"
+                        "2. Keep the query under 10 words.\n"
+                        "3. Do not explain."
                     )
                     
                     try:
-                        # Optimization: specific schema, low temp, limited tokens for speed
                         query_json = self.lollmsClient.generate_structured_content(
                             prompt=query_prompt,
                             schema={"query": "Your concise search query string."},
                             system_prompt="Output only JSON.",
-                            temperature=0.1,
-                            n_predict=512 # Force brevity
+                            temperature=0.1
+                            # n_predict removed to prevent JSON breakage
                         )
 
                         if not query_json or "query" not in query_json:
@@ -1287,32 +1311,58 @@ class LollmsDiscussion:
                             try:
                                 retrieved_data = personality.data_source(generated_query)
                                 
-                                # Optimization: Better status reporting on retrieval size
-                                data_len = len(retrieved_data) if retrieved_data else 0
-                                snippet_msg = f"Found {data_len} chars of context."
+                                # --- SCORE NORMALIZATION & FORMATTING ---
+                                formatted_data_zone = ""
                                 
-                                if callback:
-                                    callback(snippet_msg, MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id, "data_snippet": retrieved_data[:200] if retrieved_data else ""})
-                                
-                                if retrieved_data:
-                                    # Append explicit instructions to use citations
-                                    citation_instruction = "\n\nIMPORTANT: You have access to the following retrieved data. You must cite your sources in the text using format [1], [2], etc., corresponding to the provided source list."
-                                    self.personality_data_zone = retrieved_data.strip() + citation_instruction
-                                    
-                                    # Create source item metadata
-                                    source_item = {
-                                        "title": "RAG Context",
-                                        "content": retrieved_data,
-                                        "source": personality.name if hasattr(personality, 'name') else "Personality Knowledge Base",
-                                        "query": generated_query,
-                                        "index": 1 # Explicit index for citation reference
-                                    }
-                                    collected_sources.append(source_item)
-                                    
+                                if isinstance(retrieved_data, list):
+                                    # Handle list of chunks (common RAG output)
+                                    for idx, chunk in enumerate(retrieved_data):
+                                        # Normalize Score
+                                        score = chunk.get('score', chunk.get('value', 0.0))
+                                        
+                                        # Fix: Clamp scores > 1.0 (assuming they are unnormalized distances or 0-100 scale)
+                                        if score > 1.0:
+                                            # If score is massive (e.g. 7000), it's likely a raw distance or weird metric.
+                                            # We cap it at 1.0 for the UI to display 100% max.
+                                            # Alternatively, if it looks like 0-100, divide by 100.
+                                            if score > 100.0: 
+                                                score = 1.0 
+                                            else:
+                                                score = score / 100.0
+                                        
+                                        # Write back normalized score for UI
+                                        chunk['score'] = score
+                                        
+                                        # Build content for LLM
+                                        content = chunk.get('content', chunk.get('text', str(chunk)))
+                                        source_name = chunk.get('source', 'Unknown Source')
+                                        formatted_data_zone += f"Source [{idx+1}] ({source_name}):\n{content}\n\n"
+                                        
+                                        # Create metadata for UI
+                                        source_item = {
+                                            "title": f"Rank {idx+1}: {source_name}",
+                                            "content": content,
+                                            "source": source_name,
+                                            "query": generated_query,
+                                            "relevance_score": score, # Normalized
+                                            "index": idx+1
+                                        }
+                                        collected_sources.append(source_item)
+                                        
                                     if callback:
-                                        # Notify user about the specific source found
-                                        callback(f"Attached 1 source from {personality.name} RAG.", MSG_TYPE.MSG_TYPE_INFO)
-                                        callback([source_item], MSG_TYPE.MSG_TYPE_SOURCES_LIST)
+                                        callback(f"Found {len(retrieved_data)} relevant chunks.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id})
+                                        # Send full list to callback for UI rendering
+                                        callback(collected_sources, MSG_TYPE.MSG_TYPE_SOURCES_LIST)
+
+                                else:
+                                    # Handle single string return
+                                    formatted_data_zone = str(retrieved_data)
+                                    if callback:
+                                        callback(f"Retrieved {len(formatted_data_zone)} chars of context.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id})
+
+                                if formatted_data_zone:
+                                    citation_instruction = "\n\nIMPORTANT: Use the retrieved data above. Cite sources as [1], [2], etc."
+                                    self.personality_data_zone = formatted_data_zone.strip() + citation_instruction
 
                             except Exception as e:
                                 trace_exception(e)
@@ -1323,7 +1373,7 @@ class LollmsDiscussion:
                         if callback:
                             callback(f"An error occurred during query generation: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": qg_id})
 
-        # Determine effective MCPs by combining personality defaults and turn-specific overrides
+        # Determine effective MCPs
         effective_use_mcps = use_mcps
         if personality and hasattr(personality, 'active_mcps') and personality.active_mcps:
             if effective_use_mcps in [None, False]:
@@ -1331,10 +1381,22 @@ class LollmsDiscussion:
             elif isinstance(effective_use_mcps, list):
                 effective_use_mcps = list(set(effective_use_mcps + personality.active_mcps))
             
+        # --- RLM Tool Enforcement ---
+        if use_rlm:
+            rlm_tools = ["python_interpreter"] 
+            if effective_use_mcps is None or effective_use_mcps is False:
+                effective_use_mcps = rlm_tools
+            elif isinstance(effective_use_mcps, list):
+                for tool in rlm_tools:
+                    if tool not in effective_use_mcps:
+                        effective_use_mcps.append(tool)
+
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
 
-        is_agentic_turn = (effective_use_mcps is not None and effective_use_mcps) or (use_data_store is not None and use_data_store)
+        is_agentic_turn = (effective_use_mcps is not None and effective_use_mcps) or \
+                          (use_data_store is not None and use_data_store) or \
+                          use_rlm 
         
         start_time = datetime.now()
         
@@ -1345,22 +1407,37 @@ class LollmsDiscussion:
 
         if is_agentic_turn:
             prompt_for_agent = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id, suppress_system_prompt=True)
-            if debug:
-                ASCIIColors.cyan("\n" + "="*50 + "\n--- DEBUG: AGENTIC TURN TRIGGERED ---\n" + f"--- PROMPT FOR AGENT (from discussion history) ---\n{prompt_for_agent}\n" + "="*50 + "\n")
             
-            # Combine system prompt and data zones
+            # --- RLM System Prompt Injection ---
             system_prompt_part = (self._system_prompt or "").strip()
             data_zone_part = self.get_full_data_zone() 
-            full_system_prompt = ""
+            
+            if use_rlm:
+                rlm_instructions = (
+                    "\n\n### RECURSIVE LANGUAGE MODEL PROTOCOL ACTIVATED\n"
+                    "You are operating as a Recursive Language Model (RLM). "
+                    "The user's input is TOO LARGE for your context window and is stored in the "
+                    f"Python variable `{rlm_context_var_name}`.\n"
+                    "1. DO NOT assume you know the full content.\n"
+                    f"2. USE Python to read chunks of `{rlm_context_var_name}` to gather information.\n"
+                    "3. Decompose the user's request into sub-problems if necessary.\n"
+                    "4. Solve the problem by iterating through code execution and analysis.\n"
+                )
+                system_prompt_part += rlm_instructions
 
-            # Combine them intelligently
+            full_system_prompt = ""
             if system_prompt_part and data_zone_part:
                 full_system_prompt = f"{system_prompt_part}\n\n{data_zone_part}"
             elif system_prompt_part:
                 full_system_prompt = system_prompt_part
             else:
                 full_system_prompt = data_zone_part
-            
+
+            # Pass the RLM context variable to the generator's scope
+            generation_kwargs = kwargs.copy()
+            if use_rlm:
+                generation_kwargs["python_context"] = {rlm_context_var_name: user_message}
+
             agent_result = self.lollmsClient.generate_with_mcp_rag(
                 prompt=prompt_for_agent,
                 use_mcps=effective_use_mcps,
@@ -1369,21 +1446,14 @@ class LollmsDiscussion:
                 images=images,
                 system_prompt = full_system_prompt,
                 debug=debug,
-                **kwargs
+                **generation_kwargs 
             )
             final_content = agent_result.get("final_answer", "The agent did not produce a final answer.")
             final_scratchpad = agent_result.get("final_scratchpad", "")
             final_raw_response = json.dumps(agent_result, indent=2)
         else:
-            if debug:
-                prompt_for_chat = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id)
-                ASCIIColors.cyan("\n" + "="*50 + f"\n--- DEBUG: SIMPLE CHAT PROMPT ---\n{prompt_for_chat}\n" + "="*50 + "\n")
-
             final_raw_response = self.lollmsClient.chat(self, images=images, branch_tip_id=branch_tip_id, **kwargs) or ""
             
-            if debug:
-                ASCIIColors.cyan("\n" + "="*50 + f"\n--- DEBUG: RAW SIMPLE CHAT RESPONSE ---\n{final_raw_response}\n" + "="*50 + "\n")
-
             if isinstance(final_raw_response, dict) and final_raw_response.get("status") == "error":
                 raise Exception(final_raw_response.get("message", "Unknown error from lollmsClient.chat"))
             else:
