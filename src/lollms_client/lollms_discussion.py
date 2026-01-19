@@ -1309,7 +1309,7 @@ class LollmsDiscussion:
                     try:
                         query_json = self.lollmsClient.generate_structured_content(
                             prompt=query_prompt,
-                            output_format={"query": "Your generated search query here."},
+                            schema={"query": "Your generated search query here."},
                             system_prompt="You are an AI assistant that generates search queries in JSON format.",
                             temperature=0.0
                         )
