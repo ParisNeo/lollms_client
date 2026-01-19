@@ -1269,7 +1269,7 @@ class LollmsDiscussion:
                             schema={"query": "Your concise search query string."},
                             system_prompt="Output only JSON.",
                             temperature=0.1,
-                            n_predict=50 # Force brevity
+                            n_predict=512 # Force brevity
                         )
 
                         if not query_json or "query" not in query_json:
