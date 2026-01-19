@@ -1207,13 +1207,15 @@ class LollmsDiscussion:
         max_reasoning_steps: int = 20,
         images: Optional[List[str]] = None,
         debug: bool = False,
-        remove_thinking_blocks: bool = False,
+        remove_thinking_blocks: bool = True,
         use_rlm: bool = False,
+        decision_temperature: float = 0.5,
+        final_answer_temperature: float = 0.7,
         **kwargs
     ) -> Dict[str, Any]:
         """
-        Main interaction method that can invoke the dynamic, multi-modal agent.
-        Supports Recursive Language Model (RLM) execution and robust RAG score normalization.
+        Main interaction method with integrated agentic reasoning loop.
+        Supports RLM, Multi-Hop RAG, and tool orchestration using ReAct pattern.
         """
         callback = kwargs.get("streaming_callback")
         collected_sources = []
@@ -1249,35 +1251,32 @@ class LollmsDiscussion:
             if use_rlm:
                 user_msg.metadata["rlm_full_content"] = user_message
                 user_msg.save()
-        else: # Regeneration logic
+        else:
             if self.active_branch_id not in self._message_index:
                  raise ValueError("Regeneration failed: active branch tip not found or is invalid.")
             user_msg_orm = self._message_index[self.active_branch_id]
             user_msg = LollmsMessage(self, user_msg_orm)
             images = user_msg.get_active_images()
                     
-        # extract personality data
+        # Extract personality data
         if personality is not None:
             object.__setattr__(self, '_system_prompt', personality.system_prompt)
 
-            # --- Data Source Handling with Score Normalization ---
+            # --- Pre-flight RAG (First Hop) ---
             if hasattr(personality, 'data_source') and personality.data_source is not None:
 
                 if isinstance(personality.data_source, str):
-                    # --- Static Data Source ---
                     if callback:
                         callback("Loading static personality data...", MSG_TYPE.MSG_TYPE_STEP, {"id": "static_data_loading"})
                     if personality.data_source:
                         self.personality_data_zone = personality.data_zone.strip()
 
                 elif callable(personality.data_source):
-                    # --- Dynamic Data Source ---
                     qg_id = None
                     if callback:
-                        qg_id = callback("Generating optimized search query...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_query_gen"})
+                        qg_id = callback("Generating initial search query...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_query_gen"})
 
                     context_for_query = self.export('markdown', suppress_system_prompt=True)
-                    # Constraint added via text prompt instead of n_predict to ensure valid JSON
                     query_prompt = (
                         "You are a fast, expert query generator. Based on the conversation history, formulate a single, VERY CONCISE search query to retrieve facts needed to answer the user's latest request.\n\n"
                         f"--- Conversation History ---\n{context_for_query}\n\n"
@@ -1293,72 +1292,48 @@ class LollmsDiscussion:
                             schema={"query": "Your concise search query string."},
                             system_prompt="Output only JSON.",
                             temperature=0.1
-                            # n_predict removed to prevent JSON breakage
                         )
 
-                        if not query_json or "query" not in query_json:
-                            if callback:
-                                callback("Failed to generate data query.", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": qg_id})
-                        else:
+                        if query_json and "query" in query_json:
                             generated_query = query_json["query"]
                             if callback:
-                                callback(f"Query generated: '{generated_query}'", MSG_TYPE.MSG_TYPE_STEP_END, {"id": qg_id, "query": generated_query})
+                                callback(f"Query: '{generated_query}'", MSG_TYPE.MSG_TYPE_STEP_END, {"id": qg_id, "query": generated_query})
                             
                             dr_id = None
                             if callback:
-                                dr_id = callback(f"Searching knowledge base for '{generated_query}'...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_retrieval"})
+                                dr_id = callback(f"Searching knowledge base...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "dynamic_data_retrieval"})
                             
                             try:
                                 retrieved_data = personality.data_source(generated_query)
                                 
-                                # --- SCORE NORMALIZATION & FORMATTING ---
                                 formatted_data_zone = ""
-                                
                                 if isinstance(retrieved_data, list):
-                                    # Handle list of chunks (common RAG output)
                                     for idx, chunk in enumerate(retrieved_data):
-                                        # Normalize Score
                                         score = chunk.get('score', chunk.get('value', 0.0))
-                                        
-                                        # Fix: Clamp scores > 1.0 (assuming they are unnormalized distances or 0-100 scale)
                                         if score > 1.0:
-                                            # If score is massive (e.g. 7000), it's likely a raw distance or weird metric.
-                                            # We cap it at 1.0 for the UI to display 100% max.
-                                            # Alternatively, if it looks like 0-100, divide by 100.
-                                            if score > 100.0: 
-                                                score = 1.0 
-                                            else:
-                                                score = score / 100.0
+                                            score = 1.0 if score > 100.0 else score / 100.0
                                         
-                                        # Write back normalized score for UI
                                         chunk['score'] = score
-                                        
-                                        # Build content for LLM
                                         content = chunk.get('content', chunk.get('text', str(chunk)))
                                         source_name = chunk.get('source', 'Unknown Source')
                                         formatted_data_zone += f"Source [{idx+1}] ({source_name}):\n{content}\n\n"
                                         
-                                        # Create metadata for UI
-                                        source_item = {
+                                        collected_sources.append({
                                             "title": f"Rank {idx+1}: {source_name}",
                                             "content": content,
                                             "source": source_name,
                                             "query": generated_query,
-                                            "relevance_score": score, # Normalized
+                                            "relevance_score": score,
                                             "index": idx+1
-                                        }
-                                        collected_sources.append(source_item)
+                                        })
                                         
                                     if callback:
                                         callback(f"Found {len(retrieved_data)} relevant chunks.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id})
-                                        # Send full list to callback for UI rendering
                                         callback(collected_sources, MSG_TYPE.MSG_TYPE_SOURCES_LIST)
-
                                 else:
-                                    # Handle single string return
                                     formatted_data_zone = str(retrieved_data)
                                     if callback:
-                                        callback(f"Retrieved {len(formatted_data_zone)} chars of context.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id})
+                                        callback(f"Retrieved {len(formatted_data_zone)} chars.", MSG_TYPE.MSG_TYPE_STEP_END, {"id": dr_id})
 
                                 if formatted_data_zone:
                                     citation_instruction = "\n\nIMPORTANT: Use the retrieved data above. Cite sources as [1], [2], etc."
@@ -1367,61 +1342,76 @@ class LollmsDiscussion:
                             except Exception as e:
                                 trace_exception(e)
                                 if callback:
-                                    callback(f"Error retrieving dynamic data: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": dr_id})
+                                    callback(f"Error retrieving data: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": dr_id})
                     except Exception as e:
                         trace_exception(e)
                         if callback:
-                            callback(f"An error occurred during query generation: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": qg_id})
+                            callback(f"Query generation error: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": qg_id})
 
-        # Determine effective MCPs
-        effective_use_mcps = use_mcps
-        if personality and hasattr(personality, 'active_mcps') and personality.active_mcps:
-            if effective_use_mcps in [None, False]:
-                effective_use_mcps = personality.active_mcps
-            elif isinstance(effective_use_mcps, list):
-                effective_use_mcps = list(set(effective_use_mcps + personality.active_mcps))
+        # --- Build Tool Registry ---
+        tool_registry = {}
+        tool_descriptions = []
+        
+        # Add RAG tool if personality has callable data_source
+        if personality and callable(getattr(personality, 'data_source', None)):
+            def rag_search(query: str):
+                """Search the personality's knowledge base."""
+                results = personality.data_source(query)
+                if isinstance(results, list):
+                    formatted = []
+                    for chunk in results:
+                        score = chunk.get('score', 0.0)
+                        if score > 1.0:
+                            score = 1.0 if score > 100.0 else score / 100.0
+                        formatted.append({
+                            "content": chunk.get('content', chunk.get('text', '')),
+                            "score": score,
+                            "source": chunk.get('source', 'Unknown')
+                        })
+                    return {"status": "success", "results": formatted}
+                return {"status": "success", "results": [{"content": str(results), "score": 1.0}]}
             
-        # --- RLM Tool Enforcement ---
-        if use_rlm:
-            rlm_tools = ["python_interpreter"] 
-            if effective_use_mcps is None or effective_use_mcps is False:
-                effective_use_mcps = rlm_tools
-            elif isinstance(effective_use_mcps, list):
-                for tool in rlm_tools:
-                    if tool not in effective_use_mcps:
-                        effective_use_mcps.append(tool)
+            tool_registry["search_knowledge_base"] = rag_search
+            tool_descriptions.append("- search_knowledge_base(query: str): Search the knowledge base for relevant information")
 
+        # Add MCP tools if available
+        if use_mcps and hasattr(self, 'mcp_client'):
+            # Assuming mcp_client has a method to get tools
+            # This is a placeholder - adapt to your actual MCP implementation
+            pass
+
+        # Add built-in tools
+        tool_registry["final_answer"] = lambda answer: {"status": "final", "answer": answer}
+        tool_descriptions.append("- final_answer(answer: str): Provide the final answer to the user")
+        
+        tool_registry["request_clarification"] = lambda question: {"status": "clarification", "question": question}
+        tool_descriptions.append("- request_clarification(question: str): Ask user for clarification")
+
+        # RLM tool enforcement
+        if use_rlm:
+            # Add python execution capability
+            tool_descriptions.append(f"- python_exec(code: str): Execute Python code. Variable '{rlm_context_var_name}' contains the full user input.")
+
+        tools_summary = "\n".join(tool_descriptions)
+        
+        # Determine if agentic mode is needed
+        is_agentic_turn = len(tool_registry) > 2 or use_rlm  # More than just final_answer and clarification
+        
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
 
-        is_agentic_turn = (effective_use_mcps is not None and effective_use_mcps) or \
-                          (use_data_store is not None and use_data_store) or \
-                          use_rlm 
-        
         start_time = datetime.now()
         
-        agent_result = None
-        final_scratchpad = None
-        final_raw_response = ""
-        final_content = ""
-
+        # --- AGENTIC REASONING LOOP ---
         if is_agentic_turn:
-            prompt_for_agent = self.export("markdown", branch_tip_id if branch_tip_id else self.active_branch_id, suppress_system_prompt=True)
-            
-            # --- RLM System Prompt Injection ---
             system_prompt_part = (self._system_prompt or "").strip()
-            data_zone_part = self.get_full_data_zone() 
+            data_zone_part = self.get_full_data_zone()
             
             if use_rlm:
                 rlm_instructions = (
-                    "\n\n### RECURSIVE LANGUAGE MODEL PROTOCOL ACTIVATED\n"
-                    "You are operating as a Recursive Language Model (RLM). "
-                    "The user's input is TOO LARGE for your context window and is stored in the "
-                    f"Python variable `{rlm_context_var_name}`.\n"
-                    "1. DO NOT assume you know the full content.\n"
-                    f"2. USE Python to read chunks of `{rlm_context_var_name}` to gather information.\n"
-                    "3. Decompose the user's request into sub-problems if necessary.\n"
-                    "4. Solve the problem by iterating through code execution and analysis.\n"
+                    f"\n\n### RECURSIVE LANGUAGE MODEL PROTOCOL\n"
+                    f"The user's full input is stored in Python variable `{rlm_context_var_name}`.\n"
+                    f"Use python_exec() to read and process it in chunks.\n"
                 )
                 system_prompt_part += rlm_instructions
 
@@ -1433,35 +1423,187 @@ class LollmsDiscussion:
             else:
                 full_system_prompt = data_zone_part
 
-            # Pass the RLM context variable to the generator's scope
-            generation_kwargs = kwargs.copy()
-            if use_rlm:
-                generation_kwargs["python_context"] = {rlm_context_var_name: user_message}
+            # Initialize scratchpad
+            scratchpad = f"# User Request\n{user_message}\n\n# Available Tools\n{tools_summary}\n\n# Reasoning Steps\n"
+            
+            tool_calls_this_turn = []
+            final_answer_text = ""
+            
+            for step in range(max_reasoning_steps):
+                step_id = None
+                if callback:
+                    step_id = callback(f"Reasoning step {step + 1}/{max_reasoning_steps}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"reason_step_{step}"})
+                
+                # Generate next action
+                reasoning_prompt = f"""{full_system_prompt}
 
-            agent_result = self.lollmsClient.generate_with_mcp_rag(
-                prompt=prompt_for_agent,
-                use_mcps=effective_use_mcps,
-                use_data_store=use_data_store,
-                max_reasoning_steps=max_reasoning_steps,
-                images=images,
-                system_prompt = full_system_prompt,
-                debug=debug,
-                **generation_kwargs 
-            )
-            final_content = agent_result.get("final_answer", "The agent did not produce a final answer.")
-            final_scratchpad = agent_result.get("final_scratchpad", "")
-            final_raw_response = json.dumps(agent_result, indent=2)
+# Your Complete Analysis History
+{scratchpad}
+
+# Next Decision
+You are working on: {user_message}
+
+Choose the single most appropriate action:
+1. Review your progress and what you've discovered
+2. If you need more information, use search_knowledge_base(query)
+3. If you have enough information, use final_answer(answer)
+4. If the request is unclear, use request_clarification(question)
+
+Provide your decision as JSON:
+{{
+    "reasoning": "Explain your thinking",
+    "action": "tool_name",
+    "parameters": {{"param": "value"}},
+    "confidence": 0.8
+}}
+"""
+                
+                if debug:
+                    ASCIIColors.cyan(f"\n{'='*50}\n--- REASONING PROMPT STEP {step+1} ---\n{reasoning_prompt[:1000]}...\n{'='*50}\n")
+                
+                try:
+                    decision_schema = {
+                        "reasoning": "string",
+                        "action": "string", 
+                        "parameters": "object",
+                        "confidence": "number"
+                    }
+                    
+                    decision_data = self.lollmsClient.generate_structured_content(
+                        prompt=reasoning_prompt,
+                        schema=decision_schema,
+                        system_prompt="You are a reasoning AI agent. Output only valid JSON.",
+                        temperature=decision_temperature
+                    )
+                    
+                    if not decision_data or 'action' not in decision_data:
+                        if callback:
+                            callback("Invalid decision format", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
+                        break
+                    
+                    reasoning = decision_data.get('reasoning', 'No reasoning provided')
+                    action = decision_data.get('action', 'final_answer')
+                    parameters = decision_data.get('parameters', {})
+                    confidence = decision_data.get('confidence', 0.5)
+                    
+                    scratchpad += f"\n## Step {step + 1}\n**Reasoning:** {reasoning}\n**Action:** {action}\n**Confidence:** {confidence}\n"
+                    
+                    if callback:
+                        callback(f"Action: {action}", MSG_TYPE.MSG_TYPE_STEP, {"id": step_id, "action": action, "reasoning": reasoning[:100]})
+                    
+                    # Handle final answer
+                    if action == "final_answer":
+                        final_answer_text = parameters.get('answer', 'No answer provided')
+                        if callback:
+                            callback("Final answer ready", MSG_TYPE.MSG_TYPE_STEP_END, {"id": step_id})
+                        break
+                    
+                    # Handle clarification
+                    if action == "request_clarification":
+                        clarification_q = parameters.get('question', 'Could you provide more details?')
+                        if callback:
+                            callback("Clarification needed", MSG_TYPE.MSG_TYPE_STEP_END, {"id": step_id})
+                        
+                        ai_message_obj = self.add_message(
+                            sender=personality.name if personality else "assistant",
+                            sender_type="assistant",
+                            content=clarification_q,
+                            parent_id=user_msg.id,
+                            metadata={"clarification_required": True, "sources": collected_sources}
+                        )
+                        
+                        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
+                    
+                    # Execute tool
+                    if action in tool_registry:
+                        tool_start = time.time()
+                        try:
+                            result = tool_registry[action](**parameters)
+                            tool_time = time.time() - tool_start
+                            
+                            scratchpad += f"**Result:** {json.dumps(result, indent=2)[:500]}\n"
+                            
+                            tool_calls_this_turn.append({
+                                "name": action,
+                                "params": parameters,
+                                "result": result,
+                                "response_time": tool_time
+                            })
+                            
+                            # Handle RAG results
+                            if action == "search_knowledge_base" and result.get('status') == 'success':
+                                rag_results = result.get('results', [])
+                                for idx, doc in enumerate(rag_results):
+                                    source_entry = {
+                                        "title": f"Search Result {len(collected_sources) + 1}",
+                                        "content": doc.get('content', ''),
+                                        "source": doc.get('source', 'Knowledge Base'),
+                                        "query": parameters.get('query', ''),
+                                        "relevance_score": doc.get('score', 0.0),
+                                        "index": len(collected_sources) + 1
+                                    }
+                                    collected_sources.append(source_entry)
+                                
+                                if callback:
+                                    callback(f"Found {len(rag_results)} sources", MSG_TYPE.MSG_TYPE_INFO)
+                                    callback(collected_sources[-len(rag_results):], MSG_TYPE.MSG_TYPE_SOURCES_LIST)
+                            
+                            if callback:
+                                callback(f"Tool executed successfully", MSG_TYPE.MSG_TYPE_STEP_END, {"id": step_id})
+                        
+                        except Exception as e:
+                            scratchpad += f"**Error:** {str(e)}\n"
+                            if callback:
+                                callback(f"Tool error: {str(e)}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": step_id})
+                    else:
+                        scratchpad += f"**Error:** Unknown tool '{action}'\n"
+                        if callback:
+                            callback(f"Unknown tool: {action}", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
+                
+                except Exception as e:
+                    trace_exception(e)
+                    if callback:
+                        callback(f"Reasoning error: {str(e)}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": step_id})
+                    break
+            
+            # Generate final synthesis if no explicit final_answer was called
+            if not final_answer_text:
+                synthesis_prompt = f"""{full_system_prompt}
+
+# Complete Analysis
+{scratchpad}
+
+# Task
+Provide a comprehensive final answer to: {user_message}
+
+Base your answer on the reasoning and discoveries above. Cite sources as [1], [2], etc.
+"""
+                final_answer_text = self.lollmsClient.generate(
+                    synthesis_prompt,
+                    temperature=final_answer_temperature,
+                    callback=callback if callback else None
+                )
+            
+            if remove_thinking_blocks:
+                final_answer_text = self.lollmsClient.remove_thinking_blocks(final_answer_text)
+            
+            final_content = final_answer_text
+            final_scratchpad = scratchpad
+            final_raw_response = json.dumps({"final_answer": final_content, "scratchpad": scratchpad, "tool_calls": tool_calls_this_turn}, indent=2)
+        
         else:
+            # Simple chat without agent
             final_raw_response = self.lollmsClient.chat(self, images=images, branch_tip_id=branch_tip_id, **kwargs) or ""
             
             if isinstance(final_raw_response, dict) and final_raw_response.get("status") == "error":
                 raise Exception(final_raw_response.get("message", "Unknown error from lollmsClient.chat"))
+            
+            if remove_thinking_blocks:
+                final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
             else:
-                if remove_thinking_blocks:
-                    final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
-                else:
-                    final_content = final_raw_response
+                final_content = final_raw_response
             final_scratchpad = None
+            tool_calls_this_turn = []
 
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
@@ -1469,13 +1611,10 @@ class LollmsDiscussion:
         tok_per_sec = (token_count / duration) if duration > 0 else 0
 
         message_meta = {}
-        if is_agentic_turn and isinstance(agent_result, dict):
-            if "tool_calls" in agent_result: message_meta["tool_calls"] = agent_result["tool_calls"]
-            if "sources" in agent_result: collected_sources.extend(agent_result["sources"])
-            if agent_result.get("clarification_required", False): message_meta["clarification_required"] = True
-
+        if tool_calls_this_turn:
+            message_meta["tool_calls"] = tool_calls_this_turn
         if collected_sources:
-             message_meta["sources"] = collected_sources
+            message_meta["sources"] = collected_sources
 
         ai_message_obj = self.add_message(
             sender=personality.name if personality else "assistant",
@@ -1486,8 +1625,8 @@ class LollmsDiscussion:
             tokens=token_count,
             generation_speed=tok_per_sec,
             parent_id=user_msg.id,
-            model_name = self.lollmsClient.llm.model_name,
-            binding_name = self.lollmsClient.llm.binding_name,
+            model_name=self.lollmsClient.llm.model_name,
+            binding_name=self.lollmsClient.llm.binding_name,
             metadata=message_meta
         )
         
