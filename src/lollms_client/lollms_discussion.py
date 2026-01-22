@@ -1743,6 +1743,7 @@ class LollmsDiscussion:
                 ])
                 final_answer_text = self.lollmsClient.generate_text(
                     synthesis_prompt,
+                    stream=True,
                     temperature=final_answer_temperature,
                     callback=callback if callback else None
                 )
