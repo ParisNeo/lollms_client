@@ -1194,7 +1194,7 @@ class LollmsDiscussion:
         
         # Join the zones with double newlines for clear separation in the prompt.
         return "\n\n".join(parts)
-    
+        
     def chat(
         self,
         user_message: str,
@@ -1265,10 +1265,15 @@ class LollmsDiscussion:
         rag_registry = {}
         rag_tool_specs = {}
         
+        if callback:
+            callback("🔧 Building tool registry...", MSG_TYPE.MSG_TYPE_INFO)
+        
         # === UNIFIED RAG INTEGRATION ===
         
         # 1. Register personality.data_source as primary RAG tool
         if personality and callable(getattr(personality, 'data_source', None)):
+            if callback:
+                callback("  ✓ Registering personality RAG tool", MSG_TYPE.MSG_TYPE_INFO)
             def personality_rag_search(query: str):
                 """Search the personality's primary knowledge base."""
                 results = personality.data_source(query)
@@ -1296,11 +1301,22 @@ class LollmsDiscussion:
             tool_descriptions.append(
                 f"- {tool_name}(query: str): Search the personality's primary knowledge base for relevant information"
             )
+            
+            if callback:
+                callback(f"    📚 Added: {tool_name}", MSG_TYPE.MSG_TYPE_INFO)
+        else:
+            if callback:
+                if not personality:
+                    callback("  ⚠ No personality provided", MSG_TYPE.MSG_TYPE_WARNING)
+                elif not hasattr(personality, 'data_source'):
+                    callback("  ⚠ Personality has no data_source attribute", MSG_TYPE.MSG_TYPE_WARNING)
+                elif not callable(personality.data_source):
+                    callback(f"  ⚠ Personality data_source is not callable (type: {type(personality.data_source).__name__})", MSG_TYPE.MSG_TYPE_WARNING)
         
         # 2. Register all use_data_store RAG systems
         if use_data_store:
             if callback:
-                callback(f"Setting up {len(use_data_store)} knowledge bases...", MSG_TYPE.MSG_TYPE_INFO)
+                callback(f"  ✓ Setting up {len(use_data_store)} data store(s)...", MSG_TYPE.MSG_TYPE_INFO)
             
             for name, info in use_data_store.items():
                 tool_name = f"search_{name.replace(' ', '_').lower()}"
@@ -1344,6 +1360,15 @@ class LollmsDiscussion:
                         "default_min_sim": rag_min_similarity_percent
                     }
                     tool_descriptions.append(f"- {tool_name}(query: str): {description}")
+                    
+                    if callback:
+                        callback(f"    📚 Added: {tool_name} (from '{name}')", MSG_TYPE.MSG_TYPE_INFO)
+                else:
+                    if callback:
+                        callback(f"    ⚠ Skipped '{name}': no callable found", MSG_TYPE.MSG_TYPE_WARNING)
+        else:
+            if callback:
+                callback("  ⚠ No use_data_store provided", MSG_TYPE.MSG_TYPE_WARNING)
         
         # === OPTIONAL PRE-FLIGHT RAG (First Hop) ===
         # This runs BEFORE the agentic loop for initial context loading
@@ -1459,8 +1484,16 @@ class LollmsDiscussion:
 
         tools_summary = "\n".join(tool_descriptions)
         
+        if callback:
+            callback(f"🔧 Tool registry complete: {len(tool_registry)} tools available", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   RAG tools: {len(rag_registry)}", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Tool list:\n{tools_summary}", MSG_TYPE.MSG_TYPE_INFO)
+        
         # Determine if agentic mode is needed
         is_agentic_turn = len(tool_registry) > 2 or use_rlm
+        
+        if callback:
+            callback(f"🤖 Mode: {'AGENTIC' if is_agentic_turn else 'SIMPLE CHAT'} (tools: {len(tool_registry)}, rlm: {use_rlm})", MSG_TYPE.MSG_TYPE_INFO)
         
         if self.max_context_size is not None:
             self.summarize_and_prune(self.max_context_size)
@@ -1498,7 +1531,8 @@ class LollmsDiscussion:
             for step in range(max_reasoning_steps):
                 step_id = None
                 if callback:
-                    step_id = callback(f"Reasoning step {step + 1}/{max_reasoning_steps}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"reason_step_{step}"})
+                    step_id = callback(f"🧠 Reasoning step {step + 1}/{max_reasoning_steps}...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"reason_step_{step}"})
+                    callback(f"   Current scratchpad length: {len(scratchpad)} chars", MSG_TYPE.MSG_TYPE_INFO)
                 
                 # Generate next action
                 reasoning_prompt = "\n".join([
@@ -1545,6 +1579,9 @@ class LollmsDiscussion:
                         temperature=decision_temperature
                     )
                     
+                    if callback:
+                        callback(f"   LLM returned decision: {json.dumps(decision_data, indent=2)[:200]}...", MSG_TYPE.MSG_TYPE_INFO)
+                    
                     if not decision_data or 'action' not in decision_data:
                         if callback:
                             callback("Invalid decision format", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
@@ -1558,6 +1595,9 @@ class LollmsDiscussion:
                     scratchpad += f"\n## Step {step + 1}\n**Reasoning:** {reasoning}\n**Action:** {action}\n**Confidence:** {confidence}\n"
                     
                     if callback:
+                        callback(f"   ➜ Action: {action}", MSG_TYPE.MSG_TYPE_INFO)
+                        callback(f"   ➜ Parameters: {json.dumps(parameters)}", MSG_TYPE.MSG_TYPE_INFO)
+                        callback(f"   ➜ Confidence: {confidence}", MSG_TYPE.MSG_TYPE_INFO)
                         callback(f"Action: {action}", MSG_TYPE.MSG_TYPE_STEP, {"id": step_id, "action": action, "reasoning": reasoning[:100]})
                     
                     # Handle final answer
@@ -1705,7 +1745,6 @@ class LollmsDiscussion:
             self.commit()
             
         return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
-
     def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Regenerates the AI response for a given message or the active branch's AI response.
 
