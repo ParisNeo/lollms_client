@@ -1468,7 +1468,7 @@ class LollmsDiscussion:
 
         # Add core tools
         tool_registry["final_answer"] = lambda answer: {"status": "final", "answer": answer}
-        tool_descriptions.append("- final_answer(answer: str): Provide the final answer to the user")
+        tool_descriptions.append("- final_answer(answer: str): Provide final answer ONLY after searching knowledge bases")
         
         tool_registry["request_clarification"] = lambda question: {"status": "clarification", "question": question}
         tool_descriptions.append("- request_clarification(question: str): Ask user for clarification")
@@ -1523,7 +1523,23 @@ class LollmsDiscussion:
                 full_system_prompt = data_zone_part
 
             # Initialize scratchpad
-            scratchpad = f"# User Request\n{user_message}\n\n# Available Tools\n{tools_summary}\n\n# Reasoning Steps\n"
+            conversation_history = self.export('markdown', suppress_system_prompt=True)
+            
+            scratchpad = "\n".join([
+                "# User Request",
+                user_message,
+                "",
+                "# Conversation History",
+                conversation_history,
+                "",
+                "# Available Tools",
+                tools_summary,
+                "",
+                "# Reasoning Steps"
+            ])
+            
+            if callback:
+                callback(f"📝 Scratchpad initialized with {len(conversation_history)} chars of conversation history", MSG_TYPE.MSG_TYPE_INFO)
             
             tool_calls_this_turn = []
             final_answer_text = ""
@@ -1541,20 +1557,22 @@ class LollmsDiscussion:
                     "# Your Complete Analysis History",
                     scratchpad,
                     "",
-                    "# Next Decision",
-                    f"You are working on: {user_message}",
+                    "# Critical Instructions",
+                    "You are an AI agent with access to knowledge bases containing information you may not have in your training data.",
                     "",
-                    "Choose the single most appropriate action:",
-                    "1. Review your progress and what you've discovered",
-                    "2. If you need more information from a knowledge base, use the appropriate search tool",
-                    "3. If you have enough information, use final_answer(answer)",
-                    "4. If the request is unclear, use request_clarification(question)",
+                    "DECISION RULES:",
+                    "1. If the user's question is about specific facts, recent information, or domain knowledge:",
+                    "   → You MUST use a search tool BEFORE answering",
+                    "2. Search tools available:",
+                    f"   {', '.join([t for t in tool_registry.keys() if t.startswith('search_')])}",
+                    "3. Only use final_answer() AFTER you have searched and found relevant information",
+                    "4. If you're unsure whether to search → SEARCH (it's better to search than to guess)",
                     "",
-                    f"Available search tools: {', '.join([t for t in tool_registry.keys() if t.startswith('search_')])}",
+                    f"Current task: {user_message}",
                     "",
                     "Provide your decision as JSON:",
                     "{",
-                    '    "reasoning": "Explain your thinking",',
+                    '    "reasoning": "Explain why you chose this action",',
                     '    "action": "tool_name",',
                     '    "parameters": {"param": "value"},',
                     '    "confidence": 0.8',
@@ -1596,8 +1614,15 @@ class LollmsDiscussion:
                     
                     if callback:
                         callback(f"   ➜ Action: {action}", MSG_TYPE.MSG_TYPE_INFO)
+                        callback(f"   ➜ Reasoning: {reasoning[:200]}", MSG_TYPE.MSG_TYPE_INFO)
                         callback(f"   ➜ Parameters: {json.dumps(parameters)}", MSG_TYPE.MSG_TYPE_INFO)
                         callback(f"   ➜ Confidence: {confidence}", MSG_TYPE.MSG_TYPE_INFO)
+                        
+                        # WARN if choosing final_answer without any RAG searches
+                        if action == "final_answer" and not any(call['name'].startswith('search_') for call in tool_calls_this_turn):
+                            callback(f"   ⚠️  WARNING: Agent chose final_answer WITHOUT searching knowledge bases!", MSG_TYPE.MSG_TYPE_WARNING)
+                            callback(f"   ⚠️  This may result in incomplete or outdated information", MSG_TYPE.MSG_TYPE_WARNING)
+                        
                         callback(f"Action: {action}", MSG_TYPE.MSG_TYPE_STEP, {"id": step_id, "action": action, "reasoning": reasoning[:100]})
                     
                     # Handle final answer
@@ -1625,10 +1650,23 @@ class LollmsDiscussion:
                     
                     # Execute tool
                     if action in tool_registry:
+                        if callback:
+                            callback(f"   🔧 Executing tool: {action}", MSG_TYPE.MSG_TYPE_INFO)
+                            callback(f"   🔧 Tool exists in registry: YES", MSG_TYPE.MSG_TYPE_INFO)
+                            callback(f"   🔧 Is RAG tool: {action in rag_registry}", MSG_TYPE.MSG_TYPE_INFO)
+                        
                         tool_start = time.time()
                         try:
+                            if callback:
+                                callback(f"   🔧 Calling tool with params: {parameters}", MSG_TYPE.MSG_TYPE_INFO)
+                            
                             result = tool_registry[action](**parameters)
                             tool_time = time.time() - tool_start
+                            
+                            if callback:
+                                callback(f"   ✓ Tool returned in {tool_time:.2f}s", MSG_TYPE.MSG_TYPE_INFO)
+                                callback(f"   ✓ Result type: {type(result).__name__}", MSG_TYPE.MSG_TYPE_INFO)
+                                callback(f"   ✓ Result preview: {json.dumps(result, indent=2)[:300]}...", MSG_TYPE.MSG_TYPE_INFO)
                             
                             scratchpad += f"**Result:** {json.dumps(result, indent=2)[:500]}\n"
                             
@@ -1641,7 +1679,14 @@ class LollmsDiscussion:
                             
                             # Handle RAG results (works for all RAG tools)
                             if action.startswith('search_') and result.get('status') == 'success':
+                                if callback:
+                                    callback(f"   📚 Processing RAG results...", MSG_TYPE.MSG_TYPE_INFO)
+                                
                                 rag_results = result.get('results', [])
+                                
+                                if callback:
+                                    callback(f"   📚 Got {len(rag_results)} results from RAG", MSG_TYPE.MSG_TYPE_INFO)
+                                
                                 for idx, doc in enumerate(rag_results):
                                     source_entry = {
                                         "title": f"{action.replace('search_', '').replace('_', ' ').title()} Result {len(collected_sources) + 1}",
@@ -1653,9 +1698,13 @@ class LollmsDiscussion:
                                         "tool": action
                                     }
                                     collected_sources.append(source_entry)
+                                    
+                                    if callback and idx == 0:
+                                        callback(f"   📚 First result score: {doc.get('score', 0.0):.3f}", MSG_TYPE.MSG_TYPE_INFO)
                                 
                                 if callback:
-                                    callback(f"Found {len(rag_results)} sources from {action}", MSG_TYPE.MSG_TYPE_INFO)
+                                    callback(f"✓ Found {len(rag_results)} sources from {action}", MSG_TYPE.MSG_TYPE_INFO)
+                                    callback(f"📊 Total sources collected: {len(collected_sources)}", MSG_TYPE.MSG_TYPE_INFO)
                                     callback(collected_sources[-len(rag_results):], MSG_TYPE.MSG_TYPE_SOURCES_LIST)
                             
                             if callback:
@@ -1664,11 +1713,14 @@ class LollmsDiscussion:
                         except Exception as e:
                             scratchpad += f"**Error:** {str(e)}\n"
                             if callback:
-                                callback(f"Tool error: {str(e)}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": step_id})
+                                callback(f"❌ Tool error: {str(e)}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": step_id})
+                                import traceback
+                                callback(f"   Traceback: {traceback.format_exc()[:500]}", MSG_TYPE.MSG_TYPE_INFO)
                     else:
                         scratchpad += f"**Error:** Unknown tool '{action}'\n"
                         if callback:
-                            callback(f"Unknown tool: {action}", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
+                            callback(f"❌ Unknown tool: {action}", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
+                            callback(f"   Available tools: {list(tool_registry.keys())}", MSG_TYPE.MSG_TYPE_INFO)
                 
                 except Exception as e:
                     trace_exception(e)
@@ -1744,7 +1796,8 @@ class LollmsDiscussion:
         if self._is_db_backed and self.autosave:
             self.commit()
             
-        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
+        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}    
+    
     def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Regenerates the AI response for a given message or the active branch's AI response.
 
