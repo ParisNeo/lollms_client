@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 from ascii_colors import trace_exception
-import yaml
+import time
 from sqlalchemy import (Column, DateTime, Float, ForeignKey, Integer, JSON,
                         LargeBinary, String, Text, create_engine)
 from sqlalchemy.orm import (Session, declarative_base, declared_attr,
@@ -1741,7 +1741,7 @@ class LollmsDiscussion:
                     "",
                     "Base your answer on the reasoning and discoveries above. Cite sources as [1], [2], etc."
                 ])
-                final_answer_text = self.lollmsClient.generate(
+                final_answer_text = self.lollmsClient.generate_text(
                     synthesis_prompt,
                     temperature=final_answer_temperature,
                     callback=callback if callback else None
