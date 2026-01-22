@@ -2598,7 +2598,7 @@ class LollmsDiscussion:
                 "required": ["title"],
                 "description": "JSON object as title of the discussion."
             }
-            infos = self.lollmsClient.generate_structured_content(prompt = prompt, system_prompt=system_prompt, schema = title_generation_schema, n_predict=512)
+            infos = self.lollmsClient.generate_structured_content(prompt = prompt, system_prompt=system_prompt, schema = title_generation_schema)
             if infos is None or "title" not in infos:
                 raise ValueError("Title generation failed or returned invalid data.")
             discussion_title = infos["title"]
