@@ -1251,7 +1251,6 @@ class LollmsDiscussion:
             )
             if use_rlm:
                 user_msg.metadata["rlm_full_content"] = user_message
-                user_msg.save()
         else:
             if self.active_branch_id not in self._message_index:
                 raise ValueError("Regeneration failed: active branch tip not found or is invalid.")

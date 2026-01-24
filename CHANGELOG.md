@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-01-24 01:13]
+
+- **fix(lollms_discussion): remove premature save of user message during RL‑mode handling**
+
 ## [2026-01-20 08:13]
 
 - chore(version): bump package version to 1.11.1
