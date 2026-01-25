@@ -1379,7 +1379,18 @@ class LollmsDiscussion:
 
         # Inject context into data zone for discussion-aware generation
         if scratchpad:
-            self.personality_data_zone = scratchpad.strip() + "\n\nIMPORTANT: Use the above information to answer. Cite sources."
+            veracity_note = "\n".join([
+                "",
+                "=== IMPORTANT: ATTRIBUTION & HONESTY ===",
+                "- Cite sources using [1], [2], [3] format",
+                "- If information comes from above sources, cite them",
+                "- If from your general knowledge, say so clearly",
+                "- If you're uncertain or don't know, say 'I'm not certain' or 'I don't know'",
+                "- NEVER invent facts, dates, statistics, or quotes",
+                "=== END ===",
+                ""
+            ])
+            self.personality_data_zone = scratchpad.strip() + veracity_note
 
         # Generate final response using discussion-aware chat
         if callback:
@@ -1864,11 +1875,26 @@ class LollmsDiscussion:
             
             tool_calls_this_turn = []
             final_answer_text = ""
+            queries_performed = []  # Track all queries to prevent loops
+            max_rag_queries = kwargs.get("max_rag_queries", 5)  # Configurable limit
             
             for step in range(max_reasoning_steps):
                 step_id = None
                 if callback:
                     step_id = callback(f"🧠 Step {step + 1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"reason_step_{step}"})
+                
+                # Build query history summary
+                query_history = ""
+                if queries_performed:
+                    query_history = f"\n# Previous Queries Already Performed ({len(queries_performed)}/{max_rag_queries} used)\n"
+                    for idx, q in enumerate(queries_performed, 1):
+                        query_history += f"{idx}. [{q['tool']}] Query: '{q['query']}' → Found {q['result_count']} results\n"
+                    query_history += "\n⚠️ DO NOT repeat these exact queries. If you need more information, use DIFFERENT search terms.\n"
+                    
+                    if len(queries_performed) >= max_rag_queries:
+                        query_history += f"\n🛑 CRITICAL: You have reached the query limit ({max_rag_queries}). You MUST call final_answer() now.\n"
+                    elif len(queries_performed) >= max_rag_queries - 1:
+                        query_history += f"\n⚠️ WARNING: You have {max_rag_queries - len(queries_performed)} query remaining. Use it wisely or proceed to final_answer().\n"
                 
                 # Generate next action
                 reasoning_prompt = "\n".join([
@@ -1876,6 +1902,7 @@ class LollmsDiscussion:
                     "",
                     "# Your Analysis History",
                     scratchpad,
+                    query_history,
                     "",
                     "# Critical Instructions",
                     "You are an AI agent with access to knowledge bases and tools.",
@@ -1885,6 +1912,8 @@ class LollmsDiscussion:
                     f"2. Available search tools: {', '.join([t for t in rag_registry.keys()])}",
                     "3. For large inputs (RLM mode) → Use python_exec() and llm_query() for chunking",
                     "4. Only call final_answer() AFTER gathering necessary information",
+                    "5. ⚠️ CHECK 'Previous Queries' above - DO NOT repeat the same search",
+                    "6. If you have enough information from previous searches → Call final_answer()",
                     "",
                     "VERACITY RULES (CRITICAL - NEVER VIOLATE):",
                     "- If you found information in sources → You MUST cite them [1], [2], etc.",
@@ -2020,13 +2049,28 @@ class LollmsDiscussion:
                         callback(f"Reasoning error: {str(e)}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": step_id})
                     break
             
+            # Report final query statistics
+            if callback and queries_performed:
+                callback(f"📊 Query Summary: {len(queries_performed)} total RAG queries performed", MSG_TYPE.MSG_TYPE_INFO)
+                for idx, q in enumerate(queries_performed, 1):
+                    callback(f"   {idx}. [{q['tool']}] '{q['query']}' → {q['result_count']} results (step {q['step']})", MSG_TYPE.MSG_TYPE_INFO)
+            
             # Generate final synthesis if needed
             if not final_answer_text:
+                # Build query summary for final synthesis
+                query_summary = ""
+                if queries_performed:
+                    query_summary = f"\n# Search Queries Performed ({len(queries_performed)} total)\n"
+                    for idx, q in enumerate(queries_performed, 1):
+                        query_summary += f"{idx}. [{q['tool']}] Query: '{q['query']}' → {q['result_count']} results found\n"
+                    query_summary += "\nYou have completed your research. Use the information gathered above.\n"
+                
                 synthesis_prompt = "\n".join([
                     full_system_prompt,
                     "",
                     "# Complete Analysis",
                     scratchpad,
+                    query_summary,
                     "",
                     "# VERACITY PROTOCOL (MANDATORY)",
                     "You MUST follow these rules when providing your final answer:",
@@ -2122,6 +2166,11 @@ class LollmsDiscussion:
             message_meta["sources"] = collected_sources
             message_meta["source_count"] = len(collected_sources)
             message_meta["rag_queries"] = len([s for s in collected_sources if 'query' in s])
+            message_meta["unique_queries"] = len(set(s.get('query', '') for s in collected_sources if 'query' in s))
+        
+        if queries_performed:
+            message_meta["query_history"] = queries_performed
+            message_meta["total_queries"] = len(queries_performed)
         
         if rlm_enabled:
             message_meta["rlm_enabled"] = True
@@ -2148,8 +2197,15 @@ class LollmsDiscussion:
             callback(f"✅ Complete: {token_count} tokens in {duration:.2f}s ({tok_per_sec:.1f} tok/s)", MSG_TYPE.MSG_TYPE_INFO)
             if collected_sources:
                 callback(f"📚 Total sources: {len(collected_sources)}", MSG_TYPE.MSG_TYPE_INFO)
+            if queries_performed:
+                callback(f"🔍 RAG queries: {len(queries_performed)}/{max_rag_queries} (unique: {len(set(q['query'] for q in queries_performed))})", MSG_TYPE.MSG_TYPE_INFO)
+                
+                # Detect if we hit the limit
+                if len(queries_performed) >= max_rag_queries:
+                    callback(f"⚠️ Query limit reached - consider increasing max_rag_queries if needed", MSG_TYPE.MSG_TYPE_WARNING)
         
-        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}    
+        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
+    
     def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Regenerates the AI response for a given message or the active branch's AI response.
 
