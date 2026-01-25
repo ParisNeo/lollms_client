@@ -1090,14 +1090,35 @@ Continue the code exactly from where it left off. Do not repeat any part of the 
 
 
     def _extract_json_from_xml(self, response: str) -> Optional[str]:
-        """Extract JSON content from XML tags."""
+        """Extract JSON content from XML tags, avoiding nested occurrences in other tags."""
+        
+        # First, try to remove common wrapper tags that might contain nested <json> references
+        # This handles cases where LLM uses <think>, <reasoning>, etc. tags
+        cleaned_response = response
+        for wrapper_tag in ['think', 'reasoning', 'analysis', 'scratchpad', 'internal']:
+            # Remove content within these wrapper tags to avoid false matches
+            cleaned_response = re.sub(
+                f'<{wrapper_tag}>.*?</{wrapper_tag}>', 
+                '', 
+                cleaned_response, 
+                flags=re.DOTALL | re.IGNORECASE
+            )
+        
+        # Now search for <json> tags in the cleaned response
         pattern = r'<json>(.*?)</json>'
-        match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
+        matches = list(re.finditer(pattern, cleaned_response, re.DOTALL | re.IGNORECASE))
         
-        if match:
-            return match.group(1).strip()
+        if matches:
+            # Return the last complete match (most likely to be the actual output)
+            return matches[-1].group(1).strip()
         
-        # Fallback: try to find unclosed json tag (for truncated responses)
+        # Fallback: try original response for closed tags if cleaning removed everything
+        matches = list(re.finditer(pattern, response, re.DOTALL | re.IGNORECASE))
+        if matches:
+            # Return the last match from original response
+            return matches[-1].group(1).strip()
+        
+        # Last resort: try to find unclosed json tag (for truncated responses)
         pattern = r'<json>(.*?)$'
         match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
         
@@ -1310,7 +1331,7 @@ Schema:
 Example structure:
 {example_str}
 
-You must wrap your JSON response in XML tags:
+You **MUST** wrap your JSON response in XML tags:
 <json>
 your json here
 </json>
@@ -1333,7 +1354,7 @@ Important:
                 system_prompt=final_system_prompt,
                 **kwargs
             )
-            
+            response = self.remove_thinking_blocks(response)
             if isinstance(response, dict) and not response.get("status", True):
                 continue
             
