@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-01-25 22:56]
+
+- Enhance RAG reasoning loop with safety limits and richer feedback
+
 ## [2026-01-25 22:36]
 
 - **feat: improve RAG query handling and enforce attribution**

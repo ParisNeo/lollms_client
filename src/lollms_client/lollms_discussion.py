@@ -1462,6 +1462,7 @@ class LollmsDiscussion:
         rlm_context_var_name = "USER_INPUT_CONTEXT"
         actual_user_content_for_llm = user_message
         rlm_enabled = use_rlm
+        queries_performed = []
         
         if rlm_enabled:
             if callback:
@@ -1876,12 +1877,36 @@ class LollmsDiscussion:
             tool_calls_this_turn = []
             final_answer_text = ""
             queries_performed = []  # Track all queries to prevent loops
-            max_rag_queries = kwargs.get("max_rag_queries", 5)  # Configurable limit
+            max_rag_queries = kwargs.get("max_rag_queries", 3)  # Conservative default: only 3 queries
+            
+            if callback:
+                callback(f"⚙️  Configuration: max_rag_queries={max_rag_queries}, max_steps={max_reasoning_steps}", MSG_TYPE.MSG_TYPE_INFO)
             
             for step in range(max_reasoning_steps):
                 step_id = None
                 if callback:
                     step_id = callback(f"🧠 Step {step + 1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"reason_step_{step}"})
+                    callback(f"   Sources collected so far: {len(collected_sources)}", MSG_TYPE.MSG_TYPE_INFO)
+                    callback(f"   Queries performed: {len(queries_performed)}/{max_rag_queries}", MSG_TYPE.MSG_TYPE_INFO)
+                
+                # FORCE STOP if query limit exceeded
+                if len(queries_performed) >= max_rag_queries:
+                    if callback:
+                        callback(f"🛑 FORCING FINAL ANSWER - Query limit reached ({len(queries_performed)}/{max_rag_queries})", MSG_TYPE.MSG_TYPE_WARNING)
+                    
+                    # Override LLM decision and force final answer
+                    action = "final_answer"
+                    parameters = {"answer": "forced_synthesis"}
+                    reasoning = f"Query limit reached ({len(queries_performed)} queries). Forcing synthesis with available information."
+                    
+                    scratchpad += f"\n## Step {step + 1} [FORCED]\n**System:** Query limit reached. Forcing final answer.\n"
+                    
+                    if callback:
+                        callback(f"Action: final_answer (FORCED)", MSG_TYPE.MSG_TYPE_STEP, {"id": step_id, "action": "final_answer", "forced": True})
+                    
+                    # Jump directly to final answer generation
+                    final_answer_text = "forced"  # Will trigger synthesis below
+                    break
                 
                 # Build query history summary
                 query_history = ""
@@ -1934,6 +1959,9 @@ class LollmsDiscussion:
                 ])
                 
                 try:
+                    if callback:
+                        callback(f"   🤔 Generating decision...", MSG_TYPE.MSG_TYPE_INFO)
+                    
                     decision_data = self.lollmsClient.generate_structured_content(
                         prompt=reasoning_prompt,
                         schema={
@@ -1946,15 +1974,24 @@ class LollmsDiscussion:
                         temperature=decision_temperature
                     )
                     
+                    if callback:
+                        callback(f"   ✓ Decision received", MSG_TYPE.MSG_TYPE_INFO)
+                    
                     if not decision_data or 'action' not in decision_data:
                         if callback:
-                            callback("Invalid decision", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
+                            callback("⚠️ Invalid decision format - breaking loop", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
                         break
                     
                     reasoning = decision_data.get('reasoning', '')
                     action = decision_data.get('action', 'final_answer')
                     parameters = decision_data.get('parameters', {})
                     confidence = decision_data.get('confidence', 0.5)
+                    
+                    if callback:
+                        callback(f"   ➜ Reasoning: {reasoning[:150]}{'...' if len(reasoning) > 150 else ''}", MSG_TYPE.MSG_TYPE_INFO)
+                        callback(f"   ➜ Action chosen: {action}", MSG_TYPE.MSG_TYPE_INFO)
+                        callback(f"   ➜ Parameters: {json.dumps(parameters)[:100]}{'...' if len(json.dumps(parameters)) > 100 else ''}", MSG_TYPE.MSG_TYPE_INFO)
+                        callback(f"   ➜ Confidence: {confidence:.2f}", MSG_TYPE.MSG_TYPE_INFO)
                     
                     scratchpad += f"\n## Step {step + 1}\n**Reasoning:** {reasoning}\n**Action:** {action}\n**Confidence:** {confidence}\n"
                     
@@ -2050,13 +2087,26 @@ class LollmsDiscussion:
                     break
             
             # Report final query statistics
-            if callback and queries_performed:
-                callback(f"📊 Query Summary: {len(queries_performed)} total RAG queries performed", MSG_TYPE.MSG_TYPE_INFO)
-                for idx, q in enumerate(queries_performed, 1):
-                    callback(f"   {idx}. [{q['tool']}] '{q['query']}' → {q['result_count']} results (step {q['step']})", MSG_TYPE.MSG_TYPE_INFO)
+            if callback:
+                callback(f"🏁 Reasoning loop complete after {step + 1} steps", MSG_TYPE.MSG_TYPE_INFO)
+                
+                if queries_performed:
+                    callback(f"📊 FINAL QUERY REPORT:", MSG_TYPE.MSG_TYPE_INFO)
+                    callback(f"   Total queries: {len(queries_performed)}/{max_rag_queries}", MSG_TYPE.MSG_TYPE_INFO)
+                    callback(f"   Unique queries: {len(set(q['query'] for q in queries_performed))}", MSG_TYPE.MSG_TYPE_INFO)
+                    callback(f"   Total sources collected: {len(collected_sources)}", MSG_TYPE.MSG_TYPE_INFO)
+                    callback(f"", MSG_TYPE.MSG_TYPE_INFO)
+                    callback(f"   Query breakdown:", MSG_TYPE.MSG_TYPE_INFO)
+                    for idx, q in enumerate(queries_performed, 1):
+                        callback(f"   {idx}. Step {q['step']}: [{q['tool']}] '{q['query']}' → {q['result_count']} results", MSG_TYPE.MSG_TYPE_INFO)
+                else:
+                    callback(f"📊 No RAG queries performed", MSG_TYPE.MSG_TYPE_INFO)
             
             # Generate final synthesis if needed
-            if not final_answer_text:
+            if not final_answer_text or final_answer_text == "forced":
+                if callback:
+                    callback(f"📝 Generating final synthesis...", MSG_TYPE.MSG_TYPE_INFO)
+                
                 # Build query summary for final synthesis
                 query_summary = ""
                 if queries_performed:
@@ -2204,8 +2254,10 @@ class LollmsDiscussion:
                 if len(queries_performed) >= max_rag_queries:
                     callback(f"⚠️ Query limit reached - consider increasing max_rag_queries if needed", MSG_TYPE.MSG_TYPE_WARNING)
         
-        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
-    
+        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}    
+
+
+
     def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Regenerates the AI response for a given message or the active branch's AI response.
 
