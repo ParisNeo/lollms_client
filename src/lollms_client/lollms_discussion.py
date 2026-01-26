@@ -1446,23 +1446,24 @@ class LollmsDiscussion:
         **kwargs
     ) -> Dict[str, Any]:
         """
-        Advanced agentic chat with RLM support and Multi-Hop RAG.
+        Advanced agentic chat with RLM support, Multi-Hop RAG, and intelligent document handling.
         
-        RLM Mode (use_rlm=True):
-        - Treats large prompts as external variables in a REPL environment
-        - Enables recursive sub-LLM calls for divide-and-conquer on massive inputs
-        - Supports up to 100x the native context window
+        Features:
+        - RLM Mode: Handles 100x context window via recursive processing
+        - Smart Document Management: Efficiently processes large files (PDF, PPTX, CSV, HTML, Excel)
+        - Context Budget Management: Reserves space for conversation history
+        - Multi-document Operations: Summarization, cross-reference, comparison
         
         Based on: Zhang & Kraska (MIT CSAIL) - Recursive Language Models
         """
         callback = kwargs.get("streaming_callback")
         collected_sources = []
+        queries_performed = []  # Initialize at start to avoid UnboundLocalError
         
         # --- RLM Pre-processing: Context Offloading ---
         rlm_context_var_name = "USER_INPUT_CONTEXT"
         actual_user_content_for_llm = user_message
         rlm_enabled = use_rlm
-        queries_performed = []
         
         if rlm_enabled:
             if callback:
@@ -1514,6 +1515,122 @@ class LollmsDiscussion:
             user_msg_orm = self._message_index[self.active_branch_id]
             user_msg = LollmsMessage(self, user_msg_orm)
             images = user_msg.get_active_images()
+        
+        # === SMART DOCUMENT DETECTION & MANAGEMENT ===
+        if callback:
+            callback("📄 Analyzing data zones for documents...", MSG_TYPE.MSG_TYPE_INFO)
+        
+        # Parse documents from data zones
+        def extract_documents(zone_content: str) -> List[Dict[str, str]]:
+            """Extract documents from zone content marked with --- Document: --- delimiters."""
+            if not zone_content:
+                return []
+            
+            import re
+            documents = []
+            pattern = r'--- Document: (.+?) ---\n(.*?)\n--- End Document: \1 ---'
+            matches = re.findall(pattern, zone_content, re.DOTALL)
+            
+            for doc_name, doc_content in matches:
+                documents.append({
+                    "name": doc_name.strip(),
+                    "content": doc_content.strip(),
+                    "size": len(doc_content.strip()),
+                    "token_count": self.lollmsClient.count_tokens(doc_content.strip())
+                })
+            
+            return documents
+        
+        # Collect all documents from data zones
+        all_documents = []
+        zone_names = []
+        
+        if self.discussion_data_zone:
+            docs = extract_documents(self.discussion_data_zone)
+            for doc in docs:
+                doc["zone"] = "discussion"
+            all_documents.extend(docs)
+            if docs:
+                zone_names.append(f"discussion ({len(docs)} docs)")
+        
+        if self.user_data_zone:
+            docs = extract_documents(self.user_data_zone)
+            for doc in docs:
+                doc["zone"] = "user"
+            all_documents.extend(docs)
+            if docs:
+                zone_names.append(f"user ({len(docs)} docs)")
+        
+        if self.personality_data_zone and not callable(getattr(personality, 'data_source', None)):
+            # Only extract if not using dynamic RAG
+            docs = extract_documents(self.personality_data_zone)
+            for doc in docs:
+                doc["zone"] = "personality"
+            all_documents.extend(docs)
+            if docs:
+                zone_names.append(f"personality ({len(docs)} docs)")
+        
+        if callback and all_documents:
+            total_tokens = sum(doc['token_count'] for doc in all_documents)
+            callback(f"📄 Found {len(all_documents)} document(s) across {len(zone_names)} zone(s)", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Total document tokens: {total_tokens:,}", MSG_TYPE.MSG_TYPE_INFO)
+            for doc in all_documents:
+                callback(f"   - {doc['name']} ({doc['token_count']:,} tokens, {doc['zone']} zone)", MSG_TYPE.MSG_TYPE_INFO)
+        
+        # Detect if query is document-focused
+        def detect_document_intent(query: str, documents: List[Dict]) -> Dict:
+            """Detect if query requires document processing and what kind."""
+            query_lower = query.lower()
+            
+            intent = {
+                "is_document_query": False,
+                "operation": None,
+                "target_docs": [],
+                "requires_full_content": False
+            }
+            
+            if not documents:
+                return intent
+            
+            # Check for document operations
+            doc_operations = {
+                "summarize": ["summarize", "summary", "summarise", "overview", "brief"],
+                "compare": ["compare", "comparison", "difference", "versus", "vs", "contrast"],
+                "cross_reference": ["cross reference", "cross-reference", "relate", "connection", "common"],
+                "analyze": ["analyze", "analyse", "examine", "study", "investigate"],
+                "extract": ["extract", "find", "locate", "search for", "get"],
+                "table": ["table", "tabular", "spreadsheet", "comparison table"]
+            }
+            
+            for operation, keywords in doc_operations.items():
+                if any(kw in query_lower for kw in keywords):
+                    intent["is_document_query"] = True
+                    intent["operation"] = operation
+                    break
+            
+            # Check if specific documents mentioned
+            for doc in documents:
+                doc_name_lower = doc['name'].lower()
+                doc_name_base = doc_name_lower.split('.')[0]  # Without extension
+                if doc_name_lower in query_lower or doc_name_base in query_lower:
+                    intent["target_docs"].append(doc['name'])
+            
+            # If no specific docs but document operation detected, target all
+            if intent["is_document_query"] and not intent["target_docs"]:
+                intent["target_docs"] = [doc['name'] for doc in documents]
+            
+            # Operations requiring full content
+            full_content_ops = ["summarize", "compare", "cross_reference", "analyze"]
+            intent["requires_full_content"] = intent["operation"] in full_content_ops
+            
+            return intent
+        
+        doc_intent = detect_document_intent(user_message, all_documents)
+        
+        if callback and doc_intent["is_document_query"]:
+            callback(f"📊 Document operation detected: {doc_intent['operation']}", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Target documents: {', '.join(doc_intent['target_docs']) if doc_intent['target_docs'] else 'all'}", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Requires full content: {doc_intent['requires_full_content']}", MSG_TYPE.MSG_TYPE_INFO)
         
         # --- Build Tool Registry with Structured RAG ---
         tool_registry = {}
@@ -1778,16 +1895,110 @@ class LollmsDiscussion:
 
         tools_summary = "\n".join(tool_descriptions)
         
+        # Add document operation hints if applicable
+        if all_documents and doc_intent["is_document_query"]:
+            tools_summary += f"\n\n# Document Operation Detected: {doc_intent['operation']}\n"
+            tools_summary += f"Target documents: {', '.join(doc_intent['target_docs']) if doc_intent['target_docs'] else 'all'}\n"
+            
+            if doc_intent["operation"] == "summarize":
+                tools_summary += "\nRecommended approach: Use summarize_document() for each target document.\n"
+            elif doc_intent["operation"] == "compare":
+                tools_summary += "\nRecommended approach: Use compare_documents() with target document names.\n"
+            elif doc_intent["operation"] == "cross_reference":
+                tools_summary += "\nRecommended approach: Summarize each document, then analyze connections.\n"
+            elif doc_intent["requires_full_content"]:
+                total_tokens = sum(d['token_count'] for d in all_documents if d['name'] in doc_intent['target_docs'])
+                if total_tokens > context_budget['available_for_data']:
+                    tools_summary += f"\n⚠️ Target documents ({total_tokens:,} tokens) exceed context. Use read_document_* tools to access in chunks.\n"
+        
         if callback:
             callback(f"🔧 Registry complete: {len(tool_registry)} tools", MSG_TYPE.MSG_TYPE_INFO)
             callback(f"   RAG tools: {len(rag_registry)}", MSG_TYPE.MSG_TYPE_INFO)
         
         # Determine if agentic mode is needed
-        is_agentic_turn = len(rag_registry) > 0 or use_mcps or rlm_enabled
+        is_agentic_turn = len(rag_registry) > 0 or use_mcps or rlm_enabled or len(all_documents) > 0
         
         if callback:
             mode = "RLM AGENTIC" if rlm_enabled else ("AGENTIC" if is_agentic_turn else "SIMPLE CHAT")
             callback(f"🤖 Mode: {mode} (tools: {len(tool_registry)})", MSG_TYPE.MSG_TYPE_INFO)
+        
+        # === CONTEXT BUDGET MANAGEMENT ===
+        # Reserve space for conversation history and system prompt
+        context_budget = {
+            "total_available": self.lollmsClient.llm.ctx_size if hasattr(self.lollmsClient.llm, 'ctx_size') else 4096,
+            "reserved_for_conversation": 2000,  # Always keep space for discussion history
+            "reserved_for_response": 2000,      # Space for LLM output
+            "reserved_for_system": 1000,        # System prompt + instructions
+            "available_for_data": 0
+        }
+        
+        context_budget["available_for_data"] = max(0, 
+            context_budget["total_available"] 
+            - context_budget["reserved_for_conversation"]
+            - context_budget["reserved_for_response"]
+            - context_budget["reserved_for_system"]
+        )
+        
+        if callback:
+            callback(f"💾 Context Budget:", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Total: {context_budget['total_available']:,} tokens", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Reserved for conversation: {context_budget['reserved_for_conversation']:,}", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Reserved for response: {context_budget['reserved_for_response']:,}", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Reserved for system: {context_budget['reserved_for_system']:,}", MSG_TYPE.MSG_TYPE_INFO)
+            callback(f"   Available for documents/data: {context_budget['available_for_data']:,}", MSG_TYPE.MSG_TYPE_INFO)
+        
+        # Smart document handling based on context budget
+        if all_documents:
+            total_doc_tokens = sum(doc['token_count'] for doc in all_documents)
+            
+            if callback:
+                callback(f"📊 Document tokens: {total_doc_tokens:,} / Budget: {context_budget['available_for_data']:,}", MSG_TYPE.MSG_TYPE_INFO)
+            
+            if total_doc_tokens > context_budget['available_for_data']:
+                if callback:
+                    callback(f"⚠️  Documents exceed context budget!", MSG_TYPE.MSG_TYPE_WARNING)
+                    callback(f"   Overflow: {total_doc_tokens - context_budget['available_for_data']:,} tokens", MSG_TYPE.MSG_TYPE_WARNING)
+                    callback(f"   Strategy: Using document tools for chunked access", MSG_TYPE.MSG_TYPE_WARNING)
+                
+                # Don't load full documents into data zones
+                # Instead, provide document summaries and tool access
+                if doc_intent["is_document_query"]:
+                    # Give LLM document metadata and tool descriptions
+                    doc_metadata = "\n# Available Documents (Access via tools)\n\n"
+                    for doc in all_documents:
+                        doc_metadata += f"- **{doc['name']}** ({doc['token_count']:,} tokens, {doc['zone']} zone)\n"
+                        doc_metadata += f"  Use: read_document_{doc['name'].replace('.', '_').replace(' ', '_').replace('-', '_')}()\n"
+                    
+                    doc_metadata += f"\nTotal: {len(all_documents)} documents, {total_doc_tokens:,} tokens\n"
+                    doc_metadata += "⚠️ Documents are too large to load fully. Use document tools to read specific sections.\n"
+                    
+                    # Store in personality zone
+                    if self.personality_data_zone:
+                        self.personality_data_zone = doc_metadata + "\n\n" + self.personality_data_zone
+                    else:
+                        self.personality_data_zone = doc_metadata
+                    
+                    if callback:
+                        callback(f"   ✓ Loaded document metadata instead of full content", MSG_TYPE.MSG_TYPE_INFO)
+            else:
+                if callback:
+                    callback(f"   ✓ Documents fit in context budget", MSG_TYPE.MSG_TYPE_INFO)
+                
+                # Documents fit - can load selectively based on intent
+                if doc_intent["is_document_query"] and doc_intent["target_docs"]:
+                    # Load only target documents
+                    targeted_content = "\n# Target Documents\n\n"
+                    for doc in all_documents:
+                        if doc['name'] in doc_intent["target_docs"]:
+                            targeted_content += f"--- Document: {doc['name']} ---\n{doc['content']}\n--- End Document: {doc['name']} ---\n\n"
+                    
+                    if self.personality_data_zone:
+                        self.personality_data_zone = targeted_content + "\n\n" + self.personality_data_zone
+                    else:
+                        self.personality_data_zone = targeted_content
+                    
+                    if callback:
+                        callback(f"   ✓ Loaded {len(doc_intent['target_docs'])} target document(s) into context", MSG_TYPE.MSG_TYPE_INFO)
         
         # Context management
         if self.max_context_size is not None:
@@ -1914,20 +2125,52 @@ class LollmsDiscussion:
                     query_history = f"\n# Previous Queries Already Performed ({len(queries_performed)}/{max_rag_queries} used)\n"
                     for idx, q in enumerate(queries_performed, 1):
                         query_history += f"{idx}. [{q['tool']}] Query: '{q['query']}' → Found {q['result_count']} results\n"
-                    query_history += "\n⚠️ DO NOT repeat these exact queries. If you need more information, use DIFFERENT search terms.\n"
+                    
+                    # Show actual content preview from sources
+                    if collected_sources:
+                        query_history += f"\n# Information Already Retrieved ({len(collected_sources)} sources)\n"
+                        query_history += "YOU HAVE THE FOLLOWING INFORMATION AVAILABLE:\n\n"
+                        for idx, src in enumerate(collected_sources[:10], 1):  # Show first 10 sources
+                            preview = src.get('content', '')[:200]
+                            query_history += f"[{idx}] {src.get('source', 'Unknown')} (score: {src.get('relevance_score', 0):.2f}):\n{preview}...\n\n"
+                        
+                        if len(collected_sources) > 10:
+                            query_history += f"... and {len(collected_sources) - 10} more sources\n\n"
+                    
+                    query_history += "\n⚠️ IMPORTANT INSTRUCTIONS:\n"
+                    query_history += "1. DO NOT repeat these exact queries\n"
+                    query_history += "2. READ THE RETRIEVED INFORMATION ABOVE CAREFULLY\n"
+                    query_history += "3. Even partial information is valuable - USE IT\n"
+                    query_history += "4. If sources contain ANY relevant information → Call final_answer() and cite them\n"
+                    query_history += "5. Only search again if you need DIFFERENT information with DIFFERENT search terms\n"
+                    query_history += "6. 'No perfect match' does NOT mean 'no useful information'\n\n"
                     
                     if len(queries_performed) >= max_rag_queries:
-                        query_history += f"\n🛑 CRITICAL: You have reached the query limit ({max_rag_queries}). You MUST call final_answer() now.\n"
+                        query_history += f"\n🛑 CRITICAL: You have reached the query limit ({max_rag_queries}). You MUST call final_answer() NOW with whatever information you have.\n"
+                        query_history += "EVEN PARTIAL INFORMATION is better than no answer. Use what you found!\n"
                     elif len(queries_performed) >= max_rag_queries - 1:
-                        query_history += f"\n⚠️ WARNING: You have {max_rag_queries - len(queries_performed)} query remaining. Use it wisely or proceed to final_answer().\n"
+                        query_history += f"\n⚠️ WARNING: You have {max_rag_queries - len(queries_performed)} query remaining. If current sources have ANY useful info → Use final_answer() now.\n"
                 
                 # Generate next action
+                document_context = ""
+                if all_documents and doc_intent["is_document_query"]:
+                    document_context = "\n# Document Processing Context\n"
+                    document_context += f"Operation: {doc_intent['operation']}\n"
+                    document_context += f"Target documents: {', '.join(doc_intent['target_docs']) if doc_intent['target_docs'] else 'all'}\n"
+                    document_context += f"Documents available: {len(all_documents)} ({sum(d['token_count'] for d in all_documents):,} tokens total)\n"
+                    document_context += f"Context budget for data: {context_budget['available_for_data']:,} tokens\n\n"
+                    
+                    total_target_tokens = sum(d['token_count'] for d in all_documents if d['name'] in doc_intent.get('target_docs', []))
+                    if total_target_tokens > context_budget['available_for_data']:
+                        document_context += "⚠️ Target documents are too large for context. You MUST use document tools (read_document_*, summarize_document) to access them.\n\n"
+                
                 reasoning_prompt = "\n".join([
                     full_system_prompt,
                     "",
                     "# Your Analysis History",
                     scratchpad,
                     query_history,
+                    document_context,
                     "",
                     "# Critical Instructions",
                     "You are an AI agent with access to knowledge bases and tools.",
@@ -1936,15 +2179,35 @@ class LollmsDiscussion:
                     "1. For factual questions → SEARCH knowledge bases FIRST",
                     f"2. Available search tools: {', '.join([t for t in rag_registry.keys()])}",
                     "3. For large inputs (RLM mode) → Use python_exec() and llm_query() for chunking",
-                    "4. Only call final_answer() AFTER gathering necessary information",
-                    "5. ⚠️ CHECK 'Previous Queries' above - DO NOT repeat the same search",
-                    "6. If you have enough information from previous searches → Call final_answer()",
+                    "4. For document operations → Use document tools (summarize_document, compare_documents, read_document_*)",
+                    "5. ⚠️ IMPORTANT: After 1-2 searches, if you have ANY relevant information → Use final_answer()",
+                    "6. ⚠️ CHECK 'Previous Queries' above - DO NOT repeat the same search",
+                    "7. ⚠️ PARTIAL information is VALUABLE - don't keep searching for perfect answers",
+                    "",
+                    "DOCUMENT HANDLING:",
+                    "- If documents exceed context → Use document tools to access in chunks",
+                    "- For summarization → Use summarize_document(doc_name)",
+                    "- For comparison → Use compare_documents(doc1, doc2, ...)",
+                    "- For reading portions → Use read_document_*(start_char, length)",
+                    "",
+                    "STOP SEARCHING IF:",
+                    "- You have found some relevant information (even if incomplete)",
+                    "- You've already done 2+ searches",
+                    "- The retrieved sources contain anything useful about the question",
+                    "- You're approaching the query limit",
+                    "",
+                    "ONLY SEARCH AGAIN IF:",
+                    "- You have found ZERO relevant information in all previous searches",
+                    "- You need completely different information (use very different search terms)",
+                    "- Current sources are completely off-topic",
                     "",
                     "VERACITY RULES (CRITICAL - NEVER VIOLATE):",
                     "- If you found information in sources → You MUST cite them [1], [2], etc.",
-                    "- If you're uncertain or don't have enough information → You MUST say 'I don't know' or 'I'm not certain'",
-                    "- If the question requires specific facts you haven't retrieved → SEARCH before answering",
-                    "- NEVER invent, fabricate, or guess factual information",
+                    "- If information is incomplete → Say 'Based on available sources [1], I can tell you X, but I don't have information about Y'",
+                    "- If you're uncertain → You MUST say 'I'm not certain' or 'The sources provide limited information'",
+                    "- PARTIAL answers with source citations are BETTER than endless searching",
+                    "- If sources have ANY relevant info → USE IT and cite it, even if incomplete",
+                    "- NEVER say 'I found nothing' if sources contain ANY related information",
                     "- Distinguish clearly: 'Based on [Source 1]...' vs 'From general knowledge...'",
                     "",
                     f"Current task: {user_message[:200]}...",
@@ -1992,6 +2255,16 @@ class LollmsDiscussion:
                         callback(f"   ➜ Action chosen: {action}", MSG_TYPE.MSG_TYPE_INFO)
                         callback(f"   ➜ Parameters: {json.dumps(parameters)[:100]}{'...' if len(json.dumps(parameters)) > 100 else ''}", MSG_TYPE.MSG_TYPE_INFO)
                         callback(f"   ➜ Confidence: {confidence:.2f}", MSG_TYPE.MSG_TYPE_INFO)
+                    
+                    # FORCE FINAL ANSWER if we have sources and are trying to search again
+                    if action in rag_registry and len(collected_sources) > 0 and len(queries_performed) >= 2:
+                        if callback:
+                            callback(f"   🛑 OVERRIDING: You already have {len(collected_sources)} sources from {len(queries_performed)} queries", MSG_TYPE.MSG_TYPE_WARNING)
+                            callback(f"   🛑 Forcing final_answer to use available information", MSG_TYPE.MSG_TYPE_WARNING)
+                        
+                        scratchpad += f"\n**SYSTEM OVERRIDE:** Prevented another search. You have {len(collected_sources)} sources already. Use them!\n"
+                        action = "final_answer"
+                        parameters = {"answer": "forced_synthesis"}
                     
                     scratchpad += f"\n## Step {step + 1}\n**Reasoning:** {reasoning}\n**Action:** {action}\n**Confidence:** {confidence}\n"
                     
@@ -2103,9 +2376,9 @@ class LollmsDiscussion:
                     callback(f"📊 No RAG queries performed", MSG_TYPE.MSG_TYPE_INFO)
             
             # Generate final synthesis if needed
-            if not final_answer_text or final_answer_text == "forced":
+            if not final_answer_text or final_answer_text == "forced" or final_answer_text == "forced_synthesis":
                 if callback:
-                    callback(f"📝 Generating final synthesis...", MSG_TYPE.MSG_TYPE_INFO)
+                    callback(f"📝 Generating final synthesis from {len(collected_sources)} sources...", MSG_TYPE.MSG_TYPE_INFO)
                 
                 # Build query summary for final synthesis
                 query_summary = ""
@@ -2113,7 +2386,19 @@ class LollmsDiscussion:
                     query_summary = f"\n# Search Queries Performed ({len(queries_performed)} total)\n"
                     for idx, q in enumerate(queries_performed, 1):
                         query_summary += f"{idx}. [{q['tool']}] Query: '{q['query']}' → {q['result_count']} results found\n"
-                    query_summary += "\nYou have completed your research. Use the information gathered above.\n"
+                    query_summary += "\n"
+                
+                # Add complete source content for synthesis
+                sources_content = ""
+                if collected_sources:
+                    sources_content = f"\n# Retrieved Information ({len(collected_sources)} sources)\n\n"
+                    for idx, src in enumerate(collected_sources, 1):
+                        content = src.get('content', '')
+                        source_name = src.get('source', 'Unknown')
+                        score = src.get('relevance_score', 0.0)
+                        sources_content += f"[Source {idx}] {source_name} (relevance: {score:.2f}):\n{content}\n\n"
+                    
+                    sources_content += "\nYou MUST use the above sources in your answer. Even if information is incomplete, cite what you found.\n"
                 
                 synthesis_prompt = "\n".join([
                     full_system_prompt,
@@ -2121,6 +2406,7 @@ class LollmsDiscussion:
                     "# Complete Analysis",
                     scratchpad,
                     query_summary,
+                    sources_content,
                     "",
                     "# VERACITY PROTOCOL (MANDATORY)",
                     "You MUST follow these rules when providing your final answer:",
@@ -2130,25 +2416,36 @@ class LollmsDiscussion:
                     "   - For information from tool execution → State 'Based on [tool_name] results...'",
                     "   - For general knowledge (training data) → State 'From my general knowledge...' or 'As I understand...'",
                     "",
-                    "2. UNCERTAINTY EXPRESSION:",
-                    "   - If you're not certain → Say 'I'm not certain' or 'I don't have enough information'",
+                    "2. HANDLING INCOMPLETE INFORMATION:",
+                    "   - If sources provide PARTIAL information → Use it and cite it! Say 'Based on [1], I can tell you X, but the sources don't cover Y'",
+                    "   - If sources are somewhat relevant but not perfect → Still cite them and explain what they do/don't cover",
+                    "   - NEVER say 'I found nothing' if sources contain ANY related content",
+                    "   - Partial answers are BETTER than claiming you have no information",
+                    "",
+                    "3. UNCERTAINTY EXPRESSION:",
+                    "   - If you're not certain → Say 'I'm not certain' or 'Based on limited information...'",
                     "   - If sources conflict → Present both views and note the conflict",
-                    "   - If you don't know → Say 'I don't know' explicitly (this is acceptable and preferred to guessing)",
+                    "   - If you truly have no information → Say 'I don't have information about this' (but check sources first!)",
                     "",
-                    "3. KNOWLEDGE BOUNDARIES:",
+                    "4. KNOWLEDGE BOUNDARIES:",
                     "   - NEVER invent facts, dates, names, statistics, or quotes",
-                    "   - NEVER guess when specific factual information is required",
-                    "   - If sources don't contain the answer → Admit it honestly",
+                    "   - If sources are sparse → Acknowledge it but USE what's there",
+                    "   - Combine source information with general knowledge, clearly marked",
                     "",
-                    "4. RESPONSE STRUCTURE:",
-                    "   - Start with what you FOUND in sources (with citations)",
-                    "   - Then add relevant general knowledge (clearly marked)",
-                    "   - End with any uncertainties or limitations",
+                    "5. RESPONSE STRUCTURE:",
+                    "   - Start with what you FOUND in sources (with citations), even if limited",
+                    "   - Add relevant general knowledge (clearly marked)",
+                    "   - Explain what information is missing or uncertain",
                     "",
                     "# Task",
                     f"Provide a comprehensive, truthful final answer to: {user_message}",
                     "",
-                    "Remember: Saying 'I don't know' or 'The sources don't contain this information' is BETTER than guessing or inventing information."
+                    "IMPORTANT REMINDERS:",
+                    "- Use whatever information you found in the sources, even if incomplete",
+                    "- Cite all sources with [1], [2], [3] format",
+                    "- It's OK to say 'Based on available sources, I can tell you X but not Y'",
+                    "- Partial information with proper citations is valuable",
+                    "- Don't claim you found nothing if sources contain ANY relevant content"
                 ])
                 
                 final_answer_text = self.lollmsClient.generate_text(
@@ -2254,8 +2551,7 @@ class LollmsDiscussion:
                 if len(queries_performed) >= max_rag_queries:
                     callback(f"⚠️ Query limit reached - consider increasing max_rag_queries if needed", MSG_TYPE.MSG_TYPE_WARNING)
         
-        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}    
-
+        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
 
 
     def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
