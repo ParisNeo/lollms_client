@@ -1818,6 +1818,7 @@ class LollmsDiscussion:
                 try:
                     query_json = self.lollmsClient.generate_structured_content(
                         prompt=query_prompt,
+                        images=images,
                         schema={"query": "Your concise search query string"},
                         system_prompt="Output only JSON.",
                         temperature=0.1
@@ -2227,6 +2228,7 @@ class LollmsDiscussion:
                     
                     decision_data = self.lollmsClient.generate_structured_content(
                         prompt=reasoning_prompt,
+                        images=images,
                         schema={
                             "reasoning": "string",
                             "action": "string", 
