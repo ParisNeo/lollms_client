@@ -986,6 +986,7 @@ class OllamaBinding(LollmsLLMBinding):
             'dolphin': 32768,     # Dolphin (often Mistral-based)
             'openhermes': 8192,   # OpenHermes default
             'gemini-3': 1000000,  # Gemini 3 is a beast with 1M tokens
+            'Kimi-K 2.5': 256000  # Kimi-K 2.5
         }
         
         # Extract base model name (e.g., 'llama3' from 'llama3:8b-instruct')
