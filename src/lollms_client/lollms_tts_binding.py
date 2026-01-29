@@ -9,8 +9,9 @@ from lollms_client.lollms_base_binding import LollmsBaseBinding
 class LollmsTTSBinding(LollmsBaseBinding):
     def __init__(self,
                  binding_name: str = "unknown",
+                 debug:Optional[bool] = False,
                  **kwargs):
-        super().__init__(binding_name=binding_name, **kwargs)
+        super().__init__(binding_name=binding_name, debug=debug, **kwargs)
         self.settings = kwargs
 
     @abstractmethod

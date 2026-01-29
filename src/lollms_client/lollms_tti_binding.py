@@ -19,6 +19,7 @@ class LollmsTTIBinding(LollmsBaseBinding):
 
     def __init__(self,
                  binding_name:str="unknown",
+                 debug:Optional[bool] = False,
                  **kwargs):
         """
         Initialize the LollmsTTIBinding base class.
@@ -32,7 +33,7 @@ class LollmsTTIBinding(LollmsBaseBinding):
         - author: str (Author name for metadata)
         - system: str (System name for metadata)
         """
-        super().__init__(binding_name=binding_name, **kwargs)
+        super().__init__(binding_name=binding_name, debug=debug, **kwargs)
         self.watermark_path = kwargs.get("watermark_path", None)
         self.watermark_size = (
             kwargs.get("watermark_size_x", 100),

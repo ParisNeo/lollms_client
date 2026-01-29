@@ -10,7 +10,7 @@ class LollmsBaseBinding(ABC):
     Base class for all LOLLMS bindings (LLM, TTI, TTS, STT, TTM, TTV, MCP).
     Enforces a unified initialization and common methods.
     """
-    def __init__(self, binding_name: str, **kwargs):
+    def __init__(self, binding_name: str, debug:Optional[bool]=False, **kwargs):
         """
         Initialize the binding.
         
@@ -19,6 +19,7 @@ class LollmsBaseBinding(ABC):
             **kwargs: Configuration parameters passed from the manager/app.
         """
         self.binding_name = binding_name
+        self.debug = debug
         self.config = kwargs
         self.binding_dir = self._get_binding_dir()
         self.description = self._load_description()

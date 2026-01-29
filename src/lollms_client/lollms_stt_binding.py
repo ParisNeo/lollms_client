@@ -12,11 +12,12 @@ class LollmsSTTBinding(LollmsBaseBinding):
 
     def __init__(self,
                  binding_name:str="unknown",
+                 debug:Optional[bool] = False,
                  **kwargs):
         """
         Initialize the LollmsSTTBinding base class.
         """
-        super().__init__(binding_name=binding_name, **kwargs)
+        super().__init__(binding_name=binding_name, debug=debug, **kwargs)
 
     @abstractmethod
     def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:

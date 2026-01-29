@@ -11,11 +11,12 @@ class LollmsTTVBinding(LollmsBaseBinding):
 
     def __init__(self,
                  binding_name:str="unknown",
+                 debug:Optional[bool] = False,
                  **kwargs):
         """
         Initialize the LollmsTTVBinding base class.
         """
-        super().__init__(binding_name=binding_name, **kwargs)
+        super().__init__(binding_name=binding_name, debug=debug, **kwargs)
 
     @abstractmethod
     def generate_video(self, prompt: str, **kwargs) -> bytes:

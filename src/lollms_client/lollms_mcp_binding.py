@@ -14,12 +14,13 @@ class LollmsMCPBinding(LollmsBaseBinding):
 
     def __init__(self,
                  binding_name: str,
+                 debug:Optional[bool] = False,
                  **kwargs
                  ):
         """
         Initialize the LollmsMCPBinding.
         """
-        super().__init__(binding_name=binding_name, **kwargs)
+        super().__init__(binding_name=binding_name, debug=debug, **kwargs)
         self.settings = kwargs
 
 

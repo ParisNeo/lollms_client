@@ -67,11 +67,15 @@ class LollmsClient():
                  user_name ="user",
                  ai_name = "assistant",
                  callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
+
+                 debug: Optional[bool] = False,
                  **kwargs
                  ):
         """
         Initialize the LollmsClient with LLM and optional modality bindings.
         """
+
+        self.debug = debug
         if callback: callback("🚀 Initializing **Lollms Client**...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
         
         self.llm_binding_manager = LollmsLLMBindingManager(llm_bindings_dir)

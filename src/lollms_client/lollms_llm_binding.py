@@ -42,7 +42,8 @@ class LollmsLLMBinding(LollmsBaseBinding):
     """Abstract base class for all LOLLMS LLM bindings"""
     
     def __init__(self, 
-                 binding_name: Optional[str] ="unknown",
+                 binding_name: str ="unknown",
+                 debug:Optional[bool] = False,
                  **kwargs
         ):
         """
@@ -51,7 +52,7 @@ class LollmsLLMBinding(LollmsBaseBinding):
         Args:
             binding_name (Optional[str]): The name of the bindingto be used
         """
-        super().__init__(binding_name=binding_name, **kwargs)
+        super().__init__(binding_name=binding_name, debug=debug, **kwargs)
         self.model_name = None #Must be set by the instance
         self.default_ctx_size = kwargs.get("ctx_size") 
         self.default_n_predict = kwargs.get("n_predict")
