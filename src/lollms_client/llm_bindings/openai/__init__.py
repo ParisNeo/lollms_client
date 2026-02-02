@@ -135,7 +135,7 @@ class OpenAIBinding(LollmsLLMBinding):
             if k in allowed_params and v is not None:
                 params[k] = v
             else:
-                if v is not None:
+                if v is not None and kwargs.get("debug",False):
                     ASCIIColors.warning(f"Removed unsupported OpenAI param '{k}'")
 
         model_lower = model.lower()
