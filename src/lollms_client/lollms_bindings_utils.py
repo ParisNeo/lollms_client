@@ -1,7 +1,7 @@
 from pathlib import Path
 import yaml
-import importlib
 from typing import List, Dict, Optional, Union
+import importlib.util
 import sys
 
 # Define known binding types and their corresponding folder names
@@ -47,50 +47,60 @@ def get_binding_desc(binding_name: str, binding_type: str) -> Dict:
     """
     Retrieves the description of a binding.
     
-    Checks for a get_binding_desc() function in the binding's __init__.py first.
-    If not found, falls back to reading description.yaml in the binding directory.
+    This function first attempts to load a custom description loader from
+    'binding_config.py' if it exists in the binding directory. This allows
+    bindings to customize their description without loading the full binding.
+    
+    If 'binding_config.py' does not exist or fails to load, it falls back to
+    reading 'description.yaml' directly.
     
     Args:
         binding_name (str): The name of the binding.
-        binding_type (str, optional): The type of binding to narrow search (llm, tti, etc.). 
-                                      If None, searches all known types.
+        binding_type (str): The type of binding (llm, tti, etc.).
     
     Returns:
         Dict: The binding description.
     """
     
-    found_path = None
-    found_type = None
-    
-    root_dir = Path(__file__).parent
-    
-    # Locate the binding
     if not binding_type:
         raise Exception("Please specify the binding type")
-    folder_name = BINDING_TYPES.get(binding_type, f"{binding_type}_bindings")
-    candidate_path = root_dir / folder_name / binding_name
-    if candidate_path.exists() and (candidate_path / "__init__.py").exists():
-        found_path = candidate_path
-        found_type = binding_type
-
     
-    if not found_path:
-        return {"error": f"Binding {binding_name} not found."}
+    root_dir = Path(__file__).parent
+    folder_name = BINDING_TYPES.get(binding_type, f"{binding_type}_bindings")
+    binding_path = root_dir / folder_name / binding_name
+    
+    if not binding_path.exists() or not binding_path.is_dir():
+        return {"error": f"Binding {binding_name} not found in {folder_name}."}
 
-    # Try to import and call get_binding_desc
-    try:
-        folder_name = BINDING_TYPES.get(found_type, found_type+'_bindings')
-        module_name = f"lollms_client.{folder_name}.{binding_name}.config"
-        module = importlib.import_module(module_name)
-        
-        if hasattr(module, "get_binding_desc") and callable(module.get_binding_desc):
-            return module.get_binding_desc()
-    except Exception as e:
-        # If import fails no config.py file is found, ignore and use yaml
-        pass
-
-    # Fallback to description.yaml
-    desc_file = found_path / "description.yaml"
+    # Step 1: Try to use custom description loader from binding_config.py
+    # This is a lightweight module that should not have heavy dependencies
+    config_file = binding_path / "binding_config.py"
+    if config_file.exists():
+        try:
+            # Use spec-based import to avoid polluting sys.modules heavily
+            module_name = f"lollms_client.{folder_name}.{binding_name}.binding_config"
+            
+            # Check if already loaded
+            if module_name in sys.modules:
+                module = sys.modules[module_name]
+            else:
+                spec = importlib.util.spec_from_file_location(module_name, str(config_file))
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = module
+                    spec.loader.exec_module(module)
+                else:
+                    module = None
+            
+            if module and hasattr(module, "get_binding_desc") and callable(module.get_binding_desc):
+                return module.get_binding_desc()
+        except Exception as e:
+            # Custom loader failed, fall through to YAML fallback
+            pass
+    
+    # Step 2: Fall back to reading description.yaml directly
+    # This path has zero side effects - no code execution
+    desc_file = binding_path / "description.yaml"
     if desc_file.exists():
         try:
             with open(desc_file, "r", encoding="utf-8") as f:
@@ -98,4 +108,4 @@ def get_binding_desc(binding_name: str, binding_type: str) -> Dict:
         except Exception as e:
             return {"error": f"Failed to load description.yaml: {e}"}
             
-    return {"error": "No description found."}
+    return {"error": "No description found (neither binding_config.py with get_binding_desc() nor description.yaml exists)."}
