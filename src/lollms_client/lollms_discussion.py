@@ -1067,7 +1067,7 @@ class LollmsDiscussion:
                     self.participants = {}
                 # Update only if not present or icon is missing
                 if sender_name not in self.participants or self.participants[sender_name].get('icon') is None:
-                    self.participants[sender_name] = {"icon": sender_icon}
+                    self.participants[sender_name] = {"icon": sender_icon, "name":sender_name}
                     self.touch()
         # --- END NEW PARTICIPANT LOGIC ---
 
@@ -2847,8 +2847,12 @@ class LollmsDiscussion:
         for msg in branch:
             if msg.sender_type == 'user':
                 role = participants.get(msg.sender, "user")
+                if isinstance(role, dict): 
+                    role=role.get("name", "user")
             else:
                 role = participants.get(msg.sender, "assistant")
+                if isinstance(role, dict): 
+                    role=role.get("name", "assistant")
 
             content = get_full_content(msg)
             active_images_b64 = msg.get_active_images()
