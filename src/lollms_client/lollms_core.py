@@ -285,6 +285,10 @@ class LollmsClient():
     def generate_text(self, *args, **kwargs) -> Union[str, dict]:
         if self.llm: return self.llm.generate_text(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
+    
+    def generate(self, *args, **kwargs) -> Union[str, dict]:
+        if self.llm: return self.llm.generate_text(*args, **kwargs)
+        raise RuntimeError("LLM binding not initialized.")
 
     def generate_from_messages(self, *args, **kwargs) -> Union[str, dict]:
         if self.llm: return self.llm.generate_from_messages(*args, **kwargs)

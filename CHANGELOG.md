@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-02-06 01:59]
+
+- docs(readme): uncomment service_key examples to improve API key setup visibility
+
 ## [2026-02-04 01:56]
 
 - feat(bindings): add safe module loading for binding descriptions

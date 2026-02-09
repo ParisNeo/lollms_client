@@ -866,7 +866,7 @@ try:
             llm_binding_name="openai",
             llm_binding_config={
                 "model_name": "gpt-4o", # Or "gpt-3.5-turbo"
-                # "service_key": os.environ.get("OPENAI_API_KEY", "your_openai_api_key_here") 
+                "service_key": os.environ.get("OPENAI_API_KEY", "your_openai_api_key_here") 
                 # ^ service_key is optional if OPENAI_API_KEY env var is set
             }
         )
@@ -904,7 +904,7 @@ try:
             llm_binding_name="gemini",
             llm_binding_config={
                 "model_name": "gemini-1.5-pro-latest",
-                # "service_key": os.environ.get("GEMINI_API_KEY", "your_google_api_key_here")
+                "service_key": os.environ.get("GEMINI_API_KEY", "your_google_api_key_here")
             }
         )
 
@@ -941,7 +941,7 @@ try:
             llm_binding_name="claude",
             llm_binding_config={
                 "model_name": "claude-3-5-sonnet-20240620",
-                # "service_key": os.environ.get("ANTHROPIC_API_KEY", "your_anthropic_api_key_here")
+                "service_key": os.environ.get("ANTHROPIC_API_KEY", "your_anthropic_api_key_here")
             }
         )
 
