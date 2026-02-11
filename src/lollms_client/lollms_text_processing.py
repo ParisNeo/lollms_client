@@ -1553,14 +1553,12 @@ Important:
 
         return ranking
 
-    def summerize_text(self, text: str, summary_instruction: str = "Summarize concisely", **kwargs) -> str:
+    def summerize_text(self, text: str, summary_instruction: str = "Summarize concisely", **kwargs) -> str|dict:
         """Summarize a given text."""
         prompt = f"{summary_instruction}\n\nText to summarize:\n{text}"
         response = self.llm.generate_text(prompt, **kwargs)
         
-        if isinstance(response, dict) and not response.get("status", True):
-            return ""
-        return response.strip()
+        return response.strip() if isinstance(response,str) else response
     
     def extract_keywords(self, text: str, num_keywords: int = 5, **kwargs) -> list:
         """Extract key keywords/phrases from text."""

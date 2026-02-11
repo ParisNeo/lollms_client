@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Type, Union, Tuple
 from ascii_colors import trace_exception
 import time
 from sqlalchemy import (Column, DateTime, Float, ForeignKey, Integer, JSON,
@@ -1197,8 +1197,8 @@ class LollmsDiscussion:
         user_message: str,
         personality: Optional['LollmsPersonality'] = None,
         branch_tip_id: Optional[str | None] = None,
-        use_mcps: Union[None, bool, List[str]] = None,
-        use_data_store: Union[None, Dict[str, Callable]] = None,
+        mcps: Union[None, bool, List[str]] = None,
+        rag_data_stores: Union[None, Dict[str, Callable]] = None,
         add_user_message: bool = True,
         max_reasoning_steps: int = 20,
         images: Optional[List[str]] = None,
@@ -1358,8 +1358,8 @@ class LollmsDiscussion:
                 sources.append(zone_name)
 
         # 3. Query external data stores
-        if intent.get("needs_external_search") and use_data_store:
-            for name, fn in use_data_store.items():
+        if intent.get("needs_external_search") and rag_data_stores:
+            for name, fn in rag_data_stores.items():
                 if callable(fn):
                     if callback:
                         callback(f"🔎 Searching {name}...", MSG_TYPE.MSG_TYPE_INFO)
@@ -1431,48 +1431,166 @@ class LollmsDiscussion:
         user_message: str,
         personality: Optional['LollmsPersonality'] = None,
         branch_tip_id: Optional[str | None] = None,
-        use_mcps: Union[None, bool, List[str]] = None,
-        use_data_store: Union[None, Dict[str, Callable]] = None,
+        # Tools are usable by the agent in order to perform tasks or recover information. Each tool is an entry of this Dict:
+        # the key is the name of the tool
+        # the value is a Dict with this structure:
+        # "name": the name of the function to be called
+        # "description": the description of the function
+        # "parameters": the list of parameters:
+        #               {"name": parameter name, "type": "parameter type", "description": "parameter description", "optional": "a bool stating if it is optional", "default":"default value if optional"}
+        # "output": the list of outputs:
+        #               {"name": parameter name, "type": "parameter type", "description": "parameter description"}
+        # "callable": the callable to be called with the parameters and that returns the outputs
+        #
+        # Some common outputs (optional, but if present we must process them)
+        # "sources": A list of sources in data source outputs ... useful for referencing the data
+        # "success": A boolean stating if the function succeeded
+        # "error": A boolean or a text. if a boolean then it shows if an error occured, if a text, then if it is not empty, there is an error and the text of error is provided
+        tools: Union[None, Dict[str, Dict[str, Any]]] = None,
         add_user_message: bool = True,
         max_reasoning_steps: int = 20,
         images: Optional[List[str]] = None,
         debug: bool = False,
         remove_thinking_blocks: bool = True,
-        use_rlm: bool = False,
-        decision_temperature: float = 0.5,
-        final_answer_temperature: float = 0.7,
-        rag_top_k: int = 5,
-        rag_min_similarity_percent: float = 0.5,
         **kwargs
     ) -> Dict[str, Any]:
         """
-        Advanced agentic chat with RLM support, Multi-Hop RAG, and intelligent document handling.
+        Advanced agentic chat with composable answers, self-correction, and dynamic scratchpad.
         
         Features:
-        - RLM Mode: Handles 100x context window via recursive processing
-        - Smart Document Management: Efficiently processes large files (PDF, PPTX, CSV, HTML, Excel)
-        - Context Budget Management: Reserves space for conversation history
-        - Multi-document Operations: Summarization, cross-reference, comparison
+        - Composable Final Answer: Build answers incrementally through multiple tool calls
+        - Self-Correction: Agent can revise assumptions based on new information
+        - Dynamic Scratchpad: Persistent note-taking across reasoning steps
+        - Full Context Access: All data zones and history available at every step
+        - Unified Tools System: All capabilities (RAG, MCP, RLM, custom) via tools parameter
+        
+        COMPOSABLE ANSWER WORKFLOW:
+        The agent can build answers iteratively:
+        1. Search for theme 1 → append_to_answer("Theme 1 content...")
+        2. Search for theme 2 → append_to_answer("Theme 2 content...")
+        3. Self-correct if needed → update_answer_section(section_id, "corrected content")
+        4. Continue until complete → final_answer()
+        
+        SELF-CORRECTION WORKFLOW:
+        1. Make initial assumption
+        2. Query reveals assumption is wrong
+        3. update_scratchpad("assumption_status", "WRONG: initial assumption was X, actually Y")
+        4. Revise answer or query again
+        
+        Args:
+            user_message: The user's input message
+            personality: Optional personality configuration
+            branch_tip_id: Optional ID for conversation branching
+            tools: Dictionary of tools available to the agent. Each tool entry has:
+                - "name": Function name to call
+                - "description": What the tool does (used by LLM to decide when to use it)
+                - "parameters": List of parameter definitions, each with:
+                    * "name": Parameter name
+                    * "type": Parameter type (str, int, float, bool, list, dict, etc.)
+                    * "description": What this parameter is for
+                    * "optional": Boolean indicating if parameter is optional
+                    * "default": Default value if optional
+                - "output": List of output definitions, each with:
+                    * "name": Output field name
+                    * "type": Output type
+                    * "description": What this output represents
+                - "callable": The actual function to call
+                
+                Common tool output fields (optional but important if present):
+                    - "sources": List of data sources used (for attribution)
+                    - "success": Boolean indicating if operation succeeded
+                    - "error": Boolean or string describing any error
+                
+                Example tool structure:
+                {
+                    "search_company_docs": {
+                        "name": "search_company_docs",
+                        "description": "Search company documentation for relevant information",
+                        "parameters": [
+                            {
+                                "name": "query",
+                                "type": "str",
+                                "description": "Search query string",
+                                "optional": False
+                            },
+                            {
+                                "name": "max_results",
+                                "type": "int",
+                                "description": "Maximum number of results to return",
+                                "optional": True,
+                                "default": 5
+                            }
+                        ],
+                        "output": [
+                            {
+                                "name": "results",
+                                "type": "list",
+                                "description": "List of search results"
+                            },
+                            {
+                                "name": "sources",
+                                "type": "list",
+                                "description": "Source documents used"
+                            },
+                            {
+                                "name": "success",
+                                "type": "bool",
+                                "description": "Whether search succeeded"
+                            }
+                        ],
+                        "callable": my_search_function
+                    }
+                }
+            
+            add_user_message: Whether to add the user message to conversation history
+            max_reasoning_steps: Maximum number of agentic reasoning iterations
+            images: Optional list of image paths/URLs to include
+            debug: Enable debug output
+            remove_thinking_blocks: Remove <thinking> tags from final output
+            **kwargs: Additional arguments (streaming_callback, temperature, etc.)
+        
+        Returns:
+            Dict containing:
+                - "user_message": The user message object
+                - "ai_message": The AI response message object
+                - "sources": List of sources used (if any)
+                - "scratchpad": Final scratchpad state (if agentic mode)
+                - "self_corrections": List of self-corrections made (if any)
         
         Based on: Zhang & Kraska (MIT CSAIL) - Recursive Language Models
         """
         callback = kwargs.get("streaming_callback")
         collected_sources = []
-        queries_performed = []  # Initialize at start to avoid UnboundLocalError
+        queries_performed = []
+        self_corrections = []  # Track all self-corrections
         
-        # --- RLM Pre-processing: Context Offloading ---
+        # --- Configuration extraction ---
+        decision_temperature = kwargs.get("decision_temperature", 0.3)
+        final_answer_temperature = kwargs.get("final_answer_temperature", 0.7)
+        rag_top_k = kwargs.get("rag_top_k", 5)
+        rag_min_similarity_percent = kwargs.get("rag_min_similarity_percent", 0.5)
+        max_rag_queries = kwargs.get("max_rag_queries", 10)  # Increased for composable answers
+        preflight_rag_enabled = kwargs.get("preflight_rag", True)
+        
+        # --- Detect RLM mode from tools ---
+        rlm_enabled = False
         rlm_context_var_name = "USER_INPUT_CONTEXT"
         actual_user_content_for_llm = user_message
-        rlm_enabled = use_rlm
+        
+        if tools:
+            # Check if RLM tools are present (python_exec, llm_query)
+            has_python_exec = any(t.get("name") == "python_exec" for t in tools.values() if isinstance(t, dict))
+            has_llm_query = any(t.get("name") == "llm_query" for t in tools.values() if isinstance(t, dict))
+            rlm_enabled = has_python_exec and has_llm_query
         
         if rlm_enabled:
             if callback:
                 callback("🔄 RLM Mode: Recursive Language Model Enabled", MSG_TYPE.MSG_TYPE_INFO)
                 callback(f"   Context size: {len(user_message)} chars", MSG_TYPE.MSG_TYPE_INFO)
             
-            preview_length = 500
             # Only activate RLM stub for truly large inputs (>10K chars)
             if len(user_message) > 10000:
+                preview_length = 500
                 actual_user_content_for_llm = "\n".join([
                     "<RLM_STUB>",
                     f"The user has provided a large input ({len(user_message):,} characters, ~{self.lollmsClient.count_tokens(user_message):,} tokens).",
@@ -1632,7 +1750,7 @@ class LollmsDiscussion:
             callback(f"   Target documents: {', '.join(doc_intent['target_docs']) if doc_intent['target_docs'] else 'all'}", MSG_TYPE.MSG_TYPE_INFO)
             callback(f"   Requires full content: {doc_intent['requires_full_content']}", MSG_TYPE.MSG_TYPE_INFO)
         
-        # --- Build Tool Registry with Structured RAG ---
+        # --- Build Tool Registry ---
         tool_registry = {}
         tool_descriptions = []
         rag_registry = {}
@@ -1641,77 +1759,449 @@ class LollmsDiscussion:
         if callback:
             callback("🔧 Building tool registry...", MSG_TYPE.MSG_TYPE_INFO)
         
-        # === STRUCTURED RAG INTEGRATION ===
+        # === COMPOSABLE ANSWER STATE ===
+        # This stores the incrementally built answer
+        composable_answer = {
+            "sections": [],  # List of {id, content, timestamp, sources_used}
+            "complete": False,
+            "last_updated": None
+        }
         
-        # Helper to create standardized RAG tool wrapper
-        def create_rag_wrapper(rag_fn: Callable, kb_name: str, description: str = None):
-            """Creates a standardized RAG tool wrapper with proper result formatting."""
-            def wrapped_rag_search(query: str) -> Dict[str, Any]:
-                try:
-                    results = rag_fn(query)
+        # === DYNAMIC SCRATCHPAD STATE ===
+        # Persistent note-taking across reasoning steps
+        scratchpad_state = {
+            "notes": {},  # key-value pairs for notes
+            "history": [],  # chronological log of all scratchpad changes
+            "assumptions": {},  # track assumptions and their status (VALID/WRONG/UNCERTAIN)
+            "corrections": []  # track self-corrections made
+        }
+        
+        # === COMPOSABLE ANSWER TOOLS ===
+        # These are only available in agentic mode
+        
+        def append_to_answer(content: str, section_id: str = None, sources: List[str] = None) -> Dict[str, Any]:
+            """
+            Append content to the composable answer.
+            Allows building the final answer incrementally.
+            """
+            import uuid
+            from datetime import datetime
+            
+            if section_id is None:
+                section_id = f"section_{len(composable_answer['sections']) + 1}"
+            
+            section = {
+                "id": section_id,
+                "content": content,
+                "timestamp": datetime.now().isoformat(),
+                "sources_used": sources or [],
+                "status": "active"
+            }
+            
+            composable_answer["sections"].append(section)
+            composable_answer["last_updated"] = datetime.now().isoformat()
+            
+            if callback:
+                callback(f"✏️  Added section '{section_id}' ({len(content)} chars)", MSG_TYPE.MSG_TYPE_INFO)
+            
+            return {
+                "success": True,
+                "section_id": section_id,
+                "total_sections": len(composable_answer["sections"]),
+                "current_length": sum(len(s["content"]) for s in composable_answer["sections"] if s["status"] == "active")
+            }
+        
+        def update_answer_section(section_id: str, new_content: str, reason: str = None) -> Dict[str, Any]:
+            """
+            Update an existing section of the answer (for self-correction).
+            """
+            from datetime import datetime
+            
+            for section in composable_answer["sections"]:
+                if section["id"] == section_id:
+                    old_content = section["content"]
+                    section["content"] = new_content
+                    section["updated_at"] = datetime.now().isoformat()
+                    section["update_reason"] = reason or "Self-correction"
                     
-                    # Standardize output format
-                    formatted = []
-                    if isinstance(results, list):
-                        for chunk in results:
-                            # Handle various score formats
-                            score = chunk.get('score', chunk.get('value', chunk.get('similarity', 0.0)))
-                            if score > 1.0:
-                                score = 1.0 if score > 100.0 else score / 100.0
-                            
-                            formatted.append({
-                                "content": chunk.get('content', chunk.get('text', str(chunk))),
-                                "score": float(score),
-                                "source": chunk.get('source', kb_name),
-                                "metadata": chunk.get('metadata', {})
-                            })
-                        
-                        # Sort by relevance
-                        formatted.sort(key=lambda x: x['score'], reverse=True)
-                        
-                        # Apply top_k and min_similarity filters
-                        formatted = [
-                            r for r in formatted[:rag_top_k] 
-                            if r['score'] >= rag_min_similarity_percent
-                        ]
-                    else:
-                        # Non-list result (e.g., string)
-                        formatted = [{
-                            "content": str(results),
-                            "score": 1.0,
-                            "source": kb_name,
-                            "metadata": {}
-                        }]
+                    composable_answer["last_updated"] = datetime.now().isoformat()
                     
-                    return {
-                        "status": "success",
-                        "results": formatted,
-                        "count": len(formatted),
-                        "query": query
+                    # Track self-correction
+                    correction = {
+                        "section_id": section_id,
+                        "old_content": old_content[:200] + "..." if len(old_content) > 200 else old_content,
+                        "new_content": new_content[:200] + "..." if len(new_content) > 200 else new_content,
+                        "reason": reason,
+                        "timestamp": datetime.now().isoformat()
                     }
-                except Exception as e:
+                    self_corrections.append(correction)
+                    scratchpad_state["corrections"].append(correction)
+                    
+                    if callback:
+                        callback(f"🔄 Updated section '{section_id}': {reason or 'Self-correction'}", MSG_TYPE.MSG_TYPE_INFO)
+                    
                     return {
-                        "status": "error",
-                        "message": str(e),
-                        "query": query
+                        "success": True,
+                        "section_id": section_id,
+                        "updated": True,
+                        "reason": reason
                     }
             
-            wrapped_rag_search.__doc__ = description or f"Search the '{kb_name}' knowledge base"
-            return wrapped_rag_search
+            return {
+                "success": False,
+                "error": f"Section '{section_id}' not found"
+            }
         
-        # 1. Register personality.data_source as primary RAG tool
+        def remove_answer_section(section_id: str, reason: str = None) -> Dict[str, Any]:
+            """
+            Remove a section from the answer (mark as inactive).
+            """
+            from datetime import datetime
+            
+            for section in composable_answer["sections"]:
+                if section["id"] == section_id:
+                    section["status"] = "removed"
+                    section["removed_at"] = datetime.now().isoformat()
+                    section["removal_reason"] = reason or "No longer relevant"
+                    
+                    composable_answer["last_updated"] = datetime.now().isoformat()
+                    
+                    if callback:
+                        callback(f"🗑️  Removed section '{section_id}': {reason or 'No longer relevant'}", MSG_TYPE.MSG_TYPE_INFO)
+                    
+                    return {
+                        "success": True,
+                        "section_id": section_id,
+                        "removed": True
+                    }
+            
+            return {
+                "success": False,
+                "error": f"Section '{section_id}' not found"
+            }
+        
+        def get_current_answer() -> Dict[str, Any]:
+            """
+            Get the current state of the composable answer.
+            """
+            active_sections = [s for s in composable_answer["sections"] if s.get("status") == "active"]
+            full_text = "\n\n".join(s["content"] for s in active_sections)
+            
+            return {
+                "success": True,
+                "full_text": full_text,
+                "sections": active_sections,
+                "total_sections": len(active_sections),
+                "total_length": len(full_text),
+                "last_updated": composable_answer.get("last_updated")
+            }
+        
+        # === SCRATCHPAD TOOLS ===
+        
+        def update_scratchpad(key: str, value: Any, category: str = "notes") -> Dict[str, Any]:
+            """
+            Update the scratchpad with a note, assumption, or observation.
+            Categories: 'notes', 'assumptions', 'observations'
+            """
+            from datetime import datetime
+            
+            if category == "assumptions":
+                scratchpad_state["assumptions"][key] = {
+                    "value": value,
+                    "status": "UNCERTAIN",  # Can be: UNCERTAIN, VALID, WRONG
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                scratchpad_state["notes"][key] = value
+            
+            scratchpad_state["history"].append({
+                "action": "update",
+                "category": category,
+                "key": key,
+                "value": value,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            if callback:
+                callback(f"📝 Scratchpad updated: {category}.{key}", MSG_TYPE.MSG_TYPE_INFO)
+            
+            return {
+                "success": True,
+                "key": key,
+                "category": category
+            }
+        
+        def update_assumption_status(assumption_key: str, status: str, reason: str = None) -> Dict[str, Any]:
+            """
+            Update the status of an assumption (VALID/WRONG/UNCERTAIN).
+            Use this when new information confirms or refutes an assumption.
+            """
+            from datetime import datetime
+            
+            if assumption_key not in scratchpad_state["assumptions"]:
+                return {
+                    "success": False,
+                    "error": f"Assumption '{assumption_key}' not found"
+                }
+            
+            old_status = scratchpad_state["assumptions"][assumption_key].get("status", "UNCERTAIN")
+            scratchpad_state["assumptions"][assumption_key]["status"] = status
+            scratchpad_state["assumptions"][assumption_key]["updated_at"] = datetime.now().isoformat()
+            
+            if reason:
+                scratchpad_state["assumptions"][assumption_key]["reason"] = reason
+            
+            scratchpad_state["history"].append({
+                "action": "assumption_status_change",
+                "key": assumption_key,
+                "old_status": old_status,
+                "new_status": status,
+                "reason": reason,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            if callback:
+                callback(f"🔍 Assumption '{assumption_key}': {old_status} → {status}", MSG_TYPE.MSG_TYPE_INFO)
+                if reason:
+                    callback(f"   Reason: {reason}", MSG_TYPE.MSG_TYPE_INFO)
+            
+            return {
+                "success": True,
+                "assumption": assumption_key,
+                "old_status": old_status,
+                "new_status": status
+            }
+        
+        def get_scratchpad(category: str = None) -> Dict[str, Any]:
+            """
+            Retrieve scratchpad contents.
+            If category is None, return everything.
+            """
+            if category == "assumptions":
+                return {
+                    "success": True,
+                    "assumptions": scratchpad_state["assumptions"]
+                }
+            elif category == "notes":
+                return {
+                    "success": True,
+                    "notes": scratchpad_state["notes"]
+                }
+            elif category == "history":
+                return {
+                    "success": True,
+                    "history": scratchpad_state["history"]
+                }
+            else:
+                return {
+                    "success": True,
+                    "scratchpad": scratchpad_state
+                }
+        
+        def remove_scratchpad_entry(key: str, category: str = "notes") -> Dict[str, Any]:
+            """
+            Remove an entry from the scratchpad.
+            """
+            from datetime import datetime
+            
+            if category == "assumptions":
+                if key in scratchpad_state["assumptions"]:
+                    del scratchpad_state["assumptions"][key]
+                else:
+                    return {"success": False, "error": f"Assumption '{key}' not found"}
+            else:
+                if key in scratchpad_state["notes"]:
+                    del scratchpad_state["notes"][key]
+                else:
+                    return {"success": False, "error": f"Note '{key}' not found"}
+            
+            scratchpad_state["history"].append({
+                "action": "remove",
+                "category": category,
+                "key": key,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            if callback:
+                callback(f"🗑️  Removed from scratchpad: {category}.{key}", MSG_TYPE.MSG_TYPE_INFO)
+            
+            return {
+                "success": True,
+                "removed": key
+            }
+        
+        # === PROCESS UNIFIED TOOLS PARAMETER ===
+        if tools:
+            if callback:
+                callback(f"  ✓ Processing {len(tools)} unified tool(s)...", MSG_TYPE.MSG_TYPE_INFO)
+            
+            for tool_name, tool_spec in tools.items():
+                if not isinstance(tool_spec, dict):
+                    if callback:
+                        callback(f"    ⚠️ Skipping invalid tool '{tool_name}' (not a dict)", MSG_TYPE.MSG_TYPE_WARNING)
+                    continue
+                
+                # Extract tool components
+                name = tool_spec.get("name", tool_name)
+                description = tool_spec.get("description", f"Execute {name}")
+                parameters = tool_spec.get("parameters", [])
+                output_spec = tool_spec.get("output", [])
+                callable_fn = tool_spec.get("callable")
+                
+                if not callable(callable_fn):
+                    if callback:
+                        callback(f"    ⚠️ Skipping tool '{tool_name}' (no callable)", MSG_TYPE.MSG_TYPE_WARNING)
+                    continue
+                
+                # Build parameter signature for description
+                param_strs = []
+                for param in parameters:
+                    param_name = param.get("name", "arg")
+                    param_type = param.get("type", "any")
+                    is_optional = param.get("optional", False)
+                    default_val = param.get("default")
+                    
+                    if is_optional and default_val is not None:
+                        param_strs.append(f"{param_name}: {param_type} = {default_val}")
+                    elif is_optional:
+                        param_strs.append(f"{param_name}: {param_type} (optional)")
+                    else:
+                        param_strs.append(f"{param_name}: {param_type}")
+                
+                param_signature = ", ".join(param_strs)
+                
+                # Detect RAG tools by checking output for "sources" field
+                is_rag_tool = any(out.get("name") == "sources" for out in output_spec)
+                
+                # Wrap callable to handle parameter extraction and output standardization
+                def create_tool_wrapper(fn, params_spec, outputs_spec, is_rag):
+                    def wrapped(**kwargs):
+                        try:
+                            # Extract parameters according to spec
+                            call_args = {}
+                            for param in params_spec:
+                                param_name = param.get("name")
+                                if param_name in kwargs:
+                                    call_args[param_name] = kwargs[param_name]
+                                elif not param.get("optional", False):
+                                    return {
+                                        "error": f"Missing required parameter: {param_name}",
+                                        "success": False
+                                    }
+                                elif "default" in param:
+                                    call_args[param_name] = param["default"]
+                            
+                            # Call the function
+                            result = fn(**call_args)
+                            
+                            # Standardize output format for RAG tools
+                            if is_rag and isinstance(result, dict):
+                                # Ensure sources are in standard format
+                                if "sources" in result and isinstance(result["sources"], list):
+                                    standardized_sources = []
+                                    for src in result["sources"]:
+                                        if isinstance(src, dict):
+                                            standardized_sources.append({
+                                                "content": src.get("content", str(src)),
+                                                "score": float(src.get("score", src.get("relevance_score", 1.0))),
+                                                "source": src.get("source", "Unknown"),
+                                                "metadata": src.get("metadata", {})
+                                            })
+                                    result["sources"] = standardized_sources
+                            
+                            # Ensure success field exists
+                            if "success" not in result:
+                                result["success"] = "error" not in result or not result.get("error")
+                            
+                            return result
+                        
+                        except Exception as e:
+                            return {
+                                "error": str(e),
+                                "success": False
+                            }
+                    
+                    return wrapped
+                
+                wrapped_callable = create_tool_wrapper(callable_fn, parameters, output_spec, is_rag_tool)
+                
+                # Register tool
+                tool_registry[name] = wrapped_callable
+                tool_descriptions.append(f"- {name}({param_signature}): {description}")
+                
+                # Track RAG tools separately
+                if is_rag_tool:
+                    rag_registry[name] = wrapped_callable
+                    rag_tool_specs[name] = {
+                        "default_top_k": rag_top_k,
+                        "default_min_sim": rag_min_similarity_percent
+                    }
+                    if callback:
+                        callback(f"    📚 Added RAG tool: {name}", MSG_TYPE.MSG_TYPE_INFO)
+                else:
+                    if callback:
+                        callback(f"    🔧 Added tool: {name}", MSG_TYPE.MSG_TYPE_INFO)
+        
+        # === LEGACY PERSONALITY DATA_SOURCE SUPPORT ===
+        # Keep personality.data_source working as before (will be upgraded later)
         if personality and callable(getattr(personality, 'data_source', None)):
             if callback:
-                callback("  ✓ Registering personality RAG tool", MSG_TYPE.MSG_TYPE_INFO)
+                callback("  ✓ Registering personality RAG tool (legacy)", MSG_TYPE.MSG_TYPE_INFO)
             
             tool_name = "search_personality_knowledge"
             description = "Search the personality's primary knowledge base for relevant information"
             
-            wrapped_fn = create_rag_wrapper(
-                personality.data_source,
-                kb_name="Personality Knowledge Base",
-                description=description
-            )
+            def create_legacy_rag_wrapper(rag_fn: Callable, kb_name: str):
+                def wrapped_rag_search(query: str) -> Dict[str, Any]:
+                    try:
+                        results = rag_fn(query)
+                        
+                        # Standardize output format
+                        formatted = []
+                        if isinstance(results, list):
+                            for chunk in results:
+                                score = chunk.get('score', chunk.get('value', chunk.get('similarity', 0.0)))
+                                if score > 1.0:
+                                    score = 1.0 if score > 100.0 else score / 100.0
+                                
+                                formatted.append({
+                                    "content": chunk.get('content', chunk.get('text', str(chunk))),
+                                    "score": float(score),
+                                    "source": chunk.get('source', kb_name),
+                                    "metadata": chunk.get('metadata', {})
+                                })
+                            
+                            formatted.sort(key=lambda x: x['score'], reverse=True)
+                            formatted = [
+                                r for r in formatted[:rag_top_k] 
+                                if r['score'] >= rag_min_similarity_percent
+                            ]
+                        else:
+                            formatted = [{
+                                "content": str(results),
+                                "score": 1.0,
+                                "source": kb_name,
+                                "metadata": {}
+                            }]
+                        
+                        return {
+                            "status": "success",
+                            "sources": formatted,
+                            "count": len(formatted),
+                            "query": query,
+                            "success": True
+                        }
+                    except Exception as e:
+                        return {
+                            "status": "error",
+                            "error": str(e),
+                            "query": query,
+                            "success": False
+                        }
+                
+                return wrapped_rag_search
+            
+            wrapped_fn = create_legacy_rag_wrapper(personality.data_source, "Personality Knowledge Base")
             
             tool_registry[tool_name] = wrapped_fn
             rag_registry[tool_name] = wrapped_fn
@@ -1724,41 +2214,7 @@ class LollmsDiscussion:
             if callback:
                 callback(f"    📚 Added: {tool_name}", MSG_TYPE.MSG_TYPE_INFO)
         
-        # 2. Register all use_data_store RAG systems
-        if use_data_store:
-            if callback:
-                callback(f"  ✓ Setting up {len(use_data_store)} data store(s)...", MSG_TYPE.MSG_TYPE_INFO)
-            
-            for name, info in use_data_store.items():
-                tool_name = f"search_{name.replace(' ', '_').lower()}"
-                description = f"Queries the '{name}' knowledge base"
-                call_fn = None
-                
-                # Extract callable and description
-                if callable(info):
-                    call_fn = info
-                elif isinstance(info, dict):
-                    if "callable" in info and callable(info["callable"]):
-                        call_fn = info["callable"]
-                    description = info.get("description", description)
-                
-                if call_fn:
-                    wrapped_fn = create_rag_wrapper(call_fn, kb_name=name, description=description)
-                    
-                    tool_registry[tool_name] = wrapped_fn
-                    rag_registry[tool_name] = wrapped_fn
-                    rag_tool_specs[tool_name] = {
-                        "default_top_k": rag_top_k,
-                        "default_min_sim": rag_min_similarity_percent
-                    }
-                    tool_descriptions.append(f"- {tool_name}(query: str): {description}")
-                    
-                    if callback:
-                        callback(f"    📚 Added: {tool_name} (from '{name}')", MSG_TYPE.MSG_TYPE_INFO)
-        
         # === OPTIONAL PRE-FLIGHT RAG (First Hop) ===
-        preflight_rag_enabled = kwargs.get("preflight_rag", True)
-        
         if personality is not None:
             # Enhance personality system prompt with veracity instructions
             base_personality_prompt = personality.system_prompt or ""
@@ -1801,14 +2257,13 @@ class LollmsDiscussion:
                 if callback:
                     qg_id = callback("🎯 Preflight RAG: Generating search query...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "preflight_query_gen"})
 
-                # Use discussion context for better query generation
                 context_for_query = self.export('markdown', suppress_system_prompt=True)
                 
                 query_prompt = "\n".join([
                     "You are an expert query generator. Based on the conversation history, formulate a concise search query to retrieve relevant information.",
                     "",
                     "--- Conversation History ---",
-                    context_for_query[-2000:],  # Last 2K chars
+                    context_for_query[-2000:],
                     "",
                     "--- Task ---",
                     "Generate a single, focused search query (max 15 words) to find information needed to answer the user's request.",
@@ -1834,13 +2289,12 @@ class LollmsDiscussion:
                             dr_id = callback(f"🔍 Searching knowledge base...", MSG_TYPE.MSG_TYPE_STEP_START, {"id": "preflight_retrieval"})
                         
                         try:
-                            # Use the standardized RAG wrapper
                             rag_tool = rag_registry.get("search_personality_knowledge")
                             if rag_tool:
-                                result = rag_tool(generated_query)
+                                result = rag_tool(query=generated_query)
                                 
-                                if result.get("status") == "success":
-                                    rag_results = result.get("results", [])
+                                if result.get("success"):
+                                    rag_results = result.get("sources", [])
                                     
                                     formatted_data_zone = ""
                                     for idx, chunk in enumerate(rag_results):
@@ -1870,7 +2324,7 @@ class LollmsDiscussion:
                                         self.personality_data_zone = formatted_data_zone.strip() + citation_instruction
                                 else:
                                     if callback:
-                                        callback(f"Search failed: {result.get('message', 'Unknown error')}", MSG_TYPE.MSG_TYPE_WARNING, {"id": dr_id})
+                                        callback(f"Search failed: {result.get('error', 'Unknown error')}", MSG_TYPE.MSG_TYPE_WARNING, {"id": dr_id})
                         
                         except Exception as e:
                             trace_exception(e)
@@ -1883,53 +2337,66 @@ class LollmsDiscussion:
                         callback(f"Query generation error: {e}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": qg_id})
 
         # Add core control tools
-        tool_registry["final_answer"] = lambda answer: {"status": "final", "answer": answer}
-        tool_descriptions.append("- final_answer(answer: str): Provide final answer ONLY after searching knowledge bases when needed")
+        tool_registry["final_answer"] = lambda: {
+            "status": "final", 
+            "answer": get_current_answer()["full_text"] if composable_answer["sections"] else None,
+            "success": True
+        }
+        tool_descriptions.append("- final_answer(): Complete the task and return the composable answer (call this when done)")
         
-        tool_registry["request_clarification"] = lambda question: {"status": "clarification", "question": question}
+        tool_registry["request_clarification"] = lambda question: {"status": "clarification", "question": question, "success": True}
         tool_descriptions.append("- request_clarification(question: str): Ask user for clarification")
 
-        # RLM-specific tools
-        if rlm_enabled:
-            tool_descriptions.insert(0, f"- python_exec(code: str): Execute Python code. Variable `{rlm_context_var_name}` contains the full user input (if applicable)")
-            tool_descriptions.insert(1, "- llm_query(prompt: str, max_tokens: int = 4000): Recursive sub-LLM call for divide-and-conquer on large inputs")
+        # Determine if agentic mode is needed
+        is_agentic_turn = len(tool_registry) > 2 or rlm_enabled or len(all_documents) > 0
+        
+        # Register composable answer and scratchpad tools ONLY in agentic mode
+        if is_agentic_turn:
+            # Composable answer tools
+            tool_registry["append_to_answer"] = append_to_answer
+            tool_descriptions.append("- append_to_answer(content: str, section_id: str = None, sources: List[str] = None): Add content to the answer incrementally")
+            
+            tool_registry["update_answer_section"] = update_answer_section
+            tool_descriptions.append("- update_answer_section(section_id: str, new_content: str, reason: str = None): Update/correct a section (for self-correction)")
+            
+            tool_registry["remove_answer_section"] = remove_answer_section
+            tool_descriptions.append("- remove_answer_section(section_id: str, reason: str = None): Remove a section from the answer")
+            
+            tool_registry["get_current_answer"] = get_current_answer
+            tool_descriptions.append("- get_current_answer(): View the current state of your composable answer")
+            
+            # Scratchpad tools
+            tool_registry["update_scratchpad"] = update_scratchpad
+            tool_descriptions.append("- update_scratchpad(key: str, value: Any, category: str = 'notes'): Take notes, record assumptions, observations")
+            
+            tool_registry["update_assumption_status"] = update_assumption_status
+            tool_descriptions.append("- update_assumption_status(assumption_key: str, status: str, reason: str = None): Mark assumption as VALID/WRONG/UNCERTAIN")
+            
+            tool_registry["get_scratchpad"] = get_scratchpad
+            tool_descriptions.append("- get_scratchpad(category: str = None): Retrieve scratchpad (categories: 'notes', 'assumptions', 'history')")
+            
+            tool_registry["remove_scratchpad_entry"] = remove_scratchpad_entry
+            tool_descriptions.append("- remove_scratchpad_entry(key: str, category: str = 'notes'): Remove a scratchpad entry")
 
         tools_summary = "\n".join(tool_descriptions)
-        
-        # Add document operation hints if applicable
-        if all_documents and doc_intent["is_document_query"]:
-            tools_summary += f"\n\n# Document Operation Detected: {doc_intent['operation']}\n"
-            tools_summary += f"Target documents: {', '.join(doc_intent['target_docs']) if doc_intent['target_docs'] else 'all'}\n"
-            
-            if doc_intent["operation"] == "summarize":
-                tools_summary += "\nRecommended approach: Use summarize_document() for each target document.\n"
-            elif doc_intent["operation"] == "compare":
-                tools_summary += "\nRecommended approach: Use compare_documents() with target document names.\n"
-            elif doc_intent["operation"] == "cross_reference":
-                tools_summary += "\nRecommended approach: Summarize each document, then analyze connections.\n"
-            elif doc_intent["requires_full_content"]:
-                total_tokens = sum(d['token_count'] for d in all_documents if d['name'] in doc_intent['target_docs'])
-                if total_tokens > context_budget['available_for_data']:
-                    tools_summary += f"\n⚠️ Target documents ({total_tokens:,} tokens) exceed context. Use read_document_* tools to access in chunks.\n"
         
         if callback:
             callback(f"🔧 Registry complete: {len(tool_registry)} tools", MSG_TYPE.MSG_TYPE_INFO)
             callback(f"   RAG tools: {len(rag_registry)}", MSG_TYPE.MSG_TYPE_INFO)
-        
-        # Determine if agentic mode is needed
-        is_agentic_turn = len(rag_registry) > 0 or use_mcps or rlm_enabled or len(all_documents) > 0
+            if is_agentic_turn:
+                callback(f"   Composable answer tools: enabled", MSG_TYPE.MSG_TYPE_INFO)
+                callback(f"   Scratchpad tools: enabled", MSG_TYPE.MSG_TYPE_INFO)
         
         if callback:
             mode = "RLM AGENTIC" if rlm_enabled else ("AGENTIC" if is_agentic_turn else "SIMPLE CHAT")
             callback(f"🤖 Mode: {mode} (tools: {len(tool_registry)})", MSG_TYPE.MSG_TYPE_INFO)
         
         # === CONTEXT BUDGET MANAGEMENT ===
-        # Reserve space for conversation history and system prompt
         context_budget = {
             "total_available": self.lollmsClient.llm.ctx_size if hasattr(self.lollmsClient.llm, 'ctx_size') else 4096,
-            "reserved_for_conversation": 2000,  # Always keep space for discussion history
-            "reserved_for_response": 2000,      # Space for LLM output
-            "reserved_for_system": 1000,        # System prompt + instructions
+            "reserved_for_conversation": 2000,
+            "reserved_for_response": 2000,
+            "reserved_for_system": 1000,
             "available_for_data": 0
         }
         
@@ -1939,67 +2406,6 @@ class LollmsDiscussion:
             - context_budget["reserved_for_response"]
             - context_budget["reserved_for_system"]
         )
-        
-        if callback:
-            callback(f"💾 Context Budget:", MSG_TYPE.MSG_TYPE_INFO)
-            callback(f"   Total: {context_budget['total_available']:,} tokens", MSG_TYPE.MSG_TYPE_INFO)
-            callback(f"   Reserved for conversation: {context_budget['reserved_for_conversation']:,}", MSG_TYPE.MSG_TYPE_INFO)
-            callback(f"   Reserved for response: {context_budget['reserved_for_response']:,}", MSG_TYPE.MSG_TYPE_INFO)
-            callback(f"   Reserved for system: {context_budget['reserved_for_system']:,}", MSG_TYPE.MSG_TYPE_INFO)
-            callback(f"   Available for documents/data: {context_budget['available_for_data']:,}", MSG_TYPE.MSG_TYPE_INFO)
-        
-        # Smart document handling based on context budget
-        if all_documents:
-            total_doc_tokens = sum(doc['token_count'] for doc in all_documents)
-            
-            if callback:
-                callback(f"📊 Document tokens: {total_doc_tokens:,} / Budget: {context_budget['available_for_data']:,}", MSG_TYPE.MSG_TYPE_INFO)
-            
-            if total_doc_tokens > context_budget['available_for_data']:
-                if callback:
-                    callback(f"⚠️  Documents exceed context budget!", MSG_TYPE.MSG_TYPE_WARNING)
-                    callback(f"   Overflow: {total_doc_tokens - context_budget['available_for_data']:,} tokens", MSG_TYPE.MSG_TYPE_WARNING)
-                    callback(f"   Strategy: Using document tools for chunked access", MSG_TYPE.MSG_TYPE_WARNING)
-                
-                # Don't load full documents into data zones
-                # Instead, provide document summaries and tool access
-                if doc_intent["is_document_query"]:
-                    # Give LLM document metadata and tool descriptions
-                    doc_metadata = "\n# Available Documents (Access via tools)\n\n"
-                    for doc in all_documents:
-                        doc_metadata += f"- **{doc['name']}** ({doc['token_count']:,} tokens, {doc['zone']} zone)\n"
-                        doc_metadata += f"  Use: read_document_{doc['name'].replace('.', '_').replace(' ', '_').replace('-', '_')}()\n"
-                    
-                    doc_metadata += f"\nTotal: {len(all_documents)} documents, {total_doc_tokens:,} tokens\n"
-                    doc_metadata += "⚠️ Documents are too large to load fully. Use document tools to read specific sections.\n"
-                    
-                    # Store in personality zone
-                    if self.personality_data_zone:
-                        self.personality_data_zone = doc_metadata + "\n\n" + self.personality_data_zone
-                    else:
-                        self.personality_data_zone = doc_metadata
-                    
-                    if callback:
-                        callback(f"   ✓ Loaded document metadata instead of full content", MSG_TYPE.MSG_TYPE_INFO)
-            else:
-                if callback:
-                    callback(f"   ✓ Documents fit in context budget", MSG_TYPE.MSG_TYPE_INFO)
-                
-                # Documents fit - can load selectively based on intent
-                if doc_intent["is_document_query"] and doc_intent["target_docs"]:
-                    # Load only target documents
-                    targeted_content = "\n# Target Documents\n\n"
-                    for doc in all_documents:
-                        if doc['name'] in doc_intent["target_docs"]:
-                            targeted_content += f"--- Document: {doc['name']} ---\n{doc['content']}\n--- End Document: {doc['name']} ---\n\n"
-                    
-                    if self.personality_data_zone:
-                        self.personality_data_zone = targeted_content + "\n\n" + self.personality_data_zone
-                    else:
-                        self.personality_data_zone = targeted_content
-                    
-                    if callback:
-                        callback(f"   ✓ Loaded {len(doc_intent['target_docs'])} target document(s) into context", MSG_TYPE.MSG_TYPE_INFO)
         
         # Context management
         if self.max_context_size is not None:
@@ -2019,43 +2425,7 @@ class LollmsDiscussion:
                     f"- Large user inputs are stored in Python variable `{rlm_context_var_name}`",
                     "- Use python_exec() to read and process content in chunks",
                     "- Use llm_query() to make recursive sub-LLM calls on manageable chunks",
-                    "- Implement divide-and-conquer strategies for massive inputs (>100K tokens)",
-                    "",
-                    "RLM BEST PRACTICES:",
-                    "1. Chunk large inputs by natural boundaries (paragraphs, sections)",
-                    "2. Process chunks in parallel where possible (future: async llm_query)",
-                    "3. Aggregate sub-results before final answer",
-                    "4. Filter with regex/keywords before expensive LLM calls",
-                    "",
-                    "Based on: Zhang & Kraska (MIT CSAIL) - Recursive Language Models",
-                    "",
-                    "### VERACITY & TRUTHFULNESS PROTOCOL",
-                    "You are designed to be TRUTHFUL and RELIABLE. Follow these rules STRICTLY:",
-                    "",
-                    "1. ATTRIBUTION (mandatory for all factual claims):",
-                    "   - Information from search results → Cite as [1], [2], [3] etc.",
-                    "   - Information from tool execution → State 'According to [tool_name]...'",
-                    "   - Information from your training → State 'From my general knowledge...' or 'As I understand it...'",
-                    "",
-                    "2. UNCERTAINTY (express when appropriate):",
-                    "   - Not confident? → Say 'I'm not certain' or 'I'm not sure'",
-                    "   - Don't have information? → Say 'I don't know' or 'I don't have enough information'",
-                    "   - Sources conflict? → Present both sides and acknowledge the conflict",
-                    "   - Beyond your knowledge cutoff? → State this limitation",
-                    "",
-                    "3. FORBIDDEN BEHAVIORS (NEVER do these):",
-                    "   - ❌ NEVER invent facts, statistics, dates, names, or quotes",
-                    "   - ❌ NEVER guess when asked for specific factual information",
-                    "   - ❌ NEVER present speculation as fact",
-                    "   - ❌ NEVER fabricate sources or citations",
-                    "",
-                    "4. PREFERRED RESPONSES:",
-                    "   - ✅ 'Based on [Source 1], the population was X in 2020'",
-                    "   - ✅ 'I don't have information about this in the available sources'",
-                    "   - ✅ 'From my general knowledge, X is typically Y, but I should verify this'",
-                    "   - ✅ 'The sources don't contain enough detail to answer this precisely'",
-                    "",
-                    "Remember: 'I don't know' is a GOOD answer. It's far better than making something up."
+                    ""
                 ])
                 system_prompt_part += rlm_instructions
 
@@ -2067,15 +2437,12 @@ class LollmsDiscussion:
             else:
                 full_system_prompt = data_zone_part
 
-            # Initialize scratchpad with discussion context
             conversation_history = self.export('markdown', suppress_system_prompt=True)
             
-            scratchpad = "\n".join([
+            # Initialize reasoning log (separate from scratchpad)
+            reasoning_log = "\n".join([
                 "# User Request",
                 user_message,
-                "",
-                "# Conversation History",
-                conversation_history[-5000:],  # Last 5K chars to keep recent context
                 "",
                 "# Available Tools",
                 tools_summary,
@@ -2084,12 +2451,10 @@ class LollmsDiscussion:
             ])
             
             if callback:
-                callback(f"📝 Scratchpad initialized ({len(scratchpad)} chars)", MSG_TYPE.MSG_TYPE_INFO)
+                callback(f"📝 Reasoning log initialized", MSG_TYPE.MSG_TYPE_INFO)
             
             tool_calls_this_turn = []
             final_answer_text = ""
-            queries_performed = []  # Track all queries to prevent loops
-            max_rag_queries = kwargs.get("max_rag_queries", 3)  # Conservative default: only 3 queries
             
             if callback:
                 callback(f"⚙️  Configuration: max_rag_queries={max_rag_queries}, max_steps={max_reasoning_steps}", MSG_TYPE.MSG_TYPE_INFO)
@@ -2098,133 +2463,122 @@ class LollmsDiscussion:
                 step_id = None
                 if callback:
                     step_id = callback(f"🧠 Step {step + 1}/{max_reasoning_steps}", MSG_TYPE.MSG_TYPE_STEP_START, {"id": f"reason_step_{step}"})
-                    callback(f"   Sources collected so far: {len(collected_sources)}", MSG_TYPE.MSG_TYPE_INFO)
-                    callback(f"   Queries performed: {len(queries_performed)}/{max_rag_queries}", MSG_TYPE.MSG_TYPE_INFO)
                 
-                # FORCE STOP if query limit exceeded
-                if len(queries_performed) >= max_rag_queries:
-                    if callback:
-                        callback(f"🛑 FORCING FINAL ANSWER - Query limit reached ({len(queries_performed)}/{max_rag_queries})", MSG_TYPE.MSG_TYPE_WARNING)
-                    
-                    # Override LLM decision and force final answer
-                    action = "final_answer"
-                    parameters = {"answer": "forced_synthesis"}
-                    reasoning = f"Query limit reached ({len(queries_performed)} queries). Forcing synthesis with available information."
-                    
-                    scratchpad += f"\n## Step {step + 1} [FORCED]\n**System:** Query limit reached. Forcing final answer.\n"
-                    
-                    if callback:
-                        callback(f"Action: final_answer (FORCED)", MSG_TYPE.MSG_TYPE_STEP, {"id": step_id, "action": "final_answer", "forced": True})
-                    
-                    # Jump directly to final answer generation
-                    final_answer_text = "forced"  # Will trigger synthesis below
-                    break
+                # Build comprehensive context for this step
+                # ALWAYS include: full data zones, full history, current scratchpad state
                 
-                # Build query history summary
+                # 1. Full conversation history (last 5K chars to stay manageable)
+                full_history = f"# Conversation History (Last 5000 chars)\n{conversation_history[-5000:]}\n\n"
+                
+                # 2. Current scratchpad state
+                scratchpad_summary = "# Scratchpad State\n"
+                if scratchpad_state["notes"]:
+                    scratchpad_summary += "## Notes:\n"
+                    for key, value in scratchpad_state["notes"].items():
+                        scratchpad_summary += f"- {key}: {value}\n"
+                    scratchpad_summary += "\n"
+                
+                if scratchpad_state["assumptions"]:
+                    scratchpad_summary += "## Assumptions:\n"
+                    for key, assum in scratchpad_state["assumptions"].items():
+                        status = assum.get("status", "UNCERTAIN")
+                        value = assum.get("value", "")
+                        scratchpad_summary += f"- {key} [{status}]: {value}\n"
+                    scratchpad_summary += "\n"
+                
+                if scratchpad_state["corrections"]:
+                    scratchpad_summary += f"## Self-Corrections Made: {len(scratchpad_state['corrections'])}\n"
+                    for corr in scratchpad_state["corrections"][-3:]:  # Last 3
+                        scratchpad_summary += f"- {corr.get('section_id')}: {corr.get('reason')}\n"
+                    scratchpad_summary += "\n"
+                
+                # 3. Current composable answer state
+                answer_summary = "# Current Answer State\n"
+                current_answer_result = get_current_answer()
+                if current_answer_result["success"] and current_answer_result["sections"]:
+                    answer_summary += f"Total sections: {current_answer_result['total_sections']}\n"
+                    answer_summary += f"Total length: {current_answer_result['total_length']} chars\n\n"
+                    answer_summary += "## Sections:\n"
+                    for sec in current_answer_result["sections"]:
+                        preview = sec["content"][:100] + "..." if len(sec["content"]) > 100 else sec["content"]
+                        answer_summary += f"- [{sec['id']}] {preview}\n"
+                    answer_summary += "\n"
+                else:
+                    answer_summary += "No content yet. Use append_to_answer() to start building.\n\n"
+                
+                # 4. Query history
                 query_history = ""
                 if queries_performed:
-                    query_history = f"\n# Previous Queries Already Performed ({len(queries_performed)}/{max_rag_queries} used)\n"
+                    query_history = f"# Previous RAG Queries ({len(queries_performed)}/{max_rag_queries})\n"
                     for idx, q in enumerate(queries_performed, 1):
-                        query_history += f"{idx}. [{q['tool']}] Query: '{q['query']}' → Found {q['result_count']} results\n"
-                    
-                    # Show actual content preview from sources
-                    if collected_sources:
-                        query_history += f"\n# Information Already Retrieved ({len(collected_sources)} sources)\n"
-                        query_history += "YOU HAVE THE FOLLOWING INFORMATION AVAILABLE:\n\n"
-                        for idx, src in enumerate(collected_sources[:10], 1):  # Show first 10 sources
-                            preview = src.get('content', '')[:200]
-                            query_history += f"[{idx}] {src.get('source', 'Unknown')} (score: {src.get('relevance_score', 0):.2f}):\n{preview}...\n\n"
-                        
-                        if len(collected_sources) > 10:
-                            query_history += f"... and {len(collected_sources) - 10} more sources\n\n"
-                    
-                    query_history += "\n⚠️ IMPORTANT INSTRUCTIONS:\n"
-                    query_history += "1. DO NOT repeat these exact queries\n"
-                    query_history += "2. READ THE RETRIEVED INFORMATION ABOVE CAREFULLY\n"
-                    query_history += "3. Even partial information is valuable - USE IT\n"
-                    query_history += "4. If sources contain ANY relevant information → Call final_answer() and cite them\n"
-                    query_history += "5. Only search again if you need DIFFERENT information with DIFFERENT search terms\n"
-                    query_history += "6. 'No perfect match' does NOT mean 'no useful information'\n\n"
-                    
-                    if len(queries_performed) >= max_rag_queries:
-                        query_history += f"\n🛑 CRITICAL: You have reached the query limit ({max_rag_queries}). You MUST call final_answer() NOW with whatever information you have.\n"
-                        query_history += "EVEN PARTIAL INFORMATION is better than no answer. Use what you found!\n"
-                    elif len(queries_performed) >= max_rag_queries - 1:
-                        query_history += f"\n⚠️ WARNING: You have {max_rag_queries - len(queries_performed)} query remaining. If current sources have ANY useful info → Use final_answer() now.\n"
+                        query_history += f"{idx}. Step {q['step']}: [{q['tool']}] '{q['query']}' → {q['result_count']} results\n"
+                    query_history += "\n"
                 
-                # Generate next action
-                document_context = ""
-                if all_documents and doc_intent["is_document_query"]:
-                    document_context = "\n# Document Processing Context\n"
-                    document_context += f"Operation: {doc_intent['operation']}\n"
-                    document_context += f"Target documents: {', '.join(doc_intent['target_docs']) if doc_intent['target_docs'] else 'all'}\n"
-                    document_context += f"Documents available: {len(all_documents)} ({sum(d['token_count'] for d in all_documents):,} tokens total)\n"
-                    document_context += f"Context budget for data: {context_budget['available_for_data']:,} tokens\n\n"
-                    
-                    total_target_tokens = sum(d['token_count'] for d in all_documents if d['name'] in doc_intent.get('target_docs', []))
-                    if total_target_tokens > context_budget['available_for_data']:
-                        document_context += "⚠️ Target documents are too large for context. You MUST use document tools (read_document_*, summarize_document) to access them.\n\n"
+                # 5. Sources collected
+                sources_summary = ""
+                if collected_sources:
+                    sources_summary = f"# Sources Collected ({len(collected_sources)} total)\n"
+                    # Show preview of recent sources
+                    for src in collected_sources[-5:]:  # Last 5
+                        preview = src.get('content', '')[:150] + "..." if len(src.get('content', '')) > 150 else src.get('content', '')
+                        sources_summary += f"- [{src.get('index')}] {src.get('source')}: {preview}\n"
+                    sources_summary += "\n"
                 
+                # Build complete reasoning prompt with ALL context
                 reasoning_prompt = "\n".join([
                     full_system_prompt,
                     "",
-                    "# Your Analysis History",
-                    scratchpad,
+                    full_history,
+                    scratchpad_summary,
+                    answer_summary,
                     query_history,
-                    document_context,
+                    sources_summary,
                     "",
-                    "# Critical Instructions",
-                    "You are an AI agent with access to knowledge bases and tools.",
+                    "# Reasoning Log (Your Previous Steps)",
+                    reasoning_log,
                     "",
-                    "DECISION RULES:",
-                    "1. For factual questions → SEARCH knowledge bases FIRST",
-                    f"2. Available search tools: {', '.join([t for t in rag_registry.keys()])}",
-                    "3. For large inputs (RLM mode) → Use python_exec() and llm_query() for chunking",
-                    "4. For document operations → Use document tools (summarize_document, compare_documents, read_document_*)",
-                    "5. ⚠️ IMPORTANT: After 1-2 searches, if you have ANY relevant information → Use final_answer()",
-                    "6. ⚠️ CHECK 'Previous Queries' above - DO NOT repeat the same search",
-                    "7. ⚠️ PARTIAL information is VALUABLE - don't keep searching for perfect answers",
+                    "# Instructions for Next Action",
                     "",
-                    "DOCUMENT HANDLING:",
-                    "- If documents exceed context → Use document tools to access in chunks",
-                    "- For summarization → Use summarize_document(doc_name)",
-                    "- For comparison → Use compare_documents(doc1, doc2, ...)",
-                    "- For reading portions → Use read_document_*(start_char, length)",
+                    "You have access to:",
+                    "- Full conversation history (see above)",
+                    "- Full data zones (in system prompt)",
+                    "- Scratchpad for notes and assumptions",
+                    "- Composable answer builder",
+                    f"- {len(rag_registry)} RAG/search tools",
                     "",
-                    "STOP SEARCHING IF:",
-                    "- You have found some relevant information (even if incomplete)",
-                    "- You've already done 2+ searches",
-                    "- The retrieved sources contain anything useful about the question",
-                    "- You're approaching the query limit",
+                    "COMPOSABLE ANSWER WORKFLOW:",
+                    "1. For multi-part requests (e.g., 'examples from theme1, theme2, theme3'):",
+                    "   - Search for theme1 → append_to_answer() with results",
+                    "   - Search for theme2 → append_to_answer() with results",
+                    "   - Continue until all themes covered",
+                    "   - Call final_answer() when complete",
                     "",
-                    "ONLY SEARCH AGAIN IF:",
-                    "- You have found ZERO relevant information in all previous searches",
-                    "- You need completely different information (use very different search terms)",
-                    "- Current sources are completely off-topic",
+                    "2. For self-correction:",
+                    "   - If you make an assumption → update_scratchpad('my_assumption', 'I think X is Y', 'assumptions')",
+                    "   - If query reveals assumption is WRONG:",
+                    "     a) update_assumption_status('my_assumption', 'WRONG', 'Found evidence of Z')",
+                    "     b) update_answer_section(section_id, corrected_content, 'Corrected based on new info')",
+                    "   - Continue reasoning with correct information",
                     "",
-                    "VERACITY RULES (CRITICAL - NEVER VIOLATE):",
-                    "- If you found information in sources → You MUST cite them [1], [2], etc.",
-                    "- If information is incomplete → Say 'Based on available sources [1], I can tell you X, but I don't have information about Y'",
-                    "- If you're uncertain → You MUST say 'I'm not certain' or 'The sources provide limited information'",
-                    "- PARTIAL answers with source citations are BETTER than endless searching",
-                    "- If sources have ANY relevant info → USE IT and cite it, even if incomplete",
-                    "- NEVER say 'I found nothing' if sources contain ANY related information",
-                    "- Distinguish clearly: 'Based on [Source 1]...' vs 'From general knowledge...'",
+                    "3. Use scratchpad freely:",
+                    "   - Track what you've searched",
+                    "   - Note what you still need to find",
+                    "   - Record observations",
+                    "   - Mark assumptions and validate them",
                     "",
-                    f"Current task: {user_message[:200]}...",
+                    f"Current task: {user_message}",
                     "",
-                    "Provide your decision as JSON:",
+                    "Decide your next action (JSON):",
                     "{",
-                    '    "reasoning": "Why this action?",',
+                    '    "reasoning": "Why this action? What am I doing?",',
                     '    "action": "tool_name",',
-                    '    "parameters": {"param": "value"},',
-                    '    "confidence": 0.8',
+                    '    "parameters": {"param": "value"}',
                     "}"
                 ])
                 
                 try:
                     if callback:
-                        callback(f"   🤔 Generating decision...", MSG_TYPE.MSG_TYPE_INFO)
+                        callback(f"   🤔 Generating decision with full context...", MSG_TYPE.MSG_TYPE_INFO)
                     
                     decision_data = self.lollmsClient.generate_structured_content(
                         prompt=reasoning_prompt,
@@ -2232,55 +2586,31 @@ class LollmsDiscussion:
                         schema={
                             "reasoning": "string",
                             "action": "string", 
-                            "parameters": "object",
-                            "confidence": "number"
+                            "parameters": "object"
                         },
                         system_prompt="You are a reasoning AI agent. Output only valid JSON.",
                         temperature=decision_temperature
                     )
                     
-                    if callback:
-                        callback(f"   ✓ Decision received", MSG_TYPE.MSG_TYPE_INFO)
-                    
                     if not decision_data or 'action' not in decision_data:
                         if callback:
-                            callback("⚠️ Invalid decision format - breaking loop", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
+                            callback("⚠️ Invalid decision - breaking loop", MSG_TYPE.MSG_TYPE_WARNING)
                         break
                     
                     reasoning = decision_data.get('reasoning', '')
                     action = decision_data.get('action', 'final_answer')
                     parameters = decision_data.get('parameters', {})
-                    confidence = decision_data.get('confidence', 0.5)
+                    
+                    reasoning_log += f"\n## Step {step + 1}\n**Reasoning:** {reasoning}\n**Action:** {action}\n**Parameters:** {json.dumps(parameters)}\n"
                     
                     if callback:
-                        callback(f"   ➜ Reasoning: {reasoning[:150]}{'...' if len(reasoning) > 150 else ''}", MSG_TYPE.MSG_TYPE_INFO)
-                        callback(f"   ➜ Action chosen: {action}", MSG_TYPE.MSG_TYPE_INFO)
-                        callback(f"   ➜ Parameters: {json.dumps(parameters)[:100]}{'...' if len(json.dumps(parameters)) > 100 else ''}", MSG_TYPE.MSG_TYPE_INFO)
-                        callback(f"   ➜ Confidence: {confidence:.2f}", MSG_TYPE.MSG_TYPE_INFO)
-                    
-                    # FORCE FINAL ANSWER if we have sources and are trying to search again
-                    if action in rag_registry and len(collected_sources) > 0 and len(queries_performed) >= 2:
-                        if callback:
-                            callback(f"   🛑 OVERRIDING: You already have {len(collected_sources)} sources from {len(queries_performed)} queries", MSG_TYPE.MSG_TYPE_WARNING)
-                            callback(f"   🛑 Forcing final_answer to use available information", MSG_TYPE.MSG_TYPE_WARNING)
-                        
-                        scratchpad += f"\n**SYSTEM OVERRIDE:** Prevented another search. You have {len(collected_sources)} sources already. Use them!\n"
-                        action = "final_answer"
-                        parameters = {"answer": "forced_synthesis"}
-                    
-                    scratchpad += f"\n## Step {step + 1}\n**Reasoning:** {reasoning}\n**Action:** {action}\n**Confidence:** {confidence}\n"
-                    
-                    if callback:
-                        callback(f"Action: {action}", MSG_TYPE.MSG_TYPE_STEP, {"id": step_id, "action": action})
+                        callback(f"   ➜ Action: {action}", MSG_TYPE.MSG_TYPE_INFO)
+                        callback(f"   ➜ Reasoning: {reasoning[:150]}...", MSG_TYPE.MSG_TYPE_INFO)
                     
                     # Handle final answer
                     if action == "final_answer":
-                        final_answer_text = parameters.get('answer', '')
-                        
-                        # Warn if no RAG searches were performed
-                        if not any(call['name'] in rag_registry for call in tool_calls_this_turn):
-                            if callback:
-                                callback("⚠️ No knowledge base searches performed", MSG_TYPE.MSG_TYPE_WARNING)
+                        final_result = tool_registry["final_answer"]()
+                        final_answer_text = final_result.get("answer", "")
                         
                         if callback:
                             callback("Final answer ready", MSG_TYPE.MSG_TYPE_STEP_END, {"id": step_id})
@@ -2289,18 +2619,26 @@ class LollmsDiscussion:
                     # Handle clarification
                     if action == "request_clarification":
                         clarification_q = parameters.get('question', 'Could you provide more details?')
-                        if callback:
-                            callback("Clarification needed", MSG_TYPE.MSG_TYPE_STEP_END, {"id": step_id})
                         
                         ai_message_obj = self.add_message(
                             sender=personality.name if personality else "assistant",
                             sender_type="assistant",
                             content=clarification_q,
                             parent_id=user_msg.id,
-                            metadata={"clarification_required": True, "sources": collected_sources}
+                            metadata={
+                                "clarification_required": True, 
+                                "sources": collected_sources,
+                                "scratchpad": scratchpad_state,
+                                "composable_answer": composable_answer
+                            }
                         )
                         
-                        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
+                        return {
+                            "user_message": user_msg, 
+                            "ai_message": ai_message_obj, 
+                            "sources": collected_sources,
+                            "scratchpad": scratchpad_state
+                        }
                     
                     # Execute tool
                     if action in tool_registry:
@@ -2309,10 +2647,10 @@ class LollmsDiscussion:
                             result = tool_registry[action](**parameters)
                             tool_time = time.time() - tool_start
                             
+                            reasoning_log += f"**Result:** {json.dumps(result, indent=2)[:500]}...\n"
+                            
                             if callback:
                                 callback(f"✓ Tool completed in {tool_time:.2f}s", MSG_TYPE.MSG_TYPE_INFO)
-                            
-                            scratchpad += f"**Result:** {json.dumps(result, indent=2)[:500]}\n"
                             
                             tool_calls_this_turn.append({
                                 "name": action,
@@ -2321,37 +2659,49 @@ class LollmsDiscussion:
                                 "response_time": tool_time
                             })
                             
-                            # Handle RAG results with structured format
-                            if action in rag_registry and result.get('status') == 'success':
-                                rag_results = result.get('results', [])
+                            # Track RAG queries
+                            if action in rag_registry:
+                                query_str = parameters.get('query', '')
+                                queries_performed.append({
+                                    "step": step + 1,
+                                    "tool": action,
+                                    "query": query_str,
+                                    "result_count": len(result.get("sources", []))
+                                })
                                 
-                                for idx, doc in enumerate(rag_results):
+                                if callback:
+                                    callback(f"   📊 RAG query: {len(queries_performed)}/{max_rag_queries}", MSG_TYPE.MSG_TYPE_INFO)
+                            
+                            # Handle RAG results
+                            if action in rag_registry and result.get('success'):
+                                rag_sources = result.get('sources', [])
+                                
+                                for idx, doc in enumerate(rag_sources):
                                     source_entry = {
-                                        "title": f"{action.replace('search_', '').replace('_', ' ').title()} #{len(collected_sources) + 1}",
+                                        "title": doc.get('source') if doc.get('source') else f"{action} #{len(collected_sources) + 1}",
                                         "content": doc.get('content', ''),
                                         "source": doc.get('source', 'Knowledge Base'),
                                         "query": parameters.get('query', ''),
                                         "relevance_score": doc.get('score', 0.0),
                                         "index": len(collected_sources) + 1,
                                         "tool": action,
-                                        "phase": "agentic",
-                                        "metadata": doc.get('metadata', {})
+                                        "phase": "agentic"
                                     }
                                     collected_sources.append(source_entry)
                                 
-                                if callback and rag_results:
-                                    callback(f"✓ Found {len(rag_results)} sources", MSG_TYPE.MSG_TYPE_INFO)
-                                    callback(collected_sources[-len(rag_results):], MSG_TYPE.MSG_TYPE_SOURCES_LIST)
+                                if callback and rag_sources:
+                                    callback(f"✓ Found {len(rag_sources)} sources", MSG_TYPE.MSG_TYPE_INFO)
+                                    callback(collected_sources[-len(rag_sources):], MSG_TYPE.MSG_TYPE_SOURCES_LIST)
                             
                             if callback:
                                 callback("Tool executed", MSG_TYPE.MSG_TYPE_STEP_END, {"id": step_id})
                         
                         except Exception as e:
-                            scratchpad += f"**Error:** {str(e)}\n"
+                            reasoning_log += f"**Error:** {str(e)}\n"
                             if callback:
                                 callback(f"❌ Tool error: {str(e)}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": step_id})
                     else:
-                        scratchpad += f"**Error:** Unknown tool '{action}'\n"
+                        reasoning_log += f"**Error:** Unknown tool '{action}'\n"
                         if callback:
                             callback(f"❌ Unknown tool: {action}", MSG_TYPE.MSG_TYPE_WARNING, {"id": step_id})
                 
@@ -2361,115 +2711,56 @@ class LollmsDiscussion:
                         callback(f"Reasoning error: {str(e)}", MSG_TYPE.MSG_TYPE_EXCEPTION, {"id": step_id})
                     break
             
-            # Report final query statistics
-            if callback:
-                callback(f"🏁 Reasoning loop complete after {step + 1} steps", MSG_TYPE.MSG_TYPE_INFO)
+            # If no final_answer was called, get the current composable answer
+            if not final_answer_text:
+                final_result = get_current_answer()
+                final_answer_text = final_result.get("full_text", "")
                 
-                if queries_performed:
-                    callback(f"📊 FINAL QUERY REPORT:", MSG_TYPE.MSG_TYPE_INFO)
-                    callback(f"   Total queries: {len(queries_performed)}/{max_rag_queries}", MSG_TYPE.MSG_TYPE_INFO)
-                    callback(f"   Unique queries: {len(set(q['query'] for q in queries_performed))}", MSG_TYPE.MSG_TYPE_INFO)
-                    callback(f"   Total sources collected: {len(collected_sources)}", MSG_TYPE.MSG_TYPE_INFO)
-                    callback(f"", MSG_TYPE.MSG_TYPE_INFO)
-                    callback(f"   Query breakdown:", MSG_TYPE.MSG_TYPE_INFO)
-                    for idx, q in enumerate(queries_performed, 1):
-                        callback(f"   {idx}. Step {q['step']}: [{q['tool']}] '{q['query']}' → {q['result_count']} results", MSG_TYPE.MSG_TYPE_INFO)
-                else:
-                    callback(f"📊 No RAG queries performed", MSG_TYPE.MSG_TYPE_INFO)
-            
-            # Generate final synthesis if needed
-            if not final_answer_text or final_answer_text == "forced" or final_answer_text == "forced_synthesis":
-                if callback:
-                    callback(f"📝 Generating final synthesis from {len(collected_sources)} sources...", MSG_TYPE.MSG_TYPE_INFO)
-                
-                # Build query summary for final synthesis
-                query_summary = ""
-                if queries_performed:
-                    query_summary = f"\n# Search Queries Performed ({len(queries_performed)} total)\n"
-                    for idx, q in enumerate(queries_performed, 1):
-                        query_summary += f"{idx}. [{q['tool']}] Query: '{q['query']}' → {q['result_count']} results found\n"
-                    query_summary += "\n"
-                
-                # Add complete source content for synthesis
-                sources_content = ""
-                if collected_sources:
-                    sources_content = f"\n# Retrieved Information ({len(collected_sources)} sources)\n\n"
-                    for idx, src in enumerate(collected_sources, 1):
-                        content = src.get('content', '')
-                        source_name = src.get('source', 'Unknown')
-                        score = src.get('relevance_score', 0.0)
-                        sources_content += f"[Source {idx}] {source_name} (relevance: {score:.2f}):\n{content}\n\n"
+                # If still no content, generate synthesis
+                if not final_answer_text:
+                    if callback:
+                        callback(f"📝 No composable answer built - generating synthesis...", MSG_TYPE.MSG_TYPE_INFO)
                     
-                    sources_content += "\nYou MUST use the above sources in your answer. Even if information is incomplete, cite what you found.\n"
-                
-                synthesis_prompt = "\n".join([
-                    full_system_prompt,
-                    "",
-                    "# Complete Analysis",
-                    scratchpad,
-                    query_summary,
-                    sources_content,
-                    "",
-                    "# VERACITY PROTOCOL (MANDATORY)",
-                    "You MUST follow these rules when providing your final answer:",
-                    "",
-                    "1. SOURCE ATTRIBUTION:",
-                    "   - For ANY factual claim from retrieved sources → Cite as [1], [2], etc.",
-                    "   - For information from tool execution → State 'Based on [tool_name] results...'",
-                    "   - For general knowledge (training data) → State 'From my general knowledge...' or 'As I understand...'",
-                    "",
-                    "2. HANDLING INCOMPLETE INFORMATION:",
-                    "   - If sources provide PARTIAL information → Use it and cite it! Say 'Based on [1], I can tell you X, but the sources don't cover Y'",
-                    "   - If sources are somewhat relevant but not perfect → Still cite them and explain what they do/don't cover",
-                    "   - NEVER say 'I found nothing' if sources contain ANY related content",
-                    "   - Partial answers are BETTER than claiming you have no information",
-                    "",
-                    "3. UNCERTAINTY EXPRESSION:",
-                    "   - If you're not certain → Say 'I'm not certain' or 'Based on limited information...'",
-                    "   - If sources conflict → Present both views and note the conflict",
-                    "   - If you truly have no information → Say 'I don't have information about this' (but check sources first!)",
-                    "",
-                    "4. KNOWLEDGE BOUNDARIES:",
-                    "   - NEVER invent facts, dates, names, statistics, or quotes",
-                    "   - If sources are sparse → Acknowledge it but USE what's there",
-                    "   - Combine source information with general knowledge, clearly marked",
-                    "",
-                    "5. RESPONSE STRUCTURE:",
-                    "   - Start with what you FOUND in sources (with citations), even if limited",
-                    "   - Add relevant general knowledge (clearly marked)",
-                    "   - Explain what information is missing or uncertain",
-                    "",
-                    "# Task",
-                    f"Provide a comprehensive, truthful final answer to: {user_message}",
-                    "",
-                    "IMPORTANT REMINDERS:",
-                    "- Use whatever information you found in the sources, even if incomplete",
-                    "- Cite all sources with [1], [2], [3] format",
-                    "- It's OK to say 'Based on available sources, I can tell you X but not Y'",
-                    "- Partial information with proper citations is valuable",
-                    "- Don't claim you found nothing if sources contain ANY relevant content"
-                ])
-                
-                final_answer_text = self.lollmsClient.generate_text(
-                    synthesis_prompt,
-                    stream=True,
-                    temperature=final_answer_temperature,
-                    callback=callback
-                )
+                    sources_content = ""
+                    if collected_sources:
+                        sources_content = f"\n# Retrieved Information ({len(collected_sources)} sources)\n\n"
+                        for idx, src in enumerate(collected_sources, 1):
+                            sources_content += f"[Source {idx}] {src.get('source', 'Unknown')}:\n{src.get('content', '')}\n\n"
+                    
+                    synthesis_prompt = "\n".join([
+                        full_system_prompt,
+                        "",
+                        full_history,
+                        scratchpad_summary,
+                        sources_content,
+                        reasoning_log,
+                        "",
+                        f"Provide final answer to: {user_message}"
+                    ])
+                    
+                    final_answer_text = self.lollmsClient.generate_text(
+                        synthesis_prompt,
+                        stream=True,
+                        temperature=final_answer_temperature,
+                        callback=callback
+                    )
             
             if remove_thinking_blocks:
                 final_answer_text = self.lollmsClient.remove_thinking_blocks(final_answer_text)
             
             final_content = final_answer_text
-            final_scratchpad = scratchpad
+            final_scratchpad = scratchpad_state
             final_raw_response = json.dumps({
                 "final_answer": final_content,
-                "scratchpad": scratchpad,
-                "tool_calls": tool_calls_this_turn
+                "reasoning_log": reasoning_log,
+                "scratchpad": scratchpad_state,
+                "composable_answer": composable_answer,
+                "tool_calls": tool_calls_this_turn,
+                "self_corrections": self_corrections
             }, indent=2)
         
         else:
-            # Simple chat mode using discussion-aware context
+            # Simple chat mode
             if callback:
                 callback("💬 Simple chat mode", MSG_TYPE.MSG_TYPE_INFO)
             
@@ -2482,9 +2773,6 @@ class LollmsDiscussion:
                 temperature=final_answer_temperature,
                 **kwargs
             ) or ""
-            
-            if isinstance(final_raw_response, dict) and final_raw_response.get("status") == "error":
-                raise Exception(final_raw_response.get("message", "Unknown error"))
             
             if remove_thinking_blocks:
                 final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
@@ -2499,7 +2787,7 @@ class LollmsDiscussion:
         token_count = self.lollmsClient.count_tokens(final_content)
         tok_per_sec = (token_count / duration) if duration > 0 else 0
 
-        # Build comprehensive metadata
+        # Build metadata
         message_meta = {
             "mode": "rlm_agentic" if rlm_enabled else ("agentic" if is_agentic_turn else "simple"),
             "duration_seconds": duration,
@@ -2514,23 +2802,29 @@ class LollmsDiscussion:
         if collected_sources:
             message_meta["sources"] = collected_sources
             message_meta["source_count"] = len(collected_sources)
-            message_meta["rag_queries"] = len([s for s in collected_sources if 'query' in s])
-            message_meta["unique_queries"] = len(set(s.get('query', '') for s in collected_sources if 'query' in s))
         
         if queries_performed:
             message_meta["query_history"] = queries_performed
             message_meta["total_queries"] = len(queries_performed)
         
-        if rlm_enabled:
-            message_meta["rlm_enabled"] = True
-            message_meta["rlm_var_name"] = rlm_context_var_name
+        if is_agentic_turn:
+            message_meta["scratchpad"] = scratchpad_state
+            message_meta["composable_answer"] = {
+                "sections_count": len(composable_answer["sections"]),
+                "active_sections": len([s for s in composable_answer["sections"] if s.get("status") == "active"]),
+                "last_updated": composable_answer.get("last_updated")
+            }
+        
+        if self_corrections:
+            message_meta["self_corrections"] = self_corrections
+            message_meta["self_corrections_count"] = len(self_corrections)
 
         ai_message_obj = self.add_message(
             sender=personality.name if personality else "assistant",
             sender_type="assistant",
             content=final_content,
             raw_content=final_raw_response,
-            scratchpad=final_scratchpad,
+            scratchpad=json.dumps(final_scratchpad, indent=2) if final_scratchpad else None,
             tokens=token_count,
             generation_speed=tok_per_sec,
             parent_id=user_msg.id,
@@ -2546,16 +2840,19 @@ class LollmsDiscussion:
             callback(f"✅ Complete: {token_count} tokens in {duration:.2f}s ({tok_per_sec:.1f} tok/s)", MSG_TYPE.MSG_TYPE_INFO)
             if collected_sources:
                 callback(f"📚 Total sources: {len(collected_sources)}", MSG_TYPE.MSG_TYPE_INFO)
-            if queries_performed:
-                callback(f"🔍 RAG queries: {len(queries_performed)}/{max_rag_queries} (unique: {len(set(q['query'] for q in queries_performed))})", MSG_TYPE.MSG_TYPE_INFO)
-                
-                # Detect if we hit the limit
-                if len(queries_performed) >= max_rag_queries:
-                    callback(f"⚠️ Query limit reached - consider increasing max_rag_queries if needed", MSG_TYPE.MSG_TYPE_WARNING)
+            if is_agentic_turn:
+                callback(f"📝 Scratchpad entries: {len(scratchpad_state['notes']) + len(scratchpad_state['assumptions'])}", MSG_TYPE.MSG_TYPE_INFO)
+                callback(f"✏️  Answer sections: {len([s for s in composable_answer['sections'] if s.get('status') == 'active'])}", MSG_TYPE.MSG_TYPE_INFO)
+            if self_corrections:
+                callback(f"🔄 Self-corrections made: {len(self_corrections)}", MSG_TYPE.MSG_TYPE_INFO)
         
-        return {"user_message": user_msg, "ai_message": ai_message_obj, "sources": collected_sources}
-
-
+        return {
+            "user_message": user_msg, 
+            "ai_message": ai_message_obj, 
+            "sources": collected_sources,
+            "scratchpad": scratchpad_state if is_agentic_turn else None,
+            "self_corrections": self_corrections if self_corrections else None
+        }
     def regenerate_branch(self, branch_tip_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Regenerates the AI response for a given message or the active branch's AI response.
 
