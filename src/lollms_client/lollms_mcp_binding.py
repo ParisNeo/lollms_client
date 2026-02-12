@@ -28,6 +28,25 @@ class LollmsMCPBinding(LollmsBaseBinding):
     def discover_tools(self, **kwargs) -> List[Dict[str, Any]]:
         """
         Discover available tools compliant with the MCP specification.
+        Returns a list of raw tool definitions.
+        """
+        pass
+
+    @abstractmethod
+    def list_tools(self, **kwargs) -> List[Dict[str, Any]]:
+        """
+        Return a list of tools formatted for consumption by the discussion chat module.
+
+        Each dictionary should contain at least:
+            - "name": Unique tool identifier (string)
+            - "description": Human‑readable description (string)
+            - "parameters": List of parameter specifications, where each parameter is a dict with
+                "name", "type", "description", "optional" (bool) and optionally "default".
+            - "output": List of output field specifications (optional)
+
+        The returned list can be a subset or a transformed view of the data produced by
+        ``discover_tools``; its purpose is to provide a ready‑to‑use schema for the chat
+        system.
         """
         pass
 
