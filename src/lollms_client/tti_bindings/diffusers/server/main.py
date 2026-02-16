@@ -24,6 +24,11 @@ from pydantic import BaseModel, Field
 import sys
 import platform
 import inspect
+import pipmaster as pm
+
+pm.ensure_packages("ascii_colors>=0.11.10", "torch", "git+https://github.com/huggingface/diffusers.git", "pillow")
+
+from ascii_colors import trace_exception, ASCIIColors
 
 class PullModelRequest(BaseModel):
     hf_id: Optional[str] = Field(default=None, description="Hugging Face repo id or URL, e.g. 'stabilityai/sdxl-turbo'")
@@ -43,7 +48,6 @@ try:
     )
     from diffusers.utils import load_image
     from PIL import Image
-    from ascii_colors import trace_exception, ASCIIColors
     DIFFUSERS_AVAILABLE = True
 except ImportError as e:
     print(f"FATAL: A required package is missing from the server's venv: {e}.")
