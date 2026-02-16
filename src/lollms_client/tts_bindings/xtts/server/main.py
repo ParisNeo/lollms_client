@@ -1,6 +1,7 @@
 try:
     import uvicorn
-    from fastapi import FastAPI, APIRouter, HTTPException
+    import fastapi
+    from fastapi import FastAPI, APIRouter, HTTPException, File, Form, UploadFile
     from pydantic import BaseModel
     import argparse
     import sys
@@ -8,6 +9,7 @@ try:
     import asyncio
     import traceback
     import os
+    import re
     from typing import Optional, List
     import io
     import wave
@@ -48,6 +50,11 @@ try:
         # speaker_wav is kept for backward compatibility but voice is preferred
         speaker_wav: Optional[str] = None 
         split_sentences: Optional[bool] = True
+
+    class VoiceUploadResponse(BaseModel):
+        success: bool
+        voice_name: str
+        message: str
 
     class XTTSServer:
         def __init__(self):
@@ -227,6 +234,65 @@ try:
             except Exception as e:
                 ASCIIColors.error(f"Server: ERROR in generate_audio endpoint: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post("/upload_voice")
+    async def api_upload_voice(
+        voice_file: fastapi.UploadFile = fastapi.File(...),
+        voice_name: Optional[str] = fastapi.Form(None)
+    ):
+        """Upload a voice file to the server for use with XTTS"""
+        try:
+            from fastapi.responses import JSONResponse
+            
+            # Validate file type
+            allowed_extensions = {'.wav', '.mp3'}
+            file_ext = Path(voice_file.filename).suffix.lower()
+            if file_ext not in allowed_extensions:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Invalid file type. Only {allowed_extensions} are supported."
+                )
+
+            # Determine voice name
+            if voice_name:
+                # Sanitize voice name
+                safe_voice_name = re.sub(r'[^\w\-_]', '_', voice_name)
+            else:
+                # Use filename without extension
+                safe_voice_name = Path(voice_file.filename).stem
+                safe_voice_name = re.sub(r'[^\w\-_]', '_', safe_voice_name)
+
+            # Ensure unique name if file exists
+            target_path = xtts_server.voices_dir / f"{safe_voice_name}{file_ext}"
+            counter = 1
+            original_name = safe_voice_name
+            while target_path.exists():
+                safe_voice_name = f"{original_name}_{counter}"
+                target_path = xtts_server.voices_dir / f"{safe_voice_name}{file_ext}"
+                counter += 1
+
+            # Save the file
+            content = await voice_file.read()
+            with open(target_path, "wb") as f:
+                f.write(content)
+
+            # Refresh available voices list
+            xtts_server.available_voices = xtts_server._load_available_voices()
+
+            ASCIIColors.green(f"Server: Voice uploaded successfully: {safe_voice_name} ({len(content)} bytes)")
+            
+            return VoiceUploadResponse(
+                success=True,
+                voice_name=safe_voice_name,
+                message=f"Voice '{safe_voice_name}' uploaded successfully. Available as voice='{safe_voice_name}' in generation requests."
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            ASCIIColors.error(f"Server: ERROR in upload_voice endpoint: {e}")
+            ASCIIColors.error(f"Server: Traceback:\n{traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=f"Failed to upload voice: {str(e)}")
 
     @router.get("/list_voices")
     async def api_list_voices():

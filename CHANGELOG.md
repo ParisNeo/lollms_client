@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-02-16 03:38]
+
+- feat(xtts): enhance XTTS binding with extended configuration options
+
 ## [2026-02-11 00:56]
 
 - refactor(lollms_client): clean up unused code and fix imports

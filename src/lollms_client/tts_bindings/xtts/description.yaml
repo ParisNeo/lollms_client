@@ -46,3 +46,27 @@ generate_audio_parameters:
     type: "bool"
     default: true
     description: "Whether to split the text into sentences for better stability with long inputs."
+
+commands:
+  - name: "upload_voice"
+    title: "Upload Voice"
+    description: "Upload a custom voice file (WAV or MP3) to the server for voice cloning."
+    parameters:
+      - name: "voice_path"
+        type: "str"
+        description: "Path to the voice file to upload (WAV or MP3, 5-30 seconds recommended)."
+        mandatory: true
+      - name: "voice_name"
+        type: "str"
+        description: "Optional name for the voice. If not provided, uses the filename."
+        mandatory: false
+    output:
+      - name: "success"
+        type: "bool"
+        description: "Whether the upload was successful."
+      - name: "voice_name"
+        type: "str"
+        description: "The name assigned to the uploaded voice for use in generation."
+      - name: "message"
+        type: "str"
+        description: "Status message about the upload."

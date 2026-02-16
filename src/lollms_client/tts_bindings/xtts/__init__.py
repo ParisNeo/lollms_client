@@ -241,3 +241,56 @@ class XTTSClientBinding(LollmsTTSBinding):
         except requests.exceptions.RequestException as e:
             ASCIIColors.error(f"Failed to get models from XTTS server: {e}")
             return []
+
+    def upload_voice(self, voice_path: str, voice_name: Optional[str] = None) -> dict:
+        """Upload a voice file to the XTTS server
+        
+        Args:
+            voice_path: Path to the voice file (wav or mp3)
+            voice_name: Optional name for the voice. If not provided, uses filename.
+        
+        Returns:
+            dict: Upload result with success status, voice_name, and message
+        """
+        self.ensure_server_is_running()
+        
+        voice_file = Path(voice_path)
+        if not voice_file.exists():
+            return {
+                "success": False,
+                "voice_name": None,
+                "message": f"Voice file not found: {voice_path}"
+            }
+        
+        # Validate extension
+        allowed_extensions = {'.wav', '.mp3'}
+        if voice_file.suffix.lower() not in allowed_extensions:
+            return {
+                "success": False,
+                "voice_name": None,
+                "message": f"Invalid file type '{voice_file.suffix}'. Only {allowed_extensions} are supported."
+            }
+        
+        try:
+            with open(voice_file, "rb") as f:
+                files = {"voice_file": (voice_file.name, f, f"audio/{voice_file.suffix.lstrip('.')}")}
+                data = {}
+                if voice_name:
+                    data["voice_name"] = voice_name
+                
+                response = requests.post(
+                    f"{self.base_url}/upload_voice",
+                    files=files,
+                    data=data,
+                    timeout=30
+                )
+                response.raise_for_status()
+                return response.json()
+                
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.error(f"Failed to upload voice to XTTS server: {e}")
+            return {
+                "success": False,
+                "voice_name": None,
+                "message": f"Upload failed: {str(e)}"
+            }
