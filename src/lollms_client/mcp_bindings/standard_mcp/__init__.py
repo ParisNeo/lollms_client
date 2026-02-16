@@ -401,7 +401,14 @@ class StandardMCPBinding(LollmsMCPBinding):
         if stn:
             return [t for t in all_tools if t.get("name") in stn]
         return all_tools
-
+    def list_tools(self, **kwargs) -> List[Dict[str, Any]]:
+        """
+        Return a list of tools formatted for consumption by the discussion chat module.
+        This method forwards to ``discover_tools`` while preserving any
+        keyword arguments (e.g., ``force_refresh``) that the caller may provide.
+        """
+        return self.discover_tools(**kwargs)
+    
     def _parse_tool_name(self, prefixed_tool_name: str) -> Optional[Tuple[str, str]]:
         parts = prefixed_tool_name.split(TOOL_NAME_SEPARATOR, 1)
         if len(parts) == 2:

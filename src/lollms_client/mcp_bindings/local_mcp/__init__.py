@@ -110,6 +110,13 @@ class LocalMCPBinding(LollmsMCPBinding):
             return [tool for tool in self.discovered_tools if tool.get("name") in specific_tool_names]
         return self.discovered_tools
 
+    def list_tools(self, **kwargs) -> List[Dict[str, Any]]:
+        """
+        Return a list of tools formatted for consumption by the discussion chat module.
+        This implementation simply forwards to ``discover_tools``.
+        """
+        return self.discover_tools(**kwargs)
+
     def execute_tool(self,
                      tool_name: str,
                      params: Dict[str, Any],

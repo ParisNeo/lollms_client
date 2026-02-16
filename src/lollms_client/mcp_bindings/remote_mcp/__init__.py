@@ -315,7 +315,15 @@ class RemoteMCPBinding(LollmsMCPBinding):
         except Exception as e:
             trace_exception(e)
             return []
-            
+
+    def list_tools(self, **kwargs) -> List[Dict[str, Any]]:
+        """
+        Return a list of tools formatted for consumption by the discussion chat module.
+        This implementation simply forwards to ``discover_tools``.
+        """
+        # Respect any keyword arguments that ``discover_tools`` understands (e.g., force_refresh)
+        return self.discover_tools(**kwargs)
+    
     async def _execute_tool_async(self, alias: str, actual_tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
         server_info = self.servers[alias]
         
