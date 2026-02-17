@@ -205,8 +205,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
                     self.server_process = subprocess.Popen(command, creationflags=creationflags)
                     ASCIIColors.info("Diffusers server process launched in the background.")
-                    while(not self.is_server_running()):
-                        time.sleep(1)
+                    #while(not self.is_server_running()):
+                    #    time.sleep(1)
                     
                 except Exception as e:
                     ASCIIColors.error(f"Failed to start Diffusers server: {e}")
