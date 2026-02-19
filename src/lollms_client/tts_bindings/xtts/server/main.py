@@ -141,8 +141,72 @@ try:
             
             return None
 
+        def _chunk_text(self, text: str, max_chunk_length: int = 200) -> List[str]:
+            """Split text into chunks respecting sentence boundaries."""
+            # Normalize whitespace
+            text = re.sub(r'\s+', ' ', text.strip())
+            
+            # Split into sentences (handles . ! ? followed by space or end)
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            sentences = [s.strip() for s in sentences if s.strip()]
+            
+            chunks = []
+            current_chunk = ""
+            
+            for sentence in sentences:
+                # If a single sentence exceeds max length, we must split it
+                if len(sentence) > max_chunk_length:
+                    # First, save any accumulated chunk
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = ""
+                    
+                    # Split long sentence by phrases (commas, semicolons) or force split
+                    phrases = re.split(r'(?<=[,;])\s+', sentence)
+                    current_split = ""
+                    
+                    for phrase in phrases:
+                        if len(current_split) + len(phrase) + 1 <= max_chunk_length:
+                            current_split = (current_split + " " + phrase).strip() if current_split else phrase
+                        else:
+                            if current_split:
+                                chunks.append(current_split)
+                            # If single phrase still too long, force split by words
+                            if len(phrase) > max_chunk_length:
+                                words = phrase.split()
+                                current_split = ""
+                                for word in words:
+                                    if len(current_split) + len(word) + 1 <= max_chunk_length:
+                                        current_split = (current_split + " " + word).strip() if current_split else word
+                                    else:
+                                        if current_split:
+                                            chunks.append(current_split)
+                                        current_split = word
+                            else:
+                                current_split = phrase
+                    
+                    if current_split:
+                        chunks.append(current_split.strip())
+                        current_split = ""
+                        
+                else:
+                    # Normal case: try to add sentence to current chunk
+                    if len(current_chunk) + len(sentence) + 1 <= max_chunk_length:
+                        current_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
+                    else:
+                        # Current chunk is full, start a new one
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = sentence
+            
+            # Don't forget the last chunk
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            
+            return chunks
+
         async def generate_audio(self, req: GenerationRequest) -> bytes:
-            """Generate audio from text using XTTS"""
+            """Generate audio from text using XTTS with chunking for long texts."""
             await self._ensure_model_loaded()
             
             if not self.model_loaded or self.model is None:
@@ -152,10 +216,6 @@ try:
                 text_to_generate = req.text
                 ASCIIColors.info(f"Server: Generating audio for: '{text_to_generate[:50]}{'...' if len(text_to_generate) > 50 else ''}'")
                 ASCIIColors.info(f"Server: Language: {req.language}, Requested Voice: {req.voice}")
-
-                # Heuristic warning for language mismatch causing truncation
-                if len(text_to_generate) > 250 and req.language == "en":
-                    ASCIIColors.warning("Server: Text length > 250 chars with language='en'. XTTS may truncate. Ensure correct language code (e.g. 'fr', 'es') is passed if text is not English.")
 
                 # Determine which voice name to use. Priority: speaker_wav > voice > 'default_voice'
                 voice_to_find = req.speaker_wav or req.voice or "default_voice"
@@ -177,22 +237,56 @@ try:
                 
                 ASCIIColors.info(f"Server: Using speaker reference: {speaker_wav_path}")
 
-                # Generate audio using XTTS
-                wav_chunks = self.model.tts(
-                    text=text_to_generate,
-                    speaker_wav=speaker_wav_path,
-                    language=req.language,
-                    split_sentences=req.split_sentences
-                )
+                # Chunk text if it's long (threshold: 250 chars as per XTTS warning)
+                CHUNK_THRESHOLD = 250
+                MAX_CHUNK_LENGTH = 200  # Slightly under to be safe
                 
-                # Combine chunks into a single audio stream
-                audio_data = np.array(wav_chunks, dtype=np.float32)
+                if len(text_to_generate) > CHUNK_THRESHOLD:
+                    chunks = self._chunk_text(text_to_generate, MAX_CHUNK_LENGTH)
+                    ASCIIColors.info(f"Server: Text split into {len(chunks)} chunks for synthesis")
+                    
+                    all_audio_parts = []
+                    sample_rate = None
+                    
+                    for i, chunk in enumerate(chunks):
+                        ASCIIColors.info(f"Server: Synthesizing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+                        
+                        wav_chunks = self.model.tts(
+                            text=chunk,
+                            speaker_wav=speaker_wav_path,
+                            language=req.language,
+                            split_sentences=False  # We already split manually
+                        )
+                        
+                        audio_part = np.array(wav_chunks, dtype=np.float32)
+                        all_audio_parts.append(audio_part)
+                        
+                        # Capture sample rate from first chunk
+                        if sample_rate is None:
+                            sample_rate = self.model.synthesizer.output_sample_rate
+                    
+                    # Concatenate all audio parts
+                    audio_data = np.concatenate(all_audio_parts)
+                    ASCIIColors.info(f"Server: Concatenated {len(all_audio_parts)} audio chunks")
+                    
+                else:
+                    # Short text: single synthesis call
+                    wav_chunks = self.model.tts(
+                        text=text_to_generate,
+                        speaker_wav=speaker_wav_path,
+                        language=req.language,
+                        split_sentences=req.split_sentences
+                    )
+                    
+                    audio_data = np.array(wav_chunks, dtype=np.float32)
+                    sample_rate = self.model.synthesizer.output_sample_rate
                 
+                # Convert to WAV format
                 buffer = io.BytesIO()
                 with wave.open(buffer, 'wb') as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2) # 16-bit
-                    wf.setframerate(self.model.synthesizer.output_sample_rate)
+                    wf.setframerate(sample_rate)
                     wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
                 
                 audio_bytes = buffer.getvalue()
