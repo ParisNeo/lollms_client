@@ -26,7 +26,8 @@ import platform
 import inspect
 import pipmaster as pm
 
-pm.ensure_packages("ascii_colors>=0.11.10", "torch", "git+https://github.com/huggingface/diffusers.git", "pillow")
+pm.ensure_packages("ascii_colors>=0.11.10", "torch", "pillow")
+pm.ensure_packages("git+https://github.com/huggingface/diffusers.git")
 
 from ascii_colors import trace_exception, ASCIIColors
 
