@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-02-23 02:29]
+
+- chore(version): bump to 1.11.8 and add glm-5 context window
+
 ## [2026-02-19 23:14]
 
 - feat: add XTTS server functionality and update binding imports
