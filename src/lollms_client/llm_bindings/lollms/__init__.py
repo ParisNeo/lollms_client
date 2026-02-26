@@ -111,7 +111,7 @@ class LollmsBinding(LollmsLLMBinding):
             self.service_key = os.getenv("LOLLMS_API_KEY", self.service_key)
         
         # Determine verification strategy: specific file takes precedence, otherwise boolean flag
-        verify = self.certificate_file_path if self.certificate_file_path else self.verify_ssl_certificate
+        verify = False if not self.verify_ssl_certificate else self.certificate_file_path if self.certificate_file_path else True
 
         self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=verify))
         self.completion_format = ELF_COMPLETION_FORMAT.Chat

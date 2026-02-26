@@ -100,11 +100,15 @@ class OpenAIBinding(LollmsLLMBinding):
         self.model_name=kwargs.get("model_name")
         self.service_key=kwargs.get("service_key")
         self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
+        self.certificate_file_path=kwargs.get("certificate_file_path", None)
         self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
 
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=self.verify_ssl_certificate))
+
+        verify = False if not self.verify_ssl_certificate else self.certificate_file_path if self.certificate_file_path else True
+
+        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=verify))
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     def _build_openai_params(self, messages: list, **kwargs) -> dict:
