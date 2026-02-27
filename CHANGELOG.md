@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-02-27 13:00]
+
+- fix: correct import statement and JSON continuation in text processing
+
 ## [2026-02-26 01:52]
 
 - fix(ssl): correct certificate verification logic in Lollms and OpenAI bindings

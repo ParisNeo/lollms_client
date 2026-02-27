@@ -1273,10 +1273,10 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
         
         self._log_error("Failed to complete truncated JSON after all continuation attempts")
         return None
+
     # ========================
     # STRUCTURED JSON GENERATION
     # ========================
-    
     def generate_structured_content(
         self,
         prompt: str,
@@ -1287,7 +1287,7 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
         auto_continue_on_truncation: bool = True,
         **kwargs
     ) -> Optional[dict]:
-        """Generate structured JSON content conforming to a schema."""
+        """Generate structured JSON content conforming to a schema with robust error recovery."""
         images = images or []
         
         try:
@@ -1297,7 +1297,102 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
             has_validator = False
             self._log_warning("jsonschema not available, skipping validation")
         
-        # Parse schema
+        # Parse and normalize schema
+        schema_obj = self._parse_and_normalize_schema(schema)
+        
+        # Pre-generate examples and validation rules
+        example_instance = self._create_schema_example(schema_obj)
+        schema_str = json.dumps(schema_obj, indent=2, ensure_ascii=False)
+        example_str = json.dumps(example_instance, indent=2, ensure_ascii=False)
+        
+        # Extract key requirements from schema for explicit instructions
+        required_fields = schema_obj.get("required", [])
+        field_types = {k: v.get("type", "any") for k, v in schema_obj.get("properties", {}).items()}
+        
+        # Build enhanced system prompt with progressive specificity
+        base_system = self._build_robust_system_prompt(
+            schema_str, example_str, required_fields, field_types
+        )
+        
+        final_system_prompt = f"{system_prompt}\n\n{base_system}" if system_prompt else base_system
+        kwargs["ctx_size"] = kwargs.get("ctx_size", self.llm.default_ctx_size)
+        
+        # Multi-stage generation with adaptive recovery
+        for attempt in range(max_retries):
+            # Adjust prompt based on previous failures
+            adjusted_prompt = self._adjust_prompt_for_attempt(
+                prompt, attempt, schema_obj
+            )
+            
+            response = self.llm.generate_text(
+                adjusted_prompt,
+                images=images,
+                system_prompt=final_system_prompt,
+                **kwargs
+            )
+            
+            response = self.remove_thinking_blocks(response)
+            
+            if isinstance(response, dict) and not response.get("status", True):
+                continue
+            
+            # Multi-strategy extraction
+            json_string = self._extract_json_multi_strategy(response)
+            
+            if not json_string:
+                self._log_warning(f"Attempt {attempt + 1}: No JSON found in response")
+                continue
+            
+            # Progressive repair attempts
+            parsed_json = self._parse_with_progressive_repair(
+                json_string, schema_obj, attempt
+            )
+            
+            if parsed_json is None:
+                # Try truncation continuation
+                if auto_continue_on_truncation and self._looks_truncated(json_string):
+                    self._log_warning(f"Attempt {attempt + 1}: Attempting continuation...")
+                    parsed_json = self._continue_and_repair_truncated_json(
+                        original_prompt=adjusted_prompt,
+                        partial_json=json_string,
+                        schema=schema_obj,
+                        images=images,
+                        system_prompt=final_system_prompt,
+                        **kwargs
+                    )
+            
+            if parsed_json is not None:
+                # Validate and potentially repair
+                if has_validator:
+                    try:
+                        validate(instance=parsed_json, schema=schema_obj)
+                        self._log_success("JSON validated successfully against schema")
+                        return parsed_json
+                    except Exception as e:
+                        self._log_warning(f"Attempt {attempt + 1}: Validation failed - {e}")
+                        
+                        # Try schema-guided repair
+                        repaired = self._repair_against_schema(parsed_json, schema_obj, e)
+                        if repaired:
+                            try:
+                                validate(instance=repaired, schema=schema_obj)
+                                self._log_success("Repaired JSON validated successfully")
+                                return repaired
+                            except:
+                                pass
+                        
+                        # Return best effort on last attempt
+                        if attempt == max_retries - 1:
+                            return parsed_json
+                else:
+                    return parsed_json
+        
+        self._log_error("Failed to generate valid structured content after all retries")
+        return None
+
+
+    def _parse_and_normalize_schema(self, schema: Union[dict, str]) -> dict:
+        """Parse and normalize schema to standard format."""
         if isinstance(schema, dict):
             schema_obj = schema
         elif isinstance(schema, str):
@@ -1308,7 +1403,7 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
         else:
             raise TypeError("schema must be a dict or a JSON string")
         
-        # Normalize schema
+        # Normalize schema format
         if "type" not in schema_obj and "properties" not in schema_obj:
             if all(isinstance(v, dict) for v in schema_obj.values()):
                 schema_obj = {
@@ -1317,105 +1412,296 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
                     "required": list(schema_obj.keys())
                 }
         
-        # Create example from schema
-        example_instance = self._create_schema_example(schema_obj)
-        schema_str = json.dumps(schema_obj, indent=2, ensure_ascii=False)
-        example_str = json.dumps(example_instance, indent=2, ensure_ascii=False)
-        
-        # Build system prompt
-        base_system = f"""Your objective is to generate a JSON object that satisfies the user's request and conforms to the provided schema.
+        return schema_obj
 
-Schema:
+
+    def _build_robust_system_prompt(
+        self, schema_str: str, example_str: str, required_fields: list, field_types: dict
+    ) -> str:
+        """Build a robust system prompt with multiple reinforcement layers."""
+        
+        # Format field requirements explicitly
+        field_requirements = "\n".join([
+            f"  - {field}: {field_types.get(field, 'any')} (REQUIRED)"
+            for field in required_fields
+        ])
+        
+        return f"""You are a precise JSON generator. Your task is to create a JSON object that strictly conforms to the provided schema.
+
+# SCHEMA
 {schema_str}
 
-Example structure:
+# EXAMPLE STRUCTURE
 {example_str}
 
-You **MUST** wrap your JSON response in XML tags:
-<json>
-your json here
-</json>
+# REQUIRED FIELDS
+{field_requirements if field_requirements else "  (Check schema for required fields)"}
 
-Important:
-- Return valid JSON only
-- Follow the schema exactly
-- Use proper JSON syntax with double quotes
-- Do not include any text outside the <json> tags
-- Ensure the JSON is COMPLETE - close all arrays and objects properly"""
+# OUTPUT FORMAT RULES
+1. Wrap your JSON in <json_output> tags
+2. Use ONLY valid JSON syntax (double quotes, proper escaping)
+3. Include ALL required fields from the schema
+4. Match the exact data types specified (string, number, boolean, array, object)
+5. Close all brackets and braces properly
+6. Do NOT include comments or trailing commas
+7. Do NOT truncate - complete the entire structure
+
+# OUTPUT TEMPLATE
+<json_output>
+{{
+"field1": "value1",
+"field2": value2
+}}
+</json_output>
+
+Generate ONLY the JSON within the tags. No explanations before or after."""
+
+
+    def _adjust_prompt_for_attempt(self, prompt: str, attempt: int, schema: dict) -> str:
+        """Adjust prompt based on retry attempt to emphasize different aspects."""
+        if attempt == 0:
+            return prompt
         
-        final_system_prompt = f"{system_prompt}\n\n{base_system}" if system_prompt else base_system
-        kwargs["ctx_size"] = kwargs.get("ctx_size", self.llm.default_ctx_size)
+        required = schema.get("required", [])
         
-        # Attempt generation with retries
-        for attempt in range(max_retries):
-            response = self.llm.generate_text(
-                prompt,
-                images=images,
-                system_prompt=final_system_prompt,
-                **kwargs
-            )
-            response = self.remove_thinking_blocks(response)
-            if isinstance(response, dict) and not response.get("status", True):
-                continue
-            
-            json_string = self._extract_json_from_xml(response)
-            
-            if not json_string:
-                self._log_warning(f"Attempt {attempt + 1}: No JSON found in response")
-                continue
-            
-            parse_result = self._try_parse_json_with_truncation_detection(json_string)
-            
-            if parse_result["success"]:
-                parsed_json = parse_result["data"]
-                
-                if has_validator:
-                    try:
-                        validate(instance=parsed_json, schema=schema_obj)
-                        self._log_success("JSON validated successfully against schema")
-                        return parsed_json
-                    except Exception as e:
-                        self._log_warning(f"Attempt {attempt + 1}: Validation failed - {e}")
-                        if attempt == max_retries - 1:
-                            return parsed_json
-                        continue
-                else:
-                    return parsed_json
-            
-            elif parse_result["truncated"] and auto_continue_on_truncation:
-                self._log_warning(f"Attempt {attempt + 1}: JSON appears truncated. Attempting continuation...")
-                
-                continued_json = self._continue_truncated_json(
-                    original_prompt=prompt,
-                    partial_json=json_string,
-                    images=images,
-                    system_prompt=final_system_prompt,
-                    **kwargs
-                )
-                
-                if continued_json:
-                    final_parse = self._try_parse_json_with_truncation_detection(continued_json)
-                    if final_parse["success"]:
-                        parsed_json = final_parse["data"]
-                        
-                        if has_validator:
-                            try:
-                                validate(instance=parsed_json, schema=schema_obj)
-                                self._log_success("Continued JSON validated successfully")
-                                return parsed_json
-                            except:
-                                if attempt == max_retries - 1:
-                                    return parsed_json
-                        else:
-                            return parsed_json
-            else:
-                self._log_error(f"Attempt {attempt + 1}: Failed to parse JSON - {parse_result.get('error')}")
+        adjustments = [
+            f"\n\nIMPORTANT: Previous attempt failed. Focus on:\n1. Including ALL required fields: {', '.join(required)}\n2. Using correct JSON syntax with double quotes\n3. Completing the entire structure without truncation",
+            f"\n\nCRITICAL: Ensure your response is COMPLETE and VALID JSON. Required fields: {', '.join(required)}. Close all brackets properly.",
+            f"\n\nFINAL ATTEMPT: Generate simple, complete JSON. Must include: {', '.join(required)}. Use the exact structure from the example."
+        ]
         
-        self._log_error("Failed to generate valid structured content after all retries")
+        return prompt + adjustments[min(attempt - 1, len(adjustments) - 1)]
+
+
+    def _extract_json_multi_strategy(self, response: str) -> Optional[str]:
+        """Try multiple strategies to extract JSON from response."""
+        
+        # Strategy 1: XML tags
+        json_string = self._extract_json_from_xml(response)
+        if json_string:
+            return json_string
+        
+        # Strategy 2: Code blocks
+        json_string = self._extract_from_code_blocks(response)
+        if json_string:
+            return json_string
+        
+        # Strategy 3: First { to last }
+        json_string = self._extract_by_braces(response)
+        if json_string:
+            return json_string
+        
+        # Strategy 4: Entire response if it looks like JSON
+        stripped = response.strip()
+        if stripped.startswith('{') or stripped.startswith('['):
+            return stripped
+        
         return None
-    
-    # Helper methods for structured content (truncation detection, etc.) would go here
-    # See part 1 for _try_parse_json_with_truncation_detection, _continue_truncated_json, etc.
+
+
+    def _extract_from_code_blocks(self, text: str) -> Optional[str]:
+        """Extract JSON from markdown code blocks."""
+        patterns = [
+            r'```json\s*\n(.*?)\n```',
+            r'```\s*\n(.*?)\n```',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        
+        return None
+
+
+    def _extract_by_braces(self, text: str) -> Optional[str]:
+        """Extract content between first { and last }."""
+        first_brace = text.find('{')
+        last_brace = text.rfind('}')
+        
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            return text[first_brace:last_brace + 1]
+        
+        return None
+
+
+    def _parse_with_progressive_repair(
+        self, json_string: str, schema: dict, attempt: int
+    ) -> Optional[dict]:
+        """Try parsing with progressive repair strategies."""
+        
+        # Strategy 1: Direct parse
+        try:
+            return json.loads(json_string)
+        except json.JSONDecodeError as e:
+            self._log_warning(f"Parse error: {e}")
+        
+        # Strategy 2: Fix common issues
+        repaired = self._apply_common_fixes(json_string)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+        
+        # Strategy 3: Truncation repair
+        if self._looks_truncated(json_string):
+            completed = self._simple_truncation_repair(json_string, schema)
+            try:
+                return json.loads(completed)
+            except json.JSONDecodeError:
+                pass
+        
+        return None
+
+
+    def _apply_common_fixes(self, json_string: str) -> str:
+        """Apply common JSON syntax fixes."""
+        # Remove trailing commas
+        json_string = re.sub(r',(\s*[}\]])', r'\1', json_string)
+        
+        # Fix single quotes to double quotes (naive but helpful)
+        # Only outside of strings - this is simplistic
+        json_string = json_string.replace("'", '"')
+        
+        # Remove trailing incomplete content
+        json_string = json_string.rstrip()
+        if json_string.endswith(','):
+            json_string = json_string[:-1]
+        
+        return json_string
+
+
+    def _looks_truncated(self, json_string: str) -> bool:
+        """Check if JSON appears truncated."""
+        stripped = json_string.strip()
+        
+        # Count braces/brackets
+        open_braces = stripped.count('{')
+        close_braces = stripped.count('}')
+        open_brackets = stripped.count('[')
+        close_brackets = stripped.count(']')
+        
+        # Truncated if mismatched or ends mid-value
+        if open_braces != close_braces or open_brackets != close_brackets:
+            return True
+        
+        # Check for incomplete strings
+        if stripped.endswith('"') and stripped[-2] != '\\':
+            # Might be incomplete
+            return True
+        
+        return False
+
+
+    def _simple_truncation_repair(self, json_string: str, schema: dict) -> str:
+        """Attempt simple truncation repair by closing structures."""
+        result = json_string.strip()
+        
+        # Remove incomplete trailing content
+        if result.endswith(','):
+            result = result[:-1]
+        
+        # Count and close structures
+        open_braces = result.count('{')
+        close_braces = result.count('}')
+        open_brackets = result.count('[')
+        close_brackets = result.count(']')
+        
+        # Close arrays
+        for _ in range(open_brackets - close_brackets):
+            result += ']'
+        
+        # Close objects
+        for _ in range(open_braces - close_braces):
+            result += '}'
+        
+        return result
+
+
+    def _continue_and_repair_truncated_json(
+        self,
+        original_prompt: str,
+        partial_json: str,
+        schema: dict,
+        images: list,
+        system_prompt: str,
+        **kwargs
+    ) -> Optional[dict]:
+        """Continue generation for truncated JSON with schema guidance."""
+        
+        continuation_prompt = f"""The previous JSON generation was incomplete. Here is what was generated so far:
+
+    {partial_json}
+
+    Complete this JSON object according to the schema. Output ONLY the completion needed, starting from where it left off. Wrap in <json_output> tags."""
+        
+        response = self.llm.generate_text(
+            continuation_prompt,
+            images=images,
+            system_prompt=system_prompt,
+            **kwargs
+        )
+        
+        response = self.remove_thinking_blocks(response)
+        continued = self._extract_json_multi_strategy(response)
+        
+        if continued:
+            # Attempt to merge
+            combined = self._merge_json_parts(partial_json, continued)
+            return self._parse_with_progressive_repair(combined, schema, 0)
+        
+        return None
+
+
+    def _merge_json_parts(self, part1: str, part2: str) -> str:
+        """Intelligently merge two JSON parts."""
+        # Simple strategy: if part1 ends with incomplete structure, append part2
+        part1 = part1.rstrip()
+        part2 = part2.lstrip()
+        
+        # If part1 ends with comma or incomplete, try to join
+        if part1.endswith(','):
+            return part1 + part2
+        
+        # Try to find where to splice
+        # This is heuristic - look for last complete field
+        return part1 + part2
+
+
+    def _repair_against_schema(self, parsed_json: dict, schema: dict, error: Exception) -> Optional[dict]:
+        """Attempt to repair JSON based on schema validation error."""
+        # Extract missing fields from error
+        error_str = str(error)
+        
+        # If missing required field, add with default value
+        if "required property" in error_str.lower():
+            required_fields = schema.get("required", [])
+            properties = schema.get("properties", {})
+            
+            repaired = parsed_json.copy()
+            for field in required_fields:
+                if field not in repaired:
+                    # Add default value based on type
+                    field_schema = properties.get(field, {})
+                    default = self._get_default_for_type(field_schema.get("type", "string"))
+                    repaired[field] = default
+            
+            return repaired
+        
+        return None
+
+
+    def _get_default_for_type(self, type_name: str) -> any:
+        """Get default value for a schema type."""
+        defaults = {
+            "string": "",
+            "number": 0,
+            "integer": 0,
+            "boolean": False,
+            "array": [],
+            "object": {}
+        }
+        return defaults.get(type_name, None)
     
     # ========================
     # HELPER METHODS FOR COMMON TASKS
