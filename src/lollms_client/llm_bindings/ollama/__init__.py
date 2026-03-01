@@ -965,6 +965,11 @@ class OllamaBinding(LollmsLLMBinding):
             'qwen3': 128000,       # Qwen3 with 128k
             'qwen3-vl': 128000,       # Qwen3-vl with 128k
             'qwen3-coder': 256000, # Qwen3 with 256k
+            'qwen3.5': 262144,
+            'qwen3.5:27b': 262144,
+            'qwen3.5:35b': 262144,
+            'qwen3.5:122b': 262144,
+            'qwen3.5:397b': 262144,
             'codellama': 16384,   # CodeLlama extended
             'codegemma': 8192,    # CodeGemma default
             'deepseek-coder': 16384,  # DeepSeek-Coder V1 default

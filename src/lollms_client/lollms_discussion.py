@@ -2774,6 +2774,15 @@ class LollmsDiscussion:
                 **kwargs
             ) or ""
             
+            if isinstance(final_raw_response, dict):
+                return {
+                    "user_message": user_msg, 
+                    "ai_message": str(final_raw_response), 
+                    "sources": collected_sources,
+                    "scratchpad": scratchpad_state if is_agentic_turn else None,
+                    "self_corrections": self_corrections if self_corrections else None
+                }
+
             if remove_thinking_blocks:
                 final_content = self.lollmsClient.remove_thinking_blocks(final_raw_response)
             else:
