@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-03-01 23:49]
+
+- chore(release): bump version to 1.11.13
+
 ## [2026-03-01 23:04]
 
 - feat(llm): add qwen3.5 model support and improve response handling

@@ -2776,7 +2776,7 @@ class LollmsDiscussion:
             
             if isinstance(final_raw_response, dict):
                 return {
-                    "user_message": user_msg, 
+                    "user_message": {"metadata":user_msg, "content":str(user_message)}, 
                     "ai_message": str(final_raw_response), 
                     "sources": collected_sources,
                     "scratchpad": scratchpad_state if is_agentic_turn else None,
