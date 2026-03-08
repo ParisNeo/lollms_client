@@ -1,85 +1,161 @@
-title: LlamaCpp Server
+title: LlamaCpp Server (Enhanced)
 author: ParisNeo
 creation_date: 2025-12-13
-last_update_date: 2025-12-24
+last_update_date: 2026-01-15
 description: |
-  Runs a local llama.cpp server compatible with OpenAI API.
-  Supports GGUF models loaded from a local folder.
-  
-  **Process Safety:**
-  The server process is shared among multiple binding instances. A file lock is used to ensuring only one server instance runs on the configured port (default 9624).
-  
-  **Multi-file GGUF Support:**
-  This binding supports split GGUF models (e.g., `model-00001-of-00005.gguf`).
-  When pulling a model from Hugging Face, simply specify the filename of the first part.
+  Runs a fully-local llama.cpp server that exposes an OpenAI-compatible API.
+  Loads GGUF models from a local folder and manages server processes automatically.
 
-  **Multimodal Support:**
-  The binding automatically detects `.mmproj` files in the model folder or via a local registry. 
-  Association is handled automatically when pulling both model and projector from Hugging Face.
-  Projector files are hidden from the standalone model list for clarity.
-  
+  **Process & Thread Safety:**
+  A file-lock (filelock) serialises all server-spawn decisions across every
+  process and thread sharing the same models directory.  Each running server is
+  tracked via a lightweight JSON registry under `<models_path>/servers/`.
+
+  **Multi-Model Capacity:**
+  `max_active_models` controls how many llama-servers may run simultaneously.
+  When the limit is reached the Least-Recently-Used model is evicted
+  automatically.  Setting it to -1 removes the cap entirely.
+
+  **Idle Timeout:**
+  When `idle_timeout` is set to a positive number (seconds), a background
+  watchdog thread will automatically shut down servers that have not received
+  a request within that window.
+
+  **Multimodal / Vision:**
+  mmproj files are auto-detected by naming convention, or registered explicitly
+  with `bind_multimodal_model()`.  Images can be passed as local file paths or
+  HTTP URLs; they are encoded as base64 data-URIs transparently.
+
+  **Split-GGUF Support:**
+  Multi-part models (e.g., `model-00001-of-00003.gguf`) are handled in both
+  `list_models()` and `pull_model()`.
+
+  **Advanced Server Flags:**
+  Exposes flash-attn, mmap/mlock, rope scaling, tensor-split, cache-type-k/v,
+  and per-GPU settings through constructor kwargs.
+
 input_parameters:
   - name: model_name
     type: str
-    description: "The filename of the GGUF model to load."
-    mandatory: true
+    description: "Filename of the GGUF model to load on startup."
+    mandatory: false
     default: ""
   - name: host
     type: str
-    description: "Host to bind the server to."
+    description: "Interface to bind the server to."
     mandatory: false
     default: "localhost"
-  - name: port
-    type: int
-    description: "Port to bind the server to (default 9624)."
-    mandatory: false
-    default: 9624
   - name: ctx_size
     type: int
-    description: "Context window size."
+    description: "Context window size (tokens)."
     mandatory: false
     default: 4096
   - name: n_gpu_layers
     type: int
-    description: "Number of layers to offload to GPU (-1 for all)."
+    description: "Number of transformer layers to offload to GPU (-1 = all)."
     mandatory: false
     default: -1
   - name: n_threads
     type: int
-    description: "Number of CPU threads (leave empty for auto)."
+    description: "CPU threads to use for generation (null = auto)."
     mandatory: false
     default: null
   - name: n_parallel
     type: int
-    description: "Number of parallel sequences to decode."
+    description: "Parallel decoding slots (for concurrent requests)."
     mandatory: false
     default: 1
+  - name: batch_size
+    type: int
+    description: "Prompt-evaluation batch size."
+    mandatory: false
+    default: 512
+  - name: flash_attn
+    type: bool
+    description: "Enable FlashAttention (requires compatible build)."
+    mandatory: false
+    default: false
+  - name: mmap
+    type: bool
+    description: "Use memory-mapped I/O for model weights."
+    mandatory: false
+    default: true
+  - name: mlock
+    type: bool
+    description: "Lock model weights in RAM (prevents swapping)."
+    mandatory: false
+    default: false
+  - name: rope_scale
+    type: float
+    description: "RoPE context scaling factor (null = off)."
+    mandatory: false
+    default: null
+  - name: rope_freq_base
+    type: float
+    description: "RoPE frequency base override (null = model default)."
+    mandatory: false
+    default: null
+  - name: rope_freq_scale
+    type: float
+    description: "RoPE frequency scale override (null = model default)."
+    mandatory: false
+    default: null
+  - name: tensor_split
+    type: str
+    description: "Comma-separated GPU tensor-split ratios, e.g. '0.6,0.4'."
+    mandatory: false
+    default: null
+  - name: main_gpu
+    type: int
+    description: "GPU index to use for scratch/small tensors."
+    mandatory: false
+    default: null
+  - name: cache_type_k
+    type: str
+    description: "KV-cache key quantisation type (f16, q8_0, q4_0 …)."
+    mandatory: false
+    default: null
+  - name: cache_type_v
+    type: str
+    description: "KV-cache value quantisation type."
+    mandatory: false
+    default: null
+  - name: max_active_models
+    type: int
+    description: "Maximum simultaneous model servers (-1 = unlimited)."
+    mandatory: false
+    default: 1
+  - name: idle_timeout
+    type: float
+    description: "Seconds of inactivity before a server is auto-stopped (-1 = disabled)."
+    mandatory: false
+    default: -1
   - name: models_path
     type: str
-    description: "Path to the directory containing GGUF models."
+    description: "Directory containing GGUF model files."
     mandatory: false
     default: "models/llama_cpp_models"
 
 commands:
   - name: pull_model
-    title: Pull Model (HF)
-    description: "Downloads a GGUF model from Hugging Face."
+    title: Pull Model from Hugging Face
+    description: "Downloads a GGUF model (and optional mmproj) from Hugging Face Hub."
     parameters:
       - name: repo_id
         type: str
-        description: "The Hugging Face repo ID."
+        description: "Hugging Face repository ID."
         mandatory: true
       - name: filename
         type: str
-        description: "The specific GGUF filename to download."
+        description: "GGUF filename (first shard for split models)."
         mandatory: true
       - name: mmproj_repo_id
         type: str
-        description: "The Hugging Face repo ID for the mmproj file (optional)."
+        description: "Repo ID for the vision projector (optional)."
         mandatory: false
       - name: mmproj_filename
         type: str
-        description: "The specific mmproj filename to download (optional)."
+        description: "Projector filename to download and bind (optional)."
         mandatory: false
     output:
       - name: status
@@ -93,20 +169,33 @@ commands:
         type: int
       - name: total
         type: int
+
   - name: bind_multimodal_model
-    title: Bind Projector
-    description: "Explicitly associate a model file with a multimodal projector file."
+    title: Bind Vision Projector
+    description: "Explicitly associates a GGUF model with an mmproj file."
     parameters:
       - name: model_name
         type: str
-        description: "The GGUF model filename."
+        description: "GGUF model filename."
         mandatory: true
       - name: mmproj_name
         type: str
-        description: "The mmproj GGUF filename."
+        description: "mmproj GGUF filename."
         mandatory: true
     output:
       - name: status
         type: bool
       - name: message
         type: str
+
+  - name: unload_model
+    title: Unload Model
+    description: "Stops the running server for a given model."
+    parameters:
+      - name: model_name
+        type: str
+        description: "Model filename to unload (defaults to current model)."
+        mandatory: false
+    output:
+      - name: status
+        type: bool

@@ -6,3 +6,4 @@ tiktoken
 pydantic
 numpy
 jsonschema
+prompt-toolkit>=3.0.0

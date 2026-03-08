@@ -1366,7 +1366,6 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
                 if has_validator:
                     try:
                         validate(instance=parsed_json, schema=schema_obj)
-                        self._log_success("JSON validated successfully against schema")
                         return parsed_json
                     except Exception as e:
                         self._log_warning(f"Attempt {attempt + 1}: Validation failed - {e}")
