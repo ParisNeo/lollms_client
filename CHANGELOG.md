@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-03-09 02:21]
+
+- chore(deps): bump ascii-colors to >=0.11.20 and update discussion imports
+
 ## [2026-03-08 23:35]
 
 - refactor: remove deprecated examples and streamline documentation

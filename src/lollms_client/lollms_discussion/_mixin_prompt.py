@@ -147,6 +147,11 @@ class PromptMixin:
                 cleaned, auto_activate=auto_activate_artefacts
             )
 
+        # Extract type from patch tag if present for re-typing support
+        def _extract_type_from_patch(text: str) -> Optional[str]:
+            patch_match = re.search(r'<artefact\s+[^>]*type=["\']([^"\']+)["\'][^>]*>', text, re.IGNORECASE)
+            return patch_match.group(1) if patch_match else None
+
         def _parse_attrs(attr_str: str) -> Dict[str, str]:
             return {m.group(1): m.group(2)
                     for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}

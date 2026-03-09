@@ -1,5 +1,5 @@
 requests>=2.25.1
-ascii-colors>=0.11.5
+ascii-colors>=0.11.20
 pillow
 pipmaster>=1.1.0
 tiktoken

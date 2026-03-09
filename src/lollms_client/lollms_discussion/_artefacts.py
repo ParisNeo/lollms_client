@@ -135,10 +135,30 @@ class ArtefactManager:
         url:           Optional[str] = None,
         tags:          Optional[List[str]] = None,
         version:       int = 1,
-        active:        bool = False,
+        active:        bool = True,
         **extra_data
     ) -> Dict[str, Any]:
-        """Adds or replaces an artefact (same title + version = overwrite). Returns the new dict."""
+        """
+        Adds a new artefact or a specific version of an existing one.
+
+        Args:
+            title: The unique identifier/filename for the artefact.
+            artefact_type: The category (e.g., code, document, skill). See ArtefactType.
+            content: The text/markdown content.
+            images: Optional list of base64 strings.
+            audios: Optional list of base64 strings (reserved).
+            videos: Optional list of base64 strings (reserved).
+            zip_content: Optional base64 zip blob.
+            language: Programming language hint for syntax highlighting.
+            url: Source URL if applicable.
+            tags: List of organizational tags.
+            version: The version number. Defaults to 1.
+            active: If True, the content is injected into the LLM system prompt.
+            **extra_data: Arbitrary metadata (author, source, description, etc.)
+
+        Returns:
+            The created artefact dictionary.
+        """
         if artefact_type not in ArtefactType.ALL:
             raise ValueError(
                 f"Unknown artefact type '{artefact_type}'. "
@@ -202,38 +222,60 @@ class ArtefactManager:
 
     def update(
         self,
-        title:        str,
-        new_content:  Optional[str] = None,
-        new_images:   Optional[List[str]] = None,
-        new_tags:     Optional[List[str]] = None,
-        language:     Optional[str] = None,
-        url:          Optional[str] = None,
-        bump_version: bool = True,
+        title:         str,
+        new_content:   Optional[str] = None,
+        new_type:      Optional[str] = None,
+        new_images:    Optional[List[str]] = None,
+        new_tags:      Optional[List[str]] = None,
+        language:      Optional[str] = None,
+        url:           Optional[str] = None,
+        bump_version:  bool = True,
+        active:        Optional[bool] = None,
         **extra_data
     ) -> Dict[str, Any]:
-        """Creates a new version of an artefact (bump_version=False overwrites in-place)."""
+        """
+        Creates a new version of an existing artefact with updated fields.
+
+        Args:
+            title: Title of the artefact to update.
+            new_content: New text content. If None, current content is preserved.
+            new_type: If provided, changes the ArtefactType (e.g., from 'document' to 'code').
+            new_images: New images list. If None, current images are preserved.
+            new_tags: New tags list.
+            language: Programming language hint.
+            url: Updated source URL.
+            bump_version: If True (default), increments version. If False, overwrites current.
+            active: Sets or preserves the activation state.
+            **extra_data: New or updated metadata fields.
+
+        Returns:
+            The updated artefact dictionary.
+        """
         latest = self.get(title)
         if latest is None:
             raise ValueError(f"Cannot update non-existent artefact '{title}'.")
         new_version = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
         
-        # Merge old extra_data with new ones so we don't lose author/description
-        merged_extra = {k: v for k, v in latest.items() if k not in["id", "title", "type", "version", "content", "images", "audios", "videos", "zip", "language", "url", "tags", "active", "created_at", "updated_at"]}
+        # Determine active state: priority to argument, fallback to previous state
+        new_active = active if active is not None else latest.get('active', True)
+
+        # Merge old extra_data with new ones so we don't lose existing metadata (author, etc.)
+        merged_extra = {k: v for k, v in latest.items() if k not in ["id", "title", "type", "version", "content", "images", "audios", "videos", "zip", "language", "url", "tags", "active", "created_at", "updated_at"]}
         merged_extra.update(extra_data)
 
         return self.add(
             title         = title,
-            artefact_type = latest.get('type', ArtefactType.DOCUMENT),
+            artefact_type = new_type if new_type is not None else latest.get('type', ArtefactType.DOCUMENT),
             content       = new_content if new_content is not None else latest.get('content', ''),
-            images        = new_images  if new_images  is not None else latest.get('images',[]),
+            images        = new_images  if new_images  is not None else latest.get('images', []),
             audios        = latest.get('audios', []),
-            videos        = latest.get('videos',[]),
+            videos        = latest.get('videos', []),
             zip_content   = latest.get('zip'),
-            language      = language   if language  is not None else latest.get('language'),
-            url           = url        if url       is not None else latest.get('url'),
-            tags          = new_tags   if new_tags  is not None else latest.get('tags',[]),
+            language      = language if language is not None else latest.get('language'),
+            url           = url if url is not None else latest.get('url'),
+            tags          = new_tags if new_tags is not None else latest.get('tags', []),
             version       = new_version,
-            active        = latest.get('active', False),
+            active        = new_active,
             **merged_extra,
         )
 
@@ -475,6 +517,7 @@ class ArtefactManager:
                         result_artefact = self.update(
                             title=title, new_content=patched,
                             language=language, bump_version=True,
+                            active=auto_activate,
                             **attrs
                         )
                     except ValueError as e:
@@ -514,9 +557,11 @@ class ArtefactManager:
 
     def add_artefact(self, title, content="", images=None, audios=None, videos=None,
                      zip_content=None, version=1, **extra_data) -> Dict:
-        """Legacy shim → self.add()"""
+        """Legacy shim → self.add(). Allows overriding artefact_type via extra_data."""
+        # Extract artefact_type if user provided it in kwargs, otherwise default to DOCUMENT
+        atype = extra_data.pop('artefact_type', ArtefactType.DOCUMENT)
         return self.add(
-            title=title, artefact_type=ArtefactType.DOCUMENT,
+            title=title, artefact_type=atype,
             content=content, images=images, audios=audios, videos=videos,
             zip_content=zip_content, version=version, **extra_data
         )

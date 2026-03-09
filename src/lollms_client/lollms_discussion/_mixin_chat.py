@@ -83,35 +83,21 @@ class ChatMixin:
 
     def _stream_final_answer(self, callback, images, branch_tip_id, temperature, **kwargs):
         """
-        Calls lollmsClient.chat() with the current discussion state.
-
-        • If a callback is present AND the caller did not explicitly pass
-          stream=False, the answer is streamed token-by-token via
-          MSG_TYPE_CHUNK and the complete string is returned.
-        • If stream=False was passed by the caller (or no callback exists),
-          the answer is generated in one shot and returned as-is.
-
-        kwargs cleaning: 'stream', 'callback', and 'streaming_callback' are
-        removed from **kwargs before forwarding to avoid duplicate-keyword errors
-        when the caller already included them.
+        Internal helper to handle the streaming bridge between the binding and UI.
+        Fix: Correctly propagates stop signals (return False) from the callback to the binding.
         """
-        # Pull out stream intent before cleaning kwargs
         caller_stream = kwargs.pop("stream", None)
-        # Remove any callback keys the caller may have passed — we manage them here
         kwargs.pop("callback", None)
         kwargs.pop("streaming_callback", None)
 
-        # Decide whether to stream
         do_stream = (callback is not None) and (caller_stream is not False)
-
         collected = []
 
         def _streaming_relay(chunk, msg_type=None, meta=None):
-            # MUST return True — many bindings treat a falsy/None return as a
-            # "stop streaming" signal and abort after the very first token.
             if isinstance(chunk, str):
                 collected.append(chunk)
-                _cb(callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, meta)
+                # Important: return the result of the callback so the LLM knows if it should stop
+                return _cb(callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, meta)
             return True
 
         result = self.lollmsClient.chat(
@@ -125,8 +111,6 @@ class ChatMixin:
         )
 
         if do_stream:
-            # If the binding returned a string directly (non-streaming fallback),
-            # relay it now so the caller still sees chunks.
             if isinstance(result, str) and result and not collected:
                 _cb(callback, result, MSG_TYPE.MSG_TYPE_CHUNK)
                 return result
@@ -851,38 +835,31 @@ class ChatMixin:
                     return True
 
                 _stream_buf.append(chunk)
-                # Build running text for tag detection
                 _so_far = "".join(_stream_buf)
 
                 if not _in_tool_call:
-                    # Check if we've just completed a <tool_call> open tag
                     if _TC_OPEN in _so_far:
                         _in_tool_call = True
-                        # Flush everything BEFORE the tag to callback
                         _pre = _so_far[:_so_far.index(_TC_OPEN)]
                         if _pre and callback is not None:
                             _cb(callback, _pre, MSG_TYPE.MSG_TYPE_CHUNK)
-                        return True   # keep receiving (need the JSON + close tag)
+                        return True 
                     else:
-                        # No tool call yet — check if we might be mid-tag
+                        # Ensure chunks are passed through immediately unless they look like a partial tag
                         _could_be_partial = any(
                             _TC_OPEN.startswith(_so_far[-i:])
                             for i in range(1, len(_TC_OPEN) + 1)
                             if i <= len(_so_far)
                         )
-                        if _could_be_partial:
-                            return True   # withhold last few chars until resolved
-                        # Safe to forward this chunk
-                        if callback is not None:
-                            _cb(callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+                        if not _could_be_partial and callback is not None:
+                            return _cb(callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
                         return True
                 else:
-                    # Inside a tool call — check for closing tag
                     if _TC_CLOSE in _so_far:
                         _tool_trigger = True
-                        return False   # stop generation — we have a complete tool call
+                        return False  # Signal to _stream_final_answer to stop the LLM
 
-                    return True   # keep receiving
+                    return True
 
             # Build context with any injected tool results from previous rounds
             _extra_context = ""
