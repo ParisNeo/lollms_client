@@ -13,7 +13,7 @@ The `LollmsClient` class is the primary interface for interacting with various L
 *   **`stt` (`Optional[LollmsSTTBinding]`)**: The active Speech-to-Text binding instance, if configured.
 *   **`ttv` (`Optional[LollmsTTVBinding]`)**: The active Text-to-Video binding instance, if configured.
 *   **`ttm` (`Optional[LollmsTTMBinding]`)**: The active Text-to-Music binding instance, if configured.
-*   **`mcp` (`Optional[LollmsMCPBinding]`)**: The active Model Context Protocol (MCP) binding instance for function calling, if configured.
+*   **`mcp` (`Optional[LollmsToolBinding]`)**: The active Model Context Protocol (MCP) binding instance for function calling, if configured.
 *   **`binding_manager` (`LollmsLLMBindingManager`)**: Manages the discovery and creation of LLM bindings.
 *   **`tts_binding_manager`, `tti_binding_manager`, etc.**: Managers for respective modality bindings.
 *   **`default_ctx_size`, `default_n_predict`, etc.**: Default parameters for LLM text generation.
@@ -239,7 +239,7 @@ try:
     print("\n--- Function Calling with MCP (Internet Search) ---")
     lc_with_mcp = LollmsClient(
         binding_name="ollama", model_name="mistral:latest", # LLM for decisions
-        mcp_binding_name="local_mcp", # Enable local tools
+        tools_binding_name="local_mcp", # Enable local tools
         streaming_callback=my_callback # Callback for MCP steps and final answer
     )
     mcp_response = lc_with_mcp.generate_with_mcp(
@@ -289,7 +289,7 @@ except Exception as e:
 *   `lollms_client.lollms_types`
 *   `lollms_client.lollms_utilities`
 *   `lollms_client.lollms_llm_binding` (and its managers for TTS, TTI, etc.)
-*   `lollms_client.lollms_mcp_binding`
+*   `lollms_client.lollms_tools_binding`
 *   `json`, `re`, `enum`, `base64`, `numpy`, `pathlib`, `os` (standard libraries)
 
 **Configuration Options:**

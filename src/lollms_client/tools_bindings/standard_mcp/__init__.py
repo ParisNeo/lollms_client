@@ -1,4 +1,4 @@
-# File: lollms_client/mcp_bindings/standard_mcp/__init__.py
+# File: lollms_client/tools_bindings/standard_mcp/__init__.py
 
 import pipmaster as pm
 
@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 # These imports should now succeed if pipmaster did its job.
-from lollms_client.lollms_mcp_binding import LollmsMCPBinding # Assuming this base class exists
+from lollms_client.lollms_tools_binding import LollmsToolBinding # Assuming this base class exists
 from ascii_colors import ASCIIColors, trace_exception
 
 # Attempt to import MCP library components.
@@ -35,13 +35,13 @@ except ImportError as e:
     types = None # MCP types module unavailable
     MCP_LIBRARY_AVAILABLE = False
 
-# This variable is used by LollmsMCPBindingManager to identify the binding class.
+# This variable is used by LollmsTOOLBindingManager to identify the binding class.
 BindingName = "StandardMCPBinding" # Must match the class name below
 TOOL_NAME_SEPARATOR = "::"
 
-class StandardMCPBinding(LollmsMCPBinding):
+class StandardMCPBinding(LollmsToolBinding):
     """
-    A LollmsMCPBinding to connect to multiple standard Model Context Protocol (MCP) servers.
+    A LollmsToolBinding to connect to multiple standard Model Context Protocol (MCP) servers.
     This binding acts as an MCP client to these servers.
     Each server is launched via a command, communicates over stdio, and is identified by a unique alias.
     Tool names are prefixed with 'server_alias::' for disambiguation.

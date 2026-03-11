@@ -95,10 +95,10 @@ try:
         },
 
         # MCP (Function Calling) Configuration
-        mcp_binding_name="local_mcp", # Use the local MCP binding
-        # mcp_binding_config can be used to point to a custom tools folder:
-        # mcp_binding_config={"tools_folder_path": "path/to/my/custom_mcp_tools"},
-        # If mcp_binding_config is None or tools_folder_path is not set,
+        tools_binding_name="local_mcp", # Use the local MCP binding
+        # tools_binding_config can be used to point to a custom tools folder:
+        # tools_binding_config={"tools_folder_path": "path/to/my/custom_mcp_tools"},
+        # If tools_binding_config is None or tools_folder_path is not set,
         # it uses the packaged default_tools (internet_search, file_writer, etc.).
 
         # STT Configuration (Example with Whisper)
@@ -124,7 +124,7 @@ except Exception as e:
 *   `models_path` (Optional[str]): For local file-based LLM bindings.
 *   `service_key` (Optional[str]): API key for services like OpenAI.
 *   `llm_binding_config` (Optional[Dict]): Additional parameters for the LLM binding.
-*   `tts_binding_name`, `stt_binding_name`, `tti_binding_name`, `ttm_binding_name`, `ttv_binding_name`, `mcp_binding_name`: Names of bindings for different modalities.
+*   `tts_binding_name`, `stt_binding_name`, `tti_binding_name`, `ttm_binding_name`, `ttv_binding_name`, `tools_binding_name`: Names of bindings for different modalities.
 *   `tts_binding_config`, `stt_binding_config`, etc.: Dictionaries of configuration parameters for specific modality bindings.
 *   `verify_ssl_certificate` (bool): Defaults to `True`.
 
@@ -307,7 +307,7 @@ MCP allows an LLM to:
     *   `file_writer`: Writes or appends content to files.
     *   `python_interpreter`: Executes Python code snippets in a restricted environment.
     *   `generate_image_from_prompt`: Generates an image by calling the `LollmsClient`'s active TTI binding.
-*   **Custom Tools:** You can create your own tools by placing a `<tool_name>.py` (with an `execute` function) and a `<tool_name>.mcp.json` (defining metadata like name, description, input/output schemas) in a folder and pointing `mcp_binding_config={"tools_folder_path": "your/tools/dir"}` to it during `LollmsClient` initialization.
+*   **Custom Tools:** You can create your own tools by placing a `<tool_name>.py` (with an `execute` function) and a `<tool_name>.mcp.json` (defining metadata like name, description, input/output schemas) in a folder and pointing `tools_binding_config={"tools_folder_path": "your/tools/dir"}` to it during `LollmsClient` initialization.
 
 ### 5.3. Using `generate_with_mcp()`
 
@@ -329,7 +329,7 @@ def mcp_stream_callback(chunk: str, msg_type: MSG_TYPE, metadata: dict = None, t
 try:
     client_mcp = LollmsClient(
         binding_name="ollama", model_name="mistral", # Choose a capable LLM
-        mcp_binding_name="local_mcp" # Activate local_mcp with its default tools
+        tools_binding_name="local_mcp" # Activate local_mcp with its default tools
     )
 
     user_prompt_mcp = "Search the web for 'latest Python version' and then write the result into a file named 'python_version_info.txt'."

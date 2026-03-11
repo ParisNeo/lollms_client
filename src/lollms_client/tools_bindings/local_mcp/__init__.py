@@ -1,16 +1,16 @@
-# lollms_client/mcp_bindings/local_mcp/__init__.py
+# lollms_client/tools_bindings/local_mcp/__init__.py
 import json
 import importlib.util
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 
-from lollms_client.lollms_mcp_binding import LollmsMCPBinding
+from lollms_client.lollms_tools_binding import LollmsToolBinding
 from ascii_colors import ASCIIColors, trace_exception
 
-# This variable is used by the LollmsMCPBindingManager to identify the binding class.
+# This variable is used by the LollmsTOOLBindingManager to identify the binding class.
 BindingName = "LocalMCPBinding"
 
-class LocalMCPBinding(LollmsMCPBinding):
+class LocalMCPBinding(LollmsToolBinding):
     """
     Local Model Context Protocol (MCP) Binding.
 
@@ -146,7 +146,7 @@ class LocalMCPBinding(LollmsMCPBinding):
         python_file_path = Path(python_file_path_str)
 
         try:
-            module_name = f"lollms_client.mcp_bindings.local_mcp.tools.{tool_name}" 
+            module_name = f"lollms_client.tools_bindings.local_mcp.tools.{tool_name}" 
             spec = importlib.util.spec_from_file_location(module_name, str(python_file_path))
             
             if not spec or not spec.loader:

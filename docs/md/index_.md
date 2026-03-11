@@ -52,13 +52,13 @@ Welcome to the documentation for the `lollms_client` library. This index provide
             *   Implementations: `lollms` (Server), `audiocraft`, `bark` (for SFX).
         *   Text-to-Video (TTV): [`LollmsTTVBinding`](#text-to-video-ttv-bindings), `LollmsTTVBindingManager`
             *   Implementations: `lollms` (Server - Placeholder).
-    *   **MCP Bindings (`LollmsMCPBinding`, `LollmsMCPBindingManager`)**:
-        *   [Abstract Base Class & Manager](#mcp-bindings-lollms_clientlollms_mcp_bindingpy)
+    *   **MCP Bindings (`LollmsToolBinding`, `LollmsTOOLBindingManager`)**:
+        *   [Abstract Base Class & Manager](#mcp-bindings-lollms_clientlollms_tools_bindingpy)
         *   Implementations:
-            *   [`local_mcp`](#localmcpbinding-lollms_clientmcp_bindingslocal_mcp) (Local Python tools)
+            *   [`local_mcp`](#localmcpbinding-lollms_clienttools_bindingslocal_mcp) (Local Python tools)
                 *   [Default Tools for `local_mcp`](#default-tools-for-localmcp)
-            *   [`standard_mcp`](#standardmcpbinding-lollms_clientmcp_bindingsstandard_mcp) (External `stdio` MCP servers)
-            *   [`remote_mcp`](#remotemcpbinding-lollms_clientmcp_bindingsremote_mcp) (Remote HTTP MCP servers - Conceptual)
+            *   [`standard_mcp`](#standardmcpbinding-lollms_clienttools_bindingsstandard_mcp) (External `stdio` MCP servers)
+            *   [`remote_mcp`](#remotemcpbinding-lollms_clienttools_bindingsremote_mcp) (Remote HTTP MCP servers - Conceptual)
 
 ## III. Code Examples
 

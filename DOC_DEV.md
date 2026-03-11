@@ -93,7 +93,7 @@ Here's an overview of the `lollms_client` directory structure:
 │  │  └─ ...
 │  ├─ 📁 ttv_bindings/           # Text-to-Video binding implementations
 │  │  └─ ...
-│  ├─ 📁 mcp_bindings/           # Model Context Protocol binding implementations
+│  ├─ 📁 tools_bindings/           # Model Context Protocol binding implementations
 │  │  └─ 📁 local_mcp/          # Example: Local MCP tool executor
 │  │     ├─ 📁 default_tools/    # Packaged tools for local_mcp
 │  │     │  ├─ 📁 file_writer/
@@ -111,7 +111,7 @@ Here's an overview of the `lollms_client` directory structure:
 │  ├─ 📄 lollms_stt_binding.py   # ABC for STT bindings and LollmsSTTBindingManager
 │  ├─ 📄 lollms_ttm_binding.py   # ABC for TTM bindings and LollmsTTMBindingManager
 │  ├─ 📄 lollms_ttv_binding.py   # ABC for TTV bindings and LollmsTTVBindingManager
-│  ├─ 📄 lollms_mcp_binding.py   # ABC for MCP bindings and LollmsMCPBindingManager
+│  ├─ 📄 lollms_tools_binding.py   # ABC for MCP bindings and LollmsTOOLBindingManager
 │  ├─ 📄 lollms_types.py         # Enums (MSG_TYPE, ELF_COMPLETION_FORMAT, etc.)
 │  └─ 📄 lollms_utilities.py     # Helper functions
 ├─ 📁 lollms_client.egg-info/   # Packaging metadata
@@ -141,9 +141,9 @@ Located in `lollms_client/lollms_core.py`, the `LollmsClient` class is the main 
 (LLM, TTS, TTI, STT, TTM, TTV sections remain largely the same)
 
 #### MCP (Model Context Protocol) Bindings
-*   **Directory:** `lollms_client/mcp_bindings/`
-*   **ABC:** `LollmsMCPBinding` (in `lollms_mcp_binding.py`)
-*   **Manager:** `LollmsMCPBindingManager` (in `lollms_mcp_binding.py`)
+*   **Directory:** `lollms_client/tools_bindings/`
+*   **ABC:** `LollmsToolBinding` (in `lollms_tools_binding.py`)
+*   **Manager:** `LollmsTOOLBindingManager` (in `lollms_tools_binding.py`)
 *   **Implemented Bindings (Examples):**
     *   `local_mcp`: Discovers and executes local Python tools. Each tool is defined by a `<tool_name>.py` file (with an `execute` function) and a `<tool_name>.mcp.json` file (describing the tool's name, description, input/output schemas).
         *   **Default Tools for `local_mcp`**:
@@ -180,22 +180,22 @@ These methods leverage the active LLM binding for their core AI operations.
 
 Contributing a new MCP binding (e.g., to interact with a remote MCP tool server) follows a similar pattern:
 
-1.  **Create Binding Directory:** `lollms_client/mcp_bindings/<your_mcp_binding_name>/`
+1.  **Create Binding Directory:** `lollms_client/tools_bindings/<your_mcp_binding_name>/`
 2.  **Create `__init__.py`:** Inside the new directory.
 3.  **Define `BindingName`:** At the top of your `__init__.py`.
     ```python
-    # lollms_client/mcp_bindings/my_remote_mcp/__init__.py
+    # lollms_client/tools_bindings/my_remote_mcp/__init__.py
     BindingName = "MyRemoteMCPBinding" # Must match your class name
     ```
-4.  **Implement the `LollmsMCPBinding` Class:**
+4.  **Implement the `LollmsToolBinding` Class:**
     ```python
-    from lollms_client.lollms_mcp_binding import LollmsMCPBinding
+    from lollms_client.lollms_tools_binding import LollmsToolBinding
     from typing import List, Dict, Any
     # Import any SDKs or libraries needed to talk to your remote MCP server
 
     BindingName = "MyRemoteMCPBinding"
 
-    class MyRemoteMCPBinding(LollmsMCPBinding):
+    class MyRemoteMCPBinding(LollmsToolBinding):
         def __init__(self, tool_server_url: str, api_key: str = None, **kwargs):
             super().__init__(binding_name="my_remote_mcp")
             self.tool_server_url = tool_server_url
@@ -230,7 +230,7 @@ Contributing a new MCP binding (e.g., to interact with a remote MCP tool server)
 ### Adding New Local MCP Tools (for `local_mcp` binding)
 
 If you want to add a new tool to be used by the existing `local_mcp` binding:
-1.  **Choose/Create a Tools Folder:** This can be any folder. You'll pass its path to `LollmsClient` via `mcp_binding_config={"tools_folder_path": "your/tools/dir"}`.
+1.  **Choose/Create a Tools Folder:** This can be any folder. You'll pass its path to `LollmsClient` via `tools_binding_config={"tools_folder_path": "your/tools/dir"}`.
     *   The `local_mcp` binding also has a `default_tools` subdirectory packaged with it. You can add tools there if modifying the library directly, but using a custom external folder is cleaner for user-defined tools.
 2.  **Create Tool Subdirectory:** Inside your chosen tools folder, create a subdirectory for your new tool, e.g., `my_custom_tool/`.
 3.  **Create `<tool_name>.mcp.json`:** In the tool's subdirectory (e.g., `my_custom_tool/my_custom_tool.mcp.json`), define the tool's metadata.

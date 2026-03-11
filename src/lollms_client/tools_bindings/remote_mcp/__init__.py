@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import AsyncExitStack
 from typing import Optional, List, Dict, Any
-from lollms_client.lollms_mcp_binding import LollmsMCPBinding
+from lollms_client.lollms_tools_binding import LollmsToolBinding
 from ascii_colors import ASCIIColors, trace_exception
 import threading
 import json
@@ -24,7 +24,7 @@ except ImportError:
 BindingName = "RemoteMCPBinding"
 TOOL_NAME_SEPARATOR  = "::"
 
-class RemoteMCPBinding(LollmsMCPBinding):
+class RemoteMCPBinding(LollmsToolBinding):
     """
     This binding allows the connection to one or more remote MCP servers.
     Tools from all connected servers are aggregated and prefixed with the server's alias.
@@ -35,9 +35,7 @@ class RemoteMCPBinding(LollmsMCPBinding):
         """
         Initializes the binding to connect to multiple MCP servers.
         """
-        super().__init__(binding_name="remote_mcp")
-        ASCIIColors.info(f"[{self.binding_name}] Initializing RemoteMCPBinding...")
-        
+        super().__init__(binding_name="remote_mcp")        
         servers_infos: Dict[str, Dict[str, Any]] = kwargs.get("servers_infos", {})
         self.servers = None
         if not MCP_LIBRARY_AVAILABLE:
@@ -272,6 +270,7 @@ class RemoteMCPBinding(LollmsMCPBinding):
             list_tools_result = await asyncio.wait_for(server_info["session"].list_tools(), timeout=30.0)
             
             server_tools = []
+            tools_found = ""
             for tool_obj in list_tools_result.tools:
                 input_schema_dict = {}
                 tool_input_schema = getattr(tool_obj, 'inputSchema', getattr(tool_obj, 'input_schema', None))
@@ -288,7 +287,10 @@ class RemoteMCPBinding(LollmsMCPBinding):
                     "description": tool_obj.description or "",
                     "input_schema": input_schema_dict
                 })
-            ASCIIColors.info(f"[{alias}] Found {len(server_tools)} tools.")
+                tools_found+=f"[bold]name:[/bold]{tool_name_for_client}\n"
+                tools_found+=f"[bold]description:[/bold]\n{tool_obj.description}\n"
+                tools_found+=f"\n"
+            ASCIIColors.panel(f"[{alias}] Found {len(server_tools)} tools.\n"+tools_found)
             return server_tools
         except asyncio.TimeoutError:
             ASCIIColors.red(f"[{alias}] Tool listing timed out.")

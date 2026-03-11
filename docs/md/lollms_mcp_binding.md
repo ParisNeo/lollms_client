@@ -1,13 +1,13 @@
-## DOCS FOR: `lollms_client/lollms_mcp_binding.py` (MCP Bindings)
+## DOCS FOR: `lollms_client/lollms_tools_binding.py` (MCP Bindings)
 
 **Purpose:**
-This module defines the abstract base class (`LollmsMCPBinding`) for Model Context Protocol (MCP) bindings and a manager class (`LollmsMCPBindingManager`) for their discovery and instantiation. MCP bindings enable `LollmsClient` to facilitate function calling or tool use by LLMs, allowing them to interact with external systems or local Python tools.
+This module defines the abstract base class (`LollmsToolBinding`) for Model Context Protocol (MCP) bindings and a manager class (`LollmsTOOLBindingManager`) for their discovery and instantiation. MCP bindings enable `LollmsClient` to facilitate function calling or tool use by LLMs, allowing them to interact with external systems or local Python tools.
 
 ---
-### `LollmsMCPBinding` (Abstract Base Class)
+### `LollmsToolBinding` (Abstract Base Class)
 
 **Purpose:**
-`LollmsMCPBinding` is the contract for all MCP binding implementations. It ensures that each binding can discover available tools and execute them based on parameters provided, typically by an LLM's decision.
+`LollmsToolBinding` is the contract for all MCP binding implementations. It ensures that each binding can discover available tools and execute them based on parameters provided, typically by an LLM's decision.
 
 **Key Attributes/Properties:**
 
@@ -43,10 +43,10 @@ This module defines the abstract base class (`LollmsMCPBinding`) for Model Conte
 
 **Usage Example (Conceptual - Subclassing):**
 ```python
-from lollms_client.lollms_mcp_binding import LollmsMCPBinding
+from lollms_client.lollms_tools_binding import LollmsToolBinding
 from typing import List, Dict, Any
 
-class MyCustomMCPBinding(LollmsMCPBinding):
+class MyCustomMCPBinding(LollmsToolBinding):
     def __init__(self, api_endpoint: str):
         super().__init__(binding_name="my_custom_mcp")
         self.api_endpoint = api_endpoint
@@ -76,42 +76,42 @@ class MyCustomMCPBinding(LollmsMCPBinding):
 ```
 
 ---
-### `LollmsMCPBindingManager`
+### `LollmsTOOLBindingManager`
 
 **Purpose:**
-The `LollmsMCPBindingManager` is responsible for discovering available MCP binding implementations within a specified directory and instantiating them. This allows `LollmsClient` to support different ways of interacting with tools (local execution, remote servers, etc.).
+The `LollmsTOOLBindingManager` is responsible for discovering available MCP binding implementations within a specified directory and instantiating them. This allows `LollmsClient` to support different ways of interacting with tools (local execution, remote servers, etc.).
 
 **Key Attributes/Properties:**
 
-*   `mcp_bindings_dir` (Path): The directory where MCP binding implementations are stored (e.g., `lollms_client/mcp_bindings/`).
-*   `available_bindings` (Dict[str, type[LollmsMCPBinding]]): A dictionary caching loaded MCP binding classes.
+*   `tools_bindings_dir` (Path): The directory where MCP binding implementations are stored (e.g., `lollms_client/tools_bindings/`).
+*   `available_bindings` (Dict[str, type[LollmsToolBinding]]): A dictionary caching loaded MCP binding classes.
 
 **Methods:**
 
-*   **`__init__(mcp_bindings_dir: Union[str, Path] = Path(__file__).parent / "mcp_bindings")`**:
+*   **`__init__(tools_bindings_dir: Union[str, Path] = Path(__file__).parent / "tools_bindings")`**:
     *   **Purpose**: Initializes the manager.
-    *   **Parameters**: `mcp_bindings_dir` (Union[str, Path]): Path to the directory containing MCP binding modules.
+    *   **Parameters**: `tools_bindings_dir` (Union[str, Path]): Path to the directory containing MCP binding modules.
 
-*   **`_load_binding_class(binding_name: str) -> Optional[type[LollmsMCPBinding]]`**: (Internal method)
-    *   **Purpose**: Dynamically imports the Python module for the specified `binding_name` from the `mcp_bindings_dir`, retrieves the binding class (identified by a `BindingName` variable within the module's `__init__.py`), and caches it.
+*   **`_load_binding_class(binding_name: str) -> Optional[type[LollmsToolBinding]]`**: (Internal method)
+    *   **Purpose**: Dynamically imports the Python module for the specified `binding_name` from the `tools_bindings_dir`, retrieves the binding class (identified by a `BindingName` variable within the module's `__init__.py`), and caches it.
     *   **Parameters**: `binding_name` (str).
 
-*   **`create_binding(binding_name: str, **kwargs) -> Optional[LollmsMCPBinding]`**:
+*   **`create_binding(binding_name: str, **kwargs) -> Optional[LollmsToolBinding]`**:
     *   **Purpose**: Creates and returns an instance of the specified MCP binding.
     *   **Parameters**:
         *   `binding_name` (str): The name of the MCP binding to instantiate (e.g., "local_mcp", "standard_mcp").
         *   `**kwargs`: Keyword arguments to be passed to the constructor of the binding class (e.g., `tools_folder_path` for `LocalMCPBinding`, `initial_servers` for `StandardMCPBinding`).
-    *   **Returns**: An instance of the requested `LollmsMCPBinding` subclass, or `None` if failed.
+    *   **Returns**: An instance of the requested `LollmsToolBinding` subclass, or `None` if failed.
 
 *   **`get_available_bindings() -> List[str]`**:
-    *   **Purpose**: Scans the `mcp_bindings_dir` for valid MCP binding modules and returns their names.
+    *   **Purpose**: Scans the `tools_bindings_dir` for valid MCP binding modules and returns their names.
     *   **Returns**: A list of strings, each being a discoverable MCP binding name.
 
 ---
 ### Concrete MCP Binding Implementations:
 
 #### 1. `LocalMCPBinding`
-   **Module**: `lollms_client.mcp_bindings.local_mcp`
+   **Module**: `lollms_client.tools_bindings.local_mcp`
    *   **Purpose**: Discovers and executes tools defined as local Python scripts. Each tool requires a `<tool_name>.py` file with an `execute` function and a corresponding `<tool_name>.mcp.json` file for its MCP metadata.
    *   **Key `__init__` Parameters**:
         *   `tools_folder_path` (Optional[str|Path]): Path to the directory containing tool subdirectories. If `None`, it defaults to a `default_tools` folder within the `local_mcp` binding directory (containing `file_writer`, `internet_search`, `python_interpreter`, `generate_image_from_prompt`).
@@ -137,7 +137,7 @@ The `LollmsMCPBindingManager` is responsible for discovering available MCP bindi
             *   *Requires `RestrictedPython` package.*
 
 #### 2. `StandardMCPBinding`
-   **Module**: `lollms_client.mcp_bindings.standard_mcp`
+   **Module**: `lollms_client.tools_bindings.standard_mcp`
    *   **Purpose**: Connects to one or more external MCP-compliant tool servers that communicate over `stdio`. Each server is launched as a subprocess.
    *   **Key `__init__` Parameters**:
         *   `initial_servers` (Optional[Dict[str, Dict[str, Any]]]): A dictionary where keys are server aliases and values are server configuration dictionaries.
@@ -148,7 +148,7 @@ The `LollmsMCPBindingManager` is responsible for discovering available MCP bindi
    *   **Dependencies**: Requires the `mcp` library (Python SDK for MCP).
 
 #### 3. `RemoteMCPBinding`
-   **Module**: `lollms_client.mcp_bindings.remote_mcp`
+   **Module**: `lollms_client.tools_bindings.remote_mcp`
    *   **Purpose**: (Conceptual) Connects to a single remote MCP-compliant tool server over HTTP (or other network transport supported by the `mcp` Python SDK's `streamablehttp_client` or similar).
    *   **Key `__init__` Parameters**:
         *   `server_url` (str): The base URL of the remote MCP server (e.g., "http://my-mcp-server.com/mcp").

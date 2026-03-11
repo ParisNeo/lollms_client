@@ -56,8 +56,8 @@ multimodal_client = LollmsClient(
     tts_binding_config=tts_config,
     tti_binding_name="diffusers",
     tti_binding_config=tti_config,
-    mcp_binding_name="local_mcp", # Use the local MCP binding
-    mcp_binding_config=mcp_config,
+    tools_binding_name="local_mcp", # Use the local MCP binding
+    tools_binding_config=mcp_config,
     user_name="John",
     ai_name="Lolly"
 )
@@ -76,7 +76,7 @@ os.makedirs(tti_config["output_path"], exist_ok=True)
 *   `stt_binding_name` (Optional[str]): The name of the Speech-to-Text binding (e.g., "whisper", "whispercpp").
 *   `ttv_binding_name` (Optional[str]): The name of the Text-to-Video binding.
 *   `ttm_binding_name` (Optional[str]): The name of the Text-to-Music binding (e.g., "audiocraft", "bark").
-*   `mcp_binding_name` (Optional[str]): The name of the Multi-tool Code Processor binding (e.g., "local_mcp", "remote_mcp").
+*   `tools_binding_name` (Optional[str]): The name of the Multi-tool Code Processor binding (e.g., "local_mcp", "remote_mcp").
 *   `llm_bindings_dir`, `tts_bindings_dir`, `tti_bindings_dir`, etc. (Path): Directories where the respective binding implementations are located. Defaults to subdirectories within `lollms_client/`.
 *   `llm_binding_config`, `tts_binding_config`, etc. (Optional[Dict[str, Any]]): Dictionaries containing binding-specific configurations (e.g., `host_address`, `model_name`, `api_key`, `device`, `output_path`).
 *   `user_name` (str, default: "user"): The name used for the user in prompt formatting.
@@ -505,7 +505,7 @@ This method orchestrates a dynamic "observe-think-act" loop, enabling the AI to 
 To run this example, ensure you have the `local_mcp` binding enabled in your `LollmsClient` and that `internet_search` tool is available.
 
 ```python
-# Assuming 'multimodal_client' is initialized with mcp_binding_name="local_mcp"
+# Assuming 'multimodal_client' is initialized with tools_binding_name="local_mcp"
 if multimodal_client.mcp:
     print("\n--- Generate with MCP (Agentic Workflow) ---")
     
@@ -528,7 +528,7 @@ if multimodal_client.mcp:
     try:
         # Example: Use the internet_search tool via the agent
         # For this to work, the 'internet_search' tool must be active in your local_mcp binding
-        # See lollms_client/mcp_bindings/local_mcp/default_tools/internet_search/internet_search.py
+        # See lollms_client/tools_bindings/local_mcp/default_tools/internet_search/internet_search.py
         
         # A simple query that might trigger the internet search tool
         agent_result = multimodal_client.generate_with_mcp(
@@ -1338,8 +1338,8 @@ multimodal_client = LollmsClient(
     tts_binding_config=tts_config,
     tti_binding_name="diffusers",
     tti_binding_config=tti_config,
-    mcp_binding_name="local_mcp", # Use the local MCP binding
-    mcp_binding_config=mcp_config,
+    tools_binding_name="local_mcp", # Use the local MCP binding
+    tools_binding_config=mcp_config,
     user_name="John",
     ai_name="Lolly"
 )
@@ -1354,7 +1354,7 @@ print(f"Multimodal client initialized. LLM: {multimodal_client.get_model_name()}
 *   `stt_binding_name` (Optional[str]): The name of the Speech-to-Text binding (e.g., "whisper", "whispercpp").
 *   `ttv_binding_name` (Optional[str]): The name of the Text-to-Video binding.
 *   `ttm_binding_name` (Optional[str]): The name of the Text-to-Music binding (e.g., "audiocraft", "bark").
-*   `mcp_binding_name` (Optional[str]): The name of the Multi-tool Code Processor binding (e.g., "local_mcp", "remote_mcp").
+*   `tools_binding_name` (Optional[str]): The name of the Multi-tool Code Processor binding (e.g., "local_mcp", "remote_mcp").
 *   `llm_bindings_dir`, `tts_bindings_dir`, `tti_bindings_dir`, etc. (Path): Directories where the respective binding implementations are located. Defaults to subdirectories within `lollms_client/`.
 *   `llm_binding_config`, `tts_binding_config`, etc. (Optional[Dict[str, Any]]): Dictionaries containing binding-specific configurations (e.g., `host_address`, `model_name`, `api_key`, `device`, `output_path`).
 *   `user_name` (str, default: "user"): The name used for the user in prompt formatting.
@@ -1789,7 +1789,7 @@ This method orchestrates a dynamic "observe-think-act" loop, enabling the AI to 
 To run this example, ensure you have the `local_mcp` binding enabled in your `LollmsClient` and that `internet_search` tool is available.
 
 ```python
-# Assuming 'multimodal_client' is initialized with mcp_binding_name="local_mcp"
+# Assuming 'multimodal_client' is initialized with tools_binding_name="local_mcp"
 if multimodal_client.mcp:
     print("\n--- Generate with MCP (Agentic Workflow) ---")
     
@@ -1812,7 +1812,7 @@ if multimodal_client.mcp:
     try:
         # Example: Use the internet_search tool via the agent
         # For this to work, the 'internet_search' tool must be active in your local_mcp binding
-        # See lollms_client/mcp_bindings/local_mcp/default_tools/internet_search/internet_search.py
+        # See lollms_client/tools_bindings/local_mcp/default_tools/internet_search/internet_search.py
         
         # A simple query that might trigger the internet search tool
         agent_result = multimodal_client.generate_with_mcp(

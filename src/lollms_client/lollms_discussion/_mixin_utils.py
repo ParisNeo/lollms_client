@@ -224,6 +224,8 @@ class UtilsMixin:
                 n_predict=512, temperature=0.1
             )
         except Exception as e:
+            # Reveal the logic failure in context pruning
+            trace_exception(e)
             print(f"[WARNING] Pruning failed: {e}")
             return
         self.pruning_summary = ((self.pruning_summary or "") + f"\n\n--- Summary ---\n{summary.strip()}").strip()

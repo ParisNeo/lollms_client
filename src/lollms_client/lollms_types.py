@@ -49,6 +49,9 @@ class MSG_TYPE(Enum):
     MSG_TYPE_INIT_PROGRESS          = 28# Initialization progress
     MSG_TYPE_ARTEFACTS_STATE_CHANGED = 29# Artefact was created, updated, or reverted
 
+    MSG_TYPE_TOOLS_LIST             = 30# Structured list of all available tools, emitted by the show_tools built-in
+    MSG_TYPE_CONTEXT_COMPRESSION    = 31# Context was compressed (summary created, messages pruned, or artefacts deactivated)
+
 class SENDER_TYPES(Enum):
     SENDER_TYPES_USER               = 0 # Sent by user
     SENDER_TYPES_AI                 = 1 # Sent by ai
@@ -75,4 +78,4 @@ class ELF_COMPLETION_FORMAT(Enum):
             raise ValueError(f"Invalid format string: {format_string}. Must be one of {list(format_mapping.keys())}.")
     
     def __str__(self):
-        return self.name    
+        return self.name

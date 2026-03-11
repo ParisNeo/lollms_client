@@ -143,8 +143,8 @@ def run_function_calling_example():
             binding_name=LLM_BINDING_NAME,
             host_address=OLLAMA_HOST_ADDRESS,
             model_name=OLLAMA_MODEL_NAME,
-            mcp_binding_name="local_mcp", # Activate the LocalMCP binding
-            mcp_binding_config=mcp_binding_configuration, # Pass its specific config
+            tools_binding_name="local_mcp", # Activate the LocalMCP binding
+            tools_binding_config=mcp_binding_configuration, # Pass its specific config
             # Optional: Configure default LLM generation params if needed
             temperature=0.2, # Lower temp for more focused tool decisions / final answer
             n_predict=1024

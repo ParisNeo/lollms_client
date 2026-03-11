@@ -23,10 +23,10 @@ The `lollms_client/__init__.py` file serves as the main entry point for the `lol
 *   **`PromptReshaper` (from `lollms_client.lollms_utilities`)**:
     *   A utility class for formatting and potentially truncating prompts based on a template and token limits.
 
-*   **`LollmsMCPBinding` (from `lollms_client.lollms_mcp_binding`)**:
+*   **`LollmsToolBinding` (from `lollms_client.lollms_tools_binding`)**:
     *   The abstract base class for Model Context Protocol (MCP) bindings. Exported for type hinting or if developers want to create custom MCP bindings that integrate with the manager system.
 
-*   **`LollmsMCPBindingManager` (from `lollms_client.lollms_mcp_binding`)**:
+*   **`LollmsTOOLBindingManager` (from `lollms_client.lollms_tools_binding`)**:
     *   The manager class responsible for discovering and instantiating MCP binding implementations. Exported for advanced use cases or introspection.
 
 *   **`__version__` (str)**:
@@ -42,8 +42,8 @@ from lollms_client import (
     LollmsDiscussion,
     LollmsMessage,
     PromptReshaper,
-    LollmsMCPBinding, # For type hinting or custom binding development
-    LollmsMCPBindingManager # For advanced binding management
+    LollmsToolBinding, # For type hinting or custom binding development
+    LollmsTOOLBindingManager # For advanced binding management
 )
 
 # Get package version

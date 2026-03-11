@@ -620,7 +620,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 "model_name": "codellama",
                 "host_address": "http://localhost:11434"
             },
-            mcp_binding_name="local_mcp"    # Enable the local tool execution engine
+            tools_binding_name="local_mcp"    # Enable the local tool execution engine
         )
         # For agentic workflows, it's often good to have a persistent discussion
         db_manager = LollmsDataManager(f"sqlite:///{db_path}")

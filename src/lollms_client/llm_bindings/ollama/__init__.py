@@ -183,7 +183,6 @@ class OllamaBinding(LollmsLLMBinding):
         
         full_response_text = ""
         think = think if "gpt-oss" not in self.model_name else reasoning_effort
-        ASCIIColors.magenta(f"Generation with think: {think}")
 
         try:
             if images: # Multimodal
@@ -495,7 +494,7 @@ class OllamaBinding(LollmsLLMBinding):
 
         full_response_text = ""
         think = think if "gpt-oss" not in self.model_name else reasoning_effort
-        ASCIIColors.magenta(f"Generation with think: {think}")
+        ASCIIColors.panel(f"Generation with think: {think}")
 
         try:
             # 3. Call the Ollama API
@@ -549,6 +548,7 @@ class OllamaBinding(LollmsLLMBinding):
             error_message = f"An unexpected error occurred: {str(ex)}"
             trace_exception(ex)
             return {"status": "error", "message": error_message}    
+        
     def tokenize(self, text: str) -> list:
         """
         Tokenize the input text into a list of characters.

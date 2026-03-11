@@ -103,8 +103,8 @@ def setup_client_and_discussion() -> LollmsDiscussion:
         client = LollmsClient(
             "ollama",
             model_name="mistral-nemo:latest",
-            mcp_binding_name="remote_mcp",
-            mcp_binding_config=mcp_config
+            tools_binding_name="remote_mcp",
+            tools_binding_config=mcp_config
         )
     except Exception as e:
         trace_exception(e)

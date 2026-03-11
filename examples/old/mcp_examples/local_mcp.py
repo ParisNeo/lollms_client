@@ -15,7 +15,7 @@ TTI_BINDING_NAME = "dalle" # To use DALL-E via LollmsClient's TTI
 # OPENAI_API_KEY should be set as an environment variable for DALL-E
 
 # MCP Configuration
-# We will NOT provide mcp_binding_config.tools_folder_path,
+# We will NOT provide tools_binding_config.tools_folder_path,
 # so LocalMCPBinding should use its packaged default_tools.
 MCP_BINDING_NAME = "local_mcp"
 
@@ -74,8 +74,8 @@ def run_default_tools_example():
             host_address=OLLAMA_HOST_ADDRESS, # For Ollama LLM
             model_name=OLLAMA_MODEL_NAME,     # For Ollama LLM
             
-            mcp_binding_name=MCP_BINDING_NAME,
-            # No mcp_binding_config, so LocalMCPBinding should use its 'default_tools'
+            tools_binding_name=MCP_BINDING_NAME,
+            # No tools_binding_config, so LocalMCPBinding should use its 'default_tools'
             
             tti_binding_name=TTI_BINDING_NAME, # For the 'generate_image_from_prompt' tool
             # tti_binding_config would be needed here if DALL-E or other TTI bindings

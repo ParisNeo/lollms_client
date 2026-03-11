@@ -200,10 +200,10 @@ class LollmsDataManager:
     def get_session(self) -> Session:
         return self.SessionLocal()
 
-    def list_discussions(self) -> List[Dict]:
+    def list_discussions(self, limit=None) -> List[Dict]:
         with self.get_session() as session:
             discussions = session.query(self.DiscussionModel).all()
-            return [{c.name: getattr(disc, c.name) for c in disc.__table__.columns} for disc in discussions]
+            return [{c.name: getattr(disc, c.name) for c in disc.__table__.columns} for disc in (discussions[:limit] if limit else discussions)]
 
     def get_discussion(self, lollms_client, discussion_id: str, **kwargs):
         # Imported here to avoid circular dependency at module load time.

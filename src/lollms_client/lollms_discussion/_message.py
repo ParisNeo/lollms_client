@@ -18,7 +18,9 @@ class LollmsMessage:
 
     def __getattr__(self, name):
         if name == 'metadata':
-            return getattr(self._db_message, 'message_metadata', None)
+            return getattr(self._db_message, 'message_metadata', {}) or {}
+        if name == 'content':
+            return getattr(self._db_message, 'content', "") or ""
         return getattr(self._db_message, name)
 
     def __setattr__(self, name, value):

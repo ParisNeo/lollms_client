@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from sqlalchemy.orm.exc import NoResultFound
-from ascii_colors import ASCIIColors
+from ascii_colors import ASCIIColors, trace_exception
 
 from ._artefacts import ArtefactManager, ArtefactType
 from ._message import LollmsMessage
@@ -256,6 +256,8 @@ class CoreMixin:
             self._session.commit()
             self._rebuild_message_index()
         except Exception as e:
+            # Trace the specific DB error before rolling back
+            trace_exception(e)
             self._session.rollback()
             raise e
 
@@ -336,6 +338,41 @@ class CoreMixin:
         self._rebuild_message_index()
         return [LollmsMessage(self, msg_obj) for msg_obj in self._message_index.values()]
 
+    def remove_message(self, message_id: str) -> bool:
+        """
+        Removes a single message from the discussion and index.
+        Note: If this message had children, they will become orphans.
+        Returns True if successful.
+        """
+        if self._message_index is None:
+            self._rebuild_message_index()
+
+        if message_id not in self._message_index:
+            return False
+
+        # Remove from local index
+        del self._message_index[message_id]
+
+        if self._is_db_backed:
+            # Mark for deletion during next commit
+            self._messages_to_delete_from_db.add(message_id)
+            # Update the SQLAlchemy relationship list
+            self._db_discussion.messages = [m for m in self._db_discussion.messages if m.id != message_id]
+        else:
+            # In-memory proxy update
+            self._db_discussion.messages = [m for m in self._db_discussion.messages if getattr(m, 'id', None) != message_id]
+
+        # Re-evaluate active branch if the tip was removed
+        if self.active_branch_id == message_id:
+            self._validate_and_set_active_branch()
+
+        self.touch()
+        return True
+
+    def delete_message(self, message_id: str) -> bool:
+        """Alias for remove_message."""
+        return self.remove_message(message_id)
+
     def setMemory(self, memory: str):
         self.memory = memory
 
@@ -344,7 +381,7 @@ class CoreMixin:
     def get_full_data_zone(self) -> str:
         """
         Assembles all data zones + active artefacts into a single string for the system prompt.
-        Order: memory → user_data → discussion_data → personality_data → artefacts
+        Order: memory → user_data → discussion_data → personality_data → scratchpad → artefacts
         """
         parts = []
         if self.memory and self.memory.strip():
@@ -355,6 +392,11 @@ class CoreMixin:
             parts.append(f"-- Discussion Data Zone --\n{self.discussion_data_zone.strip()}")
         if self.personality_data_zone and self.personality_data_zone.strip():
             parts.append(f"-- Personality Data Zone --\n{self.personality_data_zone.strip()}")
+        
+        # [NEW] Scratchpad Zone: Full length tool outputs for the LLM to analyze
+        if hasattr(self, 'scratchpad') and self.scratchpad and self.scratchpad.strip():
+            parts.append(f"== TOOL OUTPUT SCRATCHPAD (Full Length) ==\n{self.scratchpad.strip()}\n== END SCRATCHPAD ==")
+            
         artefacts_zone = self.artefacts.build_artefacts_context_zone()
         if artefacts_zone:
             parts.append(f"-- Active Artefacts --\n{artefacts_zone}")

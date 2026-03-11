@@ -155,8 +155,8 @@ def main():
         client = LollmsClient(
             binding_name="ollama", # Use the dummy LLM binding
             model_name="mistral-nemo:latest",
-            mcp_binding_name="remote_mcp",
-            mcp_binding_config=mcp_config,
+            tools_binding_name="remote_mcp",
+            tools_binding_config=mcp_config,
             
         )
     except Exception as e:

@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-03-11 16:06]
+
+- feat(mcp): restructure MCP bindings architecture with local, remote, and standard variants
+
 ## [2026-03-09 02:21]
 
 - chore(deps): bump ascii-colors to >=0.11.20 and update discussion imports

@@ -4,12 +4,12 @@ from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager,
 from lollms_client.lollms_personality import LollmsPersonality
 from lollms_client.lollms_utilities import PromptReshaper # Keep general utilities
 # Import new MCP binding classes
-from lollms_client.lollms_mcp_binding import LollmsMCPBinding, LollmsMCPBindingManager
+from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
 # Import new bindings utils
 from lollms_client.lollms_bindings_utils import list_bindings, get_binding_desc
 
-__version__ = "1.11.16" # Updated version
+__version__ = "1.12.1" # Updated version
 
 # Optionally, you could define __all__ if you want to be explicit about exports
 __all__ = [
@@ -21,9 +21,9 @@ __all__ = [
     "LollmsPersonality",
     "LollmsDataManager",
     "PromptReshaper",
-    "LollmsMCPBinding", # Export LollmsMCPBinding ABC
+    "LollmsToolBinding", # Export LollmsToolBinding ABC
     "LollmsLLMBindingManager",
-    "LollmsMCPBindingManager", # Export LollmsMCPBindingManager
+    "LollmsTOOLBindingManager", # Export LollmsTOOLBindingManager
     "list_bindings",
     "get_binding_desc"
 ]

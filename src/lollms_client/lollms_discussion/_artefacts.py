@@ -469,6 +469,7 @@ class ArtefactManager:
         text:         str,
         default_type: str = ArtefactType.CODE,
         auto_activate: bool = True,
+        replacements:  Optional[Dict[str, str]] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Internal helper called exclusively from LollmsDiscussion._post_process_llm_response.
@@ -494,6 +495,16 @@ class ArtefactManager:
         def handle_artefact(match: re.Match) -> str:
             attrs    = _parse_attrs(match.group(1))
             content  = match.group(2)
+
+            # Restore masked content (code blocks) before saving to the database
+            if replacements:
+                for placeholder, original in replacements.items():
+                    content = content.replace(placeholder, original)
+                    # Also check attributes just in case
+                    for k, v in attrs.items():
+                        if placeholder in v:
+                            attrs[k] = v.replace(placeholder, original)
+
             title    = attrs.pop('name', attrs.pop('title', f'artefact_{uuid.uuid4().hex[:8]}'))
             atype    = attrs.pop('type', default_type)
             language = attrs.pop('language', None)

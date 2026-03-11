@@ -30,6 +30,10 @@ from ._mixin_utils  import UtilsMixin
 class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin):
     """
     Represents and manages a single discussion.
+    
+    Attributes:
+        scratchpad (str): A volatile area containing full-length tool outputs 
+                          and technical data for the current generation turn.
 
     Composed from four mixins (MRO left-to-right):
       CoreMixin    – construction, proxying, DB ops, message CRUD, data zones

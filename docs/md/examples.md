@@ -38,7 +38,7 @@ Most examples typically involve:
     *   **Purpose**: A comprehensive example of function calling using the `local_mcp` binding with custom-defined local tools.
     *   **Features Shown**:
         *   Defining simple local tools (`get_weather`, `sum_numbers`) with `.py` execution logic and `.mcp.json` metadata files.
-        *   Initializing `LollmsClient` with `mcp_binding_name="local_mcp"` and `mcp_binding_config={"tools_folder_path": ...}`.
+        *   Initializing `LollmsClient` with `tools_binding_name="local_mcp"` and `tools_binding_config={"tools_folder_path": ...}`.
         *   Using `lc.generate_with_mcp()` for complex interactions involving tool discovery, LLM decision-making, tool execution, and final answer generation.
         *   Streaming callback for observing MCP interaction steps.
         *   Multi-step tool use.
@@ -46,7 +46,7 @@ Most examples typically involve:
 *   **`local_mcp.py`**:
     *   **Purpose**: Demonstrates using the `local_mcp` binding with its *default packaged tools* (internet search, file writer, image generation, python interpreter).
     *   **Features Shown**:
-        *   Initializing `LollmsClient` with `mcp_binding_name="local_mcp"` (without specifying `tools_folder_path` to use defaults).
+        *   Initializing `LollmsClient` with `tools_binding_name="local_mcp"` (without specifying `tools_folder_path` to use defaults).
         *   Invoking default tools like `internet_search` and `generate_image_from_prompt` (which uses the client's TTI binding, e.g., DALL-E).
         *   Handling tool outputs, including saving generated images.
 

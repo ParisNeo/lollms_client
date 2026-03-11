@@ -144,7 +144,8 @@ class PromptMixin:
         # ── 1. Artefact create / patch ────────────────────────────────────────
         if has_artefact:
             cleaned, affected_artefacts = self.artefacts._apply_artefact_xml(
-                cleaned, auto_activate=auto_activate_artefacts
+                cleaned, auto_activate=auto_activate_artefacts,
+                replacements=code_blocks
             )
 
         # Extract type from patch tag if present for re-typing support
@@ -171,6 +172,14 @@ class PromptMixin:
                 def handle_generate(match: re.Match) -> str:
                     attrs  = _parse_attrs(match.group(1))
                     prompt = match.group(2).strip()
+
+                    # Restore masked content in prompt or attributes
+                    for placeholder, original in code_blocks.items():
+                        prompt = prompt.replace(placeholder, original)
+                        for k, v in attrs.items():
+                            if placeholder in v:
+                                attrs[k] = v.replace(placeholder, original)
+
                     width  = int(attrs.get('width',  1024))
                     height = int(attrs.get('height', 1024))
                     try:
@@ -209,6 +218,14 @@ class PromptMixin:
                 def handle_edit(match: re.Match) -> str:
                     attrs  = _parse_attrs(match.group(1))
                     prompt = match.group(2).strip()
+
+                    # Restore masked content in prompt or attributes
+                    for placeholder, original in code_blocks.items():
+                        prompt = prompt.replace(placeholder, original)
+                        for k, v in attrs.items():
+                            if placeholder in v:
+                                attrs[k] = v.replace(placeholder, original)
+
                     source_b64: Optional[str] = None
                     artefact_name = attrs.get('name', '')
                     

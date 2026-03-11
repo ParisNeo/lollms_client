@@ -83,8 +83,8 @@ def main():
         client = LollmsClient(
             binding_name="ollama",
             model_name="mistral-nemo:latest",
-            mcp_binding_name="standard_mcp",
-            mcp_binding_config=mcp_config,
+            tools_binding_name="standard_mcp",
+            tools_binding_config=mcp_config,
         )
     except Exception as e:
         ASCIIColors.error(f"Failed to initialize LollmsClient: {e}")
