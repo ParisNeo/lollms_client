@@ -141,9 +141,15 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         # ── Paths ─────────────────────────────────────────────────────────────
         self.binding_dir = Path(__file__).parent
-        self.bin_dir = self.binding_dir / "bin"
+        # Use binaries_path from config if provided, otherwise default to relative 'bin'
+        binaries_path = kwargs.get("binaries_path")
+        if binaries_path:
+            self.bin_dir = Path(binaries_path).resolve()
+        else:
+            self.bin_dir = self.binding_dir / "bin"
+        
         self.models_dir = Path(
-            kwargs.get("models_path", "models/llama_cpp_models")
+            kwargs.get("models_path", "data/models/llama_cpp_models")
         ).resolve()
         self.mm_registry_path = self.models_dir / "multimodal_bindings.yaml"
 
@@ -197,6 +203,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
     def install_llama_cpp(self):
         """Downloads and extracts the latest llama.cpp release binary."""
         try:
+            # Ensure the target binary directory exists
+            self.bin_dir.mkdir(parents=True, exist_ok=True)
+            ASCIIColors.info(f"llama.cpp binary directory set to: {self.bin_dir}")
+            
             ASCIIColors.info("Fetching latest llama.cpp release …")
             resp = requests.get(
                 "https://api.github.com/repos/ggerganov/llama.cpp/releases/latest",
@@ -261,21 +271,73 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                         bar.update(len(chunk))
 
             ASCIIColors.info("Extracting …")
+            extracted_files = []
             if filename.endswith(".zip"):
                 with zipfile.ZipFile(dest_file, "r") as z:
                     z.extractall(self.bin_dir)
+                    extracted_files = [f for f in z.namelist() if not f.endswith('/')]
             elif filename.endswith(".tar.gz"):
                 with tarfile.open(dest_file, "r:gz") as t:
                     t.extractall(self.bin_dir)
+                    # List top-level files/dirs to find binaries
+                    # For simplicity, we'll scan the bin_dir after extraction
             dest_file.unlink(missing_ok=True)
 
-            # Normalise executable name
+            # Normalize executable name
             exe = self._get_server_executable()
             legacy = self.bin_dir / (
                 "server.exe" if platform.system() == "Windows" else "server"
             )
-            if not exe.exists() and legacy.exists():
-                shutil.move(str(legacy), str(exe))
+            
+            found_binary = None
+            
+            # Strategy 1: Check for standard names first
+            if exe.exists():
+                found_binary = exe
+            elif legacy.exists():
+                found_binary = legacy
+                if not exe.exists():
+                    shutil.move(str(legacy), str(exe))
+            
+            # Strategy 2: If still not found, scan for any executable starting with 'llama' or ending in 'server'
+            if not found_binary or not exe.exists():
+                candidates = []
+                for f in self.bin_dir.iterdir():
+                    if f.is_file():
+                        name_lower = f.name.lower()
+                        # Common patterns: llama-server, llama-cli, server, server.exe, llama-b8287...
+                        if "llama" in name_lower and ("server" in name_lower or name_lower.startswith("server")):
+                            candidates.append(f)
+                        # Fallback: any file that looks like an executable on Linux/Mac
+                        elif platform.system() != "Windows" and (name_lower.endswith("-rocm") or name_lower.endswith("-cuda") or name_lower.startswith("llama-")):
+                             # Check if it's executable
+                             try:
+                                 import stat
+                                 if f.stat().st_mode & stat.S_IEXEC:
+                                     candidates.append(f)
+                             except Exception:
+                                 pass
+
+                if candidates:
+                    # Prefer 'llama-server' if exact match, otherwise take the first candidate
+                    preferred = next((c for c in candidates if "llama-server" in c.name.lower()), candidates[0])
+                    if preferred != exe:
+                        shutil.move(str(preferred), str(exe))
+                    found_binary = exe
+                else:
+                    # Last ditch: look for 'server' in any subdir if extraction created folders
+                    for subdir in self.bin_dir.iterdir():
+                        if subdir.is_dir():
+                            for f in subdir.iterdir():
+                                if f.is_file() and (f.name == "server" or f.name == "server.exe"):
+                                    shutil.move(str(f), str(exe))
+                                    found_binary = exe
+                                    break
+                        if found_binary: break
+
+            if not exe.exists():
+                raise RuntimeError(f"Could not locate 'llama-server' binary after extraction in {self.bin_dir}.")
+
             if platform.system() != "Windows" and exe.exists():
                 os.chmod(exe, 0o755)
 
