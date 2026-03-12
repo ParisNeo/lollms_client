@@ -165,8 +165,13 @@ class ArtefactManager:
                 f"Use one of: {sorted(ArtefactType.ALL)}"
             )
         artefacts = self._get_all_raw()
+        # Remove the specific version being replaced (upsert semantics)
         artefacts = [a for a in artefacts
                      if not (a.get('title') == title and a.get('version') == version)]
+        # Deactivate all existing versions of this title — only the new one will be active
+        for a in artefacts:
+            if a.get('title') == title:
+                a['active'] = False
         now = datetime.utcnow().isoformat()
         new_artefact: Dict[str, Any] = {
             "id":         str(uuid.uuid4()),

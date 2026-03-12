@@ -12,7 +12,7 @@ from typing import Optional, Callable, List, Union, Dict, Any
 from ascii_colors import ASCIIColors, trace_exception
 import pipmaster as pm
 from lollms_client.lollms_utilities import ImageTokenizer
-pm.ensure_packages(["ollama","pillow","tiktoken"])
+pm.ensure_packages(["ollama>=0.6.1","pillow","tiktoken"])
 import re
 import platform
 import subprocess

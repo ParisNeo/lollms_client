@@ -62,10 +62,13 @@ class LollmsPersonality:
 
     Accepted forms for ``tools``
     ─────────────────────────────
-    * ``None``                    → _NullToolBinding (no tools)
-    * ``LollmsToolBinding``       → used directly
-    * ``List[str]`` of MCP names  → stored in ``mcp_tool_names``; a binding
-                                    can be attached later via ``attach_tool_binding()``
+    * ``None``                    → _NullToolBinding (no tools configured,
+                                    but if a client_binding is supplied to
+                                    tool_specs(), ALL its tools are exposed)
+    * ``LollmsToolBinding``       → used directly; all of its tools exposed
+    * ``List[str]`` of MCP names  → explicit allowlist; only the named tools
+                                    are exposed when tool_specs() is called.
+                                    An empty list means "no tools at all".
 
     Accepted forms for ``data_source``
     ────────────────────────────────────
@@ -121,6 +124,11 @@ class LollmsPersonality:
         # ── Tools ─────────────────────────────────────────────────────────────
         self.mcp_tool_names: List[str] = []
         self._tool_binding: Any        = _NULL_TOOL_BINDING
+        # _has_explicit_allowlist distinguishes:
+        #   tools=None  → False → expose all tools from client_binding (unrestricted)
+        #   tools=[]    → True  → expose NO tools (empty allowlist)
+        #   tools=[...] → True  → expose only the listed tools
+        self._has_explicit_allowlist: bool = False
         self._init_tools(tools)
 
         # ── Data source ───────────────────────────────────────────────────────
@@ -143,16 +151,23 @@ class LollmsPersonality:
 
     def _init_tools(self, tools: Optional[Any]) -> None:
         if tools is None:
+            # No restriction — client_binding tools will all be exposed
             self._tool_binding = _NULL_TOOL_BINDING
+            self._has_explicit_allowlist = False
             return
 
         if _is_tool_binding(tools):
             self._tool_binding = tools
+            self._has_explicit_allowlist = False
             return
 
         if isinstance(tools, list):
             self.mcp_tool_names = [str(t) for t in tools if t]
             self._tool_binding  = _NULL_TOOL_BINDING
+            # An explicit list (even if empty) is an allowlist.
+            # Empty list → personality has NO tools at all.
+            # Non-empty list → only those named tools are allowed.
+            self._has_explicit_allowlist = True
             return
 
         ASCIIColors.warning(
@@ -160,6 +175,7 @@ class LollmsPersonality:
             "Expected LollmsToolBinding or List[str]. Falling back to null binding."
         )
         self._tool_binding = _NULL_TOOL_BINDING
+        self._has_explicit_allowlist = False
 
     @property
     def tools(self) -> Any:
@@ -189,12 +205,29 @@ class LollmsPersonality:
 
     def tool_specs(self, client_binding=None, **discover_kwargs) -> Dict[str, Dict[str, Any]]:
         """
-        Resolve the personality's tool allowlist against the client's binding.
+        Resolve the personality's tool allowlist against the available binding.
 
-        If mcp_tool_names is empty → return all tools from the binding (no filter).
-        If mcp_tool_names is set   → return only those tools.
-        If no binding              → return {}.
+        Behaviour matrix
+        ────────────────
+        tools=None (no allowlist)
+            → expose ALL tools from client_binding (or self._tool_binding)
+        tools=[] (empty allowlist)
+            → expose NO tools
+        tools=['A::x', 'B::y', ...] (explicit allowlist)
+            → expose ONLY the listed tool names, looked up from the binding
+        tools=LollmsToolBinding instance
+            → expose all tools from that binding (no name filter applied)
+
+        The ``client_binding`` argument (typically ``lollmsClient.tools``) is
+        preferred over ``self._tool_binding`` so the personality can piggyback
+        on whatever MCP binding the host application has configured, while still
+        enforcing its own per-name allowlist.
         """
+        # If an explicit allowlist was given and it is empty → no tools at all
+        if self._has_explicit_allowlist and not self.mcp_tool_names:
+            return {}
+
+        # Prefer the caller-supplied binding (e.g. lollmsClient.tools)
         binding = client_binding or self._tool_binding
         if not binding:
             return {}
@@ -205,14 +238,27 @@ class LollmsPersonality:
             trace_exception(exc)
             return {}
 
-        if not self.mcp_tool_names:
-            return all_specs  # no filter — personality gets everything
+        # No explicit allowlist → personality is unrestricted, return everything
+        if not self._has_explicit_allowlist:
+            return all_specs
 
-        return {
+        # Apply the allowlist using a set for O(1) membership checks
+        allowed = set(self.mcp_tool_names)
+        filtered = {
             name: spec
             for name, spec in all_specs.items()
-            if name in self.mcp_tool_names
+            if name in allowed
         }
+
+        # Warn about names that were requested but not found in the binding
+        missing = allowed - set(all_specs.keys())
+        if missing:
+            ASCIIColors.warning(
+                f"[{self.name}] The following tools are in the allowlist but were "
+                f"not found in the binding: {sorted(missing)}"
+            )
+
+        return filtered
 
     # ------------------------------------------------------------------ data
 
@@ -439,17 +485,18 @@ class LollmsPersonality:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "personality_id":    self.personality_id,
-            "name":              self.name,
-            "author":            self.author,
-            "category":          self.category,
-            "description":       self.description,
-            "system_prompt":     self.system_prompt,
-            "tools":             self.mcp_tool_names,
-            "has_tool_binding":  bool(self._tool_binding),
-            "has_data_source":   self.has_data,
-            "data_files":        [str(p) for p in self.data_files],
-            "has_script":        self.script is not None,
+            "personality_id":       self.personality_id,
+            "name":                 self.name,
+            "author":               self.author,
+            "category":             self.category,
+            "description":          self.description,
+            "system_prompt":        self.system_prompt,
+            "tools":                self.mcp_tool_names,
+            "has_explicit_allowlist": self._has_explicit_allowlist,
+            "has_tool_binding":     bool(self._tool_binding),
+            "has_data_source":      self.has_data,
+            "data_files":           [str(p) for p in self.data_files],
+            "has_script":           self.script is not None,
         }
 
     @classmethod
@@ -461,13 +508,15 @@ class LollmsPersonality:
         Callbacks / bindings must be re-injected via ``kwargs`` or
         ``attach_tool_binding()``.
         """
+        # Restore the tools list so _init_tools can set _has_explicit_allowlist correctly
+        tools_list = data.get("tools") or None
         return cls(
             name           = data.get("name", "assistant"),
             author         = data.get("author", ""),
             category       = data.get("category", "general"),
             description    = data.get("description", ""),
             system_prompt  = data.get("system_prompt", ""),
-            tools          = data.get("tools") or None,
+            tools          = tools_list,
             personality_id = data.get("personality_id"),
             **kwargs,
         )
@@ -479,7 +528,9 @@ class LollmsPersonality:
         if bool(self._tool_binding):
             parts.append(f"tools={self._tool_binding.binding_name!r}")
         elif self.mcp_tool_names:
-            parts.append(f"mcp_names={self.mcp_tool_names}")
+            parts.append(f"mcp_allowlist={self.mcp_tool_names}")
+        elif self._has_explicit_allowlist:
+            parts.append("mcp_allowlist=[] (no tools)")
         if self.has_data:
             parts.append("has_data=True")
         if self.script_module is not None:
@@ -513,6 +564,7 @@ class NullPersonality(LollmsPersonality):
         self.personality_id           = "null_personality"
         self.mcp_tool_names           = []
         self._tool_binding            = _NULL_TOOL_BINDING
+        self._has_explicit_allowlist  = False   # NullPersonality is unrestricted by design
         self._raw_data_source         = None
         self.data_files               = []
         self.vectorize_chunk_callback = None
