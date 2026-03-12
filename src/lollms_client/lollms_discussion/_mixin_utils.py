@@ -250,88 +250,143 @@ class UtilsMixin:
             trace_exception(e)
             return None
 
-    def count_discussion_tokens(self, format_type, branch_tip_id=None):
-        exported = self.export(format_type, branch_tip_id)
-        if isinstance(exported, str):
-            return self.lollmsClient.count_tokens(exported)
-        texts = []
-        for msg in exported:
-            c = msg.get("content")
-            if isinstance(c, str):
-                texts.append(c)
-            elif isinstance(c, list):
-                texts.extend(p.get("text","") for p in c if p.get("type")=="text")
-        return self.lollmsClient.count_tokens("\n".join(texts))
+    def count_discussion_tokens(self, branch_tip_id=None) -> int:
+        """Reliably count all tokens currently in the active context."""
+        status = self.get_context_status(branch_tip_id)
+        return status["current_tokens"]
 
-    def get_context_status(self, branch_tip_id=None):
-        result = {"max_tokens": self.max_context_size, "current_tokens": 0, "zones": {}}
+    def get_context_status(self, branch_tip_id=None) -> Dict[str, Any]:
+        """
+        Provides a detailed breakdown of token usage across all context zones.
+        Ensures all content (zones, scratchpad, grouped artefacts, history) is contabilized.
+        Images are fixed at 256 tokens each.
+        """
+        max_ctx = self.max_context_size or 8192
+        result = {
+            "max_tokens": max_ctx,
+            "current_tokens": 0,
+            "percent": 0.0,
+            "zones": {}
+        }
         tokenizer = self.lollmsClient.count_tokens
-        system_prompt_text  = (self._system_prompt or "").strip()
-        data_zone_text      = self.get_full_data_zone()
-        pruning_block       = ""
+        
+        # ── 1. System & Data Zones ──────────────────────────────────────────
+        system_prompt_text = (self._system_prompt or "").strip()
+        pruning_block = ""
         if self.pruning_summary and self.pruning_point_id:
             pruning_block = f"--- Conversation Summary ---\n{self.pruning_summary.strip()}"
-        full_sys_parts = [p for p in [system_prompt_text, data_zone_text, pruning_block] if p]
-        full_sys = "\n\n".join(full_sys_parts).strip()
-        if full_sys:
-            sys_block = f"!@>system:\n{full_sys}\n"
-            sys_toks  = tokenizer(sys_block)
-            breakdown = {}
-            if system_prompt_text:
-                breakdown["system_prompt"] = {"content":system_prompt_text,"tokens":tokenizer(system_prompt_text)}
-            for label, text in [("memory",self.memory),("user_data_zone",self.user_data_zone),
-                                  ("discussion_data_zone",self.discussion_data_zone),
-                                  ("personality_data_zone",self.personality_data_zone)]:
-                t = (text or "").strip()
-                if t:
-                    breakdown[label] = {"content":t,"tokens":tokenizer(t)}
-            artefacts_zone = self.artefacts.build_artefacts_context_zone()
-            if artefacts_zone:
-                breakdown["artefacts_zone"] = {"content":artefacts_zone,"tokens":tokenizer(artefacts_zone)}
-            if self.pruning_summary:
-                ps = self.pruning_summary.strip()
-                if ps:
-                    breakdown["pruning_summary"] = {"content":ps,"tokens":tokenizer(ps)}
-            result["zones"]["system_context"] = {"content":full_sys,"tokens":sys_toks,"breakdown":breakdown}
+        
+        # Build individual zone breakdown
+        zone_breakdown = {}
+        zone_map = [
+            ("system_prompt", system_prompt_text),
+            ("memory", (self.memory or "")),
+            ("user_data_zone", (self.user_data_zone or "")),
+            ("discussion_data_zone", (self.discussion_data_zone or "")),
+            ("personality_data_zone", (self.personality_data_zone or "")),
+            ("scratchpad", (getattr(self, "scratchpad", "") or "")),
+            ("pruning_summary", (pruning_block or ""))
+        ]
+        
+        for key, text in zone_map:
+            val = (text or "").strip()
+            if val:
+                zone_breakdown[key] = {"tokens": tokenizer(val)}
+
+        # ── 2. Artefacts Grouped Breakdown ──────────────────────────────────
+        active_artefacts = self.artefacts.list(active_only=True)
+        artefacts_by_type = {}
+        total_art_tokens = 0
+        
+        for art in active_artefacts:
+            atype = art.get('type', 'document')
+            content = art.get('content', '').strip()
+            if not content and not art.get('url'):
+                continue
+            
+            # Replicate assembly logic from build_artefacts_context_zone for accurate counting
+            lang = art.get('language') or ''
+            header = f"###[{atype.capitalize()}] {art['title']} (v{art['version']})\n"
+            fence = f"```{lang}\n{content}\n```" if content else ""
+            art_block = header + fence
+            
+            art_tokens = tokenizer(art_block)
+            if atype not in artefacts_by_type:
+                artefacts_by_type[atype] = {"tokens": 0, "count": 0}
+            
+            artefacts_by_type[atype]["tokens"] += art_tokens
+            artefacts_by_type[atype]["count"] += 1
+            total_art_tokens += art_tokens
+
+        if total_art_tokens > 0:
+            zone_breakdown["artefacts"] = {
+                "tokens": total_art_tokens,
+                "types": artefacts_by_type
+            }
+
+        # Assembled System Context (including headers)
+        full_data_zone = self.get_full_data_zone()
+        full_sys_content = f"{system_prompt_text}\n\n{full_data_zone}\n\n{pruning_block}".strip()
+        sys_block_formatted = f"!@>system:\n{full_sys_content}\n"
+        
+        sys_tokens = tokenizer(sys_block_formatted)
+        result["zones"]["system_context"] = {
+            "tokens": sys_tokens,
+            "breakdown": zone_breakdown
+        }
+
+        # ── 3. Message History ──────────────────────────────────────────────
         branch_tip_id = branch_tip_id or self.active_branch_id
+        history_tokens = 0
+        history_breakdown = {"text_tokens": 0, "image_tokens": 0, "message_count": 0}
+        
         if branch_tip_id:
             branch = self.get_branch(branch_tip_id)
-            msgs_render = branch
+            msgs_to_render = branch
+            # Respect pruning point
             if self.pruning_summary and self.pruning_point_id:
-                pi = next((i for i,m in enumerate(branch) if m.id==self.pruning_point_id), -1)
+                pi = next((i for i, m in enumerate(branch) if m.id == self.pruning_point_id), -1)
                 if pi != -1:
-                    msgs_render = branch[pi:]
-            parts = []
-            total_img_toks = 0
-            img_details = []
-            for msg in msgs_render:
-                sender_str = msg.sender.replace(':','').replace('!@>','')
+                    msgs_to_render = branch[pi:]
+            
+            history_breakdown["message_count"] = len(msgs_to_render)
+            
+            for msg in msgs_to_render:
+                sender_clean = msg.sender.replace(':', '').replace('!@>', '')
                 content = msg.content.strip()
+                
+                # Handle Images in history (Fixed at 256 tokens)
                 active_imgs = msg.get_active_images()
-                if active_imgs:
-                    content += f"\n({len(active_imgs)} image(s) attached)"
-                    for i, ib in enumerate(active_imgs):
-                        toks = self.lollmsClient.count_image_tokens(ib)
-                        if toks > 0:
-                            total_img_toks += toks
-                            img_details.append({"message_id":msg.id,"index":i,"tokens":toks})
-                parts.append(f"!@>{sender_str}:\n{content}\n")
-            msgs_text = "".join(parts)
-            history_toks = tokenizer(msgs_text)
+                img_count = len(active_imgs)
+                if img_count > 0:
+                    img_toks = img_count * 256
+                    history_breakdown["image_tokens"] += img_toks
+                    content += f"\n({img_count} image(s) attached)"
+                
+                msg_text = f"!@>{sender_clean}:\n{content}\n"
+                history_breakdown["text_tokens"] += tokenizer(msg_text)
+            
+            history_tokens = history_breakdown["text_tokens"] + history_breakdown["image_tokens"]
             result["zones"]["message_history"] = {
-                "content": msgs_text, "tokens": history_toks + total_img_toks,
-                "message_count": len(msgs_render),
-                "breakdown": {"text_tokens":history_toks,"image_tokens":total_img_toks,
-                               "image_details":img_details}
+                "tokens": history_tokens,
+                "breakdown": history_breakdown
             }
-        disc_imgs   = self.get_discussion_images()
-        act_disc_b64= [i['data'] for i in disc_imgs if i.get('active',True)]
-        disc_img_toks = sum(self.lollmsClient.count_image_tokens(i) for i in act_disc_b64)
-        if disc_img_toks > 0:
-            result["zones"]["discussion_images"] = {"tokens":disc_img_toks,"image_count":len(act_disc_b64)}
-        # Artefact images are not counted here — they flow through message.images
-        # once generated and are already counted in the message_history zone.
-        result["current_tokens"] = sum(z.get("tokens",0) for z in result["zones"].values())
+
+        # ── 4. Global Discussion Images ─────────────────────────────────────
+        disc_imgs = self.get_discussion_images()
+        active_disc_imgs = [i for i in disc_imgs if i.get('active', True)]
+        if active_disc_imgs:
+            disc_img_tokens = len(active_disc_imgs) * 256
+            result["zones"]["discussion_images"] = {
+                "tokens": disc_img_tokens,
+                "count": len(active_disc_imgs)
+            }
+
+        # ── 5. Totals ───────────────────────────────────────────────────────
+        total_tokens = sum(z.get("tokens", 0) for z in result["zones"].values())
+        result["current_tokens"] = total_tokens
+        result["percent"] = round((total_tokens / max_ctx) * 100, 2)
+        
         return result
 
     def get_all_images(self, branch_tip_id=None):

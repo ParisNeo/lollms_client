@@ -256,6 +256,8 @@ class LollmsClient():
 
     # --- Core LLM Methods (Delegated) ---
     def tokenize(self, text: str) -> list:
+        if text is None:
+            text = ""
         if self.llm: return self.llm.tokenize(text)
         raise RuntimeError("LLM binding not initialized.")
 
@@ -264,6 +266,8 @@ class LollmsClient():
         raise RuntimeError("LLM binding not initialized.")
 
     def count_tokens(self, text: str) -> int:
+        if text is None:
+            text = ""
         if self.llm: return self.llm.count_tokens(text)
         raise RuntimeError("LLM binding not initialized.")
 

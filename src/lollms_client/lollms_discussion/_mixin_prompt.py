@@ -6,6 +6,7 @@ import uuid
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors
+from ._artefacts import ArtefactType
 
 if TYPE_CHECKING:
     from ._message import LollmsMessage
@@ -45,7 +46,7 @@ class PromptMixin:
             "To REVERT to a previous known version:",
             '<revert_artefact name="existing_name.py" version="1" />',
             "",
-            "Supported types: code, document, note, skill, file, search_result, image",
+            f"Supported types: {', '.join(sorted(list(ArtefactType.ALL)))}",
             "=== END ARTEFACT INSTRUCTIONS ===",
             "",
         ]

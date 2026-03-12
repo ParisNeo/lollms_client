@@ -292,7 +292,7 @@ class LollmsLLMBinding(LollmsBaseBinding):
             return ImageTokenizer(self.model_name).count_image_tokens(image)
         except Exception as e:
             ASCIIColors.warning(f"Could not estimate image tokens: {e}")
-            return -1
+            return 256
     @abstractmethod
     def embed(self, text: str, **kwargs) -> list:
         """

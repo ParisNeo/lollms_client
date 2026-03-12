@@ -316,6 +316,7 @@ class ChatMixin:
         auto_activate_artefacts: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
+        self.scratchpad = "" # Reset transient scratchpad for this session
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
 
@@ -419,7 +420,7 @@ class ChatMixin:
             _step_end(callback, "External search complete", rag_id, {"sources": sources})
 
         if scratchpad:
-            self.personality_data_zone = scratchpad.strip()
+            self.scratchpad = scratchpad.strip()
 
         answer_id  = _step_start(callback, "Generating answer...")
         final_text = self._stream_final_answer(
@@ -448,7 +449,7 @@ class ChatMixin:
             _cb(callback, json.dumps([a.get("title") for a in affected]),
                 MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
         if scratchpad:
-            self.personality_data_zone = ""
+            self.scratchpad = ""
 
         return {"user_message": user_msg, "ai_message": ai,
                 "sources": sources, "artefacts": affected}
@@ -476,6 +477,7 @@ class ChatMixin:
         enable_repl_tools:            bool = True,
         **kwargs
     ) -> Dict[str, Any]:
+        self.scratchpad = "" # Reset transient scratchpad for this session
         """
         Chat with opt-in agentic tool use.
 
@@ -858,7 +860,7 @@ class ChatMixin:
                                 "metadata":        meta,
                             })
                         if fmt:
-                            self.personality_data_zone = (
+                            self.scratchpad = (
                                 fmt.strip() + "\n\nIMPORTANT: Cite sources as [1],[2],..."
                             )
                         if collected_sources:
@@ -1403,7 +1405,7 @@ class ChatMixin:
                     # Truncate ONLY for the UI timeline to keep the UI snappy
                     _result_str = json.dumps(_result, indent=2)[:2000]
                     live_entry = f"\n--- {res_label} (Live) ---\n{_result_str}\n--- End {res_label} ---\n"
-                    self.personality_data_zone = (self.personality_data_zone or "") + live_entry
+                    self.scratchpad = (self.scratchpad or "") + live_entry
                     
                     tool_calls_this_turn.append({
                         "name": _tool_name, "params": _tool_params, "result": _result,
@@ -1504,9 +1506,9 @@ class ChatMixin:
                 return True
 
             # Temporarily strengthen the instruction to force a plain answer
-            _pdz_before_final = self.personality_data_zone
-            self.personality_data_zone = (
-                (_pdz_before_final or "")
+            _scratch_before_final = self.scratchpad
+            self.scratchpad = (
+                (_scratch_before_final or "")
                 + "\n\n[INSTRUCTION] All tool calls are complete. "
                 "Now write your final answer to the user in plain text. "
                 "Do NOT emit any more <tool_call> tags."
@@ -1514,7 +1516,7 @@ class ChatMixin:
             self._stream_final_answer(
                 _final_relay, images, _current_branch_tip, final_answer_temperature, **kwargs
             )
-            self.personality_data_zone = _pdz_before_final
+            self.scratchpad = _scratch_before_final
 
             _final_text    = "".join(_final_buf)
             _accumulated_full += _final_text

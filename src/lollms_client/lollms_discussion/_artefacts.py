@@ -18,25 +18,21 @@ if TYPE_CHECKING:
 
 class ArtefactType:
     """
-    Constants for the supported artefact types.
+    Registry for supported artefact types.
 
-    All types share the same flat schema (title, type, version, content,
-    images, language, url, tags, active, …extra_data).  The ``type`` field
-    is purely a label — there are no distinct per-type sub-schemas.
-    Extra fields meaningful to a specific type (e.g. ``language`` for CODE,
-    ``url`` for SEARCH_RESULT) are stored in the same dict via **extra_data.
+    Standard types: file, search_result, note, skill, code, document, image.
+    Use register_custom_type() to add domain-specific types (e.g. 'requirement', 'test_case').
     """
-    FILE          = "file"           # Generic uploaded file (text / binary as b64)
-    SEARCH_RESULT = "search_result"  # Results from a web / RAG search
-    NOTE          = "note"           # Free-form user note
-    SKILL         = "skill"          # SKILL.md-compatible capability descriptor
-    CODE          = "code"           # LLM-generated or user-supplied code
-    DOCUMENT      = "document"       # Generated or imported text document
-    IMAGE         = "image"          # Image stored as base64 in the ``images`` list
+    FILE          = "file"
+    SEARCH_RESULT = "search_result"
+    NOTE          = "note"
+    SKILL         = "skill"
+    CODE          = "code"
+    DOCUMENT      = "document"
+    IMAGE         = "image"
 
     ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE}
 
-    # Human-readable display labels (for UI / logging)
     LABELS = {
         FILE:          "File",
         SEARCH_RESULT: "Search Result",
@@ -46,6 +42,16 @@ class ArtefactType:
         DOCUMENT:      "Document",
         IMAGE:         "Image",
     }
+
+    @classmethod
+    def register_custom_type(cls, type_name: str, label: Optional[str] = None):
+        """Adds or updates a type in the valid registry. Silent if type already exists."""
+        name = type_name.lower().strip()
+        cls.ALL.add(name)
+        if label:
+            cls.LABELS[name] = label
+        elif name not in cls.LABELS:
+            cls.LABELS[name] = name.capitalize()
 
 
 # ---------------------------------------------------------------------------
@@ -259,13 +265,26 @@ class ArtefactManager:
         latest = self.get(title)
         if latest is None:
             raise ValueError(f"Cannot update non-existent artefact '{title}'.")
+        
+        # Support legacy calls where artefact_type is passed in extra_data
+        if new_type is None and "artefact_type" in extra_data:
+            new_type = extra_data.pop("artefact_type")
+        else:
+            extra_data.pop("artefact_type", None)
+
         new_version = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
         
         # Determine active state: priority to argument, fallback to previous state
         new_active = active if active is not None else latest.get('active', True)
 
         # Merge old extra_data with new ones so we don't lose existing metadata (author, etc.)
-        merged_extra = {k: v for k, v in latest.items() if k not in ["id", "title", "type", "version", "content", "images", "audios", "videos", "zip", "language", "url", "tags", "active", "created_at", "updated_at"]}
+        # Filter out internal keys and the potential 'artefact_type' alias to prevent double-pass errors
+        internal_keys = {
+            "id", "title", "type", "version", "content", "images", "audios", 
+            "videos", "zip", "language", "url", "tags", "active", 
+            "created_at", "updated_at", "artefact_type"
+        }
+        merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
         merged_extra.update(extra_data)
 
         return self.add(

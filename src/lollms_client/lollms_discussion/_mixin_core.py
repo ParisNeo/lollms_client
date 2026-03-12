@@ -384,14 +384,22 @@ class CoreMixin:
         Order: memory → user_data → discussion_data → personality_data → scratchpad → artefacts
         """
         parts = []
-        if self.memory and self.memory.strip():
-            parts.append(f"-- Memory --\n{self.memory.strip()}")
-        if self.user_data_zone and self.user_data_zone.strip():
-            parts.append(f"-- User Data Zone --\n{self.user_data_zone.strip()}")
-        if self.discussion_data_zone and self.discussion_data_zone.strip():
-            parts.append(f"-- Discussion Data Zone --\n{self.discussion_data_zone.strip()}")
-        if self.personality_data_zone and self.personality_data_zone.strip():
-            parts.append(f"-- Personality Data Zone --\n{self.personality_data_zone.strip()}")
+        # Use (attr or "") to handle None datazones safely
+        mem = (self.memory or "").strip()
+        if mem:
+            parts.append(f"-- Memory --\n{mem}")
+            
+        udz = (self.user_data_zone or "").strip()
+        if udz:
+            parts.append(f"-- User Data Zone --\n{udz}")
+            
+        ddz = (self.discussion_data_zone or "").strip()
+        if ddz:
+            parts.append(f"-- Discussion Data Zone --\n{ddz}")
+            
+        pdz = (self.personality_data_zone or "").strip()
+        if pdz:
+            parts.append(f"-- Personality Data Zone --\n{pdz}")
         
         # [NEW] Scratchpad Zone: Full length tool outputs for the LLM to analyze
         if hasattr(self, 'scratchpad') and self.scratchpad and self.scratchpad.strip():

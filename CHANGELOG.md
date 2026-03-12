@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-03-12 09:41]
+
+- refactor: modularize LLM bindings and discussion mixins
+
 ## [2026-03-12 07:14]
 
 - fix: minor adjustments across bindings, artefacts, and personality modules
