@@ -413,16 +413,51 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             ASCIIColors.error(f"Failed to save multimodal registry: {e}")
 
     def bind_multimodal_model(self, model_name: str, mmproj_name: str) -> dict:
-        """Explicitly associates a GGUF model with a vision projector (.mmproj)."""
-        if not (self.models_dir / model_name).exists():
+        """Explicitly associates a GGUF model with a vision projector (.mmproj).
+        
+        If the model is currently running, the server will be automatically 
+        restarted to apply the new projector configuration.
+        """
+        # Validate files
+        model_path = self.models_dir / model_name
+        mmproj_path = self.models_dir / mmproj_name
+        
+        if not model_path.exists():
             return {"status": False, "error": f"Model '{model_name}' not found."}
-        if not (self.models_dir / mmproj_name).exists():
+        if not mmproj_path.exists():
             return {"status": False, "error": f"Projector '{mmproj_name}' not found."}
+            
         registry = self._load_mm_registry()
         registry[model_name] = mmproj_name
         self._save_mm_registry(registry)
         ASCIIColors.success(f"Bound '{model_name}' ↔ '{mmproj_name}'")
-        return {"status": True, "message": f"Bound '{model_name}' with '{mmproj_name}'"}
+
+        # Check if the model is currently running and restart it
+        is_running = self._get_server_info(model_name) is not None
+        was_active = (self.model_name == model_name)
+        
+        if is_running:
+            ASCIIColors.info(f"Server for '{model_name}' is running. Restarting to apply projector...")
+            
+            # Kill the current server
+            info = self._get_server_info(model_name)
+            if info:
+                self._kill_server(model_name, info)
+                # Small delay to ensure port is released
+                import time
+                time.sleep(1)
+            
+            # Reload the model (this will spawn a new server with the --mmproj flag)
+            try:
+                self.load_model(model_name)
+                msg = f"Server for '{model_name}' has been restarted successfully with projector '{mmproj_name}'."
+                ASCIIColors.success(msg)
+                return {"status": True, "message": msg}
+            except Exception as e:
+                ASCIIColors.error(f"Failed to restart server for '{model_name}': {e}")
+                return {"status": False, "error": f"Binding successful, but restart failed: {e}"}
+        
+        return {"status": True, "message": f"Bound '{model_name}' with '{mmproj_name}'. Restart the server manually or load the model to apply changes."}
 
     def _find_mmproj(self, model_path: Path) -> Optional[Path]:
         """
