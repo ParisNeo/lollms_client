@@ -134,7 +134,12 @@ input_parameters:
     type: str
     description: "Directory containing GGUF model files."
     mandatory: false
-    default: "models/llama_cpp_models"
+    default: "data/models/llama_cpp_models"
+  - name: binaries_path
+    type: str
+    description: "Directory containing GGUF model files."
+    mandatory: false
+    default: "data/bin/llama_cpp_bin"
 
 commands:
   - name: pull_model
