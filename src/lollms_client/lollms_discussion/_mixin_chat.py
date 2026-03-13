@@ -1297,10 +1297,6 @@ class ChatMixin:
                 _inline_relay, images, _current_branch_tip, final_answer_temperature, **kwargs
             )
 
-            self._stream_final_answer(
-                _inline_relay, images, _current_branch_tip, final_answer_temperature, **kwargs
-            )
-
             _so_far           = "".join(_stream_buf)
             _accumulated_full += _so_far
 
