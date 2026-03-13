@@ -271,11 +271,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                         bar.update(len(chunk))
 
             ASCIIColors.info("Extracting …")
-            extracted_files = []
             if filename.endswith(".zip"):
                 with zipfile.ZipFile(dest_file, "r") as z:
                     z.extractall(self.bin_dir)
-                    extracted_files = [f for f in z.namelist() if not f.endswith('/')]
             elif filename.endswith(".tar.gz"):
                 with tarfile.open(dest_file, "r:gz") as t:
                     t.extractall(self.bin_dir)
