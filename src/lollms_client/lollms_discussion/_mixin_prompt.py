@@ -29,12 +29,26 @@ class PromptMixin:
             "You can create, modify, and version control artefacts (persistent code, documents, notes, skills).",
             "Always use XML tags for artefact operations. The system keeps full version history automatically.",
             "",
+            "IMPORTANT: Whenever you create or update an artefact, you MUST also write a",
+            "short explanation in your reply (outside the tag) telling the user what you",
+            "created/changed and why. Never let your entire response consist of only XML tags.",
+            "Example: 'I've created `hello.py` with a basic Flask server — here's what it does: …'",
+            "",
             "To CREATE a new artefact (supports metadata attributes):",
             '<artefact name="unique_name.py" type="code" language="python" author="Your Name" description="What it does">',
             "[full content here]",
             "</artefact>",
             "",
-            "To UPDATE an existing artefact, use SEARCH/REPLACE blocks inside the tag.",
+            "To UPDATE an existing artefact (use the EXACT same name as the existing one):",
+            "  The system will automatically find the artefact even if the name is slightly",
+            "  different (fuzzy matching), but using the exact stored name is safest.",
+            "",
+            "To RENAME an artefact while updating it, add a rename attribute:",
+            '<artefact name="old_title" rename="new_title">',
+            "  [full new content OR SEARCH/REPLACE blocks]",
+            "</artefact>",
+            "",
+            "To UPDATE content only (no rename), use SEARCH/REPLACE blocks inside the tag.",
             "CRITICAL RULES FOR SEARCH/REPLACE:",
             "  1. Keep each SEARCH block as SHORT as possible — 1 to 5 lines is ideal.",
             "     The longer the SEARCH block, the higher the chance of a whitespace or",
@@ -104,31 +118,62 @@ class PromptMixin:
         return "\n".join(lines)
 
     def _build_inline_widget_instructions(self) -> str:
-        """Returns prompt instructions for generating inline interactive widgets."""
+        """
+        Returns prompt instructions for generating inline interactive widgets.
+
+        Framing is explicitly educational / teaching-focused: the model should
+        use widgets to make abstract concepts tangible through interaction, not
+        just to show off visuals.  The instructions also reinforce that a plain-
+        text explanation must accompany every widget (mirrors the artefact rule).
+        """
         lines = [
             "",
-            "=== INLINE INTERACTIVE WIDGETS ===",
-            "You can embed a live, interactive widget directly inside your reply.",
-            "Use this whenever an interactive visual would explain your answer better than text.",
+            "=== INTERACTIVE TEACHING WIDGETS ===",
+            "You can embed a live, interactive widget directly inside your reply to help",
+            "the user *learn by doing*.  Use a widget whenever an interactive visual would",
+            "make a concept clearer than text alone — think of it as a mini lab or demo.",
+            "",
+            "IMPORTANT: Always write a short explanation in your reply alongside the widget.",
+            "Never let the widget be your entire response.  Tell the user:",
+            "  • what the widget demonstrates,",
+            "  • which controls to interact with and what to look for,",
+            "  • the key insight they should walk away with.",
             "",
             "Tag syntax:",
             '<lollms_inline type="html" title="Descriptive title">',
-            "  <!-- self-contained HTML/JS/CSS — no external files, CDN links are OK -->",
+            "  <!-- self-contained HTML/JS/CSS — no external files; CDN links are OK -->",
             "</lollms_inline>",
             "",
-            "Supported types: html (default), react, svg",
+            "Supported types:",
+            "  html  — default; full HTML/JS/CSS in one file (most flexible)",
+            "  react — JSX component rendered client-side",
+            "  svg   — animated or interactive SVG",
             "",
-            "Good uses: formula explorers with sliders, mini charts, SVG animations,",
-            "           physics / math simulations, colour pickers, interactive diagrams.",
-            "Bad uses: full applications (use <artefact> instead), anything needing a server.",
+            "GOOD uses (teaching moments):",
+            "  • Physics / math simulations with parameter sliders",
+            "    (e.g. 'drag the mass slider to see how period changes')",
+            "  • Algorithm step-through visualisers",
+            "    (e.g. 'click Next to advance bubble-sort one step')",
+            "  • Signal / wave / Fourier explorers",
+            "  • Probability / statistics sandboxes",
+            "  • Colour / geometry / trigonometry explorers",
+            "  • Mini quizzes or flashcard drills",
+            "  • Data-entry forms that compute a result live",
             "",
-            "Rules:",
-            "  • Fully self-contained — the widget must work with zero network requests",
-            "    (CDN links to well-known libraries are the only exception).",
-            "  • Keep it compact: aim for ≤ 420 px height, full container width.",
+            "BAD uses (do NOT use a widget for these):",
+            "  • Full applications → use <artefact> instead",
+            "  • Static charts with no interactivity → just describe or use a note",
+            "  • Anything requiring a server or file I/O",
+            "",
+            "Technical rules:",
+            "  • Fully self-contained — zero network requests at runtime",
+            "    (CDN links to well-known libraries, e.g. KaTeX, Chart.js, are fine).",
+            "  • Target ≤ 460 px height, full container width.",
             "  • Use KaTeX (https://cdn.jsdelivr.net/npm/katex/dist/katex.min.js) for math.",
+            "  • Label every control clearly so the user knows what to do.",
             "  • No alert() / confirm() / prompt().",
-            "=== END INLINE WIDGET INSTRUCTIONS ===",
+            "  • Prefer smooth transitions / animations over abrupt jumps.",
+            "=== END INTERACTIVE TEACHING WIDGET INSTRUCTIONS ===",
             "",
         ]
         return "\n".join(lines)
@@ -136,26 +181,6 @@ class PromptMixin:
     def _build_note_instructions(self) -> str:
         """
         Returns prompt instructions for creating persistent notes via the <note> tag.
-
-        Notes are lightweight named documents saved as ArtefactType.NOTE artefacts.
-        They are ideal for structured summaries, analysis results, comparison tables,
-        research findings, or any content the user explicitly wants saved and retrievable
-        later — as opposed to artefacts (code, full documents) or inline widgets (live UI).
-
-        Tag anatomy
-        -----------
-        <note title="Human-readable title">
-          [note content — plain text or Markdown]
-        </note>
-
-        Rules
-        -----
-        1. Use a clear, specific title that describes the content (not "Note 1").
-        2. A single response may contain multiple <note> tags with different titles.
-        3. If a note with the same title already exists it is replaced (new version created).
-        4. Notes are immediately visible in the discussion artefact panel.
-        5. Do NOT use <note> for code — use <artefact type="code"> instead.
-        6. Do NOT use <note> for large structured documents — use <artefact type="document">.
         """
         lines = [
             "",
@@ -172,17 +197,7 @@ class PromptMixin:
             "  [note content — plain text or Markdown]",
             "</note>",
             "",
-            "You may emit multiple notes in a single response:",
-            '<note title="Transavia - Price Analysis">',
-            "  | Route | Base | +Baggage | Total |",
-            "  |-------|------|----------|-------|",
-            "  | TUN→LYS | €89 | €35 | €124 |",
-            "</note>",
-            '<note title="easyJet - Price Analysis">',
-            "  | Route | Base | +Baggage | Total |",
-            "  |-------|------|----------|-------|",
-            "  | TUN→LYS | €95 | €25 | €120 |",
-            "</note>",
+            "You may emit multiple notes in a single response.",
             "=== END NOTE INSTRUCTIONS ===",
             "",
         ]
@@ -191,35 +206,6 @@ class PromptMixin:
     def _build_skill_instructions(self) -> str:
         """
         Returns prompt instructions for saving reusable skills via the <skill> tag.
-
-        Skills are reusable knowledge capsules — code patterns, workflows, techniques,
-        or domain recipes — that the user or the system can retrieve in future sessions.
-        They are saved as ArtefactType.SKILL artefacts with rich metadata.
-
-        Tag anatomy
-        -----------
-        <skill title="Skill name"
-               description="One-sentence description of what this teaches"
-               category="domain/subdomain/topic">
-          [skill content — Markdown with explanations and code examples]
-        </skill>
-
-        Category convention
-        -------------------
-        Use forward-slash-separated hierarchical labels:
-          programming/python/async
-          language/french/subjunctive
-          cooking/baking/bread
-          devops/docker/networking
-
-        Rules
-        -----
-        1. Only emit a <skill> tag when the user explicitly asks to save a skill,
-           or when the response encapsulates a reusable, teachable pattern.
-        2. Skills should be self-contained — someone reading only the skill content
-           should be able to apply the technique without additional context.
-        3. Include concrete examples; avoid vague advice.
-        4. Do NOT use <skill> for one-off answers — use it for genuinely reusable knowledge.
         """
         lines = [
             "",
@@ -257,6 +243,7 @@ class PromptMixin:
         enable_inline_widgets:   bool = True,
         enable_notes:            bool = True,
         enable_skills:           bool = False,
+        enable_silent_artefact_explanation: bool = True,
     ) -> Tuple[str, List[Dict]]:
         """
         Scans the raw LLM response for XML action tags and applies them.
@@ -281,8 +268,8 @@ class PromptMixin:
             Only when ``enable_image_editing=True`` and tti is set.
 
         ``<lollms_inline type="html|react|svg" title="…">…</lollms_inline>``
-            Extracts a self-contained widget and stores it in
-            ``ai_message.metadata["inline_widgets"]``.
+            Extracts a self-contained interactive teaching widget and stores it
+            in ``ai_message.metadata["inline_widgets"]``.
             Only when ``enable_inline_widgets=True``.
 
         ``<note title="…">…</note>``
@@ -294,6 +281,13 @@ class PromptMixin:
             Saves a reusable knowledge capsule as an ``ArtefactType.SKILL``
             artefact with category and description metadata.
             Only when ``enable_skills=True``.
+
+        Silent artefact guard
+        ---------------------
+        When ``enable_silent_artefact_explanation=True`` (the default), if the
+        cleaned text after stripping all XML tags is blank or only whitespace,
+        a concise auto-generated explanation is appended so the user always
+        receives a human-readable confirmation of what was done.
 
         Returns
         -------
@@ -335,9 +329,34 @@ class PromptMixin:
 
         # ── 1. Artefact create / patch ────────────────────────────────────────
         if has_artefact:
+            # Build a real-time event callback so the UI receives artefact
+            # create/update notifications as each tag is processed.
+            _active_cb = getattr(self, '_active_callback', None)
+
+            def _artefact_event(artefact: Dict, is_new: bool):
+                if not _active_cb:
+                    return
+                import json as _json
+                from lollms_client.lollms_types import MSG_TYPE as _MT
+                event_type = "artefact_created" if is_new else "artefact_updated"
+                try:
+                    _active_cb(
+                        _json.dumps({
+                            "type":     event_type,
+                            "title":    artefact.get("title"),
+                            "version":  artefact.get("version"),
+                            "art_type": artefact.get("type"),
+                        }),
+                        _MT.MSG_TYPE_ARTEFACTS_STATE_CHANGED,
+                        {"artefact": artefact, "is_new": is_new},
+                    )
+                except Exception:
+                    pass
+
             cleaned, affected_artefacts = self.artefacts._apply_artefact_xml(
                 cleaned, auto_activate=auto_activate_artefacts,
                 replacements=code_blocks,
+                event_callback=_artefact_event,
             )
 
         # ── 2. Image generation → message.images ─────────────────────────────
@@ -449,7 +468,6 @@ class PromptMixin:
                 re.DOTALL | re.IGNORECASE,
             )
 
-            # Ensure the metadata list exists
             meta = dict(ai_message.metadata or {})
             if "inline_widgets" not in meta:
                 meta["inline_widgets"] = []
@@ -458,15 +476,13 @@ class PromptMixin:
                 attrs  = _parse_attrs(match.group(1))
                 source = match.group(2)
 
-                # Restore any masked code inside the widget source
                 for placeholder, original in code_blocks.items():
                     source = source.replace(placeholder, original)
 
-                widget_id   = str(uuid.uuid4())
-                widget_type = attrs.get('type', 'html').lower().strip()
+                widget_id    = str(uuid.uuid4())
+                widget_type  = attrs.get('type', 'html').lower().strip()
                 widget_title = attrs.get('title', 'Interactive Widget')
 
-                # Normalise type to one of the three supported values
                 if widget_type not in ('html', 'react', 'svg'):
                     widget_type = 'html'
 
@@ -481,14 +497,11 @@ class PromptMixin:
                 ASCIIColors.success(
                     f"Inline widget '{widget_title}' ({widget_type}) registered.")
 
-                # Replace the tag in the message text with a lightweight
-                # anchor element that the frontend can use to locate and
-                # render the widget in-place.
+                # Replace the tag with a lightweight anchor for the frontend
                 return f'<lollms_widget id="{widget_id}" />'
 
             cleaned = inline_pattern.sub(handle_inline, cleaned)
 
-            # Only write back metadata if at least one widget was found
             if meta["inline_widgets"]:
                 ai_message.metadata = meta
 
@@ -503,7 +516,6 @@ class PromptMixin:
                 attrs   = _parse_attrs(match.group(1))
                 content = match.group(2)
 
-                # Restore any masked code blocks inside the note body
                 for placeholder, original in code_blocks.items():
                     content = content.replace(placeholder, original)
                     for k, v in attrs.items():
@@ -513,8 +525,6 @@ class PromptMixin:
                 title = (attrs.get('title') or attrs.get('name') or
                          f'note_{uuid.uuid4().hex[:8]}')
 
-                # Notes are always saved as NOTE type, active by default so
-                # they appear immediately in the artefact panel.
                 note_artefact = self.artefacts.add(
                     title         = title,
                     artefact_type = ArtefactType.NOTE,
@@ -523,7 +533,7 @@ class PromptMixin:
                 )
                 affected_artefacts.append(note_artefact)
                 ASCIIColors.success(f"Note '{title}' saved.")
-                return ''   # strip tag from visible text
+                return ''
 
             cleaned = note_pattern.sub(handle_note, cleaned)
 
@@ -538,7 +548,6 @@ class PromptMixin:
                 attrs   = _parse_attrs(match.group(1))
                 content = match.group(2)
 
-                # Restore any masked code blocks inside the skill body
                 for placeholder, original in code_blocks.items():
                     content = content.replace(placeholder, original)
                     for k, v in attrs.items():
@@ -550,8 +559,6 @@ class PromptMixin:
                 description = attrs.get('description', '')
                 category    = attrs.get('category', '')
 
-                # Skills are saved with description and category as extra metadata
-                # so the application layer can index / search them by category.
                 skill_artefact = self.artefacts.add(
                     title         = title,
                     artefact_type = ArtefactType.SKILL,
@@ -565,7 +572,7 @@ class PromptMixin:
                     f"Skill '{title}' saved"
                     + (f" [{category}]" if category else "") + "."
                 )
-                return ''   # strip tag from visible text
+                return ''
 
             cleaned = skill_pattern.sub(handle_skill, cleaned)
 
@@ -573,4 +580,68 @@ class PromptMixin:
         for placeholder, original in code_blocks.items():
             cleaned = cleaned.replace(placeholder, original)
 
-        return cleaned.strip(), affected_artefacts
+        cleaned = cleaned.strip()
+
+        # ── 7. Silent-artefact guard ──────────────────────────────────────────
+        # If the entire response was consumed by XML tags and the user would
+        # receive an empty bubble, generate a concise human-readable summary
+        # of what was produced so the chat never feels broken.
+        if enable_silent_artefact_explanation and not cleaned:
+            summary_parts: List[str] = []
+
+            # Artefacts (code, documents, …)
+            non_note_non_skill = [
+                a for a in affected_artefacts
+                if a.get('type') not in (ArtefactType.NOTE, ArtefactType.SKILL)
+            ]
+            for art in non_note_non_skill:
+                atype    = art.get('type', 'artefact')
+                title    = art.get('title', 'untitled')
+                lang     = art.get('language', '')
+                version  = art.get('version', 1)
+                desc     = art.get('description', '')
+                lang_str = f" ({lang})" if lang else ""
+                ver_str  = f" — version {version}" if version > 1 else ""
+                desc_str = f": {desc}" if desc else ""
+                summary_parts.append(
+                    f"📄 Created **{title}**{lang_str} [{atype}{ver_str}]{desc_str}."
+                )
+
+            # Notes
+            notes = [a for a in affected_artefacts if a.get('type') == ArtefactType.NOTE]
+            for note in notes:
+                title = note.get('title', 'untitled')
+                # Peek at the first non-blank line of the note for context
+                first_line = next(
+                    (l.strip() for l in note.get('content', '').splitlines() if l.strip()),
+                    ''
+                )
+                peek = f" — {first_line[:80]}…" if first_line else ""
+                summary_parts.append(f"📝 Saved note **{title}**{peek}")
+
+            # Skills
+            skills = [a for a in affected_artefacts if a.get('type') == ArtefactType.SKILL]
+            for skill in skills:
+                title    = skill.get('title', 'untitled')
+                category = skill.get('category', '')
+                desc     = skill.get('description', '')
+                cat_str  = f" [{category}]" if category else ""
+                desc_str = f" — {desc}" if desc else ""
+                summary_parts.append(f"🎓 Skill saved **{title}**{cat_str}{desc_str}.")
+
+            # Inline widgets
+            meta_now = dict(ai_message.metadata or {})
+            for widget in meta_now.get("inline_widgets", []):
+                w_title = widget.get('title', 'Interactive Widget')
+                w_type  = widget.get('type', 'html')
+                summary_parts.append(
+                    f"🎛️ Interactive widget ready: **{title}** ({w_type}) — "
+                    "use the controls below to explore the concept."
+                )
+
+            if summary_parts:
+                cleaned = "\n".join(summary_parts)
+                ASCIIColors.info(
+                    "[silent-artefact guard] Auto-generated explanation appended.")
+
+        return cleaned, affected_artefacts

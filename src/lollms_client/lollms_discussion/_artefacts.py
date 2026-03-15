@@ -82,6 +82,73 @@ def _find_closest_line(needle: str, haystack: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fuzzy title matching
+# ---------------------------------------------------------------------------
+
+def _title_similarity(a: str, b: str) -> float:
+    """
+    Returns a similarity score in [0.0, 1.0] between two artefact title strings.
+    Normalises case, strips common extensions and punctuation before comparing.
+    """
+    def _norm(s: str) -> str:
+        # lower, strip extension, collapse whitespace/separators
+        s = s.lower().strip()
+        s = re.sub(r'\.[a-z0-9]{1,6}$', '', s)        # strip extension
+        s = re.sub(r'[\s\-_/\\]+', ' ', s)             # normalise separators
+        return s
+
+    na, nb = _norm(a), _norm(b)
+    if na == nb:
+        return 1.0
+    if not na or not nb:
+        return 0.0
+
+    # Check substring containment (e.g. "Transavia note" vs "note Transavia")
+    if na in nb or nb in na:
+        return 0.85
+
+    # Character bigram overlap
+    def bigrams(s):
+        return {s[i:i+2] for i in range(len(s) - 1)}
+
+    bg_a, bg_b = bigrams(na), bigrams(nb)
+    if not bg_a or not bg_b:
+        # fall back to character overlap
+        common = sum(x == y for x, y in zip(na, nb))
+        return common / max(len(na), len(nb))
+
+    overlap = len(bg_a & bg_b)
+    return (2.0 * overlap) / (len(bg_a) + len(bg_b))
+
+
+def _find_best_title_match(
+    candidate: str,
+    existing_titles: List[str],
+    threshold: float = 0.60,
+) -> Optional[str]:
+    """
+    Returns the existing title that best matches *candidate* if the similarity
+    is at or above *threshold*, otherwise None (→ create a new artefact).
+
+    threshold=0.60 catches:
+      • minor typos / extra words ("Transavia note" → "note Transavia")
+      • extension changes ("app.py" → "app")
+      • casing differences ("MyFile.py" → "myfile.py")
+    while rejecting genuinely different names.
+    """
+    best_title: Optional[str] = None
+    best_score: float         = -1.0
+    for title in existing_titles:
+        score = _title_similarity(candidate, title)
+        if score > best_score:
+            best_score = score
+            best_title = title
+    if best_score >= threshold:
+        return best_title
+    return None
+
+
+# ---------------------------------------------------------------------------
 # ArtefactManager
 # ---------------------------------------------------------------------------
 
@@ -152,6 +219,15 @@ class ArtefactManager:
         new_meta["_artefacts"] = artefacts
         self._discussion.metadata = new_meta
         self._discussion.commit()
+
+    def _all_latest_titles(self) -> List[str]:
+        """Returns the title of the latest version of every distinct artefact."""
+        seen: Dict[str, int] = {}
+        for a in self._get_all_raw():
+            t, v = a.get('title', ''), a.get('version', 1)
+            if t not in seen or v > seen[t]:
+                seen[t] = v
+        return list(seen.keys())
 
     # ----------------------------------------------------------------- CRUD
 
@@ -244,6 +320,7 @@ class ArtefactManager:
         new_tags:      Optional[List[str]] = None,
         language:      Optional[str] = None,
         url:           Optional[str] = None,
+        new_title:     Optional[str] = None,   # ← rename support
         bump_version:  bool = True,
         active:        Optional[bool] = None,
         **extra_data
@@ -257,8 +334,9 @@ class ArtefactManager:
         else:
             extra_data.pop("artefact_type", None)
 
-        new_version = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
-        new_active = active if active is not None else latest.get('active', True)
+        new_version  = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
+        new_active   = active if active is not None else latest.get('active', True)
+        target_title = new_title if new_title else title   # support rename
 
         internal_keys = {
             "id", "title", "type", "version", "content", "images", "audios",
@@ -268,8 +346,17 @@ class ArtefactManager:
         merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
         merged_extra.update(extra_data)
 
+        # If renaming, deactivate old title entries first
+        if new_title and new_title != title:
+            artefacts = self._get_all_raw()
+            for a in artefacts:
+                if a.get('title') == title:
+                    a['active'] = False
+            self._save_all(artefacts)
+            ASCIIColors.info(f"Renaming artefact '{title}' → '{new_title}'")
+
         return self.add(
-            title         = title,
+            title         = target_title,
             artefact_type = new_type if new_type is not None else latest.get('type', ArtefactType.DOCUMENT),
             content       = new_content if new_content is not None else latest.get('content', ''),
             images        = new_images  if new_images  is not None else latest.get('images', []),
@@ -457,7 +544,6 @@ class ArtefactManager:
 
         # ── ensure terminal >>>>>>> REPLACE ──────────────────────────────────
         lines = patch_block.split('\n')
-        # strip trailing blank lines
         while lines and not lines[-1].strip():
             lines.pop()
         if lines and not REPLACE_RE.match(lines[-1].rstrip()):
@@ -488,13 +574,11 @@ class ArtefactManager:
 
                 separator_line = raw_lines[i].rstrip()
 
-                # Fault case: >>>>>>> REPLACE used as separator → empty replace
                 if REPLACE_RE.match(separator_line):
                     segments.append(('\n'.join(search_lines), ''))
                     i += 1
                     continue
 
-                # Normal case: separator is =======
                 i += 1
                 replace_lines: List[str] = []
                 while i < len(raw_lines):
@@ -503,7 +587,6 @@ class ArtefactManager:
                         break
                     replace_lines.append(raw_lines[i])
                     i += 1
-                # skip the >>>>>>> REPLACE line
                 if i < len(raw_lines) and REPLACE_RE.match(raw_lines[i].rstrip()):
                     i += 1
 
@@ -520,7 +603,6 @@ class ArtefactManager:
         # ── apply each segment ────────────────────────────────────────────────
         result = original
         for search_text, replace_text in segments:
-            # Strip the single leading / trailing newline the join may introduce
             if search_text.startswith('\n'):
                 search_text = search_text[1:]
             if replace_text.startswith('\n'):
@@ -551,27 +633,27 @@ class ArtefactManager:
         default_type:  str = ArtefactType.CODE,
         auto_activate: bool = True,
         replacements:  Optional[Dict[str, str]] = None,
+        event_callback: Optional[Any] = None,   # ← NEW: fires MSG_TYPE events
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Internal helper called exclusively from LollmsDiscussion._post_process_llm_response.
 
         Scans *text* for ``<artefact …>…</artefact>`` blocks and:
 
-        * Creates a new artefact when content has no aider markers.
+        * Uses fuzzy title matching to find an existing artefact whose name is
+          similar to the tag's ``name`` attribute, so a renamed tag still updates
+          the right artefact instead of creating a duplicate.
+
+        * Supports an explicit ``rename="new title"`` attribute to change the
+          stored title while applying content changes.
+
+        * Creates a new artefact when no sufficiently similar title is found.
+
         * Applies one or more aider SEARCH/REPLACE patch blocks when markers
-          are present, with the following error recovery:
+          are present, with the same error recovery as before.
 
-          - On ValueError from apply_aider_patch (SEARCH not found, malformed
-            block, etc.) the method logs a prominent warning, leaves the
-            existing artefact **untouched**, and still appends it to the
-            affected list so the UI can surface the failure to the user.
-
-          - If the patch targets an artefact that does not yet exist, the raw
-            patch content is saved as the initial version (version 1) so the
-            user can see what the model intended.
-
-          - Content with no recognisable SEARCH markers is treated as a full
-            content replacement / creation.
+        * Fires event_callback(artefact_dict, is_new: bool) after each
+          artefact is saved, so the UI can update in real time.
 
         Returns (cleaned_text, affected_artefacts_list).
         """
@@ -587,11 +669,16 @@ class ArtefactManager:
             return {m.group(1): m.group(2)
                     for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
+        # Collect all existing titles once for the whole response pass
+        existing_titles = self._all_latest_titles()
+
         def handle_artefact(match: re.Match) -> str:
+            nonlocal existing_titles
+
             attrs   = _parse_attrs(match.group(1))
             content = match.group(2)
 
-            # Restore masked content (code blocks) before saving to the database
+            # Restore masked content before saving
             if replacements:
                 for placeholder, original in replacements.items():
                     content = content.replace(placeholder, original)
@@ -599,7 +686,8 @@ class ArtefactManager:
                         if placeholder in v:
                             attrs[k] = v.replace(placeholder, original)
 
-            title       = attrs.pop('name', attrs.pop('title', f'artefact_{uuid.uuid4().hex[:8]}'))
+            tag_title   = attrs.pop('name', attrs.pop('title', f'artefact_{uuid.uuid4().hex[:8]}'))
+            new_name    = attrs.pop('rename', None)   # explicit rename attribute
             atype       = attrs.pop('type', default_type)
             language    = attrs.pop('language', None)
             version_str = attrs.pop('version', '1')
@@ -608,57 +696,111 @@ class ArtefactManager:
             if atype not in ArtefactType.ALL:
                 atype = default_type
 
+            # ── Fuzzy title resolution ────────────────────────────────────────
+            # Priority:
+            #   1. Exact match on tag_title                → update that artefact
+            #   2. Fuzzy match on tag_title (≥ 0.60)       → update matched artefact
+            #   3. No match                                 → create new artefact
+            resolved_title: Optional[str] = None
+            is_new = False
+
+            if tag_title in existing_titles:
+                resolved_title = tag_title
+            else:
+                fuzzy = _find_best_title_match(tag_title, existing_titles)
+                if fuzzy:
+                    ASCIIColors.info(
+                        f"Fuzzy title match: '{tag_title}' → '{fuzzy}' (updating in place)"
+                    )
+                    resolved_title = fuzzy
+                else:
+                    resolved_title = tag_title
+                    is_new = True
+
             # Detect whether this is a patch or a full replacement
             _has_search = bool(
                 re.search(r'<{6,8}\s*SEARCH', content, re.IGNORECASE)
             )
 
+            result_artefact: Optional[Dict] = None
+
             if _has_search:
-                existing = self.get(title)
+                existing = self.get(resolved_title)
                 if existing is None:
-                    # No existing artefact to patch — save the raw patch text
-                    # as version 1 so the user can see what the model intended.
                     ASCIIColors.warning(
-                        f"Aider patch for '{title}' but artefact does not exist yet — "
+                        f"Aider patch for '{resolved_title}' but artefact does not exist yet — "
                         "saving raw patch content as initial version."
                     )
                     result_artefact = self.add(
-                        title=title, artefact_type=atype, content=content,
+                        title=resolved_title, artefact_type=atype, content=content,
                         language=language, version=version, active=auto_activate,
                         **attrs
                     )
+                    is_new = True
                 else:
                     try:
                         patched = ArtefactManager.apply_aider_patch(
                             existing.get('content', ''), content
                         )
                         result_artefact = self.update(
-                            title=title, new_content=patched,
-                            language=language, bump_version=True,
+                            title=resolved_title,
+                            new_content=patched,
+                            new_title=new_name,        # rename if requested
+                            language=language,
+                            bump_version=True,
                             active=auto_activate,
                             **attrs
                         )
+                        final_title = result_artefact.get('title', resolved_title)
                         ASCIIColors.success(
-                            f"Aider patch applied to '{title}' "
-                            f"→ v{result_artefact.get('version', '?')}"
+                            f"Aider patch applied to '{resolved_title}'"
+                            + (f" → renamed '{final_title}'" if new_name else "")
+                            + f" → v{result_artefact.get('version', '?')}"
                         )
                     except ValueError as e:
-                        # Patch failed — keep existing artefact untouched, log
-                        # the error prominently so the UI can surface it.
                         ASCIIColors.warning(
-                            f"⚠ Aider patch FAILED for '{title}':\n  {e}\n"
+                            f"⚠ Aider patch FAILED for '{resolved_title}':\n  {e}\n"
                             "  Existing artefact is unchanged."
                         )
                         result_artefact = existing
             else:
-                # No patch markers — full content replacement / creation
-                result_artefact = self.add(
-                    title=title, artefact_type=atype, content=content.strip(),
-                    language=language, version=version, active=auto_activate,
-                    **attrs
-                )
+                # Full content replacement / creation
+                if is_new:
+                    result_artefact = self.add(
+                        title=resolved_title, artefact_type=atype,
+                        content=content.strip(),
+                        language=language, version=version, active=auto_activate,
+                        **attrs
+                    )
+                else:
+                    result_artefact = self.update(
+                        title=resolved_title,
+                        new_content=content.strip(),
+                        new_title=new_name,            # rename if requested
+                        new_type=atype,
+                        language=language,
+                        bump_version=True,
+                        active=auto_activate,
+                        **attrs
+                    )
+                    final_title = result_artefact.get('title', resolved_title)
+                    if new_name:
+                        ASCIIColors.info(
+                            f"Artefact '{resolved_title}' renamed to '{final_title}'")
+
+            # Update the known titles list so subsequent tags in the same
+            # response don't mistakenly match against stale titles
+            existing_titles = self._all_latest_titles()
 
             affected.append(result_artefact)
+
+            # ── Fire real-time event callback ─────────────────────────────────
+            if event_callback and result_artefact:
+                try:
+                    event_callback(result_artefact, is_new)
+                except Exception as _ecb_err:
+                    ASCIIColors.warning(f"Artefact event callback error: {_ecb_err}")
+
             return ''   # strip tag from cleaned output
 
         cleaned = artefact_pattern.sub(handle_artefact, cleaned)
@@ -671,9 +813,18 @@ class ArtefactManager:
             title   = attrs.get('name') or attrs.get('title')
             version = attrs.get('version')
             if title and version and version.isdigit():
+                # Fuzzy match for revert too
+                resolved = title if title in existing_titles else (
+                    _find_best_title_match(title, existing_titles) or title
+                )
                 try:
-                    res_artefact = self.revert(title, int(version))
+                    res_artefact = self.revert(resolved, int(version))
                     affected.append(res_artefact)
+                    if event_callback:
+                        try:
+                            event_callback(res_artefact, False)
+                        except Exception:
+                            pass
                 except ValueError as e:
                     ASCIIColors.warning(str(e))
             return ''

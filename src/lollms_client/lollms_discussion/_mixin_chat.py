@@ -117,6 +117,16 @@ def _extract_content_title(content: str, max_len: int = 80) -> Optional[str]:
 class ChatMixin:
     """
     Provides simplified_chat() and chat().
+
+    Changes vs previous version
+    ---------------------------
+    * _active_callback is stored on self at the start of every chat turn so
+      that _post_process_llm_response can fire artefact create/update events
+      in real time, and cleared at the end to avoid leaking across turns.
+    * enable_silent_artefact_explanation parameter (default True) is threaded
+      through both chat paths and both _post_process_llm_response call sites.
+    * enable_inline_widgets is wired through the fast path and agentic path
+      identically to enable_notes / enable_skills.
     """
 
     # ------------------------------------------------------------------ helpers
@@ -312,11 +322,18 @@ class ChatMixin:
         enable_image_generation: bool = False,
         enable_image_editing:    bool = False,
         auto_activate_artefacts: bool = True,
+        enable_inline_widgets:   bool = True,
+        enable_notes:            bool = True,
+        enable_skills:           bool = False,
+        enable_silent_artefact_explanation: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         self.scratchpad = ""
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
+
+        # Stash callback so _post_process_llm_response can fire artefact events
+        object.__setattr__(self, '_active_callback', callback)
 
         def is_fast(msg):
             m = msg.lower().strip()
@@ -327,6 +344,12 @@ class ChatMixin:
         extra_instructions = self._build_artefact_instructions()
         if enable_image_generation or enable_image_editing:
             extra_instructions += self._build_image_generation_instructions()
+        if enable_inline_widgets:
+            extra_instructions += self._build_inline_widget_instructions()
+        if enable_notes:
+            extra_instructions += self._build_note_instructions()
+        if enable_skills:
+            extra_instructions += self._build_skill_instructions()
         if extra_instructions.strip():
             original_sp = self._system_prompt or ""
             if extra_instructions not in original_sp:
@@ -352,14 +375,20 @@ class ChatMixin:
                 binding_name=self.lollmsClient.llm.binding_name,
             )
             cleaned, affected = self._post_process_llm_response(
-                text, ai, enable_image_generation, enable_image_editing,
+                text, ai,
+                enable_image_generation, enable_image_editing,
                 auto_activate_artefacts,
+                enable_inline_widgets=enable_inline_widgets,
+                enable_notes=enable_notes,
+                enable_skills=enable_skills,
+                enable_silent_artefact_explanation=enable_silent_artefact_explanation,
             )
             if cleaned != text:
                 ai.content = cleaned
             if affected and callback:
                 _cb(callback, json.dumps([a.get("title") for a in affected]),
                     MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
+            object.__setattr__(self, '_active_callback', None)
             return {"user_message": user_msg, "ai_message": ai,
                     "sources": [], "artefacts": affected}
 
@@ -438,8 +467,13 @@ class ChatMixin:
             metadata={"sources": sources} if sources else {},
         )
         cleaned, affected = self._post_process_llm_response(
-            final_text, ai, enable_image_generation, enable_image_editing,
+            final_text, ai,
+            enable_image_generation, enable_image_editing,
             auto_activate_artefacts,
+            enable_inline_widgets=enable_inline_widgets,
+            enable_notes=enable_notes,
+            enable_skills=enable_skills,
+            enable_silent_artefact_explanation=enable_silent_artefact_explanation,
         )
         if cleaned != final_text:
             ai.content = cleaned
@@ -447,6 +481,7 @@ class ChatMixin:
             _cb(callback, json.dumps([a.get("title") for a in affected]),
                 MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
         self.scratchpad = ""
+        object.__setattr__(self, '_active_callback', None)
 
         return {"user_message": user_msg, "ai_message": ai,
                 "sources": sources, "artefacts": affected}
@@ -459,22 +494,25 @@ class ChatMixin:
         personality=None,
         branch_tip_id=None,
         tools=None,
+        swarm=None,
+        swarm_config=None,
         add_user_message: bool = True,
         max_reasoning_steps: int = 20,
         images=None,
         debug: bool = False,
         remove_thinking_blocks: bool = True,
-        enable_image_generation: bool = True,   # auto-disabled when lollmsClient.tti is None
-        enable_image_editing:    bool = True,   # auto-disabled when lollmsClient.tti is None
+        enable_image_generation: bool = True,
+        enable_image_editing:    bool = True,
         auto_activate_artefacts: bool = True,
         enable_show_tools:            bool = True,
         enable_extract_artefact:      bool = True,
         enable_final_answer:          bool = True,
         enable_request_clarification: bool = True,
         enable_repl_tools:            bool = True,
-        enable_inline_widgets:        bool = True,   # embed live HTML/SVG/React widgets inline
-        enable_notes:                 bool = True,   # save <note> tags as NOTE artefacts
-        enable_skills:                bool = False,  # save <skill> tags as SKILL artefacts
+        enable_inline_widgets:        bool = True,
+        enable_notes:                 bool = True,
+        enable_skills:                bool = False,
+        enable_silent_artefact_explanation: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -485,6 +523,13 @@ class ChatMixin:
         If no tools are registered, the method skips all agentic scaffolding
         and goes directly to a single LLM call.  The model may still emit
         <artefact>, <note>, <skill>, and <lollms_inline> XML tags inline.
+
+        Callback lifecycle
+        ------------------
+        self._active_callback is set to the streaming callback at the start of
+        every turn and cleared at the end.  _post_process_llm_response reads it
+        to fire artefact create/update events in real time as each XML tag is
+        processed, so the UI never has to wait for the full response.
 
         Scratchpad placement
         --------------------
@@ -518,20 +563,74 @@ class ChatMixin:
         When enable_notes=True (default) the model may emit
         <note title="…">…</note> tags.  Each is saved as an ArtefactType.NOTE
         artefact, active immediately, and stripped from the visible message text.
-        The application layer no longer needs to parse these tags itself.
 
         Skills
         ------
         When enable_skills=True (default False) the model may emit
         <skill title="…" description="…" category="…">…</skill> tags.
-        Each is saved as an ArtefactType.SKILL artefact with category and
-        description metadata and stripped from the visible message text.
+        Each is saved as an ArtefactType.SKILL artefact.
+
+        Silent artefact guard
+        ---------------------
+        When enable_silent_artefact_explanation=True (default), if the LLM
+        response consists entirely of XML tags with no human-readable text,
+        a concise auto-generated summary of what was created/updated is shown
+        so the chat never presents the user with an empty bubble.
+
+        Swarm mode
+        ----------
+        When swarm= is a non-empty list of Agent objects, the discussion
+        delegates the entire turn to SwarmOrchestrator, which runs a
+        multi-agent deliberation session.  swarm_config= is an optional
+        SwarmConfig instance; if omitted, SwarmConfig() defaults are used.
+        The return dict gains two extra keys:
+          ``agent_messages``  — list of LollmsMessage objects, one per agent per round
+          ``hlf_log``         — list of HLF message dicts (inter-agent protocol log)
+          ``swarm_meta``      — run statistics dict
         """
         self.scratchpad = ""
 
         # ── Normalise personality ────────────────────────────────────────────
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
+
+        # Stash callback for real-time artefact events in _post_process_llm_response
+        object.__setattr__(self, '_active_callback', callback)
+
+        # ====================================================================
+        #  SWARM DISPATCH — delegate to SwarmOrchestrator when agents present
+        # ====================================================================
+        if swarm:
+            from lollms_client.lollms_swarm import SwarmOrchestrator, SwarmConfig as _SC
+
+            _swarm_config = swarm_config if swarm_config is not None else _SC()
+
+            # Add user message first so agents can read it
+            if add_user_message:
+                user_msg = self.add_message(
+                    sender=kwargs.get("user_name", "user"),
+                    sender_type="user",
+                    content=user_message,
+                    images=images,
+                    **kwargs,
+                )
+            else:
+                user_msg = None
+
+            orchestrator = SwarmOrchestrator(
+                discussion  = self,
+                agents      = swarm,
+                config      = _swarm_config,
+                callback    = callback,
+                user_msg_id = user_msg.id if user_msg else self.active_branch_id,
+            )
+            result = orchestrator.run(user_message, **kwargs)
+            result["user_message"] = user_msg
+            object.__setattr__(self, '_active_callback', None)
+            self.scratchpad = ""
+            if self._is_db_backed and self.autosave:
+                self.commit()
+            return result
 
         # ── Effective image flags (auto-resolve against TTI availability) ────
         _tti_available = getattr(self.lollmsClient, 'tti', None) is not None
@@ -760,9 +859,6 @@ class ChatMixin:
             )
 
         # ── Layer 2: personality.tool_specs() ────────────────────────────────
-        # NOTE: step events for tool loading are intentionally silent (no
-        # _step_start/_step_end) when there are no personality tools — the user
-        # shouldn't see scaffolding noise for a simple conversation turn.
         _pt_specs = {}
         try:
             _pt_specs = personality.tool_specs(
@@ -887,18 +983,10 @@ class ChatMixin:
 
         # ====================================================================
         #  FAST PATH — no external tools registered
-        #
-        #  When tool_registry is empty at this point (no caller tools, no
-        #  personality tools, no RAG), there is nothing for the agentic loop to
-        #  do.  We skip all scaffolding and go straight to a single LLM call.
-        #  The model will answer normally and may emit <artefact>/<note> XML
-        #  tags which are processed by _post_process_llm_response as usual.
         # ====================================================================
-        _has_external_tools = bool(tool_registry)   # true iff at least one tool registered
+        _has_external_tools = bool(tool_registry)
 
         if not _has_external_tools:
-            # Still add artefact instructions — the model may want to create
-            # notes/artefacts inline via XML tags without any tool calls.
             fast_buf: List[str] = []
 
             def _fast_relay(chunk, msg_type=None, meta=None):
@@ -931,6 +1019,7 @@ class ChatMixin:
                 enable_inline_widgets=enable_inline_widgets,
                 enable_notes=enable_notes,
                 enable_skills=enable_skills,
+                enable_silent_artefact_explanation=enable_silent_artefact_explanation,
             )
             if cleaned != raw_text:
                 ai_message.content = cleaned
@@ -940,6 +1029,7 @@ class ChatMixin:
             if self._is_db_backed and self.autosave:
                 self.commit()
             self.scratchpad = ""
+            object.__setattr__(self, '_active_callback', None)
             return {
                 "user_message":     user_msg,
                 "ai_message":       ai_message,
@@ -950,8 +1040,7 @@ class ChatMixin:
             }
 
         # ====================================================================
-        #  Built-in tools (only registered when there ARE external tools, so
-        #  they don't trigger the agentic loop on bare conversations)
+        #  Built-in tools (only when external tools exist)
         # ====================================================================
 
         # show_tools ----------------------------------------------------------
@@ -1231,16 +1320,14 @@ class ChatMixin:
         _current_branch_tip   = branch_tip_id or self.active_branch_id
 
         # Anti-duplication tracking
-        _completed_tool_calls:    List[str] = []   # "round N: tool_name(params)"
-        _created_artefact_titles: List[str] = []   # title/name from every result
+        _completed_tool_calls:    List[str] = []
+        _created_artefact_titles: List[str] = []
 
-        # Runaway guard: break only when the SAME tool is called with IDENTICAL
-        # params repeatedly.  Different params (e.g. different search queries)
-        # are legitimate and must be allowed through.
-        _MAX_IDENTICAL_REPEATS = 2          # how many exact duplicates to allow before breaking
-        _identical_call_counts: Dict[str, int] = {}   # signature -> count
+        # Runaway guard
+        _MAX_IDENTICAL_REPEATS              = 2
+        _identical_call_counts: Dict[str, int] = {}
 
-        # Pre-create the assistant message so the UI can show a bubble immediately
+        # Pre-create the assistant message so the UI shows a bubble immediately
         ai_message = self.add_message(
             sender=personality.name,
             sender_type="assistant",
@@ -1263,21 +1350,196 @@ class ChatMixin:
             "<lollms_inline",
         ]
 
+        # ── Secondary-stream tag type mapping ────────────────────────────────
+        # Maps tag prefix → (open_meta_type, chunk_MSG_TYPE, done_MSG_TYPE, close_tag)
+        # open_meta_type is the string put in the MSG_TYPE_CHUNK announcement meta.
+        _SECONDARY_TAG_MAP = {
+            "<artefact":    ("artefact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
+                             MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,  "</artefact>"),
+            "<note":        ("note_start",           MSG_TYPE.MSG_TYPE_NOTE_CHUNK,
+                             MSG_TYPE.MSG_TYPE_NOTE_DONE,      "</note>"),
+            "<skill":       ("skill_start",          MSG_TYPE.MSG_TYPE_SKILL_CHUNK,
+                             MSG_TYPE.MSG_TYPE_SKILL_DONE,     "</skill>"),
+            "<lollms_inline":("inline_widget_start", MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,
+                              MSG_TYPE.MSG_TYPE_WIDGET_DONE,   "</lollms_inline>"),
+        }
+
         while _round < max_reasoning_steps:
             _round += 1
             _stream_buf: List[str] = []
 
-            # Streaming flow-control state — reset every round
+            # ── Streaming flow-control state — reset every round ─────────────
             _in_logic_tag         = False
             _is_hidden_tag        = False
             _tool_trigger         = False
             _bracket_buf: List[str] = []
             _is_buffering_bracket = False
 
-            def _inline_relay(chunk, msg_type=None, meta=None):
-                nonlocal _in_logic_tag, _is_hidden_tag, _tool_trigger, _is_buffering_bracket
+            # Secondary-stream state: which XML tag are we currently inside?
+            _sec_tag_prefix:  str        = ""   # e.g. "<artefact"
+            _sec_chunk_type:  Any        = None  # MSG_TYPE for chunk events
+            _sec_done_type:   Any        = None  # MSG_TYPE for done event
+            _sec_close_tag:   str        = ""    # e.g. "</artefact>"
+            _sec_open_meta:   Dict       = {}    # attrs extracted from opening tag
+            _sec_content_buf: List[str]  = []    # accumulates raw content inside tag
+            # Buffer for partial close-tag detection across chunk boundaries
+            _sec_close_scan:  str        = ""
 
-                # Non-chunk events (thoughts, steps) pass through unchanged
+            def _parse_tag_attrs(attr_str: str) -> Dict[str, str]:
+                return {m.group(1): m.group(2)
+                        for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
+
+            def _build_open_meta_and_announce(b_str: str) -> None:
+                """
+                Called once when an opening tag's full `<tag attrs>` is seen.
+                Fires the MSG_TYPE_CHUNK announcement and populates _sec_open_meta.
+                """
+                nonlocal _sec_tag_prefix, _sec_chunk_type, _sec_done_type
+                nonlocal _sec_close_tag, _sec_open_meta, _sec_content_buf, _sec_close_scan
+
+                for prefix, (ann_type, chunk_mt, done_mt, close_tag) \
+                        in _SECONDARY_TAG_MAP.items():
+                    if not b_str.startswith(prefix):
+                        continue
+
+                    # Only handle tags that are enabled
+                    if prefix == "<note"         and not enable_notes:            break
+                    if prefix == "<skill"        and not enable_skills:           break
+                    if prefix == "<lollms_inline" and not enable_inline_widgets:  break
+
+                    attrs = _parse_tag_attrs(b_str)
+                    _sec_tag_prefix  = prefix
+                    _sec_chunk_type  = chunk_mt
+                    _sec_done_type   = done_mt
+                    _sec_close_tag   = close_tag
+                    _sec_open_meta   = attrs
+                    _sec_content_buf = []
+                    _sec_close_scan  = ""
+
+                    # Build the announcement meta (same shape as before — backwards compat)
+                    if prefix == "<artefact":
+                        title = attrs.get('name') or attrs.get('title', '')
+                        if title and title not in _created_artefact_titles:
+                            _created_artefact_titles.append(title)
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                            "type": "artefact_update",
+                            "content": {"title": title}
+                        })
+
+                    elif prefix == "<note":
+                        title = attrs.get('title') or attrs.get('name', 'Note')
+                        if title and title not in _created_artefact_titles:
+                            _created_artefact_titles.append(title)
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                            "type": "note_start",
+                            "content": {"title": title}
+                        })
+
+                    elif prefix == "<skill":
+                        title    = attrs.get('title') or attrs.get('name', 'Skill')
+                        category = attrs.get('category', '')
+                        if title and title not in _created_artefact_titles:
+                            _created_artefact_titles.append(title)
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                            "type": "skill_start",
+                            "content": {"title": title, "category": category}
+                        })
+
+                    elif prefix == "<lollms_inline":
+                        title       = attrs.get('title', 'Interactive Widget')
+                        widget_type = attrs.get('type', 'html')
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                            "type":    "inline_widget_start",
+                            "content": {"title": title, "widget_type": widget_type}
+                        })
+                    break
+
+            def _fire_sec_chunk(raw_chunk: str) -> None:
+                """Fire a secondary-stream chunk event for the current tag type."""
+                if not _sec_chunk_type or not raw_chunk:
+                    return
+                attrs = _sec_open_meta
+                if _sec_tag_prefix == "<artefact":
+                    _cb(callback, raw_chunk, _sec_chunk_type, {
+                        "title":    attrs.get('name') or attrs.get('title', ''),
+                        "chunk":    raw_chunk,
+                        "art_type": attrs.get('type', 'document'),
+                        "language": attrs.get('language'),
+                    })
+                elif _sec_tag_prefix == "<note":
+                    _cb(callback, raw_chunk, _sec_chunk_type, {
+                        "title": attrs.get('title') or attrs.get('name', 'Note'),
+                        "chunk": raw_chunk,
+                    })
+                elif _sec_tag_prefix == "<skill":
+                    _cb(callback, raw_chunk, _sec_chunk_type, {
+                        "title":       attrs.get('title') or attrs.get('name', 'Skill'),
+                        "chunk":       raw_chunk,
+                        "category":    attrs.get('category', ''),
+                        "description": attrs.get('description', ''),
+                    })
+                elif _sec_tag_prefix == "<lollms_inline":
+                    _cb(callback, raw_chunk, _sec_chunk_type, {
+                        "title":       attrs.get('title', 'Interactive Widget'),
+                        "chunk":       raw_chunk,
+                        "widget_type": attrs.get('type', 'html'),
+                    })
+
+            def _fire_sec_done() -> None:
+                """Fire the secondary-stream done event and reset secondary state."""
+                nonlocal _sec_tag_prefix, _sec_chunk_type, _sec_done_type
+                nonlocal _sec_close_tag, _sec_open_meta, _sec_content_buf, _sec_close_scan
+
+                if not _sec_done_type:
+                    return
+
+                full_content = "".join(_sec_content_buf)
+                attrs        = _sec_open_meta
+
+                if _sec_tag_prefix == "<artefact":
+                    is_patch = bool(re.search(r'<{6,8}\s*SEARCH', full_content, re.I))
+                    _cb(callback, full_content, _sec_done_type, {
+                        "title":    attrs.get('name') or attrs.get('title', ''),
+                        "content":  full_content,
+                        "art_type": attrs.get('type', 'document'),
+                        "language": attrs.get('language'),
+                        "is_patch": is_patch,
+                        "attrs":    {k: v for k, v in attrs.items()
+                                     if k not in ('name', 'title', 'type', 'language')},
+                    })
+                elif _sec_tag_prefix == "<note":
+                    _cb(callback, full_content, _sec_done_type, {
+                        "title":   attrs.get('title') or attrs.get('name', 'Note'),
+                        "content": full_content,
+                    })
+                elif _sec_tag_prefix == "<skill":
+                    _cb(callback, full_content, _sec_done_type, {
+                        "title":       attrs.get('title') or attrs.get('name', 'Skill'),
+                        "content":     full_content,
+                        "category":    attrs.get('category', ''),
+                        "description": attrs.get('description', ''),
+                    })
+                elif _sec_tag_prefix == "<lollms_inline":
+                    _cb(callback, full_content, _sec_done_type, {
+                        "title":       attrs.get('title', 'Interactive Widget'),
+                        "content":     full_content,
+                        "widget_type": attrs.get('type', 'html'),
+                    })
+
+                # Reset secondary state
+                _sec_tag_prefix  = ""
+                _sec_chunk_type  = None
+                _sec_done_type   = None
+                _sec_close_tag   = ""
+                _sec_open_meta   = {}
+                _sec_content_buf = []
+                _sec_close_scan  = ""
+
+            def _inline_relay(chunk, msg_type=None, meta=None):
+                nonlocal _in_logic_tag, _is_hidden_tag, _tool_trigger
+                nonlocal _is_buffering_bracket, _sec_close_scan
+
+                # Non-chunk events pass through unchanged
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     if msg_type in [MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING]:
                         ai_message.thoughts = (ai_message.thoughts or "") + chunk
@@ -1289,20 +1551,70 @@ class ChatMixin:
                 _stream_buf.append(chunk)
                 _so_far = "".join(_stream_buf)
 
-                # Inside <tool_call>: buffer silently; stop on close tag
+                # ── Inside <tool_call>: buffer silently; stop on close tag ────
                 if _in_logic_tag:
                     if _TC_CLOSE in _so_far:
                         _tool_trigger = True
                         return False
                     return True
 
-                # Inside <artefact> / <think> etc.: buffer silently
+                # ── Inside a secondary-stream tag (artefact/note/skill/widget) ─
+                # Forward each chunk on the secondary stream, detect closing tag.
+                if _is_hidden_tag and _sec_tag_prefix:
+                    # Check for tool_call nested inside (shouldn't happen but be safe)
+                    if _TC_OPEN in chunk:
+                        _in_logic_tag = True
+                        return True
+
+                    # Accumulate close-tag scanner across chunk boundaries
+                    _sec_close_scan += chunk
+                    close_tag = _sec_close_tag  # e.g. "</artefact>"
+                    close_len = len(close_tag)
+
+                    if close_tag in _sec_close_scan:
+                        # Found the closing tag — split content at it
+                        idx      = _sec_close_scan.index(close_tag)
+                        pre_part = _sec_close_scan[:idx]
+                        # Everything after the close tag goes back to normal stream
+                        post_part = _sec_close_scan[idx + close_len:]
+
+                        # Emit any remaining content before the close
+                        if pre_part:
+                            _sec_content_buf.append(pre_part)
+                            _fire_sec_chunk(pre_part)
+
+                        # Fire the done event
+                        _fire_sec_done()
+
+                        # Reset hidden-tag state
+                        _is_hidden_tag = False
+                        _sec_close_scan = ""
+
+                        # Route any post-close content back through normal processing
+                        if post_part:
+                            # Directly append to visible stream (simple case: prose after tag)
+                            ai_message.content += post_part
+                            _cb(callback, post_part, MSG_TYPE.MSG_TYPE_CHUNK)
+                    else:
+                        # Close tag not yet complete — keep scanning
+                        # Only forward content that cannot be the start of the close tag
+                        # (to avoid emitting partial close-tag fragments)
+                        safe_len = max(0, len(_sec_close_scan) - close_len + 1)
+                        safe_content = _sec_close_scan[:safe_len]
+                        if safe_content:
+                            _sec_content_buf.append(safe_content)
+                            _fire_sec_chunk(safe_content)
+                            _sec_close_scan = _sec_close_scan[safe_len:]
+
+                    return True
+
+                # ── Inside <think> or other silently-buffered hidden tags ──────
                 if _is_hidden_tag:
                     if _TC_OPEN in _so_far:
                         _in_logic_tag = True
                     return True
 
-                # ── Content processing: scan for tag openings ────────────────
+                # ── Normal content: scan for tag openings ────────────────────
                 rem = chunk
                 while rem:
                     if _is_buffering_bracket:
@@ -1322,70 +1634,43 @@ class ChatMixin:
                                 _is_hidden_tag        = True
                                 _is_buffering_bracket = False
 
-                                # Track artefact title from opening tag
-                                if b_str.startswith("<artefact"):
-                                    _title_m = re.search(
-                                        r'name=["\']([^"\']+)["\']', b_str)
-                                    if not _title_m:
-                                        _title_m = re.search(
-                                            r'title=["\']([^"\']+)["\']', b_str)
-                                    if _title_m:
-                                        _art_title = _title_m.group(1)
-                                        if _art_title not in _created_artefact_titles:
-                                            _created_artefact_titles.append(_art_title)
-                                        _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                                            "type": "artefact_update",
-                                            "content": {"title": _art_title}
-                                        })
+                                # Fire opening announcement + set up secondary stream
+                                _build_open_meta_and_announce(b_str)
 
-                                # Notify frontend that a note is being generated
-                                if b_str.startswith("<note") and enable_notes:
-                                    _note_title_m = re.search(
-                                        r'title=["\']([^"\']+)["\']', b_str)
-                                    _note_title = (_note_title_m.group(1)
-                                                   if _note_title_m else "Note")
-                                    if _note_title not in _created_artefact_titles:
-                                        _created_artefact_titles.append(_note_title)
-                                    _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                                        "type": "note_start",
-                                        "content": {"title": _note_title}
-                                    })
+                                # Reset close-tag scanner for the new tag
+                                _sec_close_scan = ""
 
-                                # Notify frontend that a skill is being generated
-                                if b_str.startswith("<skill") and enable_skills:
-                                    _skill_title_m = re.search(
-                                        r'title=["\']([^"\']+)["\']', b_str)
-                                    _skill_cat_m   = re.search(
-                                        r'category=["\']([^"\']+)["\']', b_str)
-                                    _skill_title   = (_skill_title_m.group(1)
-                                                      if _skill_title_m else "Skill")
-                                    if _skill_title not in _created_artefact_titles:
-                                        _created_artefact_titles.append(_skill_title)
-                                    _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                                        "type": "skill_start",
-                                        "content": {
-                                            "title":    _skill_title,
-                                            "category": (_skill_cat_m.group(1)
-                                                         if _skill_cat_m else ""),
-                                        }
-                                    })
-
-                                # Notify frontend that an inline widget is being streamed
-                                if b_str.startswith("<lollms_inline") and enable_inline_widgets:
-                                    _widget_title_m = re.search(
-                                        r'title=["\']([^"\']+)["\']', b_str)
-                                    _widget_type_m  = re.search(
-                                        r'type=["\']([^"\']+)["\']', b_str)
-                                    _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                                        "type":    "inline_widget_start",
-                                        "content": {
-                                            "title": (_widget_title_m.group(1)
-                                                      if _widget_title_m
-                                                      else "Interactive Widget"),
-                                            "widget_type": (_widget_type_m.group(1)
-                                                            if _widget_type_m else "html"),
-                                        }
-                                    })
+                                # Any content remaining in this chunk after the
+                                # opening tag belongs to the secondary stream, not
+                                # the chat bubble.  Route it through the secondary
+                                # handler and stop the while-rem loop — subsequent
+                                # chunks will enter via the _is_hidden_tag branch.
+                                if rem and _sec_tag_prefix:
+                                    _sec_close_scan += rem
+                                    close_tag = _sec_close_tag
+                                    close_len = len(close_tag)
+                                    if close_tag in _sec_close_scan:
+                                        idx       = _sec_close_scan.index(close_tag)
+                                        pre_part  = _sec_close_scan[:idx]
+                                        post_part = _sec_close_scan[idx + close_len:]
+                                        if pre_part:
+                                            _sec_content_buf.append(pre_part)
+                                            _fire_sec_chunk(pre_part)
+                                        _fire_sec_done()
+                                        _is_hidden_tag  = False
+                                        _sec_close_scan = ""
+                                        if post_part:
+                                            ai_message.content += post_part
+                                            _cb(callback, post_part,
+                                                MSG_TYPE.MSG_TYPE_CHUNK)
+                                    else:
+                                        safe_len = max(0, len(_sec_close_scan) - close_len + 1)
+                                        safe_content = _sec_close_scan[:safe_len]
+                                        if safe_content:
+                                            _sec_content_buf.append(safe_content)
+                                            _fire_sec_chunk(safe_content)
+                                            _sec_close_scan = _sec_close_scan[safe_len:]
+                                rem = ""   # consumed — exit the while loop
                                 continue
 
                             # Not a special tag — flush buffered bracket content
@@ -1424,8 +1709,6 @@ class ChatMixin:
                 return True
 
             # ── Build agent-state header and prepend to scratchpad ───────────
-            # Gives the model a clear "already done" checklist at the top of
-            # the injected scratchpad system message before every round.
             _saved_scratchpad = self.scratchpad
             if _completed_tool_calls or _created_artefact_titles:
                 _state_lines = [
@@ -1444,7 +1727,7 @@ class ChatMixin:
                 _inline_relay, images, _current_branch_tip, final_answer_temperature, **kwargs
             )
 
-            # Restore undecorated scratchpad — header must not accumulate
+            # Restore undecorated scratchpad
             self.scratchpad = _saved_scratchpad
 
             _so_far            = "".join(_stream_buf)
@@ -1454,7 +1737,6 @@ class ChatMixin:
             _clean_text_so_far += _clean_segment
 
             if not _tool_trigger:
-                # LLM gave a plain answer — exit the loop
                 break
 
             # ── Parse tool call ──────────────────────────────────────────────
@@ -1471,34 +1753,23 @@ class ChatMixin:
                 break
 
             # ── Deduplication + runaway guard ────────────────────────────────
-            # Policy:
-            #   • Same tool, DIFFERENT params  → always allowed (legitimate
-            #     multi-query investigation, e.g. several search calls).
-            #   • Same tool, SAME params       → blocked after the first repeat;
-            #     a synthetic tool_result explains why.
-            #   • Same signature seen > _MAX_IDENTICAL_REPEATS times → hard
-            #     break to prevent infinite loops even if the model ignores the
-            #     synthetic result.
             _params_summary = ", ".join(
                 f"{k}={str(v)[:40]}" for k, v in _tool_params.items()
             )
             _call_signature = f"{_tool_name}({_params_summary})"
             _call_tag       = f"round {_round}: {_call_signature}"
 
-            # Count how many times this exact signature has been seen
             _identical_call_counts[_call_signature] = \
                 _identical_call_counts.get(_call_signature, 0) + 1
             _sig_count = _identical_call_counts[_call_signature]
 
             if _sig_count > _MAX_IDENTICAL_REPEATS:
-                # Hard break — the model is stuck in a tight loop
                 _warning(callback,
                          f"[RUNAWAY] Identical call '{_call_signature}' seen "
                          f"{_sig_count} times — breaking loop.")
                 break
 
             if _sig_count > 1:
-                # First repeat: let the model know and give it a chance to move on
                 _warning(callback,
                          f"[DEDUP] Blocking duplicate tool call: {_call_signature}")
                 _dup_result_str = (
@@ -1531,7 +1802,6 @@ class ChatMixin:
             _cb(callback, _call_evt["content"], MSG_TYPE.MSG_TYPE_TOOL_CALL, _call_evt)
             all_events.append(_call_evt)
 
-            # Insert structural marker into message content for UI positioning
             _marker = f"\n<lollms_event id=\"{_call_id}\" />\n"
             _clean_text_so_far    += _marker
             ai_message.content     = _clean_text_so_far
@@ -1564,7 +1834,6 @@ class ChatMixin:
                 try:
                     _result = tool_registry[_tool_name](**_tool_params)
 
-                    # Build structured source block for scratchpad
                     inferred_srcs = _infer_sources_from_json(_result, _tool_name)
                     res_label     = _tool_name.replace('_', ' ').title()
                     llm_block     = f"### [Source List: {res_label}]\n"
@@ -1580,15 +1849,12 @@ class ChatMixin:
                     if not inferred_srcs:
                         llm_block += json.dumps(_result, indent=2)
 
-                    # Accumulate into scratchpad — export() places this as a
-                    # system message after the last user message
                     self.scratchpad = (self.scratchpad or "") + (
                         f"\n--- Tool: {res_label} (round {_round}) ---\n"
                         f"{llm_block}\n"
                         f"--- End {res_label} ---\n"
                     )
 
-                    # Record call + any produced title for dedup tracking
                     _completed_tool_calls.append(_call_tag)
                     _created_title = (
                         _result.get("title") or _result.get("name") or
@@ -1610,7 +1876,6 @@ class ChatMixin:
                         "result": _result, "offset": _current_offset,
                     }
                     _cb(callback, _out_evt["content"], MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, _out_evt)
-                    # step_end carries the same id as step_start for correlation
                     _step_end(callback, f"Done: {_tool_name}",
                               _step_id, {"status": "success"})
                     all_events.extend([
@@ -1624,7 +1889,6 @@ class ChatMixin:
                     if self._is_db_backed:
                         self.commit()
 
-                    # Standard RAG source extraction
                     _q       = _tool_params.get("query", _tool_params.get("prompt", ""))
                     raw_srcs = _result.get("sources", [])
                     if not raw_srcs:
@@ -1672,8 +1936,6 @@ class ChatMixin:
                     _result_str = f"Error: {e}"
                     _result     = {"error": _result_str}
 
-            # Add temporary history messages so the next round sees the full
-            # tool-call / tool-result exchange in the branch.
             _temp_call = self.add_message(
                 sender=personality.name, sender_type="assistant",
                 content=_so_far, parent_id=_current_branch_tip
@@ -1688,10 +1950,6 @@ class ChatMixin:
 
         # ====================================================================
         #  Forced final-answer pass
-        #
-        #  If at least one tool was called but the loop produced no plain text,
-        #  do one extra LLM call with an explicit instruction to write the answer.
-        #  We temporarily augment the scratchpad for this one call, then restore.
         # ====================================================================
         if is_agentic_turn and not _clean_text_so_far.strip():
             _final_id  = _step_start(callback, "Generating final answer...")
@@ -1768,7 +2026,7 @@ class ChatMixin:
                 if any(tc["name"] == n for tc in tool_calls_this_turn)
             ]
 
-        # Clear volatile scratchpad — must not leak into next turn or DB commit
+        # Clear volatile scratchpad
         self.scratchpad = ""
 
         ai_message.content          = _clean
@@ -1782,6 +2040,7 @@ class ChatMixin:
             enable_inline_widgets=enable_inline_widgets,
             enable_notes=enable_notes,
             enable_skills=enable_skills,
+            enable_silent_artefact_explanation=enable_silent_artefact_explanation,
         )
         if cleaned_content != _clean:
             ai_message.content = cleaned_content
@@ -1796,6 +2055,9 @@ class ChatMixin:
 
         if self._is_db_backed and self.autosave:
             self.commit()
+
+        # Clear the stashed callback — must not leak into the next turn
+        object.__setattr__(self, '_active_callback', None)
 
         return {
             "user_message":     user_msg,
