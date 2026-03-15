@@ -97,8 +97,19 @@ class UtilsMixin:
                 full_system_prompt = data_zone_part
         participants = self.participants or {}
 
+        # Resolve scratchpad — empty scratchpad is suppressed entirely so no
+        # blank system message is ever injected into the context.
+        _scratchpad = (getattr(self, 'scratchpad', None) or "").strip()
+
         def get_full_content(msg):
             return msg.content.strip()
+
+        # Helper: find the forward index of the last user message in a list
+        def _last_user_index(branch_list):
+            for i in range(len(branch_list) - 1, -1, -1):
+                if branch_list[i].sender_type == 'user':
+                    return i
+            return -1
 
         if format_type == "lollms_text":
             final_parts = []
@@ -122,9 +133,14 @@ class UtilsMixin:
                 if max_allowed_tokens is None or current_tokens + st <= max_allowed_tokens:
                     final_parts.append(summary_text)
                     current_tokens += st
-            for msg in reversed(messages_to_render):
+
+            last_user_idx = _last_user_index(messages_to_render)
+
+            for idx, msg in enumerate(reversed(messages_to_render)):
+                # Convert reversed index back to forward index
+                fwd_idx    = len(messages_to_render) - 1 - idx
                 sender_str = msg.sender.replace(':','').replace('!@>','')
-                content = get_full_content(msg)
+                content    = get_full_content(msg)
                 active_images = msg.get_active_images()
                 if active_images:
                     content += f"\n({len(active_images)} image(s) attached)"
@@ -134,6 +150,21 @@ class UtilsMixin:
                     break
                 message_parts.insert(0, msg_text)
                 current_tokens += msg_toks
+
+                # Inject scratchpad ONLY when non-empty, right after last user message
+                if _scratchpad and fwd_idx == last_user_idx:
+                    scratch_text = (
+                        "!@>system:\n"
+                        "== TOOL OUTPUT SCRATCHPAD ==\n"
+                        f"{_scratchpad}\n"
+                        "== END SCRATCHPAD ==\n"
+                    )
+                    scratch_toks = self.lollmsClient.count_tokens(scratch_text)
+                    if max_allowed_tokens is None or current_tokens + scratch_toks <= max_allowed_tokens:
+                        # index 1 = immediately after the user msg prepended at [0]
+                        message_parts.insert(1, scratch_text)
+                        current_tokens += scratch_toks
+
             final_parts.extend(message_parts)
             return "".join(final_parts).strip()
 
@@ -170,7 +201,9 @@ class UtilsMixin:
                 if full_system_prompt:
                     messages.append({"role":"system","content":full_system_prompt})
 
-        for msg in branch:
+        last_user_idx = _last_user_index(branch)
+
+        for idx, msg in enumerate(branch):
             role = participants.get(msg.sender, "user" if msg.sender_type=='user' else "assistant")
             if isinstance(role, dict):
                 role = role.get("name","user" if msg.sender_type=='user' else "assistant")
@@ -202,8 +235,24 @@ class UtilsMixin:
             else:
                 raise ValueError(f"Unsupported format_type: {format_type}")
 
-        return "\n".join(messages) if format_type == "markdown" else messages
+            # Inject scratchpad ONLY when non-empty, right after last user message
+            if _scratchpad and idx == last_user_idx:
+                scratch_content = (
+                    "== TOOL OUTPUT SCRATCHPAD ==\n"
+                    f"{_scratchpad}\n"
+                    "== END SCRATCHPAD =="
+                )
+                if format_type == "openai_chat":
+                    messages.append({"role": "system", "content": scratch_content})
+                elif format_type == "ollama_chat":
+                    messages.append({"role": "system", "content": scratch_content})
+                elif format_type == "markdown":
+                    messages.append(f"**system**: {scratch_content}\n")
 
+        return "\n".join(messages) if format_type == "markdown" else messages
+    
+
+    
     def summarize_and_prune(self, max_tokens, preserve_last_n=4):
         branch_tip_id = self.active_branch_id
         if not branch_tip_id:

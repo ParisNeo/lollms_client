@@ -29,9 +29,7 @@ def _cb(callback, text: str, msg_type: MSG_TYPE, meta: Optional[Dict] = None) ->
         if result is False:
             return False
     except Exception as e:
-        # Added trace_exception to reveal if the application-side callback is failing
         trace_exception(e)
-        pass
     return True
 
 
@@ -316,7 +314,7 @@ class ChatMixin:
         auto_activate_artefacts: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
-        self.scratchpad = "" # Reset transient scratchpad for this session
+        self.scratchpad = ""
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
 
@@ -448,8 +446,7 @@ class ChatMixin:
         if affected and callback:
             _cb(callback, json.dumps([a.get("title") for a in affected]),
                 MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
-        if scratchpad:
-            self.scratchpad = ""
+        self.scratchpad = ""
 
         return {"user_message": user_msg, "ai_message": ai,
                 "sources": sources, "artefacts": affected}
@@ -467,72 +464,103 @@ class ChatMixin:
         images=None,
         debug: bool = False,
         remove_thinking_blocks: bool = True,
-        enable_image_generation: bool = False,
-        enable_image_editing:    bool = False,
+        enable_image_generation: bool = True,   # auto-disabled when lollmsClient.tti is None
+        enable_image_editing:    bool = True,   # auto-disabled when lollmsClient.tti is None
         auto_activate_artefacts: bool = True,
         enable_show_tools:            bool = True,
         enable_extract_artefact:      bool = True,
         enable_final_answer:          bool = True,
         enable_request_clarification: bool = True,
         enable_repl_tools:            bool = True,
+        enable_inline_widgets:        bool = True,   # embed live HTML/SVG/React widgets inline
+        enable_notes:                 bool = True,   # save <note> tags as NOTE artefacts
+        enable_skills:                bool = False,  # save <skill> tags as SKILL artefacts
         **kwargs
     ) -> Dict[str, Any]:
-        self.scratchpad = "" # Reset transient scratchpad for this session
         """
         Chat with opt-in agentic tool use.
 
-        Root cause of the infinite tool-call loop (now fixed)
-        -------------------------------------------------------
-        Previously, every round of the agentic loop called the LLM with the
-        same branch_tip_id (the original user message) and injected tool results
-        only into personality_data_zone (system context).  The LLM saw:
+        Fast path
+        ---------
+        If no tools are registered, the method skips all agentic scaffolding
+        and goes directly to a single LLM call.  The model may still emit
+        <artefact>, <note>, <skill>, and <lollms_inline> XML tags inline.
 
-            [system: ... tool_result ...]
-            [user:   original question  ]   ← only message in history
+        Scratchpad placement
+        --------------------
+        self.scratchpad is written to as tool results accumulate.  export()
+        injects it as a role:system message immediately after the last user
+        message, so the model always sees full tool-output context in the most
+        relevant position.
 
-        Since no assistant turn existed in the history, the LLM thought it had
-        never responded and kept re-calling the same tool.
+        Anti-duplication
+        ----------------
+        _completed_tool_calls and _created_artefact_titles track every call
+        and every produced title this turn.  An AGENT STATE block is prepended
+        to the scratchpad (temporarily) at the top of each round.
 
-        The fix: after each tool call we add two TEMPORARY messages to the real
-        discussion branch:
-          1. assistant — the LLM output from this round (including the raw
-             <tool_call> tag so the model knows it already issued that call).
-          2. user/tool — the <tool_result> so the model sees the answer.
+        Runaway guard
+        -------------
+        _identical_call_counts[signature] tracks how many times each exact
+        call has been made.  On the second repeat the call is blocked with a
+        synthetic result; on the third the loop breaks hard.  Different params
+        on the same tool are always allowed (multi-query investigation).
 
-        _current_branch_tip is advanced to the tool-result message before the
-        next LLM call, so discussion.export() delivers the full accumulated
-        tool-call/result history to the model.
+        Inline widgets
+        --------------
+        When enable_inline_widgets=True (default) the model may emit
+        <lollms_inline type="html|react|svg" title="…">…</lollms_inline> tags.
+        These are buffered during streaming and extracted into
+        ai_message.metadata["inline_widgets"].
 
-        All temporary messages are deleted from the branch after the loop ends,
-        keeping the persisted conversation clean (only the final assistant
-        message is stored permanently).
+        Notes
+        -----
+        When enable_notes=True (default) the model may emit
+        <note title="…">…</note> tags.  Each is saved as an ArtefactType.NOTE
+        artefact, active immediately, and stripped from the visible message text.
+        The application layer no longer needs to parse these tags itself.
+
+        Skills
+        ------
+        When enable_skills=True (default False) the model may emit
+        <skill title="…" description="…" category="…">…</skill> tags.
+        Each is saved as an ArtefactType.SKILL artefact with category and
+        description metadata and stripped from the visible message text.
         """
-        # ---- Normalise personality ------------------------------------------
+        self.scratchpad = ""
+
+        # ── Normalise personality ────────────────────────────────────────────
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
 
-        # ---- Effective image flags ------------------------------------------
+        # ── Effective image flags (auto-resolve against TTI availability) ────
         _tti_available = getattr(self.lollmsClient, 'tti', None) is not None
         _eff_img_gen   = enable_image_generation and _tti_available
         _eff_img_edit  = enable_image_editing     and _tti_available
 
-        # ---- System-prompt instructions ------------------------------------
+        # ── System-prompt instructions ───────────────────────────────────────
         extra_instructions = self._build_artefact_instructions()
         if _eff_img_gen or _eff_img_edit:
             extra_instructions += self._build_image_generation_instructions()
+        if enable_inline_widgets:
+            extra_instructions += self._build_inline_widget_instructions()
+        if enable_notes:
+            extra_instructions += self._build_note_instructions()
+        if enable_skills:
+            extra_instructions += self._build_skill_instructions()
         if extra_instructions.strip():
             original_sp = self._system_prompt or ""
             if extra_instructions not in original_sp:
                 object.__setattr__(self, "_system_prompt", original_sp + extra_instructions)
 
-        # ---- Generation parameters -----------------------------------------
+        # ── Generation parameters ────────────────────────────────────────────
         decision_temperature       = kwargs.get("decision_temperature",       0.3)
         final_answer_temperature   = kwargs.get("final_answer_temperature",   0.7)
         rag_top_k                  = kwargs.get("rag_top_k",                  5)
         rag_min_similarity_percent = kwargs.get("rag_min_similarity_percent", 0.5)
         preflight_rag_enabled      = kwargs.get("preflight_rag",              True)
 
-        # ---- RLM detection -------------------------------------------------
+        # ── RLM detection ────────────────────────────────────────────────────
         rlm_enabled          = False
         rlm_context_var_name = "USER_INPUT_CONTEXT"
         actual_user_content  = user_message
@@ -553,7 +581,7 @@ class ChatMixin:
                 "</RLM_STUB>",
             ])
 
-        # ---- Add user message ----------------------------------------------
+        # ── Add user message ─────────────────────────────────────────────────
         if add_user_message:
             user_msg = self.add_message(
                 sender=kwargs.get("user_name", "user"),
@@ -571,74 +599,56 @@ class ChatMixin:
             user_msg = LollmsMessage(self, self._message_index[self.active_branch_id])
             images   = user_msg.get_active_images()
 
-        # ---- Source Inference Helper (Structured Search) -------------------
+        # ── Source inference helper ──────────────────────────────────────────
         def _infer_sources_from_json(data: Any, tool_name: str) -> List[Dict]:
-            """
-            Scans JSON output for patterns matching lists of sources/documents.
-            Normalizes disparate schemas (ArXiv, Google, Wikipedia, etc.) 
-            into a standard format.
-            """
             found_sources = []
-            
-            # Helper to check if a dict looks like a "Source Item"
+
             def looks_like_source(d: dict) -> bool:
                 title_keys = {'title', 'name', 'label', 'header', 'id', 'filename'}
                 return any(k in d for k in title_keys)
 
-            # Recursive scanner
             def scan(obj: Any):
                 if isinstance(obj, list):
                     for item in obj:
                         if isinstance(item, dict) and looks_like_source(item):
-                            # It's a list of sources!
                             found_sources.append(item)
                         else:
                             scan(item)
                 elif isinstance(obj, dict):
                     for k, v in obj.items():
-                        # If a key explicitly contains "results", "sources", "content", prioritize it
-                        if k.lower() in ['results', 'sources', 'data', 'items', 'content'] and isinstance(v, list):
+                        if k.lower() in ['results', 'sources', 'data', 'items', 'content'] \
+                                and isinstance(v, list):
                             scan(v)
                         else:
                             scan(v)
 
             scan(data)
-            
-            # If the top level was just a single source dict, catch it
             if not found_sources and isinstance(data, dict) and looks_like_source(data):
                 found_sources.append(data)
 
-            # Normalize found items
             normalized = []
             for item in found_sources:
-                title = (item.get('title') or item.get('name') or item.get('label') or 
+                title = (item.get('title') or item.get('name') or item.get('label') or
                          item.get('id') or item.get('filename') or f"{tool_name} Result")
-                
-                content = (item.get('content') or item.get('summary') or item.get('snippet') or 
+                content = (item.get('content') or item.get('summary') or item.get('snippet') or
                            item.get('text') or item.get('description') or "")
-                
-                link = (item.get('url') or item.get('link') or item.get('href') or 
+                link = (item.get('url') or item.get('link') or item.get('href') or
                         item.get('source') or item.get('pdf_url') or "")
-                
-                # Standardize relevance (default to 100 if content exists)
                 raw_score = item.get('score') or item.get('relevance', 100 if content else 0)
-                score = float(raw_score) * 100 if 0 < float(raw_score) <= 1 else float(raw_score)
-
-                # Embed remaining metadata into the sub-JSON
-                metadata = {k: v for k, v in item.items() if k not in ['title', 'content', 'url', 'link', 'score']}
-
+                try:
+                    score = float(raw_score) * 100 if 0 < float(raw_score) <= 1 \
+                        else float(raw_score)
+                except (TypeError, ValueError):
+                    score = 0.0
+                metadata = {k: v for k, v in item.items()
+                            if k not in ['title', 'content', 'url', 'link', 'score']}
                 normalized.append({
-                    "title": str(title),
-                    "content": str(content),
-                    "source": str(link),
-                    "relevance_score": score,
-                    "metadata": metadata,
-                    "tool": tool_name
+                    "title": str(title), "content": str(content), "source": str(link),
+                    "relevance_score": score, "metadata": metadata, "tool": tool_name
                 })
-            
             return normalized
 
-        # ---- Document zone extraction helper --------------------------------
+        # ── Document zone extraction helper ──────────────────────────────────
         def _extract_docs(zone_content):
             if not zone_content:
                 return []
@@ -687,7 +697,7 @@ class ChatMixin:
                     "total_sections": len(active), "total_length": len(full_text),
                     "last_updated": composable_answer.get("last_updated")}
 
-        # ---- Validated wrapper factory -------------------------------------
+        # ── Validated wrapper factory ────────────────────────────────────────
         def _make_wrapper(fn: Any, params_spec: List[Dict]) -> Any:
             def _wrapped(**kw):
                 try:
@@ -734,7 +744,7 @@ class ChatMixin:
                     "default_min_sim": rag_min_similarity_percent,
                 }
 
-        # ---- Layer 1: caller-supplied tools --------------------------------
+        # ── Layer 1: caller-supplied tools ───────────────────────────────────
         for tool_name, tool_spec in (tools or {}).items():
             if not isinstance(tool_spec, dict):
                 continue
@@ -749,8 +759,10 @@ class ChatMixin:
                 output      = tool_spec.get("output", []),
             )
 
-        # ---- Layer 2: personality.tool_specs() -----------------------------
-        _pt_step_id = _step_start(callback, "Loading personality tools...")
+        # ── Layer 2: personality.tool_specs() ────────────────────────────────
+        # NOTE: step events for tool loading are intentionally silent (no
+        # _step_start/_step_end) when there are no personality tools — the user
+        # shouldn't see scaffolding noise for a simple conversation turn.
         _pt_specs = {}
         try:
             _pt_specs = personality.tool_specs(
@@ -759,22 +771,25 @@ class ChatMixin:
         except Exception as _pte:
             _warning(callback, f"  Personality tool discovery failed: {_pte}")
             trace_exception(_pte)
-        _step_end(callback, f"{len(_pt_specs)} personality tool(s) ready", _pt_step_id,
-                {"tool_count": len(_pt_specs)})
 
-        for pt_name, pt_spec in _pt_specs.items():
-            fn = pt_spec.get("callable")
-            if not callable(fn):
-                continue
-            _register(
-                name        = pt_name,
-                fn          = fn,
-                params      = pt_spec.get("parameters", []),
-                description = pt_spec.get("description", f"Execute {pt_name}"),
-                output      = pt_spec.get("output", []),
-            )
+        if _pt_specs:
+            _pt_step_id = _step_start(callback,
+                                      f"Loading {len(_pt_specs)} personality tool(s)...")
+            for pt_name, pt_spec in _pt_specs.items():
+                fn = pt_spec.get("callable")
+                if not callable(fn):
+                    continue
+                _register(
+                    name        = pt_name,
+                    fn          = fn,
+                    params      = pt_spec.get("parameters", []),
+                    description = pt_spec.get("description", f"Execute {pt_name}"),
+                    output      = pt_spec.get("output", []),
+                )
+            _step_end(callback, f"{len(_pt_specs)} personality tool(s) ready", _pt_step_id,
+                      {"tool_count": len(_pt_specs)})
 
-        # ---- Layer 3: personality RAG tool ---------------------------------
+        # ── Layer 3: personality RAG tool ────────────────────────────────────
         if personality.has_data:
             def _personality_rag(query: str) -> Dict[str, Any]:
                 result = personality.query_data(query)
@@ -804,7 +819,7 @@ class ChatMixin:
                 output      = [{"name": "sources", "type": "list"}],
             )
 
-        # ---- Personality system prompt + veracity --------------------------
+        # ── Personality system prompt + veracity ─────────────────────────────
         if personality.system_prompt:
             veracity = (
                 "\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
@@ -818,7 +833,7 @@ class ChatMixin:
                 personality.system_prompt + veracity + extra_instructions,
             )
 
-        # ---- Pre-flight RAG ------------------------------------------------
+        # ── Pre-flight RAG ───────────────────────────────────────────────────
         if preflight_rag_enabled and personality.has_data:
             preflight_id = _step_start(callback, "Pre-flight knowledge retrieval...")
             ctx = self.export("markdown", suppress_system_prompt=True)
@@ -871,7 +886,72 @@ class ChatMixin:
                       {"source_count": len(collected_sources)})
 
         # ====================================================================
-        #  Built-in tools
+        #  FAST PATH — no external tools registered
+        #
+        #  When tool_registry is empty at this point (no caller tools, no
+        #  personality tools, no RAG), there is nothing for the agentic loop to
+        #  do.  We skip all scaffolding and go straight to a single LLM call.
+        #  The model will answer normally and may emit <artefact>/<note> XML
+        #  tags which are processed by _post_process_llm_response as usual.
+        # ====================================================================
+        _has_external_tools = bool(tool_registry)   # true iff at least one tool registered
+
+        if not _has_external_tools:
+            # Still add artefact instructions — the model may want to create
+            # notes/artefacts inline via XML tags without any tool calls.
+            fast_buf: List[str] = []
+
+            def _fast_relay(chunk, msg_type=None, meta=None):
+                if isinstance(chunk, str):
+                    fast_buf.append(chunk)
+                return _cb(callback, chunk, msg_type or MSG_TYPE.MSG_TYPE_CHUNK, meta)
+
+            raw_text = self._stream_final_answer(
+                _fast_relay, images,
+                branch_tip_id or self.active_branch_id,
+                final_answer_temperature, **kwargs,
+            )
+            if not raw_text and fast_buf:
+                raw_text = "".join(fast_buf)
+
+            if remove_thinking_blocks:
+                raw_text = self.lollmsClient.remove_thinking_blocks(raw_text)
+
+            ai_message = self.add_message(
+                sender=personality.name,
+                sender_type="assistant",
+                content=raw_text,
+                parent_id=user_msg.id,
+                model_name=self.lollmsClient.llm.model_name,
+                binding_name=self.lollmsClient.llm.binding_name,
+                metadata={"mode": "direct"},
+            )
+            cleaned, affected = self._post_process_llm_response(
+                raw_text, ai_message, _eff_img_gen, _eff_img_edit, auto_activate_artefacts,
+                enable_inline_widgets=enable_inline_widgets,
+                enable_notes=enable_notes,
+                enable_skills=enable_skills,
+            )
+            if cleaned != raw_text:
+                ai_message.content = cleaned
+            if affected and callback:
+                _cb(callback, json.dumps([a.get("title") for a in affected]),
+                    MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
+            if self._is_db_backed and self.autosave:
+                self.commit()
+            self.scratchpad = ""
+            return {
+                "user_message":     user_msg,
+                "ai_message":       ai_message,
+                "sources":          collected_sources,
+                "scratchpad":       None,
+                "self_corrections": None,
+                "artefacts":        affected,
+            }
+
+        # ====================================================================
+        #  Built-in tools (only registered when there ARE external tools, so
+        #  they don't trigger the agentic loop on bare conversations)
         # ====================================================================
 
         # show_tools ----------------------------------------------------------
@@ -1066,27 +1146,32 @@ class ChatMixin:
                 "- request_clarification(question: str): Ask user for clarification"
             )
 
-        # ---- Inject tool catalogue into system prompt ----------------------
+        # ── Inject tool catalogue into system prompt ─────────────────────────
         if tool_descriptions:
             _tc = [
                 "\n\n## Available Tools & Action Protocol",
                 "You are an agent with access to external tools.",
-                "CRITICAL: To perform an action, you MUST emit a <tool_call> tag. Do NOT use markdown code blocks for tool calls.",
+                "CRITICAL: To perform an action, you MUST emit a <tool_call> tag. "
+                "Do NOT use markdown code blocks for tool calls.",
+                "IMPORTANT: Call each tool ONCE. Check the AGENT STATE in the scratchpad "
+                "before calling any tool — if a call is already listed there, do NOT repeat it.",
                 "",
                 "### Call Syntax",
                 '  <tool_call>{"name": "tool_name", "parameters": {"key": "value"}}</tool_call>',
                 "",
-                "The system will stop generation, execute the tool, and provide a <tool_result> in the next turn.",
-                "You can call multiple tools in sequence, but each must be wrapped in its own <tool_call> tags.",
+                "The system will stop generation, execute the tool, and provide a "
+                "<tool_result> in the next turn.",
+                "Call one tool per turn. After receiving the result, either call the "
+                "next tool OR write your final answer — never repeat a call you already made.",
                 "",
                 "### Tool Catalogue",
             ] + tool_descriptions
-            _cur_sp  = self._system_prompt or ""
-            # Ensure we overwrite any markdown-based tool instructions from the binding
-            _clean_sp = _cur_sp.split("\n\n## Available Tools")[0].split("### FUNCTION CALLING INSTRUCTIONS")[0]
+            _cur_sp   = self._system_prompt or ""
+            _clean_sp = (_cur_sp.split("\n\n## Available Tools")[0]
+                                .split("### FUNCTION CALLING INSTRUCTIONS")[0])
             object.__setattr__(self, "_system_prompt", _clean_sp + "\n".join(_tc))
 
-        # ---- Context compression ------------------------------------------
+        # ── Context compression ──────────────────────────────────────────────
         if self.max_context_size is not None:
             _cr = self._compress_context(callback, self.max_context_size)
             if _cr["needed"] and _cr["artefact_pressure"]:
@@ -1145,7 +1230,17 @@ class ChatMixin:
         _temp_msg_ids:        List[str] = []
         _current_branch_tip   = branch_tip_id or self.active_branch_id
 
-        # Pre-create the assistant message so events are visible in UI immediately
+        # Anti-duplication tracking
+        _completed_tool_calls:    List[str] = []   # "round N: tool_name(params)"
+        _created_artefact_titles: List[str] = []   # title/name from every result
+
+        # Runaway guard: break only when the SAME tool is called with IDENTICAL
+        # params repeatedly.  Different params (e.g. different search queries)
+        # are legitimate and must be allowed through.
+        _MAX_IDENTICAL_REPEATS = 2          # how many exact duplicates to allow before breaking
+        _identical_call_counts: Dict[str, int] = {}   # signature -> count
+
+        # Pre-create the assistant message so the UI can show a bubble immediately
         ai_message = self.add_message(
             sender=personality.name,
             sender_type="assistant",
@@ -1155,37 +1250,34 @@ class ChatMixin:
             binding_name=self.lollmsClient.llm.binding_name,
             metadata={"mode": "agentic", "events": []}
         )
-        # Force commit so the message ID is valid in the DB for the frontend
         if self._is_db_backed:
             self.commit()
-        
-        # [FIX] Notify the caller of the new message ID so the frontend can create the bubble
-        _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"message_id": ai_message.id})
+        _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE,
+            {"message_id": ai_message.id})
 
-        # Tags that should be buffered and filtered from the live chat UI stream
+        # Tags that must be buffered / hidden from the live chat UI stream
         _TAG_STARTS = [
-            _TC_OPEN, "<think>", "<think ", "<artefact", "<generate_image", 
-            "<edit_image", "<revert_artefact", "<generate_slides", 
-            "<street_view", "<schedule_task", "<note", "<skill", "<lollms_event"
+            _TC_OPEN, "<think>", "<think ", "<artefact", "<generate_image",
+            "<edit_image", "<revert_artefact", "<generate_slides",
+            "<street_view", "<schedule_task", "<note", "<skill", "<lollms_event",
+            "<lollms_inline",
         ]
 
         while _round < max_reasoning_steps:
-            _round       += 1
-            _stream_buf:  List[str] = []
-            
-            # Streaming flow control state
-            _in_logic_tag = False  # True if inside <tool_call> (never streamed to UI)
-            _is_hidden_tag = False # True if inside <artefact>, <think>, etc. (hidden from live UI)
-            _tool_trigger = False
-            
-            # Bracket buffering state to prevent tag leaks during streaming
-            _bracket_buf: List[str] = [] 
+            _round += 1
+            _stream_buf: List[str] = []
+
+            # Streaming flow-control state — reset every round
+            _in_logic_tag         = False
+            _is_hidden_tag        = False
+            _tool_trigger         = False
+            _bracket_buf: List[str] = []
             _is_buffering_bracket = False
 
             def _inline_relay(chunk, msg_type=None, meta=None):
                 nonlocal _in_logic_tag, _is_hidden_tag, _tool_trigger, _is_buffering_bracket
-                
-                # [FIX] Handle non-text chunks (thoughts, steps) from the binding
+
+                # Non-chunk events (thoughts, steps) pass through unchanged
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     if msg_type in [MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING]:
                         ai_message.thoughts = (ai_message.thoughts or "") + chunk
@@ -1196,78 +1288,118 @@ class ChatMixin:
 
                 _stream_buf.append(chunk)
                 _so_far = "".join(_stream_buf)
-                
-                # Logic tags (<tool_call>) are never sent to UI as they trigger backend execution
+
+                # Inside <tool_call>: buffer silently; stop on close tag
                 if _in_logic_tag:
                     if _TC_CLOSE in _so_far:
                         _tool_trigger = True
                         return False
                     return True
-                
-                # If we detected a tag that should be filtered (like <artefact>), we buffer it silently
+
+                # Inside <artefact> / <think> etc.: buffer silently
                 if _is_hidden_tag:
-                    # Logic tags take priority even inside other tags
                     if _TC_OPEN in _so_far:
                         _in_logic_tag = True
                     return True
 
-                # ─── Content Processing Loop ───
-                # Processes chunks to handle tokens that might contain partial tags or multiple elements
+                # ── Content processing: scan for tag openings ────────────────
                 rem = chunk
                 while rem:
                     if _is_buffering_bracket:
-                        # Find end of potential tag
                         if ">" in rem:
-                            idx = rem.index(">") + 1
+                            idx     = rem.index(">") + 1
                             tag_bit = rem[:idx]
-                            rem = rem[idx:]
-                            
+                            rem     = rem[idx:]
                             _bracket_buf.append(tag_bit)
                             b_str = "".join(_bracket_buf)
-                            
-                            # Evaluate if this is a logic or UI-hidden tag
+
                             if _TC_OPEN in b_str:
-                                _in_logic_tag = True
+                                _in_logic_tag         = True
                                 _is_buffering_bracket = False
-                                return True # Handle tool call in next relay turn
-                            
+                                return True
+
                             if any(b_str.startswith(s) for s in _TAG_STARTS):
-                                _is_hidden_tag = True
+                                _is_hidden_tag        = True
                                 _is_buffering_bracket = False
-                                
-                                # [NEW] Real-time Artefact Notification
-                                # If this is an artefact creation tag, notify frontend to open workspace
+
+                                # Track artefact title from opening tag
                                 if b_str.startswith("<artefact"):
-                                    art_title = None
-                                    title_match = re.search(r'name=["\']([^"\']+)["\']', b_str)
-                                    if not title_match:
-                                        title_match = re.search(r'title=["\']([^"\']+)["\']', b_str)
-                                    
-                                    if title_match:
-                                        art_title = title_match.group(1)
-                                        # Use the special event type defined in frontend store
+                                    _title_m = re.search(
+                                        r'name=["\']([^"\']+)["\']', b_str)
+                                    if not _title_m:
+                                        _title_m = re.search(
+                                            r'title=["\']([^"\']+)["\']', b_str)
+                                    if _title_m:
+                                        _art_title = _title_m.group(1)
+                                        if _art_title not in _created_artefact_titles:
+                                            _created_artefact_titles.append(_art_title)
                                         _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                                            "type": "artefact_update", 
-                                            "content": {"title": art_title}
+                                            "type": "artefact_update",
+                                            "content": {"title": _art_title}
                                         })
-                                
-                                continue # Check remaining content for further text
-                            
-                            # Not a special tag, flush buffered bracket content to UI
-                            # Check if the buffer is actually part of a known tag start (partial match)
-                            # If it isn't, we stop buffering and flush.
+
+                                # Notify frontend that a note is being generated
+                                if b_str.startswith("<note") and enable_notes:
+                                    _note_title_m = re.search(
+                                        r'title=["\']([^"\']+)["\']', b_str)
+                                    _note_title = (_note_title_m.group(1)
+                                                   if _note_title_m else "Note")
+                                    if _note_title not in _created_artefact_titles:
+                                        _created_artefact_titles.append(_note_title)
+                                    _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                                        "type": "note_start",
+                                        "content": {"title": _note_title}
+                                    })
+
+                                # Notify frontend that a skill is being generated
+                                if b_str.startswith("<skill") and enable_skills:
+                                    _skill_title_m = re.search(
+                                        r'title=["\']([^"\']+)["\']', b_str)
+                                    _skill_cat_m   = re.search(
+                                        r'category=["\']([^"\']+)["\']', b_str)
+                                    _skill_title   = (_skill_title_m.group(1)
+                                                      if _skill_title_m else "Skill")
+                                    if _skill_title not in _created_artefact_titles:
+                                        _created_artefact_titles.append(_skill_title)
+                                    _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                                        "type": "skill_start",
+                                        "content": {
+                                            "title":    _skill_title,
+                                            "category": (_skill_cat_m.group(1)
+                                                         if _skill_cat_m else ""),
+                                        }
+                                    })
+
+                                # Notify frontend that an inline widget is being streamed
+                                if b_str.startswith("<lollms_inline") and enable_inline_widgets:
+                                    _widget_title_m = re.search(
+                                        r'title=["\']([^"\']+)["\']', b_str)
+                                    _widget_type_m  = re.search(
+                                        r'type=["\']([^"\']+)["\']', b_str)
+                                    _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                                        "type":    "inline_widget_start",
+                                        "content": {
+                                            "title": (_widget_title_m.group(1)
+                                                      if _widget_title_m
+                                                      else "Interactive Widget"),
+                                            "widget_type": (_widget_type_m.group(1)
+                                                            if _widget_type_m else "html"),
+                                        }
+                                    })
+                                continue
+
+                            # Not a special tag — flush buffered bracket content
                             if not any(s.startswith(b_str) for s in _TAG_STARTS):
                                 ai_message.content += b_str
                                 _cb(callback, b_str, MSG_TYPE.MSG_TYPE_CHUNK)
                                 _is_buffering_bracket = False
                                 _bracket_buf.clear()
                         else:
-                            # No closing bracket in this token, keep buffering
                             _bracket_buf.append(rem)
                             b_str = "".join(_bracket_buf)
-                            
-                            # Fail-safe: if we see spaces/newlines or buffer gets too big, it's likely a comparison
-                            if any(c in b_str for c in [" ", "\n", "\r", "\t"]) or len(b_str) > 100:
+                            # Fail-safe: flush if obviously not a tag
+                            if (any(c in b_str for c in [" ", "\n", "\r", "\t"])
+                                    or len(b_str) > 100):
                                 if not any(s.startswith(b_str) for s in _TAG_STARTS):
                                     ai_message.content += b_str
                                     _cb(callback, b_str, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -1275,40 +1407,57 @@ class ChatMixin:
                                     _bracket_buf.clear()
                             rem = ""
                     else:
-                        # Look for potential tag start
                         if "<" in rem:
-                            idx = rem.index("<")
-                            pre, post = rem[:idx], rem[idx:]
+                            idx  = rem.index("<")
+                            pre  = rem[:idx]
+                            post = rem[idx:]
                             if pre:
                                 ai_message.content += pre
                                 _cb(callback, pre, MSG_TYPE.MSG_TYPE_CHUNK)
-                            
                             _is_buffering_bracket = True
                             _bracket_buf.clear()
                             rem = post
                         else:
-                            # Normal text segment
                             ai_message.content += rem
                             _cb(callback, rem, MSG_TYPE.MSG_TYPE_CHUNK)
                             rem = ""
                 return True
 
+            # ── Build agent-state header and prepend to scratchpad ───────────
+            # Gives the model a clear "already done" checklist at the top of
+            # the injected scratchpad system message before every round.
+            _saved_scratchpad = self.scratchpad
+            if _completed_tool_calls or _created_artefact_titles:
+                _state_lines = [
+                    "=== AGENT STATE (already completed this turn — DO NOT repeat) ==="
+                ]
+                if _completed_tool_calls:
+                    _state_lines.append("Tool calls already made:")
+                    _state_lines.extend(f"  ✓ {c}" for c in _completed_tool_calls)
+                if _created_artefact_titles:
+                    _state_lines.append("Artefacts / notes already created:")
+                    _state_lines.extend(f"  ✓ {t}" for t in _created_artefact_titles)
+                _state_lines.append("=== END AGENT STATE ===\n")
+                self.scratchpad = "\n".join(_state_lines) + (self.scratchpad or "")
+
             self._stream_final_answer(
                 _inline_relay, images, _current_branch_tip, final_answer_temperature, **kwargs
             )
 
-            _so_far           = "".join(_stream_buf)
-            _accumulated_full += _so_far
+            # Restore undecorated scratchpad — header must not accumulate
+            self.scratchpad = _saved_scratchpad
 
-            _clean_segment      = (_so_far[:_so_far.index(_TC_OPEN)]
-                                   if _tool_trigger else _so_far)
+            _so_far            = "".join(_stream_buf)
+            _accumulated_full += _so_far
+            _clean_segment     = (_so_far[:_so_far.index(_TC_OPEN)]
+                                  if _tool_trigger else _so_far)
             _clean_text_so_far += _clean_segment
 
             if not _tool_trigger:
-                # LLM produced no tool call — it gave a final answer, exit loop
+                # LLM gave a plain answer — exit the loop
                 break
 
-            # ---- Parse tool call ------------------------------------------
+            # ── Parse tool call ──────────────────────────────────────────────
             is_agentic_turn = True
             try:
                 _open_idx    = _so_far.index(_TC_OPEN) + len(_TC_OPEN)
@@ -1317,15 +1466,63 @@ class ChatMixin:
                 _tool_name   = _call_data.get("name", "")
                 _tool_params = _call_data.get("parameters", {})
             except Exception as e:
-                # Added trace_exception to debug malformed tool calls
                 trace_exception(e)
                 _warning(callback, f"Failed to parse tool call: {e}")
                 break
 
-            # Define the current offset based on text length before the marker is added
+            # ── Deduplication + runaway guard ────────────────────────────────
+            # Policy:
+            #   • Same tool, DIFFERENT params  → always allowed (legitimate
+            #     multi-query investigation, e.g. several search calls).
+            #   • Same tool, SAME params       → blocked after the first repeat;
+            #     a synthetic tool_result explains why.
+            #   • Same signature seen > _MAX_IDENTICAL_REPEATS times → hard
+            #     break to prevent infinite loops even if the model ignores the
+            #     synthetic result.
+            _params_summary = ", ".join(
+                f"{k}={str(v)[:40]}" for k, v in _tool_params.items()
+            )
+            _call_signature = f"{_tool_name}({_params_summary})"
+            _call_tag       = f"round {_round}: {_call_signature}"
+
+            # Count how many times this exact signature has been seen
+            _identical_call_counts[_call_signature] = \
+                _identical_call_counts.get(_call_signature, 0) + 1
+            _sig_count = _identical_call_counts[_call_signature]
+
+            if _sig_count > _MAX_IDENTICAL_REPEATS:
+                # Hard break — the model is stuck in a tight loop
+                _warning(callback,
+                         f"[RUNAWAY] Identical call '{_call_signature}' seen "
+                         f"{_sig_count} times — breaking loop.")
+                break
+
+            if _sig_count > 1:
+                # First repeat: let the model know and give it a chance to move on
+                _warning(callback,
+                         f"[DEDUP] Blocking duplicate tool call: {_call_signature}")
+                _dup_result_str = (
+                    f"DUPLICATE CALL BLOCKED: '{_call_signature}' was already executed "
+                    f"this turn. Check the AGENT STATE in the scratchpad and either "
+                    f"proceed to the next step or write your final answer."
+                )
+                _temp_call = self.add_message(
+                    sender=personality.name, sender_type="assistant",
+                    content=_so_far, parent_id=_current_branch_tip
+                )
+                _temp_res = self.add_message(
+                    sender="system", sender_type="user",
+                    content=(f"<tool_result name=\"{_tool_name}\">"
+                             f"{_dup_result_str}</tool_result>"),
+                    parent_id=_temp_call.id
+                )
+                _temp_msg_ids.extend([_temp_call.id, _temp_res.id])
+                _current_branch_tip = _temp_res.id
+                continue
+
+            # ── Emit tool-call event ─────────────────────────────────────────
             _current_offset = len(_clean_text_so_far)
-            _call_id = str(uuid.uuid4())
-            
+            _call_id        = str(uuid.uuid4())
             _call_evt = {
                 "type": "tool_call", "content": f"Calling {_tool_name}",
                 "id": _call_id, "tool": _tool_name,
@@ -1333,26 +1530,22 @@ class ChatMixin:
             }
             _cb(callback, _call_evt["content"], MSG_TYPE.MSG_TYPE_TOOL_CALL, _call_evt)
             all_events.append(_call_evt)
-            
-            # Insert a structural marker into the actual message content
-            # This allows both the LLM and the frontend to see the tool's position
-            _marker = f"\n<lollms_event id=\"{_call_id}\" />\n"
-            _clean_text_so_far += _marker
-            ai_message.content = _clean_text_so_far
 
-            # Live-sync events to the placeholder message for UI visibility
+            # Insert structural marker into message content for UI positioning
+            _marker = f"\n<lollms_event id=\"{_call_id}\" />\n"
+            _clean_text_so_far    += _marker
+            ai_message.content     = _clean_text_so_far
             ai_message.metadata["events"] = list(all_events)
 
-            _step_lbl = f"Running tool: {_tool_name.replace('_', ' ').title()}"
+            _step_lbl = f"Running: {_tool_name.replace('_', ' ').title()}"
             _step_id  = _step_start(callback, _step_lbl,
                                     {"tool": _tool_name, "offset": _current_offset})
             all_events.append({"type": "step_start", "content": _step_lbl,
-                                "id": _step_id, "offset": _current_offset})
+                               "id": _step_id, "offset": _current_offset})
 
+            # ── Execute tool ─────────────────────────────────────────────────
             if _tool_name not in tool_registry:
                 _warning(callback, f"Unknown tool: {_tool_name}")
-                _step_end(callback, f"Error: Tool '{_tool_name}' not found",
-                          _step_id, {"status": "failed"})
                 _result_str = f"Error: tool '{_tool_name}' not found"
                 _result     = {"error": _result_str}
                 _err_evt = {
@@ -1361,48 +1554,52 @@ class ChatMixin:
                     "result": _result, "offset": _current_offset,
                 }
                 _cb(callback, _err_evt["content"], MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, _err_evt)
-                all_events.extend([
-                    _err_evt,
+                _step_end(callback, f"Unknown tool '{_tool_name}'",
+                          _step_id, {"status": "failed"})
+                all_events.extend([_err_evt,
                     {"type": "step_end",
-                     "content": f"Error: Tool '{_tool_name}' not found",
-                     "id": _step_id, "offset": _current_offset},
-                ])
+                     "content": f"Unknown tool '{_tool_name}'",
+                     "id": _step_id, "offset": _current_offset, "status": "failed"}])
             else:
                 try:
                     _result = tool_registry[_tool_name](**_tool_params)
-                    
-                    # ─── Inference ───────────────────────────────────────────
-                    # Try to extract formal sources from the JSON
+
+                    # Build structured source block for scratchpad
                     inferred_srcs = _infer_sources_from_json(_result, _tool_name)
-                    
-                    # Build uncropped representation for the LLM
-                    res_label = _tool_name.replace('_', ' ').title()
-                    llm_block = f"### [Source List: {res_label}]\n"
-                    
+                    res_label     = _tool_name.replace('_', ' ').title()
+                    llm_block     = f"### [Source List: {res_label}]\n"
                     for s in inferred_srcs:
                         s["index"] = len(collected_sources) + 1
                         collected_sources.append(s)
-                        
-                        # High-priority embedding for the LLM
                         llm_block += f"[[{s['index']}]] {s['title']}\n"
-                        if s['content']: llm_block += f"Content: {s['content']}\n"
-                        if s['metadata']: llm_block += f"Metadata: {json.dumps(s['metadata'])}\n"
+                        if s['content']:
+                            llm_block += f"Content: {s['content']}\n"
+                        if s['metadata']:
+                            llm_block += f"Metadata: {json.dumps(s['metadata'])}\n"
                         llm_block += "---\n"
-                    
-                    # If no specific items found, fallback to raw JSON
                     if not inferred_srcs:
                         llm_block += json.dumps(_result, indent=2)
 
-                    # Update uncropped scratchpad (context)
-                    self.scratchpad = (getattr(self, 'scratchpad', "") or "") + \
-                                      f"\n--- Full Tool Output: {res_label} ---\n{llm_block}\n"
-                    
-                    # ─── Display & Persistence ────────────────────────────────
-                    # Truncate ONLY for the UI timeline to keep the UI snappy
+                    # Accumulate into scratchpad — export() places this as a
+                    # system message after the last user message
+                    self.scratchpad = (self.scratchpad or "") + (
+                        f"\n--- Tool: {res_label} (round {_round}) ---\n"
+                        f"{llm_block}\n"
+                        f"--- End {res_label} ---\n"
+                    )
+
+                    # Record call + any produced title for dedup tracking
+                    _completed_tool_calls.append(_call_tag)
+                    _created_title = (
+                        _result.get("title") or _result.get("name") or
+                        _result.get("note_title") or _result.get("artefact_title") or
+                        _tool_params.get("title") or _tool_params.get("name") or
+                        _tool_params.get("note_title")
+                    )
+                    if _created_title and str(_created_title) not in _created_artefact_titles:
+                        _created_artefact_titles.append(str(_created_title))
+
                     _result_str = json.dumps(_result, indent=2)[:2000]
-                    live_entry = f"\n--- {res_label} (Live) ---\n{_result_str}\n--- End {res_label} ---\n"
-                    self.scratchpad = (self.scratchpad or "") + live_entry
-                    
                     tool_calls_this_turn.append({
                         "name": _tool_name, "params": _tool_params, "result": _result,
                     })
@@ -1413,62 +1610,70 @@ class ChatMixin:
                         "result": _result, "offset": _current_offset,
                     }
                     _cb(callback, _out_evt["content"], MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, _out_evt)
-                    
+                    # step_end carries the same id as step_start for correlation
+                    _step_end(callback, f"Done: {_tool_name}",
+                              _step_id, {"status": "success"})
                     all_events.extend([
                         _out_evt,
-                        {"type": "step_end", "content": f"Completed: {_tool_name}",
+                        {"type": "step_end", "content": f"Done: {_tool_name}",
                          "id": _step_id, "offset": _current_offset, "status": "success"},
                     ])
 
-                    # Sync everything to message metadata
-                    ai_message.metadata["events"] = list(all_events)
+                    ai_message.metadata["events"]  = list(all_events)
                     ai_message.metadata["sources"] = list(collected_sources)
-                    
                     if self._is_db_backed:
                         self.commit()
-                    # Auto-detect sources from tool results
-                    _q = _tool_params.get("query", _tool_params.get("prompt", ""))
-                    
-                    # 1. Standard RAG result format: {"sources": [...]}
+
+                    # Standard RAG source extraction
+                    _q       = _tool_params.get("query", _tool_params.get("prompt", ""))
                     raw_srcs = _result.get("sources", [])
-                    
-                    # 2. Heuristic: if tool returned a list directly or in "results"/"content"
                     if not raw_srcs:
-                        cand = _result.get("results", _result.get("content", _result if isinstance(_result, list) else []))
+                        cand = _result.get(
+                            "results", _result.get(
+                                "content",
+                                _result if isinstance(_result, list) else []
+                            )
+                        )
                         if isinstance(cand, list):
                             raw_srcs = cand
-
                     if raw_srcs and isinstance(raw_srcs, list):
                         queries_performed.append({
                             "step": _round, "tool": _tool_name, "query": _q,
                             "result_count": len(raw_srcs),
                         })
                         for _doc in raw_srcs:
-                            if not isinstance(_doc, dict): continue
-                            
-                            # Normalize fields across different tool implementations
-                            title = _doc.get("title") or _doc.get("name") or _doc.get("source") or f"{_tool_name} Result"
-                            content = _doc.get("content") or _doc.get("summary") or _doc.get("snippet") or ""
-                            link = _doc.get("link") or _doc.get("url") or _doc.get("source") or ""
-                            
+                            if not isinstance(_doc, dict):
+                                continue
+                            _doc_title   = (_doc.get("title") or _doc.get("name") or
+                                            _doc.get("source") or f"{_tool_name} Result")
+                            _doc_content = (_doc.get("content") or _doc.get("summary") or
+                                            _doc.get("snippet") or "")
+                            _doc_link    = (_doc.get("link") or _doc.get("url") or
+                                            _doc.get("source") or "")
                             collected_sources.append({
-                                "title":           title,
-                                "content":         content,
-                                "source":          link,
+                                "title":           _doc_title,
+                                "content":         _doc_content,
+                                "source":          _doc_link,
                                 "query":           _q,
-                                "relevance_score": _doc.get("score", _doc.get("relevance", 100 if content else 0)),
+                                "relevance_score": _doc.get("score",
+                                    _doc.get("relevance", 100 if _doc_content else 0)),
                                 "index":           len(collected_sources) + 1,
                                 "tool":            _tool_name,
                             })
+
                 except Exception as e:
                     trace_exception(e)
                     _warning(callback, f"Tool error ({_tool_name}): {e}")
-                    _step_end(callback, f"Error running {_tool_name}: {e}",
-                              _step_id, {"status": "error"})
+                    _step_end(callback, f"Error: {e}", _step_id, {"status": "error"})
+                    all_events.append({
+                        "type": "step_end", "content": f"Error: {e}",
+                        "id": _step_id, "offset": _current_offset, "status": "error"
+                    })
                     _result_str = f"Error: {e}"
                     _result     = {"error": _result_str}
 
-            # Add temporary messages to history so the model sees them in the next pass
+            # Add temporary history messages so the next round sees the full
+            # tool-call / tool-result exchange in the branch.
             _temp_call = self.add_message(
                 sender=personality.name, sender_type="assistant",
                 content=_so_far, parent_id=_current_branch_tip
@@ -1484,14 +1689,12 @@ class ChatMixin:
         # ====================================================================
         #  Forced final-answer pass
         #
-        #  If we made at least one tool call, the loop may have exited because
-        #  the LLM stopped streaming after a tool call without producing a plain
-        #  text answer (common with some models).  We do one extra unconditional
-        #  LLM call here with a clear instruction to produce the final answer.
-        #  The injected history is still present so the LLM has all context.
+        #  If at least one tool was called but the loop produced no plain text,
+        #  do one extra LLM call with an explicit instruction to write the answer.
+        #  We temporarily augment the scratchpad for this one call, then restore.
         # ====================================================================
         if is_agentic_turn and not _clean_text_so_far.strip():
-            _final_id = _step_start(callback, "Generating final answer...")
+            _final_id  = _step_start(callback, "Generating final answer...")
             _final_buf: List[str] = []
 
             def _final_relay(chunk, msg_type=None, meta=None):
@@ -1501,12 +1704,11 @@ class ChatMixin:
                         return _cb(callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, meta)
                 return True
 
-            # Temporarily strengthen the instruction to force a plain answer
             _scratch_before_final = self.scratchpad
             self.scratchpad = (
                 (_scratch_before_final or "")
-                + "\n\n[INSTRUCTION] All tool calls are complete. "
-                "Now write your final answer to the user in plain text. "
+                + "\n\n[SYSTEM INSTRUCTION] All tool calls are complete. "
+                "Write your final answer to the user in plain text. "
                 "Do NOT emit any more <tool_call> tags."
             )
             self._stream_final_answer(
@@ -1514,24 +1716,22 @@ class ChatMixin:
             )
             self.scratchpad = _scratch_before_final
 
-            _final_text    = "".join(_final_buf)
+            _final_text        = "".join(_final_buf)
             _accumulated_full += _final_text
             _clean_text_so_far = _final_text
             _step_end(callback, "Final answer generated", _final_id)
 
-        # Restore conversation state: delete temporary tool messages
+        # ── Clean up temporary tool-history messages ─────────────────────────
         for mid in reversed(_temp_msg_ids):
             if hasattr(self, 'remove_message'):
                 self.remove_message(mid)
             elif hasattr(self, 'delete_message'):
                 self.delete_message(mid)
             else:
-                # Fallback to direct DB manager if class methods are missing
                 self.db_manager.delete_message(mid)
 
-        # ---- Clean accumulated text and build final message ----------------
+        # ── Strip tool-call tags; keep lollms_event markers ──────────────────
         import re as _re
-        # [FIX] Strip the tool_call logic tags but KEEP our injected <lollms_event /> markers
         _clean = _re.sub(
             r"<tool_call>.*?(?:</tool_call>|$)", "", _clean_text_so_far, flags=_re.DOTALL
         ).strip()
@@ -1551,32 +1751,37 @@ class ChatMixin:
             "tokens_per_second": tok_per_sec,
         }
         if tool_calls_this_turn:
-            message_meta["tool_calls"]     = tool_calls_this_turn
+            message_meta["tool_calls"]           = tool_calls_this_turn
         if all_events:
-            message_meta["events"]         = all_events
+            message_meta["events"]               = all_events
         if collected_sources:
-            message_meta["sources"]        = collected_sources
+            message_meta["sources"]              = collected_sources
         if queries_performed:
-            message_meta["query_history"]  = queries_performed
+            message_meta["query_history"]        = queries_performed
         if is_agentic_turn:
-            message_meta["scratchpad"]     = scratchpad_state
+            message_meta["scratchpad"]           = scratchpad_state
         if self_corrections:
-            message_meta["self_corrections"] = self_corrections
+            message_meta["self_corrections"]     = self_corrections
         if _pt_specs:
             message_meta["personality_tools_used"] = [
                 n for n in _pt_specs
                 if any(tc["name"] == n for tc in tool_calls_this_turn)
             ]
 
-        # Update the pre-created ai_message with final content and metadata
-        ai_message.content = _clean
-        ai_message.raw_content = _accumulated_full
-        ai_message.tokens = token_count
+        # Clear volatile scratchpad — must not leak into next turn or DB commit
+        self.scratchpad = ""
+
+        ai_message.content          = _clean
+        ai_message.raw_content      = _accumulated_full
+        ai_message.tokens           = token_count
         ai_message.generation_speed = tok_per_sec
-        ai_message.metadata = message_meta
+        ai_message.metadata         = message_meta
 
         cleaned_content, affected_artefacts = self._post_process_llm_response(
             _clean, ai_message, _eff_img_gen, _eff_img_edit, auto_activate_artefacts,
+            enable_inline_widgets=enable_inline_widgets,
+            enable_notes=enable_notes,
+            enable_skills=enable_skills,
         )
         if cleaned_content != _clean:
             ai_message.content = cleaned_content
