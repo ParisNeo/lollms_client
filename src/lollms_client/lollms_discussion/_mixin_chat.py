@@ -653,6 +653,7 @@ class ChatMixin:
                 object.__setattr__(self, "_system_prompt", original_sp + extra_instructions)
 
         # ── Generation parameters ────────────────────────────────────────────
+        kwargs.pop("temperature", None) # protect against a temperature setting
         decision_temperature       = kwargs.get("decision_temperature",       0.3)
         final_answer_temperature   = kwargs.get("final_answer_temperature",   0.7)
         rag_top_k                  = kwargs.get("rag_top_k",                  5)
