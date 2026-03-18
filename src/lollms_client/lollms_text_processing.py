@@ -1330,11 +1330,11 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
                 system_prompt=final_system_prompt,
                 **kwargs
             )
-            
-            response = self.remove_thinking_blocks(response)
-            
             if isinstance(response, dict) and not response.get("status", True):
                 continue
+                
+            response = self.remove_thinking_blocks(response)
+            
             
             # Multi-strategy extraction
             json_string = self._extract_json_multi_strategy(response)

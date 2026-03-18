@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-03-18 21:06]
+
+- Fix: Move error check before `remove_thinking_blocks` processing
+
 ## [2026-03-15 23:28]
 
 - Bump version to 1.12.7
