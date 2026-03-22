@@ -42,6 +42,14 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-03-22 23:07]
+
+- feat(discussion): refactor lollms_discussion module and remove deprecated lollms_agentic
+
+## [2026-03-22 22:47]
+
+- Based on the diff snippets provided, I can see the following changes:
+
 ## [2026-03-18 21:06]
 
 - Fix: Move error check before `remove_thinking_blocks` processing

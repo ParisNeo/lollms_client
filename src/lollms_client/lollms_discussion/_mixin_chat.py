@@ -593,7 +593,11 @@ class ChatMixin:
         # ── Normalise personality ────────────────────────────────────────────
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
-
+        # patch temperature
+        if "temperature" in kwargs:
+            final_answer_temperature=kwargs.pop("temperature")
+        else:
+            final_answer_temperature=0.7
         # Stash callback for real-time artefact events in _post_process_llm_response
         object.__setattr__(self, '_active_callback', callback)
 
@@ -655,7 +659,7 @@ class ChatMixin:
         # ── Generation parameters ────────────────────────────────────────────
         kwargs.pop("temperature", None) # protect against a temperature setting
         decision_temperature       = kwargs.get("decision_temperature",       0.3)
-        final_answer_temperature   = kwargs.get("final_answer_temperature",   0.7)
+        final_answer_temperature   = kwargs.get("final_answer_temperature",   final_answer_temperature)
         rag_top_k                  = kwargs.get("rag_top_k",                  5)
         rag_min_similarity_percent = kwargs.get("rag_min_similarity_percent", 0.5)
         preflight_rag_enabled      = kwargs.get("preflight_rag",              True)

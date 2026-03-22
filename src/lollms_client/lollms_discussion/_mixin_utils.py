@@ -43,41 +43,19 @@ class UtilsMixin:
                          branch_tip_id=user_msg_to_regenerate_from.id, **kwargs)
 
     def delete_branch(self, message_id: str):
-        if not self._is_db_backed:
-            raise NotImplementedError("Branch deletion is only supported for DB-backed discussions.")
-        self._rebuild_message_index()
-        if message_id not in self._message_index:
-            raise ValueError(f"Message '{message_id}' not found.")
-        original = self._message_index[message_id]
-        new_parent_id = original.parent_id
-        children_of_deleted = [m.id for m in self._db_discussion.messages
-                                if m.parent_id == message_id and m.id != message_id]
-        to_delete = set()
-        queue = [message_id]
-        qi = 0
-        while qi < len(queue):
-            cur = queue[qi]; qi += 1
-            if cur in to_delete:
-                continue
-            to_delete.add(cur)
-            for mid, mobj in self._message_index.items():
-                if mobj.parent_id == cur and mid not in to_delete:
-                    queue.append(mid)
-        for m in self._db_discussion.messages:
-            if m.id in children_of_deleted:
-                m.parent_id = new_parent_id
-        self._db_discussion.messages = [m for m in self._db_discussion.messages
-                                        if m.id not in to_delete]
-        self._messages_to_delete_from_db.update(to_delete)
-        self._message_index = {k: v for k, v in self._message_index.items()
-                                if k not in to_delete}
-        new_active = None
-        if new_parent_id and new_parent_id in self._message_index:
-            new_active = self._find_deepest_leaf(new_parent_id)
-        if new_active is None:
-            new_active = self._find_deepest_leaf(None)
-        self.active_branch_id = new_active
-        self.touch()
+        """
+        Compatibility shim — delegates to BranchMixin.prune_branch()
+        which handles both DB-backed and in-memory discussions.
+
+        To delete only the leaf (trimming back empty ancestors), use:
+            disc.delete_branch(leaf_id, keep_ancestors=True)
+
+        To delete a message and ALL its descendants, use:
+            disc.prune_branch(message_id)
+        """
+        # BranchMixin.prune_branch is the canonical implementation.
+        # Calling super() here would go to BranchMixin in the MRO.
+        return self.prune_branch(message_id)
 
     def export(self, format_type, branch_tip_id=None, max_allowed_tokens=None,
                suppress_system_prompt=False, suppress_images=False):

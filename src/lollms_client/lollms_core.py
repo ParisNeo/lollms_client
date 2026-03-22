@@ -25,11 +25,7 @@ from lollms_client.lollms_ttm_binding import LollmsTTMBinding, LollmsTTMBindingM
 from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
 
 from lollms_client.lollms_discussion import LollmsDiscussion
-from lollms_client.lollms_agentic import (
-    TaskStatus, TaskPlanner, MemoryManager, 
-    UncertaintyManager, ToolPerformanceTracker, 
-    SubTask, ExecutionPlan
-)
+
 
 
 class LollmsClient():
