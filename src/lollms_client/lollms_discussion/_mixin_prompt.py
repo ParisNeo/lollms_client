@@ -14,54 +14,62 @@ if TYPE_CHECKING:
 
 class PromptMixin:
     """
-    Builds artefact / image-generation / inline-widget instructions for the
+    Builds artifact / image-generation / inline-widget instructions for the
     system prompt and post-processes the LLM response to apply any XML action
     tags it contains.
+
+    NOTE ON SPELLING
+    ----------------
+    The XML tags shown to the LLM use the American spelling "artifact"
+    (<artifact>, </artifact>, <revert_artifact />) because it appears far
+    more frequently in LLM training corpora.  The Python API (method names,
+    variable names, class names) keeps the British spelling "artefact" for
+    backwards compatibility.  The parser accepts BOTH spellings from the LLM.
     """
 
     # ─────────────────────────────────────── instruction builders ────────────
 
     def _build_artefact_instructions(self) -> str:
-        """Returns prompt instructions for creating/updating artefacts via XML tags."""
+        """Returns prompt instructions for creating/updating artifacts via XML tags."""
         lines = [
             "",
-            "=== ARTEFACT SYSTEM ===",
-            "You can create, modify, and version control artefacts (persistent code, documents, notes, skills).",
-            "Always use XML tags for artefact operations. The system keeps full version history automatically.",
+            "=== ARTIFACT SYSTEM ===",
+            "You can create, modify, and version control artifacts (persistent code, documents, notes, skills).",
+            "Always use XML tags for artifact operations. The system keeps full version history automatically.",
             "",
-            "IMPORTANT: Whenever you create or update an artefact, you MUST also write a",
+            "IMPORTANT: Whenever you create or update an artifact, you MUST also write a",
             "short explanation in your reply (outside the tag) telling the user what you",
             "created/changed and why. Never let your entire response consist of only XML tags.",
             "Example: 'I've created `hello.py` with a basic Flask server — here's what it does: …'",
             "",
-            "To CREATE a new artefact (supports metadata attributes):",
-            '<artefact name="unique_name.py" type="code" language="python" author="Your Name" description="What it does">',
+            "To CREATE a new artifact (supports metadata attributes):",
+            '<artifact name="unique_name.py" type="code" language="python" author="Your Name" description="What it does">',
             "[full content here]",
-            "</artefact>",
+            "</artifact>",
             "",
-            "To UPDATE an existing artefact (use the EXACT same name as the existing one):",
-            "  The system will automatically find the artefact even if the name is slightly",
+            "To UPDATE an existing artifact (use the EXACT same name as the existing one):",
+            "  The system will automatically find the artifact even if the name is slightly",
             "  different (fuzzy matching), but using the exact stored name is safest.",
             "",
-            "To RENAME an artefact while updating it, add a rename attribute:",
-            '<artefact name="old_title" rename="new_title">',
+            "To RENAME an artifact while updating it, add a rename attribute:",
+            '<artifact name="old_title" rename="new_title">',
             "  [full new content OR SEARCH/REPLACE blocks]",
-            "</artefact>",
+            "</artifact>",
             "",
             "To UPDATE content only (no rename), use SEARCH/REPLACE blocks inside the tag.",
             "CRITICAL RULES FOR SEARCH/REPLACE:",
             "  1. Keep each SEARCH block as SHORT as possible — 1 to 5 lines is ideal.",
             "     The longer the SEARCH block, the higher the chance of a whitespace or",
             "     punctuation mismatch that causes the patch to fail.",
-            "  2. You may include MULTIPLE SEARCH/REPLACE blocks inside a single <artefact>",
+            "  2. You may include MULTIPLE SEARCH/REPLACE blocks inside a single <artifact>",
             "     tag to make several independent edits in one turn.",
             "  3. Each block MUST use this exact structure — do not skip or reorder markers:",
             "       <<<<<<< SEARCH",
-            "       [exact lines to find — copy verbatim from the artefact]",
+            "       [exact lines to find — copy verbatim from the artifact]",
             "       =======",
             "       [replacement lines]",
             "       >>>>>>> REPLACE",
-            "  4. The SEARCH text must match the artefact content CHARACTER FOR CHARACTER",
+            "  4. The SEARCH text must match the artifact content CHARACTER FOR CHARACTER",
             "     (spaces, indentation, blank lines). When in doubt, use fewer lines.",
             "  5. Do NOT place the replacement lines where ======= should be.",
             "     Do NOT omit the >>>>>>> REPLACE marker at the end.",
@@ -69,7 +77,7 @@ class PromptMixin:
             "     over one large block.",
             "",
             "Example — two independent edits in one tag:",
-            '<artefact name="app.py">',
+            '<artifact name="app.py">',
             "<<<<<<< SEARCH",
             "def greet():",
             "    return 'hello'",
@@ -82,13 +90,13 @@ class PromptMixin:
             "=======",
             "PORT = int(os.getenv('PORT', 8000))",
             ">>>>>>> REPLACE",
-            "</artefact>",
+            "</artifact>",
             "",
             "To REVERT to a previous known version:",
-            '<revert_artefact name="existing_name.py" version="1" />',
+            '<revert_artifact name="existing_name.py" version="1" />',
             "",
             f"Supported types: {', '.join(sorted(list(ArtefactType.ALL)))}",
-            "=== END ARTEFACT INSTRUCTIONS ===",
+            "=== END ARTIFACT INSTRUCTIONS ===",
             "",
         ]
         return "\n".join(lines)
@@ -108,8 +116,8 @@ class PromptMixin:
             "  A detailed description of the image you want to generate",
             "</generate_image>",
             "",
-            "To edit an existing image artefact:",
-            '<edit_image name="artefact_name">',
+            "To edit an existing image artifact:",
+            '<edit_image name="artifact_name">',
             "  Description of how to edit / modify the image",
             "</edit_image>",
             "=== END IMAGE INSTRUCTIONS ===",
@@ -118,14 +126,6 @@ class PromptMixin:
         return "\n".join(lines)
 
     def _build_inline_widget_instructions(self) -> str:
-        """
-        Returns prompt instructions for generating inline interactive widgets.
-
-        Framing is explicitly educational / teaching-focused: the model should
-        use widgets to make abstract concepts tangible through interaction, not
-        just to show off visuals.  The instructions also reinforce that a plain-
-        text explanation must accompany every widget (mirrors the artefact rule).
-        """
         lines = [
             "",
             "=== INTERACTIVE TEACHING WIDGETS ===",
@@ -151,37 +151,28 @@ class PromptMixin:
             "",
             "GOOD uses (teaching moments):",
             "  • Physics / math simulations with parameter sliders",
-            "    (e.g. 'drag the mass slider to see how period changes')",
             "  • Algorithm step-through visualisers",
-            "    (e.g. 'click Next to advance bubble-sort one step')",
             "  • Signal / wave / Fourier explorers",
             "  • Probability / statistics sandboxes",
-            "  • Colour / geometry / trigonometry explorers",
             "  • Mini quizzes or flashcard drills",
-            "  • Data-entry forms that compute a result live",
             "",
             "BAD uses (do NOT use a widget for these):",
-            "  • Full applications → use <artefact> instead",
+            "  • Full applications → use <artifact> instead",
             "  • Static charts with no interactivity → just describe or use a note",
             "  • Anything requiring a server or file I/O",
             "",
             "Technical rules:",
             "  • Fully self-contained — zero network requests at runtime",
-            "    (CDN links to well-known libraries, e.g. KaTeX, Chart.js, are fine).",
+            "    (CDN links to well-known libraries are fine).",
             "  • Target ≤ 460 px height, full container width.",
-            "  • Use KaTeX (https://cdn.jsdelivr.net/npm/katex/dist/katex.min.js) for math.",
             "  • Label every control clearly so the user knows what to do.",
             "  • No alert() / confirm() / prompt().",
-            "  • Prefer smooth transitions / animations over abrupt jumps.",
             "=== END INTERACTIVE TEACHING WIDGET INSTRUCTIONS ===",
             "",
         ]
         return "\n".join(lines)
 
     def _build_note_instructions(self) -> str:
-        """
-        Returns prompt instructions for creating persistent notes via the <note> tag.
-        """
         lines = [
             "",
             "=== NOTE SYSTEM ===",
@@ -190,7 +181,7 @@ class PromptMixin:
             "",
             "Use <note> for: summaries, analysis results, comparison tables, key findings,",
             "  action item lists, or any content the user would want to save and reference.",
-            "Do NOT use <note> for code (use <artefact type=\"code\">) or large documents.",
+            'Do NOT use <note> for code (use <artifact type="code">) or large documents.',
             "",
             "Tag syntax:",
             '<note title="Clear descriptive title">',
@@ -204,9 +195,6 @@ class PromptMixin:
         return "\n".join(lines)
 
     def _build_skill_instructions(self) -> str:
-        """
-        Returns prompt instructions for saving reusable skills via the <skill> tag.
-        """
         lines = [
             "",
             "=== SKILL SYSTEM ===",
@@ -248,6 +236,10 @@ class PromptMixin:
         """
         Scans the raw LLM response for XML action tags and applies them.
 
+        Accepts both spellings from the LLM:
+          <artifact …>  or  <artefact …>   (American / British)
+          <revert_artifact …>  or  <revert_artefact …>
+        All other tags use a single canonical spelling.
         This is the *single* place where all LLM-output XML is intercepted.
         Called at the end of ``chat()`` / ``simplified_chat()``, after
         ``remove_thinking_blocks`` has run, and *after* the ai_message object
@@ -305,7 +297,8 @@ class PromptMixin:
         masked_text = re.sub(r'(`{3,})[\s\S]*?\1', mask_code_block, text)
         masked_text = re.sub(r'`[^`]+`',           mask_code_block, masked_text)
 
-        has_artefact = bool(re.search(r'<(?:revert_)?artefact[\s>]', masked_text, re.IGNORECASE))
+        # Accept both spellings when detecting presence of artifact tags
+        has_artefact = bool(re.search(r'<(?:revert_)?art[ei]fact[\s>]', masked_text, re.IGNORECASE))
         has_gen      = enable_image_generation and bool(
             re.search(r'<generate_image[\s>]', masked_text, re.IGNORECASE))
         has_edit     = enable_image_editing and bool(
@@ -327,10 +320,8 @@ class PromptMixin:
             return {m.group(1): m.group(2)
                     for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
-        # ── 1. Artefact create / patch ────────────────────────────────────────
+        # ── 1. Artifact create / patch (both spellings) ───────────────────────
         if has_artefact:
-            # Build a real-time event callback so the UI receives artefact
-            # create/update notifications as each tag is processed.
             _active_cb = getattr(self, '_active_callback', None)
 
             def _artefact_event(artefact: Dict, is_new: bool):
@@ -338,7 +329,7 @@ class PromptMixin:
                     return
                 import json as _json
                 from lollms_client.lollms_types import MSG_TYPE as _MT
-                event_type = "artefact_created" if is_new else "artefact_updated"
+                event_type = "artifact_created" if is_new else "artifact_updated"
                 try:
                     _active_cb(
                         _json.dumps({
@@ -432,7 +423,7 @@ class PromptMixin:
                         else:
                             ASCIIColors.warning(
                                 f"<edit_image name='{artefact_name}'> — "
-                                "artefact not found or has no images; "
+                                "artifact not found or has no images; "
                                 "falling back to last message image.")
                     if source_b64 is None:
                         active_imgs = ai_message.get_active_images()
@@ -493,11 +484,8 @@ class PromptMixin:
                     "source": source.strip(),
                 }
                 meta["inline_widgets"].append(widget_entry)
-
                 ASCIIColors.success(
                     f"Inline widget '{widget_title}' ({widget_type}) registered.")
-
-                # Replace the tag with a lightweight anchor for the frontend
                 return f'<lollms_widget id="{widget_id}" />'
 
             cleaned = inline_pattern.sub(handle_inline, cleaned)
@@ -582,20 +570,16 @@ class PromptMixin:
 
         cleaned = cleaned.strip()
 
-        # ── 7. Silent-artefact guard ──────────────────────────────────────────
-        # If the entire response was consumed by XML tags and the user would
-        # receive an empty bubble, generate a concise human-readable summary
-        # of what was produced so the chat never feels broken.
+        # ── 7. Silent-artifact guard ──────────────────────────────────────────
         if enable_silent_artefact_explanation and not cleaned:
             summary_parts: List[str] = []
 
-            # Artefacts (code, documents, …)
             non_note_non_skill = [
                 a for a in affected_artefacts
                 if a.get('type') not in (ArtefactType.NOTE, ArtefactType.SKILL)
             ]
             for art in non_note_non_skill:
-                atype    = art.get('type', 'artefact')
+                atype    = art.get('type', 'artifact')
                 title    = art.get('title', 'untitled')
                 lang     = art.get('language', '')
                 version  = art.get('version', 1)
@@ -607,11 +591,9 @@ class PromptMixin:
                     f"📄 Created **{title}**{lang_str} [{atype}{ver_str}]{desc_str}."
                 )
 
-            # Notes
             notes = [a for a in affected_artefacts if a.get('type') == ArtefactType.NOTE]
             for note in notes:
                 title = note.get('title', 'untitled')
-                # Peek at the first non-blank line of the note for context
                 first_line = next(
                     (l.strip() for l in note.get('content', '').splitlines() if l.strip()),
                     ''
@@ -619,7 +601,6 @@ class PromptMixin:
                 peek = f" — {first_line[:80]}…" if first_line else ""
                 summary_parts.append(f"📝 Saved note **{title}**{peek}")
 
-            # Skills
             skills = [a for a in affected_artefacts if a.get('type') == ArtefactType.SKILL]
             for skill in skills:
                 title    = skill.get('title', 'untitled')
@@ -629,19 +610,18 @@ class PromptMixin:
                 desc_str = f" — {desc}" if desc else ""
                 summary_parts.append(f"🎓 Skill saved **{title}**{cat_str}{desc_str}.")
 
-            # Inline widgets
             meta_now = dict(ai_message.metadata or {})
             for widget in meta_now.get("inline_widgets", []):
                 w_title = widget.get('title', 'Interactive Widget')
                 w_type  = widget.get('type', 'html')
                 summary_parts.append(
-                    f"🎛️ Interactive widget ready: **{title}** ({w_type}) — "
+                    f"🎛️ Interactive widget ready: **{w_title}** ({w_type}) — "
                     "use the controls below to explore the concept."
                 )
 
             if summary_parts:
                 cleaned = "\n".join(summary_parts)
                 ASCIIColors.info(
-                    "[silent-artefact guard] Auto-generated explanation appended.")
+                    "[silent-artifact guard] Auto-generated explanation appended.")
 
         return cleaned, affected_artefacts

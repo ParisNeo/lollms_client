@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-03-24 01:21]
+
+- feat(discussion): add artefacts, chat, and prompt mixins to lollms_discussion
+
 ## [2026-03-22 23:07]
 
 - feat(discussion): refactor lollms_discussion module and remove deprecated lollms_agentic

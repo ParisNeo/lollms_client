@@ -1,5 +1,13 @@
 # lollms_discussion/_artefacts.py
 # ArtefactType constants and ArtefactManager: full typed artefact subsystem.
+#
+# NOTE ON SPELLING
+# ----------------
+# The Python API keeps the British spelling "artefact" (ArtefactType, ArtefactManager,
+# artefacts.*) for backwards compatibility.
+# The XML tag used in LLM prompts and response parsing uses the American spelling
+# "artifact" (<artifact>, </artifact>, <revert_artifact />) because it is far more
+# common in LLM training corpora and avoids model confusion.
 
 import re
 import uuid
@@ -91,10 +99,9 @@ def _title_similarity(a: str, b: str) -> float:
     Normalises case, strips common extensions and punctuation before comparing.
     """
     def _norm(s: str) -> str:
-        # lower, strip extension, collapse whitespace/separators
         s = s.lower().strip()
-        s = re.sub(r'\.[a-z0-9]{1,6}$', '', s)        # strip extension
-        s = re.sub(r'[\s\-_/\\]+', ' ', s)             # normalise separators
+        s = re.sub(r'\.[a-z0-9]{1,6}$', '', s)
+        s = re.sub(r'[\s\-_/\\]+', ' ', s)
         return s
 
     na, nb = _norm(a), _norm(b)
@@ -103,17 +110,14 @@ def _title_similarity(a: str, b: str) -> float:
     if not na or not nb:
         return 0.0
 
-    # Check substring containment (e.g. "Transavia note" vs "note Transavia")
     if na in nb or nb in na:
         return 0.85
 
-    # Character bigram overlap
     def bigrams(s):
         return {s[i:i+2] for i in range(len(s) - 1)}
 
     bg_a, bg_b = bigrams(na), bigrams(nb)
     if not bg_a or not bg_b:
-        # fall back to character overlap
         common = sum(x == y for x, y in zip(na, nb))
         return common / max(len(na), len(nb))
 
@@ -126,16 +130,6 @@ def _find_best_title_match(
     existing_titles: List[str],
     threshold: float = 0.60,
 ) -> Optional[str]:
-    """
-    Returns the existing title that best matches *candidate* if the similarity
-    is at or above *threshold*, otherwise None (→ create a new artefact).
-
-    threshold=0.60 catches:
-      • minor typos / extra words ("Transavia note" → "note Transavia")
-      • extension changes ("app.py" → "app")
-      • casing differences ("MyFile.py" → "myfile.py")
-    while rejecting genuinely different names.
-    """
     best_title: Optional[str] = None
     best_score: float         = -1.0
     for title in existing_titles:
@@ -221,7 +215,6 @@ class ArtefactManager:
         self._discussion.commit()
 
     def _all_latest_titles(self) -> List[str]:
-        """Returns the title of the latest version of every distinct artefact."""
         seen: Dict[str, int] = {}
         for a in self._get_all_raw():
             t, v = a.get('title', ''), a.get('version', 1)
@@ -282,7 +275,6 @@ class ArtefactManager:
         return new_artefact
 
     def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        """Returns an artefact by title. If version is None, returns the latest."""
         candidates = [a for a in self._get_all_raw() if a.get('title') == title]
         if not candidates:
             return None
@@ -291,7 +283,6 @@ class ArtefactManager:
         return max(candidates, key=lambda a: a.get('version', 0))
 
     def get_by_id(self, artefact_id: str) -> Optional[Dict[str, Any]]:
-        """Returns an artefact by its stable UUID."""
         return next((a for a in self._get_all_raw() if a.get('id') == artefact_id), None)
 
     def list(
@@ -300,7 +291,6 @@ class ArtefactManager:
         active_only:   bool = False,
         tags:          Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Lists artefacts with optional filters (type, active_only, tags)."""
         result = self._get_all_raw()
         if artefact_type:
             result = [a for a in result if a.get('type') == artefact_type]
@@ -320,7 +310,7 @@ class ArtefactManager:
         new_tags:      Optional[List[str]] = None,
         language:      Optional[str] = None,
         url:           Optional[str] = None,
-        new_title:     Optional[str] = None,   # ← rename support
+        new_title:     Optional[str] = None,
         bump_version:  bool = True,
         active:        Optional[bool] = None,
         **extra_data
@@ -336,7 +326,7 @@ class ArtefactManager:
 
         new_version  = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
         new_active   = active if active is not None else latest.get('active', True)
-        target_title = new_title if new_title else title   # support rename
+        target_title = new_title if new_title else title
 
         internal_keys = {
             "id", "title", "type", "version", "content", "images", "audios",
@@ -346,7 +336,6 @@ class ArtefactManager:
         merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
         merged_extra.update(extra_data)
 
-        # If renaming, deactivate old title entries first
         if new_title and new_title != title:
             artefacts = self._get_all_raw()
             for a in artefacts:
@@ -400,7 +389,6 @@ class ArtefactManager:
         )
 
     def remove(self, title: str, version: Optional[int] = None) -> int:
-        """Removes artefact(s) by title. Removes all versions if version is None."""
         artefacts = self._get_all_raw()
         initial = len(artefacts)
         if version is None:
@@ -475,13 +463,13 @@ class ArtefactManager:
                 parts.append(f"{header}\n{fence}\n{item['content'].strip()}\n```")
             else:
                 parts.append(header)
-        return "## Active Artefacts\n\n" + "\n\n".join(parts)
+        return "## Active Artifacts\n\n" + "\n\n".join(parts)
 
     def get_active_images(self) -> List[Dict[str, Any]]:
         result = []
         for a in self._get_all_raw():
             if a.get('active', False) and a.get('type') == ArtefactType.IMAGE:
-                source_id = f"artefact:{a['title']} v{a['version']}"
+                source_id = f"artifact:{a['title']} v{a['version']}"
                 for img_b64 in (a.get('images') or []):
                     result.append({
                         "data":       img_b64,
@@ -539,10 +527,8 @@ class ArtefactManager:
         SEP_RE     = _re.compile(r'^={5,}\s*$')
         REPLACE_RE = _re.compile(r'^>{6,8}\s*REPLACE\s*$', _re.IGNORECASE)
 
-        # ── normalise line endings ────────────────────────────────────────────
         patch_block = patch_block.replace('\r\n', '\n').replace('\r', '\n')
 
-        # ── ensure terminal >>>>>>> REPLACE ──────────────────────────────────
         lines = patch_block.split('\n')
         while lines and not lines[-1].strip():
             lines.pop()
@@ -550,7 +536,6 @@ class ArtefactManager:
             lines.append('>>>>>>> REPLACE')
         patch_block = '\n'.join(lines)
 
-        # ── parse all (SEARCH, REPLACE) pairs ────────────────────────────────
         raw_lines = patch_block.split('\n')
         segments: List[Tuple[str, str]] = []
         i = 0
@@ -600,7 +585,6 @@ class ArtefactManager:
                 "block found.\nPatch preview:\n" + patch_block[:500]
             )
 
-        # ── apply each segment ────────────────────────────────────────────────
         result = original
         for search_text, replace_text in segments:
             if search_text.startswith('\n'):
@@ -625,7 +609,9 @@ class ArtefactManager:
 
         return result
 
-    # -------------------------------------------- LLM artefact XML parser
+    # -------------------------------------------- LLM artifact XML parser
+    # NOTE: The XML tag is <artifact> (American spelling) but the Python
+    # method and variable names keep "artefact" for API stability.
 
     def _apply_artefact_xml(
         self,
@@ -633,12 +619,12 @@ class ArtefactManager:
         default_type:  str = ArtefactType.CODE,
         auto_activate: bool = True,
         replacements:  Optional[Dict[str, str]] = None,
-        event_callback: Optional[Any] = None,   # ← NEW: fires MSG_TYPE events
+        event_callback: Optional[Any] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
-        Internal helper called exclusively from LollmsDiscussion._post_process_llm_response.
-
-        Scans *text* for ``<artefact …>…</artefact>`` blocks and:
+        Scans *text* for ``<artifact …>…</artifact>`` blocks (American spelling)
+        and also accepts the legacy ``<artefact …>…</artefact>`` spelling for
+        backward compatibility with older model outputs.
 
         * Uses fuzzy title matching to find an existing artefact whose name is
           similar to the tag's ``name`` attribute, so a renamed tag still updates
@@ -660,8 +646,9 @@ class ArtefactManager:
         affected: List[Dict] = []
         cleaned  = text
 
+        # Accept both spellings from the LLM
         artefact_pattern = re.compile(
-            r'<artefact\s([^>]*)>(.*?)</artefact>',
+            r'<art[ei]fact\s([^>]*)>(.*?)</art[ei]fact>',
             re.DOTALL | re.IGNORECASE
         )
 
@@ -669,7 +656,6 @@ class ArtefactManager:
             return {m.group(1): m.group(2)
                     for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
-        # Collect all existing titles once for the whole response pass
         existing_titles = self._all_latest_titles()
 
         def handle_artefact(match: re.Match) -> str:
@@ -678,7 +664,6 @@ class ArtefactManager:
             attrs   = _parse_attrs(match.group(1))
             content = match.group(2)
 
-            # Restore masked content before saving
             if replacements:
                 for placeholder, original in replacements.items():
                     content = content.replace(placeholder, original)
@@ -686,8 +671,8 @@ class ArtefactManager:
                         if placeholder in v:
                             attrs[k] = v.replace(placeholder, original)
 
-            tag_title   = attrs.pop('name', attrs.pop('title', f'artefact_{uuid.uuid4().hex[:8]}'))
-            new_name    = attrs.pop('rename', None)   # explicit rename attribute
+            tag_title   = attrs.pop('name', attrs.pop('title', f'artifact_{uuid.uuid4().hex[:8]}'))
+            new_name    = attrs.pop('rename', None)
             atype       = attrs.pop('type', default_type)
             language    = attrs.pop('language', None)
             version_str = attrs.pop('version', '1')
@@ -696,11 +681,6 @@ class ArtefactManager:
             if atype not in ArtefactType.ALL:
                 atype = default_type
 
-            # ── Fuzzy title resolution ────────────────────────────────────────
-            # Priority:
-            #   1. Exact match on tag_title                → update that artefact
-            #   2. Fuzzy match on tag_title (≥ 0.60)       → update matched artefact
-            #   3. No match                                 → create new artefact
             resolved_title: Optional[str] = None
             is_new = False
 
@@ -717,7 +697,6 @@ class ArtefactManager:
                     resolved_title = tag_title
                     is_new = True
 
-            # Detect whether this is a patch or a full replacement
             _has_search = bool(
                 re.search(r'<{6,8}\s*SEARCH', content, re.IGNORECASE)
             )
@@ -745,7 +724,7 @@ class ArtefactManager:
                         result_artefact = self.update(
                             title=resolved_title,
                             new_content=patched,
-                            new_title=new_name,        # rename if requested
+                            new_title=new_name,
                             language=language,
                             bump_version=True,
                             active=auto_activate,
@@ -764,7 +743,6 @@ class ArtefactManager:
                         )
                         result_artefact = existing
             else:
-                # Full content replacement / creation
                 if is_new:
                     result_artefact = self.add(
                         title=resolved_title, artefact_type=atype,
@@ -776,7 +754,7 @@ class ArtefactManager:
                     result_artefact = self.update(
                         title=resolved_title,
                         new_content=content.strip(),
-                        new_title=new_name,            # rename if requested
+                        new_title=new_name,
                         new_type=atype,
                         language=language,
                         bump_version=True,
@@ -788,32 +766,28 @@ class ArtefactManager:
                         ASCIIColors.info(
                             f"Artefact '{resolved_title}' renamed to '{final_title}'")
 
-            # Update the known titles list so subsequent tags in the same
-            # response don't mistakenly match against stale titles
             existing_titles = self._all_latest_titles()
 
             affected.append(result_artefact)
 
-            # ── Fire real-time event callback ─────────────────────────────────
             if event_callback and result_artefact:
                 try:
                     event_callback(result_artefact, is_new)
                 except Exception as _ecb_err:
                     ASCIIColors.warning(f"Artefact event callback error: {_ecb_err}")
 
-            return ''   # strip tag from cleaned output
+            return ''
 
         cleaned = artefact_pattern.sub(handle_artefact, cleaned)
 
-        # Parse <revert_artefact name="..." version="..." /> tags
-        revert_pattern = re.compile(r'<revert_artefact\s([^>]+)/?>', re.IGNORECASE)
+        # Accept both spellings for revert tag too
+        revert_pattern = re.compile(r'<revert_art[ei]fact\s([^>]+)/?>', re.IGNORECASE)
 
         def handle_revert(match: re.Match) -> str:
             attrs   = _parse_attrs(match.group(1))
             title   = attrs.get('name') or attrs.get('title')
             version = attrs.get('version')
             if title and version and version.isdigit():
-                # Fuzzy match for revert too
                 resolved = title if title in existing_titles else (
                     _find_best_title_match(title, existing_titles) or title
                 )
@@ -857,7 +831,7 @@ class ArtefactManager:
         for a in items:
             section_start  = f"--- Document: {a['title']} v{a['version']} ---"
             content_loaded = section_start in (disc.discussion_data_zone or "")
-            source_id      = f"artefact:{a['title']} v{a['version']}"
+            source_id      = f"artifact:{a['title']} v{a['version']}"
             image_loaded   = any(
                 img.get("source") == source_id for img in disc.get_discussion_images()
             )

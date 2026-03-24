@@ -1,5 +1,28 @@
 # lollms_discussion/_mixin_chat.py
 # ChatMixin: simplified_chat() and chat() — the two high-level conversation methods.
+#
+# ARTIFACT STREAMING CONTRACT
+# ---------------------------
+# When the LLM emits an <artifact ...>...</artifact> block (or <note>, <skill>,
+# <lollms_inline>) the content inside that block is NEVER forwarded to the
+# main chat bubble via MSG_TYPE_CHUNK.  Instead:
+#
+#   1. When the opening tag is fully buffered, a single MSG_TYPE_CHUNK is fired
+#      with text="" and meta={"type": "artifact_update", "content": {"title": ...}}
+#      so the UI can open a secondary panel / indicator.
+#
+#   2. Each content fragment inside the tag fires MSG_TYPE_ARTEFACT_CHUNK
+#      (or MSG_TYPE_NOTE_CHUNK / MSG_TYPE_SKILL_CHUNK / MSG_TYPE_WIDGET_CHUNK).
+#      These must NOT reach the main chat bubble.
+#
+#   3. When the closing tag is detected, MSG_TYPE_ARTEFACT_DONE
+#      (or the matching *_DONE type) is fired with the complete raw content.
+#      _post_process_llm_response then runs and fires
+#      MSG_TYPE_ARTEFACTS_STATE_CHANGED.
+#
+# The separation means a UI only subscribed to MSG_TYPE_CHUNK will show clean
+# prose without XML noise, while a UI that wants to show live artifact diffs
+# subscribes to MSG_TYPE_ARTEFACT_CHUNK separately.
 
 import json
 import re
@@ -118,24 +141,17 @@ class ChatMixin:
     """
     Provides simplified_chat() and chat().
 
-    Changes vs previous version
-    ---------------------------
-    * _active_callback is stored on self at the start of every chat turn so
-      that _post_process_llm_response can fire artefact create/update events
-      in real time, and cleared at the end to avoid leaking across turns.
-    * enable_silent_artefact_explanation parameter (default True) is threaded
-      through both chat paths and both _post_process_llm_response call sites.
-    * enable_inline_widgets is wired through the fast path and agentic path
-      identically to enable_notes / enable_skills.
+    Artifact streaming
+    ------------------
+    Content inside <artifact>, <note>, <skill>, <lollms_inline> tags is routed
+    exclusively to the secondary MSG_TYPE_ARTEFACT_CHUNK / MSG_TYPE_NOTE_CHUNK /
+    MSG_TYPE_SKILL_CHUNK / MSG_TYPE_WIDGET_CHUNK stream.  It is NEVER sent via
+    MSG_TYPE_CHUNK so the main chat bubble stays clean.
     """
 
     # ------------------------------------------------------------------ helpers
 
     def _stream_final_answer(self, callback, images, branch_tip_id, temperature, **kwargs):
-        """
-        Calls the LLM to generate the next response.
-        branch_tip_id controls which message is the tip of the exported branch.
-        """
         caller_stream = kwargs.pop("stream", None)
         kwargs.pop("callback", None)
         kwargs.pop("streaming_callback", None)
@@ -332,7 +348,6 @@ class ChatMixin:
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
 
-        # Stash callback so _post_process_llm_response can fire artefact events
         object.__setattr__(self, '_active_callback', callback)
 
         def is_fast(msg):
@@ -515,101 +530,26 @@ class ChatMixin:
         enable_silent_artefact_explanation: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
-        """
-        Chat with opt-in agentic tool use.
-
-        Fast path
-        ---------
-        If no tools are registered, the method skips all agentic scaffolding
-        and goes directly to a single LLM call.  The model may still emit
-        <artefact>, <note>, <skill>, and <lollms_inline> XML tags inline.
-
-        Callback lifecycle
-        ------------------
-        self._active_callback is set to the streaming callback at the start of
-        every turn and cleared at the end.  _post_process_llm_response reads it
-        to fire artefact create/update events in real time as each XML tag is
-        processed, so the UI never has to wait for the full response.
-
-        Scratchpad placement
-        --------------------
-        self.scratchpad is written to as tool results accumulate.  export()
-        injects it as a role:system message immediately after the last user
-        message, so the model always sees full tool-output context in the most
-        relevant position.
-
-        Anti-duplication
-        ----------------
-        _completed_tool_calls and _created_artefact_titles track every call
-        and every produced title this turn.  An AGENT STATE block is prepended
-        to the scratchpad (temporarily) at the top of each round.
-
-        Runaway guard
-        -------------
-        _identical_call_counts[signature] tracks how many times each exact
-        call has been made.  On the second repeat the call is blocked with a
-        synthetic result; on the third the loop breaks hard.  Different params
-        on the same tool are always allowed (multi-query investigation).
-
-        Inline widgets
-        --------------
-        When enable_inline_widgets=True (default) the model may emit
-        <lollms_inline type="html|react|svg" title="…">…</lollms_inline> tags.
-        These are buffered during streaming and extracted into
-        ai_message.metadata["inline_widgets"].
-
-        Notes
-        -----
-        When enable_notes=True (default) the model may emit
-        <note title="…">…</note> tags.  Each is saved as an ArtefactType.NOTE
-        artefact, active immediately, and stripped from the visible message text.
-
-        Skills
-        ------
-        When enable_skills=True (default False) the model may emit
-        <skill title="…" description="…" category="…">…</skill> tags.
-        Each is saved as an ArtefactType.SKILL artefact.
-
-        Silent artefact guard
-        ---------------------
-        When enable_silent_artefact_explanation=True (default), if the LLM
-        response consists entirely of XML tags with no human-readable text,
-        a concise auto-generated summary of what was created/updated is shown
-        so the chat never presents the user with an empty bubble.
-
-        Swarm mode
-        ----------
-        When swarm= is a non-empty list of Agent objects, the discussion
-        delegates the entire turn to SwarmOrchestrator, which runs a
-        multi-agent deliberation session.  swarm_config= is an optional
-        SwarmConfig instance; if omitted, SwarmConfig() defaults are used.
-        The return dict gains two extra keys:
-          ``agent_messages``  — list of LollmsMessage objects, one per agent per round
-          ``hlf_log``         — list of HLF message dicts (inter-agent protocol log)
-          ``swarm_meta``      — run statistics dict
-        """
         self.scratchpad = ""
 
-        # ── Normalise personality ────────────────────────────────────────────
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
-        # patch temperature
+
         if "temperature" in kwargs:
-            final_answer_temperature=kwargs.pop("temperature")
+            final_answer_temperature = kwargs.pop("temperature")
         else:
-            final_answer_temperature=0.7
-        # Stash callback for real-time artefact events in _post_process_llm_response
+            final_answer_temperature = 0.7
+
         object.__setattr__(self, '_active_callback', callback)
 
         # ====================================================================
-        #  SWARM DISPATCH — delegate to SwarmOrchestrator when agents present
+        #  SWARM DISPATCH
         # ====================================================================
         if swarm:
             from lollms_client.lollms_swarm import SwarmOrchestrator, SwarmConfig as _SC
 
             _swarm_config = swarm_config if swarm_config is not None else _SC()
 
-            # Add user message first so agents can read it
             if add_user_message:
                 user_msg = self.add_message(
                     sender=kwargs.get("user_name", "user"),
@@ -636,7 +576,7 @@ class ChatMixin:
                 self.commit()
             return result
 
-        # ── Effective image flags (auto-resolve against TTI availability) ────
+        # ── Effective image flags ────────────────────────────────────────────
         _tti_available = getattr(self.lollmsClient, 'tti', None) is not None
         _eff_img_gen   = enable_image_generation and _tti_available
         _eff_img_edit  = enable_image_editing     and _tti_available
@@ -657,7 +597,7 @@ class ChatMixin:
                 object.__setattr__(self, "_system_prompt", original_sp + extra_instructions)
 
         # ── Generation parameters ────────────────────────────────────────────
-        kwargs.pop("temperature", None) # protect against a temperature setting
+        kwargs.pop("temperature", None)
         decision_temperature       = kwargs.get("decision_temperature",       0.3)
         final_answer_temperature   = kwargs.get("final_answer_temperature",   final_answer_temperature)
         rag_top_k                  = kwargs.get("rag_top_k",                  5)
@@ -801,7 +741,6 @@ class ChatMixin:
                     "total_sections": len(active), "total_length": len(full_text),
                     "last_updated": composable_answer.get("last_updated")}
 
-        # ── Validated wrapper factory ────────────────────────────────────────
         def _make_wrapper(fn: Any, params_spec: List[Dict]) -> Any:
             def _wrapped(**kw):
                 try:
@@ -920,7 +859,7 @@ class ChatMixin:
                 output      = [{"name": "sources", "type": "list"}],
             )
 
-        # ── Personality system prompt + veracity ─────────────────────────────
+        # ── Personality system prompt ─────────────────────────────────────────
         if personality.system_prompt:
             veracity = (
                 "\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
@@ -1048,7 +987,6 @@ class ChatMixin:
         #  Built-in tools (only when external tools exist)
         # ====================================================================
 
-        # show_tools ----------------------------------------------------------
         if enable_show_tools:
             def _show_tools_impl():
                 catalogue: List[Dict[str, Any]] = []
@@ -1079,8 +1017,8 @@ class ChatMixin:
                 ]
                 if enable_extract_artefact:
                     builtins.append({
-                        "name": "extract_artefact_text",
-                        "description": "Extract a range from an artefact by line-hint anchors",
+                        "name": "extract_artifact_text",
+                        "description": "Extract a range from an artifact by line-hint anchors",
                         "parameters": [
                             {"name": "source_title",    "type": "str"},
                             {"name": "new_title",       "type": "str"},
@@ -1142,7 +1080,6 @@ class ChatMixin:
             tool_registry["show_tools"] = _show_tools_impl
             tool_descriptions.append("- show_tools(): Display the full list of available tools")
 
-        # extract_artefact_text -----------------------------------------------
         if enable_extract_artefact:
             def _extract_artefact_text_impl(
                 source_title: str, new_title: str,
@@ -1154,12 +1091,12 @@ class ChatMixin:
                 source = self.artefacts.get(source_title)
                 if source is None:
                     return {"success": False,
-                            "error": f"Artefact '{source_title}' not found."}
+                            "error": f"Artifact '{source_title}' not found."}
                 all_lines = source.get("content", "").splitlines()
                 total = len(all_lines)
                 if total == 0:
                     return {"success": False,
-                            "error": f"Artefact '{source_title}' is empty."}
+                            "error": f"Artifact '{source_title}' is empty."}
                 sh = start_line_hint.strip().lower()
                 eh = end_line_hint.strip().lower()
                 if not sh:
@@ -1205,15 +1142,14 @@ class ChatMixin:
                     "artefact_id": new_art.get("id"),
                 }
 
-            tool_registry["extract_artefact_text"] = _extract_artefact_text_impl
+            tool_registry["extract_artifact_text"] = _extract_artefact_text_impl
             tool_descriptions.append(
-                "- extract_artefact_text(source_title: str, new_title: str, "
+                "- extract_artifact_text(source_title: str, new_title: str, "
                 "start_line_hint: str, end_line_hint: str, occurrence: int = 1, "
                 "artefact_type: str = 'document', language: str = ''): "
-                "Extract a range from an artefact by line-prefix anchors"
+                "Extract a range from an artifact by line-prefix anchors"
             )
 
-        # REPL text tools -----------------------------------------------------
         if enable_repl_tools:
             try:
                 from ._repl_tools import TextBuffer, register_repl_tools as _reg_repl
@@ -1221,7 +1157,6 @@ class ChatMixin:
             except ImportError as _e:
                 _warning(callback, f"REPL text tools unavailable: {_e}")
 
-        # final_answer --------------------------------------------------------
         if enable_final_answer:
             tool_registry["final_answer"] = lambda: {
                 "status":  "final",
@@ -1231,7 +1166,6 @@ class ChatMixin:
             }
             tool_descriptions.append("- final_answer(): Signal that the answer is ready")
 
-        # request_clarification -----------------------------------------------
         if enable_request_clarification:
             tool_registry["request_clarification"] = lambda question: {
                 "status": "clarification", "question": question, "success": True,
@@ -1297,7 +1231,7 @@ class ChatMixin:
                 tool_registry["deactivate_artefacts"] = _deactivate_artefacts_impl
                 tool_descriptions.insert(0,
                     "- deactivate_artefacts(titles: list[str]): "
-                    "CONTEXT PRESSURE -- deactivate unneeded artefacts first")
+                    "CONTEXT PRESSURE -- deactivate unneeded artifacts first")
                 _tc2 = [
                     "\n\n## Available Tools",
                     '  <tool_call>{"name": "tool_name", "parameters": {"key": "value"}}</tool_call>',
@@ -1324,11 +1258,9 @@ class ChatMixin:
         _temp_msg_ids:        List[str] = []
         _current_branch_tip   = branch_tip_id or self.active_branch_id
 
-        # Anti-duplication tracking
         _completed_tool_calls:    List[str] = []
         _created_artefact_titles: List[str] = []
 
-        # Runaway guard
         _MAX_IDENTICAL_REPEATS              = 2
         _identical_call_counts: Dict[str, int] = {}
 
@@ -1347,57 +1279,68 @@ class ChatMixin:
         _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE,
             {"message_id": ai_message.id})
 
-        # Tags that must be buffered / hidden from the live chat UI stream
+        # ── Tags that must be buffered / hidden from the live chat UI stream ─
+        # Note: "<artifact" covers both "<artifact " and "<artifact>" openings.
+        # The legacy "<artefact" is also listed so both spellings are buffered.
         _TAG_STARTS = [
-            _TC_OPEN, "<think>", "<think ", "<artefact", "<generate_image",
-            "<edit_image", "<revert_artefact", "<generate_slides",
-            "<street_view", "<schedule_task", "<note", "<skill", "<lollms_event",
-            "<lollms_inline",
+            _TC_OPEN, "<think>", "<think ", "<artifact", "<artefact",
+            "<generate_image", "<edit_image", "<revert_artifact", "<revert_artefact",
+            "<generate_slides", "<street_view", "<schedule_task",
+            "<note", "<skill", "<lollms_event", "<lollms_inline",
         ]
 
         # ── Secondary-stream tag type mapping ────────────────────────────────
         # Maps tag prefix → (open_meta_type, chunk_MSG_TYPE, done_MSG_TYPE, close_tag)
-        # open_meta_type is the string put in the MSG_TYPE_CHUNK announcement meta.
+        #
+        # IMPORTANT: artifact content chunks go to MSG_TYPE_ARTEFACT_CHUNK,
+        # NOT to MSG_TYPE_CHUNK.  The main chat bubble never sees these bytes.
         _SECONDARY_TAG_MAP = {
-            "<artefact":    ("artefact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
-                             MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,  "</artefact>"),
-            "<note":        ("note_start",           MSG_TYPE.MSG_TYPE_NOTE_CHUNK,
-                             MSG_TYPE.MSG_TYPE_NOTE_DONE,      "</note>"),
-            "<skill":       ("skill_start",          MSG_TYPE.MSG_TYPE_SKILL_CHUNK,
-                             MSG_TYPE.MSG_TYPE_SKILL_DONE,     "</skill>"),
-            "<lollms_inline":("inline_widget_start", MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,
-                              MSG_TYPE.MSG_TYPE_WIDGET_DONE,   "</lollms_inline>"),
+            # American spelling (primary — what we instruct the LLM to use)
+            "<artifact":     ("artifact_update",      MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
+                              MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,   "</artifact>"),
+            # British spelling (legacy fallback — some models still output it)
+            "<artefact":     ("artifact_update",      MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
+                              MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,   "</artefact>"),
+            "<note":         ("note_start",            MSG_TYPE.MSG_TYPE_NOTE_CHUNK,
+                              MSG_TYPE.MSG_TYPE_NOTE_DONE,        "</note>"),
+            "<skill":        ("skill_start",           MSG_TYPE.MSG_TYPE_SKILL_CHUNK,
+                              MSG_TYPE.MSG_TYPE_SKILL_DONE,       "</skill>"),
+            "<lollms_inline":("inline_widget_start",   MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,
+                              MSG_TYPE.MSG_TYPE_WIDGET_DONE,      "</lollms_inline>"),
         }
 
         while _round < max_reasoning_steps:
             _round += 1
             _stream_buf: List[str] = []
 
-            # ── Streaming flow-control state — reset every round ─────────────
-            _in_logic_tag         = False
-            _is_hidden_tag        = False
-            _tool_trigger         = False
+            # ── Per-round streaming state ────────────────────────────────────
+            _in_logic_tag         = False   # inside <tool_call>
+            _is_hidden_tag        = False   # inside any buffered/secondary tag
+            _tool_trigger         = False   # </tool_call> detected → stop round
             _bracket_buf: List[str] = []
             _is_buffering_bracket = False
 
-            # Secondary-stream state: which XML tag are we currently inside?
-            _sec_tag_prefix:  str        = ""   # e.g. "<artefact"
-            _sec_chunk_type:  Any        = None  # MSG_TYPE for chunk events
-            _sec_done_type:   Any        = None  # MSG_TYPE for done event
-            _sec_close_tag:   str        = ""    # e.g. "</artefact>"
-            _sec_open_meta:   Dict       = {}    # attrs extracted from opening tag
-            _sec_content_buf: List[str]  = []    # accumulates raw content inside tag
-            # Buffer for partial close-tag detection across chunk boundaries
-            _sec_close_scan:  str        = ""
+            # Secondary-stream state for the current open tag
+            _sec_tag_prefix:  str        = ""
+            _sec_chunk_type:  Any        = None
+            _sec_done_type:   Any        = None
+            _sec_close_tag:   str        = ""
+            _sec_open_meta:   Dict       = {}
+            _sec_content_buf: List[str]  = []
+            _sec_close_scan:  str        = ""  # cross-chunk close-tag scanner
 
             def _parse_tag_attrs(attr_str: str) -> Dict[str, str]:
                 return {m.group(1): m.group(2)
                         for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
-            def _build_open_meta_and_announce(b_str: str) -> None:
+            def _enter_secondary_tag(b_str: str) -> None:
                 """
-                Called once when an opening tag's full `<tag attrs>` is seen.
-                Fires the MSG_TYPE_CHUNK announcement and populates _sec_open_meta.
+                Called once when an opening secondary tag's full `<tag attrs>` has
+                been buffered.  Sets up the secondary-stream state and fires a single
+                MSG_TYPE_CHUNK announcement (empty text, typed meta) so the UI can
+                open a secondary panel.  Content bytes are then routed exclusively to
+                the appropriate secondary MSG_TYPE (MSG_TYPE_ARTEFACT_CHUNK etc.) and
+                NEVER to MSG_TYPE_CHUNK.
                 """
                 nonlocal _sec_tag_prefix, _sec_chunk_type, _sec_done_type
                 nonlocal _sec_close_tag, _sec_open_meta, _sec_content_buf, _sec_close_scan
@@ -1407,10 +1350,10 @@ class ChatMixin:
                     if not b_str.startswith(prefix):
                         continue
 
-                    # Only handle tags that are enabled
-                    if prefix == "<note"         and not enable_notes:            break
-                    if prefix == "<skill"        and not enable_skills:           break
-                    if prefix == "<lollms_inline" and not enable_inline_widgets:  break
+                    # Respect feature flags
+                    if prefix in ("<note",)          and not enable_notes:           break
+                    if prefix in ("<skill",)         and not enable_skills:          break
+                    if prefix in ("<lollms_inline",) and not enable_inline_widgets:  break
 
                     attrs = _parse_tag_attrs(b_str)
                     _sec_tag_prefix  = prefix
@@ -1421,14 +1364,16 @@ class ChatMixin:
                     _sec_content_buf = []
                     _sec_close_scan  = ""
 
-                    # Build the announcement meta (same shape as before — backwards compat)
-                    if prefix == "<artefact":
+                    # ── One-time announcement on MSG_TYPE_CHUNK (empty text) ──
+                    # This tells the UI "a secondary panel is opening" without
+                    # polluting the chat bubble with any artifact bytes.
+                    if prefix in ("<artifact", "<artefact"):
                         title = attrs.get('name') or attrs.get('title', '')
                         if title and title not in _created_artefact_titles:
                             _created_artefact_titles.append(title)
                         _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                            "type": "artefact_update",
-                            "content": {"title": title}
+                            "type":    "artifact_update",
+                            "content": {"title": title},
                         })
 
                     elif prefix == "<note":
@@ -1436,8 +1381,8 @@ class ChatMixin:
                         if title and title not in _created_artefact_titles:
                             _created_artefact_titles.append(title)
                         _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                            "type": "note_start",
-                            "content": {"title": title}
+                            "type":    "note_start",
+                            "content": {"title": title},
                         })
 
                     elif prefix == "<skill":
@@ -1446,8 +1391,8 @@ class ChatMixin:
                         if title and title not in _created_artefact_titles:
                             _created_artefact_titles.append(title)
                         _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                            "type": "skill_start",
-                            "content": {"title": title, "category": category}
+                            "type":    "skill_start",
+                            "content": {"title": title, "category": category},
                         })
 
                     elif prefix == "<lollms_inline":
@@ -1455,16 +1400,19 @@ class ChatMixin:
                         widget_type = attrs.get('type', 'html')
                         _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
                             "type":    "inline_widget_start",
-                            "content": {"title": title, "widget_type": widget_type}
+                            "content": {"title": title, "widget_type": widget_type},
                         })
                     break
 
-            def _fire_sec_chunk(raw_chunk: str) -> None:
-                """Fire a secondary-stream chunk event for the current tag type."""
+            def _fire_secondary_chunk(raw_chunk: str) -> None:
+                """
+                Forward a content fragment on the secondary stream only.
+                NEVER calls MSG_TYPE_CHUNK — the main chat bubble must stay clean.
+                """
                 if not _sec_chunk_type or not raw_chunk:
                     return
                 attrs = _sec_open_meta
-                if _sec_tag_prefix == "<artefact":
+                if _sec_tag_prefix in ("<artifact", "<artefact"):
                     _cb(callback, raw_chunk, _sec_chunk_type, {
                         "title":    attrs.get('name') or attrs.get('title', ''),
                         "chunk":    raw_chunk,
@@ -1490,8 +1438,11 @@ class ChatMixin:
                         "widget_type": attrs.get('type', 'html'),
                     })
 
-            def _fire_sec_done() -> None:
-                """Fire the secondary-stream done event and reset secondary state."""
+            def _fire_secondary_done() -> None:
+                """
+                Fire the done event for the current secondary tag and reset state.
+                Does NOT touch MSG_TYPE_CHUNK.
+                """
                 nonlocal _sec_tag_prefix, _sec_chunk_type, _sec_done_type
                 nonlocal _sec_close_tag, _sec_open_meta, _sec_content_buf, _sec_close_scan
 
@@ -1501,7 +1452,7 @@ class ChatMixin:
                 full_content = "".join(_sec_content_buf)
                 attrs        = _sec_open_meta
 
-                if _sec_tag_prefix == "<artefact":
+                if _sec_tag_prefix in ("<artifact", "<artefact"):
                     is_patch = bool(re.search(r'<{6,8}\s*SEARCH', full_content, re.I))
                     _cb(callback, full_content, _sec_done_type, {
                         "title":    attrs.get('name') or attrs.get('title', ''),
@@ -1531,7 +1482,7 @@ class ChatMixin:
                         "widget_type": attrs.get('type', 'html'),
                     })
 
-                # Reset secondary state
+                # Reset all secondary state
                 _sec_tag_prefix  = ""
                 _sec_chunk_type  = None
                 _sec_done_type   = None
@@ -1541,6 +1492,19 @@ class ChatMixin:
                 _sec_close_scan  = ""
 
             def _inline_relay(chunk, msg_type=None, meta=None):
+                """
+                Per-chunk streaming router.
+
+                Routing rules:
+                  • Non-chunk events (thoughts, reasoning, etc.) pass through unchanged.
+                  • Inside <tool_call>: buffer silently; stop round on </tool_call>.
+                  • Inside a secondary tag (<artifact>, <note>, etc.):
+                      - Content bytes → secondary MSG_TYPE only (ARTEFACT_CHUNK etc.)
+                      - NEVER forwarded to MSG_TYPE_CHUNK.
+                  • Inside <think> or other silently-buffered tags: swallow entirely.
+                  • Normal prose: forward to MSG_TYPE_CHUNK and accumulate in
+                    ai_message.content so the bubble updates live.
+                """
                 nonlocal _in_logic_tag, _is_hidden_tag, _tool_trigger
                 nonlocal _is_buffering_bracket, _sec_close_scan
 
@@ -1556,68 +1520,60 @@ class ChatMixin:
                 _stream_buf.append(chunk)
                 _so_far = "".join(_stream_buf)
 
-                # ── Inside <tool_call>: buffer silently; stop on close tag ────
+                # ── Inside <tool_call>: buffer silently ──────────────────────
                 if _in_logic_tag:
                     if _TC_CLOSE in _so_far:
                         _tool_trigger = True
-                        return False
+                        return False   # stop generation
                     return True
 
-                # ── Inside a secondary-stream tag (artefact/note/skill/widget) ─
-                # Forward each chunk on the secondary stream, detect closing tag.
+                # ── Inside a secondary tag ───────────────────────────────────
+                # Route every byte to the secondary stream; detect closing tag.
+                # NOTHING reaches MSG_TYPE_CHUNK from inside a secondary tag.
                 if _is_hidden_tag and _sec_tag_prefix:
-                    # Check for tool_call nested inside (shouldn't happen but be safe)
                     if _TC_OPEN in chunk:
+                        # Nested tool_call inside artifact — unusual but handle it
                         _in_logic_tag = True
                         return True
 
-                    # Accumulate close-tag scanner across chunk boundaries
                     _sec_close_scan += chunk
-                    close_tag = _sec_close_tag  # e.g. "</artefact>"
+                    close_tag = _sec_close_tag
                     close_len = len(close_tag)
 
                     if close_tag in _sec_close_scan:
-                        # Found the closing tag — split content at it
-                        idx      = _sec_close_scan.index(close_tag)
-                        pre_part = _sec_close_scan[:idx]
-                        # Everything after the close tag goes back to normal stream
+                        idx       = _sec_close_scan.index(close_tag)
+                        pre_part  = _sec_close_scan[:idx]
                         post_part = _sec_close_scan[idx + close_len:]
 
-                        # Emit any remaining content before the close
                         if pre_part:
                             _sec_content_buf.append(pre_part)
-                            _fire_sec_chunk(pre_part)
+                            _fire_secondary_chunk(pre_part)
 
-                        # Fire the done event
-                        _fire_sec_done()
+                        _fire_secondary_done()
 
-                        # Reset hidden-tag state
-                        _is_hidden_tag = False
+                        _is_hidden_tag  = False
                         _sec_close_scan = ""
 
-                        # Route any post-close content back through normal processing
+                        # Post-close prose goes to the chat bubble normally
                         if post_part:
-                            # Directly append to visible stream (simple case: prose after tag)
                             ai_message.content += post_part
                             _cb(callback, post_part, MSG_TYPE.MSG_TYPE_CHUNK)
                     else:
-                        # Close tag not yet complete — keep scanning
-                        # Only forward content that cannot be the start of the close tag
-                        # (to avoid emitting partial close-tag fragments)
+                        # Close tag not yet complete — emit safe prefix to secondary
                         safe_len = max(0, len(_sec_close_scan) - close_len + 1)
                         safe_content = _sec_close_scan[:safe_len]
                         if safe_content:
                             _sec_content_buf.append(safe_content)
-                            _fire_sec_chunk(safe_content)
+                            _fire_secondary_chunk(safe_content)
                             _sec_close_scan = _sec_close_scan[safe_len:]
 
                     return True
 
-                # ── Inside <think> or other silently-buffered hidden tags ──────
+                # ── Inside <think> or other silently-buffered tags ───────────
                 if _is_hidden_tag:
                     if _TC_OPEN in _so_far:
                         _in_logic_tag = True
-                    return True
+                    return True   # swallow — no MSG_TYPE_CHUNK forwarding
 
                 # ── Normal content: scan for tag openings ────────────────────
                 rem = chunk
@@ -1639,43 +1595,36 @@ class ChatMixin:
                                 _is_hidden_tag        = True
                                 _is_buffering_bracket = False
 
-                                # Fire opening announcement + set up secondary stream
-                                _build_open_meta_and_announce(b_str)
+                                # Set up secondary-stream state and fire announcement
+                                _enter_secondary_tag(b_str)
 
-                                # Reset close-tag scanner for the new tag
-                                _sec_close_scan = ""
-
-                                # Any content remaining in this chunk after the
-                                # opening tag belongs to the secondary stream, not
-                                # the chat bubble.  Route it through the secondary
-                                # handler and stop the while-rem loop — subsequent
-                                # chunks will enter via the _is_hidden_tag branch.
+                                # Route any remaining content in this chunk that
+                                # comes immediately after the opening tag.
                                 if rem and _sec_tag_prefix:
                                     _sec_close_scan += rem
                                     close_tag = _sec_close_tag
                                     close_len = len(close_tag)
                                     if close_tag in _sec_close_scan:
-                                        idx       = _sec_close_scan.index(close_tag)
-                                        pre_part  = _sec_close_scan[:idx]
-                                        post_part = _sec_close_scan[idx + close_len:]
-                                        if pre_part:
-                                            _sec_content_buf.append(pre_part)
-                                            _fire_sec_chunk(pre_part)
-                                        _fire_sec_done()
+                                        idx2      = _sec_close_scan.index(close_tag)
+                                        pre2      = _sec_close_scan[:idx2]
+                                        post2     = _sec_close_scan[idx2 + close_len:]
+                                        if pre2:
+                                            _sec_content_buf.append(pre2)
+                                            _fire_secondary_chunk(pre2)
+                                        _fire_secondary_done()
                                         _is_hidden_tag  = False
                                         _sec_close_scan = ""
-                                        if post_part:
-                                            ai_message.content += post_part
-                                            _cb(callback, post_part,
-                                                MSG_TYPE.MSG_TYPE_CHUNK)
+                                        if post2:
+                                            ai_message.content += post2
+                                            _cb(callback, post2, MSG_TYPE.MSG_TYPE_CHUNK)
                                     else:
-                                        safe_len = max(0, len(_sec_close_scan) - close_len + 1)
-                                        safe_content = _sec_close_scan[:safe_len]
-                                        if safe_content:
-                                            _sec_content_buf.append(safe_content)
-                                            _fire_sec_chunk(safe_content)
-                                            _sec_close_scan = _sec_close_scan[safe_len:]
-                                rem = ""   # consumed — exit the while loop
+                                        safe_len2 = max(0, len(_sec_close_scan) - close_len + 1)
+                                        safe2 = _sec_close_scan[:safe_len2]
+                                        if safe2:
+                                            _sec_content_buf.append(safe2)
+                                            _fire_secondary_chunk(safe2)
+                                            _sec_close_scan = _sec_close_scan[safe_len2:]
+                                rem = ""
                                 continue
 
                             # Not a special tag — flush buffered bracket content
@@ -1687,7 +1636,7 @@ class ChatMixin:
                         else:
                             _bracket_buf.append(rem)
                             b_str = "".join(_bracket_buf)
-                            # Fail-safe: flush if obviously not a tag
+                            # Fail-safe: flush if clearly not a tag
                             if (any(c in b_str for c in [" ", "\n", "\r", "\t"])
                                     or len(b_str) > 100):
                                 if not any(s.startswith(b_str) for s in _TAG_STARTS):
@@ -1713,7 +1662,7 @@ class ChatMixin:
                             rem = ""
                 return True
 
-            # ── Build agent-state header and prepend to scratchpad ───────────
+            # ── Build agent-state header ─────────────────────────────────────
             _saved_scratchpad = self.scratchpad
             if _completed_tool_calls or _created_artefact_titles:
                 _state_lines = [
@@ -1723,7 +1672,7 @@ class ChatMixin:
                     _state_lines.append("Tool calls already made:")
                     _state_lines.extend(f"  ✓ {c}" for c in _completed_tool_calls)
                 if _created_artefact_titles:
-                    _state_lines.append("Artefacts / notes already created:")
+                    _state_lines.append("Artifacts / notes already created:")
                     _state_lines.extend(f"  ✓ {t}" for t in _created_artefact_titles)
                 _state_lines.append("=== END AGENT STATE ===\n")
                 self.scratchpad = "\n".join(_state_lines) + (self.scratchpad or "")
@@ -1732,7 +1681,6 @@ class ChatMixin:
                 _inline_relay, images, _current_branch_tip, final_answer_temperature, **kwargs
             )
 
-            # Restore undecorated scratchpad
             self.scratchpad = _saved_scratchpad
 
             _so_far            = "".join(_stream_buf)
@@ -2031,7 +1979,6 @@ class ChatMixin:
                 if any(tc["name"] == n for tc in tool_calls_this_turn)
             ]
 
-        # Clear volatile scratchpad
         self.scratchpad = ""
 
         ai_message.content          = _clean
@@ -2061,7 +2008,6 @@ class ChatMixin:
         if self._is_db_backed and self.autosave:
             self.commit()
 
-        # Clear the stashed callback — must not leak into the next turn
         object.__setattr__(self, '_active_callback', None)
 
         return {
