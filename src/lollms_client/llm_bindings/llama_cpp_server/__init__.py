@@ -1059,7 +1059,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         This is the low-level counterpart to *_chat* for callers that already
         hold a formatted message list.
         """
-        n_predict   = self._resolve(n_predict,   self.default_n_predict or 1024)
+        n_predict   = self._resolve(n_predict,   self.default_n_predict or 16000)
         temperature = self._resolve(temperature, self.default_temperature or 0.7)
         top_k       = self._resolve(top_k,       self.default_top_k or 40)
         top_p       = self._resolve(top_p,       self.default_top_p or 0.9)
