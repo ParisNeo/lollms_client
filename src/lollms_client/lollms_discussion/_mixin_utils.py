@@ -75,9 +75,9 @@ class UtilsMixin:
                 full_system_prompt = data_zone_part
         participants = self.participants or {}
 
-        # Resolve scratchpad — empty scratchpad is suppressed entirely so no
-        # blank system message is ever injected into the context.
-        _scratchpad = (getattr(self, 'scratchpad', None) or "").strip()
+        # Scratchpad is now injected via export() to avoid template issues with
+        # mid-conversation system messages in strict chat templates like llama.cpp.
+        _scratchpad = ""  # Handled in get_full_data_zone and export()
 
         def get_full_content(msg):
             return msg.content.strip()
@@ -88,6 +88,10 @@ class UtilsMixin:
                 if branch_list[i].sender_type == 'user':
                     return i
             return -1
+
+        def _last_user_msg(branch_list):
+            idx = _last_user_index(branch_list)
+            return branch_list[idx] if idx >= 0 else None
 
         if format_type == "lollms_text":
             final_parts = []
@@ -130,13 +134,16 @@ class UtilsMixin:
                 current_tokens += msg_toks
 
                 # Inject scratchpad ONLY when non-empty, right after last user message
+                # For OpenAI/ollama_chat formats, we inject as a user message to avoid
+                # strict template issues with mid-conversation system messages
                 if _scratchpad and fwd_idx == last_user_idx:
-                    scratch_text = (
-                        "!@>system:\n"
+                    scratch_content = (
                         "== TOOL OUTPUT SCRATCHPAD ==\n"
                         f"{_scratchpad}\n"
-                        "== END SCRATCHPAD ==\n"
+                        "== END SCRATCHPAD =="
                     )
+                    # Use user role with special marker to avoid template issues
+                    scratch_text = f"!@>user:\n[SYSTEM CONTEXT]\n{scratch_content}\n[/SYSTEM CONTEXT]\n"
                     scratch_toks = self.lollmsClient.count_tokens(scratch_text)
                     if max_allowed_tokens is None or current_tokens + scratch_toks <= max_allowed_tokens:
                         # index 1 = immediately after the user msg prepended at [0]
@@ -214,6 +221,8 @@ class UtilsMixin:
                 raise ValueError(f"Unsupported format_type: {format_type}")
 
             # Inject scratchpad ONLY when non-empty, right after last user message
+            # For OpenAI-compatible APIs with strict templates, use a user message
+            # with special markers rather than a system message mid-conversation
             if _scratchpad and idx == last_user_idx:
                 scratch_content = (
                     "== TOOL OUTPUT SCRATCHPAD ==\n"
@@ -221,9 +230,16 @@ class UtilsMixin:
                     "== END SCRATCHPAD =="
                 )
                 if format_type == "openai_chat":
-                    messages.append({"role": "system", "content": scratch_content})
+                    # Use user role with marker to avoid "system role not supported here" errors
+                    messages.append({
+                        "role": "user",
+                        "content": f"[SYSTEM CONTEXT - TOOL OUTPUTS]\n{scratch_content}\n[/SYSTEM CONTEXT]"
+                    })
                 elif format_type == "ollama_chat":
-                    messages.append({"role": "system", "content": scratch_content})
+                    messages.append({
+                        "role": "user",
+                        "content": f"[SYSTEM CONTEXT - TOOL OUTPUTS]\n{scratch_content}\n[/SYSTEM CONTEXT]"
+                    })
                 elif format_type == "markdown":
                     messages.append(f"**system**: {scratch_content}\n")
 

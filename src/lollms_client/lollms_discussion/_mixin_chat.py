@@ -20,9 +20,32 @@
 #      _post_process_llm_response then runs and fires
 #      MSG_TYPE_ARTEFACTS_STATE_CHANGED.
 #
-# The separation means a UI only subscribed to MSG_TYPE_CHUNK will show clean
-# prose without XML noise, while a UI that wants to show live artifact diffs
-# subscribes to MSG_TYPE_ARTEFACT_CHUNK separately.
+# HANDLE SYSTEM
+# -------------
+# Handles let the LLM reference an already-generated code block by position
+# rather than rewriting it entirely.  Format:  <msg_index>:<block_index>
+#
+#   msg_index   — 0-based index of the message in the current branch
+#   block_index — 0-based index of the fenced code block in that message
+#
+# The LLM emits:
+#   <use_handle ref="2:0" name="app.py" type="code" language="python"/>
+#
+# Post-processing extracts the referenced block and creates/updates the
+# artefact directly without any LLM regeneration.
+#
+# TOOL-CALLING RELIABILITY IMPROVEMENTS
+# --------------------------------------
+# 1. The tool catalogue is injected as a COMPACT, high-signal block placed
+#    immediately before the assistant turn marker so it is the last thing
+#    the LLM reads before generating.  This dramatically increases compliance.
+#
+# 2. A per-round AGENT REMINDER is injected into the scratchpad only when
+#    external tools are registered.  It repeats the call syntax in ≤5 lines.
+#
+# 3. When no tool call is detected on round 1 AND external tools are registered
+#    AND the query appears to need a tool, the orchestrator injects a corrective
+#    "you forgot to call a tool" message and retries once.
 
 import json
 import re
@@ -134,6 +157,166 @@ def _extract_content_title(content: str, max_len: int = 80) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Handle system helpers
+# ---------------------------------------------------------------------------
+
+def _extract_code_blocks(text: str) -> List[Dict[str, str]]:
+    """
+    Extract all fenced code blocks from *text*.
+    Returns a list of dicts: {language, content, raw}
+    in the order they appear.
+    """
+    blocks = []
+    pattern = re.compile(r'```(\w*)\n(.*?)```', re.DOTALL)
+    for m in pattern.finditer(text):
+        blocks.append({
+            "language": m.group(1).strip(),
+            "content":  m.group(2),
+            "raw":      m.group(0),
+        })
+    return blocks
+
+
+def _resolve_handle(ref: str, branch_messages: List) -> Optional[Dict[str, str]]:
+    """
+    Resolve a handle reference like "2:0" to the code block it points to.
+    Returns {language, content} or None if the ref is invalid.
+
+    branch_messages — ordered list of LollmsMessage objects (root-to-tip).
+    """
+    parts = ref.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        msg_idx   = int(parts[0])
+        block_idx = int(parts[1])
+    except ValueError:
+        return None
+
+    if msg_idx < 0 or msg_idx >= len(branch_messages):
+        return None
+
+    msg    = branch_messages[msg_idx]
+    blocks = _extract_code_blocks(getattr(msg, "content", "") or "")
+
+    if block_idx < 0 or block_idx >= len(blocks):
+        return None
+
+    return blocks[block_idx]
+
+
+def _build_handle_instructions(branch_messages: List) -> str:
+    """
+    Build a brief instruction block listing available handles so the LLM
+    knows what it can reference without rewriting.
+    Only emitted when there are code blocks in the current branch.
+    """
+    entries = []
+    for msg_idx, msg in enumerate(branch_messages):
+        blocks = _extract_code_blocks(getattr(msg, "content", "") or "")
+        for block_idx, blk in enumerate(blocks):
+            lang    = blk["language"] or "text"
+            preview = blk["content"].strip().splitlines()[0][:60] if blk["content"].strip() else ""
+            entries.append(f"  {msg_idx}:{block_idx}  [{lang}]  {preview}")
+
+    if not entries:
+        return ""
+
+    lines = [
+        "",
+        "=== AVAILABLE HANDLES ===",
+        "Instead of rewriting a code block that already exists in the conversation,",
+        "you can reference it by handle to create or update an artefact directly.",
+        "",
+        "Syntax (self-closing tag):",
+        '  <use_handle ref="<msg_idx>:<block_idx>" name="filename.ext"',
+        '              type="code" language="python"/>',
+        "",
+        "Available handles in this conversation:",
+    ] + entries + [
+        "",
+        "Example — convert the Python block at position 1:0 into an artefact:",
+        '  <use_handle ref="1:0" name="main.py" type="code" language="python"/>',
+        "=== END HANDLES ===",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool-catalogue helpers
+# ---------------------------------------------------------------------------
+
+_TOOL_CALL_HEADER = """\
+
+╔══════════════════════════════════════════════════════════════════╗
+║  TOOL USE — READ CAREFULLY BEFORE GENERATING                     ║
+╠══════════════════════════════════════════════════════════════════╣
+║  You have external tools. To use one you MUST emit a tool_call   ║
+║  tag containing a JSON object — NO markdown, NO prose calls.     ║
+║                                                                  ║
+║  EXACT FORMAT (copy this pattern):                               ║
+║    <tool_call>{"name": "tool_name",                              ║
+║                "parameters": {"key": "value"}}</tool_call>       ║
+║                                                                  ║
+║  Rules:                                                          ║
+║    • One tool call per response turn.                            ║
+║    • Do NOT call a tool you already called this turn (see STATE) ║
+║    • After calling ALL needed tools, write your final answer.    ║
+║    • If the user explicitly asks you to use a tool, USE IT.      ║
+╚══════════════════════════════════════════════════════════════════╝
+
+TOOLS AVAILABLE:
+"""
+
+_TOOL_CALL_REMINDER = """\
+[AGENT REMINDER — YOU HAVE TOOLS]
+Call syntax:  <tool_call>{"name": "NAME", "parameters": {…}}</tool_call>
+One call per turn. Check AGENT STATE above before calling.
+If the user asked you to use a specific tool, call it NOW.
+"""
+
+_TOOL_CALL_CORRECTION = """\
+You were expected to call a tool but did not emit a <tool_call> tag.
+Please re-read the available tools and call the most appropriate one now.
+Do not explain why you didn't call it — just call it.
+"""
+
+
+def _build_tool_system_prompt(
+    base_system_prompt: str,
+    tool_descriptions: List[str],
+) -> str:
+    """
+    Replaces any previous tool section in *base_system_prompt* and appends
+    a fresh, compact tool-call block at the end.
+
+    The tool catalogue is placed at the END of the system prompt so it is
+    the last thing before the conversation history — maximising recall.
+    """
+    # Strip any previous tool section to avoid accumulation
+    cleaned = re.split(
+        r'\n*╔══+╗.*?╚══+╝.*?\nTOOLS AVAILABLE:',
+        base_system_prompt,
+        flags=re.DOTALL,
+    )[0].rstrip()
+    # Also strip the old plain-text variant
+    cleaned = re.split(
+        r'\n*## Available Tools.*',
+        cleaned,
+        flags=re.DOTALL,
+    )[0].rstrip()
+    cleaned = re.split(
+        r'\n*### FUNCTION CALLING INSTRUCTIONS.*',
+        cleaned,
+        flags=re.DOTALL,
+    )[0].rstrip()
+
+    tool_block = _TOOL_CALL_HEADER + "\n".join(tool_descriptions)
+    return cleaned + "\n\n" + tool_block
+
+
+# ---------------------------------------------------------------------------
 # ChatMixin
 # ---------------------------------------------------------------------------
 
@@ -147,6 +330,11 @@ class ChatMixin:
     exclusively to the secondary MSG_TYPE_ARTEFACT_CHUNK / MSG_TYPE_NOTE_CHUNK /
     MSG_TYPE_SKILL_CHUNK / MSG_TYPE_WIDGET_CHUNK stream.  It is NEVER sent via
     MSG_TYPE_CHUNK so the main chat bubble stays clean.
+
+    Handle system
+    -------------
+    <use_handle ref="N:M" name="..." type="..." language="..."/>
+    Converts an already-generated code block into an artefact without rewriting.
     """
 
     # ------------------------------------------------------------------ helpers
@@ -365,6 +553,13 @@ class ChatMixin:
             extra_instructions += self._build_note_instructions()
         if enable_skills:
             extra_instructions += self._build_skill_instructions()
+
+        # Add handle instructions based on current branch
+        branch_msgs = self.get_branch(branch_tip_id or self.active_branch_id)
+        handle_instructions = _build_handle_instructions(branch_msgs)
+        if handle_instructions:
+            extra_instructions += handle_instructions
+
         if extra_instructions.strip():
             original_sp = self._system_prompt or ""
             if extra_instructions not in original_sp:
@@ -389,8 +584,16 @@ class ChatMixin:
                 model_name=self.lollmsClient.llm.model_name,
                 binding_name=self.lollmsClient.llm.binding_name,
             )
+            # Resolve handles before post-processing
+            branch_msgs_updated = self.get_branch(ai.id)
+            text_after_handles, handle_artefacts = _apply_handles(
+                text, branch_msgs_updated, self.artefacts
+            )
+            if text_after_handles != text:
+                ai.content = text_after_handles
+
             cleaned, affected = self._post_process_llm_response(
-                text, ai,
+                text_after_handles, ai,
                 enable_image_generation, enable_image_editing,
                 auto_activate_artefacts,
                 enable_inline_widgets=enable_inline_widgets,
@@ -398,7 +601,8 @@ class ChatMixin:
                 enable_skills=enable_skills,
                 enable_silent_artefact_explanation=enable_silent_artefact_explanation,
             )
-            if cleaned != text:
+            affected = handle_artefacts + affected
+            if cleaned != text_after_handles:
                 ai.content = cleaned
             if affected and callback:
                 _cb(callback, json.dumps([a.get("title") for a in affected]),
@@ -481,8 +685,17 @@ class ChatMixin:
             binding_name=self.lollmsClient.llm.binding_name,
             metadata={"sources": sources} if sources else {},
         )
+
+        # Resolve handles
+        branch_msgs_updated = self.get_branch(ai.id)
+        final_text_after_handles, handle_artefacts = _apply_handles(
+            final_text, branch_msgs_updated, self.artefacts
+        )
+        if final_text_after_handles != final_text:
+            ai.content = final_text_after_handles
+
         cleaned, affected = self._post_process_llm_response(
-            final_text, ai,
+            final_text_after_handles, ai,
             enable_image_generation, enable_image_editing,
             auto_activate_artefacts,
             enable_inline_widgets=enable_inline_widgets,
@@ -490,7 +703,8 @@ class ChatMixin:
             enable_skills=enable_skills,
             enable_silent_artefact_explanation=enable_silent_artefact_explanation,
         )
-        if cleaned != final_text:
+        affected = handle_artefacts + affected
+        if cleaned != final_text_after_handles:
             ai.content = cleaned
         if affected and callback:
             _cb(callback, json.dumps([a.get("title") for a in affected]),
@@ -591,6 +805,13 @@ class ChatMixin:
             extra_instructions += self._build_note_instructions()
         if enable_skills:
             extra_instructions += self._build_skill_instructions()
+
+        # Add handle instructions based on current branch
+        branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
+        handle_instructions = _build_handle_instructions(branch_msgs_now)
+        if handle_instructions:
+            extra_instructions += handle_instructions
+
         if extra_instructions.strip():
             original_sp = self._system_prompt or ""
             if extra_instructions not in original_sp:
@@ -958,14 +1179,25 @@ class ChatMixin:
                 binding_name=self.lollmsClient.llm.binding_name,
                 metadata={"mode": "direct"},
             )
+
+            # Resolve handles in the fast path too
+            branch_for_handles = self.get_branch(ai_message.id)
+            raw_after_handles, handle_arts = _apply_handles(
+                raw_text, branch_for_handles, self.artefacts
+            )
+            if raw_after_handles != raw_text:
+                ai_message.content = raw_after_handles
+
             cleaned, affected = self._post_process_llm_response(
-                raw_text, ai_message, _eff_img_gen, _eff_img_edit, auto_activate_artefacts,
+                raw_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
+                auto_activate_artefacts,
                 enable_inline_widgets=enable_inline_widgets,
                 enable_notes=enable_notes,
                 enable_skills=enable_skills,
                 enable_silent_artefact_explanation=enable_silent_artefact_explanation,
             )
-            if cleaned != raw_text:
+            affected = handle_arts + affected
+            if cleaned != raw_after_handles:
                 ai_message.content = cleaned
             if affected and callback:
                 _cb(callback, json.dumps([a.get("title") for a in affected]),
@@ -1174,30 +1406,16 @@ class ChatMixin:
                 "- request_clarification(question: str): Ask user for clarification"
             )
 
-        # ── Inject tool catalogue into system prompt ─────────────────────────
-        if tool_descriptions:
-            _tc = [
-                "\n\n## Available Tools & Action Protocol",
-                "You are an agent with access to external tools.",
-                "CRITICAL: To perform an action, you MUST emit a <tool_call> tag. "
-                "Do NOT use markdown code blocks for tool calls.",
-                "IMPORTANT: Call each tool ONCE. Check the AGENT STATE in the scratchpad "
-                "before calling any tool — if a call is already listed there, do NOT repeat it.",
-                "",
-                "### Call Syntax",
-                '  <tool_call>{"name": "tool_name", "parameters": {"key": "value"}}</tool_call>',
-                "",
-                "The system will stop generation, execute the tool, and provide a "
-                "<tool_result> in the next turn.",
-                "Call one tool per turn. After receiving the result, either call the "
-                "next tool OR write your final answer — never repeat a call you already made.",
-                "",
-                "### Tool Catalogue",
-            ] + tool_descriptions
-            _cur_sp   = self._system_prompt or ""
-            _clean_sp = (_cur_sp.split("\n\n## Available Tools")[0]
-                                .split("### FUNCTION CALLING INSTRUCTIONS")[0])
-            object.__setattr__(self, "_system_prompt", _clean_sp + "\n".join(_tc))
+        # ── Inject compact tool catalogue into system prompt ─────────────────
+        # Uses _build_tool_system_prompt() which places the catalogue at the END
+        # of the system prompt (closest to the conversation / highest recall).
+        object.__setattr__(
+            self, "_system_prompt",
+            _build_tool_system_prompt(
+                self._system_prompt or "",
+                tool_descriptions,
+            )
+        )
 
         # ── Context compression ──────────────────────────────────────────────
         if self.max_context_size is not None:
@@ -1232,15 +1450,13 @@ class ChatMixin:
                 tool_descriptions.insert(0,
                     "- deactivate_artefacts(titles: list[str]): "
                     "CONTEXT PRESSURE -- deactivate unneeded artifacts first")
-                _tc2 = [
-                    "\n\n## Available Tools",
-                    '  <tool_call>{"name": "tool_name", "parameters": {"key": "value"}}</tool_call>',
-                    "", "### Tool list",
-                ] + tool_descriptions
+                # Rebuild system prompt with the new tool added
                 object.__setattr__(
                     self, "_system_prompt",
-                    (self._system_prompt or "").split("\n\n## Available Tools")[0]
-                    + "\n".join(_tc2)
+                    _build_tool_system_prompt(
+                        (self._system_prompt or ""),
+                        tool_descriptions,
+                    )
                 )
 
         # ====================================================================
@@ -1264,6 +1480,9 @@ class ChatMixin:
         _MAX_IDENTICAL_REPEATS              = 2
         _identical_call_counts: Dict[str, int] = {}
 
+        # Did round-1 produce zero tool calls despite external tools being present?
+        _round1_no_tool_call = False
+
         # Pre-create the assistant message so the UI shows a bubble immediately
         ai_message = self.add_message(
             sender=personality.name,
@@ -1280,25 +1499,18 @@ class ChatMixin:
             {"message_id": ai_message.id})
 
         # ── Tags that must be buffered / hidden from the live chat UI stream ─
-        # Note: "<artifact" covers both "<artifact " and "<artifact>" openings.
-        # The legacy "<artefact" is also listed so both spellings are buffered.
         _TAG_STARTS = [
             _TC_OPEN, "<think>", "<think ", "<artifact", "<artefact",
             "<generate_image", "<edit_image", "<revert_artifact", "<revert_artefact",
             "<generate_slides", "<street_view", "<schedule_task",
             "<note", "<skill", "<lollms_event", "<lollms_inline",
+            "<use_handle",
         ]
 
         # ── Secondary-stream tag type mapping ────────────────────────────────
-        # Maps tag prefix → (open_meta_type, chunk_MSG_TYPE, done_MSG_TYPE, close_tag)
-        #
-        # IMPORTANT: artifact content chunks go to MSG_TYPE_ARTEFACT_CHUNK,
-        # NOT to MSG_TYPE_CHUNK.  The main chat bubble never sees these bytes.
         _SECONDARY_TAG_MAP = {
-            # American spelling (primary — what we instruct the LLM to use)
             "<artifact":     ("artifact_update",      MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
                               MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,   "</artifact>"),
-            # British spelling (legacy fallback — some models still output it)
             "<artefact":     ("artifact_update",      MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
                               MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,   "</artefact>"),
             "<note":         ("note_start",            MSG_TYPE.MSG_TYPE_NOTE_CHUNK,
@@ -1313,35 +1525,25 @@ class ChatMixin:
             _round += 1
             _stream_buf: List[str] = []
 
-            # ── Per-round streaming state ────────────────────────────────────
-            _in_logic_tag         = False   # inside <tool_call>
-            _is_hidden_tag        = False   # inside any buffered/secondary tag
-            _tool_trigger         = False   # </tool_call> detected → stop round
+            _in_logic_tag         = False
+            _is_hidden_tag        = False
+            _tool_trigger         = False
             _bracket_buf: List[str] = []
             _is_buffering_bracket = False
 
-            # Secondary-stream state for the current open tag
             _sec_tag_prefix:  str        = ""
             _sec_chunk_type:  Any        = None
             _sec_done_type:   Any        = None
             _sec_close_tag:   str        = ""
             _sec_open_meta:   Dict       = {}
             _sec_content_buf: List[str]  = []
-            _sec_close_scan:  str        = ""  # cross-chunk close-tag scanner
+            _sec_close_scan:  str        = ""
 
             def _parse_tag_attrs(attr_str: str) -> Dict[str, str]:
                 return {m.group(1): m.group(2)
                         for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
             def _enter_secondary_tag(b_str: str) -> None:
-                """
-                Called once when an opening secondary tag's full `<tag attrs>` has
-                been buffered.  Sets up the secondary-stream state and fires a single
-                MSG_TYPE_CHUNK announcement (empty text, typed meta) so the UI can
-                open a secondary panel.  Content bytes are then routed exclusively to
-                the appropriate secondary MSG_TYPE (MSG_TYPE_ARTEFACT_CHUNK etc.) and
-                NEVER to MSG_TYPE_CHUNK.
-                """
                 nonlocal _sec_tag_prefix, _sec_chunk_type, _sec_done_type
                 nonlocal _sec_close_tag, _sec_open_meta, _sec_content_buf, _sec_close_scan
 
@@ -1350,7 +1552,6 @@ class ChatMixin:
                     if not b_str.startswith(prefix):
                         continue
 
-                    # Respect feature flags
                     if prefix in ("<note",)          and not enable_notes:           break
                     if prefix in ("<skill",)         and not enable_skills:          break
                     if prefix in ("<lollms_inline",) and not enable_inline_widgets:  break
@@ -1364,9 +1565,6 @@ class ChatMixin:
                     _sec_content_buf = []
                     _sec_close_scan  = ""
 
-                    # ── One-time announcement on MSG_TYPE_CHUNK (empty text) ──
-                    # This tells the UI "a secondary panel is opening" without
-                    # polluting the chat bubble with any artifact bytes.
                     if prefix in ("<artifact", "<artefact"):
                         title = attrs.get('name') or attrs.get('title', '')
                         if title and title not in _created_artefact_titles:
@@ -1375,7 +1573,6 @@ class ChatMixin:
                             "type":    "artifact_update",
                             "content": {"title": title},
                         })
-
                     elif prefix == "<note":
                         title = attrs.get('title') or attrs.get('name', 'Note')
                         if title and title not in _created_artefact_titles:
@@ -1384,7 +1581,6 @@ class ChatMixin:
                             "type":    "note_start",
                             "content": {"title": title},
                         })
-
                     elif prefix == "<skill":
                         title    = attrs.get('title') or attrs.get('name', 'Skill')
                         category = attrs.get('category', '')
@@ -1394,7 +1590,6 @@ class ChatMixin:
                             "type":    "skill_start",
                             "content": {"title": title, "category": category},
                         })
-
                     elif prefix == "<lollms_inline":
                         title       = attrs.get('title', 'Interactive Widget')
                         widget_type = attrs.get('type', 'html')
@@ -1405,10 +1600,6 @@ class ChatMixin:
                     break
 
             def _fire_secondary_chunk(raw_chunk: str) -> None:
-                """
-                Forward a content fragment on the secondary stream only.
-                NEVER calls MSG_TYPE_CHUNK — the main chat bubble must stay clean.
-                """
                 if not _sec_chunk_type or not raw_chunk:
                     return
                 attrs = _sec_open_meta
@@ -1439,10 +1630,6 @@ class ChatMixin:
                     })
 
             def _fire_secondary_done() -> None:
-                """
-                Fire the done event for the current secondary tag and reset state.
-                Does NOT touch MSG_TYPE_CHUNK.
-                """
                 nonlocal _sec_tag_prefix, _sec_chunk_type, _sec_done_type
                 nonlocal _sec_close_tag, _sec_open_meta, _sec_content_buf, _sec_close_scan
 
@@ -1482,7 +1669,6 @@ class ChatMixin:
                         "widget_type": attrs.get('type', 'html'),
                     })
 
-                # Reset all secondary state
                 _sec_tag_prefix  = ""
                 _sec_chunk_type  = None
                 _sec_done_type   = None
@@ -1492,23 +1678,9 @@ class ChatMixin:
                 _sec_close_scan  = ""
 
             def _inline_relay(chunk, msg_type=None, meta=None):
-                """
-                Per-chunk streaming router.
-
-                Routing rules:
-                  • Non-chunk events (thoughts, reasoning, etc.) pass through unchanged.
-                  • Inside <tool_call>: buffer silently; stop round on </tool_call>.
-                  • Inside a secondary tag (<artifact>, <note>, etc.):
-                      - Content bytes → secondary MSG_TYPE only (ARTEFACT_CHUNK etc.)
-                      - NEVER forwarded to MSG_TYPE_CHUNK.
-                  • Inside <think> or other silently-buffered tags: swallow entirely.
-                  • Normal prose: forward to MSG_TYPE_CHUNK and accumulate in
-                    ai_message.content so the bubble updates live.
-                """
                 nonlocal _in_logic_tag, _is_hidden_tag, _tool_trigger
                 nonlocal _is_buffering_bracket, _sec_close_scan
 
-                # Non-chunk events pass through unchanged
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     if msg_type in [MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING]:
                         ai_message.thoughts = (ai_message.thoughts or "") + chunk
@@ -1520,19 +1692,14 @@ class ChatMixin:
                 _stream_buf.append(chunk)
                 _so_far = "".join(_stream_buf)
 
-                # ── Inside <tool_call>: buffer silently ──────────────────────
                 if _in_logic_tag:
                     if _TC_CLOSE in _so_far:
                         _tool_trigger = True
-                        return False   # stop generation
+                        return False
                     return True
 
-                # ── Inside a secondary tag ───────────────────────────────────
-                # Route every byte to the secondary stream; detect closing tag.
-                # NOTHING reaches MSG_TYPE_CHUNK from inside a secondary tag.
                 if _is_hidden_tag and _sec_tag_prefix:
                     if _TC_OPEN in chunk:
-                        # Nested tool_call inside artifact — unusual but handle it
                         _in_logic_tag = True
                         return True
 
@@ -1554,12 +1721,10 @@ class ChatMixin:
                         _is_hidden_tag  = False
                         _sec_close_scan = ""
 
-                        # Post-close prose goes to the chat bubble normally
                         if post_part:
                             ai_message.content += post_part
                             _cb(callback, post_part, MSG_TYPE.MSG_TYPE_CHUNK)
                     else:
-                        # Close tag not yet complete — emit safe prefix to secondary
                         safe_len = max(0, len(_sec_close_scan) - close_len + 1)
                         safe_content = _sec_close_scan[:safe_len]
                         if safe_content:
@@ -1569,13 +1734,11 @@ class ChatMixin:
 
                     return True
 
-                # ── Inside <think> or other silently-buffered tags ───────────
                 if _is_hidden_tag:
                     if _TC_OPEN in _so_far:
                         _in_logic_tag = True
-                    return True   # swallow — no MSG_TYPE_CHUNK forwarding
+                    return True
 
-                # ── Normal content: scan for tag openings ────────────────────
                 rem = chunk
                 while rem:
                     if _is_buffering_bracket:
@@ -1595,11 +1758,8 @@ class ChatMixin:
                                 _is_hidden_tag        = True
                                 _is_buffering_bracket = False
 
-                                # Set up secondary-stream state and fire announcement
                                 _enter_secondary_tag(b_str)
 
-                                # Route any remaining content in this chunk that
-                                # comes immediately after the opening tag.
                                 if rem and _sec_tag_prefix:
                                     _sec_close_scan += rem
                                     close_tag = _sec_close_tag
@@ -1627,7 +1787,6 @@ class ChatMixin:
                                 rem = ""
                                 continue
 
-                            # Not a special tag — flush buffered bracket content
                             if not any(s.startswith(b_str) for s in _TAG_STARTS):
                                 ai_message.content += b_str
                                 _cb(callback, b_str, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -1636,7 +1795,6 @@ class ChatMixin:
                         else:
                             _bracket_buf.append(rem)
                             b_str = "".join(_bracket_buf)
-                            # Fail-safe: flush if clearly not a tag
                             if (any(c in b_str for c in [" ", "\n", "\r", "\t"])
                                     or len(b_str) > 100):
                                 if not any(s.startswith(b_str) for s in _TAG_STARTS):
@@ -1664,18 +1822,31 @@ class ChatMixin:
 
             # ── Build agent-state header ─────────────────────────────────────
             _saved_scratchpad = self.scratchpad
+            state_lines = []
+
             if _completed_tool_calls or _created_artefact_titles:
-                _state_lines = [
+                state_lines.append(
                     "=== AGENT STATE (already completed this turn — DO NOT repeat) ==="
-                ]
+                )
                 if _completed_tool_calls:
-                    _state_lines.append("Tool calls already made:")
-                    _state_lines.extend(f"  ✓ {c}" for c in _completed_tool_calls)
+                    state_lines.append("Tool calls already made:")
+                    state_lines.extend(f"  ✓ {c}" for c in _completed_tool_calls)
                 if _created_artefact_titles:
-                    _state_lines.append("Artifacts / notes already created:")
-                    _state_lines.extend(f"  ✓ {t}" for t in _created_artefact_titles)
-                _state_lines.append("=== END AGENT STATE ===\n")
-                self.scratchpad = "\n".join(_state_lines) + (self.scratchpad or "")
+                    state_lines.append("Artifacts / notes already created:")
+                    state_lines.extend(f"  ✓ {t}" for t in _created_artefact_titles)
+                state_lines.append("=== END AGENT STATE ===")
+
+            # Always append the per-round reminder when external tools are present
+            state_lines.append(_TOOL_CALL_REMINDER)
+
+            # On round 1 with no previous calls, list tools concisely in scratchpad too
+            if _round == 1 and not _completed_tool_calls:
+                state_lines.append(
+                    "AVAILABLE TOOLS (quick list): "
+                    + ", ".join(tool_registry.keys())
+                )
+
+            self.scratchpad = "\n".join(state_lines) + ("\n\n" + (self.scratchpad or "") if self.scratchpad else "")
 
             self._stream_final_answer(
                 _inline_relay, images, _current_branch_tip, final_answer_temperature, **kwargs
@@ -1688,6 +1859,45 @@ class ChatMixin:
             _clean_segment     = (_so_far[:_so_far.index(_TC_OPEN)]
                                   if _tool_trigger else _so_far)
             _clean_text_so_far += _clean_segment
+
+            # ── Round-1 no-tool-call detection ───────────────────────────────
+            # If round 1 produced no tool call AND external tools are registered,
+            # inject a correction message and retry (once only).
+            if _round == 1 and not _tool_trigger and _has_external_tools:
+                # Check whether the output already has a final answer or a
+                # non-trivial response that makes tool calls unnecessary
+                _output_clean = _clean_segment.strip()
+                _needs_tool   = bool(
+                    # heuristic: output is very short OR contains an apology about
+                    # not being able to do something
+                    len(_output_clean) < 50
+                    or re.search(
+                        r"i (cannot|can't|don't|am unable|don't have access|"
+                        r"have no access|cannot access)",
+                        _output_clean, re.IGNORECASE,
+                    )
+                )
+                if _needs_tool:
+                    _round1_no_tool_call = True
+                    ASCIIColors.yellow(
+                        "[chat] Round 1 produced no tool call — injecting correction")
+                    _warning(callback,
+                             "No tool call detected; reminding the model to use tools.")
+                    _corr_call = self.add_message(
+                        sender=personality.name, sender_type="assistant",
+                        content=_so_far, parent_id=_current_branch_tip
+                    )
+                    _corr_res = self.add_message(
+                        sender="system", sender_type="user",
+                        content=_TOOL_CALL_CORRECTION,
+                        parent_id=_corr_call.id
+                    )
+                    _temp_msg_ids.extend([_corr_call.id, _corr_res.id])
+                    _current_branch_tip = _corr_res.id
+                    # Reset clean text — the correction turn shouldn't count
+                    _clean_text_so_far = ""
+                    _accumulated_full  = ""
+                    continue   # re-run the loop
 
             if not _tool_trigger:
                 break
@@ -1978,6 +2188,8 @@ class ChatMixin:
                 n for n in _pt_specs
                 if any(tc["name"] == n for tc in tool_calls_this_turn)
             ]
+        if _round1_no_tool_call:
+            message_meta["round1_correction_applied"] = True
 
         self.scratchpad = ""
 
@@ -1987,14 +2199,24 @@ class ChatMixin:
         ai_message.generation_speed = tok_per_sec
         ai_message.metadata         = message_meta
 
+        # Resolve handles in the final text
+        branch_for_final_handles = self.get_branch(ai_message.id)
+        _clean_after_handles, handle_arts = _apply_handles(
+            _clean, branch_for_final_handles, self.artefacts
+        )
+        if _clean_after_handles != _clean:
+            ai_message.content = _clean_after_handles
+
         cleaned_content, affected_artefacts = self._post_process_llm_response(
-            _clean, ai_message, _eff_img_gen, _eff_img_edit, auto_activate_artefacts,
+            _clean_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
+            auto_activate_artefacts,
             enable_inline_widgets=enable_inline_widgets,
             enable_notes=enable_notes,
             enable_skills=enable_skills,
             enable_silent_artefact_explanation=enable_silent_artefact_explanation,
         )
-        if cleaned_content != _clean:
+        affected_artefacts = handle_arts + affected_artefacts
+        if cleaned_content != _clean_after_handles:
             ai_message.content = cleaned_content
 
         if affected_artefacts:
@@ -2018,3 +2240,84 @@ class ChatMixin:
             "self_corrections": self_corrections or None,
             "artefacts":        affected_artefacts,
         }
+
+
+# ---------------------------------------------------------------------------
+# Handle resolution — called after generation completes
+# ---------------------------------------------------------------------------
+
+def _apply_handles(
+    text: str,
+    branch_messages: List,
+    artefacts_manager: Any,
+) -> tuple:
+    """
+    Scan *text* for <use_handle .../> tags, resolve each one against
+    *branch_messages*, and create/update the corresponding artefact.
+
+    Returns (cleaned_text, list_of_affected_artefact_dicts).
+    The <use_handle> tags are removed from the returned text; a short
+    confirmation stub is left in their place so the silent-artefact guard
+    can produce a readable summary if needed.
+    """
+    from ._artefacts import ArtefactType
+
+    handle_pattern = re.compile(
+        r'<use_handle\s+([^/]*)/>', re.DOTALL | re.IGNORECASE
+    )
+    affected: List[Dict] = []
+    cleaned  = text
+
+    def _parse_attrs(attr_str: str) -> Dict[str, str]:
+        return {m.group(1): m.group(2)
+                for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
+
+    def _handle_match(match: re.Match) -> str:
+        attrs = _parse_attrs(match.group(1))
+
+        ref      = attrs.get("ref", "").strip()
+        name     = attrs.get("name", "").strip()
+        atype    = attrs.get("type",     ArtefactType.CODE)
+        language = attrs.get("language", "").strip()
+
+        if not ref or not name:
+            ASCIIColors.warning(
+                f"<use_handle> missing ref or name attribute: {match.group(0)}")
+            return match.group(0)   # leave untouched on bad attrs
+
+        block = _resolve_handle(ref, branch_messages)
+        if block is None:
+            ASCIIColors.warning(
+                f"<use_handle ref='{ref}'> — handle not found in branch; "
+                "check msg_idx and block_idx.")
+            return f"[handle {ref} not found]"
+
+        content  = block["content"]
+        eff_lang = language or block.get("language") or ""
+        eff_type = atype if atype in ArtefactType.ALL else ArtefactType.CODE
+
+        # Create or update the artefact
+        existing = artefacts_manager.get(name)
+        if existing is None:
+            art = artefacts_manager.add(
+                title=name, artefact_type=eff_type,
+                content=content, language=eff_lang or None, active=True,
+            )
+            ASCIIColors.success(
+                f"[use_handle] Created artefact '{name}' from handle {ref}")
+        else:
+            art = artefacts_manager.update(
+                title=name, new_content=content,
+                language=eff_lang or None, bump_version=True, active=True,
+            )
+            ASCIIColors.success(
+                f"[use_handle] Updated artefact '{name}' from handle {ref} "
+                f"→ v{art.get('version','?')}")
+
+        affected.append(art)
+        # Return empty string so the tag is stripped from visible text;
+        # _post_process will add a summary via the silent-artefact guard.
+        return ""
+
+    cleaned = handle_pattern.sub(_handle_match, cleaned)
+    return cleaned.strip(), affected

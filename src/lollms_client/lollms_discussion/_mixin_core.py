@@ -401,9 +401,8 @@ class CoreMixin:
         if pdz:
             parts.append(f"-- Personality Data Zone --\n{pdz}")
         
-        # [NEW] Scratchpad Zone: Full length tool outputs for the LLM to analyze
-        if hasattr(self, 'scratchpad') and self.scratchpad and self.scratchpad.strip():
-            parts.append(f"== TOOL OUTPUT SCRATCHPAD (Full Length) ==\n{self.scratchpad.strip()}\n== END SCRATCHPAD ==")
+        # Scratchpad is now handled in export() to avoid mid-conversation system messages
+        # that break strict chat templates (e.g., llama.cpp). See _mixin_utils.py.
             
         artefacts_zone = self.artefacts.build_artefacts_context_zone()
         if artefacts_zone:
