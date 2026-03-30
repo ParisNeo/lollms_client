@@ -29,16 +29,17 @@
 5. [Notes](#5-notes)
 6. [Skills](#6-skills)
 7. [Inline Interactive Teaching Widgets](#7-inline-interactive-teaching-widgets)
-8. [The Silent Artefact Guard](#8-the-silent-artefact-guard)
-9. [The Tooling System](#9-the-tooling-system)
-10. [REPL Text Tools](#10-repl-text-tools)
-11. [Context Compression](#11-context-compression)
-12. [Scratchpad Placement Model](#12-scratchpad-placement-model)
-13. [Source Title Extraction](#13-source-title-extraction)
-14. [`chat()` Parameter Reference](#14-chat-parameter-reference)
-15. [`chat()` Return Value Reference](#15-chat-return-value-reference)
-16. [The Swarm System](#16-the-swarm-system)
-17. [Worked Example (single-agent)](#17-worked-example)
+8. [Interactive Forms](#8-interactive-forms)0
+9. [The Silent Artefact Guard](#8-the-silent-artefact-guard)
+10. [The Tooling System](#9-the-tooling-system)
+11. [REPL Text Tools](#10-repl-text-tools)
+12. [Context Compression](#11-context-compression)
+13. [Scratchpad Placement Model](#12-scratchpad-placement-model)
+14. [Source Title Extraction](#13-source-title-extraction)
+15. [`chat()` Parameter Reference](#14-chat-parameter-reference)
+16. [`chat()` Return Value Reference](#15-chat-return-value-reference)
+17. [The Swarm System](#16-the-swarm-system)
+18. [Worked Example (single-agent)](#17-worked-example)
 
 ---
 
@@ -221,6 +222,8 @@ internal synchronisation channel between the streaming loop and the post-process
 | 43 | `MSG_TYPE_SKILL_DONE` | Complete raw skill content | `{title, content, category, description}` |
 | 44 | `MSG_TYPE_WIDGET_CHUNK` | Raw chunk of widget source being streamed | `{title, chunk, widget_type}` |
 | 45 | `MSG_TYPE_WIDGET_DONE` | Complete raw widget source (do NOT mount directly) | `{title, content, widget_type}` |
+| 46 | `MSG_TYPE_FORM_READY` | Complete parsed form descriptor ready for rendering | `{title, form}` |
+| 47 | `MSG_TYPE_FORM_SUBMITTED` | User answers injected back into generation context | `{form_id, answers}` |
 
 ### 2.4 Inline Streaming Events (MSG_TYPE_CHUNK with meta)
 
@@ -234,7 +237,8 @@ but carry no content. Content arrives on the secondary stream (§2.5).
 | `"artefact_update"` | Opening `<artefact name="...">` tag detected | `{title: str}` |
 | `"note_start"` | Opening `<note title="...">` tag detected | `{title: str}` |
 | `"skill_start"` | Opening `<skill title="..." category="...">` tag detected | `{title: str, category: str}` |
-| `"inline_widget_start"` | Opening `<lollms_inline ...>` tag detected | `{title: str, widget_type: "html"|"react"|"svg"}` |
+| `"inline_widget_start"` | Opening `<lollms_inline ...>` tag detected | `{title: str, widget_type: "html"\|"react"\|"svg"}` |
+| `"form_start"` | Opening `<lollms_form ...>` tag detected | `{title: str}` |
 
 ### 2.5 Secondary Content Streams — CHUNK and DONE Events
 
@@ -285,9 +289,17 @@ def on_event(text, msg_type, meta):
             else:
                 print(text, end="", flush=True)
 
-        case MSG_TYPE.MSG_TYPE_ARTEFACT_DONE:
+        case MSG_TYPE.MSG_TYPE_WIDGET_DONE:
             label = "[patch]" if meta["is_patch"] else f"[{meta['art_type']}]"
             print(f"\n  Artefact ready: {meta['title']} {label}")
+
+        case MSG_TYPE.MSG_TYPE_FORM_READY:
+            print(f"\n  [Form ready] {meta['form']['title']}")
+            print(f"    Fields: {len(meta['form']['fields'])}")
+
+        case MSG_TYPE.MSG_TYPE_FORM_SUBMITTED:
+            print(f"\n  [Form submitted] {meta['form_id'][:8]}")
+            print(f"    Answers: {list(meta['answers'].keys())}")
 
         case MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED:
             if "artefact" in meta:
@@ -1086,7 +1098,256 @@ result = discussion.chat("Explain quicksort.", enable_inline_widgets=False)
 
 ---
 
-## 8. The Silent Artefact Guard
+## 8. Interactive Forms
+
+### 8.1 Concept
+
+Forms allow the LLM to pause generation and ask the user for structured, multi-field input. When the LLM emits a `<lollms_form>` block, the framework fires `MSG_TYPE_FORM_READY`, generation pauses, and the application renders an interactive form UI. After the user submits their answers, `submit_form_response()` injects the results back into the conversation and generation resumes.
+
+Forms are ideal for:
+- Collecting multiple pieces of information before starting a complex task
+- Quizzes and interactive evaluations
+- Guided workflows where early choices affect later steps
+- Any scenario where structured input is more efficient than free-text chat
+
+### 8.2 LLM Interaction — XML Tags
+
+The LLM creates forms by emitting a `<lollms_form>` block with field definitions inside.
+
+#### 8.2.1 Basic XML Syntax
+
+```xml
+<lollms_form title="Project Configuration" description="Tell us about your requirements">
+  <field name="project_name" label="Project Name" type="text" required="true"/>
+  <field name="language" label="Programming Language" type="select" options="Python,JavaScript,Rust,Go" required="true"/>
+  <field name="needs_auth" label="Require Authentication?" type="checkbox"/>
+  <field name="description" label="Project Description" type="textarea" rows="4"/>
+</lollms_form>
+```
+
+#### 8.2.2 Alternative JSON Syntax
+
+Forms can also be defined as JSON inside the tag body:
+
+```xml
+<lollms_form title="Quiz: Python Basics">
+{
+  "fields": [
+    {"name": "q1", "label": "What does list.append() do?", "type": "radio", "options": ["Adds to start", "Adds to end", "Removes item", "Sorts list"], "required": true},
+    {"name": "q2", "label": "Explain your answer", "type": "textarea", "rows": 3, "required": true},
+    {"name": "q3", "label": "Confidence (1-5)", "type": "range", "min": 1, "max": 5, "required": true}
+  ]
+}
+</lollms_form>
+```
+
+#### 8.2.3 Field Types Reference
+
+| Type | Description | Attributes |
+|------|-------------|------------|
+| `text` | Single-line text input | `placeholder`, `default` |
+| `textarea` | Multi-line text input | `rows` (default 4), `placeholder` |
+| `number` | Numeric input | `min`, `max`, `step`, `default` |
+| `range` | Slider input | `min`*, `max`*, `step` |
+| `select` | Dropdown selection | `options`* (comma-separated), `multiple` |
+| `radio` | Radio button group | `options`* (comma-separated) |
+| `checkbox` | Single boolean checkbox | `default` |
+| `checkbox_group` | Multiple checkboxes | `options`* (comma-separated) |
+| `date` | Date picker | `min`, `max` |
+| `time` | Time picker | — |
+| `color` | Color picker (returns #RRGGBB) | `default` |
+| `rating` | Star rating widget | `min` (default 1), `max` (default 5) |
+| `file` | File upload | `accept` (MIME type or extension), `multiple` |
+| `code` | Code editor with syntax highlighting | `language` (e.g., "python"), `rows` |
+| `section` | Visual divider/heading (no input) | `label` (shown as subheading) |
+| `hidden` | Hidden field | `default` (value sent to LLM) |
+
+\* Required attribute
+
+### 8.3 Form Events
+
+| Event | When Fired | `meta` Contents |
+|-------|-----------|---------------|
+| `MSG_TYPE_FORM_READY` (46) | `</lollms_form>` parsed and validated | `{"form": {...}, "form_id": "uuid"}` |
+| `MSG_TYPE_FORM_SUBMITTED` (47) | `submit_form_response()` called | `{"form_id": "uuid", "answers": {...}, "form": {...}}` |
+
+### 8.4 Application Integration
+
+The application layer must:
+1. Listen for `MSG_TYPE_FORM_READY` events
+2. Render the form described in `meta["form"]`
+3. Collect user answers (matching field `name` attributes)
+4. Call `discussion.submit_form_response(form_id, answers_dict)` to resume
+
+```python
+# Example: handling form submission in application code
+def on_form_ready(form_id, form_descriptor):
+    # Render UI with form_descriptor["fields"]
+    answers = show_form_ui_and_wait(form_descriptor)  # blocking or async
+    
+    # Submit answers back to resume generation
+    discussion.submit_form_response(form_id, answers)
+```
+
+### 8.5 Complete Working Example
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_types import MSG_TYPE
+
+lc = LollmsClient("ollama", {"model_name": "llama3.2", "host_address": "http://localhost:11434"})
+db = LollmsDataManager("sqlite:///forms_demo.db")
+discussion = LollmsDiscussion.create_new(
+    lollms_client=lc,
+    db_manager=db,
+    autosave=True,
+    system_prompt="You are a helpful assistant that creates project plans based on user requirements."
+)
+
+# Simulated form submission handler (in a real app, this would come from UI)
+pending_forms = {}
+
+def streaming_callback(text, msg_type, meta):
+    if msg_type == MSG_TYPE.MSG_TYPE_FORM_READY:
+        form = meta["form"]
+        print(f"\n📝 FORM READY: {form['title']}")
+        print(f"Description: {form.get('description', 'None')}")
+        print("\nFields:")
+        for field in form["fields"]:
+            req = " [required]" if field.get("required") else ""
+            print(f"  • {field['name']} ({field['type']}): {field['label']}{req}")
+        
+        # Simulate user filling the form
+        simulated_answers = {
+            "project_name": "My API Server",
+            "language": "Python",
+            "framework": "FastAPI",
+            "needs_auth": True,
+            "database": "PostgreSQL",
+            "description": "A REST API for user management with JWT authentication"
+        }
+        
+        # Store for later submission (or submit immediately)
+        pending_forms[meta["form_id"]] = (form, simulated_answers)
+        
+        # In real app, you'd submit after user interaction:
+        # discussion.submit_form_response(meta["form_id"], user_answers)
+        
+        return False  # Pause streaming (form blocks generation)
+    
+    elif msg_type == MSG_TYPE.MSG_TYPE_FORM_SUBMITTED:
+        print(f"\n✅ Form {meta['form_id'][:8]} submitted with answers:")
+        for k, v in meta["answers"].items():
+            print(f"  {k}: {v}")
+    
+    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+        print(text, end="", flush=True)
+    
+    return True
+
+# Example 1: Simple configuration form
+print("=" * 50)
+print("Example 1: Project Configuration Form")
+print("=" * 50)
+
+result = discussion.chat(
+    "I want to build a web API. Please ask me about my requirements "
+    "using a form so you can suggest the best architecture.",
+    streaming_callback=streaming_callback,
+    enable_forms=True
+)
+
+# Submit the pending form if one was created
+if pending_forms:
+    form_id, (form_desc, answers) = pending_forms.popitem()
+    print(f"\n\n[Simulating user submission...]")
+    discussion.submit_form_response(form_id, answers)
+    
+    # Continue the conversation with the form answers injected
+    result2 = discussion.chat(
+        "Based on my requirements above, what architecture do you recommend?",
+        streaming_callback=streaming_callback
+    )
+
+# Example 2: Quiz form with scoring
+print("\n" + "=" * 50)
+print("Example 2: Interactive Quiz")
+print("=" * 50)
+
+discussion2 = LollmsDiscussion.create_new(
+    lollms_client=lc,
+    db_manager=db,
+    autosave=True
+)
+
+quiz_prompt = """
+Create a 3-question quiz about Python list comprehensions.
+Use a form with:
+- Question 1: Multiple choice about syntax
+- Question 2: Code field where user writes a comprehension
+- Question 3: Rating of their confidence
+
+After submission, grade their answers and explain any mistakes.
+"""
+
+result = discussion2.chat(
+    quiz_prompt,
+    streaming_callback=streaming_callback,
+    enable_forms=True
+)
+
+if pending_forms:
+    form_id, (form_desc, answers) = pending_forms.popitem()
+    # Simulate different answers for quiz
+    quiz_answers = {
+        "q1": "[x*2 for x in items]",  # correct
+        "q2": "[x for x in range(10) if x % 2 == 0]",  # user writes code
+        "q3": 4  # confidence 1-5
+    }
+    print(f"\n\n[Simulating quiz submission...]")
+    discussion2.submit_form_response(form_id, quiz_answers)
+    
+    result2 = discussion2.chat(
+        "Please grade my quiz and provide feedback.",
+        streaming_callback=streaming_callback
+    )
+
+print("\n" + "=" * 50)
+print("Forms demonstration complete!")
+```
+
+### 8.6 Form Descriptor Schema
+
+The complete form descriptor available in `MSG_TYPE_FORM_READY`:
+
+```python
+{
+    "id": "uuid-string",           # Unique form instance ID
+    "title": "Form Title",         # Display heading
+    "description": "...",          # Optional instructions
+    "submit_label": "Submit",      # Button text (default "Submit")
+    "fields": [                    # List of field descriptors
+        {
+            "name": "field_id",    # Machine key for answers dict
+            "label": "Human label", # Display text
+            "type": "text",        # One of the field types above
+            "required": True,      # Whether field must be filled
+            "default": "...",      # Pre-filled value (optional)
+            # ... type-specific attributes
+        }
+    ]
+}
+```
+
+### 8.7 Disabling Forms
+
+```python
+result = discussion.chat("Just a regular message", enable_forms=False)
+```
+
+---
+
+## 9. The Silent Artefact Guard
 
 When the LLM response consists **entirely** of XML tags, the post-processor
 auto-generates a human-readable confirmation of what was produced, so the chat bubble
@@ -1097,29 +1358,30 @@ Format:
 - Notes: `📝 Saved note **title** — [first line of content…]`
 - Skills: `🎓 Skill saved **title** [category] — description.`
 - Widgets: `🎛️ Interactive widget ready: **title** (type) — use the controls below…`
+- Forms: `📋 Form ready: **title** — please fill in the fields above…`
 
 ---
 
-## 9. The Tooling System
+## 10. The Tooling System
 
-### 9.1 Mechanics
+### 10.1 Mechanics
 
 The LLM calls tools by emitting `<tool_call>` JSON tags mid-stream. The framework
 detects these, pauses generation, dispatches the tool, appends the result to
 `self.scratchpad`, and resumes. Loop runs up to `max_reasoning_steps` times.
 
-### 9.2 Fast Path — No External Tools
+### 10.2 Fast Path — No External Tools
 
 When no external tools are registered, the framework skips all agentic scaffolding and
 makes a single LLM call. XML tags (`<artefact>`, `<note>`, etc.) are still post-processed.
 
-### 9.3 Anti-Duplication Guards
+### 10.3 Anti-Duplication Guards
 
 Every tool call's signature is tracked. On the second identical call a `DUPLICATE CALL
 BLOCKED` result is injected; on the third the loop breaks. Different parameters on the
 same tool are always allowed.
 
-### 9.4 Registering External Tools
+### 10.4 Registering External Tools
 
 ```python
 tools = {
@@ -1136,7 +1398,7 @@ result = discussion.chat("What files are in /tmp?", tools=tools)
 
 Any tool with `name="sources"` in its output spec is treated as a RAG tool.
 
-### 9.5 Built-in Tools
+### 10.5 Built-in Tools
 
 | Tool | Flag | Purpose |
 |---|---|---|
@@ -1148,7 +1410,7 @@ Any tool with `name="sources"` in its output spec is treated as a RAG tool.
 
 ---
 
-## 10. REPL Text Tools
+## 11. REPL Text Tools
 
 In-session named buffers (`enable_repl_tools=True`, default) for navigating large tool
 outputs without re-injecting them into the context window.
@@ -1170,7 +1432,7 @@ Formats auto-detected: `json_array`, `jsonl`, `csv`, `md_table`, `numbered_list`
 
 ---
 
-## 11. Context Compression
+## 12. Context Compression
 
 Runs automatically when `max_context_size` is set and token count exceeds
 `max_context_size × 0.80`.
@@ -1186,7 +1448,7 @@ Cache key: `SHA-1(branch_tip_id + "|" + sorted_active_artefact_ids)`. Cache hit 
 
 ---
 
-## 12. Scratchpad Placement Model
+## 13. Scratchpad Placement Model
 
 `export()` injects the scratchpad as a `role: system` message immediately **after the
 last user message** (not in the system-prompt header). An empty scratchpad produces no
@@ -1204,7 +1466,7 @@ The scratchpad is never written to the database and is cleared at the end of eve
 
 ---
 
-## 13. Source Title Extraction
+## 14. Source Title Extraction
 
 When RAG chunks arrive without explicit titles, `_extract_content_title()` derives a
 label via a priority chain (no LLM call):
@@ -1217,7 +1479,7 @@ label via a priority chain (no LLM call):
 
 ---
 
-## 14. `chat()` Parameter Reference
+## 15. `chat()` Parameter Reference
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -1242,6 +1504,7 @@ label via a priority chain (no LLM call):
 | `enable_inline_widgets` | `True` | Process `<lollms_inline>` tags |
 | `enable_notes` | `True` | Process `<note>` tags |
 | `enable_skills` | `False` | Process `<skill>` tags |
+| `enable_forms` | `True` | Process `<lollms_form>` tags |
 | `enable_silent_artefact_explanation` | `True` | Auto-generate summary when response is all XML |
 | `streaming_callback` | `None` | Callback function (see §2.1) |
 | `decision_temperature` | `0.3` | Temperature for intent / structured calls |
@@ -1252,7 +1515,7 @@ label via a priority chain (no LLM call):
 
 ---
 
-## 15. `chat()` Return Value Reference
+## 16. `chat()` Return Value Reference
 
 ```python
 result = discussion.chat(...)
@@ -1276,9 +1539,9 @@ result = discussion.chat(...)
 
 ---
 
-## 16. The Swarm System
+## 17. The Swarm System
 
-### 16.1 Concept
+### 17.1 Concept
 
 A swarm run turns one `chat()` call into a **multi-agent deliberation session**. A team
 of `Agent` instances each contribute their perspective across multiple rounds, collaborate
@@ -1301,7 +1564,7 @@ result = discussion.chat(
 )
 ```
 
-### 16.2 The Agent Dataclass
+### 17.2 The Agent Dataclass
 
 | Field | Default | Description |
 |---|---|---|
@@ -1312,12 +1575,12 @@ result = discussion.chat(
 | `model_params` | `{}` | Extra kwargs for every generation call |
 | `max_tokens_per_turn` | `1024` | Soft cap on tokens per round |
 
-### 16.3 AgentRole Reference
+### 17.3 AgentRole Reference
 
 `PROPOSER` · `CRITIC` · `DEVIL_ADVOCATE` · `DOMAIN_EXPERT` · `SYNTHESIZER` ·
 `MODERATOR` · `IMPLEMENTER` · `TESTER` · `NARRATOR` · `PLAYER` · `FREEFORM`
 
-### 16.4 The HLF Protocol
+### 17.4 The HLF Protocol
 
 After each agent's NLP turn, a small structured call produces a `HLFMessage`:
 
@@ -1333,7 +1596,7 @@ After each agent's NLP turn, a small structured call produces a `HLFMessage`:
 Convergence exits early when mean confidence ≥ `convergence_threshold` AND no
 outstanding `critique` messages (checked from round 2 onward).
 
-### 16.5 SwarmConfig Reference
+### 17.5 SwarmConfig Reference
 
 | Field | Default | Description |
 |---|---|---|
@@ -1349,14 +1612,14 @@ outstanding `critique` messages (checked from round 2 onward).
 | `world_state` | `""` | For `"simulation"` mode — initial world description |
 | `max_nlp_tokens_per_agent` | `512` | Soft cap on visible NLP per agent per round |
 
-### 16.6 Anti-Sycophancy
+### 17.6 Anti-Sycophancy
 
 Rules injected from round 2 onward prevent empty agreement:
 - **`"light"`** — add new value; brief acknowledgement allowed.
 - **`"medium"`** (default) — no simple confirmation; must add angle / counter-example / risk.
 - **`"strong"`** — adversarial: find a flaw before agreeing; confidence ≤ 0.6 on first pass.
 
-### 16.7 Execution Flow
+### 17.7 Execution Flow
 
 ```
 chat(swarm=[...]) → add user message → SwarmOrchestrator.run()
@@ -1377,7 +1640,7 @@ All agents share `discussion.artefacts`. Any agent may create, patch, revert, or
 notes via XML tags. Fuzzy matching (§4.2.2) ensures patches target the right artefact
 even when the tester spells the name differently from the implementer.
 
-### 16.9 User Steering
+### 17.9 User Steering
 
 ```python
 orchestrator.steer("Focus only on the security implications from here on.")
@@ -1386,13 +1649,13 @@ orchestrator.steer("Focus only on the security implications from here on.")
 Delivered to all agents at the start of the next round, prefixed with
 `"⚡ USER DIRECTIVE:"`, and logged in the HLF as `type="steer"`.
 
-### 16.10 Swarm Result Keys
+### 17.10 Swarm Result Keys
 
 Standard: `user_message`, `ai_message`, `artefacts`, `sources`.
 Swarm-only: `agent_messages`, `hlf_log`, `swarm_meta`
 (`{mode, rounds_run, agents, touched_artefacts, duration_seconds}`).
 
-### 16.11 Worked Example — Collaborative Coding
+### 17.11 Worked Example — Collaborative Coding
 
 ```python
 dev_agents = [
@@ -1426,7 +1689,7 @@ print(f"Version: {impl['version']}")   # > 1 after tester's patches
 
 ---
 
-## 17. Worked Example (single-agent)
+## 18. Worked Example (single-agent)
 
 Full turn: external tool, REPL text tools, notes, skills, artefact, inline widget.
 
@@ -1473,7 +1736,9 @@ def cb(text, msg_type, meta):
                 print(f"\n  [Skill] {c['title']}  [{c['category']}]")
             elif not text and t == "inline_widget_start":
                 c = meta["content"]
-                print(f"\n  [Widget] {c['title']} ({c['widget_type']})")
+                print(f"\n  [Widget building] {c['title']} ({c['widget_type']})")
+            elif not text and t == "form_start":
+                print(f"\n  [Form building] {meta['content']['title']}")
             elif not text and t == "artefact_update":
                 print(f"\n  [Artefact streaming] {meta['content']['title']}")
             else:
@@ -1500,6 +1765,7 @@ result = discussion.chat(
     enable_inline_widgets=True,
     enable_notes=True,
     enable_skills=True,
+    enable_forms=True,
     enable_silent_artefact_explanation=True,
     max_reasoning_steps=15,
 )
@@ -1509,11 +1775,13 @@ notes  = [a for a in artefacts if a["type"] == "note"]
 skills = [a for a in artefacts if a["type"] == "skill"]
 docs   = [a for a in artefacts if a["type"] not in ("note", "skill", "image")]
 widgets = result["ai_message"].metadata.get("inline_widgets", [])
+forms = result["ai_message"].metadata.get("forms", [])
 
 print(f"\nDocuments : {[a['title'] for a in docs]}")
 print(f"Notes     : {[a['title'] for a in notes]}")
 print(f"Skills    : {[(a['title'], a.get('category')) for a in skills]}")
 print(f"Widgets   : {[w['title'] for w in widgets]}")
+print(f"Forms     : {[f['title'] for f in forms]}")
 print(f"Sources   : {[s['title'] for s in result['sources']]}")
 print(f"Mode      : {result['ai_message'].metadata['mode']}")
 print(f"Duration  : {result['ai_message'].metadata['duration_seconds']}s")
@@ -1530,4 +1798,5 @@ During this turn the LLM will typically:
 7. Emit `<skill title="arXiv Research Workflow" category="research/workflow">...</skill>` — saved, real-time event fires.
 8. Emit `<artefact name="context_compression_report.md" type="document">...</artefact>` — saved, real-time event fires.
 9. Emit `<lollms_inline type="html" title="Publication Counts">...</lollms_inline>` — bar chart rendered in-place.
-10. If only XML tags were produced, the silent artefact guard generates a summary line for each item.
+10. Emit `<lollms_form title="Citation Preferences">...</lollms_form>` — interactive form pauses generation.
+11. If only XML tags were produced, the silent artefact guard generates a summary line for each item.

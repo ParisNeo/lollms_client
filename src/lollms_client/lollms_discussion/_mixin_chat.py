@@ -4,21 +4,51 @@
 # ARTIFACT STREAMING CONTRACT
 # ---------------------------
 # When the LLM emits an <artifact ...>...</artifact> block (or <note>, <skill>,
-# <lollms_inline>) the content inside that block is NEVER forwarded to the
-# main chat bubble via MSG_TYPE_CHUNK.  Instead:
+# <lollms_inline>, <lollms_form>) the content inside that block is NEVER forwarded
+# to the main chat bubble via MSG_TYPE_CHUNK.  Instead:
 #
 #   1. When the opening tag is fully buffered, a single MSG_TYPE_CHUNK is fired
 #      with text="" and meta={"type": "artifact_update", "content": {"title": ...}}
 #      so the UI can open a secondary panel / indicator.
 #
 #   2. Each content fragment inside the tag fires MSG_TYPE_ARTEFACT_CHUNK
-#      (or MSG_TYPE_NOTE_CHUNK / MSG_TYPE_SKILL_CHUNK / MSG_TYPE_WIDGET_CHUNK).
+#      (or the matching *_CHUNK type for notes / skills / widgets / forms).
 #      These must NOT reach the main chat bubble.
 #
 #   3. When the closing tag is detected, MSG_TYPE_ARTEFACT_DONE
 #      (or the matching *_DONE type) is fired with the complete raw content.
 #      _post_process_llm_response then runs and fires
 #      MSG_TYPE_ARTEFACTS_STATE_CHANGED.
+#
+# BRACKET BUFFERING CONTRACT
+# --------------------------
+# The moment a '<' character is seen in the stream, ALL subsequent characters
+# are buffered and NEVER forwarded to the chat bubble until the tag is fully
+# identified (closing '>' received).  The buffer is flushed as visible text
+# ONLY when it is conclusively not a known tag — i.e. when NO known tag prefix
+# can possibly match the buffered content.  The old heuristic that flushed on
+# whitespace or after 100 chars has been REMOVED; it caused partial tag text
+# like "<note" to appear in the chat bubble before the '>' arrived.
+#
+# The new rule: flush the bracket buffer as visible text if and only if:
+#   (a) the buffer contains a '>' and the completed tag does not match any
+#       known tag prefix, OR
+#   (b) the buffer grows beyond MAX_BRACKET_BUF characters (hard safety cap).
+#
+# WIDGET CONTENT VALIDATION
+# -------------------------
+# <lollms_inline> content is validated before storage.  Only HTML/CSS/JS is
+# accepted.  Non-web language fences (```python, ```mermaid, etc.) are stripped.
+# A widget whose cleaned content does not contain at least one HTML tag is
+# logged as a warning and replaced with an error placeholder.
+#
+# FORM / FRAME SYSTEM
+# -------------------
+# <lollms_form> lets the LLM render an interactive form in the UI.  When the
+# closing tag is detected, MSG_TYPE_FORM_READY fires and generation PAUSES.
+# The application collects user answers and calls:
+#   discussion.submit_form_response(form_id, answers)
+# which injects the answers as a user message and resumes generation.
 #
 # HANDLE SYSTEM
 # -------------
@@ -30,9 +60,6 @@
 #
 # The LLM emits:
 #   <use_handle ref="2:0" name="app.py" type="code" language="python"/>
-#
-# Post-processing extracts the referenced block and creates/updates the
-# artefact directly without any LLM regeneration.
 #
 # TOOL-CALLING RELIABILITY IMPROVEMENTS
 # --------------------------------------
@@ -61,6 +88,12 @@ from ._message import LollmsMessage
 
 if TYPE_CHECKING:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Hard cap on bracket buffer size (safety valve only — not a flush trigger)
+# ---------------------------------------------------------------------------
+_MAX_BRACKET_BUF = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -161,11 +194,6 @@ def _extract_content_title(content: str, max_len: int = 80) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _extract_code_blocks(text: str) -> List[Dict[str, str]]:
-    """
-    Extract all fenced code blocks from *text*.
-    Returns a list of dicts: {language, content, raw}
-    in the order they appear.
-    """
     blocks = []
     pattern = re.compile(r'```(\w*)\n(.*?)```', re.DOTALL)
     for m in pattern.finditer(text):
@@ -178,12 +206,6 @@ def _extract_code_blocks(text: str) -> List[Dict[str, str]]:
 
 
 def _resolve_handle(ref: str, branch_messages: List) -> Optional[Dict[str, str]]:
-    """
-    Resolve a handle reference like "2:0" to the code block it points to.
-    Returns {language, content} or None if the ref is invalid.
-
-    branch_messages — ordered list of LollmsMessage objects (root-to-tip).
-    """
     parts = ref.strip().split(":")
     if len(parts) != 2:
         return None
@@ -206,11 +228,6 @@ def _resolve_handle(ref: str, branch_messages: List) -> Optional[Dict[str, str]]
 
 
 def _build_handle_instructions(branch_messages: List) -> str:
-    """
-    Build a brief instruction block listing available handles so the LLM
-    knows what it can reference without rewriting.
-    Only emitted when there are code blocks in the current branch.
-    """
     entries = []
     for msg_idx, msg in enumerate(branch_messages):
         blocks = _extract_code_blocks(getattr(msg, "content", "") or "")
@@ -287,20 +304,11 @@ def _build_tool_system_prompt(
     base_system_prompt: str,
     tool_descriptions: List[str],
 ) -> str:
-    """
-    Replaces any previous tool section in *base_system_prompt* and appends
-    a fresh, compact tool-call block at the end.
-
-    The tool catalogue is placed at the END of the system prompt so it is
-    the last thing before the conversation history — maximising recall.
-    """
-    # Strip any previous tool section to avoid accumulation
     cleaned = re.split(
         r'\n*╔══+╗.*?╚══+╝.*?\nTOOLS AVAILABLE:',
         base_system_prompt,
         flags=re.DOTALL,
     )[0].rstrip()
-    # Also strip the old plain-text variant
     cleaned = re.split(
         r'\n*## Available Tools.*',
         cleaned,
@@ -317,6 +325,189 @@ def _build_tool_system_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Widget content validation
+# ---------------------------------------------------------------------------
+
+# Non-web language fence patterns that must be stripped from widget content
+_NON_WEB_FENCE_RE = re.compile(
+    r'```(?:python|mermaid|java|c\+\+|cpp|c#|csharp|rust|go|ruby|php|r|'
+    r'swift|kotlin|scala|haskell|erlang|elixir|clojure|lua|perl|bash|sh|'
+    r'zsh|powershell|sql|graphql|yaml|toml|ini|json|xml|latex|tex|'
+    r'dockerfile|makefile|cmake)[\s\S]*?```',
+    re.IGNORECASE,
+)
+
+# A minimal HTML tag that proves the content is web-native
+_HTML_TAG_RE = re.compile(r'<(?:html|head|body|div|span|script|style|p|h[1-6]|'
+                           r'canvas|svg|button|input|form|table|ul|ol|li|a|'
+                           r'section|article|main|header|footer|nav)[^>]*>',
+                           re.IGNORECASE)
+
+
+def _validate_widget_content(raw: str, title: str) -> Optional[str]:
+    """
+    Validates and cleans widget content to ensure it contains only HTML/CSS/JS.
+
+    Steps:
+    1. Strip non-web code fences (```python…```, ```mermaid…```, etc.)
+    2. Unwrap a sole remaining ```html…``` fence if the LLM wrapped the whole doc
+    3. Check that at least one HTML tag survives
+    4. Return the cleaned content, or None with a warning if content is invalid.
+    """
+    cleaned = _NON_WEB_FENCE_RE.sub('', raw).strip()
+
+    # Unwrap a single ```html``` or plain ``` fence if it wraps the whole doc
+    sole_fence = re.match(r'^```(?:html)?\s*\n([\s\S]+?)\n```\s*$', cleaned, re.IGNORECASE)
+    if sole_fence:
+        cleaned = sole_fence.group(1).strip()
+
+    if not cleaned:
+        ASCIIColors.warning(
+            f"[Widget '{title}'] Content is empty after stripping non-web fences. "
+            "Widget discarded."
+        )
+        return None
+
+    if not _HTML_TAG_RE.search(cleaned):
+        ASCIIColors.warning(
+            f"[Widget '{title}'] No HTML tags found after cleaning. "
+            f"Content preview: {cleaned[:120]!r}. Widget discarded."
+        )
+        return None
+
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Form parsing helpers
+# ---------------------------------------------------------------------------
+
+def _parse_form_xml(tag_attrs_str: str, body: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse a <lollms_form …>…</lollms_form> block into a form descriptor dict.
+
+    The body may contain either:
+      (a) JSON — a plain JSON object that IS the descriptor (minus the id),
+      (b) XML field tags  — <field name="…" type="…" label="…" … />
+                         — <section label="…" hint="…" />
+
+    Returns the descriptor dict or None on parse failure.
+    """
+    def _parse_attrs(s: str) -> Dict[str, str]:
+        return {m.group(1): m.group(2)
+                for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', s)}
+
+    top_attrs = _parse_attrs(tag_attrs_str)
+
+    form: Dict[str, Any] = {
+        "id":           str(uuid.uuid4()),
+        "title":        top_attrs.get("title", "Please fill in the form"),
+        "description":  top_attrs.get("description", ""),
+        "submit_label": top_attrs.get("submit_label", "Submit"),
+        "fields":       [],
+    }
+
+    body_stripped = body.strip()
+
+    # ── Strategy A: pure JSON body ────────────────────────────────────────────
+    if body_stripped.startswith("{") or body_stripped.startswith("["):
+        try:
+            parsed = json.loads(body_stripped)
+            if isinstance(parsed, dict):
+                # Merge top-level keys but keep our id
+                form.update({k: v for k, v in parsed.items() if k != "id"})
+                if "fields" not in form:
+                    form["fields"] = []
+                return form
+        except json.JSONDecodeError:
+            pass
+
+    # ── Strategy B: XML <field> / <section> tags ─────────────────────────────
+    field_pattern = re.compile(
+        r'<(?:field|section)\s([^/]*?)(?:/\s*>|>.*?</(?:field|section)>)',
+        re.DOTALL | re.IGNORECASE,
+    )
+    fields_found = []
+    for m in field_pattern.finditer(body_stripped):
+        attrs = _parse_attrs(m.group(1))
+        field: Dict[str, Any] = {
+            "name":    attrs.get("name", f"field_{len(fields_found)}"),
+            "label":   attrs.get("label", attrs.get("name", f"Field {len(fields_found)+1}")),
+            "type":    attrs.get("type", "text"),
+            "required": attrs.get("required", "true").lower() not in ("false", "0", "no"),
+        }
+        # Optional numeric conversions
+        for num_key in ("min", "max", "step", "rows", "min_rating", "max_rating"):
+            if num_key in attrs:
+                try:
+                    field[num_key] = float(attrs[num_key]) if '.' in attrs[num_key] \
+                                     else int(attrs[num_key])
+                except ValueError:
+                    field[num_key] = attrs[num_key]
+        # Optional string fields
+        for str_key in ("default", "placeholder", "hint", "accept", "language",
+                        "category", "options"):
+            if str_key in attrs:
+                field[str_key] = attrs[str_key]
+        # options may be a comma-separated string
+        if "options" in field and isinstance(field["options"], str):
+            field["options"] = [o.strip() for o in field["options"].split(",") if o.strip()]
+        # multiple
+        if "multiple" in attrs:
+            field["multiple"] = attrs["multiple"].lower() not in ("false", "0", "no")
+        fields_found.append(field)
+
+    if fields_found:
+        form["fields"] = fields_found
+        return form
+
+    # ── Strategy C: markdown-style question list ──────────────────────────────
+    # Support a simple "- Question text" or "1. Question text" format
+    question_re = re.compile(r'^[-*\d.]+\s+(.+)', re.MULTILINE)
+    questions = question_re.findall(body_stripped)
+    if questions:
+        form["fields"] = [
+            {
+                "name":     f"q{i+1}",
+                "label":    q.strip().rstrip("?:"),
+                "type":     "textarea",
+                "required": True,
+                "rows":     3,
+            }
+            for i, q in enumerate(questions)
+        ]
+        return form
+
+    # Nothing parseable
+    ASCIIColors.warning(f"[Form] Could not parse form body. Returning empty form.")
+    return form
+
+
+def _format_form_answers_for_llm(form_descriptor: Dict, answers: Dict[str, Any]) -> str:
+    """
+    Formats user-submitted form answers into a readable block that will be
+    injected as a user/system message to resume generation.
+    """
+    lines = [
+        f"=== FORM RESPONSE: {form_descriptor.get('title', 'User Form')} ===",
+    ]
+    fields = form_descriptor.get("fields", [])
+    field_map = {f["name"]: f for f in fields if f.get("type") != "section"}
+
+    for name, value in answers.items():
+        label = field_map.get(name, {}).get("label", name)
+        # Truncate very long values (e.g. file uploads)
+        if isinstance(value, str) and len(value) > 2000:
+            display = value[:2000] + f"… [+{len(value)-2000} chars truncated]"
+        else:
+            display = value
+        lines.append(f"  {label}: {display}")
+
+    lines.append("=== END FORM RESPONSE ===")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ChatMixin
 # ---------------------------------------------------------------------------
 
@@ -326,16 +517,68 @@ class ChatMixin:
 
     Artifact streaming
     ------------------
-    Content inside <artifact>, <note>, <skill>, <lollms_inline> tags is routed
-    exclusively to the secondary MSG_TYPE_ARTEFACT_CHUNK / MSG_TYPE_NOTE_CHUNK /
-    MSG_TYPE_SKILL_CHUNK / MSG_TYPE_WIDGET_CHUNK stream.  It is NEVER sent via
+    Content inside <artifact>, <note>, <skill>, <lollms_inline>, <lollms_form>
+    tags is routed exclusively to the secondary stream.  It is NEVER sent via
     MSG_TYPE_CHUNK so the main chat bubble stays clean.
+
+    Bracket buffering
+    -----------------
+    The '<' character always starts buffering.  The buffer is flushed as visible
+    text ONLY when the completed tag string conclusively does not match any known
+    tag prefix.  Whitespace or length alone NEVER trigger an early flush.
+
+    Widget validation
+    -----------------
+    <lollms_inline> content is validated: non-web fences are stripped, and the
+    result must contain at least one HTML tag or the widget is discarded.
+
+    Form system
+    -----------
+    <lollms_form> pauses generation and fires MSG_TYPE_FORM_READY.  Resume via
+    discussion.submit_form_response(form_id, answers_dict).
 
     Handle system
     -------------
     <use_handle ref="N:M" name="..." type="..." language="..."/>
     Converts an already-generated code block into an artefact without rewriting.
     """
+
+    # ------------------------------------------------------------------ pending forms
+
+    def _get_pending_forms(self) -> Dict[str, Dict]:
+        """Returns the dict of forms awaiting user submission."""
+        if not hasattr(self, '_pending_forms_store'):
+            object.__setattr__(self, '_pending_forms_store', {})
+        return self._pending_forms_store  # type: ignore[attr-defined]
+
+    def submit_form_response(self, form_id: str, answers: Dict[str, Any]) -> bool:
+        """
+        Called by the application layer after the user fills a form.
+
+        Injects the answers as a user message and fires MSG_TYPE_FORM_SUBMITTED.
+        Returns True if the form_id was found and accepted.
+        """
+        pending = self._get_pending_forms()
+        form_descriptor = pending.pop(form_id, None)
+        if form_descriptor is None:
+            ASCIIColors.warning(f"[Form] submit_form_response: form_id '{form_id}' not found.")
+            return False
+
+        answer_text = _format_form_answers_for_llm(form_descriptor, answers)
+        self.add_message(
+            sender="user",
+            sender_type="user",
+            content=answer_text,
+            metadata={"form_id": form_id, "form_answers": answers},
+        )
+
+        cb = getattr(self, '_active_callback', None)
+        _cb(cb, json.dumps({"form_id": form_id, "answers": answers}),
+            MSG_TYPE.MSG_TYPE_FORM_SUBMITTED,
+            {"form_id": form_id, "answers": answers, "form": form_descriptor})
+
+        ASCIIColors.success(f"[Form] '{form_descriptor.get('title')}' answers injected.")
+        return True
 
     # ------------------------------------------------------------------ helpers
 
@@ -529,6 +772,7 @@ class ChatMixin:
         enable_inline_widgets:   bool = True,
         enable_notes:            bool = True,
         enable_skills:           bool = False,
+        enable_forms:            bool = True,
         enable_silent_artefact_explanation: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
@@ -553,8 +797,9 @@ class ChatMixin:
             extra_instructions += self._build_note_instructions()
         if enable_skills:
             extra_instructions += self._build_skill_instructions()
+        if enable_forms:
+            extra_instructions += self._build_form_instructions()
 
-        # Add handle instructions based on current branch
         branch_msgs = self.get_branch(branch_tip_id or self.active_branch_id)
         handle_instructions = _build_handle_instructions(branch_msgs)
         if handle_instructions:
@@ -584,7 +829,6 @@ class ChatMixin:
                 model_name=self.lollmsClient.llm.model_name,
                 binding_name=self.lollmsClient.llm.binding_name,
             )
-            # Resolve handles before post-processing
             branch_msgs_updated = self.get_branch(ai.id)
             text_after_handles, handle_artefacts = _apply_handles(
                 text, branch_msgs_updated, self.artefacts
@@ -599,6 +843,7 @@ class ChatMixin:
                 enable_inline_widgets=enable_inline_widgets,
                 enable_notes=enable_notes,
                 enable_skills=enable_skills,
+                enable_forms=enable_forms,
                 enable_silent_artefact_explanation=enable_silent_artefact_explanation,
             )
             affected = handle_artefacts + affected
@@ -686,7 +931,6 @@ class ChatMixin:
             metadata={"sources": sources} if sources else {},
         )
 
-        # Resolve handles
         branch_msgs_updated = self.get_branch(ai.id)
         final_text_after_handles, handle_artefacts = _apply_handles(
             final_text, branch_msgs_updated, self.artefacts
@@ -701,6 +945,7 @@ class ChatMixin:
             enable_inline_widgets=enable_inline_widgets,
             enable_notes=enable_notes,
             enable_skills=enable_skills,
+            enable_forms=enable_forms,
             enable_silent_artefact_explanation=enable_silent_artefact_explanation,
         )
         affected = handle_artefacts + affected
@@ -741,6 +986,7 @@ class ChatMixin:
         enable_inline_widgets:        bool = True,
         enable_notes:                 bool = True,
         enable_skills:                bool = False,
+        enable_forms:                 bool = True,
         enable_silent_artefact_explanation: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
@@ -805,8 +1051,9 @@ class ChatMixin:
             extra_instructions += self._build_note_instructions()
         if enable_skills:
             extra_instructions += self._build_skill_instructions()
+        if enable_forms:
+            extra_instructions += self._build_form_instructions()
 
-        # Add handle instructions based on current branch
         branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
         handle_instructions = _build_handle_instructions(branch_msgs_now)
         if handle_instructions:
@@ -1180,7 +1427,6 @@ class ChatMixin:
                 metadata={"mode": "direct"},
             )
 
-            # Resolve handles in the fast path too
             branch_for_handles = self.get_branch(ai_message.id)
             raw_after_handles, handle_arts = _apply_handles(
                 raw_text, branch_for_handles, self.artefacts
@@ -1194,6 +1440,7 @@ class ChatMixin:
                 enable_inline_widgets=enable_inline_widgets,
                 enable_notes=enable_notes,
                 enable_skills=enable_skills,
+                enable_forms=enable_forms,
                 enable_silent_artefact_explanation=enable_silent_artefact_explanation,
             )
             affected = handle_arts + affected
@@ -1241,70 +1488,6 @@ class ChatMixin:
                         "source":      "personality",
                         "binding":     pt_spec.get("_binding", ""),
                     })
-                builtins: List[Dict] = [
-                    {"name": "show_tools",
-                     "description": "Display the full list of available tools",
-                     "parameters": [], "output": [{"name": "tools", "type": "list"}],
-                     "source": "builtin"},
-                ]
-                if enable_extract_artefact:
-                    builtins.append({
-                        "name": "extract_artifact_text",
-                        "description": "Extract a range from an artifact by line-hint anchors",
-                        "parameters": [
-                            {"name": "source_title",    "type": "str"},
-                            {"name": "new_title",       "type": "str"},
-                            {"name": "start_line_hint", "type": "str"},
-                            {"name": "end_line_hint",   "type": "str"},
-                            {"name": "occurrence",      "type": "int",
-                             "optional": True, "default": 1},
-                            {"name": "artefact_type",   "type": "str",
-                             "optional": True, "default": "document"},
-                            {"name": "language",        "type": "str",
-                             "optional": True, "default": ""},
-                        ],
-                        "output": [{"name": "lines_extracted", "type": "int"}],
-                        "source": "builtin",
-                    })
-                if enable_final_answer:
-                    builtins.append({
-                        "name": "final_answer",
-                        "description": "Signal that the answer is ready",
-                        "parameters": [], "output": [], "source": "builtin",
-                    })
-                if enable_request_clarification:
-                    builtins.append({
-                        "name": "request_clarification",
-                        "description": "Ask the user for clarification",
-                        "parameters": [{"name": "question", "type": "str"}],
-                        "output": [], "source": "builtin",
-                    })
-                if _eff_img_gen:
-                    builtins.append({
-                        "name": "generate_image (XML tag)",
-                        "description": "Generate an image via <generate_image> XML tag",
-                        "parameters": [
-                            {"name": "width",  "type": "int", "optional": True, "default": 1024},
-                            {"name": "height", "type": "int", "optional": True, "default": 1024},
-                            {"name": "prompt", "type": "str"},
-                        ],
-                        "output": [{"name": "image", "type": "base64"}],
-                        "source": "builtin",
-                    })
-                if _eff_img_edit:
-                    builtins.append({
-                        "name": "edit_image (XML tag)",
-                        "description": "Edit an image via <edit_image> XML tag",
-                        "parameters": [
-                            {"name": "name",   "type": "str", "optional": True},
-                            {"name": "prompt", "type": "str"},
-                        ],
-                        "output": [{"name": "image", "type": "base64"}],
-                        "source": "builtin",
-                    })
-                for b in builtins:
-                    if b not in catalogue:
-                        catalogue.append(b)
                 _cb(callback, json.dumps(catalogue, indent=2),
                     MSG_TYPE.MSG_TYPE_TOOLS_LIST, {"tools": catalogue})
                 return {"success": True, "tool_count": len(catalogue), "tools": catalogue}
@@ -1406,9 +1589,6 @@ class ChatMixin:
                 "- request_clarification(question: str): Ask user for clarification"
             )
 
-        # ── Inject compact tool catalogue into system prompt ─────────────────
-        # Uses _build_tool_system_prompt() which places the catalogue at the END
-        # of the system prompt (closest to the conversation / highest recall).
         object.__setattr__(
             self, "_system_prompt",
             _build_tool_system_prompt(
@@ -1450,7 +1630,6 @@ class ChatMixin:
                 tool_descriptions.insert(0,
                     "- deactivate_artefacts(titles: list[str]): "
                     "CONTEXT PRESSURE -- deactivate unneeded artifacts first")
-                # Rebuild system prompt with the new tool added
                 object.__setattr__(
                     self, "_system_prompt",
                     _build_tool_system_prompt(
@@ -1480,10 +1659,8 @@ class ChatMixin:
         _MAX_IDENTICAL_REPEATS              = 2
         _identical_call_counts: Dict[str, int] = {}
 
-        # Did round-1 produce zero tool calls despite external tools being present?
         _round1_no_tool_call = False
 
-        # Pre-create the assistant message so the UI shows a bubble immediately
         ai_message = self.add_message(
             sender=personality.name,
             sender_type="assistant",
@@ -1498,12 +1675,12 @@ class ChatMixin:
         _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE,
             {"message_id": ai_message.id})
 
-        # ── Tags that must be buffered / hidden from the live chat UI stream ─
+        # ── All tag prefixes that must NEVER leak to the chat bubble ─────────
         _TAG_STARTS = [
             _TC_OPEN, "<think>", "<think ", "<artifact", "<artefact",
             "<generate_image", "<edit_image", "<revert_artifact", "<revert_artefact",
             "<generate_slides", "<street_view", "<schedule_task",
-            "<note", "<skill", "<lollms_event", "<lollms_inline",
+            "<note", "<skill", "<lollms_event", "<lollms_inline", "<lollms_form",
             "<use_handle",
         ]
 
@@ -1519,6 +1696,8 @@ class ChatMixin:
                               MSG_TYPE.MSG_TYPE_SKILL_DONE,       "</skill>"),
             "<lollms_inline":("inline_widget_start",   MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,
                               MSG_TYPE.MSG_TYPE_WIDGET_DONE,      "</lollms_inline>"),
+            "<lollms_form":  ("form_start",            MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,
+                              MSG_TYPE.MSG_TYPE_WIDGET_DONE,      "</lollms_form>"),
         }
 
         while _round < max_reasoning_steps:
@@ -1555,6 +1734,7 @@ class ChatMixin:
                     if prefix in ("<note",)          and not enable_notes:           break
                     if prefix in ("<skill",)         and not enable_skills:          break
                     if prefix in ("<lollms_inline",) and not enable_inline_widgets:  break
+                    if prefix in ("<lollms_form",)   and not enable_forms:           break
 
                     attrs = _parse_tag_attrs(b_str)
                     _sec_tag_prefix  = prefix
@@ -1597,6 +1777,12 @@ class ChatMixin:
                             "type":    "inline_widget_start",
                             "content": {"title": title, "widget_type": widget_type},
                         })
+                    elif prefix == "<lollms_form":
+                        title = attrs.get('title', 'Please fill in the form')
+                        _cb(callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
+                            "type":    "form_start",
+                            "content": {"title": title},
+                        })
                     break
 
             def _fire_secondary_chunk(raw_chunk: str) -> None:
@@ -1627,6 +1813,11 @@ class ChatMixin:
                         "title":       attrs.get('title', 'Interactive Widget'),
                         "chunk":       raw_chunk,
                         "widget_type": attrs.get('type', 'html'),
+                    })
+                elif _sec_tag_prefix == "<lollms_form":
+                    _cb(callback, raw_chunk, _sec_chunk_type, {
+                        "title": attrs.get('title', 'Form'),
+                        "chunk": raw_chunk,
                     })
 
             def _fire_secondary_done() -> None:
@@ -1663,11 +1854,44 @@ class ChatMixin:
                         "description": attrs.get('description', ''),
                     })
                 elif _sec_tag_prefix == "<lollms_inline":
-                    _cb(callback, full_content, _sec_done_type, {
-                        "title":       attrs.get('title', 'Interactive Widget'),
-                        "content":     full_content,
+                    # ── Widget content validation ─────────────────────────────
+                    title = attrs.get('title', 'Interactive Widget')
+                    validated = _validate_widget_content(full_content, title)
+                    if validated is None:
+                        validated = (
+                            "<!DOCTYPE html><html><head><meta charset='UTF-8'></head>"
+                            f"<body><p style='color:red;font-family:monospace'>"
+                            f"[Widget '{title}' discarded: no valid HTML/CSS/JS content]"
+                            f"</p></body></html>"
+                        )
+                    _cb(callback, validated, _sec_done_type, {
+                        "title":       title,
+                        "content":     validated,
                         "widget_type": attrs.get('type', 'html'),
                     })
+                    # Override full_content for post-processor
+                    _sec_content_buf.clear()
+                    _sec_content_buf.append(validated)
+                    full_content = validated
+
+                elif _sec_tag_prefix == "<lollms_form":
+                    # ── Form parsing ──────────────────────────────────────────
+                    form_descriptor = _parse_form_xml(
+                        " ".join(f'{k}="{v}"' for k, v in attrs.items()),
+                        full_content,
+                    )
+                    if form_descriptor:
+                        # Store in pending forms (pauses generation)
+                        self._get_pending_forms()[form_descriptor["id"]] = form_descriptor
+                        _cb(callback, json.dumps(form_descriptor),
+                            MSG_TYPE.MSG_TYPE_FORM_READY,
+                            {"form": form_descriptor,
+                             "form_id": form_descriptor["id"]})
+                        ASCIIColors.cyan(
+                            f"[Form] '{form_descriptor['title']}' ready "
+                            f"(id={form_descriptor['id'][:8]}). "
+                            "Awaiting submit_form_response()."
+                        )
 
                 _sec_tag_prefix  = ""
                 _sec_chunk_type  = None
@@ -1676,6 +1900,24 @@ class ChatMixin:
                 _sec_open_meta   = {}
                 _sec_content_buf = []
                 _sec_close_scan  = ""
+
+            # ------------------------------------------------------------------
+            # _inline_relay — the token-by-token streaming interceptor
+            # ------------------------------------------------------------------
+            # KEY FIX — bracket buffering rules:
+            #
+            # Rule 1: Once '<' is seen, enter buffering mode.
+            # Rule 2: While buffering, accumulate ALL characters.
+            # Rule 3: As soon as '>' arrives, the tag is complete.
+            #         - If the complete tag matches a known prefix → route to secondary.
+            #         - If it definitively does NOT match → flush as visible text.
+            # Rule 4: While buffering (before '>'), flush ONLY when:
+            #         - The buffer content can NEVER match any known tag prefix
+            #           (i.e. no known prefix starts with what we have so far), AND
+            #         - We have at least 2 characters (to avoid flushing bare '<').
+            #         - OR the buffer hits the hard safety cap (_MAX_BRACKET_BUF).
+            # Rule 5: NEVER flush on whitespace or length alone (the old bug).
+            # ------------------------------------------------------------------
 
             def _inline_relay(chunk, msg_type=None, meta=None):
                 nonlocal _in_logic_tag, _is_hidden_tag, _tool_trigger
@@ -1690,9 +1932,9 @@ class ChatMixin:
                     return True
 
                 _stream_buf.append(chunk)
-                _so_far = "".join(_stream_buf)
 
                 if _in_logic_tag:
+                    _so_far = "".join(_stream_buf)
                     if _TC_CLOSE in _so_far:
                         _tool_trigger = True
                         return False
@@ -1735,14 +1977,16 @@ class ChatMixin:
                     return True
 
                 if _is_hidden_tag:
-                    if _TC_OPEN in _so_far:
+                    if _TC_OPEN in chunk:
                         _in_logic_tag = True
                     return True
 
+                # ── Normal text — scan for '<' to start buffering ─────────────
                 rem = chunk
                 while rem:
                     if _is_buffering_bracket:
                         if ">" in rem:
+                            # Tag is now complete — we can make a routing decision
                             idx     = rem.index(">") + 1
                             tag_bit = rem[:idx]
                             rem     = rem[idx:]
@@ -1757,6 +2001,7 @@ class ChatMixin:
                             if any(b_str.startswith(s) for s in _TAG_STARTS):
                                 _is_hidden_tag        = True
                                 _is_buffering_bracket = False
+                                _bracket_buf.clear()
 
                                 _enter_secondary_tag(b_str)
 
@@ -1787,21 +2032,37 @@ class ChatMixin:
                                 rem = ""
                                 continue
 
-                            if not any(s.startswith(b_str) for s in _TAG_STARTS):
+                            # Tag is complete but matches nothing known → flush as visible
+                            ai_message.content += b_str
+                            _cb(callback, b_str, MSG_TYPE.MSG_TYPE_CHUNK)
+                            _is_buffering_bracket = False
+                            _bracket_buf.clear()
+                        else:
+                            # No '>' yet — accumulate and check if we can early-exit buffering
+                            _bracket_buf.append(rem)
+                            b_str = "".join(_bracket_buf)
+
+                            # Safety valve: hard cap — flush and abandon buffering
+                            if len(b_str) >= _MAX_BRACKET_BUF:
+                                ASCIIColors.warning(
+                                    f"[bracket-buffer] Hard cap reached ({_MAX_BRACKET_BUF} chars). "
+                                    "Flushing as plain text."
+                                )
                                 ai_message.content += b_str
                                 _cb(callback, b_str, MSG_TYPE.MSG_TYPE_CHUNK)
                                 _is_buffering_bracket = False
                                 _bracket_buf.clear()
-                        else:
-                            _bracket_buf.append(rem)
-                            b_str = "".join(_bracket_buf)
-                            if (any(c in b_str for c in [" ", "\n", "\r", "\t"])
-                                    or len(b_str) > 100):
-                                if not any(s.startswith(b_str) for s in _TAG_STARTS):
+                            else:
+                                # KEY FIX: only flush early if NO known tag can possibly
+                                # start with what we have so far.  Never flush on whitespace.
+                                can_still_match = any(s.startswith(b_str) or b_str.startswith(s[:len(b_str)])
+                                                      for s in _TAG_STARTS)
+                                if not can_still_match and len(b_str) > 1:
                                     ai_message.content += b_str
                                     _cb(callback, b_str, MSG_TYPE.MSG_TYPE_CHUNK)
                                     _is_buffering_bracket = False
                                     _bracket_buf.clear()
+                                # else: keep buffering, wait for '>'
                             rem = ""
                     else:
                         if "<" in rem:
@@ -1813,14 +2074,15 @@ class ChatMixin:
                                 _cb(callback, pre, MSG_TYPE.MSG_TYPE_CHUNK)
                             _is_buffering_bracket = True
                             _bracket_buf.clear()
-                            rem = post
+                            _bracket_buf.append("<")
+                            rem = post[1:]   # consume the '<', rest goes to next iteration
                         else:
                             ai_message.content += rem
                             _cb(callback, rem, MSG_TYPE.MSG_TYPE_CHUNK)
                             rem = ""
                 return True
 
-            # ── Build agent-state header ─────────────────────────────────────
+            # ── Build agent-state scratchpad header ──────────────────────────
             _saved_scratchpad = self.scratchpad
             state_lines = []
 
@@ -1836,10 +2098,8 @@ class ChatMixin:
                     state_lines.extend(f"  ✓ {t}" for t in _created_artefact_titles)
                 state_lines.append("=== END AGENT STATE ===")
 
-            # Always append the per-round reminder when external tools are present
             state_lines.append(_TOOL_CALL_REMINDER)
 
-            # On round 1 with no previous calls, list tools concisely in scratchpad too
             if _round == 1 and not _completed_tool_calls:
                 state_lines.append(
                     "AVAILABLE TOOLS (quick list): "
@@ -1861,15 +2121,9 @@ class ChatMixin:
             _clean_text_so_far += _clean_segment
 
             # ── Round-1 no-tool-call detection ───────────────────────────────
-            # If round 1 produced no tool call AND external tools are registered,
-            # inject a correction message and retry (once only).
             if _round == 1 and not _tool_trigger and _has_external_tools:
-                # Check whether the output already has a final answer or a
-                # non-trivial response that makes tool calls unnecessary
                 _output_clean = _clean_segment.strip()
                 _needs_tool   = bool(
-                    # heuristic: output is very short OR contains an apology about
-                    # not being able to do something
                     len(_output_clean) < 50
                     or re.search(
                         r"i (cannot|can't|don't|am unable|don't have access|"
@@ -1894,10 +2148,9 @@ class ChatMixin:
                     )
                     _temp_msg_ids.extend([_corr_call.id, _corr_res.id])
                     _current_branch_tip = _corr_res.id
-                    # Reset clean text — the correction turn shouldn't count
                     _clean_text_so_far = ""
                     _accumulated_full  = ""
-                    continue   # re-run the loop
+                    continue
 
             if not _tool_trigger:
                 break
@@ -2199,7 +2452,6 @@ class ChatMixin:
         ai_message.generation_speed = tok_per_sec
         ai_message.metadata         = message_meta
 
-        # Resolve handles in the final text
         branch_for_final_handles = self.get_branch(ai_message.id)
         _clean_after_handles, handle_arts = _apply_handles(
             _clean, branch_for_final_handles, self.artefacts
@@ -2213,6 +2465,7 @@ class ChatMixin:
             enable_inline_widgets=enable_inline_widgets,
             enable_notes=enable_notes,
             enable_skills=enable_skills,
+            enable_forms=enable_forms,
             enable_silent_artefact_explanation=enable_silent_artefact_explanation,
         )
         affected_artefacts = handle_arts + affected_artefacts
@@ -2251,15 +2504,6 @@ def _apply_handles(
     branch_messages: List,
     artefacts_manager: Any,
 ) -> tuple:
-    """
-    Scan *text* for <use_handle .../> tags, resolve each one against
-    *branch_messages*, and create/update the corresponding artefact.
-
-    Returns (cleaned_text, list_of_affected_artefact_dicts).
-    The <use_handle> tags are removed from the returned text; a short
-    confirmation stub is left in their place so the silent-artefact guard
-    can produce a readable summary if needed.
-    """
     from ._artefacts import ArtefactType
 
     handle_pattern = re.compile(
@@ -2283,7 +2527,7 @@ def _apply_handles(
         if not ref or not name:
             ASCIIColors.warning(
                 f"<use_handle> missing ref or name attribute: {match.group(0)}")
-            return match.group(0)   # leave untouched on bad attrs
+            return match.group(0)
 
         block = _resolve_handle(ref, branch_messages)
         if block is None:
@@ -2296,7 +2540,6 @@ def _apply_handles(
         eff_lang = language or block.get("language") or ""
         eff_type = atype if atype in ArtefactType.ALL else ArtefactType.CODE
 
-        # Create or update the artefact
         existing = artefacts_manager.get(name)
         if existing is None:
             art = artefacts_manager.add(
@@ -2315,8 +2558,6 @@ def _apply_handles(
                 f"→ v{art.get('version','?')}")
 
         affected.append(art)
-        # Return empty string so the tag is stripped from visible text;
-        # _post_process will add a summary via the silent-artefact guard.
         return ""
 
     cleaned = handle_pattern.sub(_handle_match, cleaned)

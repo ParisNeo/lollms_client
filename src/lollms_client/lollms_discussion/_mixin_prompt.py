@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 class PromptMixin:
     """
-    Builds artifact / image-generation / inline-widget instructions for the
+    Builds artifact / image-generation / inline-widget / form instructions for the
     system prompt and post-processes the LLM response to apply any XML action
     tags it contains.
 
@@ -26,6 +26,19 @@ class PromptMixin:
     variable names, class names) keeps the British spelling "artefact" for
     backwards compatibility.  The parser accepts BOTH spellings from the LLM.
 
+    FORM SYSTEM
+    -----------
+    <lollms_form> lets the LLM pause and ask the user structured questions.
+    It renders as an interactive form in the UI.  The complete form descriptor
+    fires as MSG_TYPE_FORM_READY.  The application must call
+    discussion.submit_form_response(form_id, answers) to resume generation.
+
+    WIDGET VALIDATION
+    -----------------
+    <lollms_inline> content is validated: non-web code fences (python, mermaid,
+    etc.) are stripped.  If no HTML tag survives, the widget is replaced with
+    an error placeholder.  Only HTML/CSS/JS is accepted.
+
     HANDLE SYSTEM
     -------------
     <use_handle ref="N:M" name="filename" type="code" language="python"/>
@@ -34,83 +47,79 @@ class PromptMixin:
     """
 
     # ─────────────────────────────────────── instruction builders ────────────
-
     def _build_artefact_instructions(self) -> str:
-        """Returns prompt instructions for creating/updating artifacts via XML tags."""
+        """Returns the latest 2026-best-practice prompt for artifact operations."""
         lines = [
             "",
             "=== ARTIFACT SYSTEM ===",
-            "You can create, modify, and version control artifacts (persistent code, documents, notes, skills).",
-            "Always use XML tags for artifact operations. The system keeps full version history automatically.",
             "",
-            "IMPORTANT: Whenever you create or update an artifact, you MUST also write a",
-            "short explanation in your reply (outside the tag) telling the user what you",
-            "created/changed and why. Never let your entire response consist of only XML tags.",
-            "Example: 'I've created `hello.py` with a basic Flask server — here's what it does: …'",
+            "**CRITICAL DISTINCTION — READ THIS FIRST**",
             "",
-            "── Option A: CREATE or REPLACE (write full content) ──────────────────────",
-            '<artifact name="unique_name.py" type="code" language="python"',
-            '          author="Your Name" description="What it does">',
-            "[full content here]",
+            "Artifacts and markdown code blocks are **completely different** things:",
+            "",
+            "• Markdown code blocks (```language ```)",
+            "• Artifacts (<artifact> XML tags) = persistent, version-controlled storage",
+            "",
+            "❌ **NEVER** do this — it breaks the system permanently:",
+            "```xml",
+            "<artifact name=\"example.ext\" type=\"type\">",
+            "...",
+            "</artifact>",
+            "```",
+            "",
+            "✅ **ALWAYS** output the <artifact> tag **directly** as raw XML in your response.",
+            "Never wrap it inside any markdown code fence.",
+            "",
+            "Supported types: " + ", ".join(sorted(list(ArtefactType.ALL))),
+            "Always choose the **most accurate type** for the content. Do not default to any single language.",
+            "",
+            "=== HOW TO USE ARTIFACTS ===",
+            "You can create, update, rename, or revert persistent artifacts using XML tags.",
+            "The system automatically maintains full version history.",
+            "",
+            "You **MUST** always add a short natural explanation in your reply (outside the tag)",
+            "explaining what you created/changed and why.",
+            "Never reply with XML tags only.",
+            "",
+            "── Option A: CREATE or REPLACE (full content)",
+            "<artifact name=\"filename.ext\" type=\"appropriate_type\">",
+            "Full content goes here...",
             "</artifact>",
             "",
-            "── Option B: HANDLE (reference an existing code block — no rewriting) ─────",
-            "If you already wrote a code block earlier in this conversation, you can",
-            "convert it directly into an artefact WITHOUT copying it again:",
+            "── Option B: HANDLE (reference previous code block — no duplication)",
+            "<artifact name=\"filename.ext\" type=\"appropriate_type\" handle=\"msg_idx:block_idx\" />",
             "",
-            '<use_handle ref="<msg_idx>:<block_idx>" name="filename.py"',
-            '            type="code" language="python"/>',
-            "",
-            "  msg_idx   — 0-based index of the message in this conversation",
-            "  block_idx — 0-based index of the fenced code block in that message",
-            "",
-            "Available handles are listed under '=== AVAILABLE HANDLES ===' if any exist.",
-            "Use handles whenever you want to save code you already wrote — avoid",
-            "duplicating content unless the code actually needs to change.",
-            "",
-            "── Option C: PATCH (SEARCH/REPLACE — update an existing artefact) ──────────",
-            "To UPDATE an existing artifact, use SEARCH/REPLACE blocks inside the tag.",
-            "CRITICAL RULES FOR SEARCH/REPLACE:",
-            "  1. Keep each SEARCH block as SHORT as possible — 1 to 5 lines is ideal.",
-            "  2. You may include MULTIPLE SEARCH/REPLACE blocks inside a single <artifact>",
-            "     tag to make several independent edits in one turn.",
-            "  3. Each block MUST use this exact structure:",
-            "       <<<<<<< SEARCH",
-            "       [exact lines to find — copy verbatim from the artifact]",
-            "       =======",
-            "       [replacement lines]",
-            "       >>>>>>> REPLACE",
-            "  4. The SEARCH text must match the artifact content CHARACTER FOR CHARACTER.",
-            "  5. Do NOT omit the >>>>>>> REPLACE marker at the end.",
-            "",
-            "Example — two independent edits in one tag:",
-            '<artifact name="app.py">',
+            "── Option C: PATCH (targeted updates)",
+            "<artifact name=\"filename.ext\" type=\"appropriate_type\">",
             "<<<<<<< SEARCH",
-            "def greet():",
-            "    return 'hello'",
+            "exact old lines here",
             "=======",
-            "def greet(name: str = 'world'):",
-            "    return f'hello {name}'",
+            "new lines here",
             ">>>>>>> REPLACE",
+            "",
             "<<<<<<< SEARCH",
-            "PORT = 8000",
+            "another exact section",
             "=======",
-            "PORT = int(os.getenv('PORT', 8000))",
+            "replacement",
             ">>>>>>> REPLACE",
             "</artifact>",
             "",
-            "── Option D: RENAME ────────────────────────────────────────────────────────",
-            "To rename an artifact while updating it, add a rename attribute:",
-            '<artifact name="old_title" rename="new_title">',
-            "  [full new content OR SEARCH/REPLACE blocks]",
+            "── Option D: RENAME + UPDATE",
+            "<artifact name=\"new_name.ext\" type=\"appropriate_type\" rename=\"old_name.ext\">",
+            "... content or SEARCH/REPLACE blocks ...",
             "</artifact>",
             "",
-            "── Option E: REVERT ────────────────────────────────────────────────────────",
-            "To revert to a previous known version:",
-            '<revert_artifact name="existing_name.py" version="1" />',
+            "── Option E: REVERT",
+            "<artifact name=\"filename.ext\" revert_to=\"v3\" />",
             "",
-            f"Supported types: {', '.join(sorted(list(ArtefactType.ALL)))}",
-            "=== END ARTIFACT INSTRUCTIONS ===",
+            "=== REMINDER (most important rules again) ===",
+            "→ Artifacts = persistent & versioned",
+            "→ Markdown code blocks = temporary display only",
+            "→ Never nest <artifact> inside ``` blocks",
+            "→ Always choose the correct type — never default",
+            "→ Always add a human explanation outside the tag",
+            "",
+            "=== END ARTIFACT SYSTEM ===",
             "",
         ]
         return "\n".join(lines)
@@ -142,63 +151,77 @@ class PromptMixin:
     def _build_inline_widget_instructions(self) -> str:
         lines = [
             "",
-            "=== INTERACTIVE TEACHING WIDGETS ===",
-            "You can embed a live, interactive widget directly inside your reply to help",
-            "the user *learn by doing*.  Use a widget whenever an interactive visual would",
-            "make a concept clearer than text alone — think of it as a mini lab or demo.",
+            "=== INTERACTIVE WIDGET SYSTEM ===",
             "",
-            "IMPORTANT: Always write a short explanation in your reply alongside the widget.",
-            "Never let the widget be your entire response.  Tell the user:",
-            "  • what the widget demonstrates,",
-            "  • which controls to interact with and what to look for,",
-            "  • the key insight they should walk away with.",
+            "**Purpose**",
+            "You can embed live, interactive HTML widgets directly in your replies to help users *learn by doing*. ",
+            "Widgets turn abstract concepts into mini interactive labs or demos.",
             "",
-            "Tag syntax — the content MUST be a complete, standalone HTML document:",
-            '<lollms_inline type="html" title="Descriptive title">',
+            "**CRITICAL DISTINCTION**",
+            "• Normal code blocks or explanations = static text",
+            "• Widgets (`<lollms_inline>`) = **live, interactive experiences** the user can play with",
+            "",
+            "✅ WHEN TO USE A WIDGET:",
+            "  • When an interactive visualization would make the concept much clearer than text alone",
+            "  • To let the user experiment with parameters and immediately see results",
+            "  • For teaching algorithms, math, physics, UI behavior, data transformations, games, etc.",
+            "  • Whenever 'learning by doing' is more effective than 'learning by reading'",
+            "",
+            "❌ DO NOT use widgets for:",
+            "  • Simple static explanations or text content",
+            "  • Displaying code (use <artifact> or markdown code blocks instead)",
+            "  • Non-interactive diagrams (use Mermaid or normal images)",
+            "  • Anything that doesn't meaningfully benefit from user interaction",
+            "",
+            "=== HOW TO CREATE A WIDGET ===",
+            "",
+            "Always include a short, natural explanation **outside** the tag that tells the user:",
+            "  • What the widget demonstrates",
+            "  • Which controls they can interact with",
+            "  • What key insight they should discover",
+            "",
+            "Never let the widget be your entire response.",
+            "",
+            "Tag syntax — Content must be a **complete, standalone HTML document**:",
+            '<lollms_inline type="html" title="Clear descriptive title">',
             "<!DOCTYPE html>",
             "<html>",
             "<head>",
-            "  <meta charset='UTF-8'>",
-            "  <style>/* CSS here */</style>",
+            "  <meta charset=\"UTF-8\">",
+            "  <title>Widget Title</title>",
+            "  <style>",
+            "    /* All CSS here */",
+            "  </style>",
             "</head>",
             "<body>",
-            "  <!-- HTML structure here -->",
-            "  <script>/* JavaScript here */</script>",
+            "  <!-- All HTML content here -->",
+            "  <script>",
+            "    /* All JavaScript here */",
+            "  </script>",
             "</body>",
             "</html>",
             "</lollms_inline>",
             "",
-            "CRITICAL: The widget content must be a COMPLETE HTML document with:",
-            "  • <!DOCTYPE html> declaration",
-            "  • <html>, <head>, and <body> tags",
-            "  • All CSS inside <style> tags in the head",
-            "  • All JavaScript inside <script> tags at end of body",
-            "  • NO external container references like id='game-container' — the widget IS the container",
+            "=== WIDGET CONTENT RULES (Strict) ===",
+            "  • The entire content MUST be a valid, complete HTML5 document",
+            "  • Only HTML + CSS + JavaScript allowed — nothing else",
+            "  • **Never** wrap the HTML inside ```html ... ``` code fences",
+            "  • Do NOT include Python, Mermaid, SQL, or any non-web languages",
+            "  • No alert(), confirm(), or prompt() dialogs",
+            "  • Keep height reasonable (ideally ≤ 460px) and responsive to width",
+            "  • Make every button, slider, or control clearly labeled",
+            "  • Fully self-contained (you may use public CDNs for common libraries like Chart.js, Three.js, etc.)",
+            "  • The widget must work immediately when rendered",
             "",
-            "Supported types:",
-            "  html  — default; full HTML/JS/CSS in one file (most flexible)",
-            "  react — JSX component rendered client-side",
-            "  svg   — animated or interactive SVG",
+            "Supported types: html (default), react, svg",
             "",
-            "GOOD uses (teaching moments):",
-            "  • Physics / math simulations with parameter sliders",
-            "  • Algorithm step-through visualisers",
-            "  • Signal / wave / Fourier explorers",
-            "  • Probability / statistics sandboxes",
-            "  • Mini quizzes or flashcard drills",
+            "=== REMINDER ===",
+            "→ Widgets are for **interactive learning**, not static content",
+            "→ Always add explanatory text before or after the widget",
+            "→ Never output the widget alone",
+            "→ Do not wrap widget content in markdown code blocks",
             "",
-            "BAD uses (do NOT use a widget for these):",
-            "  • Full applications → use <artifact> instead",
-            "  • Static charts with no interactivity → just describe or use a note",
-            "  • Anything requiring a server or file I/O",
-            "",
-            "Technical rules:",
-            "  • Fully self-contained — zero network requests at runtime",
-            "    (CDN links to well-known libraries are fine).",
-            "  • Target ≤ 460 px height, full container width.",
-            "  • Label every control clearly so the user knows what to do.",
-            "  • No alert() / confirm() / prompt().",
-            "=== END INTERACTIVE TEACHING WIDGETS ===",
+            "=== END INTERACTIVE WIDGET SYSTEM ===",
             "",
         ]
         return "\n".join(lines)
@@ -207,27 +230,38 @@ class PromptMixin:
         lines = [
             "",
             "=== NOTE SYSTEM ===",
-            "Notes are persistent, named documents stored alongside the discussion.",
             "",
-            "Use <note> ONLY when:",
-            "  • The user explicitly asks you to save or remember information",
-            "  • You have analysis results, comparison tables, or key findings the user needs",
-            "    to reference later in THIS discussion",
-            "  • You are creating action items or task lists the user needs to track",
+            "**CRITICAL DISTINCTION**",
             "",
-            "DO NOT use <note> for:",
-            "  • Routine explanations or answers to single questions",
-            "  • Calculations or solutions to specific problems (unless user asks to save)",
+            "Notes are **user-facing** persistent documents.",
+            "They are saved for the **user** to read and reference later in this discussion.",
+            "",
+            "Use the <note> tag **only** when it provides real value to the user.",
+            "",
+            "✅ WHEN TO CREATE A NOTE:",
+            "  • The user explicitly asks to save a note for himself",
+            "  • You have produced analysis, comparisons, tables, key findings, or summaries",
+            "    that the user would benefit from referencing later",
+            "  • You are creating action items, task lists, decisions, or plans the user needs to track",
+            "  • You believe the user would find it genuinely useful to have this information persisted",
+            "",
+            "❌ DO NOT create a note for:",
+            "  • Routine explanations or answers to simple questions",
+            "  • One-off calculations or solutions (unless the user asks to save them)",
             "  • Basic facts or concepts that don't need persistence",
-            '  • Code (use <artifact type="code">)',
+            "  • Code or reusable techniques → use <artifact> instead",
+            "",
+            "When in doubt: Ask the user 'Would you like me to save this as a note for future reference?'",
             "",
             "Tag syntax:",
-            '<note title="Clear descriptive title">',
-            "  [note content — plain text or Markdown]",
+            '<note title="Clear, descriptive title">',
+            "Content here — use plain text or Markdown (headings, lists, tables, etc.)",
             "</note>",
             "",
-            "When in doubt, ask the user if they want to save something as a note.",
-            "=== END NOTE INSTRUCTIONS ===",
+            "Always add a short natural explanation **outside** the tag, e.g.:",
+            '"I\'ve saved the comparison table as a note titled \"Model Options\" for easy reference."',
+            "",
+            "=== END NOTE SYSTEM ===",
             "",
         ]
         return "\n".join(lines)
@@ -236,33 +270,104 @@ class PromptMixin:
         lines = [
             "",
             "=== SKILL SYSTEM ===",
-            "Skills are reusable knowledge capsules that persist across sessions.",
-            "They are retrieved automatically when relevant to future questions.",
             "",
-            "Emit a <skill> tag ONLY when ALL these conditions are met:",
-            "  1. The user EXPLICITLY asks you to save something as a skill ('save this as a skill',",
-            "     'remember this pattern', 'learn this trick', etc.) — OR —",
-            "  2. You are teaching a genuinely reusable technique, design pattern, or methodology",
-            "     that the user would explicitly want to reuse in unrelated future tasks.",
+            "**CRITICAL DISTINCTION**",
             "",
-            "DO NOT save as a skill:",
-            "  • Single calculations, formulas, or one-off solutions to specific problems",
-            "  • Explanations of basic concepts that are easily searchable",
-            "  • Code snippets that are not generalizable patterns or frameworks",
-            "  • Anything where the user has not explicitly indicated this should be remembered",
+            "Skills are **LLM-facing** reusable knowledge capsules.",
+            "They persist across sessions and are automatically retrieved when relevant to future queries.",
+            "Skills are for the **LLM** to become better at solving similar problems in the future.",
             "",
-            "When in doubt, ask the user: 'Should I save this as a reusable skill?'",
+            "Create a <skill> **only** when it has clear long-term reusable value.",
+            "",
+            "✅ WHEN TO CREATE A SKILL:",
+            "  1. The user **explicitly** asks you to save it as a skill ('save this as a skill', 'learn this pattern', 'remember this technique', etc.)",
+            "  2. OR you have discovered or synthesized a genuinely reusable technique, design pattern, methodology, prompt template, or heuristic during this session that would help you perform better on unrelated future tasks.",
+            "",
+            "❌ DO NOT create a skill for:",
+            "  • One-off solutions, calculations, or specific problem instances",
+            "  • Basic explanations or easily searchable facts",
+            "  • Non-generalizable code snippets (use <artifact> instead)",
+            "  • Anything without clear reusable value across sessions",
+            "",
+            "When in doubt: Ask the user 'Should I save this as a reusable skill for future conversations?'",
             "",
             "Tag syntax:",
-            '<skill title="Skill Name"',
-            '       description="One-sentence description of what this teaches"',
-            '       category="domain/subdomain/topic">',
-            "  [skill content — Markdown with explanation and concrete examples]",
+            '<skill title="Concise Skill Name"',
+            '       description="One clear sentence describing what this skill teaches"',
+            '       category="domain/subdomain">',
+            "Content here — use Markdown with explanation + concrete examples + usage guidelines",
             "</skill>",
             "",
-            "Category examples: programming/python/async  |  language/french/grammar",
-            "                   cooking/baking/sourdough  |  devops/kubernetes/networking",
-            "=== END SKILL INSTRUCTIONS ===",
+            "Category examples: programming/python/async, writing/prompting/advanced, analysis/comparison/tables, etc.",
+            "",
+            "Always add a short natural explanation **outside** the tag explaining why this skill is valuable.",
+            "",
+            "=== END SKILL SYSTEM ===",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _build_form_instructions(self) -> str:
+        lines = [
+            "",
+            "=== FORM SYSTEM ===",
+            "",
+            "You can create interactive forms to gather structured information from the user.",
+            "The application renders the form as a nice UI; the user fills it in and submits.",
+            "Their answers are sent back to you as a new system message so you can continue accurately.",
+            "",
+            "✅ WHEN TO USE FORMS:",
+            "  • Before starting a complex task where user preferences or multiple inputs are needed",
+            "  • When collecting several pieces of information at once is more efficient than many messages",
+            "  • For quizzes, challenges, or evaluations",
+            "  • In multi-step workflows where early choices affect later steps",
+            "  • To make the interaction more guided, enjoyable, and structured",
+            "",
+            "❌ DO NOT overuse forms for simple or single-question requests.",
+            "",
+            "IMPORTANT RULES:",
+            "  • Always write a short, friendly preamble explaining why you need the information and what you'll do with it.",
+            "  • After emitting the <lollms_form> tag, **stop generation** — do not add any more text in that response.",
+            "  • The conversation continues after the user submits the form.",
+            "",
+            "── Basic XML syntax ─────────────────────────────────────────────────────",
+            '<lollms_form title="Form Title" description="Optional instructions for the user"',
+            '             submit_label="Submit">',
+            '  <field name="field_id" label="User visible label" type="text" required="true"/>',
+            "</lollms_form>",
+            "",
+            "── Field types reference (exact supported types) ────────────────────────",
+            "  text            — single-line text input",
+            "  textarea        — multi-line text input (use rows='N' to control height)",
+            "  number          — numeric input (supports min=, max=, step=)",
+            "  range           — slider input (requires min= and max= attributes)",
+            "  select          — dropdown list (use options='Value1,Value2,Value3')",
+            "  radio           — radio buttons (single choice, use options='A,B,C')",
+            "  checkbox        — single yes/no checkbox",
+            "  checkbox_group  — multiple checkboxes (use options='A,B,C')",
+            "  date            — date picker",
+            "  time            — time picker",
+            "  color           — color picker (returns hexadecimal #RRGGBB)",
+            "  rating          — star rating widget (use min= and max= to set number of stars)",
+            "  code            — code editor with syntax highlighting (use language='python' or similar)",
+            "  section         — visual divider or sub-heading (no user input, use label= for title)",
+            "  hidden          — hidden field whose value is set via default= attribute",
+            "",
+            "── Quiz / challenge example ─────────────────────────────────────────────",
+            '<lollms_form title="Python Quiz — Lists" submit_label="Check my answers">',
+            '  <field name="q1" label="What method adds an element to the END of a list?"',
+            '         type="text" placeholder="method name only" required="true"/>',
+            '  <field name="q2" label="What does list[1:3] return for [10,20,30,40]?"',
+            '         type="radio" options="[10,20],[20,30],[30,40],[20,30,40]" required="true"/>',
+            '  <field name="q3" label="Write a list comprehension for squares 1–5"',
+            '         type="code" language="python" rows="3" required="true"/>',
+            "</lollms_form>",
+            "",
+            "── Alternative: JSON body ───────────────────────────────────────────────",
+            "You may also provide the form definition as a JSON object containing a 'fields' array.",
+            "The JSON structure mirrors the XML field attributes shown above.",
+            "",
+            "=== END FORM SYSTEM ===",
             "",
         ]
         return "\n".join(lines)
@@ -279,60 +384,42 @@ class PromptMixin:
         enable_inline_widgets:   bool = True,
         enable_notes:            bool = True,
         enable_skills:           bool = False,
+        enable_forms:            bool = True,
         enable_silent_artefact_explanation: bool = True,
     ) -> Tuple[str, List[Dict]]:
         """
         Scans the raw LLM response for XML action tags and applies them.
 
-        Accepts both spellings from the LLM:
-          <artifact …>  or  <artefact …>   (American / British)
-          <revert_artifact …>  or  <revert_artefact …>
-        All other tags use a single canonical spelling.
-        This is the *single* place where all LLM-output XML is intercepted.
-        Called at the end of ``chat()`` / ``simplified_chat()``, after
-        ``remove_thinking_blocks`` has run, and *after* the ai_message object
-        has been created (so images / inline widgets can be attached directly).
-
         Handled tags
         ------------
-        ``<artefact name="…" type="…" language="…">…</artefact>``
-            Create or patch (aider SEARCH/REPLACE) a named artefact.
+        ``<artifact …>…</artifact>``  (both spellings)
+            Create or patch a named artefact.
 
-        ``<generate_image width="…" height="…">prompt</generate_image>``
-            Calls ``lollmsClient.tti.generate()`` and attaches the result
-            to *ai_message* via ``add_image_pack``.
-            Only when ``enable_image_generation=True`` and tti is set.
+        ``<generate_image …>…</generate_image>``
+            Image generation via TTI binding.
 
-        ``<edit_image name="…">edit prompt</edit_image>``
-            Calls ``lollmsClient.tti.edit()`` on a source image.
-            Only when ``enable_image_editing=True`` and tti is set.
+        ``<edit_image …>…</edit_image>``
+            Image editing via TTI binding.
 
-        ``<lollms_inline type="html|react|svg" title="…">…</lollms_inline>``
-            Extracts a self-contained interactive teaching widget and stores it
-            in ``ai_message.metadata["inline_widgets"]``.
-            Only when ``enable_inline_widgets=True``.
+        ``<lollms_inline …>…</lollms_inline>``
+            Inline interactive HTML/CSS/JS widget.
+            Content is validated — non-web code is stripped.
 
-        ``<note title="…">…</note>``
-            Saves a persistent named note as an ``ArtefactType.NOTE`` artefact.
-            Active immediately; visible in the artefact panel.
-            Only when ``enable_notes=True``.
+        ``<note …>…</note>``
+            Persistent named note (ArtefactType.NOTE).
 
-        ``<skill title="…" description="…" category="…">…</skill>``
-            Saves a reusable knowledge capsule as an ``ArtefactType.SKILL``
-            artefact with category and description metadata.
-            Only when ``enable_skills=True``.
+        ``<skill …>…</skill>``
+            Reusable knowledge capsule (ArtefactType.SKILL).
+
+        ``<lollms_form …>…</lollms_form>``
+            Interactive form rendered by the application.
+            Fires MSG_TYPE_FORM_READY and waits for
+            discussion.submit_form_response().
 
         Silent artefact guard
         ---------------------
-        When ``enable_silent_artefact_explanation=True`` (the default), if the
-        cleaned text after stripping all XML tags is blank or only whitespace,
-        a concise auto-generated explanation is appended so the user always
-        receives a human-readable confirmation of what was done.
-
-        Returns
-        -------
-        (cleaned_text, affected_artefacts)
-        ``cleaned_text`` has all processed XML tags stripped.
+        When enable_silent_artefact_explanation=True and the cleaned text is
+        blank, a concise auto-generated explanation is appended.
         """
         # ── Mask code blocks so XML inside documentation isn't processed ─────
         code_blocks: Dict[str, str] = {}
@@ -356,8 +443,11 @@ class PromptMixin:
             re.search(r'<note[\s>]', masked_text, re.IGNORECASE))
         has_skill    = enable_skills and bool(
             re.search(r'<skill[\s>]', masked_text, re.IGNORECASE))
+        has_form     = enable_forms and bool(
+            re.search(r'<lollms_form[\s>]', masked_text, re.IGNORECASE))
 
-        if not (has_artefact or has_gen or has_edit or has_inline or has_note or has_skill):
+        if not (has_artefact or has_gen or has_edit or has_inline
+                or has_note or has_skill or has_form):
             return text, []
 
         cleaned             = masked_text
@@ -501,6 +591,8 @@ class PromptMixin:
 
         # ── 4. Inline widgets → message.metadata["inline_widgets"] ───────────
         if has_inline:
+            from ._mixin_chat import _validate_widget_content
+
             inline_pattern = re.compile(
                 r'<lollms_inline\s*([^>]*)>(.*?)</lollms_inline>',
                 re.DOTALL | re.IGNORECASE,
@@ -524,11 +616,21 @@ class PromptMixin:
                 if widget_type not in ('html', 'react', 'svg'):
                     widget_type = 'html'
 
+                # ── Validate content — only HTML/CSS/JS allowed ───────────────
+                validated = _validate_widget_content(source, widget_title)
+                if validated is None:
+                    ASCIIColors.warning(
+                        f"[post-process] Widget '{widget_title}' discarded — no valid HTML.")
+                    return (
+                        f"\n\n*[Widget '{widget_title}' could not be rendered: "
+                        "the content did not contain valid HTML/CSS/JS.]*\n\n"
+                    )
+
                 widget_entry = {
                     "id":     widget_id,
                     "type":   widget_type,
                     "title":  widget_title,
-                    "source": source.strip(),
+                    "source": validated,
                 }
                 meta["inline_widgets"].append(widget_entry)
                 ASCIIColors.success(
@@ -611,13 +713,74 @@ class PromptMixin:
 
             cleaned = skill_pattern.sub(handle_skill, cleaned)
 
+        # ── 7. Forms → MSG_TYPE_FORM_READY  ──────────────────────────────────
+        if has_form:
+            from ._mixin_chat import _parse_form_xml, _format_form_answers_for_llm
+            from lollms_client.lollms_types import MSG_TYPE as _MT
+
+            form_pattern = re.compile(
+                r'<lollms_form\s*([^>]*)>(.*?)</lollms_form>',
+                re.DOTALL | re.IGNORECASE,
+            )
+
+            meta_now = dict(ai_message.metadata or {})
+            if "forms" not in meta_now:
+                meta_now["forms"] = []
+
+            def handle_form(match: re.Match) -> str:
+                import json as _json
+                attrs_str = match.group(1)
+                body      = match.group(2)
+
+                # Unmask code blocks in body
+                for placeholder, original in code_blocks.items():
+                    body = body.replace(placeholder, original)
+
+                form_descriptor = _parse_form_xml(attrs_str, body)
+                if not form_descriptor:
+                    ASCIIColors.warning("[post-process] Form parsing failed; skipping.")
+                    return ''
+
+                # Register in pending forms store
+                self._get_pending_forms()[form_descriptor["id"]] = form_descriptor
+
+                # Store in message metadata
+                meta_now["forms"].append({
+                    "id":    form_descriptor["id"],
+                    "title": form_descriptor["title"],
+                })
+
+                # Fire FORM_READY event
+                _active_cb = getattr(self, '_active_callback', None)
+                if _active_cb:
+                    try:
+                        _active_cb(
+                            _json.dumps(form_descriptor),
+                            _MT.MSG_TYPE_FORM_READY,
+                            {"form": form_descriptor, "form_id": form_descriptor["id"]},
+                        )
+                    except Exception:
+                        pass
+
+                ASCIIColors.cyan(
+                    f"[Form] '{form_descriptor['title']}' ready "
+                    f"(id={form_descriptor['id'][:8]}). "
+                    "Awaiting submit_form_response()."
+                )
+                return f'<lollms_form_anchor id="{form_descriptor["id"]}" />'
+
+            cleaned = form_pattern.sub(handle_form, cleaned)
+
+            if meta_now["forms"]:
+                ai_message.metadata = meta_now
+
         # ── Unmask code blocks ────────────────────────────────────────────────
         for placeholder, original in code_blocks.items():
             cleaned = cleaned.replace(placeholder, original)
 
         cleaned = cleaned.strip()
 
-        # ── 7. Silent-artifact guard ──────────────────────────────────────────
+        # ── 8. Silent-artifact guard ──────────────────────────────────────────
         if enable_silent_artefact_explanation and not cleaned:
             summary_parts: List[str] = []
 
@@ -657,13 +820,19 @@ class PromptMixin:
                 desc_str = f" — {desc}" if desc else ""
                 summary_parts.append(f"🎓 Skill saved **{title}**{cat_str}{desc_str}.")
 
-            meta_now = dict(ai_message.metadata or {})
-            for widget in meta_now.get("inline_widgets", []):
+            meta_now2 = dict(ai_message.metadata or {})
+            for widget in meta_now2.get("inline_widgets", []):
                 w_title = widget.get('title', 'Interactive Widget')
                 w_type  = widget.get('type', 'html')
                 summary_parts.append(
                     f"🎛️ Interactive widget ready: **{w_title}** ({w_type}) — "
                     "use the controls below to explore the concept."
+                )
+
+            for form_ref in meta_now2.get("forms", []):
+                f_title = form_ref.get('title', 'Form')
+                summary_parts.append(
+                    f"📋 Form ready: **{f_title}** — please fill in the fields above."
                 )
 
             if summary_parts:

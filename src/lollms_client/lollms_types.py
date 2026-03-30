@@ -107,9 +107,9 @@ class MSG_TYPE(Enum):
     #
     # MSG_TYPE_WIDGET_DONE:
     #   {"title": str, "content": str, "widget_type": str}
-    #   NOTE: content here is the raw un-mounted widget source. The app should
-    #   NOT attempt to render/mount it inline — wait for the lollms_widget anchor
-    #   in the final message and use metadata["inline_widgets"] instead.
+    #   NOTE: content here is the raw HTML/CSS/JS source validated on arrival.
+    #   The app should NOT attempt to render/mount it inline — wait for the
+    #   lollms_widget anchor in the final message and use metadata["inline_widgets"].
 
     MSG_TYPE_ARTEFACT_CHUNK             = 38 # streaming content chunk of an artefact being built
     MSG_TYPE_ARTEFACT_DONE              = 39 # complete raw artefact content ready (pre-post-processing)
@@ -118,7 +118,78 @@ class MSG_TYPE(Enum):
     MSG_TYPE_SKILL_CHUNK                = 42 # streaming content chunk of a skill being built
     MSG_TYPE_SKILL_DONE                 = 43 # complete raw skill content ready
     MSG_TYPE_WIDGET_CHUNK               = 44 # streaming content chunk of a widget being built
-    MSG_TYPE_WIDGET_DONE                = 45 # complete raw widget source ready (do NOT mount directly)
+    MSG_TYPE_WIDGET_DONE                = 45 # complete raw widget source (validated HTML/CSS/JS only)
+
+    MSG_TYPE_FORM_READY                 = 46 # complete parsed form descriptor ready for rendering
+    MSG_TYPE_FORM_SUBMITTED             = 47 # user answers injected back into generation context
+    # ── Form / Frame system ───────────────────────────────────────────────────
+    # lollms_form lets the LLM ask the user structured questions that render as
+    # an interactive form in the UI.  When submitted, the answers are sent back
+    # to the LLM as a tool_result so generation can continue.
+    #
+    # Lifecycle
+    # ---------
+    #   1. MSG_TYPE_FORM_READY fires when </lollms_form> is fully buffered.
+    #      meta["form"] contains the complete parsed form descriptor dict.
+    #      Generation is PAUSED — the LLM cannot continue until answers arrive.
+    #
+    #   2. The application renders the form, collects user answers, and calls:
+    #        discussion.submit_form_response(form_id, answers_dict)
+    #      This resumes generation with the answers injected as a user/system message.
+    #
+    #   3. MSG_TYPE_FORM_SUBMITTED fires when the answers are injected, confirming
+    #      the round-trip is complete.
+    #
+    # Form descriptor schema (meta["form"])
+    # --------------------------------------
+    # {
+    #   "id":          str    – stable UUID for this form instance
+    #   "title":       str    – displayed as the form heading
+    #   "description": str    – optional subtitle / instructions for the user
+    #   "submit_label":str    – label for the submit button (default "Submit")
+    #   "fields":      list[FieldDescriptor]
+    # }
+    #
+    # FieldDescriptor schema
+    # ----------------------
+    # {
+    #   "name":        str    – machine key returned in the answers dict
+    #   "label":       str    – human-readable label shown next to the field
+    #   "type":        str    – see Field Types below
+    #   "required":    bool   – default True
+    #   "default":     any    – pre-filled value (optional)
+    #   "placeholder": str    – hint text (text / textarea / number fields)
+    #   "options":     list   – for select / radio / checkbox_group / rating
+    #                           each item: str  OR  {"value": any, "label": str}
+    #   "min":         number – for number / range / rating
+    #   "max":         number – for number / range / rating
+    #   "step":        number – for number / range
+    #   "rows":        int    – for textarea (default 4)
+    #   "accept":      str    – for file ("image/*", ".pdf", etc.)
+    #   "multiple":    bool   – for file / select (allow multiple selections)
+    #   "hint":        str    – small explanatory text shown below the field
+    # }
+    #
+    # Field Types
+    # -----------
+    #   text          – single-line text input
+    #   textarea      – multi-line text (rows controlled by "rows")
+    #   number        – numeric input (int or float)
+    #   range         – slider (requires min/max, optional step)
+    #   select        – dropdown (single selection unless multiple=True)
+    #   radio         – radio button group (single selection)
+    #   checkbox       – single boolean checkbox
+    #   checkbox_group – multiple checkboxes from an options list
+    #   date          – date picker
+    #   time          – time picker
+    #   color         – color picker (returns #RRGGBB)
+    #   rating        – star rating (min defaults to 1, max defaults to 5)
+    #   file          – file upload (returns base64 data-URI or filename)
+    #   hidden        – not shown to user; value comes from "default"
+    #   code          – multi-line code editor with optional syntax highlighting
+    #                   (language set via "language" field)
+    #   section       – visual divider / heading with no user input;
+    #                   "label" becomes a sub-heading
 
 
 class SENDER_TYPES(Enum):
