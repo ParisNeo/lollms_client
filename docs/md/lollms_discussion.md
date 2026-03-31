@@ -29,9 +29,19 @@
 5. [Notes](#5-notes)
 6. [Skills](#6-skills)
 7. [Inline Interactive Teaching Widgets](#7-inline-interactive-teaching-widgets)
-8. [Interactive Forms](#8-interactive-forms)0
-9. [The Silent Artefact Guard](#8-the-silent-artefact-guard)
-10. [The Tooling System](#9-the-tooling-system)
+8. [Interactive Forms](#8-interactive-forms)
+9. [The Silent Artefact Guard](#9-the-silent-artefact-guard)
+10. [The Tooling System](#10-the-tooling-system)
+11. [The Streaming State Machine](#11-the-streaming-state-machine)
+12. [REPL Text Tools](#12-repl-text-tools)
+13. [Context Compression](#13-context-compression)
+14. [Scratchpad Placement Model](#14-scratchpad-placement-model)
+15. [Source Title Extraction](#15-source-title-extraction)
+16. [`chat()` Parameter Reference](#16-chat-parameter-reference)
+17. [`chat()` Return Value Reference](#17-chat-return-value-reference)
+18. [The Swarm System](#18-the-swarm-system)
+19. [Worked Example (single-agent)](#19-worked-example)
+20. [UI Implementation Guide](#20-ui-implementation-guide)
 11. [REPL Text Tools](#10-repl-text-tools)
 12. [Context Compression](#11-context-compression)
 13. [Scratchpad Placement Model](#12-scratchpad-placement-model)
@@ -242,9 +252,22 @@ but carry no content. Content arrives on the secondary stream (§2.5).
 
 ### 2.5 Secondary Content Streams — CHUNK and DONE Events
 
+The framework uses an internal state machine (`_StreamState`) to intercept XML tags.
 When the LLM generates an artefact, note, skill, or widget, the raw content is routed
 to a **separate, parallel stream** using dedicated event types rather than appearing in
-the main chat bubble stream. See §4–7 for full details per content type.
+the main chat bubble stream (`MSG_TYPE_CHUNK`).
+
+#### 2.5.1 Lifecycle of a Tagged Block
+1.  **Announcement**: A `MSG_TYPE_CHUNK` fires with `text=""` and `meta` containing the tag title.
+2.  **Streaming**: Zero or more `*_CHUNK` events fire (e.g., `MSG_TYPE_ARTEFACT_CHUNK`).
+3.  **Completion**: A `*_DONE` event fires. At this exact moment, the framework:
+    -   Validates the content (for widgets).
+    -   Persists the data to the database (for artefacts/notes/skills).
+    -   Fires `MSG_TYPE_ARTEFACTS_STATE_CHANGED`.
+4.  **Anchor Placement**: For Widgets and Forms, an anchor tag is appended to the main message content (see §20).
+
+### 2.6 `MSG_TYPE_ARTEFACTS_STATE_CHANGED` — Two Distinct Modes
+=======
 
 ### 2.6 `MSG_TYPE_ARTEFACTS_STATE_CHANGED` — Two Distinct Modes
 
@@ -931,13 +954,8 @@ Airline: Transavia
 </artefact>
 ```
 
-#### 4.2.4 Patch an Existing Artefact — SEARCH/REPLACE (Aider Format)
-
-```xml
-<artefact name="app.py">
-<<<<<<< SEARCH
-def greet():
-    return 'hello'
+def greet(name: str = 'world'):
+    return f'hello {name}'
 =======
 def greet(name: str = 'world'):
     return f'hello {name}'
@@ -1410,7 +1428,20 @@ Any tool with `name="sources"` in its output spec is treated as a RAG tool.
 
 ---
 
-## 11. REPL Text Tools
+## 11. The Streaming State Machine
+
+The `_StreamState` machine is the "firewall" of the conversation. Its primary job is to prevent raw XML tags and tool calls from leaking into the user's chat bubble.
+
+### 11.1 Bracket Buffering
+The moment a `<` character appears, all streaming is diverted into a `bracket_buf`.
+- If the buffer grows to match a known tag (e.g., `<artifact`), the machine enters `STATE_SECONDARY`.
+- If the buffer can no longer possibly match any known tag (e.g., `< Looking at the...`), the entire buffer is flushed to the chat bubble and the machine returns to `STATE_NORMAL`.
+- **Max Buffer**: A safety cap of 4096 characters exists; if exceeded without a match, the buffer is flushed as text.
+
+### 11.2 Real-time Persistence
+Unlike older versions that processed tags after the message was finished, the 2026 architecture performs DB operations **the moment the closing tag (e.g., `</artifact>`) is seen**. This ensures that even if the connection drops or a tool-call causes an error later in the turn, the artefacts created earlier are already saved.
+
+## 12. REPL Text Tools
 
 In-session named buffers (`enable_repl_tools=True`, default) for navigating large tool
 outputs without re-injecting them into the context window.
@@ -1689,7 +1720,25 @@ print(f"Version: {impl['version']}")   # > 1 after tester's patches
 
 ---
 
-## 18. Worked Example (single-agent)
+## 20. UI Implementation Guide
+
+### 20.1 Mounting Interactive Components
+For `lollms_inline` and `lollms_form`, the framework inserts "anchor tags" into the `ai_message.content`. Your UI should scan for these and replace them with live components.
+
+| Tag | Purpose | Source Data Location |
+|---|---|---|
+| `<lollms_widget id="UUID" />` | Interactive Lab/Demo | `message.metadata['inline_widgets']` |
+| `<lollms_form_anchor id="UUID" />` | Structured Input Form | `message.metadata['forms']` |
+
+### 20.2 Handling "The clean bubble"
+Because the framework removes the XML tags during streaming, `ai_message.content` only contains the text the LLM intended for the user. 
+- **DO NOT** try to regex-extract tags from the final content; they aren't there.
+- **DO** use the `affected_artefacts` list returned by `chat()` to know what changed.
+- **DO** listen for `MSG_TYPE_ARTEFACTS_STATE_CHANGED` for real-time sidebar updates.
+
+---
+
+## 21. Worked Example (single-agent)
 
 Full turn: external tool, REPL text tools, notes, skills, artefact, inline widget.
 

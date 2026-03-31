@@ -49,10 +49,12 @@ import json
 import re
 import uuid
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors, trace_exception
 
+from ._artefacts import _find_best_title_match, ArtefactType
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_personality import NullPersonality
 from ._message import LollmsMessage
@@ -480,17 +482,6 @@ def _parse_tag_attrs(attr_str: str) -> Dict[str, str]:
 class _StreamState:
     """
     Encapsulates all mutable state for the streaming interceptor.
-
-    This replaces the previous tangle of nonlocal variables shared between
-    _inline_relay and its nested helper functions.  All transitions are
-    explicit method calls, making the logic much easier to follow and debug.
-
-    States
-    ------
-    NORMAL       — emitting plain text to the main chat bubble
-    BUFFERING    — '<' seen, accumulating characters to identify the tag
-    TOOL_CALL    — inside <tool_call>...</tool_call>
-    SECONDARY    — inside a secondary-stream tag (artefact/note/skill/widget/form)
     """
 
     STATE_NORMAL    = "normal"
@@ -500,22 +491,25 @@ class _StreamState:
 
     def __init__(
         self,
+        discussion: 'LollmsDiscussion',
         callback,
         ai_message,
         enable_notes: bool,
         enable_skills: bool,
         enable_inline_widgets: bool,
         enable_forms: bool,
+        auto_activate_artefacts: bool = True,
     ):
+        self.discussion            = discussion
         self.callback              = callback
         self.ai_message            = ai_message
         self.enable_notes          = enable_notes
         self.enable_skills         = enable_skills
         self.enable_inline_widgets = enable_inline_widgets
         self.enable_forms          = enable_forms
+        self.auto_activate         = auto_activate_artefacts
 
         self.state: str            = self.STATE_NORMAL
-
         # BUFFERING state
         self.bracket_buf: List[str] = []
 
@@ -532,7 +526,8 @@ class _StreamState:
         self.sec_content: List[str] = []
         self.sec_close_scan: str    = ""      # sliding window for close-tag search
 
-        # Accumulated raw stream (for tool_call detection after the round)
+        # Results
+        self.affected_artefacts: List[Dict] = []
         self.stream_buf: List[str]  = []
 
     # ---------------------------------------------------------------- public entry point
@@ -670,9 +665,10 @@ class _StreamState:
                 self.state = self.STATE_NORMAL
                 return len(chunk)
 
-            # Check if any known tag could still start with what we have
+            # Check if any known tag could still start with what we have (Case Insensitive)
+            b_str_lower = b_str.lower()
             can_still_match = any(
-                s.startswith(b_str) or b_str.startswith(s[:len(b_str)])
+                s.lower().startswith(b_str_lower) or b_str_lower.startswith(s[:len(b_str_lower)].lower())
                 for s in _TAG_STARTS
             )
             if not can_still_match and len(b_str) > 1:
@@ -691,8 +687,9 @@ class _StreamState:
 
     def _match_secondary_prefix(self, b_str: str) -> Optional[str]:
         """Return the matching secondary-tag prefix, or None."""
+        b_str_lower = b_str.lower()
         for prefix in _SECONDARY_TAG_MAP:
-            if b_str.startswith(prefix):
+            if b_str_lower.startswith(prefix.lower()):
                 # Check feature flags
                 if prefix in ("<note",)          and not self.enable_notes:           continue
                 if prefix in ("<skill",)         and not self.enable_skills:          continue
@@ -888,63 +885,112 @@ class _StreamState:
             return
 
         full_content = "".join(self.sec_content)
-        attrs        = self.sec_open_attrs
+        attrs        = dict(self.sec_open_attrs)
         prefix       = self.sec_prefix
+        
+        # Helper for real-time state change events
+        def _fire_state_change(art, is_new):
+            if not self.callback: return
+            ev_type = "artifact_created" if is_new else "artifact_updated"
+            _cb(self.callback, json.dumps({
+                "type": ev_type, "title": art.get("title"),
+                "version": art.get("version"), "art_type": art.get("type")
+            }), MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefact": art, "is_new": is_new})
 
         if prefix in ("<artifact", "<artefact"):
-            is_patch = bool(re.search(r'<{6,8}\s*SEARCH', full_content, re.I))
-            _cb(self.callback, full_content, self.sec_done_mt, {
-                "title":    attrs.get('name') or attrs.get('title', ''),
-                "content":  full_content,
-                "art_type": attrs.get('type', 'document'),
-                "language": attrs.get('language'),
-                "is_patch": is_patch,
-                "attrs":    {k: v for k, v in attrs.items()
-                             if k not in ('name', 'title', 'type', 'language')},
-            })
-        elif prefix == "<note":
-            _cb(self.callback, full_content, self.sec_done_mt, {
-                "title":   attrs.get('title') or attrs.get('name', 'Note'),
-                "content": full_content,
-            })
-        elif prefix == "<skill":
-            _cb(self.callback, full_content, self.sec_done_mt, {
-                "title":       attrs.get('title') or attrs.get('name', 'Skill'),
-                "content":     full_content,
-                "category":    attrs.get('category', ''),
-                "description": attrs.get('description', ''),
-            })
-        elif prefix == "<lollms_inline":
-            # Validate widget content
-            title = attrs.get('title', 'Interactive Widget')
-            validated = _validate_widget_content(full_content, title)
-            if validated is None:
-                validated = (
-                    "<!DOCTYPE html><html><head><meta charset='UTF-8'></head>"
-                    f"<body><p style='color:red;font-family:monospace'>"
-                    f"[Widget '{title}' discarded: no valid HTML/CSS/JS content]"
-                    f"</p></body></html>"
-                )
-            _cb(self.callback, validated, self.sec_done_mt, {
-                "title":       title,
-                "content":     validated,
-                "widget_type": attrs.get('type', 'html'),
-            })
-        elif prefix == "<lollms_form":
-            form_descriptor = _parse_form_xml(
-                " ".join(f'{k}="{v}"' for k, v in attrs.items()),
-                full_content,
+            # 1. Persistence
+            tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
+            new_name  = attrs.pop('rename', None)
+            atype     = attrs.pop('type', 'code')
+            lang      = attrs.pop('language', None)
+            
+            existing_titles = self.discussion.artefacts._all_latest_titles()
+            resolved_title = tag_title if tag_title in existing_titles else (
+                _find_best_title_match(tag_title, existing_titles) or tag_title
             )
+            is_new = resolved_title not in existing_titles
+            
+            is_patch = bool(re.search(r'<{6,8}\s*SEARCH', full_content, re.I))
+            
+            result_art = None
+            if is_patch:
+                existing = self.discussion.artefacts.get(resolved_title)
+                if existing:
+                    try:
+                        patched = self.discussion.artefacts.apply_aider_patch(existing.get('content', ''), full_content)
+                        result_art = self.discussion.artefacts.update(
+                            resolved_title, new_content=patched, new_title=new_name, 
+                            language=lang, active=self.auto_activate, **attrs)
+                    except ValueError: result_art = existing
+                else:
+                    result_art = self.discussion.artefacts.add(resolved_title, atype, full_content, language=lang, active=self.auto_activate, **attrs)
+            else:
+                if is_new:
+                    result_art = self.discussion.artefacts.add(resolved_title, atype, full_content.strip(), language=lang, active=self.auto_activate, **attrs)
+                else:
+                    result_art = self.discussion.artefacts.update(resolved_title, new_content=full_content.strip(), new_title=new_name, new_type=atype, language=lang, active=self.auto_activate, **attrs)
+
+            if result_art:
+                self.affected_artefacts.append(result_art)
+                _fire_state_change(result_art, is_new)
+
+            # 2. DONE Event
+            _cb(self.callback, full_content, self.sec_done_mt, {
+                "title": resolved_title, "content": full_content, "art_type": atype,
+                "language": lang, "is_patch": is_patch, "attrs": attrs
+            })
+
+        elif prefix == "<note":
+            title = attrs.get('title') or attrs.get('name', f'note_{uuid.uuid4().hex[:8]}')
+            art = self.discussion.artefacts.add(title=title, artefact_type=ArtefactType.NOTE, content=full_content.strip(), active=self.auto_activate)
+            self.affected_artefacts.append(art)
+            _fire_state_change(art, True)
+            _cb(self.callback, full_content, self.sec_done_mt, {"title": title, "content": full_content})
+
+        elif prefix == "<skill":
+            title = attrs.get('title') or attrs.get('name', f'skill_{uuid.uuid4().hex[:8]}')
+            desc = attrs.get('description', '')
+            cat = attrs.get('category', '')
+            art = self.discussion.artefacts.add(title=title, artefact_type=ArtefactType.SKILL, content=full_content.strip(), active=self.auto_activate, description=desc, category=cat)
+            self.affected_artefacts.append(art)
+            _fire_state_change(art, True)
+            _cb(self.callback, full_content, self.sec_done_mt, {"title": title, "content": full_content, "category": cat, "description": desc})
+
+        elif prefix == "<lollms_inline":
+            title = attrs.get('title', 'Interactive Widget')
+            wtype = attrs.get('type', 'html').lower().strip()
+            validated = _validate_widget_content(full_content, title) or ""
+            
+            meta = dict(self.ai_message.metadata or {})
+            if "inline_widgets" not in meta: meta["inline_widgets"] = []
+            widget_id = str(uuid.uuid4())
+            meta["inline_widgets"].append({"id": widget_id, "type": wtype, "title": title, "source": validated})
+            self.ai_message.metadata = meta
+
+            # Add placement anchor to content and emit chunk
+            anchor = f'\n<lollms_widget id="{widget_id}" />\n'
+            self.ai_message.content += anchor
+            _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_CHUNK)
+
+            _cb(self.callback, validated, self.sec_done_mt, {"title": title, "content": validated, "widget_type": wtype})
+
+        elif prefix == "<lollms_form":
+            form_descriptor = _parse_form_xml(" ".join(f'{k}="{v}"' for k, v in attrs.items()), full_content)
             if form_descriptor:
-                _cb(self.callback, json.dumps(form_descriptor),
-                    MSG_TYPE.MSG_TYPE_FORM_READY,
-                    {"form": form_descriptor,
-                     "form_id": form_descriptor["id"]})
-                ASCIIColors.cyan(
-                    f"[Form] '{form_descriptor['title']}' ready "
-                    f"(id={form_descriptor['id'][:8]}). "
-                    "Awaiting submit_form_response()."
-                )
+                self.discussion._get_pending_forms()[form_descriptor["id"]] = form_descriptor
+                meta = dict(self.ai_message.metadata or {})
+                if "forms" not in meta: meta["forms"] = []
+                meta["forms"].append({"id": form_descriptor["id"], "title": form_descriptor["title"]})
+                self.ai_message.metadata = meta
+                
+                # Add placement anchor to content for UI mounting
+                anchor = f'\n<lollms_form_anchor id="{form_descriptor["id"]}" />\n'
+                self.ai_message.content += anchor
+                
+                # EMIT standard chunk so the UI receives the anchor in real-time
+                _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_CHUNK)
+                
+                _cb(self.callback, json.dumps(form_descriptor), MSG_TYPE.MSG_TYPE_FORM_READY, {"form": form_descriptor, "form_id": form_descriptor["id"]})
 
     # ---------------------------------------------------------------- accessors
 
@@ -1054,10 +1100,23 @@ class ChatMixin:
         do_stream = (callback is not None) and (caller_stream is not False)
         collected = []
 
+        ss = _StreamState(
+            discussion            = self,
+            callback              = callback,
+            ai_message            = LollmsMessage(self, SimpleNamespace(content="", metadata={})), 
+            enable_notes          = kwargs.get("enable_notes", True),
+            enable_skills         = kwargs.get("enable_skills", False),
+            enable_inline_widgets = kwargs.get("enable_inline_widgets", True),
+            enable_forms          = kwargs.get("enable_forms", True),
+            auto_activate_artefacts = kwargs.get("auto_activate_artefacts", True),
+        )
+
         def _streaming_relay(chunk, msg_type=None, meta=None):
+            if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
+                return ss.passthrough(chunk, msg_type, meta)
             if isinstance(chunk, str):
                 collected.append(chunk)
-                return _cb(callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, meta)
+                return ss.feed(chunk)
             return True
 
         result = self.lollmsClient.chat(
@@ -1300,7 +1359,7 @@ class ChatMixin:
             if text_after_handles != text:
                 ai.content = text_after_handles
 
-            cleaned, affected = self._post_process_llm_response(
+            cleaned, affected_pp = self._post_process_llm_response(
                 text_after_handles, ai,
                 enable_image_generation, enable_image_editing,
                 auto_activate_artefacts,
@@ -1310,7 +1369,7 @@ class ChatMixin:
                 enable_forms=enable_forms,
                 enable_silent_artefact_explanation=enable_silent_artefact_explanation,
             )
-            affected = handle_artefacts + affected
+            affected = handle_artefacts + ss.affected_artefacts + affected_pp
             if cleaned != text_after_handles:
                 ai.content = cleaned
             if affected and callback:
@@ -1864,16 +1923,17 @@ class ChatMixin:
 
         if not _has_external_tools:
             # ----------------------------------------------------------------
-            # Fast path uses the StreamState machine too, so artifact tags
-            # generated in non-agentic responses are also correctly intercepted.
+            # Fast path uses the StreamState machine too
             # ----------------------------------------------------------------
             ss = _StreamState(
+                discussion            = self,
                 callback              = callback,
-                ai_message            = None,  # placeholder — set after add_message
+                ai_message            = None,  # placeholder
                 enable_notes          = enable_notes,
                 enable_skills         = enable_skills,
                 enable_inline_widgets = enable_inline_widgets,
                 enable_forms          = enable_forms,
+                auto_activate_artefacts = auto_activate_artefacts,
             )
 
             # We need the ai_message object before streaming so _StreamState can
@@ -1910,20 +1970,21 @@ class ChatMixin:
                     ss.feed(ch)
                 ss.flush_remaining_buffer()
 
+            # Retrieve the content accumulated by StreamState (includes anchors)
             raw_text = ai_message.content
 
             if remove_thinking_blocks:
                 raw_text = self.lollmsClient.remove_thinking_blocks(raw_text)
-                ai_message.content = raw_text
 
             branch_for_handles = self.get_branch(ai_message.id)
+            # Process handles on the text that includes our anchors
             raw_after_handles, handle_arts = _apply_handles(
                 raw_text, branch_for_handles, self.artefacts
             )
-            if raw_after_handles != raw_text:
-                ai_message.content = raw_after_handles
+            
+            ai_message.content = raw_after_handles
 
-            cleaned, affected = self._post_process_llm_response(
+            cleaned, affected_pp = self._post_process_llm_response(
                 raw_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
                 auto_activate_artefacts,
                 enable_inline_widgets=enable_inline_widgets,
@@ -1932,7 +1993,7 @@ class ChatMixin:
                 enable_forms=enable_forms,
                 enable_silent_artefact_explanation=enable_silent_artefact_explanation,
             )
-            affected = handle_arts + affected
+            affected = handle_arts + ss.affected_artefacts + affected_pp
             if cleaned != raw_after_handles:
                 ai_message.content = cleaned
             if affected and callback:
@@ -2194,17 +2255,18 @@ class ChatMixin:
             )
 
             # ── Create per-round StreamState ─────────────────────────────────
-            # Reset ai_message content accumulation for this round by using a
-            # temporary content tracker, then appending to ai_message after.
+            # Reset ai_message content accumulation for this round
             round_content_start = len(ai_message.content)
 
             ss = _StreamState(
+                discussion            = self,
                 callback              = callback,
                 ai_message            = ai_message,
                 enable_notes          = enable_notes,
                 enable_skills         = enable_skills,
                 enable_inline_widgets = enable_inline_widgets,
                 enable_forms          = enable_forms,
+                auto_activate_artefacts = auto_activate_artefacts,
             )
 
             def _inline_relay(chunk, msg_type=None, meta=None):
@@ -2521,6 +2583,7 @@ class ChatMixin:
             self.scratchpad = _scratch_before_final
 
             _accumulated_full += "".join(ss_final.stream_buf)
+            # Ensure we take the version of content that has the anchors
             _clean_text_so_far = ai_message.content
             _step_end(callback, "Final answer generated", _final_id)
 
@@ -2534,6 +2597,8 @@ class ChatMixin:
                 self.db_manager.delete_message(mid)
 
         # ── Strip tool-call tags; keep lollms_event markers ──────────────────
+        # Gather all artefacts created during the rounds
+        # (Assuming we have logic to accumulate them or that we re-run pp)
         import re as _re
         _clean = _re.sub(
             r"<tool_call>.*?(?:</tool_call>|$)", "", _clean_text_so_far, flags=_re.DOTALL
@@ -2588,7 +2653,7 @@ class ChatMixin:
         if _clean_after_handles != _clean:
             ai_message.content = _clean_after_handles
 
-        cleaned_content, affected_artefacts = self._post_process_llm_response(
+        cleaned_content, affected_pp = self._post_process_llm_response(
             _clean_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
             auto_activate_artefacts,
             enable_inline_widgets=enable_inline_widgets,
@@ -2597,7 +2662,9 @@ class ChatMixin:
             enable_forms=enable_forms,
             enable_silent_artefact_explanation=enable_silent_artefact_explanation,
         )
-        affected_artefacts = handle_arts + affected_artefacts
+        # Note: In agentic mode, artifacts are handled round-by-round by StreamState.
+        # We need to make sure we return them all.
+        affected_artefacts = handle_arts + affected_pp
         if cleaned_content != _clean_after_handles:
             ai_message.content = cleaned_content
 

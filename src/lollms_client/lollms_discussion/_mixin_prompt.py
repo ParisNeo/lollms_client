@@ -444,7 +444,7 @@ class PromptMixin:
         has_skill    = enable_skills and bool(
             re.search(r'<skill[\s>]', masked_text, re.IGNORECASE))
         has_form     = enable_forms and bool(
-            re.search(r'<lollms_form[\s>]', masked_text, re.IGNORECASE))
+            re.search(r'<lollms_form[\s>]', masked_text, re.I))
 
         if not (has_artefact or has_gen or has_edit or has_inline
                 or has_note or has_skill or has_form):
@@ -767,7 +767,8 @@ class PromptMixin:
                     f"(id={form_descriptor['id'][:8]}). "
                     "Awaiting submit_form_response()."
                 )
-                return f'<lollms_form_anchor id="{form_descriptor["id"]}" />'
+                # Return the anchor so it replaces the XML tag in the text
+                return f'\n<lollms_form_anchor id="{form_descriptor["id"]}" />\n'
 
             cleaned = form_pattern.sub(handle_form, cleaned)
 

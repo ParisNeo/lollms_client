@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-03-31 01:03]
+
+- docs(chat): update discussion documentation and prompt handling
+
 ## [2026-03-30 23:49]
 
 - refactor(_mixin_chat): reduce post-processing logic
