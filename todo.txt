@@ -2,3 +2,4 @@
 - OK Add actions to bindings. Each action has its own parameters and can be called by the app. Define the parameters in the yaml
 - Images must be used for decision making
 ChatMixin._stream_final_answer() got multiple values for argument 'temperature'
+- the description.yaml is not bundled with the module. fix that
