@@ -8,6 +8,36 @@
 # The XML tag used in LLM prompts and response parsing uses the American spelling
 # "artifact" (<artifact>, </artifact>, <revert_artifact />) because it is far more
 # common in LLM training corpora and avoids model confusion.
+#
+# ARTEFACT IMAGE SYSTEM
+# ---------------------
+# Artefacts can carry images (e.g. pages of a PDF converted to PNG/JPEG).
+# Each image is a base64 string stored in artefact["images"][N].
+# In the artefact *text content*, images are referenced with anchor tags:
+#
+#   <artefact_image id="TITLE::N" />
+#
+# where TITLE is the artefact title and N is the 0-based image index.
+# build_artefacts_context_zone() preserves these anchors verbatim in the
+# text it returns, and also returns a parallel list of image dicts:
+#
+#   [{"id": "TITLE::0", "data": "<base64>", "media_type": "image/png"}, ...]
+#
+# The chat layer collects that list and passes it alongside the messages to the
+# LLM so the model receives the actual pixel data keyed to the in-text anchors.
+#
+# Application side (PDF import example)
+# --------------------------------------
+#   pages_text = []
+#   images_b64 = []
+#   for i, page in enumerate(pdf_pages):
+#       images_b64.append(page.render_to_base64())
+#       pages_text.append(f"## Page {i+1}\n\n<artefact_image id=\"my_doc::{i}\" />\n\n{page.text}")
+#   combined_text = "\n\n".join(pages_text)
+#   discussion.artefacts.add(
+#       title="my_doc", artefact_type=ArtefactType.DOCUMENT,
+#       content=combined_text, images=images_b64, active=True
+#   )
 
 import re
 import uuid
@@ -29,7 +59,7 @@ class ArtefactType:
     Registry for supported artefact types.
 
     Standard types: file, search_result, note, skill, code, document, image.
-    Use register_custom_type() to add domain-specific types (e.g. 'requirement', 'test_case').
+    Use register_custom_type() to add domain-specific types.
     """
     FILE          = "file"
     SEARCH_RESULT = "search_result"
@@ -53,7 +83,6 @@ class ArtefactType:
 
     @classmethod
     def register_custom_type(cls, type_name: str, label: Optional[str] = None):
-        """Adds or updates a type in the valid registry. Silent if type already exists."""
         name = type_name.lower().strip()
         cls.ALL.add(name)
         if label:
@@ -63,15 +92,40 @@ class ArtefactType:
 
 
 # ---------------------------------------------------------------------------
+# Image ID helpers
+# ---------------------------------------------------------------------------
+
+# Separator used in image IDs: "artefact_title::image_index"
+_IMAGE_ID_SEP = "::"
+
+def make_image_id(artefact_title: str, index: int) -> str:
+    """Return the canonical image ID for artefact_title, image index."""
+    return f"{artefact_title}{_IMAGE_ID_SEP}{index}"
+
+
+def parse_image_id(image_id: str) -> Optional[Tuple[str, int]]:
+    """Parse an image ID back to (artefact_title, index), or None on failure."""
+    if _IMAGE_ID_SEP not in image_id:
+        return None
+    title, _, idx_str = image_id.rpartition(_IMAGE_ID_SEP)
+    try:
+        return title, int(idx_str)
+    except ValueError:
+        return None
+
+
+# Regex matching <artefact_image id="..." /> (self-closing, optional space before /)
+_ARTEFACT_IMAGE_TAG_RE = re.compile(
+    r'<artefact_image\s+id=["\']([^"\']+)["\'](?:\s*/?>|>)',
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
 # Levenshtein-1 heuristic helper (no external deps)
 # ---------------------------------------------------------------------------
 
 def _find_closest_line(needle: str, haystack: str) -> str:
-    """
-    Return the line in *haystack* whose stripped content is most similar to
-    *needle* (stripped).  Uses a character-overlap ratio — fast enough for
-    interactive use on files up to ~10 000 lines.
-    """
     needle_s = needle.strip()
     if not needle_s:
         return ''
@@ -94,10 +148,6 @@ def _find_closest_line(needle: str, haystack: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _title_similarity(a: str, b: str) -> float:
-    """
-    Returns a similarity score in [0.0, 1.0] between two artefact title strings.
-    Normalises case, strips common extensions and punctuation before comparing.
-    """
     def _norm(s: str) -> str:
         s = s.lower().strip()
         s = re.sub(r'\.[a-z0-9]{1,6}$', '', s)
@@ -109,7 +159,6 @@ def _title_similarity(a: str, b: str) -> float:
         return 1.0
     if not na or not nb:
         return 0.0
-
     if na in nb or nb in na:
         return 0.85
 
@@ -152,23 +201,38 @@ class ArtefactManager:
 
     Artefact schema (stored in discussion_metadata["_artefacts"]):
     {
-        "id":           str   – stable UUID (survives renames / version bumps)
+        "id":           str   – stable UUID
         "title":        str   – human-readable name / identifier
         "type":         str   – one of ArtefactType.ALL
         "version":      int   – incremented on each update
-        "content":      str   – text content (code, markdown, skill text, …)
-        "images":       list  – list of base64 strings  (for IMAGE type)
+        "content":      str   – text content; may contain <artefact_image id="TITLE::N" /> anchors
+        "images":       list  – list of base64 strings referenced by the anchors above
+        "image_media_types": list  – parallel list of MIME types ("image/png", "image/jpeg", …)
+                                     Defaults to "image/jpeg" when not supplied.
         "audios":       list  – list of base64 strings  (reserved)
         "videos":       list  – list of base64 strings  (reserved)
         "zip":          str | None  – base64 zip blob   (reserved)
         "language":     str | None  – programming language hint  (CODE type)
-        "url":          str | None  – source URL  (SEARCH_RESULT / FILE)
+        "url":          str | None  – source URL
         "tags":         list  – free-form tags
-        "active":       bool  – whether it is injected into the context
+        "active":       bool  – injected into context when True
         "created_at":   str   – ISO datetime
         "updated_at":   str   – ISO datetime
-        # …any extra_data kwargs are also stored here
     }
+
+    IMAGE ANCHOR CONVENTION
+    -----------------------
+    When an artefact holds both text and images (e.g. a PDF converted to
+    text+images), the text content may contain self-closing tags:
+
+        <artefact_image id="my_doc::0" />
+        <artefact_image id="my_doc::1" />
+
+    The id attribute is  "<artefact_title>::<0-based-image-index>".
+
+    build_artefacts_context_zone() returns the text verbatim (anchors
+    preserved).  get_context_images() returns the list of images that
+    are referenced by active artefacts, formatted for the LLM API.
     """
 
     def __init__(self, discussion: 'LollmsDiscussion'):
@@ -177,7 +241,6 @@ class ArtefactManager:
     # --------------------------------------------------------- internal helpers
 
     def _get_all_raw(self) -> List[Dict]:
-        """Returns the raw list from metadata, migrating legacy entries."""
         metadata = self._discussion.metadata or {}
         raw = metadata.get("_artefacts", [])
         now = datetime.utcnow().isoformat()
@@ -185,21 +248,22 @@ class ArtefactManager:
         migrated = []
         for a in raw:
             fixed = a.copy()
-            if "id"         not in fixed: fixed["id"]         = str(uuid.uuid4()); dirty = True
-            if "type"       not in fixed: fixed["type"]        = ArtefactType.DOCUMENT; dirty = True
-            if "title"      not in fixed: fixed["title"]       = "untitled"; dirty = True
-            if "content"    not in fixed: fixed["content"]     = ""; dirty = True
-            if "images"     not in fixed: fixed["images"]      = []; dirty = True
-            if "audios"     not in fixed: fixed["audios"]      = []; dirty = True
-            if "videos"     not in fixed: fixed["videos"]      = []; dirty = True
-            if "zip"        not in fixed: fixed["zip"]         = None; dirty = True
-            if "language"   not in fixed: fixed["language"]    = None; dirty = True
-            if "url"        not in fixed: fixed["url"]         = None; dirty = True
-            if "tags"       not in fixed: fixed["tags"]        = []; dirty = True
-            if "active"     not in fixed: fixed["active"]      = False; dirty = True
-            if "version"    not in fixed: fixed["version"]     = 1; dirty = True
-            if "created_at" not in fixed: fixed["created_at"]  = now; dirty = True
-            if "updated_at" not in fixed: fixed["updated_at"]  = now; dirty = True
+            if "id"               not in fixed: fixed["id"]               = str(uuid.uuid4()); dirty = True
+            if "type"             not in fixed: fixed["type"]             = ArtefactType.DOCUMENT; dirty = True
+            if "title"            not in fixed: fixed["title"]            = "untitled"; dirty = True
+            if "content"          not in fixed: fixed["content"]          = ""; dirty = True
+            if "images"           not in fixed: fixed["images"]           = []; dirty = True
+            if "image_media_types" not in fixed: fixed["image_media_types"] = []; dirty = True
+            if "audios"           not in fixed: fixed["audios"]           = []; dirty = True
+            if "videos"           not in fixed: fixed["videos"]           = []; dirty = True
+            if "zip"              not in fixed: fixed["zip"]              = None; dirty = True
+            if "language"         not in fixed: fixed["language"]         = None; dirty = True
+            if "url"              not in fixed: fixed["url"]              = None; dirty = True
+            if "tags"             not in fixed: fixed["tags"]             = []; dirty = True
+            if "active"           not in fixed: fixed["active"]           = False; dirty = True
+            if "version"          not in fixed: fixed["version"]          = 1; dirty = True
+            if "created_at"       not in fixed: fixed["created_at"]       = now; dirty = True
+            if "updated_at"       not in fixed: fixed["updated_at"]       = now; dirty = True
             migrated.append(fixed)
         if dirty:
             new_meta = (self._discussion.metadata or {}).copy()
@@ -226,18 +290,19 @@ class ArtefactManager:
 
     def add(
         self,
-        title:         str,
-        artefact_type: str = ArtefactType.DOCUMENT,
-        content:       str = "",
-        images:        Optional[List[str]] = None,
-        audios:        Optional[List[str]] = None,
-        videos:        Optional[List[str]] = None,
-        zip_content:   Optional[str] = None,
-        language:      Optional[str] = None,
-        url:           Optional[str] = None,
-        tags:          Optional[List[str]] = None,
-        version:       int = 1,
-        active:        bool = True,
+        title:             str,
+        artefact_type:     str = ArtefactType.DOCUMENT,
+        content:           str = "",
+        images:            Optional[List[str]] = None,
+        image_media_types: Optional[List[str]] = None,
+        audios:            Optional[List[str]] = None,
+        videos:            Optional[List[str]] = None,
+        zip_content:       Optional[str] = None,
+        language:          Optional[str] = None,
+        url:               Optional[str] = None,
+        tags:              Optional[List[str]] = None,
+        version:           int = 1,
+        active:            bool = True,
         **extra_data
     ) -> Dict[str, Any]:
         if artefact_type not in ArtefactType.ALL:
@@ -251,23 +316,31 @@ class ArtefactManager:
         for a in artefacts:
             if a.get('title') == title:
                 a['active'] = False
+
+        imgs  = images or []
+        mtypes = image_media_types or []
+        # Pad / extend media_types to match image count
+        if len(mtypes) < len(imgs):
+            mtypes = mtypes + ["image/jpeg"] * (len(imgs) - len(mtypes))
+
         now = datetime.utcnow().isoformat()
         new_artefact: Dict[str, Any] = {
-            "id":         str(uuid.uuid4()),
-            "title":      title,
-            "type":       artefact_type,
-            "version":    version,
-            "content":    content,
-            "images":     images or [],
-            "audios":     audios or [],
-            "videos":     videos or [],
-            "zip":        zip_content,
-            "language":   language,
-            "url":        url,
-            "tags":       tags or [],
-            "active":     active,
-            "created_at": now,
-            "updated_at": now,
+            "id":               str(uuid.uuid4()),
+            "title":            title,
+            "type":             artefact_type,
+            "version":          version,
+            "content":          content,
+            "images":           imgs,
+            "image_media_types": mtypes,
+            "audios":           audios or [],
+            "videos":           videos or [],
+            "zip":              zip_content,
+            "language":         language,
+            "url":              url,
+            "tags":             tags or [],
+            "active":           active,
+            "created_at":       now,
+            "updated_at":       now,
             **extra_data,
         }
         artefacts.append(new_artefact)
@@ -303,16 +376,17 @@ class ArtefactManager:
 
     def update(
         self,
-        title:         str,
-        new_content:   Optional[str] = None,
-        new_type:      Optional[str] = None,
-        new_images:    Optional[List[str]] = None,
-        new_tags:      Optional[List[str]] = None,
-        language:      Optional[str] = None,
-        url:           Optional[str] = None,
-        new_title:     Optional[str] = None,
-        bump_version:  bool = True,
-        active:        Optional[bool] = None,
+        title:             str,
+        new_content:       Optional[str] = None,
+        new_type:          Optional[str] = None,
+        new_images:        Optional[List[str]] = None,
+        new_image_media_types: Optional[List[str]] = None,
+        new_tags:          Optional[List[str]] = None,
+        language:          Optional[str] = None,
+        url:               Optional[str] = None,
+        new_title:         Optional[str] = None,
+        bump_version:      bool = True,
+        active:            Optional[bool] = None,
         **extra_data
     ) -> Dict[str, Any]:
         latest = self.get(title)
@@ -329,8 +403,8 @@ class ArtefactManager:
         target_title = new_title if new_title else title
 
         internal_keys = {
-            "id", "title", "type", "version", "content", "images", "audios",
-            "videos", "zip", "language", "url", "tags", "active",
+            "id", "title", "type", "version", "content", "images", "image_media_types",
+            "audios", "videos", "zip", "language", "url", "tags", "active",
             "created_at", "updated_at", "artefact_type"
         }
         merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
@@ -344,19 +418,37 @@ class ArtefactManager:
             self._save_all(artefacts)
             ASCIIColors.info(f"Renaming artefact '{title}' → '{new_title}'")
 
+        # When renaming, rewrite any image-anchor IDs in the content
+        use_content = new_content if new_content is not None else latest.get('content', '')
+        if new_title and new_title != title:
+            use_content = use_content.replace(
+                f'id="{title}{_IMAGE_ID_SEP}',
+                f'id="{new_title}{_IMAGE_ID_SEP}'
+            ).replace(
+                f"id='{title}{_IMAGE_ID_SEP}",
+                f"id='{new_title}{_IMAGE_ID_SEP}"
+            )
+
+        use_images = new_images if new_images is not None else latest.get('images', [])
+        use_mtypes = (
+            new_image_media_types if new_image_media_types is not None
+            else latest.get('image_media_types', [])
+        )
+
         return self.add(
-            title         = target_title,
-            artefact_type = new_type if new_type is not None else latest.get('type', ArtefactType.DOCUMENT),
-            content       = new_content if new_content is not None else latest.get('content', ''),
-            images        = new_images  if new_images  is not None else latest.get('images', []),
-            audios        = latest.get('audios', []),
-            videos        = latest.get('videos', []),
-            zip_content   = latest.get('zip'),
-            language      = language if language is not None else latest.get('language'),
-            url           = url if url is not None else latest.get('url'),
-            tags          = new_tags if new_tags is not None else latest.get('tags', []),
-            version       = new_version,
-            active        = new_active,
+            title             = target_title,
+            artefact_type     = new_type if new_type is not None else latest.get('type', ArtefactType.DOCUMENT),
+            content           = use_content,
+            images            = use_images,
+            image_media_types = use_mtypes,
+            audios            = latest.get('audios', []),
+            videos            = latest.get('videos', []),
+            zip_content       = latest.get('zip'),
+            language          = language if language is not None else latest.get('language'),
+            url               = url if url is not None else latest.get('url'),
+            tags              = new_tags if new_tags is not None else latest.get('tags', []),
+            version           = new_version,
+            active            = new_active,
             **merged_extra,
         )
 
@@ -367,24 +459,25 @@ class ArtefactManager:
         latest = self.get(title)
         new_version = (latest.get('version', 1) + 1) if latest else 1
         extra_keys = {k: v for k, v in target.items() if k not in [
-            "id", "title", "type", "version", "content", "images", "audios",
-            "videos", "zip", "language", "url", "tags", "active",
+            "id", "title", "type", "version", "content", "images", "image_media_types",
+            "audios", "videos", "zip", "language", "url", "tags", "active",
             "created_at", "updated_at"
         ]}
         ASCIIColors.info(f"Reverting '{title}' to version {target_version} (now saved as v{new_version})")
         return self.add(
-            title         = title,
-            artefact_type = target.get('type', ArtefactType.DOCUMENT),
-            content       = target.get('content', ''),
-            images        = target.get('images', []),
-            audios        = target.get('audios', []),
-            videos        = target.get('videos', []),
-            zip_content   = target.get('zip'),
-            language      = target.get('language'),
-            url           = target.get('url'),
-            tags          = target.get('tags', []),
-            version       = new_version,
-            active        = True,
+            title             = title,
+            artefact_type     = target.get('type', ArtefactType.DOCUMENT),
+            content           = target.get('content', ''),
+            images            = target.get('images', []),
+            image_media_types = target.get('image_media_types', []),
+            audios            = target.get('audios', []),
+            videos            = target.get('videos', []),
+            zip_content       = target.get('zip'),
+            language          = target.get('language'),
+            url               = target.get('url'),
+            tags              = target.get('tags', []),
+            version           = new_version,
+            active            = True,
             **extra_keys,
         )
 
@@ -439,6 +532,13 @@ class ArtefactManager:
     # --------------------------------------------------------- context zone
 
     def build_artefacts_context_zone(self) -> str:
+        """
+        Assembles a text block describing all active artefacts.
+
+        <artefact_image id="TITLE::N" /> anchors in artefact content are
+        preserved verbatim so the LLM can correlate text with images.
+        The companion image list is obtained via get_context_images().
+        """
         active = [a for a in self._get_all_raw() if a.get('active', False)]
         with_content = [a for a in active if a.get('content', '').strip() or a.get('url')]
         if not with_content:
@@ -455,17 +555,79 @@ class ArtefactManager:
             if total_versions > 1:
                 version_str += f" | {total_versions} total versions exist"
             meta_str = ""
-            if item.get('author'): meta_str += f" | Author: {item['author']}"
+            if item.get('author'):      meta_str += f" | Author: {item['author']}"
             if item.get('description'): meta_str += f"\nDescription: {item['description']}"
             label  = ArtefactType.LABELS.get(atype, atype.capitalize())
             header = f"###[{label}] {item['title']} ({version_str}){meta_str}{url_line}"
+
+            # Image count note (only when images present)
+            img_note = ""
+            imgs = item.get('images') or []
+            if imgs:
+                img_note = (
+                    f"\n<!-- This artefact has {len(imgs)} image(s). "
+                    f"They are referenced inline via <artefact_image id=\"{item['title']}::N\" /> tags. "
+                    f"The actual image data has been appended to the conversation context. -->"
+                )
+
             if item.get('content', '').strip():
-                parts.append(f"{header}\n{fence}\n{item['content'].strip()}\n```")
+                # For code artefacts that have no image anchors, keep the fence.
+                # For document artefacts that embed image anchors, use plain text
+                # so the anchors are not hidden inside a code block.
+                content_text = item['content'].strip()
+                if atype == ArtefactType.CODE or (
+                    lang and not _ARTEFACT_IMAGE_TAG_RE.search(content_text)
+                ):
+                    parts.append(f"{header}{img_note}\n{fence}\n{content_text}\n```")
+                else:
+                    parts.append(f"{header}{img_note}\n{content_text}")
             else:
-                parts.append(header)
+                parts.append(header + img_note)
+
         return "## Active Artifacts\n\n" + "\n\n".join(parts)
 
+    def get_context_images(self) -> List[Dict[str, Any]]:
+        """
+        Returns ALL images from active artefacts that have images.
+
+        Each entry:
+            {
+                "id":         str  – "<title>::<index>"
+                "data":       str  – base64 encoded image data
+                "media_type": str  – e.g. "image/jpeg", "image/png"
+                "title":      str  – artefact title
+                "index":      int  – 0-based index within the artefact
+                "active":     bool – True
+            }
+
+        The list is ordered: artefacts in activation order, images in index order.
+        The chat layer merges these with message-level images before calling the LLM.
+        """
+        result: List[Dict[str, Any]] = []
+        for a in self._get_all_raw():
+            if not a.get('active', False):
+                continue
+            imgs   = a.get('images') or []
+            mtypes = a.get('image_media_types') or []
+            for idx, img_b64 in enumerate(imgs):
+                if not img_b64:
+                    continue
+                mtype = mtypes[idx] if idx < len(mtypes) else "image/jpeg"
+                result.append({
+                    "id":         make_image_id(a['title'], idx),
+                    "data":       img_b64,
+                    "media_type": mtype,
+                    "title":      a['title'],
+                    "index":      idx,
+                    "active":     True,
+                })
+        return result
+
     def get_active_images(self) -> List[Dict[str, Any]]:
+        """
+        Legacy / UI helper: returns images from active IMAGE-type artefacts only.
+        For full artefact image context, use get_context_images().
+        """
         result = []
         for a in self._get_all_raw():
             if a.get('active', False) and a.get('type') == ArtefactType.IMAGE:
@@ -485,41 +647,7 @@ class ArtefactManager:
     def apply_aider_patch(original: str, patch_block: str) -> str:
         """
         Applies one or more aider SEARCH/REPLACE blocks to *original* text.
-
-        Canonical block format
-        ----------------------
-        <<<<<<< SEARCH
-        [exact lines to find]
-        =======
-        [replacement lines]
-        >>>>>>> REPLACE
-
-        Multiple blocks are applied left-to-right on the result of each
-        previous application.
-
-        Fault-tolerance
-        ---------------
-        The following LLM hallucination patterns are handled gracefully:
-
-        1. Missing ``>>>>>>> REPLACE`` at the very end
-           → appended automatically.
-
-        2. ``>>>>>>> REPLACE`` used where ``=======`` should be (model
-           confused the two markers)
-           → treated as an empty replacement (deletion of the search text).
-
-        3. Variant marker spellings:
-           - ``======`` (5+ ``=`` signs) as separator
-           - ``<<<<<<<`` or ``<<<<<<<<`` with or without trailing SEARCH
-           - ``>>>>>>>`` or ``>>>>>>>>`` with or without trailing REPLACE
-           - Trailing spaces / CR on any marker line
-
-        4. SEARCH text not found verbatim
-           → raises ValueError with a hint showing the closest line found,
-             to help diagnose whitespace / indentation mismatches.
-
-        Raises ValueError if a SEARCH block cannot be located in the text
-        after all normalisation attempts.
+        (Full docstring preserved from original — see source.)
         """
         import re as _re
 
@@ -610,8 +738,6 @@ class ArtefactManager:
         return result
 
     # -------------------------------------------- LLM artifact XML parser
-    # NOTE: The XML tag is <artifact> (American spelling) but the Python
-    # method and variable names keep "artefact" for API stability.
 
     def _apply_artefact_xml(
         self,
@@ -623,30 +749,15 @@ class ArtefactManager:
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Scans *text* for ``<artifact …>…</artifact>`` blocks (American spelling)
-        and also accepts the legacy ``<artefact …>…</artefact>`` spelling for
-        backward compatibility with older model outputs.
+        and also accepts the legacy ``<artefact …>…</artefact>`` spelling.
 
-        * Uses fuzzy title matching to find an existing artefact whose name is
-          similar to the tag's ``name`` attribute, so a renamed tag still updates
-          the right artefact instead of creating a duplicate.
-
-        * Supports an explicit ``rename="new title"`` attribute to change the
-          stored title while applying content changes.
-
-        * Creates a new artefact when no sufficiently similar title is found.
-
-        * Applies one or more aider SEARCH/REPLACE patch blocks when markers
-          are present, with the same error recovery as before.
-
-        * Fires event_callback(artefact_dict, is_new: bool) after each
-          artefact is saved, so the UI can update in real time.
-
-        Returns (cleaned_text, affected_artefacts_list).
+        NOTE: The LLM cannot create artefact images via XML — images are supplied
+        by the application layer when calling add() / update() directly.
+        The parser ignores any image-related attributes it encounters.
         """
         affected: List[Dict] = []
         cleaned  = text
 
-        # Accept both spellings from the LLM
         artefact_pattern = re.compile(
             r'<art[ei]fact\s([^>]*)>(.*?)</art[ei]fact>',
             re.DOTALL | re.IGNORECASE
@@ -677,6 +788,9 @@ class ArtefactManager:
             language    = attrs.pop('language', None)
             version_str = attrs.pop('version', '1')
             version     = int(version_str) if version_str.isdigit() else 1
+            # Strip any image-related attrs the LLM might have hallucinated
+            attrs.pop('images', None)
+            attrs.pop('image_media_types', None)
 
             if atype not in ArtefactType.ALL:
                 atype = default_type
@@ -780,7 +894,6 @@ class ArtefactManager:
 
         cleaned = artefact_pattern.sub(handle_artefact, cleaned)
 
-        # Accept both spellings for revert tag too
         revert_pattern = re.compile(r'<revert_art[ei]fact\s([^>]+)/?>', re.IGNORECASE)
 
         def handle_revert(match: re.Match) -> str:

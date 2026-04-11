@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lollms_client"
-    dynamic = ["version"]
+dynamic = ["version"]
 authors = [
     {name = "ParisNeo", email = "parisneoai@gmail.com"},
 ]
@@ -51,4 +51,4 @@ exclude = ["lollms_client.egg-info*", "lollms_client.llm_bindings.llama_cpp_serv
 [tool.setuptools.dynamic]
 version = {attr = "lollms_client.__version__"}
 [tool.setuptools.package-data]
-lollms_client = ["assets/*.json"]
+lollms_client = ["assets/*.json", "**/description.yaml"]

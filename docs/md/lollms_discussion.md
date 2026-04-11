@@ -26,6 +26,7 @@
    - 3.10 Temporary Tool-History Messages
    - 3.11 Complete Branch Management Example
 4. [The Artefact System](#4-the-artefact-system)
+   - 4.5 [Artefact Images](#45-artefact-images--embedding-visual-content-in-documents)
 5. [Notes](#5-notes)
 6. [Skills](#6-skills)
 7. [Inline Interactive Teaching Widgets](#7-inline-interactive-teaching-widgets)
@@ -50,6 +51,7 @@
 16. [`chat()` Return Value Reference](#15-chat-return-value-reference)
 17. [The Swarm System](#16-the-swarm-system)
 18. [Worked Example (single-agent)](#17-worked-example)
+19. [UI Implementation Guide](#20-ui-implementation-guide)
 
 ---
 
@@ -1010,6 +1012,221 @@ mgr.remove("scratch.txt")
 `MSG_TYPE_ARTEFACTS_STATE_CHANGED` fires once per `<artefact>` / `<revert_artefact>`
 tag immediately as it is processed, before the full response is assembled. See §2.6 for
 event payload shapes.
+
+### 4.5 Artefact Images — Embedding Visual Content in Documents
+
+Artefacts can carry images alongside their text content. This is essential for:
+- **PDF documents** converted to text+images (each page rendered as PNG/JPEG)
+- **Screenshots** embedded in technical documentation
+- **Diagrams** referenced from code explanations
+- **Multi-modal reports** combining prose and visual evidence
+
+#### 4.5.1 The Image Anchor System
+
+Images are stored as base64 strings in `artefact["images"]` and referenced **inline**
+in the text content using self-closing anchor tags:
+
+```xml
+<artefact_image id="TITLE::N" />
+```
+
+Where:
+- `TITLE` = the artefact's `title` field
+- `N` = 0-based index into `artefact["images"]`
+
+**Example artefact with embedded images:**
+```xml
+<artefact name="annual_report_2024.pdf" type="document">
+# Annual Report 2024
+
+## Executive Summary
+<artefact_image id="annual_report_2024.pdf::0" />
+
+Revenue increased 23% year-over-year. Key drivers shown in the chart above.
+
+## Regional Breakdown
+<artefact_image id="annual_report_2024.pdf::1" />
+
+The Asia-Pacific region now represents our largest market segment.
+
+## Product Portfolio
+<artefact_image id="annual_report_2024.pdf::2" />
+<artefact_image id="annual_report_2024.pdf::3" />
+
+New product lines launched in Q3 and Q4 respectively.
+</artefact>
+```
+
+#### 4.5.2 Image Storage and MIME Types
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `images` | `list[str]` | Base64-encoded image data |
+| `image_media_types` | `list[str]` | Parallel list of MIME types (`"image/png"`, `"image/jpeg"`, etc.) |
+
+When `image_media_types` is shorter than `images`, missing entries default to `"image/jpeg"`.
+
+#### 4.5.3 Context Assembly — How the LLM Receives Images
+
+The framework automatically:
+
+1. **Collects** all images from active artefacts via `artefacts.get_context_images()`
+2. **Appends** them to the vision input after any user-supplied images
+3. **Injects** a mapping note into the scratchpad showing which slot corresponds to which anchor
+
+Image ordering in the LLM call:
+```
+[user images] → [artefact images in activation order, by index]
+```
+
+The system prompt includes instructions (see `_build_artefact_instructions()`) telling the LLM how to interpret `<artefact_image id="..." />` anchors and correlate them with the numbered image slots.
+
+#### 4.5.4 API Methods for Image-Enabled Artefacts
+
+```python
+# Create an artefact with images
+artefact = discussion.artefacts.add(
+    title="my_document",
+    artefact_type=ArtefactType.DOCUMENT,
+    content="See figure: <artefact_image id='my_document::0' />",
+    images=[base64_page_1, base64_page_2],  # list of base64 strings
+    image_media_types=["image/png", "image/png"],
+    active=True
+)
+
+# Retrieve images for rendering
+context_images = discussion.artefacts.get_context_images()
+# Returns: [{"id": "my_document::0", "data": "...", "media_type": "image/png",
+#            "title": "my_document", "index": 0, "active": True}, ...]
+
+# Get only IMAGE-type artefacts (legacy/UI helper)
+image_artefacts = discussion.artefacts.get_active_images()
+```
+
+#### 4.5.5 Complete Working Example — PDF Import with Page Images
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_discussion import ArtefactType
+import base64
+
+# Setup
+lc = LollmsClient("ollama", {"model_name": "llava", "host_address": "http://localhost:11434"})
+db = LollmsDataManager("sqlite:///multimodal.db")
+discussion = LollmsDiscussion.create_new(lollms_client=lc, db_manager=db, autosave=True)
+
+# Simulate PDF processing: extract text and render pages to images
+def import_pdf_as_artefact(discussion, pdf_path: str, title: str):
+    """
+    Example: Convert a PDF to a text+images artefact.
+    In production, use pdf2image + pytesseract or similar.
+    """
+    # Simulated: pages as (text, image_base64) tuples
+    pages = [
+        ("## Page 1\n\nExecutive summary content here...", "iVBORw0KGgo..."),  # PNG base64
+        ("## Page 2\n\nFinancial data table...", "iVBORw0KGgo..."),           # PNG base64
+        ("## Page 3\n\nChart showing trends...", "iVBORw0KGgo..."),          # PNG base64
+    ]
+    
+    # Build content with image anchors
+    content_parts = []
+    images_b64 = []
+    media_types = []
+    
+    for i, (page_text, img_b64) in enumerate(pages):
+        # Add image anchor before the page text
+        content_parts.append(f"<artefact_image id=\"{title}::{i}\" />\n\n{page_text}")
+        images_b64.append(img_b64)
+        media_types.append("image/png")
+    
+    full_content = "\n\n---\n\n".join(content_parts)
+    
+    # Create the artefact
+    artefact = discussion.artefacts.add(
+        title=title,
+        artefact_type=ArtefactType.DOCUMENT,
+        content=full_content,
+        images=images_b64,
+        image_media_types=media_types,
+        active=True,
+        description=f"Imported from {pdf_path} — {len(pages)} pages with images"
+    )
+    
+    return artefact
+
+# Import a document
+artefact = import_pdf_as_artefact(discussion, "report.pdf", "Q4_Earnings_Report")
+
+# --- Rendering in a UI ---
+
+def render_artefact_with_images(discussion, title: str):
+    """
+    Render an artefact's text content, replacing image anchors with actual images.
+    """
+    artefact = discussion.artefacts.get(title)
+    if not artefact:
+        return None
+    
+    content = artefact["content"]
+    images = artefact.get("images", [])
+    media_types = artefact.get("image_media_types", ["image/jpeg"] * len(images))
+    
+    # Build an HTML representation
+    html_parts = []
+    
+    # Split by image anchors and interleave actual images
+    import re
+    pattern = r'<artefact_image\s+id=["\']([^"\']+)["\']\s*/?>'
+    
+    last_end = 0
+    for match in re.finditer(pattern, content):
+        # Text before this anchor
+        html_parts.append(content[last_end:match.start()])
+        
+        # Parse the image ID
+        img_id = match.group(1)
+        parsed = discussion.artefacts._artefacts.parse_image_id(img_id)
+        if parsed:
+            art_title, idx = parsed
+            if art_title == title and 0 <= idx < len(images):
+                # Embed as data URI
+                mime = media_types[idx] if idx < len(media_types) else "image/jpeg"
+                data_uri = f"data:{mime};base64,{images[idx]}"
+                html_parts.append(f'<img src="{data_uri}" alt="Page {idx+1}" style="max-width:100%;" />')
+        
+        last_end = match.end()
+    
+    # Remaining text
+    html_parts.append(content[last_end:])
+    
+    return "".join(html_parts)
+
+# Or use the framework's built-in context image collection
+context_images = discussion.artefacts.get_context_images()
+print(f"Total images in context: {len(context_images)}")
+for img in context_images:
+    print(f"  {img['id']}: {img['media_type']} ({len(img['data'])} chars base64)")
+
+# Chat with the document — the LLM sees both text and images
+result = discussion.chat(
+    "Summarize the key findings from the earnings report, "
+    "referencing specific charts and figures by name.",
+    streaming_callback=lambda t, mt, m: print(t, end="", flush=True) if mt.value == 0 else None
+)
+```
+
+#### 4.5.6 Rules for LLM-Generated Artefacts with Images
+
+When the LLM patches or creates artefacts:
+
+| Rule | Rationale |
+|------|-----------|
+| **Preserve anchors unchanged** | When patching text containing `<artefact_image id="..." />`, do not modify or remove the tags |
+| **Cannot create images via XML** | Images must be supplied by the application layer; the LLM cannot generate base64 image data |
+| **Can reference anchors in replies** | The LLM may write "As shown in `<artefact_image id='doc::2' />`, revenue..." |
+| **Image slots are append-only** | New images are always added to the end; existing indices remain stable |
+
+The `build_artefacts_context_zone()` method preserves anchors verbatim in the text it returns, while `get_context_images()` provides the parallel image data for the LLM API call.
 
 ---
 

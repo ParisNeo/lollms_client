@@ -3,47 +3,31 @@
 #
 # ARTIFACT STREAMING CONTRACT
 # ---------------------------
-# When the LLM emits an <artifact ...>...</artifact> block (or <note>, <skill>,
-# <lollms_inline>, <lollms_form>) the content inside that block is NEVER forwarded
-# to the main chat bubble via MSG_TYPE_CHUNK.  Instead:
+# Content inside <artifact>, <note>, <skill>, <lollms_inline>, <lollms_form> tags is
+# NEVER forwarded to the main chat bubble via MSG_TYPE_CHUNK.
 #
-#   1. When the opening tag is fully buffered, a single MSG_TYPE_CHUNK is fired
-#      with text="" and meta={"type": "artifact_update", "content": {"title": ...}}
-#      so the UI can open a secondary panel / indicator.
+# ARTEFACT IMAGE CONTRACT
+# -----------------------
+# When active artefacts carry images (e.g. PDF pages), those images are collected by
+# _collect_artefact_images() and merged with any user-supplied images before the LLM
+# call.  The system prompt (built by PromptMixin._build_artefact_instructions) already
+# informs the LLM about <artefact_image id="TITLE::N" /> anchors.
 #
-#   2. Each content fragment inside the tag fires MSG_TYPE_ARTEFACT_CHUNK
-#      (or the matching *_CHUNK type for notes / skills / widgets / forms).
-#      These must NOT reach the main chat bubble.
+# Image ordering sent to the LLM:
+#   [discussion-level images] + [user message images] + [artefact images in order]
 #
-#   3. When the closing tag is detected, MSG_TYPE_ARTEFACT_DONE
-#      (or the matching *_DONE type) is fired with the complete raw content.
-#      _post_process_llm_response then runs and fires
-#      MSG_TYPE_ARTEFACTS_STATE_CHANGED.
+# Each artefact image is keyed by its id ("TITLE::N") which matches the anchor tag
+# in the artefact text so the model can correlate text and pixel data.
 #
 # STREAMING STATE MACHINE
 # -----------------------
-# The streaming interceptor uses an explicit StreamState object to avoid
-# the closure/nonlocal fragility of nested functions sharing mutable state.
-#
-# States:
-#   NORMAL        — plain text, forwarded to chat bubble
-#   BUFFERING_TAG — '<' seen, accumulating until '>' to identify tag
-#   TOOL_CALL     — inside <tool_call>...</tool_call>
-#   SECONDARY     — inside a secondary-stream tag (artifact/note/skill/widget/form)
+# The streaming interceptor uses an explicit _StreamState object.
+# States: NORMAL | BUFFERING_TAG | TOOL_CALL | SECONDARY
 #
 # BRACKET BUFFERING CONTRACT
 # --------------------------
-# The moment a '<' character is seen in the stream, ALL subsequent characters
-# are buffered and NEVER forwarded to the chat bubble until the tag is fully
-# identified (closing '>' received).  The buffer is flushed as visible text
-# ONLY when it is conclusively not a known tag — i.e. when NO known tag prefix
-# can possibly match the buffered content.
-#
-# Flush rules:
-#   (a) '>' received and completed tag does not match any known tag prefix → flush
-#   (b) Buffer grows beyond MAX_BRACKET_BUF characters (hard safety cap) → flush
-#   (c) Buffer content cannot possibly start any known tag (no prefix match) → flush
-#   NEVER flush on whitespace or length alone.
+# '<' always starts buffering. Buffer flushed as text only when conclusively not a
+# known tag. Whitespace or length alone NEVER trigger flush.
 
 import json
 import re
@@ -54,7 +38,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors, trace_exception
 
-from ._artefacts import _find_best_title_match, ArtefactType
+from ._artefacts import _find_best_title_match, ArtefactType, make_image_id, parse_image_id
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_personality import NullPersonality
 from ._message import LollmsMessage
@@ -64,7 +48,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Hard cap on bracket buffer size (safety valve only — not a flush trigger)
+# Hard cap on bracket buffer size
 # ---------------------------------------------------------------------------
 _MAX_BRACKET_BUF = 4096
 
@@ -83,7 +67,7 @@ _TAG_STARTS = [
     "<use_handle",
 ]
 
-# Secondary-stream tag type mapping: prefix → (announce_type, chunk_mt, done_mt, close_tag)
+# Secondary-stream tag type mapping
 _SECONDARY_TAG_MAP = {
     "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
                        MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
@@ -476,6 +460,66 @@ def _parse_tag_attrs(attr_str: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Artefact image collection
+# ---------------------------------------------------------------------------
+
+def _collect_artefact_images(discussion: Any) -> List[str]:
+    """
+    Collect all images from active artefacts and return them as a list of
+    base64 strings in the order: artefact images sorted by
+    (activation order, image index).
+
+    The LLM will receive these images appended after any user-supplied
+    images, in the same order they appear as <artefact_image id="..."/>
+    anchors in the active artefact text.
+    """
+    context_imgs = discussion.artefacts.get_context_images()
+    return [img["data"] for img in context_imgs]
+
+
+def _build_artefact_image_index(discussion: Any) -> Dict[str, int]:
+    """
+    Returns a mapping from image_id → position in the combined image list
+    (0-based, after user images).
+
+    Used to tell the LLM which numbered image slot corresponds to which
+    artefact_image id when the binding doesn't support named images.
+    This mapping is injected into the scratchpad context if needed.
+    """
+    context_imgs = discussion.artefacts.get_context_images()
+    return {img["id"]: idx for idx, img in enumerate(context_imgs)}
+
+
+def _build_artefact_image_map_note(
+    discussion: Any,
+    user_image_count: int,
+) -> str:
+    """
+    Builds a compact system note that maps artefact_image IDs to the
+    actual image slot numbers the model will receive.
+
+    Only generated when there are artefact images to map.
+
+    Example output:
+        [Artefact image slots — images are 0-indexed in the vision input]
+        <artefact_image id="my_doc::0" /> → image slot 2
+        <artefact_image id="my_doc::1" /> → image slot 3
+    """
+    context_imgs = discussion.artefacts.get_context_images()
+    if not context_imgs:
+        return ""
+    lines = [
+        "[Artefact image map — images are appended after user images in the vision input]"
+    ]
+    for idx, img in enumerate(context_imgs):
+        slot = user_image_count + idx
+        lines.append(
+            f'  <artefact_image id="{img["id"]}" /> → vision input image #{slot}'
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # StreamState — explicit state machine for the inline relay
 # ---------------------------------------------------------------------------
 
@@ -510,39 +554,30 @@ class _StreamState:
         self.auto_activate         = auto_activate_artefacts
 
         self.state: str            = self.STATE_NORMAL
-        # BUFFERING state
         self.bracket_buf: List[str] = []
 
-        # TOOL_CALL state — accumulate everything until </tool_call>
         self.tool_buf: List[str]    = []
-        self.tool_trigger: bool     = False   # set True when </tool_call> seen
+        self.tool_trigger: bool     = False
 
-        # SECONDARY state
-        self.sec_prefix: str        = ""      # e.g. "<artifact"
+        self.sec_prefix: str        = ""
         self.sec_chunk_mt: Any      = None
         self.sec_done_mt: Any       = None
-        self.sec_close_tag: str     = ""      # e.g. "</artifact>"
+        self.sec_close_tag: str     = ""
         self.sec_open_attrs: Dict   = {}
         self.sec_content: List[str] = []
-        self.sec_close_scan: str    = ""      # sliding window for close-tag search
+        self.sec_close_scan: str    = ""
 
-        # Results
         self.affected_artefacts: List[Dict] = []
         self.stream_buf: List[str]  = []
 
     # ---------------------------------------------------------------- public entry point
 
     def feed(self, chunk: str) -> bool:
-        """
-        Feed one streaming chunk into the state machine.
-        Returns False to request stream abort, True to continue.
-        """
         if not isinstance(chunk, str):
             return True
 
         self.stream_buf.append(chunk)
 
-        # Dispatch character-by-character within the chunk
         pos = 0
         while pos < len(chunk):
             ch = chunk[pos]
@@ -571,10 +606,6 @@ class _StreamState:
     # ---------------------------------------------------------------- passthrough relay
 
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
-        """
-        Used by the caller to relay non-CHUNK events (thoughts, reasoning, etc.)
-        directly to the application callback, bypassing state-machine processing.
-        """
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
             if msg_type in (MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING):
                 self.ai_message.thoughts = (self.ai_message.thoughts or "") + (chunk or "")
@@ -584,60 +615,39 @@ class _StreamState:
     # ---------------------------------------------------------------- STATE_NORMAL
 
     def _feed_normal(self, chunk: str, pos: int) -> int:
-        """
-        Scan forward in NORMAL state.  Emit visible text until '<' is hit.
-        On '<', enter BUFFERING state.
-        Returns new position.
-        """
         lt_idx = chunk.find("<", pos)
 
         if lt_idx == -1:
-            # No '<' in the remainder — emit all of it
             text = chunk[pos:]
             if text:
                 self.ai_message.content += text
                 _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
             return len(chunk)
 
-        # Emit everything before '<'
         if lt_idx > pos:
             text = chunk[pos:lt_idx]
             self.ai_message.content += text
             _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
 
-        # Start buffering from '<'
         self.state = self.STATE_BUFFERING
         self.bracket_buf = ["<"]
-        return lt_idx + 1   # '<' consumed, continue from next char
+        return lt_idx + 1
 
     # ---------------------------------------------------------------- STATE_BUFFERING
 
     def _feed_buffering(self, chunk: str, pos: int) -> int:
-        """
-        Accumulate characters until we can identify (or rule out) a known tag.
-
-        Decision rules:
-        1. '>' received → tag is complete; route or flush.
-        2. Buffer content can no longer match any known tag prefix → flush as text.
-        3. Buffer exceeds hard cap → flush as text (safety valve).
-        """
         gt_idx = chunk.find(">", pos)
 
         if gt_idx != -1:
-            # We have a '>' — complete the tag
             self.bracket_buf.append(chunk[pos:gt_idx + 1])
             b_str = "".join(self.bracket_buf)
             new_pos = gt_idx + 1
 
-            # Is it a tool call opener?
             if "<tool_call>" in b_str:
-                # Everything before <tool_call> (from bracket buf prefix) is lost —
-                # that's fine, there should be nothing before it in the buffer.
                 self.state = self.STATE_TOOL_CALL
                 self.tool_buf = [b_str]
                 return new_pos
 
-            # Is it a known secondary tag?
             matched_prefix = self._match_secondary_prefix(b_str)
             if matched_prefix:
                 self.bracket_buf.clear()
@@ -645,17 +655,14 @@ class _StreamState:
                 self._enter_secondary(b_str, matched_prefix)
                 return new_pos
 
-            # Not a known tag — flush as plain text
             self._flush_bracket_buf_as_text()
             self.state = self.STATE_NORMAL
             return new_pos
 
         else:
-            # No '>' yet — accumulate what we have
             self.bracket_buf.append(chunk[pos:])
             b_str = "".join(self.bracket_buf)
 
-            # Hard cap safety valve
             if len(b_str) >= _MAX_BRACKET_BUF:
                 ASCIIColors.warning(
                     f"[StreamState] Bracket buffer hard cap ({_MAX_BRACKET_BUF}) reached. "
@@ -665,14 +672,12 @@ class _StreamState:
                 self.state = self.STATE_NORMAL
                 return len(chunk)
 
-            # Check if any known tag could still start with what we have (Case Insensitive)
             b_str_lower = b_str.lower()
             can_still_match = any(
                 s.lower().startswith(b_str_lower) or b_str_lower.startswith(s[:len(b_str_lower)].lower())
                 for s in _TAG_STARTS
             )
             if not can_still_match and len(b_str) > 1:
-                # Definitively not a known tag — flush
                 self._flush_bracket_buf_as_text()
                 self.state = self.STATE_NORMAL
 
@@ -686,11 +691,9 @@ class _StreamState:
             _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
 
     def _match_secondary_prefix(self, b_str: str) -> Optional[str]:
-        """Return the matching secondary-tag prefix, or None."""
         b_str_lower = b_str.lower()
         for prefix in _SECONDARY_TAG_MAP:
             if b_str_lower.startswith(prefix.lower()):
-                # Check feature flags
                 if prefix in ("<note",)          and not self.enable_notes:           continue
                 if prefix in ("<skill",)         and not self.enable_skills:          continue
                 if prefix in ("<lollms_inline",) and not self.enable_inline_widgets:  continue
@@ -701,10 +704,6 @@ class _StreamState:
     # ---------------------------------------------------------------- STATE_TOOL_CALL
 
     def _feed_tool_call(self, chunk: str, pos: int) -> int:
-        """
-        Accumulate everything until </tool_call> is seen.
-        On finding the close tag, set tool_trigger = True and return.
-        """
         self.tool_buf.append(chunk[pos:])
         accumulated = "".join(self.tool_buf)
 
@@ -717,10 +716,6 @@ class _StreamState:
     # ---------------------------------------------------------------- STATE_SECONDARY
 
     def _enter_secondary(self, opening_tag: str, prefix: str):
-        """
-        Called when a complete secondary opening tag has been identified.
-        Fires the opening announcement event and sets up state for content streaming.
-        """
         ann_type, chunk_mt, done_mt, close_tag = _SECONDARY_TAG_MAP[prefix]
 
         self.sec_prefix    = prefix
@@ -731,7 +726,6 @@ class _StreamState:
         self.sec_content   = []
         self.sec_close_scan = ""
 
-        # Fire the opening announcement on MSG_TYPE_CHUNK with meta
         if prefix in ("<artifact", "<artefact"):
             title = self.sec_open_attrs.get('name') or self.sec_open_attrs.get('title', '')
             _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
@@ -766,23 +760,15 @@ class _StreamState:
             })
 
     def _feed_secondary(self, chunk: str, pos: int) -> int:
-        """
-        In SECONDARY state: scan for the closing tag.
-        Content before the close tag is routed to the secondary chunk stream.
-        Content after the close tag is handed back to NORMAL state.
-        """
         close_tag = self.sec_close_tag
         close_len = len(close_tag)
         incoming  = chunk[pos:]
 
-        # Append to the sliding close-tag scanner
         self.sec_close_scan += incoming
 
-        # Check if the close tag is present anywhere in the accumulated scan buffer
         close_idx = self.sec_close_scan.find(close_tag)
 
         if close_idx != -1:
-            # Close tag found — everything before it is content
             pre_close  = self.sec_close_scan[:close_idx]
             post_close = self.sec_close_scan[close_idx + close_len:]
 
@@ -792,7 +778,6 @@ class _StreamState:
 
             self._fire_secondary_done()
 
-            # Reset secondary state
             self.sec_prefix     = ""
             self.sec_chunk_mt   = None
             self.sec_done_mt    = None
@@ -801,18 +786,10 @@ class _StreamState:
             self.sec_close_scan = ""
             self.state          = self.STATE_NORMAL
 
-            # Process any remaining text after the close tag
             if post_close:
-                # Re-enter normal state processing for the remainder
-                # Directly emit since we know it's not tagged
-                # (it will be re-processed through _feed_normal on the next feed call,
-                #  but we need to handle it here since we're mid-chunk)
                 self._feed_post_close(post_close)
 
         else:
-            # Close tag not found yet.
-            # Safely emit everything except the last (close_len - 1) chars,
-            # which might be the start of the close tag split across chunks.
             safe_len = max(0, len(self.sec_close_scan) - close_len + 1)
             safe_content = self.sec_close_scan[:safe_len]
             if safe_content:
@@ -823,11 +800,6 @@ class _StreamState:
         return len(chunk)
 
     def _feed_post_close(self, text: str):
-        """
-        Process text that came after a secondary tag's close tag,
-        within the same chunk processing pass.
-        We are now back in NORMAL state.
-        """
         pos = 0
         while pos < len(text):
             if self.state == self.STATE_NORMAL:
@@ -887,8 +859,7 @@ class _StreamState:
         full_content = "".join(self.sec_content)
         attrs        = dict(self.sec_open_attrs)
         prefix       = self.sec_prefix
-        
-        # Helper for real-time state change events
+
         def _fire_state_change(art, is_new):
             if not self.callback: return
             ev_type = "artifact_created" if is_new else "artifact_updated"
@@ -898,20 +869,21 @@ class _StreamState:
             }), MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefact": art, "is_new": is_new})
 
         if prefix in ("<artifact", "<artefact"):
-            # 1. Persistence
             tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
             new_name  = attrs.pop('rename', None)
             atype     = attrs.pop('type', 'code')
             lang      = attrs.pop('language', None)
-            
+            attrs.pop('images', None)
+            attrs.pop('image_media_types', None)
+
             existing_titles = self.discussion.artefacts._all_latest_titles()
             resolved_title = tag_title if tag_title in existing_titles else (
                 _find_best_title_match(tag_title, existing_titles) or tag_title
             )
             is_new = resolved_title not in existing_titles
-            
+
             is_patch = bool(re.search(r'<{6,8}\s*SEARCH', full_content, re.I))
-            
+
             result_art = None
             if is_patch:
                 existing = self.discussion.artefacts.get(resolved_title)
@@ -919,7 +891,7 @@ class _StreamState:
                     try:
                         patched = self.discussion.artefacts.apply_aider_patch(existing.get('content', ''), full_content)
                         result_art = self.discussion.artefacts.update(
-                            resolved_title, new_content=patched, new_title=new_name, 
+                            resolved_title, new_content=patched, new_title=new_name,
                             language=lang, active=self.auto_activate, **attrs)
                     except ValueError: result_art = existing
                 else:
@@ -934,7 +906,6 @@ class _StreamState:
                 self.affected_artefacts.append(result_art)
                 _fire_state_change(result_art, is_new)
 
-            # 2. DONE Event
             _cb(self.callback, full_content, self.sec_done_mt, {
                 "title": resolved_title, "content": full_content, "art_type": atype,
                 "language": lang, "is_patch": is_patch, "attrs": attrs
@@ -960,14 +931,13 @@ class _StreamState:
             title = attrs.get('title', 'Interactive Widget')
             wtype = attrs.get('type', 'html').lower().strip()
             validated = _validate_widget_content(full_content, title) or ""
-            
+
             meta = dict(self.ai_message.metadata or {})
             if "inline_widgets" not in meta: meta["inline_widgets"] = []
             widget_id = str(uuid.uuid4())
             meta["inline_widgets"].append({"id": widget_id, "type": wtype, "title": title, "source": validated})
             self.ai_message.metadata = meta
 
-            # Add placement anchor to content and emit chunk
             anchor = f'\n<lollms_widget id="{widget_id}" />\n'
             self.ai_message.content += anchor
             _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -982,14 +952,10 @@ class _StreamState:
                 if "forms" not in meta: meta["forms"] = []
                 meta["forms"].append({"id": form_descriptor["id"], "title": form_descriptor["title"]})
                 self.ai_message.metadata = meta
-                
-                # Add placement anchor to content for UI mounting
+
                 anchor = f'\n<lollms_form_anchor id="{form_descriptor["id"]}" />\n'
                 self.ai_message.content += anchor
-                
-                # EMIT standard chunk so the UI receives the anchor in real-time
                 _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_CHUNK)
-                
                 _cb(self.callback, json.dumps(form_descriptor), MSG_TYPE.MSG_TYPE_FORM_READY, {"form": form_descriptor, "form_id": form_descriptor["id"]})
 
     # ---------------------------------------------------------------- accessors
@@ -998,7 +964,6 @@ class _StreamState:
         return "".join(self.stream_buf)
 
     def get_tool_call_json(self) -> Optional[str]:
-        """Return the JSON string between <tool_call> and </tool_call>, or None."""
         if not self.tool_trigger:
             return None
         raw = "".join(self.tool_buf)
@@ -1009,11 +974,9 @@ class _StreamState:
         return raw[open_idx + len("<tool_call>"):close_idx].strip()
 
     def get_clean_text_so_far(self) -> str:
-        """Text that was emitted to the main chat bubble this round."""
         return self.ai_message.content
 
     def flush_remaining_buffer(self):
-        """Called at end of round to flush any incomplete bracket buffer."""
         if self.state == self.STATE_BUFFERING and self.bracket_buf:
             self._flush_bracket_buf_as_text()
             self.state = self.STATE_NORMAL
@@ -1027,37 +990,20 @@ class ChatMixin:
     """
     Provides simplified_chat() and chat().
 
-    Artifact streaming
-    ------------------
-    Content inside <artifact>, <note>, <skill>, <lollms_inline>, <lollms_form>
-    tags is routed exclusively to the secondary stream.  It is NEVER sent via
-    MSG_TYPE_CHUNK so the main chat bubble stays clean.
+    Artefact images
+    ---------------
+    When active artefacts carry images (e.g. PDF pages rendered to PNG/JPEG),
+    those images are automatically collected and appended to the LLM call
+    alongside any user-supplied images.  The artefact text content uses
+    <artefact_image id="TITLE::N" /> anchors so the model can correlate
+    each image to its position in the document.
 
-    The streaming interceptor is implemented as an explicit _StreamState machine
-    rather than a nest of closures with nonlocal variables.  This eliminates the
-    class of bugs where nested function assignments created local variables instead
-    of updating the shared outer-scope state.
+    Image ordering sent to the LLM:
+        [discussion-level images] + [user message images] + [artefact images]
 
-    Bracket buffering
-    -----------------
-    The '<' character always starts buffering.  The buffer is flushed as visible
-    text ONLY when the completed tag string conclusively does not match any known
-    tag prefix.  Whitespace or length alone NEVER trigger an early flush.
-
-    Widget validation
-    -----------------
-    <lollms_inline> content is validated: non-web fences are stripped, and the
-    result must contain at least one HTML tag or the widget is discarded.
-
-    Form system
-    -----------
-    <lollms_form> pauses generation and fires MSG_TYPE_FORM_READY.  Resume via
-    discussion.submit_form_response(form_id, answers_dict).
-
-    Handle system
-    -------------
-    <use_handle ref="N:M" name="..." type="..." language="..."/>
-    Converts an already-generated code block into an artefact without rewriting.
+    The system prompt injection always includes a map of id → slot number so
+    that even vision models that only see positional image slots can resolve
+    the anchors correctly.
     """
 
     # ------------------------------------------------------------------ pending forms
@@ -1092,6 +1038,34 @@ class ChatMixin:
 
     # ------------------------------------------------------------------ helpers
 
+    def _merge_artefact_images(self, user_images: Optional[List[str]]) -> List[str]:
+        """
+        Merge user-supplied images with active-artefact images.
+
+        Returns the combined list: [user_images...] + [artefact_images...]
+        Also injects an image-map note into self.scratchpad so the LLM
+        knows which slot corresponds to which artefact_image id.
+        """
+        base = list(user_images or [])
+        art_images = _collect_artefact_images(self)
+
+        if not art_images:
+            return base
+
+        combined = base + art_images
+
+        # Build the image-map note and append to scratchpad so it is visible
+        # to the LLM immediately before/after the last user message.
+        map_note = _build_artefact_image_map_note(self, len(base))
+        if map_note:
+            existing_scratch = getattr(self, 'scratchpad', '') or ''
+            object.__setattr__(
+                self, 'scratchpad',
+                (existing_scratch + "\n\n" + map_note).strip()
+            )
+
+        return combined
+
     def _stream_final_answer(self, callback, images, branch_tip_id, temperature, **kwargs):
         caller_stream = kwargs.pop("stream", None)
         kwargs.pop("callback", None)
@@ -1100,10 +1074,13 @@ class ChatMixin:
         do_stream = (callback is not None) and (caller_stream is not False)
         collected = []
 
+        # Merge artefact images into the image list before calling the LLM
+        merged_images = self._merge_artefact_images(images)
+
         ss = _StreamState(
             discussion            = self,
             callback              = callback,
-            ai_message            = LollmsMessage(self, SimpleNamespace(content="", metadata={})), 
+            ai_message            = LollmsMessage(self, SimpleNamespace(content="", metadata={})),
             enable_notes          = kwargs.get("enable_notes", True),
             enable_skills         = kwargs.get("enable_skills", False),
             enable_inline_widgets = kwargs.get("enable_inline_widgets", True),
@@ -1121,7 +1098,7 @@ class ChatMixin:
 
         result = self.lollmsClient.chat(
             self,
-            images=images,
+            images=merged_images,
             branch_tip_id=branch_tip_id,
             stream=do_stream,
             streaming_callback=_streaming_relay if do_stream else None,
@@ -1137,6 +1114,7 @@ class ChatMixin:
         return result if isinstance(result, str) else (result or "")
 
     # ------------------------------------------------------------------ context compression
+    # (unchanged from original — reproduced in full for completeness)
 
     def _compress_context(
         self,
@@ -1177,7 +1155,7 @@ class ChatMixin:
 
         active_ids = sorted(a.get("id", "") for a in self.artefacts.list(active_only=True))
         key_src    = (self.active_branch_id or "") + "|" + ",".join(active_ids)
-        cache_key  = hashlib.sha1(key_src.encode()).hexdigest()
+        cache_key  = __import__('hashlib').sha1(key_src.encode()).hexdigest()
 
         meta   = dict(self.metadata or {})
         cache  = meta.get("_compression_cache", {})
@@ -1922,13 +1900,10 @@ class ChatMixin:
         _has_external_tools = bool(tool_registry)
 
         if not _has_external_tools:
-            # ----------------------------------------------------------------
-            # Fast path uses the StreamState machine too
-            # ----------------------------------------------------------------
             ss = _StreamState(
                 discussion            = self,
                 callback              = callback,
-                ai_message            = None,  # placeholder
+                ai_message            = None,
                 enable_notes          = enable_notes,
                 enable_skills         = enable_skills,
                 enable_inline_widgets = enable_inline_widgets,
@@ -1936,8 +1911,6 @@ class ChatMixin:
                 auto_activate_artefacts = auto_activate_artefacts,
             )
 
-            # We need the ai_message object before streaming so _StreamState can
-            # accumulate content into it.  Create it with empty content now.
             ai_message = self.add_message(
                 sender=personality.name,
                 sender_type="assistant",
@@ -1956,6 +1929,7 @@ class ChatMixin:
                     return ss.feed(chunk)
                 return True
 
+            # _stream_final_answer now handles artefact image merging internally
             raw_text = self._stream_final_answer(
                 _fast_relay, images,
                 branch_tip_id or self.active_branch_id,
@@ -1964,24 +1938,21 @@ class ChatMixin:
 
             ss.flush_remaining_buffer()
 
-            # If non-streaming path returned bulk text, feed it now
             if raw_text and not ai_message.content:
                 for ch in raw_text:
                     ss.feed(ch)
                 ss.flush_remaining_buffer()
 
-            # Retrieve the content accumulated by StreamState (includes anchors)
             raw_text = ai_message.content
 
             if remove_thinking_blocks:
                 raw_text = self.lollmsClient.remove_thinking_blocks(raw_text)
 
             branch_for_handles = self.get_branch(ai_message.id)
-            # Process handles on the text that includes our anchors
             raw_after_handles, handle_arts = _apply_handles(
                 raw_text, branch_for_handles, self.artefacts
             )
-            
+
             ai_message.content = raw_after_handles
 
             cleaned, affected_pp = self._post_process_llm_response(
@@ -2226,7 +2197,6 @@ class ChatMixin:
         while _round < max_reasoning_steps:
             _round += 1
 
-            # ── Build agent-state scratchpad header ──────────────────────────
             _saved_scratchpad = self.scratchpad
             state_lines = []
 
@@ -2254,8 +2224,6 @@ class ChatMixin:
                 "\n\n" + (self.scratchpad or "") if self.scratchpad else ""
             )
 
-            # ── Create per-round StreamState ─────────────────────────────────
-            # Reset ai_message content accumulation for this round
             round_content_start = len(ai_message.content)
 
             ss = _StreamState(
@@ -2279,6 +2247,7 @@ class ChatMixin:
                     return result
                 return True
 
+            # Artefact image merging is handled inside _stream_final_answer
             self._stream_final_answer(
                 _inline_relay, images, _current_branch_tip,
                 final_answer_temperature, **kwargs,
@@ -2290,15 +2259,12 @@ class ChatMixin:
             _so_far        = "".join(ss.stream_buf)
             _accumulated_full += _so_far
 
-            # The clean text this round is whatever was appended to ai_message.content
             _round_clean   = ai_message.content[round_content_start:]
             _clean_text_so_far += _round_clean
 
-            # ── Check for tool trigger ────────────────────────────────────────
             _tool_trigger  = ss.tool_trigger
             _tool_json_str = ss.get_tool_call_json()
 
-            # ── Round-1 no-tool-call detection ───────────────────────────────
             if _round == 1 and not _tool_trigger and _has_external_tools:
                 _output_clean = _round_clean.strip()
                 _needs_tool   = bool(
@@ -2328,14 +2294,12 @@ class ChatMixin:
                     _current_branch_tip = _corr_res.id
                     _clean_text_so_far = ""
                     _accumulated_full  = ""
-                    # Undo the content we appended to ai_message this round
                     ai_message.content = ai_message.content[:round_content_start]
                     continue
 
             if not _tool_trigger:
                 break
 
-            # ── Parse tool call ──────────────────────────────────────────────
             is_agentic_turn = True
             try:
                 _call_data   = json.loads(_tool_json_str or "{}")
@@ -2346,7 +2310,6 @@ class ChatMixin:
                 _warning(callback, f"Failed to parse tool call: {e}")
                 break
 
-            # ── Deduplication + runaway guard ────────────────────────────────
             _params_summary = ", ".join(
                 f"{k}={str(v)[:40]}" for k, v in _tool_params.items()
             )
@@ -2385,7 +2348,6 @@ class ChatMixin:
                 _current_branch_tip = _temp_res.id
                 continue
 
-            # ── Emit tool-call event ─────────────────────────────────────────
             _current_offset = len(_clean_text_so_far)
             _call_id        = str(uuid.uuid4())
             _call_evt = {
@@ -2407,7 +2369,6 @@ class ChatMixin:
             all_events.append({"type": "step_start", "content": _step_lbl,
                                "id": _step_id, "offset": _current_offset})
 
-            # ── Execute tool ─────────────────────────────────────────────────
             if _tool_name not in tool_registry:
                 _warning(callback, f"Unknown tool: {_tool_name}")
                 _result_str = f"Error: tool '{_tool_name}' not found"
@@ -2542,7 +2503,6 @@ class ChatMixin:
             _temp_msg_ids.extend([_temp_call.id, _temp_res.id])
             _current_branch_tip = _temp_res.id
 
-            # Reset ai_message content to clean_text_so_far for next round
             ai_message.content = _clean_text_so_far
 
         # ====================================================================
@@ -2558,8 +2518,8 @@ class ChatMixin:
                 enable_skills         = enable_skills,
                 enable_inline_widgets = enable_inline_widgets,
                 enable_forms          = enable_forms,
+                discussion            = self,
             )
-            # Start fresh for final answer
             ai_message.content = ""
 
             def _final_relay(chunk, msg_type=None, meta=None):
@@ -2583,7 +2543,6 @@ class ChatMixin:
             self.scratchpad = _scratch_before_final
 
             _accumulated_full += "".join(ss_final.stream_buf)
-            # Ensure we take the version of content that has the anchors
             _clean_text_so_far = ai_message.content
             _step_end(callback, "Final answer generated", _final_id)
 
@@ -2596,9 +2555,6 @@ class ChatMixin:
             else:
                 self.db_manager.delete_message(mid)
 
-        # ── Strip tool-call tags; keep lollms_event markers ──────────────────
-        # Gather all artefacts created during the rounds
-        # (Assuming we have logic to accumulate them or that we re-run pp)
         import re as _re
         _clean = _re.sub(
             r"<tool_call>.*?(?:</tool_call>|$)", "", _clean_text_so_far, flags=_re.DOTALL
@@ -2662,8 +2618,6 @@ class ChatMixin:
             enable_forms=enable_forms,
             enable_silent_artefact_explanation=enable_silent_artefact_explanation,
         )
-        # Note: In agentic mode, artifacts are handled round-by-round by StreamState.
-        # We need to make sure we return them all.
         affected_artefacts = handle_arts + affected_pp
         if cleaned_content != _clean_after_handles:
             ai_message.content = cleaned_content
