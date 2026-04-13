@@ -65,7 +65,7 @@ class MSG_TYPE(Enum):
 
     # ── Secondary content streams ─────────────────────────────────────────────
     # These events carry the raw content being built inside XML tags
-    # (<artefact>, <note>, <skill>, <lollms_inline>) on a SEPARATE stream
+    # (<artefact>, <note>, <skill>) on a SEPARATE stream
     # from the main chat bubble (MSG_TYPE_CHUNK).
     #
     # Contract

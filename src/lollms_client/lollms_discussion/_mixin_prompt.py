@@ -303,8 +303,6 @@ class PromptMixin:
             re.search(r'<generate_image[\s>]', masked_text, re.IGNORECASE))
         has_edit     = enable_image_editing and bool(
             re.search(r'<edit_image[\s>]', masked_text, re.IGNORECASE))
-        has_inline   = enable_inline_widgets and bool(
-            re.search(r'<lollms_inline[\s>]', masked_text, re.IGNORECASE))
         has_note     = enable_notes and bool(
             re.search(r'<note[\s>]', masked_text, re.IGNORECASE))
         has_skill    = enable_skills and bool(
@@ -312,7 +310,7 @@ class PromptMixin:
         has_form     = enable_forms and bool(
             re.search(r'<lollms_form[\s>]', masked_text, re.I))
 
-        if not (has_artefact or has_gen or has_edit or has_inline
+        if not (has_artefact or has_gen or has_edit
                 or has_note or has_skill or has_form):
             return text, []
 
@@ -455,58 +453,6 @@ class PromptMixin:
 
                 cleaned = edit_pattern.sub(handle_edit, cleaned)
 
-        # ── 4. Inline widgets ─────────────────────────────────────────────────
-        if has_inline:
-            from ._mixin_chat import _validate_widget_content
-
-            inline_pattern = re.compile(
-                r'<lollms_inline\s*([^>]*)>(.*?)</lollms_inline>',
-                re.DOTALL | re.IGNORECASE,
-            )
-
-            meta = dict(ai_message.metadata or {})
-            if "inline_widgets" not in meta:
-                meta["inline_widgets"] = []
-
-            def handle_inline(match: re.Match) -> str:
-                attrs  = _parse_attrs(match.group(1))
-                source = match.group(2)
-
-                for placeholder, original in code_blocks.items():
-                    source = source.replace(placeholder, original)
-
-                widget_id    = str(uuid.uuid4())
-                widget_type  = attrs.get('type', 'html').lower().strip()
-                widget_title = attrs.get('title', 'Interactive Widget')
-
-                if widget_type not in ('html', 'react', 'svg'):
-                    widget_type = 'html'
-
-                validated = _validate_widget_content(source, widget_title)
-                if validated is None:
-                    ASCIIColors.warning(
-                        f"[post-process] Widget '{widget_title}' discarded — no valid HTML.")
-                    return (
-                        f"\n\n*[Widget '{widget_title}' could not be rendered: "
-                        "the content did not contain valid HTML/CSS/JS.]*\n\n"
-                    )
-
-                widget_entry = {
-                    "id":     widget_id,
-                    "type":   widget_type,
-                    "title":  widget_title,
-                    "source": validated,
-                }
-                meta["inline_widgets"].append(widget_entry)
-                ASCIIColors.success(
-                    f"Inline widget '{widget_title}' ({widget_type}) registered.")
-                return f'<lollms_widget id="{widget_id}" />'
-
-            cleaned = inline_pattern.sub(handle_inline, cleaned)
-
-            if meta["inline_widgets"]:
-                ai_message.metadata = meta
-
         # ── 5. Notes ──────────────────────────────────────────────────────────
         if has_note:
             note_pattern = re.compile(
@@ -578,63 +524,6 @@ class PromptMixin:
 
             cleaned = skill_pattern.sub(handle_skill, cleaned)
 
-        # ── 7. Forms ──────────────────────────────────────────────────────────
-        if has_form:
-            from ._mixin_chat import _parse_form_xml, _format_form_answers_for_llm
-            from lollms_client.lollms_types import MSG_TYPE as _MT
-
-            form_pattern = re.compile(
-                r'<lollms_form\s*([^>]*)>(.*?)</lollms_form>',
-                re.DOTALL | re.IGNORECASE,
-            )
-
-            meta_now = dict(ai_message.metadata or {})
-            if "forms" not in meta_now:
-                meta_now["forms"] = []
-
-            def handle_form(match: re.Match) -> str:
-                import json as _json
-                attrs_str = match.group(1)
-                body      = match.group(2)
-
-                for placeholder, original in code_blocks.items():
-                    body = body.replace(placeholder, original)
-
-                form_descriptor = _parse_form_xml(attrs_str, body)
-                if not form_descriptor:
-                    ASCIIColors.warning("[post-process] Form parsing failed; skipping.")
-                    return ''
-
-                self._get_pending_forms()[form_descriptor["id"]] = form_descriptor
-
-                meta_now["forms"].append({
-                    "id":    form_descriptor["id"],
-                    "title": form_descriptor["title"],
-                })
-
-                _active_cb = getattr(self, '_active_callback', None)
-                if _active_cb:
-                    try:
-                        _active_cb(
-                            _json.dumps(form_descriptor),
-                            _MT.MSG_TYPE_FORM_READY,
-                            {"form": form_descriptor, "form_id": form_descriptor["id"]},
-                        )
-                    except Exception:
-                        pass
-
-                ASCIIColors.cyan(
-                    f"[Form] '{form_descriptor['title']}' ready "
-                    f"(id={form_descriptor['id'][:8]}). "
-                    "Awaiting submit_form_response()."
-                )
-                return f'\n<lollms_form_anchor id="{form_descriptor["id"]}" />\n'
-
-            cleaned = form_pattern.sub(handle_form, cleaned)
-
-            if meta_now["forms"]:
-                ai_message.metadata = meta_now
-
         # ── Unmask code blocks ────────────────────────────────────────────────
         for placeholder, original in code_blocks.items():
             cleaned = cleaned.replace(placeholder, original)
@@ -683,13 +572,14 @@ class PromptMixin:
                 desc_str = f" — {desc}" if desc else ""
                 summary_parts.append(f"🎓 Skill saved **{title}**{cat_str}{desc_str}.")
 
-            meta_now2 = dict(ai_message.metadata or {})
-            for widget in meta_now2.get("inline_widgets", []):
-                w_title = widget.get('title', 'Interactive Widget')
-                w_type  = widget.get('type', 'html')
+            # Widgets are now inline tags only - check content for widget anchors
+            widget_count = len(re.findall(
+                r'<lollms_widget\s+id=["\'][^"\']+["\']\s*/?>',
+                cleaned
+            ))
+            for _ in range(widget_count):
                 summary_parts.append(
-                    f"🎛️ Interactive widget ready: **{w_title}** ({w_type}) — "
-                    "use the controls below to explore the concept."
+                    "🎛️ Interactive widget ready — use the controls below to explore the concept."
                 )
 
             for form_ref in meta_now2.get("forms", []):

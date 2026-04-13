@@ -344,6 +344,16 @@ class SwarmOrchestrator:
         all_affected_artefacts: List[Dict] = []
 
         for round_num in range(1, self.config.max_rounds + 1):
+            # Emit synthesis processing tag opening
+            synthesis_attrs = f' type="synthesis" round="{round_num}" agents="{len(self.agents)}" mode="{self.config.mode}"'
+            _cb(self.callback, f"<processing{synthesis_attrs}>", MSG_TYPE.MSG_TYPE_CHUNK, {
+                "type": "processing_open",
+                "processing_type": "synthesis",
+                "round": round_num,
+                "agents": len(self.agents),
+                "mode": self.config.mode,
+            })
+            
             self._emit(MT_SWARM_ROUND_START, f"Round {round_num}/{self.config.max_rounds}",
                        {"round": round_num})
             _cb(self.callback, f"\n\n---\n**Round {round_num}**\n", MSG_TYPE.MSG_TYPE_CHUNK)
@@ -455,10 +465,28 @@ class SwarmOrchestrator:
                            f"{agent.display_name} done",
                            {"agent": agent.display_name, "round": round_num})
 
+            # Emit synthesis status for this round
+            status_msg = f"Round {round_num} complete"
+            if round_confidences:
+                mean_conf = sum(round_confidences) / len(round_confidences)
+                status_msg += f" (mean confidence: {mean_conf:.2f})"
+            _cb(self.callback, f"\n* {status_msg}", MSG_TYPE.MSG_TYPE_CHUNK, {
+                "type": "processing_status",
+                "processing_type": "synthesis",
+                "status": status_msg,
+            })
+            
             self._emit(MT_SWARM_ROUND_END, f"Round {round_num} complete",
                        {"round": round_num,
                         "mean_confidence": (sum(round_confidences) / len(round_confidences))
                                            if round_confidences else 1.0})
+
+            # Close synthesis processing tag for this round
+            _cb(self.callback, "</processing>", MSG_TYPE.MSG_TYPE_CHUNK, {
+                "type": "processing_close",
+                "processing_type": "synthesis",
+                "round": round_num,
+            })
 
             # ── Convergence check ─────────────────────────────────────────
             if (not has_unresolved_critique
@@ -474,6 +502,12 @@ class SwarmOrchestrator:
                 break
 
         # ── Final synthesis ───────────────────────────────────────────────
+        # Emit final synthesis processing
+        _cb(self.callback, '<processing type="synthesis" stage="final">', MSG_TYPE.MSG_TYPE_CHUNK, {
+            "type": "processing_open",
+            "processing_type": "synthesis",
+            "stage": "final",
+        })
         moderator = self.agents[
             min(self.config.moderator_index, len(self.agents) - 1)]
         final_synthesis = self._synthesise(
@@ -484,6 +518,13 @@ class SwarmOrchestrator:
                 f"\n\n---\n**{moderator.display_name} (synthesis)**\n",
                 MSG_TYPE.MSG_TYPE_CHUNK)
         if final_synthesis:
+            _cb(self.callback, f"\n* {moderator.display_name} synthesizing final answer...", 
+                MSG_TYPE.MSG_TYPE_CHUNK, {
+                    "type": "processing_status",
+                    "processing_type": "synthesis",
+                    "status": f"{moderator.display_name} synthesizing final answer...",
+                })
+            
             syn_buf: List[str] = []
 
             def _syn_relay(chunk, msg_type=None, meta=None):
@@ -519,6 +560,19 @@ class SwarmOrchestrator:
             if cleaned_syn != syn_text:
                 final_synthesis.content = cleaned_syn
             all_affected_artefacts.extend(syn_affected)
+            
+            _cb(self.callback, f"\n* Synthesis complete", MSG_TYPE.MSG_TYPE_CHUNK, {
+                "type": "processing_status",
+                "processing_type": "synthesis",
+                "status": "Synthesis complete",
+            })
+            
+            # Close final synthesis processing
+            _cb(self.callback, "</processing>", MSG_TYPE.MSG_TYPE_CHUNK, {
+                "type": "processing_close",
+                "processing_type": "synthesis",
+                "stage": "final",
+            })
 
         if self.discussion._is_db_backed and self.discussion.autosave:
             self.discussion.commit()

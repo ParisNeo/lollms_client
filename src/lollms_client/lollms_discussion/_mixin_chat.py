@@ -3,7 +3,7 @@
 #
 # ARTIFACT STREAMING CONTRACT
 # ---------------------------
-# Content inside <artifact>, <note>, <skill>, <lollms_inline>, <lollms_form> tags is
+# Content inside <artifact>, <note>, <skill> tags is
 # NEVER forwarded to the main chat bubble via MSG_TYPE_CHUNK.
 #
 # ARTEFACT IMAGE CONTRACT
@@ -28,6 +28,17 @@
 # --------------------------
 # '<' always starts buffering. Buffer flushed as text only when conclusively not a
 # known tag. Whitespace or length alone NEVER trigger flush.
+#
+# DOUBLE-PROCESSING FIX
+# ---------------------
+# _emit_processing_close() must NOT call _cb() with final_content (widget HTML /
+# form tag) because the relay wraps _cb and calls ss.feed() re-entrantly. This
+# causes <lollms_form>/<lollms_inline> to be seen as a new secondary tag and fires
+# a second <processing> block.
+#
+# Fix: _emit_processing_close() stores final_content in self.pending_final_content.
+# _feed_secondary() flushes it AFTER state has been fully reset to STATE_NORMAL,
+# so no re-entrant feed() call can match it as a tag opener.
 
 import json
 import re
@@ -63,8 +74,11 @@ _TAG_STARTS = [
     "<revert_artifact", "<revert_artefact",
     "<generate_slides", "<street_view", "<schedule_task",
     "<note", "<skill",
-    "<lollms_event", "<lollms_inline", "<lollms_form",
+    "<lollms_inline",  # Widget tags
+    "<lollms_form",    # Form tags
+    "<lollms_event",
     "<use_handle",
+    "<processing",     # Unified processing indicator
 ]
 
 # Secondary-stream tag type mapping
@@ -79,8 +93,8 @@ _SECONDARY_TAG_MAP = {
                        MSG_TYPE.MSG_TYPE_SKILL_DONE,        "</skill>"),
     "<lollms_inline": ("inline_widget_start", MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,
                        MSG_TYPE.MSG_TYPE_WIDGET_DONE,       "</lollms_inline>"),
-    "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,
-                       MSG_TYPE.MSG_TYPE_WIDGET_DONE,       "</lollms_form>"),
+    "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_FORM_READY,
+                       MSG_TYPE.MSG_TYPE_FORM_READY,        "</lollms_form>"),
 }
 
 
@@ -464,28 +478,11 @@ def _parse_tag_attrs(attr_str: str) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _collect_artefact_images(discussion: Any) -> List[str]:
-    """
-    Collect all images from active artefacts and return them as a list of
-    base64 strings in the order: artefact images sorted by
-    (activation order, image index).
-
-    The LLM will receive these images appended after any user-supplied
-    images, in the same order they appear as <artefact_image id="..."/>
-    anchors in the active artefact text.
-    """
     context_imgs = discussion.artefacts.get_context_images()
     return [img["data"] for img in context_imgs]
 
 
 def _build_artefact_image_index(discussion: Any) -> Dict[str, int]:
-    """
-    Returns a mapping from image_id → position in the combined image list
-    (0-based, after user images).
-
-    Used to tell the LLM which numbered image slot corresponds to which
-    artefact_image id when the binding doesn't support named images.
-    This mapping is injected into the scratchpad context if needed.
-    """
     context_imgs = discussion.artefacts.get_context_images()
     return {img["id"]: idx for idx, img in enumerate(context_imgs)}
 
@@ -494,17 +491,6 @@ def _build_artefact_image_map_note(
     discussion: Any,
     user_image_count: int,
 ) -> str:
-    """
-    Builds a compact system note that maps artefact_image IDs to the
-    actual image slot numbers the model will receive.
-
-    Only generated when there are artefact images to map.
-
-    Example output:
-        [Artefact image slots — images are 0-indexed in the vision input]
-        <artefact_image id="my_doc::0" /> → image slot 2
-        <artefact_image id="my_doc::1" /> → image slot 3
-    """
     context_imgs = discussion.artefacts.get_context_images()
     if not context_imgs:
         return ""
@@ -526,6 +512,20 @@ def _build_artefact_image_map_note(
 class _StreamState:
     """
     Encapsulates all mutable state for the streaming interceptor.
+
+    UNIFIED STREAMING PROTOCOL:
+    All secondary content (artefacts, widgets, forms, notes, skills) streams
+    through <processing> tags. Status messages stream inside these tags; final
+    bulk content (widget HTML, form tag) is stored in pending_final_content and
+    flushed AFTER the state machine resets to STATE_NORMAL — never emitted via
+    _cb() from inside _fire_secondary_done() or _emit_processing_close().
+
+    WHY: The relay callbacks (e.g. _fast_relay, _inline_relay) intercept all
+    MSG_TYPE_CHUNK calls and feed them back into ss.feed(). If final_content is
+    emitted via _cb() while still inside _feed_secondary(), the re-entrant
+    ss.feed() call sees <lollms_form>/<lollms_inline> as a new secondary tag
+    and fires a duplicate <processing> block. By flushing pending_final_content
+    only after state reset, we guarantee no re-entrant tag matching occurs.
     """
 
     STATE_NORMAL    = "normal"
@@ -553,12 +553,13 @@ class _StreamState:
         self.enable_forms          = enable_forms
         self.auto_activate         = auto_activate_artefacts
 
-        self.state: str            = self.STATE_NORMAL
+        self.state: str             = self.STATE_NORMAL
         self.bracket_buf: List[str] = []
 
         self.tool_buf: List[str]    = []
         self.tool_trigger: bool     = False
 
+        # Secondary stream state
         self.sec_prefix: str        = ""
         self.sec_chunk_mt: Any      = None
         self.sec_done_mt: Any       = None
@@ -566,6 +567,22 @@ class _StreamState:
         self.sec_open_attrs: Dict   = {}
         self.sec_content: List[str] = []
         self.sec_close_scan: str    = ""
+
+        # Unified processing state
+        self.proc_type: str          = ""
+        self.proc_title: str         = ""
+        self.proc_attrs: Dict        = {}
+        self.proc_content: List[str] = []
+        self.proc_has_opened: bool   = False
+
+        # ---------------------------------------------------------------
+        # KEY FIX: final bulk content (widget HTML / form tag) is stored
+        # here and flushed by _feed_secondary() AFTER state has been fully
+        # reset to STATE_NORMAL — never inside _emit_processing_close().
+        # This prevents re-entrant ss.feed() from matching the content as
+        # a new secondary tag and emitting a duplicate <processing> block.
+        # ---------------------------------------------------------------
+        self.pending_final_content: str = ""
 
         self.affected_artefacts: List[Dict] = []
         self.stream_buf: List[str]  = []
@@ -580,8 +597,6 @@ class _StreamState:
 
         pos = 0
         while pos < len(chunk):
-            ch = chunk[pos]
-
             if self.state == self.STATE_NORMAL:
                 pos = self._feed_normal(chunk, pos)
 
@@ -694,10 +709,10 @@ class _StreamState:
         b_str_lower = b_str.lower()
         for prefix in _SECONDARY_TAG_MAP:
             if b_str_lower.startswith(prefix.lower()):
-                if prefix in ("<note",)          and not self.enable_notes:           continue
-                if prefix in ("<skill",)         and not self.enable_skills:          continue
-                if prefix in ("<lollms_inline",) and not self.enable_inline_widgets:  continue
-                if prefix in ("<lollms_form",)   and not self.enable_forms:           continue
+                if prefix in ("<note",)  and not self.enable_notes:           continue
+                if prefix in ("<skill",) and not self.enable_skills:          continue
+                if prefix in ("<lollms_inline",) and not self.enable_inline_widgets: continue
+                if prefix in ("<lollms_form",)   and not self.enable_forms:   continue
                 return prefix
         return None
 
@@ -706,58 +721,112 @@ class _StreamState:
     def _feed_tool_call(self, chunk: str, pos: int) -> int:
         self.tool_buf.append(chunk[pos:])
         accumulated = "".join(self.tool_buf)
-
         if "</tool_call>" in accumulated:
             self.tool_trigger = True
             return len(chunk)
-
         return len(chunk)
+
+    # ---------------------------------------------------------------- Tool processing helpers
+
+    def _emit_tool_processing_open(self, tool_name: str, params: Dict[str, Any]):
+        """Emit opening <processing> tag for tool call execution."""
+        params_str = json.dumps(params, ensure_ascii=False)[:200]
+        params_escaped = params_str.replace('"', '&quot;')
+        tag = f'<processing type="tool_execution" tool="{tool_name}" params="{params_escaped}">'
+        self.ai_message.content += tag
+        _cb(self.callback, tag, MSG_TYPE.MSG_TYPE_CHUNK, {
+            "type": "processing_open",
+            "processing_type": "tool_execution",
+            "tool": tool_name,
+            "params": params,
+        })
+        self.proc_has_opened = True
+        self.proc_type = "tool_execution"
+
+    def _emit_tool_processing_status(self, status_text: str):
+        """Stream a status update for tool execution."""
+        if not self.proc_has_opened:
+            return
+        line = f"\n* {status_text}"
+        self.proc_content.append(line)
+        self.ai_message.content += line
+        _cb(self.callback, line, MSG_TYPE.MSG_TYPE_CHUNK, {
+            "type": "processing_status",
+            "processing_type": "tool_execution",
+            "status": status_text,
+        })
+
+    def _emit_tool_processing_close(self, result_summary: str = ""):
+        """Close the tool execution processing tag.
+        
+        Note: result_summary is plain text (no XML tags) so it is safe to emit
+        directly via _cb without risk of re-entrant tag matching.
+        """
+        if not self.proc_has_opened:
+            return
+
+        close_tag = "</processing>"
+        self.ai_message.content += close_tag
+        _cb(self.callback, close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {
+            "type": "processing_close",
+            "processing_type": "tool_execution",
+        })
+
+        if result_summary:
+            self.ai_message.content += result_summary
+            _cb(self.callback, result_summary, MSG_TYPE.MSG_TYPE_CHUNK, {
+                "type": "processing_final_content",
+                "processing_type": "tool_execution",
+                "summary": result_summary,
+            })
+
+        self.proc_has_opened = False
+        self.proc_type = ""
 
     # ---------------------------------------------------------------- STATE_SECONDARY
 
     def _enter_secondary(self, opening_tag: str, prefix: str):
         ann_type, chunk_mt, done_mt, close_tag = _SECONDARY_TAG_MAP[prefix]
 
-        self.sec_prefix    = prefix
-        self.sec_chunk_mt  = chunk_mt
-        self.sec_done_mt   = done_mt
-        self.sec_close_tag = close_tag
+        self.sec_prefix     = prefix
+        self.sec_chunk_mt   = chunk_mt
+        self.sec_done_mt    = done_mt
+        self.sec_close_tag  = close_tag
         self.sec_open_attrs = _parse_tag_attrs(opening_tag)
-        self.sec_content   = []
+        self.sec_content    = []
         self.sec_close_scan = ""
 
+        # Map prefix → processing type
+        proc_type_map = {
+            "<artifact":      "artefact_building",
+            "<artefact":      "artefact_building",
+            "<note":          "note_building",
+            "<skill":         "skill_building",
+            "<lollms_inline": "widget_building",
+            "<lollms_form":   "form_building",
+        }
+        self.proc_type    = proc_type_map.get(prefix, "building")
+        self.proc_title   = self.sec_open_attrs.get('name') or self.sec_open_attrs.get('title', 'untitled')
+        self.proc_attrs   = {}
+        self.proc_content = []
+        self.pending_final_content = ""
+        self.proc_has_opened = False
+
+        # Build type-specific attrs
         if prefix in ("<artifact", "<artefact"):
-            title = self.sec_open_attrs.get('name') or self.sec_open_attrs.get('title', '')
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                "type":    "artifact_update",
-                "content": {"title": title},
-            })
-        elif prefix == "<note":
-            title = self.sec_open_attrs.get('title') or self.sec_open_attrs.get('name', 'Note')
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                "type":    "note_start",
-                "content": {"title": title},
-            })
+            self.proc_attrs['art_type'] = self.sec_open_attrs.get('type', 'document')
+            if self.sec_open_attrs.get('language'):
+                self.proc_attrs['language'] = self.sec_open_attrs.get('language')
         elif prefix == "<skill":
-            title    = self.sec_open_attrs.get('title') or self.sec_open_attrs.get('name', 'Skill')
-            category = self.sec_open_attrs.get('category', '')
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                "type":    "skill_start",
-                "content": {"title": title, "category": category},
-            })
+            if self.sec_open_attrs.get('category'):
+                self.proc_attrs['category'] = self.sec_open_attrs.get('category')
+            if self.sec_open_attrs.get('description'):
+                self.proc_attrs['description'] = self.sec_open_attrs.get('description')
         elif prefix == "<lollms_inline":
-            title       = self.sec_open_attrs.get('title', 'Interactive Widget')
-            widget_type = self.sec_open_attrs.get('type', 'html')
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                "type":    "inline_widget_start",
-                "content": {"title": title, "widget_type": widget_type},
-            })
-        elif prefix == "<lollms_form":
-            title = self.sec_open_attrs.get('title', 'Please fill in the form')
-            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_CHUNK, {
-                "type":    "form_start",
-                "content": {"title": title},
-            })
+            self.proc_attrs['widget_type'] = self.sec_open_attrs.get('type', 'html')
+
+        # Emit the opening <processing> tag immediately
+        self._emit_processing_open()
 
     def _feed_secondary(self, chunk: str, pos: int) -> int:
         close_tag = self.sec_close_tag
@@ -776,8 +845,13 @@ class _StreamState:
                 self.sec_content.append(pre_close)
                 self._fire_secondary_chunk(pre_close)
 
+            # _fire_secondary_done() processes content, emits <processing> status lines,
+            # calls _emit_processing_close() which stores final bulk content in
+            # self.pending_final_content rather than emitting it via _cb.
             self._fire_secondary_done()
 
+            # ── Full state reset ────────────────────────────────────────
+            saved_proc_type  = self.proc_type   # preserve for pending_final_content meta
             self.sec_prefix     = ""
             self.sec_chunk_mt   = None
             self.sec_done_mt    = None
@@ -786,6 +860,22 @@ class _StreamState:
             self.sec_close_scan = ""
             self.state          = self.STATE_NORMAL
 
+            # ── Flush pending final content (widget HTML / form tag) ────
+            # This MUST happen after state == STATE_NORMAL so that if the
+            # relay calls ss.feed(content) re-entrantly, the state machine
+            # won't match <lollms_form>/<lollms_inline> as a new secondary
+            # tag and emit a duplicate <processing> block.
+            if self.pending_final_content:
+                content = self.pending_final_content
+                self.pending_final_content = ""
+                self.ai_message.content += content
+                _cb(self.callback, content, MSG_TYPE.MSG_TYPE_CHUNK, {
+                    "type": "processing_final_content",
+                    "processing_type": saved_proc_type,
+                    "content_length": len(content),
+                })
+
+            # ── Continue with any text after the closing tag ────────────
             if post_close:
                 self._feed_post_close(post_close)
 
@@ -813,14 +903,85 @@ class _StreamState:
             else:
                 pos += 1
 
-    # ---------------------------------------------------------------- secondary event helpers
+    # ---------------------------------------------------------------- Processing helpers
+
+    def _emit_processing_open(self):
+        """Emit the opening <processing> tag with attributes."""
+        if self.proc_has_opened:
+            return
+        attrs_str = f' type="{self.proc_type}" title="{self.proc_title}"'
+        for k, v in self.proc_attrs.items():
+            if v:
+                attrs_str += f' {k}="{v}"'
+        tag = f"<processing{attrs_str}>"
+        self.ai_message.content += tag
+        _cb(self.callback, tag, MSG_TYPE.MSG_TYPE_CHUNK, {
+            "type": "processing_open",
+            "processing_type": self.proc_type,
+            "title": self.proc_title,
+            "attrs": self.proc_attrs,
+        })
+        self.proc_has_opened = True
+
+    def _emit_processing_status(self, status_text: str):
+        """Stream a status line inside the processing tag."""
+        if not self.proc_has_opened:
+            self._emit_processing_open()
+        line = f"\n* {status_text}"
+        self.proc_content.append(line)
+        self.ai_message.content += line
+        _cb(self.callback, line, MSG_TYPE.MSG_TYPE_CHUNK, {
+            "type": "processing_status",
+            "processing_type": self.proc_type,
+            "status": status_text,
+        })
+
+    def _emit_processing_close(self, final_content: str = ""):
+        """Close the <processing> tag.
+
+        IMPORTANT: final_content (widget HTML or form tag) is stored in
+        self.pending_final_content rather than being emitted here via _cb().
+
+        Rationale: this method is called from within _fire_secondary_done(),
+        which is called from _feed_secondary(). The relay callbacks intercept
+        all MSG_TYPE_CHUNK _cb() calls and forward them to ss.feed(). Emitting
+        final_content here would cause a re-entrant ss.feed() call that sees
+        <lollms_form>/<lollms_inline> as a new secondary tag, producing a
+        duplicate <processing> block. Instead, _feed_secondary() flushes
+        pending_final_content after the state machine has been fully reset to
+        STATE_NORMAL, making re-entrant tag matching impossible.
+        """
+        if not self.proc_has_opened:
+            return
+
+        close_tag = "</processing>"
+        self.ai_message.content += close_tag
+        _cb(self.callback, close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {
+            "type": "processing_close",
+            "processing_type": self.proc_type,
+            "title": self.proc_title,
+        })
+
+        # Store for deferred emission — see docstring above
+        if final_content:
+            self.pending_final_content = final_content
+
+        self.proc_has_opened = False
+
+    # ---------------------------------------------------------------- Secondary event helpers
 
     def _fire_secondary_chunk(self, content: str):
+        """Buffer arriving content; emit legacy chunk events for backward compat."""
         if not self.sec_chunk_mt or not content:
             return
-        attrs = self.sec_open_attrs
+        attrs  = self.sec_open_attrs
         prefix = self.sec_prefix
 
+        # Widgets and forms: buffer silently, no chunk events
+        if prefix in ("<lollms_inline", "<lollms_form"):
+            return
+
+        # Artefacts, notes, skills: fire legacy chunk events
         if prefix in ("<artifact", "<artefact"):
             _cb(self.callback, content, self.sec_chunk_mt, {
                 "title":    attrs.get('name') or attrs.get('title', ''),
@@ -840,19 +1001,14 @@ class _StreamState:
                 "category":    attrs.get('category', ''),
                 "description": attrs.get('description', ''),
             })
-        elif prefix == "<lollms_inline":
-            _cb(self.callback, content, self.sec_chunk_mt, {
-                "title":       attrs.get('title', 'Interactive Widget'),
-                "chunk":       content,
-                "widget_type": attrs.get('type', 'html'),
-            })
-        elif prefix == "<lollms_form":
-            _cb(self.callback, content, self.sec_chunk_mt, {
-                "title": attrs.get('title', 'Form'),
-                "chunk": content,
-            })
 
     def _fire_secondary_done(self):
+        """Process completed secondary content; emit processing status + close.
+
+        For widgets and forms, the final bulk content (HTML / form tag) is passed
+        to _emit_processing_close() which stores it in self.pending_final_content.
+        _feed_secondary() will flush it after state reset — see class docstring.
+        """
         if not self.sec_done_mt:
             return
 
@@ -861,13 +1017,15 @@ class _StreamState:
         prefix       = self.sec_prefix
 
         def _fire_state_change(art, is_new):
-            if not self.callback: return
+            if not self.callback:
+                return
             ev_type = "artifact_created" if is_new else "artifact_updated"
             _cb(self.callback, json.dumps({
                 "type": ev_type, "title": art.get("title"),
                 "version": art.get("version"), "art_type": art.get("type")
             }), MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefact": art, "is_new": is_new})
 
+        # ── Artefacts ────────────────────────────────────────────────────
         if prefix in ("<artifact", "<artefact"):
             tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
             new_name  = attrs.pop('rename', None)
@@ -880,83 +1038,185 @@ class _StreamState:
             resolved_title = tag_title if tag_title in existing_titles else (
                 _find_best_title_match(tag_title, existing_titles) or tag_title
             )
-            is_new = resolved_title not in existing_titles
-
+            is_new   = resolved_title not in existing_titles
             is_patch = bool(re.search(r'<{6,8}\s*SEARCH', full_content, re.I))
+
+            self._emit_processing_status(
+                f"{'Creating new' if is_new else 'Updating'} artefact '{resolved_title}'"
+            )
+            if is_patch:
+                self._emit_processing_status("Applying patch with SEARCH/REPLACE blocks")
+            self._emit_processing_status(
+                f"Finalizing artefact (type: {atype}, language: {lang or 'none'})"
+            )
 
             result_art = None
             if is_patch:
                 existing = self.discussion.artefacts.get(resolved_title)
                 if existing:
                     try:
-                        patched = self.discussion.artefacts.apply_aider_patch(existing.get('content', ''), full_content)
+                        patched = self.discussion.artefacts.apply_aider_patch(
+                            existing.get('content', ''), full_content)
                         result_art = self.discussion.artefacts.update(
                             resolved_title, new_content=patched, new_title=new_name,
                             language=lang, active=self.auto_activate, **attrs)
-                    except ValueError: result_art = existing
+                    except ValueError:
+                        result_art = existing
                 else:
-                    result_art = self.discussion.artefacts.add(resolved_title, atype, full_content, language=lang, active=self.auto_activate, **attrs)
+                    result_art = self.discussion.artefacts.add(
+                        resolved_title, atype, full_content,
+                        language=lang, active=self.auto_activate, **attrs)
             else:
                 if is_new:
-                    result_art = self.discussion.artefacts.add(resolved_title, atype, full_content.strip(), language=lang, active=self.auto_activate, **attrs)
+                    result_art = self.discussion.artefacts.add(
+                        resolved_title, atype, full_content.strip(),
+                        language=lang, active=self.auto_activate, **attrs)
                 else:
-                    result_art = self.discussion.artefacts.update(resolved_title, new_content=full_content.strip(), new_title=new_name, new_type=atype, language=lang, active=self.auto_activate, **attrs)
+                    result_art = self.discussion.artefacts.update(
+                        resolved_title, new_content=full_content.strip(),
+                        new_title=new_name, new_type=atype,
+                        language=lang, active=self.auto_activate, **attrs)
 
             if result_art:
                 self.affected_artefacts.append(result_art)
                 _fire_state_change(result_art, is_new)
+                self._emit_processing_status(
+                    f"Artefact saved as version {result_art.get('version', '?')}"
+                )
 
+            # Artefacts live in discussion space — no final_content to flush
+            self._emit_processing_close()
+
+            # Legacy event
             _cb(self.callback, full_content, self.sec_done_mt, {
-                "title": resolved_title, "content": full_content, "art_type": atype,
-                "language": lang, "is_patch": is_patch, "attrs": attrs
+                "title": resolved_title, "content": full_content,
+                "art_type": atype, "language": lang,
+                "is_patch": is_patch, "attrs": attrs,
             })
 
+        # ── Notes ────────────────────────────────────────────────────────
         elif prefix == "<note":
             title = attrs.get('title') or attrs.get('name', f'note_{uuid.uuid4().hex[:8]}')
-            art = self.discussion.artefacts.add(title=title, artefact_type=ArtefactType.NOTE, content=full_content.strip(), active=self.auto_activate)
+
+            self._emit_processing_status(f"Creating note '{title}'")
+
+            art = self.discussion.artefacts.add(
+                title=title, artefact_type=ArtefactType.NOTE,
+                content=full_content.strip(), active=self.auto_activate)
             self.affected_artefacts.append(art)
             _fire_state_change(art, True)
-            _cb(self.callback, full_content, self.sec_done_mt, {"title": title, "content": full_content})
 
+            self._emit_processing_status("Note saved successfully")
+            self._emit_processing_close()
+
+            # Legacy event
+            _cb(self.callback, full_content, self.sec_done_mt,
+                {"title": title, "content": full_content})
+
+        # ── Skills ───────────────────────────────────────────────────────
         elif prefix == "<skill":
             title = attrs.get('title') or attrs.get('name', f'skill_{uuid.uuid4().hex[:8]}')
-            desc = attrs.get('description', '')
-            cat = attrs.get('category', '')
-            art = self.discussion.artefacts.add(title=title, artefact_type=ArtefactType.SKILL, content=full_content.strip(), active=self.auto_activate, description=desc, category=cat)
+            desc  = attrs.get('description', '')
+            cat   = attrs.get('category', '')
+
+            self._emit_processing_status(f"Creating skill '{title}'")
+            if cat:
+                self._emit_processing_status(f"Category: {cat}")
+
+            art = self.discussion.artefacts.add(
+                title=title, artefact_type=ArtefactType.SKILL,
+                content=full_content.strip(), active=self.auto_activate,
+                description=desc, category=cat)
             self.affected_artefacts.append(art)
             _fire_state_change(art, True)
-            _cb(self.callback, full_content, self.sec_done_mt, {"title": title, "content": full_content, "category": cat, "description": desc})
 
+            self._emit_processing_status("Skill saved successfully")
+            self._emit_processing_close()
+
+            # Legacy event
+            _cb(self.callback, full_content, self.sec_done_mt,
+                {"title": title, "content": full_content, "category": cat, "description": desc})
+
+        # ── Inline widgets ───────────────────────────────────────────────
         elif prefix == "<lollms_inline":
-            title = attrs.get('title', 'Interactive Widget')
-            wtype = attrs.get('type', 'html').lower().strip()
-            validated = _validate_widget_content(full_content, title) or ""
+            title       = attrs.get('title') or attrs.get('name', f'widget_{uuid.uuid4().hex[:8]}')
+            widget_type = attrs.get('type', 'html')
 
-            meta = dict(self.ai_message.metadata or {})
-            if "inline_widgets" not in meta: meta["inline_widgets"] = []
-            widget_id = str(uuid.uuid4())
-            meta["inline_widgets"].append({"id": widget_id, "type": wtype, "title": title, "source": validated})
-            self.ai_message.metadata = meta
+            self._emit_processing_status(f"Building {widget_type} widget '{title}'")
+            self._emit_processing_status("Validating HTML/CSS/JS content...")
 
-            anchor = f'\n<lollms_widget id="{widget_id}" />\n'
-            self.ai_message.content += anchor
-            _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_CHUNK)
+            validated = _validate_widget_content(full_content, title)
+            if validated is None:
+                self._emit_processing_status("Validation failed — widget discarded")
+                self._emit_processing_close()  # no final_content → nothing pending
+                _cb(self.callback, "", self.sec_done_mt, {
+                    "title": title, "content": "", "widget_type": widget_type,
+                    "error": "Validation failed",
+                })
+            else:
+                self._emit_processing_status("Validation passed")
+                # Store validated HTML as pending — flushed after state reset
+                self._emit_processing_close(validated)
+                # Legacy event
+                _cb(self.callback, validated, self.sec_done_mt,
+                    {"title": title, "content": validated, "widget_type": widget_type})
 
-            _cb(self.callback, validated, self.sec_done_mt, {"title": title, "content": validated, "widget_type": wtype})
-
+        # ── Forms ────────────────────────────────────────────────────────
         elif prefix == "<lollms_form":
-            form_descriptor = _parse_form_xml(" ".join(f'{k}="{v}"' for k, v in attrs.items()), full_content)
-            if form_descriptor:
-                self.discussion._get_pending_forms()[form_descriptor["id"]] = form_descriptor
-                meta = dict(self.ai_message.metadata or {})
-                if "forms" not in meta: meta["forms"] = []
-                meta["forms"].append({"id": form_descriptor["id"], "title": form_descriptor["title"]})
-                self.ai_message.metadata = meta
+            title = attrs.get('title') or attrs.get('name', f'form_{uuid.uuid4().hex[:8]}')
 
-                anchor = f'\n<lollms_form_anchor id="{form_descriptor["id"]}" />\n'
-                self.ai_message.content += anchor
-                _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_CHUNK)
-                _cb(self.callback, json.dumps(form_descriptor), MSG_TYPE.MSG_TYPE_FORM_READY, {"form": form_descriptor, "form_id": form_descriptor["id"]})
+            self._emit_processing_status(f"Building form '{title}'")
+            self._emit_processing_status("Parsing form fields...")
+
+            form_descriptor = _parse_form_xml(
+                ' '.join(f'{k}="{v}"' for k, v in attrs.items()),
+                full_content,
+            )
+
+            if form_descriptor and form_descriptor.get('fields'):
+                n = len(form_descriptor['fields'])
+                self._emit_processing_status(f"Found {n} field(s)")
+
+                # Reconstruct clean form tag from parsed descriptor
+                form_attrs_parts = []
+                if title:
+                    form_attrs_parts.append(f'title="{title}"')
+                if attrs.get('description'):
+                    form_attrs_parts.append(f'description="{attrs["description"]}"')
+                if attrs.get('submit_label'):
+                    form_attrs_parts.append(f'submit_label="{attrs["submit_label"]}"')
+
+                field_lines = []
+                for field in form_descriptor['fields']:
+                    fa = [
+                        f'name="{field["name"]}"',
+                        f'label="{field["label"]}"',
+                        f'type="{field["type"]}"',
+                    ]
+                    if field.get('required'):
+                        fa.append('required="true"')
+                    field_lines.append('  <field ' + ' '.join(fa) + '/>')
+
+                sep = " " if form_attrs_parts else ""
+                full_form_tag = (
+                    f'<lollms_form{sep}{" ".join(form_attrs_parts)}>\n'
+                    + ('\n'.join(field_lines) + '\n' if field_lines else '')
+                    + '</lollms_form>'
+                )
+
+                self._emit_processing_status("Form ready")
+                # Store form tag as pending — flushed after state reset
+                self._emit_processing_close(full_form_tag)
+                # Legacy event
+                _cb(self.callback, full_content, self.sec_done_mt, {
+                    "title": title, "content": full_content, "form": form_descriptor,
+                })
+            else:
+                self._emit_processing_status("Form parsing failed")
+                self._emit_processing_close()  # no final_content
+                _cb(self.callback, "", self.sec_done_mt, {
+                    "title": title, "content": "", "error": "Form parsing failed",
+                })
 
     # ---------------------------------------------------------------- accessors
 
@@ -1000,10 +1260,6 @@ class ChatMixin:
 
     Image ordering sent to the LLM:
         [discussion-level images] + [user message images] + [artefact images]
-
-    The system prompt injection always includes a map of id → slot number so
-    that even vision models that only see positional image slots can resolve
-    the anchors correctly.
     """
 
     # ------------------------------------------------------------------ pending forms
@@ -1039,13 +1295,6 @@ class ChatMixin:
     # ------------------------------------------------------------------ helpers
 
     def _merge_artefact_images(self, user_images: Optional[List[str]]) -> List[str]:
-        """
-        Merge user-supplied images with active-artefact images.
-
-        Returns the combined list: [user_images...] + [artefact_images...]
-        Also injects an image-map note into self.scratchpad so the LLM
-        knows which slot corresponds to which artefact_image id.
-        """
         base = list(user_images or [])
         art_images = _collect_artefact_images(self)
 
@@ -1054,8 +1303,6 @@ class ChatMixin:
 
         combined = base + art_images
 
-        # Build the image-map note and append to scratchpad so it is visible
-        # to the LLM immediately before/after the last user message.
         map_note = _build_artefact_image_map_note(self, len(base))
         if map_note:
             existing_scratch = getattr(self, 'scratchpad', '') or ''
@@ -1074,7 +1321,6 @@ class ChatMixin:
         do_stream = (callback is not None) and (caller_stream is not False)
         collected = []
 
-        # Merge artefact images into the image list before calling the LLM
         merged_images = self._merge_artefact_images(images)
 
         ss = _StreamState(
@@ -1114,7 +1360,6 @@ class ChatMixin:
         return result if isinstance(result, str) else (result or "")
 
     # ------------------------------------------------------------------ context compression
-    # (unchanged from original — reproduced in full for completeness)
 
     def _compress_context(
         self,
@@ -1155,7 +1400,7 @@ class ChatMixin:
 
         active_ids = sorted(a.get("id", "") for a in self.artefacts.list(active_only=True))
         key_src    = (self.active_branch_id or "") + "|" + ",".join(active_ids)
-        cache_key  = __import__('hashlib').sha1(key_src.encode()).hexdigest()
+        cache_key  = hashlib.sha1(key_src.encode()).hexdigest()
 
         meta   = dict(self.metadata or {})
         cache  = meta.get("_compression_cache", {})
@@ -1320,6 +1565,17 @@ class ChatMixin:
                 images=images,
                 **kwargs,
             )
+
+        ss = _StreamState(
+            discussion            = self,
+            callback              = callback,
+            ai_message            = LollmsMessage(self, SimpleNamespace(content="", metadata={})),
+            enable_notes          = enable_notes,
+            enable_skills         = enable_skills,
+            enable_inline_widgets = enable_inline_widgets,
+            enable_forms          = enable_forms,
+            auto_activate_artefacts = auto_activate_artefacts,
+        )
 
         def _finish(text):
             ai = self.add_message(
@@ -1929,7 +2185,6 @@ class ChatMixin:
                     return ss.feed(chunk)
                 return True
 
-            # _stream_final_answer now handles artefact image merging internally
             raw_text = self._stream_final_answer(
                 _fast_relay, images,
                 branch_tip_id or self.active_branch_id,
@@ -2247,10 +2502,15 @@ class ChatMixin:
                     return result
                 return True
 
-            # Artefact image merging is handled inside _stream_final_answer
-            self._stream_final_answer(
-                _inline_relay, images, _current_branch_tip,
-                final_answer_temperature, **kwargs,
+            merged_images = self._merge_artefact_images(images)
+            kwargs['streaming_callback']=_inline_relay
+            self.lollmsClient.chat(
+                self,
+                images=merged_images,
+                branch_tip_id=_current_branch_tip,
+                stream=True,
+                temperature=final_answer_temperature,
+                **kwargs,
             )
 
             ss.flush_remaining_buffer()
@@ -2369,7 +2629,10 @@ class ChatMixin:
             all_events.append({"type": "step_start", "content": _step_lbl,
                                "id": _step_id, "offset": _current_offset})
 
+            ss._emit_tool_processing_open(_tool_name, _tool_params)
+
             if _tool_name not in tool_registry:
+                ss._emit_tool_processing_status(f"Tool '{_tool_name}' not found in registry")
                 _warning(callback, f"Unknown tool: {_tool_name}")
                 _result_str = f"Error: tool '{_tool_name}' not found"
                 _result     = {"error": _result_str}
@@ -2385,8 +2648,10 @@ class ChatMixin:
                     {"type": "step_end",
                      "content": f"Unknown tool '{_tool_name}'",
                      "id": _step_id, "offset": _current_offset, "status": "failed"}])
+                ss._emit_tool_processing_close("Failed: tool not found")
             else:
                 try:
+                    ss._emit_tool_processing_status(f"Executing {_tool_name}...")
                     _result = tool_registry[_tool_name](**_tool_params)
 
                     inferred_srcs = _infer_sources_from_json(_result, _tool_name)
@@ -2424,6 +2689,14 @@ class ChatMixin:
                     tool_calls_this_turn.append({
                         "name": _tool_name, "params": _tool_params, "result": _result,
                     })
+
+                    result_summary = f"Success: {res_label}"
+                    if inferred_srcs:
+                        result_summary += f" ({len(inferred_srcs)} sources)"
+                    ss._emit_tool_processing_status(result_summary)
+                    ss._emit_tool_processing_close(
+                        f"Completed with {len(str(_result))} chars of output"
+                    )
 
                     _out_evt = {
                         "type": "tool_output", "content": _result_str,
@@ -2482,7 +2755,9 @@ class ChatMixin:
 
                 except Exception as e:
                     trace_exception(e)
+                    ss._emit_tool_processing_status(f"Error during execution: {str(e)[:100]}")
                     _warning(callback, f"Tool error ({_tool_name}): {e}")
+                    ss._emit_tool_processing_close(f"Failed: {str(e)[:200]}")
                     _step_end(callback, f"Error: {e}", _step_id, {"status": "error"})
                     all_events.append({
                         "type": "step_end", "content": f"Error: {e}",
@@ -2536,9 +2811,18 @@ class ChatMixin:
                 "Write your final answer to the user in plain text. "
                 "Do NOT emit any more <tool_call> tags."
             )
-            self._stream_final_answer(
-                _final_relay, images, _current_branch_tip, final_answer_temperature, **kwargs
+            
+            merged_images = self._merge_artefact_images(images)
+            kwargs['streaming_callback']=_final_relay
+            self.lollmsClient.chat(
+                self,
+                images=merged_images,
+                branch_tip_id=_current_branch_tip,
+                stream=True,
+                temperature=final_answer_temperature,
+                **kwargs,
             )
+            
             ss_final.flush_remaining_buffer()
             self.scratchpad = _scratch_before_final
 
