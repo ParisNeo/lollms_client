@@ -38,6 +38,7 @@ class CoreMixin:
         db_discussion_obj: Optional[Any] = None,
         autosave: bool = False,
         max_context_size: Optional[int] = None,
+        memory_manager=None,
     ):
         object.__setattr__(self, 'lollmsClient', lollmsClient)
         object.__setattr__(self, 'db_manager', db_manager)
@@ -74,6 +75,9 @@ class CoreMixin:
         object.__setattr__(self, 'images', images_data)
 
         object.__setattr__(self, 'artefacts', ArtefactManager(self))
+
+        # ── Memory system ─────────────────────────────────────────────────
+        self._init_memory(memory_manager)
 
         self._rebuild_message_index()
         self._validate_and_set_active_branch()

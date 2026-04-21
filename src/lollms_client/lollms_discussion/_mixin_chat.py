@@ -1520,13 +1520,24 @@ class ChatMixin:
         enable_skills:           bool = False,
         enable_forms:            bool = True,
         enable_silent_artefact_explanation: bool = True,
+        memory_manager=None,
         **kwargs
     ) -> Dict[str, Any]:
         self.scratchpad = ""
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
 
+        # ── Memory ────────────────────────────────────────────────────────
+        _mm = self._get_memory_manager(memory_manager)
+        _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
+        self._memory_pre_turn(_mm, token_counter=_counter)
+        _mem_instructions = self._build_memory_system_instructions(_mm)
+
         object.__setattr__(self, '_active_callback', callback)
+
+        self.scratchpad = ""
+        personality = personality or NullPersonality()
+        callback    = kwargs.get("streaming_callback")
 
         def is_fast(msg):
             m = msg.lower().strip()
@@ -1535,6 +1546,8 @@ class ChatMixin:
             return m in ["ok", "merci", "thanks", "cool", "yes", "no", "oui", "non"]
 
         extra_instructions = self._build_artefact_instructions()
+        if _mem_instructions:
+            extra_instructions += _mem_instructions
         if enable_image_generation or enable_image_editing:
             extra_instructions += self._build_image_generation_instructions()
         if enable_inline_widgets:
@@ -1606,12 +1619,20 @@ class ChatMixin:
             affected = handle_artefacts + ss.affected_artefacts + affected_pp
             if cleaned != text_after_handles:
                 ai.content = cleaned
+
+            # Memory tag processing
+            mem_cleaned, mem_report = self._process_memory_tags(
+                ai.content, _mm, callback)
+            if mem_cleaned != ai.content:
+                ai.content = mem_cleaned
+
             if affected and callback:
                 _cb(callback, json.dumps([a.get("title") for a in affected]),
                     MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
             object.__setattr__(self, '_active_callback', None)
             return {"user_message": user_msg, "ai_message": ai,
-                    "sources": [], "artefacts": affected}
+                    "sources": [], "artefacts": affected,
+                    "memory_report": mem_report}
 
         if is_fast(user_message):
             _info(callback, "Simple response path")
@@ -1745,12 +1766,19 @@ class ChatMixin:
         enable_skills:                bool = False,
         enable_forms:                 bool = True,
         enable_silent_artefact_explanation: bool = True,
+        memory_manager=None,
         **kwargs
     ) -> Dict[str, Any]:
         self.scratchpad = ""
 
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
+
+        # ── Memory ────────────────────────────────────────────────────────
+        _mm = self._get_memory_manager(memory_manager)
+        _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
+        self._memory_pre_turn(_mm, token_counter=_counter)
+        _mem_instructions = self._build_memory_system_instructions(_mm)
 
         if "temperature" in kwargs:
             final_answer_temperature = kwargs.pop("temperature")
@@ -1800,6 +1828,8 @@ class ChatMixin:
 
         # ── System-prompt instructions ───────────────────────────────────────
         extra_instructions = self._build_artefact_instructions()
+        if _mem_instructions:
+            extra_instructions += _mem_instructions
         if _eff_img_gen or _eff_img_edit:
             extra_instructions += self._build_image_generation_instructions()
         if enable_inline_widgets:
@@ -2222,6 +2252,13 @@ class ChatMixin:
             affected = handle_arts + ss.affected_artefacts + affected_pp
             if cleaned != raw_after_handles:
                 ai_message.content = cleaned
+
+            # Memory tag processing
+            _mem_cleaned, _mem_report = self._process_memory_tags(
+                ai_message.content, _mm, callback)
+            if _mem_cleaned != ai_message.content:
+                ai_message.content = _mem_cleaned
+
             if affected and callback:
                 _cb(callback, json.dumps([a.get("title") for a in affected]),
                     MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
@@ -2236,6 +2273,7 @@ class ChatMixin:
                 "scratchpad":       None,
                 "self_corrections": None,
                 "artefacts":        affected,
+                "memory_report":    _mem_report,
             }
 
         # ====================================================================
@@ -2914,6 +2952,12 @@ class ChatMixin:
                     MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED,
                     {"artefacts": affected_artefacts})
 
+        # Memory tag processing on final cleaned content
+        _mem_cleaned, _mem_report = self._process_memory_tags(
+            ai_message.content, _mm, callback)
+        if _mem_cleaned != ai_message.content:
+            ai_message.content = _mem_cleaned
+
         if self._is_db_backed and self.autosave:
             self.commit()
 
@@ -2926,6 +2970,7 @@ class ChatMixin:
             "scratchpad":       scratchpad_state if is_agentic_turn else None,
             "self_corrections": self_corrections or None,
             "artefacts":        affected_artefacts,
+            "memory_report":    _mem_report,
         }
 
 

@@ -243,6 +243,14 @@ class UtilsMixin:
                 elif format_type == "markdown":
                     messages.append(f"**system**: {scratch_content}\n")
 
+        # ── Memory context injection ─────────────────────────────────────
+        _mm = getattr(self, 'memory_manager', None)
+        if _mm is not None and format_type in ("openai_chat", "ollama_chat"):
+            messages = self._inject_memory_into_messages(
+                messages, _mm, format_type,
+                token_counter=self.lollmsClient.count_tokens,
+            )
+
         return "\n".join(messages) if format_type == "markdown" else messages
     
 

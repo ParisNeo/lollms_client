@@ -27,11 +27,27 @@ from ._mixin_prompt import PromptMixin
 from ._mixin_chat   import ChatMixin
 from ._mixin_utils  import UtilsMixin
 from ._mixin_branch import BranchMixin, BranchInfo, MessageNode
+from ._mixin_memory import MemoryMixin
 
 
-class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixin):
+class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixin, MemoryMixin):
     """
     Represents and manages a single discussion.
+
+    Memory system
+    ─────────────
+    Attach a LollmsMemoryManager to enable multi-level persistent memory:
+
+        from lollms_client.lollms_discussion.lollms_memory import LollmsMemoryManager, MemoryConfig
+
+        mem = LollmsMemoryManager(
+            db_path="sqlite:///memories.db",
+            owner_id=discussion.id,
+            config=MemoryConfig(working_token_budget=800),
+        )
+        discussion.memory_manager = mem          # attach after creation
+        # … or pass at chat time:
+        discussion.chat("...", memory_manager=mem)
 
     Attributes:
         scratchpad (str): A volatile area containing full-length tool outputs
@@ -91,4 +107,5 @@ __all__ = [
     # Branch management
     "BranchInfo",
     "MessageNode",
+    "MemoryMixin",
 ]

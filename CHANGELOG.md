@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-04-21 02:58]
+
+- feat(discussion): add new functionality to chat and core mixins
+
 ## [2026-04-12 11:04]
 
 - docs: update discussion docs and refactor swarm artefact handling
