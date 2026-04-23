@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-04-23 01:57]
+
+- feat(lollms_client): Update LLM binding configurations and modernize Python syntax
+
 ## [2026-04-21 02:58]
 
 - feat(discussion): add new functionality to chat and core mixins

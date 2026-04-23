@@ -1,4 +1,5 @@
 # lollms_binding.py
+from __future__ import annotations
 from abc import abstractmethod
 import importlib
 from pathlib import Path
@@ -9,9 +10,37 @@ from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_utilities import ImageTokenizer, robust_json_parser
 from lollms_client.lollms_base_binding import LollmsBaseBinding
 from lollms_client.lollms_text_processing import LollmsTextProcessor
+from functools import lru_cache
 import re
 import yaml
 import json
+
+
+@lru_cache(maxsize=1)
+def load_known_contexts() -> dict:
+    file_path = Path(__file__).parent / "assets" / "models_ctx_sizes.json"
+    try:
+        with file_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected top-level dict in {file_path}")
+
+        data.setdefault("exact", {})
+        data.setdefault("aliases", {})
+        data.setdefault("prefix", {})
+
+        return data
+
+    except FileNotFoundError:
+        print(f"Error: File not found at {file_path}")
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode JSON from {file_path}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+    return {"exact": {}, "aliases": {}, "prefix": {}}
+
 
 def load_known_contexts():
     """
@@ -238,28 +267,61 @@ class LollmsLLMBinding(LollmsBaseBinding):
         # Call the internal chat method with all resolved parameters
         return self._chat(**chat_kwargs)
 
-    def get_ctx_size(self, model_name: Optional[str|None] = None) -> Optional[int]:
-        """
-        Retrieves context size for a model from a hardcoded list.
-        """
+
+    def normalize_model_name(self, model_name: str) -> str:
+        return model_name.strip().lower()
+
+
+    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
         if model_name is None:
             model_name = self.model_name
 
+        normalized = self.normalize_model_name(model_name)
         known_contexts = load_known_contexts()
 
-        normalized_model_name = model_name.lower().strip()
-        sorted_base_models = sorted(known_contexts.keys(), key=len, reverse=True)
+        exact = {
+            self.normalize_model_name(k): v
+            for k, v in known_contexts.get("exact", {}).items()
+        }
+        aliases = {
+            self.normalize_model_name(k): self.normalize_model_name(v)
+            for k, v in known_contexts.get("aliases", {}).items()
+        }
+        prefix = {
+            self.normalize_model_name(k): v
+            for k, v in known_contexts.get("prefix", {}).items()
+        }
 
-        for base_name in sorted_base_models:
-            if base_name in normalized_model_name:
-                context_size = known_contexts[base_name]
+        if normalized in exact:
+            context_size = exact[normalized]
+            ASCIIColors.warning(
+                f"Using exact context size for model '{model_name}': {context_size}"
+            )
+            return context_size
+
+        if normalized in aliases:
+            aliased_name = aliases[normalized]
+            context_size = exact.get(aliased_name)
+            if context_size is not None:
                 ASCIIColors.warning(
-                    f"Using hardcoded context size for model '{model_name}' "
-                    f"based on base name '{base_name}': {context_size}"
+                    f"Using aliased context size for model '{model_name}' "
+                    f"via '{aliased_name}': {context_size}"
                 )
                 return context_size
 
-        ASCIIColors.warning(f"Context size not found for model '{model_name}' in the hardcoded list.")
+        for prefix_name in sorted(prefix.keys(), key=len, reverse=True):
+            if normalized.startswith(prefix_name):
+                context_size = prefix[prefix_name]
+                ASCIIColors.warning(
+                    f"Using prefix context size for model '{model_name}' "
+                    f"via '{prefix_name}': {context_size}"
+                )
+                return context_size
+
+        ASCIIColors.warning(
+            f"Context size not found for model '{model_name}', "
+            f"falling back to default: {self.default_ctx_size}"
+        )
         return self.default_ctx_size
 
 
