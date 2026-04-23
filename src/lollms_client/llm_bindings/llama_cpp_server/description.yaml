@@ -207,10 +207,12 @@ commands:
 
   - name: update
     title: Update llama.cpp Binaries
-    description: "Downloads and reinstalls the latest llama.cpp server binaries from GitHub."
+    description: "Downloads and reinstalls the latest llama.cpp server binaries from GitHub. Returns status and message."
     parameters: []
     output:
       - name: status
         type: bool
+        description: "True if update succeeded, False otherwise"
       - name: message
         type: str
+        description: "Detailed status message or error description"
