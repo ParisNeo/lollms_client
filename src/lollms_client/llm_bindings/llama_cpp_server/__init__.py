@@ -200,13 +200,27 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             pass
         return "cpu"
 
-    def install_llama_cpp(self):
-        """Downloads and extracts the latest llama.cpp release binary."""
+    def install_llama_cpp(self, force: bool = False) -> dict:
+        """Downloads and extracts the latest llama.cpp release binary.
+
+        Args:
+            force: If True, forces re-download even if binary exists.
+
+        Returns:
+            dict: {"status": bool, "message": str}
+        """
         try:
             # Ensure the target binary directory exists
             self.bin_dir.mkdir(parents=True, exist_ok=True)
             ASCIIColors.info(f"llama.cpp binary directory set to: {self.bin_dir}")
-            
+
+            # Check if binary exists and force is False
+            exe = self._get_server_executable()
+            if not force and exe.exists():
+                # Check if we want to update anyway or just return success
+                # For an "update" command, we usually want to force
+                pass
+
             ASCIIColors.info("Fetching latest llama.cpp release …")
             resp = requests.get(
                 "https://api.github.com/repos/ggerganov/llama.cpp/releases/latest",
@@ -340,9 +354,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 os.chmod(exe, 0o755)
 
             ASCIIColors.success("llama.cpp installed successfully.")
+            return {"status": True, "message": "llama.cpp updated successfully."}
         except Exception as e:
             trace_exception(e)
-            ASCIIColors.error(f"Failed to install llama.cpp: {e}")
+            error_msg = f"Failed to install llama.cpp: {e}"
+            ASCIIColors.error(error_msg)
+            return {"status": False, "message": error_msg}
+
+    def update_llama_cpp(self) -> dict:
+        """Updates or reinstalls the llama.cpp binaries.
+
+        This is the command entry point for the 'update' command.
+        It forces a re-download of the latest binaries.
+
+        Returns:
+        dict: {"status": bool, "message": str}
+        """
+        return self.install_llama_cpp(force=True)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Registry helpers
