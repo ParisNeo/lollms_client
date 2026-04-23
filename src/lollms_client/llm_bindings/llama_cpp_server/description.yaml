@@ -204,3 +204,13 @@ commands:
     output:
       - name: status
         type: bool
+
+  - name: update
+    title: Update llama.cpp Binaries
+    description: "Downloads and reinstalls the latest llama.cpp server binaries from GitHub."
+    parameters: []
+    output:
+      - name: status
+        type: bool
+      - name: message
+        type: str
