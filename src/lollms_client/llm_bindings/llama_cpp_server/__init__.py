@@ -170,7 +170,13 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         # ── Auto-install llama.cpp if missing ────────────────────────────────
         if not self._get_server_executable().exists():
             ASCIIColors.warning("llama.cpp binary not found. Attempting auto-install …")
-            self.install_llama_cpp()
+            install_result = self.install_llama_cpp()
+            if not install_result.get("status", False):
+                raise RuntimeError(
+                    f"Failed to initialize LLM engine: {install_result.get('message', 'Unknown error')}. "
+                    f"The llama.cpp binary could not be installed. Please check your network connection "
+                    f"and ensure you have write permissions to: {self.bin_dir}"
+                )
 
         # ── Auto-load model if provided at construction time ──────────────────
         if self.model_name:
@@ -217,9 +223,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             # Check if binary exists and force is False
             exe = self._get_server_executable()
             if not force and exe.exists():
-                # Check if we want to update anyway or just return success
-                # For an "update" command, we usually want to force
-                pass
+                ASCIIColors.info(f"Binary already exists at {exe}. Use force=True to update.")
+                # For update command, we should still proceed
+                if not force:
+                    return {"status": True, "message": "llama.cpp already installed. Use force=True to update."}
 
             ASCIIColors.info("Fetching latest llama.cpp release …")
             resp = requests.get(
@@ -227,10 +234,16 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 timeout=30,
             )
             resp.raise_for_status()
-            assets = resp.json().get("assets", [])
+            releases_data = resp.json()
+            assets = releases_data.get("assets", [])
+
+            if not assets:
+                raise RuntimeError("No assets found in the latest release")
 
             hardware = self.detect_hardware()
             sys_plat = platform.system()
+            ASCIIColors.info(f"Detected platform: {sys_plat} / {hardware}")
+
             target_asset = None
             search_terms: List[str] = []
 
@@ -244,6 +257,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     "arm64" if platform.machine() == "arm64" else "x64",
                 ]
 
+            ASCIIColors.info(f"Searching for assets matching: {search_terms}")
+
             for asset in assets:
                 name = asset["name"].lower()
                 if "cudart" in name:
@@ -252,6 +267,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     if "cuda" in name and "cu11" in name and hardware == "cuda":
                         continue
                     target_asset = asset
+                    ASCIIColors.info(f"Found matching asset: {asset['name']}")
                     break
 
             # Windows CPU fallback
@@ -262,11 +278,14 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     n = asset["name"].lower()
                     if "win" in n and "x64" in n and "cuda" not in n:
                         target_asset = asset
+                        ASCIIColors.info(f"Found fallback asset: {asset['name']}")
                         break
 
             if not target_asset:
+                ASCIIColors.error(f"Available assets: {[a['name'] for a in assets[:10]]}")
                 raise RuntimeError(
-                    f"No suitable llama.cpp binary found for {sys_plat} / {hardware}"
+                    f"No suitable llama.cpp binary found for {sys_plat} / {hardware}. "
+                    f"Search terms: {search_terms}"
                 )
 
             filename = target_asset["name"]
@@ -285,14 +304,17 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                         bar.update(len(chunk))
 
             ASCIIColors.info("Extracting …")
+            extracted_files = []
             if filename.endswith(".zip"):
                 with zipfile.ZipFile(dest_file, "r") as z:
                     z.extractall(self.bin_dir)
+                    extracted_files = z.namelist()
             elif filename.endswith(".tar.gz"):
                 with tarfile.open(dest_file, "r:gz") as t:
                     t.extractall(self.bin_dir)
-                    # List top-level files/dirs to find binaries
-                    # For simplicity, we'll scan the bin_dir after extraction
+                    # Get list of extracted files
+                    extracted_files = t.getnames()
+
             dest_file.unlink(missing_ok=True)
 
             # Normalize executable name
@@ -300,55 +322,80 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             legacy = self.bin_dir / (
                 "server.exe" if platform.system() == "Windows" else "server"
             )
-            
+
             found_binary = None
-            
-            # Strategy 1: Check for standard names first
+
+            # Strategy 1: Check for standard names first (exact match)
             if exe.exists():
                 found_binary = exe
+                ASCIIColors.success(f"Found binary at: {exe}")
             elif legacy.exists():
                 found_binary = legacy
                 if not exe.exists():
                     shutil.move(str(legacy), str(exe))
-            
-            # Strategy 2: If still not found, scan for any executable starting with 'llama' or ending in 'server'
+                    found_binary = exe
+                    ASCIIColors.success(f"Moved legacy binary to: {exe}")
+
+            # Strategy 2: If still not found, scan for any executable starting with 'llama' and containing 'server'
             if not found_binary or not exe.exists():
                 candidates = []
                 for f in self.bin_dir.iterdir():
                     if f.is_file():
                         name_lower = f.name.lower()
-                        # Common patterns: llama-server, llama-cli, server, server.exe, llama-b8287...
-                        if "llama" in name_lower and ("server" in name_lower or name_lower.startswith("server")):
+                        # Common patterns: llama-server, llama-cli, server, server.exe, llama-xxx-server
+                        if "llama" in name_lower and "server" in name_lower:
                             candidates.append(f)
-                        # Fallback: any file that looks like an executable on Linux/Mac
-                        elif platform.system() != "Windows" and (name_lower.endswith("-rocm") or name_lower.endswith("-cuda") or name_lower.startswith("llama-")):
-                             # Check if it's executable
-                             try:
-                                 import stat
-                                 if f.stat().st_mode & stat.S_IEXEC:
-                                     candidates.append(f)
-                             except Exception:
-                                 pass
+                        # Also check for server.exe or server on Windows/non-Windows
+                        elif name_lower == "server.exe" or name_lower == "server":
+                            candidates.append(f)
 
                 if candidates:
-                    # Prefer 'llama-server' if exact match, otherwise take the first candidate
-                    preferred = next((c for c in candidates if "llama-server" in c.name.lower()), candidates[0])
-                    if preferred != exe:
+                    # Prefer exact 'llama-server' match, otherwise take the first candidate
+                    preferred = next((c for c in candidates if c.name.lower() == "llama-server" or c.name.lower() == "llama-server.exe"), None)
+                    if preferred is None:
+                        preferred = next((c for c in candidates if "llama-server" in c.name.lower()), candidates[0])
+
+                    if preferred.exists() and preferred != exe:
                         shutil.move(str(preferred), str(exe))
-                    found_binary = exe
+                        found_binary = exe
+                        ASCIIColors.success(f"Moved candidate binary to: {exe}")
+                    elif preferred.exists():
+                        found_binary = preferred
                 else:
-                    # Last ditch: look for 'server' in any subdir if extraction created folders
+                    # Last ditch: look in subdirectories if extraction created folders
+                    ASCIIColors.info("Scanning subdirectories for binaries...")
                     for subdir in self.bin_dir.iterdir():
                         if subdir.is_dir():
                             for f in subdir.iterdir():
-                                if f.is_file() and (f.name == "server" or f.name == "server.exe"):
-                                    shutil.move(str(f), str(exe))
-                                    found_binary = exe
-                                    break
-                        if found_binary: break
+                                if f.is_file():
+                                    name_lower = f.name.lower()
+                                    if (name_lower == "llama-server" or name_lower == "llama-server.exe" or 
+                                        (name_lower == "server" and platform.system() != "Windows") or
+                                        (name_lower == "server.exe" and platform.system() == "Windows")):
+                                        shutil.move(str(f), str(exe))
+                                        found_binary = exe
+                                        ASCIIColors.success(f"Found binary in subdirectory: {subdir.name}")
+                                        break
+                        if found_binary: 
+                            break
 
             if not exe.exists():
-                raise RuntimeError(f"Could not locate 'llama-server' binary after extraction in {self.bin_dir}.")
+                # Provide more detailed error information
+                ASCIIColors.error(f"Extraction completed but 'llama-server' binary not found in {self.bin_dir}")
+                ASCIIColors.error(f"Extracted files: {extracted_files[:10] if extracted_files else 'None'}")
+                ASCIIColors.error(f"Contents of bin_dir: {[f.name for f in self.bin_dir.iterdir()]}")
+                raise RuntimeError(
+                    f"Could not locate 'llama-server' binary after extraction in {self.bin_dir}. "
+                    f"Please check the extraction logs above."
+                )
+
+            # Verify the binary is executable
+            if platform.system() != "Windows" and exe.exists():
+                import stat
+                exe_stat = exe.stat()
+                if not (exe_stat.st_mode & stat.S_IEXEC):
+                    ASCIIColors.info(f"Setting executable permission on {exe}")
+                    os.chmod(exe, exe_stat.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
             if platform.system() != "Windows" and exe.exists():
                 os.chmod(exe, 0o755)
