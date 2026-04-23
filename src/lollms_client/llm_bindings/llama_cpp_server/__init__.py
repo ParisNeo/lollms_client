@@ -156,7 +156,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         # Registry directory – one JSON per running model
         self.servers_dir = self.models_dir / "servers"
         self.servers_dir.mkdir(parents=True, exist_ok=True)
-        self.bin_dir.mkdir(exist_ok=True)
+        self.bin_dir.mkdir(parents=True, exist_ok=True)
 
         # Global file-lock (prevents port races across processes)
         self.global_lock_path = self.models_dir / "global_server_manager.lock"
