@@ -1,73 +1,80 @@
-title: 'OpenAI TTI'
-author: 'ParisNeo'
-version: 1.0.0
-binding_name: 'openai'
-supported_file_types: []
+title: "OpenAI TTI"
+author: "ParisNeo"
+version: 1.1.0
+binding_name: "openai"
+description: |
+  Binding for OpenAI Image Generation API.
+  Uses the unified image generation endpoint supporting both creation and editing.
+  Compatible with models like gpt-image-1 and future OpenAI image models.
 
-input_parameters:
-  - name: "model"
-    type: "str"
-    default: "gpt-image-1"
-    description: "The OpenAI image model to use."
-    options: ["gpt-image-1", "dall-e-2", "dall-e-3"]
-
+global_input_parameters:
   - name: "api_key"
     type: "str"
+    description: "Your OpenAI API Key. If empty, OPENAI_API_KEY environment variable will be used."
+    mandatory: false
+    is_secret: true
     default: ""
-    description: "Optional API key for OpenAI. If empty, the environment variable OPENAI_API_KEY will be used."
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    description: "OpenAI image model to use."
+    mandatory: true
+    default: "gpt-image-1"
+    options: ["gpt-image-1"]
+
+  - name: "size"
+    type: "str"
+    description: "Output image size."
+    mandatory: false
+    default: "1024x1024"
+    options: ["256x256", "512x512", "1024x1024", "2048x2048"]
+
+  - name: "quality"
+    type: "str"
+    description: "Image quality setting."
+    mandatory: false
+    default: "standard"
+    options: ["standard", "hd"]
+
+commands:
+  - name: list_models
+    title: "Refresh Models"
+    description: "Fetches the current list of available OpenAI image models."
+    parameters: []
+    output:
+      - name: models
+        type: list
+
+  - name: get_credits
+    title: "Get Credits"
+    description: "Get total credits and usage (if available from OpenAI billing API)."
+    parameters: []
+    output:
+      - name: credits
+        type: dict
+
+  - name: list_services
+    title: "List Services"
+    description: "Returns available OpenAI services."
+    parameters: []
+    output:
+      - name: services
+        type: list
 
 generate_image_parameters:
   - name: "prompt"
     type: "str"
-    default: ""
     description: "The prompt describing the image to generate."
-
-  - name: "size"
-    type: "str"
-    default: "1024x1024"
-    description: "Size of the generated image."
-    options: ["256x256", "512x512", "1024x1024", "2048x2048"]
-
-  - name: "n"
-    type: "int"
-    default: 1
-    description: "Number of images to generate per request. Maximum 10."
-
-  - name: "quality"
-    type: "str"
-    default: "standard"
-    description: "Image quality (only supported by dall-e-3)."
-    options: ["standard", "hd"]
+    default: ""
 
 edit_image_parameters:
   - name: "prompt"
     type: "str"
-    default: ""
     description: "The prompt describing the edit to apply."
-
-  - name: "image"
-    type: "str"
     default: ""
-    description: "The input image to edit. Can be base64, URL, or local file path."
 
-  - name: "mask"
+  - name: "images"
     type: "str"
+    description: "Input image(s) for editing. Can be base64, URL, or file path."
     default: ""
-    description: "Optional mask image. Areas in white will be edited."
-
-  - name: "size"
-    type: "str"
-    default: "1024x1024"
-    description: "Size of the output image."
-    options: ["256x256", "512x512", "1024x1024", "2048x2048"]
-
-  - name: "n"
-    type: "int"
-    default: 1
-    description: "Number of edited images to generate. Maximum 10."
-
-  - name: "quality"
-    type: "str"
-    default: "standard"
-    description: "Image quality (only supported by dall-e-3)."
-    options: ["standard", "hd"]

@@ -42,6 +42,14 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-04-26 23:13]
+
+- feat: add OpenAI TTI binding and refactor imports
+
+## [2026-04-23 23:33]
+
+- feat(lollms_client): update version and import bindings utils
+
 ## [2026-04-23 01:57]
 
 - feat(lollms_client): Update LLM binding configurations and modernize Python syntax
