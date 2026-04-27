@@ -808,9 +808,11 @@ class _StreamState:
         self.proc_type    = proc_type_map.get(prefix, "building")
         self.proc_title   = self.sec_open_attrs.get('name') or self.sec_open_attrs.get('title', 'untitled')
         self.proc_attrs   = {}
+        if self.sec_open_attrs.get('id'):
+            self.proc_attrs['id'] = self.sec_open_attrs.get('id')
         self.proc_content = []
         self.pending_final_content = ""
-        self.proc_has_opened = False
+        self.proc_has_opened = False # Reset flag before emitting
 
         # Build type-specific attrs
         if prefix in ("<artifact", "<artefact"):
@@ -825,7 +827,7 @@ class _StreamState:
         elif prefix == "<lollms_inline":
             self.proc_attrs['widget_type'] = self.sec_open_attrs.get('type', 'html')
 
-        # Emit the opening <processing> tag immediately
+        # [FIX] CRITICAL: Actually emit the opening <processing> tag to the stream
         self._emit_processing_open()
 
     def _feed_secondary(self, chunk: str, pos: int) -> int:
@@ -974,6 +976,11 @@ class _StreamState:
         """Buffer arriving content; emit legacy chunk events for backward compat."""
         if not self.sec_chunk_mt or not content:
             return
+            
+        # [NEW] For Artefacts/Notes/Skills, provide a silent 'writing' update to processing 
+        # if the buffer gets significantly larger, to keep the UI spinning.
+        if len("".join(self.sec_content)) % 500 == 0: # Every ~500 chars
+             self._emit_processing_status("Writing content data...")
         attrs  = self.sec_open_attrs
         prefix = self.sec_prefix
 
@@ -1025,7 +1032,7 @@ class _StreamState:
                 "version": art.get("version"), "art_type": art.get("type")
             }), MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefact": art, "is_new": is_new})
 
-        # ── Artefacts ────────────────────────────────────────────────────
+        # ── Artefacts (LCP Intercepted) ──────────────────────────────────
         if prefix in ("<artifact", "<artefact"):
             tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
             new_name  = attrs.pop('rename', None)
@@ -1084,7 +1091,7 @@ class _StreamState:
                     f"Artefact saved as version {result_art.get('version', '?')}"
                 )
 
-            # Artefacts live in discussion space — no final_content to flush
+            # LCP Compliance: Artefacts are intercepted. We close processing WITHOUT sending raw content.
             self._emit_processing_close()
 
             # Legacy event
@@ -1094,7 +1101,7 @@ class _StreamState:
                 "is_patch": is_patch, "attrs": attrs,
             })
 
-        # ── Notes ────────────────────────────────────────────────────────
+        # ── Notes (LCP Intercepted) ──────────────────────────────────────
         elif prefix == "<note":
             title = attrs.get('title') or attrs.get('name', f'note_{uuid.uuid4().hex[:8]}')
 
@@ -1107,6 +1114,7 @@ class _StreamState:
             _fire_state_change(art, True)
 
             self._emit_processing_status("Note saved successfully")
+            # LCP Compliance: Close processing, raw content is kept in the artefact store only.
             self._emit_processing_close()
 
             # Legacy event
@@ -1155,9 +1163,16 @@ class _StreamState:
                 })
             else:
                 self._emit_processing_status("Validation passed")
-                # Store validated HTML as pending — flushed after state reset
-                self._emit_processing_close(validated)
-                # Legacy event
+                
+                # [FIX] Wrap the validated content in the identification tag 
+                # so the frontend renderer detects it as an interactive block.
+                # Added newlines for proper markdown separation.
+                wrapped_widget = f'\n\n<lollms_inline title="{title}" type="{widget_type}">\n{validated}\n</lollms_inline>\n\n'
+                
+                # Store wrapped HTML as pending — flushed after state reset
+                self._emit_processing_close(wrapped_widget)
+                
+                # Legacy event (keep raw for backward compatibility)
                 _cb(self.callback, validated, self.sec_done_mt,
                     {"title": title, "content": validated, "widget_type": widget_type})
 
