@@ -657,7 +657,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         if self.n_threads:
             cmd += ["--threads", str(self.n_threads)]
         if self.flash_attn:
+            # The new llama-server binary requires a value: on, off, or auto
             cmd.append("--flash-attn")
+            cmd.append("on")
         if not self.mmap:
             cmd.append("--no-mmap")
         if self.mlock:
@@ -688,6 +690,9 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         """
         Spawns a detached llama-server process for *model_name*.
         Returns (pid, port, base_url).
+
+        If the process fails, it captures stderr and logs it to a file
+        and includes it in the exception message for debugging.
         """
         exe = self._get_server_executable()
         model_path = self.models_dir / model_name
@@ -700,15 +705,28 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         ASCIIColors.info(f"Spawning '{model_name}' on port {port} …")
 
+        # Prepare a log file for stderr to capture crash reasons
+        log_file_path = self.servers_dir / f"{model_name.replace('.gguf', '')}_error.log"
+
+        # We need to capture stderr to read it if the process crashes
+        # On Windows, we still want it detached, but we can redirect stderr to a file
         popen_kwargs: Dict[str, Any] = {
             "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
         }
+
         if platform.system() == "Windows":
+            # On Windows, we can't easily read stderr from a detached process without a pipe
+            # So we redirect stderr to a file for later inspection
+            popen_kwargs["stderr"] = open(log_file_path, "w", encoding="utf-8")
             popen_kwargs["creationflags"] = (
                 subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             )
         else:
+            # On Linux/Mac, we can use start_new_session and capture stderr
+            # But to keep it detached, we still redirect to file or pipe
+            # For better debugging, let's use a pipe but ensure the process detaches
+            # Actually, to keep it truly detached and readable, file is safer
+            popen_kwargs["stderr"] = open(log_file_path, "w", encoding="utf-8")
             popen_kwargs["start_new_session"] = True
 
         proc = subprocess.Popen(cmd, **popen_kwargs)
@@ -730,14 +748,47 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                     return proc.pid, port, base_url
             except Exception:
                 pass
+
+            # Check if the process died
             if proc.poll() is not None:
-                raise RuntimeError(
-                    f"Server process for '{model_name}' exited early "
-                    f"(code {proc.returncode})."
-                )
+                # Process exited. Read the error log if it exists
+                error_msg = f"Server process for '{model_name}' exited early (code {proc.returncode})."
+
+                if log_file_path.exists():
+                    try:
+                        with open(log_file_path, "r", encoding="utf-8") as f:
+                            stderr_content = f.read()
+                        if stderr_content.strip():
+                            # Log the first 10 lines of stderr to console
+                            error_lines = stderr_content.splitlines()[:10]
+                            error_details = "\n".join(error_lines)
+                            ASCIIColors.error(f"Server stderr (first 10 lines):\n{error_details}")
+
+                            if len(error_lines) > 10:
+                                error_details += "\n... (truncated, see log file)"
+
+                            error_msg += f"\n\nDetailed error output:\n{error_details}\n\nLog saved to: {log_file_path}"
+                        else:
+                            error_msg += f"\nNo stderr output captured. Check log file: {log_file_path}"
+                    except Exception as read_err:
+                        error_msg += f"\nFailed to read error log: {read_err}"
+                else:
+                    error_msg += f"\nNo error log generated. Check permissions or model integrity."
+
+                # Close the file handle if it's still open
+                if hasattr(popen_kwargs["stderr"], "close"):
+                    popen_kwargs["stderr"].close()
+
+                raise RuntimeError(error_msg)
+
             time.sleep(0.5)
 
+        # Timeout reached
         proc.terminate()
+        # Close file handle
+        if "stderr" in popen_kwargs and hasattr(popen_kwargs["stderr"], "close"):
+            popen_kwargs["stderr"].close()
+
         raise TimeoutError(f"Server for '{model_name}' failed to become ready within 120 s.")
 
     def load_model(self, model_name: str) -> bool:
