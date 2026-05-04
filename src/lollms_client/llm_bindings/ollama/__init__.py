@@ -355,7 +355,7 @@ class OllamaBinding(LollmsLLMBinding):
                                     cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data["base64"])
                                     images.append(cleaned)
                                 elif "url" in base64_data :
-                                    if "http" in base64_data["url"]:
+                                    if base64_data["url"].lower().startswith("http"):
                                         images.append(base64_data["url"])
                                     else:
                                         cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data["url"])
@@ -369,6 +369,7 @@ class OllamaBinding(LollmsLLMBinding):
             }
 
         ollama_messages = []
+        
         for m in messages:
             nm = normalize_message(m)
             if nm["images"]:

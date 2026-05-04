@@ -123,73 +123,29 @@ class MSG_TYPE(Enum):
     MSG_TYPE_FORM_READY                 = 46 # complete parsed form descriptor ready for rendering
     MSG_TYPE_FORM_SUBMITTED             = 47 # user answers injected back into generation context
     # ── Form / Frame system ───────────────────────────────────────────────────
-    # lollms_form lets the LLM ask the user structured questions that render as
-    # an interactive form in the UI.  When submitted, the answers are sent back
-    # to the LLM as a tool_result so generation can continue.
+    # lollms_form allows the AI to solicit structured data from the user.
+    # The UI renders a rich, interactive form. Submission pauses the AI until
+    # the user provides the answers, which are then injected as a tool_result.
     #
     # Lifecycle
     # ---------
-    #   1. MSG_TYPE_FORM_READY fires when </lollms_form> is fully buffered.
-    #      meta["form"] contains the complete parsed form descriptor dict.
-    #      Generation is PAUSED — the LLM cannot continue until answers arrive.
+    # 1. AI emits <lollms_form> XML block.
+    # 2. Framework parses block into a Form Descriptor and fires MSG_TYPE_FORM_READY.
+    # 3. UI renders component. AI generation is PAUSED.
+    # 4. User submits. UI calls `/api/discussions/{id}/forms/{id}/submit`.
+    # 5. Framework resumes generation with the JSON response.
     #
-    #   2. The application renders the form, collects user answers, and calls:
-    #        discussion.submit_form_response(form_id, answers_dict)
-    #      This resumes generation with the answers injected as a user/system message.
-    #
-    #   3. MSG_TYPE_FORM_SUBMITTED fires when the answers are injected, confirming
-    #      the round-trip is complete.
-    #
-    # Form descriptor schema (meta["form"])
-    # --------------------------------------
-    # {
-    #   "id":          str    – stable UUID for this form instance
-    #   "title":       str    – displayed as the form heading
-    #   "description": str    – optional subtitle / instructions for the user
-    #   "submit_label":str    – label for the submit button (default "Submit")
-    #   "fields":      list[FieldDescriptor]
-    # }
-    #
-    # FieldDescriptor schema
-    # ----------------------
-    # {
-    #   "name":        str    – machine key returned in the answers dict
-    #   "label":       str    – human-readable label shown next to the field
-    #   "type":        str    – see Field Types below
-    #   "required":    bool   – default True
-    #   "default":     any    – pre-filled value (optional)
-    #   "placeholder": str    – hint text (text / textarea / number fields)
-    #   "options":     list   – for select / radio / checkbox_group / rating
-    #                           each item: str  OR  {"value": any, "label": str}
-    #   "min":         number – for number / range / rating
-    #   "max":         number – for number / range / rating
-    #   "step":        number – for number / range
-    #   "rows":        int    – for textarea (default 4)
-    #   "accept":      str    – for file ("image/*", ".pdf", etc.)
-    #   "multiple":    bool   – for file / select (allow multiple selections)
-    #   "hint":        str    – small explanatory text shown below the field
-    # }
-    #
-    # Field Types
-    # -----------
-    #   text          – single-line text input
-    #   textarea      – multi-line text (rows controlled by "rows")
-    #   number        – numeric input (int or float)
-    #   range         – slider (requires min/max, optional step)
-    #   select        – dropdown (single selection unless multiple=True)
-    #   radio         – radio button group (single selection)
-    #   checkbox       – single boolean checkbox
-    #   checkbox_group – multiple checkboxes from an options list
-    #   date          – date picker
-    #   time          – time picker
-    #   color         – color picker (returns #RRGGBB)
-    #   rating        – star rating (min defaults to 1, max defaults to 5)
-    #   file          – file upload (returns base64 data-URI or filename)
-    #   hidden        – not shown to user; value comes from "default"
-    #   code          – multi-line code editor with optional syntax highlighting
-    #                   (language set via "language" field)
-    #   section       – visual divider / heading with no user input;
-    #                   "label" becomes a sub-heading
+    # Supported Field Types & Attributes
+    # ---------------------------------
+    # - text: Single line input. (placeholder, default)
+    # - textarea: Multi-line input. (rows, placeholder, default)
+    # - number: Numeric input. (min, max, step, default)
+    # - range: Slider control. (min, max, step, default)
+    # - select: Dropdown list. (options="A,B,C", multiple=true/false)
+    # - radio: Radio group. (options="A,B,C")
+    # - checkbox: Single toggle. (default=true/false)
+    # - rating: Star rating. (max=5, default=3)
+    # - section: Header divider. (label="Section Name")
 
 
 class SENDER_TYPES(Enum):

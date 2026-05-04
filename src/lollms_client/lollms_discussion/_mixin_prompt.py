@@ -25,6 +25,20 @@ class PromptMixin:
     """
 
     # ─────────────────────────────────────── instruction builders ────────────
+    def _build_book_instructions(self) -> str:
+        """Instructions for creating high-quality HTML books."""
+        return """
+=== BOOK ARTEFACTS ===
+When requested to write a book, use <artifact type="book" title="Book Title">.
+Books must be written in SEMANTIC HTML5. 
+Rules:
+1. Include a <style> block at the top for layout (typography, chapter spacing).
+2. Use <section class="chapter"> for each chapter.
+3. Use <h1> for the book title and <h2> for chapters.
+4. You can use <img> tags (referencing <artefact_image id="TITLE::N" /> if images were generated).
+5. The content will be rendered as a rich interactive book in the UI and converted 1:1 to PDF.
+=== END BOOK INSTRUCTIONS ===
+"""
 
     def _build_artefact_instructions(self) -> str:
         """Returns the system-prompt instructions for artifact operations."""
@@ -233,33 +247,51 @@ class PromptMixin:
         return "\n".join(lines)
 
     def _build_form_instructions(self) -> str:
-        lines = [
-            "",
-            "=== FORM SYSTEM ===",
-            "",
-            "You can create interactive forms to gather structured information from the user.",
-            "",
-            "✅ WHEN TO USE FORMS:",
-            "  • Before starting a complex task where multiple inputs are needed",
-            "  • For quizzes, challenges, or evaluations",
-            "  • In multi-step workflows where early choices affect later steps",
-            "",
-            "IMPORTANT:",
-            "  • Write a short preamble before the form tag.",
-            "  • After emitting <lollms_form>, stop generation for that response.",
-            "",
-            "Tag syntax:",
-            '<lollms_form title="Form Title" description="Instructions" submit_label="Submit">',
-            '  <field name="field_id" label="Label" type="text" required="true"/>',
-            "</lollms_form>",
-            "",
-            "Supported field types: text, textarea, number, range, select, radio,",
-            "checkbox, checkbox_group, date, time, color, rating, code, section, hidden",
-            "",
-            "=== END FORM SYSTEM ===",
-            "",
-        ]
-        return "\n".join(lines)
+        """Instruction for rich interactive form building."""
+        return """
+=== INTERACTIVE FORMS ===
+If you need structured data or multiple details from the user, use <lollms_form>. 
+The UI will render a rich component and PAUSE your generation until the user submits.
+
+XML Structure:
+<lollms_form title="Form Title" description="Subtitle" submit_label="Action">
+  <field name="key" label="Display Name" type="TYPE" ...>
+    <!-- Options go here for select/radio -->
+  </field>
+</lollms_form>
+
+Field Types & Attributes:
+- text: <field name="id" label="Name" type="text" placeholder="Hint" />
+- textarea: <field name="id" label="Description" type="textarea" />
+- select: (Use BOTH nested <option> tags AND a comma-separated 'options' attribute for maximum compatibility)
+    <field name="id" label="Choose" type="select" options="Choice 1, Choice 2">
+      <option>Choice 1</option>
+      <option>Choice 2</option>
+    </field>
+- radio: (MUST use child <option> tags. FORBIDDEN to use 'options' attribute)
+    <field name="id" label="Pick one" type="radio">
+      <option>Option A</option>
+      <option>Option B</option>
+    </field>
+- checkbox: <field name="id" label="Enable" type="checkbox" default="true" />
+- range: <field name="id" label="Value" type="range" min="0" max="100" />
+- rating: <field name="id" label="Rate" type="rating" max="5" />
+
+EXAMPLE OF CORRECT FORM:
+<lollms_form title="User Survey" description="Please fill this out" submit_label="Submit">
+  <field name="user_name" label="Full Name" type="text" placeholder="John Doe" />
+  <field name="color" label="Favorite Color" type="select">
+    <option>Red</option>
+    <option>Blue</option>
+    <option>Green</option>
+  </field>
+  <field name="pref" label="Contact Method" type="radio">
+    <option>Email</option>
+    <option>Phone</option>
+  </field>
+</lollms_form>
+=== END FORM INSTRUCTIONS ===
+"""
 
     # ─────────────────────────────────── LLM response post-processor ─────────
 

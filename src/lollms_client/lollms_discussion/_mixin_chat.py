@@ -1780,6 +1780,7 @@ class ChatMixin:
         enable_notes:                 bool = True,
         enable_skills:                bool = False,
         enable_forms:                 bool = True,
+        enable_books:                 bool = False,
         enable_silent_artefact_explanation: bool = True,
         memory_manager=None,
         **kwargs
@@ -1855,6 +1856,8 @@ class ChatMixin:
             extra_instructions += self._build_skill_instructions()
         if enable_forms:
             extra_instructions += self._build_form_instructions()
+        if enable_books:
+            extra_instructions += self._build_book_instructions()
 
         branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
         handle_instructions = _build_handle_instructions(branch_msgs_now)
