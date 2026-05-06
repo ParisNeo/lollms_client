@@ -68,8 +68,9 @@ class ArtefactType:
     CODE          = "code"
     DOCUMENT      = "document"
     IMAGE         = "image"
+    PRESENTATION  = "presentation"
 
-    ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE}
+    ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE, PRESENTATION}
 
     LABELS = {
         FILE:          "File",
@@ -79,6 +80,7 @@ class ArtefactType:
         CODE:          "Code",
         DOCUMENT:      "Document",
         IMAGE:         "Image",
+        PRESENTATION:  "Presentation"
     }
 
     @classmethod

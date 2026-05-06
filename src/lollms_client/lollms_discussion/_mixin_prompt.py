@@ -1,10 +1,13 @@
 # lollms_discussion/_mixin_prompt.py
 # PromptMixin: system-prompt instruction builders and LLM response post-processor.
 #
-# This file is identical to the original except _build_artefact_instructions()
-# now includes a section explaining the <artefact_image id="TITLE::N" /> anchor
-# system so that vision-capable models know how to correlate image slots with
-# in-text references.
+# Changes vs previous version:
+#   • _build_artefact_instructions() now embeds the surgical-update doctrine
+#     (SEARCH/REPLACE patch policy, decision threshold, retry guidance) so the
+#     LLM receives it on EVERY path — fast, no-tools, simplified, agentic.
+#   • Fixed undefined `meta_now2` reference in the silent-artifact guard; the
+#     form-summary branch now iterates over affected_artefacts directly.
+#   • Minor cleanup: consistent quoting, removed redundant blank lines.
 
 import re
 import uuid
@@ -25,12 +28,13 @@ class PromptMixin:
     """
 
     # ─────────────────────────────────────── instruction builders ────────────
+
     def _build_book_instructions(self) -> str:
         """Instructions for creating high-quality HTML books."""
         return """
 === BOOK ARTEFACTS ===
 When requested to write a book, use <artifact type="book" title="Book Title">.
-Books must be written in SEMANTIC HTML5. 
+Books must be written in SEMANTIC HTML5.
 Rules:
 1. Include a <style> block at the top for layout (typography, chapter spacing).
 2. Use <section class="chapter"> for each chapter.
@@ -39,9 +43,373 @@ Rules:
 5. The content will be rendered as a rich interactive book in the UI and converted 1:1 to PDF.
 === END BOOK INSTRUCTIONS ===
 """
-
+    def _build_presentation_instructions(self) -> str:
+        """
+        Compact presentation schema instructions (~250 tokens).
+        Injected only when enable_presentations=True is passed to chat().
+        """
+        return """
+=== PRESENTATION ARTEFACTS ===
+Create slides with type="presentation". The artefact is self-contained HTML
+rendered live in the browser and exportable to PPTX/PDF by the app.
+ 
+FULL TEMPLATE (copy and extend):
+<artifact name="deck.html" type="presentation">
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  /* Import a Google Font for visual polish */
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+ 
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+ 
+  body {
+    font-family: 'Inter', sans-serif;
+    background: #0a0a0a;
+  }
+ 
+  /* ── Slideshow container ── */
+  .presentation { width: 100%; }
+ 
+  /* ── Each slide is a 16:9 canvas ── */
+  .slide {
+    position: relative;
+    width: 1920px; height: 1080px;
+    overflow: hidden;
+    display: none;          /* JS controls visibility */
+  }
+  .slide.active { display: flex; flex-direction: column; }
+ 
+  /* ── Semantic content classes (read by PPTX exporter) ── */
+  .slide-bg       { position: absolute; inset: 0; z-index: 0; }
+  .slide-title    { position: relative; z-index: 1; }
+  .slide-subtitle { position: relative; z-index: 1; }
+  .slide-body     { position: relative; z-index: 1; }
+  .slide-bullets  { position: relative; z-index: 1; list-style: none; }
+  .slide-image    { position: relative; z-index: 1; }
+  .slide-image img { width: 100%; height: 100%; object-fit: cover; }
+  .slide-svg      { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+  .slide-chart    { position: relative; z-index: 1; }
+ 
+  /* ── Viewer chrome ── */
+  #viewer-controls {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 16px;
+    background: rgba(0,0,0,0.7); border-radius: 32px;
+    padding: 10px 24px; color: #fff; font-size: 14px;
+    backdrop-filter: blur(8px); z-index: 9999;
+    user-select: none;
+  }
+  #viewer-controls button {
+    background: none; border: none; color: #fff;
+    font-size: 20px; cursor: pointer; padding: 4px 8px;
+    border-radius: 6px; transition: background 0.2s;
+  }
+  #viewer-controls button:hover { background: rgba(255,255,255,0.15); }
+  #slide-counter { min-width: 60px; text-align: center; opacity: 0.8; }
+ 
+  /* ── Overview mode (ESC) ── */
+  #overview {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.92); z-index: 9998;
+    overflow-y: auto; padding: 32px;
+  }
+  #overview.active { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; }
+  .overview-thumb {
+    width: 320px; height: 180px; overflow: hidden;
+    border-radius: 8px; cursor: pointer;
+    border: 2px solid transparent; transition: border-color 0.2s;
+    position: relative;
+  }
+  .overview-thumb:hover { border-color: #6c63ff; }
+  .overview-thumb .slide { display: flex !important; transform: scale(0.1667); transform-origin: top left; }
+  .overview-num {
+    position: absolute; bottom: 4px; right: 8px;
+    color: #fff; font-size: 11px; opacity: 0.7;
+  }
+</style>
+</head>
+<body>
+ 
+<article class="presentation" data-theme="dark" data-accent="#6c63ff" data-font="Inter">
+ 
+  <!-- ═══ SLIDE 1 — Title ═══ -->
+  <section class="slide active" data-layout="title" data-notes="Opening remarks here">
+    <div class="slide-bg" style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 60%, #0f3460 100%);"></div>
+ 
+    <div style="position:relative; z-index:1; display:flex; flex-direction:column;
+                align-items:center; justify-content:center; height:100%; padding:80px;">
+      <h1 class="slide-title" style="font-size:96px; font-weight:700; color:#e0e0e0;
+                                      text-align:center; line-height:1.1; margin-bottom:32px;">
+        Presentation Title
+      </h1>
+      <h2 class="slide-subtitle" style="font-size:40px; font-weight:400; color:#a0a0c0;
+                                         text-align:center;">
+        Your subtitle or tagline
+      </h2>
+    </div>
+  </section>
+ 
+  <!-- ═══ SLIDE 2 — Content with bullets ═══ -->
+  <section class="slide" data-layout="content" data-notes="Talk through each point">
+    <div class="slide-bg" style="background: #16213e;"></div>
+ 
+    <div style="position:relative; z-index:1; padding:80px; height:100%;
+                display:flex; flex-direction:column; gap:40px;">
+      <h2 class="slide-title" style="font-size:64px; font-weight:700; color:#e0e0e0;">
+        Key Points
+      </h2>
+      <ul class="slide-bullets" style="display:flex; flex-direction:column; gap:24px;">
+        <li style="font-size:32px; color:#c0c0d8; display:flex; align-items:center; gap:16px;">
+          <span style="color:#6c63ff; font-size:24px;">▶</span> First important point
+        </li>
+        <li style="font-size:32px; color:#c0c0d8; display:flex; align-items:center; gap:16px;">
+          <span style="color:#6c63ff; font-size:24px;">▶</span> Second important point
+        </li>
+        <li style="font-size:32px; color:#c0c0d8; display:flex; align-items:center; gap:16px;">
+          <span style="color:#6c63ff; font-size:24px;">▶</span> Third important point
+        </li>
+      </ul>
+    </div>
+  </section>
+ 
+  <!-- ═══ SLIDE 3 — Chart ═══ -->
+  <section class="slide" data-layout="content" data-notes="Explain the data trend">
+    <div class="slide-bg" style="background: #16213e;"></div>
+ 
+    <div style="position:relative; z-index:1; padding:80px; height:100%;
+                display:flex; flex-direction:column; gap:40px;">
+      <h2 class="slide-title" style="font-size:64px; font-weight:700; color:#e0e0e0;">
+        Data Overview
+      </h2>
+      <figure class="slide-chart" data-type="bar"
+              style="flex:1; background:rgba(255,255,255,0.05);
+                     border-radius:16px; padding:24px;">
+        <canvas id="chart-0"></canvas>
+        <script type="application/json">
+          {
+            "labels": ["Q1", "Q2", "Q3", "Q4"],
+            "datasets": [
+              {
+                "label": "Revenue ($k)",
+                "data": [42, 68, 55, 89],
+                "backgroundColor": ["#6c63ff","#6c63ff","#6c63ff","#6c63ff"]
+              }
+            ]
+          }
+        </script>
+      </figure>
+    </div>
+  </section>
+ 
+  <!-- ═══ SLIDE 4 — Two column (text + image) ═══ -->
+  <section class="slide" data-layout="two-column" data-notes="">
+    <div class="slide-bg" style="background: #1a1a2e;"></div>
+ 
+    <div style="position:relative; z-index:1; padding:80px; height:100%;
+                display:grid; grid-template-columns:1fr 1fr; grid-template-rows:auto 1fr;
+                gap:40px;">
+      <h2 class="slide-title" style="font-size:60px; font-weight:700; color:#e0e0e0;
+                                      grid-column:1/-1;">
+        Two Column Layout
+      </h2>
+      <ul class="slide-bullets" style="list-style:none; display:flex;
+                                        flex-direction:column; gap:20px; align-self:start;">
+        <li style="font-size:28px; color:#c0c0d8;">• Left column content</li>
+        <li style="font-size:28px; color:#c0c0d8;">• More text here</li>
+        <li style="font-size:28px; color:#c0c0d8;">• And another point</li>
+      </ul>
+      <figure class="slide-image" style="border-radius:16px; overflow:hidden;">
+        <!-- Replace with: <artefact_image id="my_image::0" /> -->
+        <div style="width:100%;height:100%;background:linear-gradient(135deg,#6c63ff,#028090);
+                    display:flex;align-items:center;justify-content:center;
+                    color:#fff;font-size:32px;">Image placeholder</div>
+      </figure>
+    </div>
+  </section>
+ 
+  <!-- ═══ SLIDE 5 — SVG shapes ═══ -->
+  <section class="slide" data-layout="blank" data-notes="">
+    <div class="slide-bg" style="background:#0f3460;"></div>
+    <div class="slide-svg">
+      <svg viewBox="0 0 1920 1080" xmlns="http://www.w3.org/2000/svg" width="1920" height="1080">
+        <rect x="200" y="200" width="500" height="300" rx="24"
+              fill="#6c63ff" opacity="0.85"/>
+        <text x="450" y="370" text-anchor="middle"
+              font-family="Inter,sans-serif" font-size="48" fill="#fff">Box A</text>
+        <line x1="720" y1="350" x2="880" y2="350"
+              stroke="#fff" stroke-width="4" marker-end="url(#arrow)"/>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#fff"/>
+          </marker>
+        </defs>
+        <rect x="900" y="200" width="500" height="300" rx="24"
+              fill="#028090" opacity="0.85"/>
+        <text x="1150" y="370" text-anchor="middle"
+              font-family="Inter,sans-serif" font-size="48" fill="#fff">Box B</text>
+      </svg>
+    </div>
+  </section>
+ 
+</article>
+ 
+<!-- ── Viewer controls ── -->
+<div id="viewer-controls">
+  <button id="btn-prev" title="Previous (←)">&#8592;</button>
+  <span id="slide-counter">1 / 1</span>
+  <button id="btn-next" title="Next (→)">&#8594;</button>
+  <button id="btn-fs"   title="Fullscreen (F)">&#x26F6;</button>
+  <button id="btn-ov"   title="Overview (Esc)">&#8942;</button>
+</div>
+ 
+<!-- ── Overview panel ── -->
+<div id="overview"></div>
+ 
+<!-- ── Chart.js (CDN, loaded async — graceful offline fallback) ── -->
+<script>
+(function() {
+  var s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js';
+  s.onload = initCharts;
+  s.onerror = function() { console.warn('Chart.js offline — charts will not render'); };
+  document.head.appendChild(s);
+})();
+ 
+function initCharts() {
+  document.querySelectorAll('.slide-chart').forEach(function(fig, idx) {
+    var script = fig.querySelector('script[type="application/json"]');
+    if (!script) return;
+    try {
+      var data     = JSON.parse(script.textContent);
+      var chartType = fig.dataset.type || 'bar';
+      var canvas   = fig.querySelector('canvas') || document.createElement('canvas');
+      if (!canvas.parentNode) fig.appendChild(canvas);
+      canvas.style.maxHeight = '100%';
+      new Chart(canvas, {
+        type: chartType,
+        data: data,
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { labels: { color: '#c0c0d8', font: { size: 18 } } }
+          },
+          scales: chartType !== 'pie' && chartType !== 'doughnut' && chartType !== 'radar' ? {
+            x: { ticks: { color: '#a0a0c0', font: { size: 16 } },
+                 grid:  { color: 'rgba(255,255,255,0.08)' } },
+            y: { ticks: { color: '#a0a0c0', font: { size: 16 } },
+                 grid:  { color: 'rgba(255,255,255,0.08)' } }
+          } : {}
+        }
+      });
+    } catch(e) { console.error('Chart init error', e); }
+  });
+}
+ 
+/* ── Slideshow controller ── */
+(function() {
+  var slides  = Array.from(document.querySelectorAll('.slide'));
+  var current = 0;
+ 
+  function show(n) {
+    slides.forEach(function(s, i) { s.classList.toggle('active', i === n); });
+    current = n;
+    document.getElementById('slide-counter').textContent =
+      (n + 1) + ' / ' + slides.length;
+  }
+ 
+  show(0);
+ 
+  document.getElementById('btn-prev').onclick = function() {
+    show((current - 1 + slides.length) % slides.length);
+  };
+  document.getElementById('btn-next').onclick = function() {
+    show((current + 1) % slides.length);
+  };
+  document.getElementById('btn-fs').onclick = function() {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+    else document.exitFullscreen();
+  };
+ 
+  /* Overview */
+  var ov = document.getElementById('overview');
+  document.getElementById('btn-ov').onclick = toggleOverview;
+ 
+  function buildOverview() {
+    ov.innerHTML = '';
+    slides.forEach(function(s, i) {
+      var thumb = document.createElement('div');
+      thumb.className = 'overview-thumb';
+      var clone = s.cloneNode(true);
+      clone.classList.add('active');
+      thumb.appendChild(clone);
+      var num = document.createElement('span');
+      num.className = 'overview-num';
+      num.textContent = i + 1;
+      thumb.appendChild(num);
+      thumb.onclick = function() { show(i); toggleOverview(); };
+      ov.appendChild(thumb);
+    });
+  }
+ 
+  function toggleOverview() {
+    if (ov.classList.toggle('active')) buildOverview();
+  }
+ 
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown')  show((current+1) % slides.length);
+    if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')    show((current-1+slides.length) % slides.length);
+    if (e.key === 'Escape')    { if (ov.classList.contains('active')) toggleOverview(); }
+    if (e.key === 'f' || e.key === 'F') document.getElementById('btn-fs').click();
+  });
+})();
+</script>
+ 
+</body>
+</html>
+</artifact>
+ 
+SEMANTIC CLASSES — used by the PPTX exporter (keep them on the right elements):
+  .slide-title    → main heading      .slide-subtitle → secondary heading
+  .slide-body     → free text block   .slide-bullets  → <ul> of <li> items
+  .slide-image    → <figure> wrapper  .slide-chart    → chart figure (see below)
+  .slide-svg      → SVG shape layer   .slide-bg       → background div
+ 
+CHARTS — declarative JSON inside <script type="application/json">:
+  data-type: bar | column | line | pie | doughnut | area | scatter | radar
+  JSON shape: { "labels": [...], "datasets": [{ "label": "...", "data": [...] }] }
+ 
+SVG SHAPES — embed an <svg viewBox="0 0 1920 1080"> inside .slide-svg for
+  arrows, callouts, connectors, icons, flowchart boxes, etc.
+ 
+ARTEFACT IMAGES — reference images from other artefacts:
+  <figure class="slide-image"><artefact_image id="TITLE::0" /></figure>
+ 
+SLIDES LAYOUTS (data-layout attribute):
+  title | content | two-column | image-full | quote | blank
+ 
+RULES:
+  • Every slide needs a .slide-bg div as the first child for background.
+  • Make it visually stunning — use gradients, bold typography, meaningful colours.
+  • data-notes="..." on each <section> becomes PowerPoint speaker notes.
+  • Charts render via Chart.js in browser; PPTX export uses native chart objects.
+  • Never use external image URLs — use data URIs or <artefact_image> anchors.
+=== END PRESENTATION ARTEFACTS ===
+"""
     def _build_artefact_instructions(self) -> str:
-        """Returns the system-prompt instructions for artifact operations."""
+        """
+        Returns the system-prompt instructions for artifact operations.
+
+        Includes:
+          • LCP interception rules (what the user sees vs what is stored)
+          • Full create / patch / rename / revert syntax
+          • SURGICAL UPDATE POLICY — the core doctrine that drives patch preference
+          • Artefact-image anchor documentation
+        """
         lines = [
             "",
             "=== ARTIFACT SYSTEM ===",
@@ -51,53 +419,91 @@ Rules:
             "Artifacts and markdown code blocks are **completely different** things:",
             "",
             "• Markdown code blocks (```language ```) = temporary display only",
-            "• Artifacts (<artifact> XML tags) = persistent, version-controlled storage managed by the Agent",
+            "• Artifacts (<artifact> XML tags) = persistent, version-controlled storage",
             "",
             "Lollms Communication Protocol (LCP) Rules:",
-            "1. Artifacts are INTERCEPTED. The user only sees a 'Processing' summary while you write them.",
-            "2. Interactive components (widgets/forms) are NOT intercepted. The user sees them as soon as they are complete.",
+            "1. Artifacts are INTERCEPTED. The user only sees a 'Processing' summary while",
+            "   you write them — they never see the raw XML.",
+            "2. Interactive components (widgets/forms) are NOT intercepted; the user sees",
+            "   them rendered as soon as they are complete.",
             "",
-            "❌ **NEVER** wrap XML tags in code blocks — it breaks the system permanently:",
-            "```xml",
-            "<artifact name=\"example.ext\" type=\"type\">",
-            "...",
-            "</artifact>",
-            "```",
+            "❌ NEVER wrap XML tags in code blocks — it breaks the system permanently:",
+            "   ```xml",
+            '   <artifact name="example.ext" type="type">',
+            "   ...",
+            "   </artifact>",
+            "   ```",
             "",
-            "✅ **ALWAYS** output the <artifact> tag **directly** as raw XML in your response.",
-            "Never wrap it inside any markdown code fence.",
+            "✅ ALWAYS output the <artifact> tag **directly** as raw XML in your response.",
+            "   Never wrap it inside any markdown code fence.",
             "",
             "Supported types: " + ", ".join(sorted(list(ArtefactType.ALL))),
             "Always choose the **most accurate type** for the content.",
             "",
             "=== HOW TO USE ARTIFACTS ===",
             "You can create, update, rename, or revert persistent artifacts using XML tags.",
-            "",
-            "You **MUST** always add a short natural explanation in your reply (outside the tag)",
+            "You MUST always add a short natural explanation in your reply (outside the tag)",
             "explaining what you created/changed and why.",
             "Never reply with XML tags only.",
             "",
-            "── Option A: CREATE or REPLACE (full content)",
-            "<artifact name=\"filename.ext\" type=\"appropriate_type\">",
+            "── Option A: CREATE (new artefact, full content)",
+            '<artifact name="filename.ext" type="appropriate_type">',
             "Full content goes here...",
             "</artifact>",
             "",
-            "── Option B: PATCH (targeted updates)",
-            "<artifact name=\"filename.ext\" type=\"appropriate_type\">",
+            "── Option B: SURGICAL PATCH (targeted update — PREFERRED for existing artefacts)",
+            '<artifact name="filename.ext" type="appropriate_type">',
             "<<<<<<< SEARCH",
-            "exact old lines here",
+            "exact old lines here — copy verbatim, including indentation",
             "=======",
-            "new lines here",
+            "new replacement lines here",
             ">>>>>>> REPLACE",
             "</artifact>",
             "",
+            "   Multiple SEARCH/REPLACE blocks are allowed in a single tag.",
+            "   Each block is applied independently in document order.",
+            "",
             "── Option C: RENAME + UPDATE",
-            "<artifact name=\"new_name.ext\" type=\"appropriate_type\" rename=\"old_name.ext\">",
-            "... content or SEARCH/REPLACE blocks ...",
+            '<artifact name="new_name.ext" type="appropriate_type" rename="old_name.ext">',
+            "... full content or SEARCH/REPLACE blocks ...",
             "</artifact>",
             "",
             "── Option D: REVERT",
-            "<artifact name=\"filename.ext\" revert_to=\"v3\" />",
+            '<artifact name="filename.ext" revert_to="v3" />',
+            "",
+            "╔══════════════════════════════════════════════════════════════════╗",
+            "║  SURGICAL UPDATE POLICY — READ BEFORE EVERY ARTEFACT EDIT       ║",
+            "╠══════════════════════════════════════════════════════════════════╣",
+            "║                                                                  ║",
+            "║  When modifying an EXISTING artefact you MUST use SEARCH/REPLACE ║",
+            "║  patches UNLESS the change affects more than 60% of all lines.   ║",
+            "║                                                                  ║",
+            "║  Decision rule (apply in order):                                 ║",
+            "║    1. Count lines that need changing.                            ║",
+            "║    2. If changed_lines / total_lines > 0.60  → full rewrite OK. ║",
+            "║    3. Otherwise                              → patch REQUIRED.   ║",
+            "║                                                                  ║",
+            "║  SEARCH block rules:                                             ║",
+            "║    • Copy the lines CHARACTER-FOR-CHARACTER from the current     ║",
+            "║      artefact content, including all whitespace and indentation. ║",
+            "║    • Include ±2 unchanged context lines around every edit site   ║",
+            "║      to make the match unambiguous.                              ║",
+            "║    • Never add comments, ellipses, or placeholders inside a      ║",
+            "║      SEARCH block — only verbatim content.                       ║",
+            "║    • Each SEARCH block must be unique within the file; if the    ║",
+            "║      same lines appear multiple times, widen the context until   ║",
+            "║      the block is unique.                                        ║",
+            "║                                                                  ║",
+            "║  If a patch is REJECTED (SEARCH did not match):                 ║",
+            "║    • The system will show you the CURRENT file content.          ║",
+            "║    • Widen the SEARCH context by ±3 additional lines and retry. ║",
+            "║    • Do NOT switch to a full rewrite unless told to.             ║",
+            "║                                                                  ║",
+            "║  Verification: after every patch the system reports             ║",
+            "║    '+N added / -M removed lines'. If you see '±0 lines' the     ║",
+            "║    patch was rejected. You will be asked to reissue it.          ║",
+            "║                                                                  ║",
+            "╚══════════════════════════════════════════════════════════════════╝",
             "",
             "=== ARTIFACT IMAGES ===",
             "",
@@ -120,7 +526,7 @@ Rules:
             "  look at the corresponding image slot in the vision input to understand",
             "  what that part of the document looks like.",
             "• You may reference an anchor in your reply to point the user to a specific",
-            "  image, e.g.: 'As shown in <artefact_image id=\"my_doc::2\" />, ...'",
+            '  image, e.g.: \'As shown in <artefact_image id="my_doc::2" />, ...\'',
             "• When patching an artifact that contains image anchors, preserve the",
             "  anchor tags unchanged — do not remove or alter them.",
             "",
@@ -128,7 +534,8 @@ Rules:
             "→ Artifacts = persistent & versioned",
             "→ Markdown code blocks = temporary display only",
             "→ Never nest <artifact> inside ``` blocks",
-            "→ Always choose the correct type",
+            "→ PATCH existing artefacts surgically — full rewrites only when >60% changes",
+            "→ SEARCH blocks must be verbatim copies of the current content",
             "→ Always add a human explanation outside the tag",
             "→ Preserve <artefact_image> anchors when patching image-bearing artifacts",
             "",
@@ -250,7 +657,7 @@ Rules:
         """Instruction for rich interactive form building."""
         return """
 === INTERACTIVE FORMS ===
-If you need structured data or multiple details from the user, use <lollms_form>. 
+If you need structured data or multiple details from the user, use <lollms_form>.
 The UI will render a rich component and PAUSE your generation until the user submits.
 
 XML Structure:
@@ -261,21 +668,21 @@ XML Structure:
 </lollms_form>
 
 Field Types & Attributes:
-- text: <field name="id" label="Name" type="text" placeholder="Hint" />
+- text:     <field name="id" label="Name" type="text" placeholder="Hint" />
 - textarea: <field name="id" label="Description" type="textarea" />
-- select: (Use BOTH nested <option> tags AND a comma-separated 'options' attribute for maximum compatibility)
+- select:   (Use BOTH nested <option> tags AND a comma-separated 'options' attribute)
     <field name="id" label="Choose" type="select" options="Choice 1, Choice 2">
       <option>Choice 1</option>
       <option>Choice 2</option>
     </field>
-- radio: (MUST use child <option> tags. FORBIDDEN to use 'options' attribute)
+- radio:    (MUST use child <option> tags — FORBIDDEN to use 'options' attribute)
     <field name="id" label="Pick one" type="radio">
       <option>Option A</option>
       <option>Option B</option>
     </field>
 - checkbox: <field name="id" label="Enable" type="checkbox" default="true" />
-- range: <field name="id" label="Value" type="range" min="0" max="100" />
-- rating: <field name="id" label="Rate" type="rating" max="5" />
+- range:    <field name="id" label="Value" type="range" min="0" max="100" />
+- rating:   <field name="id" label="Rate" type="rating" max="5" />
 
 EXAMPLE OF CORRECT FORM:
 <lollms_form title="User Survey" description="Please fill this out" submit_label="Submit">
@@ -567,6 +974,13 @@ EXAMPLE OF CORRECT FORM:
         cleaned = cleaned.strip()
 
         # ── 8. Silent-artifact guard ──────────────────────────────────────────
+        # Generates a human-readable summary when the LLM reply was entirely
+        # consumed by artifact/note/skill/form tags and nothing visible remains.
+        #
+        # FIX: the original code referenced an undefined `meta_now2` variable
+        # when summarising forms.  We now iterate affected_artefacts directly
+        # and detect form artefacts by type, matching the same pattern used for
+        # notes and skills above.
         if enable_silent_artefact_explanation and not cleaned:
             summary_parts: List[str] = []
 
@@ -575,23 +989,23 @@ EXAMPLE OF CORRECT FORM:
                 if a.get('type') not in (ArtefactType.NOTE, ArtefactType.SKILL)
             ]
             for art in non_note_non_skill:
-                atype    = art.get('type', 'artifact')
-                title    = art.get('title', 'untitled')
-                lang     = art.get('language', '')
-                version  = art.get('version', 1)
-                desc     = art.get('description', '')
+                atype     = art.get('type', 'artifact')
+                title     = art.get('title', 'untitled')
+                lang      = art.get('language', '')
+                version   = art.get('version', 1)
+                desc      = art.get('description', '')
                 img_count = len(art.get('images') or [])
-                lang_str = f" ({lang})" if lang else ""
-                ver_str  = f" — version {version}" if version > 1 else ""
-                desc_str = f": {desc}" if desc else ""
-                img_str  = f" · {img_count} image(s)" if img_count else ""
+                lang_str  = f" ({lang})"       if lang           else ""
+                ver_str   = f" — version {version}" if version > 1 else ""
+                desc_str  = f": {desc}"         if desc           else ""
+                img_str   = f" · {img_count} image(s)" if img_count else ""
                 summary_parts.append(
                     f"📄 Created **{title}**{lang_str} [{atype}{ver_str}]{desc_str}{img_str}."
                 )
 
             notes = [a for a in affected_artefacts if a.get('type') == ArtefactType.NOTE]
             for note in notes:
-                title = note.get('title', 'untitled')
+                title      = note.get('title', 'untitled')
                 first_line = next(
                     (l.strip() for l in note.get('content', '').splitlines() if l.strip()),
                     ''
@@ -605,24 +1019,35 @@ EXAMPLE OF CORRECT FORM:
                 category = skill.get('category', '')
                 desc     = skill.get('description', '')
                 cat_str  = f" [{category}]" if category else ""
-                desc_str = f" — {desc}" if desc else ""
+                desc_str = f" — {desc}"     if desc     else ""
                 summary_parts.append(f"🎓 Skill saved **{title}**{cat_str}{desc_str}.")
 
-            # Widgets are now inline tags only - check content for widget anchors
+            # Widget anchors embedded in the (now empty) cleaned text won't be
+            # present, but we can count them from the original masked_text.
             widget_count = len(re.findall(
                 r'<lollms_widget\s+id=["\'][^"\']+["\']\s*/?>',
-                cleaned
+                masked_text,
             ))
             for _ in range(widget_count):
                 summary_parts.append(
                     "🎛️ Interactive widget ready — use the controls below to explore the concept."
                 )
 
-            for form_ref in meta_now2.get("forms", []):
-                f_title = form_ref.get('title', 'Form')
-                summary_parts.append(
-                    f"📋 Form ready: **{f_title}** — please fill in the fields above."
-                )
+            # Forms: detected by the has_form flag; we summarise based on the
+            # lollms_form tags present in the original masked text rather than
+            # relying on an artefact store entry (forms are not stored as
+            # artefacts — they are rendered inline).
+            if has_form:
+                for fm in re.finditer(
+                    r'<lollms_form\s+([^>]*)>',
+                    masked_text,
+                    re.IGNORECASE,
+                ):
+                    f_attrs  = _parse_attrs(fm.group(1))
+                    f_title  = f_attrs.get('title', 'Form')
+                    summary_parts.append(
+                        f"📋 Form ready: **{f_title}** — please fill in the fields above."
+                    )
 
             if summary_parts:
                 cleaned = "\n".join(summary_parts)

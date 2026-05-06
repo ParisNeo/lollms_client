@@ -66,6 +66,25 @@ _MAX_BRACKET_BUF = 4096
 # ---------------------------------------------------------------------------
 # All tag prefixes that must NEVER leak to the chat bubble
 # ---------------------------------------------------------------------------
+
+# At module level — add alongside other constants
+_MAX_PATCH_RETRIES = 3
+
+_PATCH_RETRY_PROMPT_TEMPLATE = """\
+Your previous SEARCH/REPLACE patch for artefact '{title}' was REJECTED because \
+the SEARCH block did not match any text in the current content.
+
+Current content of '{title}' (use this verbatim for your SEARCH blocks):
+
+{current_content}
+
+Reissue the patch now. Rules:
+  • Copy SEARCH lines CHARACTER-FOR-CHARACTER from the content above.
+  • Widen context by ±3 surrounding lines if needed.
+  • Do NOT change anything outside the intended edit.
+  • Do NOT rewrite the full file unless the change affects >60% of lines.
+"""
+
 _TAG_STARTS = [
     "<tool_call>",
     "<think>", "<think ",
@@ -301,6 +320,33 @@ Please re-read the available tools and call the most appropriate one now.
 Do not explain why you didn't call it — just call it.
 """
 
+_SURGICAL_UPDATE_GUIDANCE = """\
+
+╔══════════════════════════════════════════════════════════════════╗
+║  ARTEFACT UPDATE POLICY — SURGICAL EDITS PREFERRED               ║
+╠══════════════════════════════════════════════════════════════════╣
+║  When modifying an EXISTING artefact, you MUST use SEARCH/REPLACE║
+║  patch blocks unless the change affects >60% of the content.     ║
+║                                                                  ║
+║  PATCH FORMAT (Aider-style — copy exactly):                      ║
+║    <artifact name="filename.ext" type="code" language="python">  ║
+║    <<<<<<< SEARCH                                                 ║
+║    exact lines to find (verbatim, incl. indentation)             ║
+║    =======                                                        ║
+║    replacement lines                                             ║
+║    >>>>>>> REPLACE                                                ║
+║    </artifact>                                                   ║
+║                                                                  ║
+║  Rules:                                                          ║
+║    • SEARCH block must match the current artefact EXACTLY.       ║
+║    • Multiple SEARCH/REPLACE blocks allowed in one tag.          ║
+║    • Only rewrite the full content when creating NEW artefacts   ║
+║      or when >60% of lines change.                               ║
+║    • Never add commentary inside SEARCH/REPLACE blocks.          ║
+║    • If a previous patch was REJECTED, widen the SEARCH context  ║
+║      by ±3 lines and try again.                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
 
 def _build_tool_system_prompt(
     base_system_prompt: str,
@@ -322,8 +368,15 @@ def _build_tool_system_prompt(
         flags=re.DOTALL,
     )[0].rstrip()
 
+    # Strip any previous surgical-update guidance so we don't duplicate it
+    cleaned = re.split(
+        r'\n*╔══+╗.*?ARTEFACT UPDATE POLICY.*?╚══+╝',
+        cleaned,
+        flags=re.DOTALL,
+    )[0].rstrip()
+
     tool_block = _TOOL_CALL_HEADER + "\n".join(tool_descriptions)
-    return cleaned + "\n\n" + tool_block
+    return cleaned + _SURGICAL_UPDATE_GUIDANCE + "\n\n" + tool_block
 
 
 # ---------------------------------------------------------------------------
@@ -973,22 +1026,83 @@ class _StreamState:
     # ---------------------------------------------------------------- Secondary event helpers
 
     def _fire_secondary_chunk(self, content: str):
-        """Buffer arriving content; emit legacy chunk events for backward compat."""
+        """
+        Buffer arriving secondary content and emit legacy chunk events.
+ 
+        Status messages are emitted at meaningful SIZE MILESTONES rather than
+        on every 500-char tick, and vary by content type so the UI feels alive
+        instead of spamming identical lines.
+        """
         if not self.sec_chunk_mt or not content:
             return
-            
-        # [NEW] For Artefacts/Notes/Skills, provide a silent 'writing' update to processing 
-        # if the buffer gets significantly larger, to keep the UI spinning.
-        if len("".join(self.sec_content)) % 500 == 0: # Every ~500 chars
-             self._emit_processing_status("Writing content data...")
+ 
         attrs  = self.sec_open_attrs
         prefix = self.sec_prefix
-
-        # Widgets and forms: buffer silently, no chunk events
+ 
+        # Widgets and forms: buffer silently — no chunk events, no status spam
         if prefix in ("<lollms_inline", "<lollms_form"):
             return
-
-        # Artefacts, notes, skills: fire legacy chunk events
+ 
+        # ── Milestone status messages ──────────────────────────────────────────
+        # Emitted once per size bracket, not on every chunk, so the console log
+        # stays informative without drowning in identical lines.
+        total_so_far = len("".join(self.sec_content))
+ 
+        # Per-type flavour tables  {milestone_chars: message}
+        _ARTEFACT_MILESTONES = {
+            500:   "✏️  Sketching the structure…",
+            1500:  "🔨  Hammering out the details…",
+            3000:  "🚀  Really getting into it now…",
+            6000:  "📖  This one's going to be thorough…",
+            10000: "🏗️  Building something substantial…",
+            20000: "🌊  Deep in the zone…",
+            40000: "🗺️  Still exploring — lots of ground to cover…",
+        }
+        _PRESENTATION_MILESTONES = {
+            500:   "🎨  Designing the first slide…",
+            2000:  "✨  Adding some visual flair…",
+            5000:  "📊  Charting new territory…",
+            10000: "🖼️  Painting the bigger picture…",
+            20000: "🎭  Crafting the grand finale…",
+        }
+        _NOTE_MILESTONES = {
+            300:  "📝  Capturing your thoughts…",
+            1000: "📚  This note is getting meaty…",
+            3000: "🗒️  Writing a proper essay here…",
+        }
+        _SKILL_MILESTONES = {
+            300:  "🧠  Encoding the knowledge…",
+            1000: "⚙️  Refining the methodology…",
+            3000: "🎓  Building a comprehensive reference…",
+        }
+ 
+        # Pick the right milestone table
+        if prefix in ("<artifact", "<artefact"):
+            art_type = attrs.get('type', 'document')
+            milestones = (
+                _PRESENTATION_MILESTONES if art_type == "presentation"
+                else _ARTEFACT_MILESTONES
+            )
+        elif prefix == "<note":
+            milestones = _NOTE_MILESTONES
+        elif prefix == "<skill":
+            milestones = _SKILL_MILESTONES
+        else:
+            milestones = _ARTEFACT_MILESTONES
+ 
+        # Emit the message for the highest crossed milestone that hasn't fired yet
+        # We track fired milestones via a lightweight set on self.
+        if not hasattr(self, '_fired_milestones'):
+            self._fired_milestones = set()
+ 
+        for threshold, message in sorted(milestones.items()):
+            key = f"{prefix}:{threshold}"
+            if total_so_far >= threshold and key not in self._fired_milestones:
+                self._fired_milestones.add(key)
+                self._emit_processing_status(message)
+                break  # only one message per chunk to avoid bursts
+ 
+        # ── Legacy chunk events for artefacts, notes, skills ──────────────────
         if prefix in ("<artifact", "<artefact"):
             _cb(self.callback, content, self.sec_chunk_mt, {
                 "title":    attrs.get('name') or attrs.get('title', ''),
@@ -1008,6 +1122,7 @@ class _StreamState:
                 "category":    attrs.get('category', ''),
                 "description": attrs.get('description', ''),
             })
+ 
 
     def _fire_secondary_done(self):
         """Process completed secondary content; emit processing status + close.
@@ -1015,6 +1130,15 @@ class _StreamState:
         For widgets and forms, the final bulk content (HTML / form tag) is passed
         to _emit_processing_close() which stores it in self.pending_final_content.
         _feed_secondary() will flush it after state reset — see class docstring.
+
+        Artefact patch verification
+        ---------------------------
+        When is_patch=True, apply_aider_patch() is called and the result is
+        compared to the pre-patch content.  If the content is unchanged (patch
+        failed to match), a correction prompt is injected into the discussion's
+        temporary message chain and the LLM is asked to reissue the patch.  This
+        retry loop runs up to _MAX_PATCH_RETRIES times before giving up and
+        falling back to a full-content overwrite.
         """
         if not self.sec_done_mt:
             return
@@ -1032,7 +1156,7 @@ class _StreamState:
                 "version": art.get("version"), "art_type": art.get("type")
             }), MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefact": art, "is_new": is_new})
 
-        # ── Artefacts (LCP Intercepted) ──────────────────────────────────
+        # ── Artefacts ────────────────────────────────────────────────────────
         if prefix in ("<artifact", "<artefact"):
             tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
             new_name  = attrs.pop('rename', None)
@@ -1051,34 +1175,149 @@ class _StreamState:
             self._emit_processing_status(
                 f"{'Creating new' if is_new else 'Updating'} artefact '{resolved_title}'"
             )
-            if is_patch:
-                self._emit_processing_status("Applying patch with SEARCH/REPLACE blocks")
-            self._emit_processing_status(
-                f"Finalizing artefact (type: {atype}, language: {lang or 'none'})"
-            )
 
             result_art = None
-            if is_patch:
+
+            if is_patch and not is_new:
+                # ── Surgical patch path with verification + retry ──────────────
                 existing = self.discussion.artefacts.get(resolved_title)
-                if existing:
-                    try:
-                        patched = self.discussion.artefacts.apply_aider_patch(
-                            existing.get('content', ''), full_content)
-                        result_art = self.discussion.artefacts.update(
-                            resolved_title, new_content=patched, new_title=new_name,
-                            language=lang, active=self.auto_activate, **attrs)
-                    except ValueError:
-                        result_art = existing
-                else:
+                if existing is None:
+                    # Artefact disappeared between stream start and close — fall back
+                    self._emit_processing_status(
+                        f"WARNING: '{resolved_title}' not found for patch; creating new"
+                    )
                     result_art = self.discussion.artefacts.add(
                         resolved_title, atype, full_content,
                         language=lang, active=self.auto_activate, **attrs)
+                else:
+                    patch_content  = full_content
+                    original_text  = existing.get('content', '')
+                    patch_accepted = False
+
+                    for attempt in range(1, _MAX_PATCH_RETRIES + 1):
+                        self._emit_processing_status(
+                            f"Applying patch (attempt {attempt}/{_MAX_PATCH_RETRIES})…"
+                        )
+                        try:
+                            patched = self.discussion.artefacts.apply_aider_patch(
+                                original_text, patch_content
+                            )
+                        except ValueError as exc:
+                            patched = original_text  # treat exception as failed match
+                            self._emit_processing_status(
+                                f"Patch parser error: {str(exc)[:120]}"
+                            )
+
+                        if patched != original_text:
+                            # ── Patch succeeded ───────────────────────────────
+                            old_lines = original_text.splitlines()
+                            new_lines = patched.splitlines()
+                            added   = sum(1 for l in new_lines if l not in old_lines)
+                            removed = sum(1 for l in old_lines if l not in new_lines)
+                            self._emit_processing_status(
+                                f"Patch accepted — +{added} / -{removed} lines"
+                            )
+                            result_art = self.discussion.artefacts.update(
+                                resolved_title,
+                                new_content=patched,
+                                new_title=new_name,
+                                language=lang,
+                                active=self.auto_activate,
+                                **attrs,
+                            )
+                            patch_accepted = True
+                            break
+                        else:
+                            # ── Patch failed — request correction ─────────────
+                            self._emit_processing_status(
+                                f"Patch REJECTED (attempt {attempt}): "
+                                "SEARCH block did not match current content"
+                            )
+                            if attempt < _MAX_PATCH_RETRIES:
+                                # Inject a correction prompt as a temporary system
+                                # turn so the next LLM call sees the real content
+                                correction_prompt = _PATCH_RETRY_PROMPT_TEMPLATE.format(
+                                    title=resolved_title,
+                                    current_content=original_text,
+                                )
+                                # We synthesise a fresh patch by asking the model
+                                # directly via generate_text (non-streaming, low temp)
+                                self._emit_processing_status(
+                                    f"Requesting corrected patch from model…"
+                                )
+                                try:
+                                    retry_raw = self.discussion.lollmsClient.generate_text(
+                                        correction_prompt,
+                                        n_predict=min(2048, len(original_text) + 512),
+                                        temperature=0.1,
+                                    )
+                                    # Extract the artifact tag from the retry response
+                                    art_match = re.search(
+                                        r'<art[ei]fact[^>]*>(.*?)</art[ei]fact>',
+                                        retry_raw, re.DOTALL | re.IGNORECASE
+                                    )
+                                    if art_match:
+                                        patch_content = art_match.group(1)
+                                        self._emit_processing_status(
+                                            "Corrected patch received — retrying…"
+                                        )
+                                    else:
+                                        self._emit_processing_status(
+                                            "Model did not return a valid patch tag — aborting retry"
+                                        )
+                                        break
+                                except Exception as retry_exc:
+                                    self._emit_processing_status(
+                                        f"Retry generation failed: {str(retry_exc)[:80]}"
+                                    )
+                                    break
+
+                    if not patch_accepted:
+                        # ── All retries exhausted — fall back to full overwrite ─
+                        self._emit_processing_status(
+                            f"All {_MAX_PATCH_RETRIES} patch attempts failed. "
+                            "Falling back to full content overwrite."
+                        )
+                        # Use the last successfully generated patch_content if it
+                        # looked like a full rewrite (no SEARCH markers), otherwise
+                        # keep original to avoid data loss.
+                        has_search = bool(re.search(r'<{6,8}\s*SEARCH', patch_content, re.I))
+                        fallback_content = original_text if has_search else patch_content
+                        result_art = self.discussion.artefacts.update(
+                            resolved_title,
+                            new_content=fallback_content,
+                            new_title=new_name,
+                            language=lang,
+                            active=self.auto_activate,
+                            **attrs,
+                        )
+                        if result_art:
+                            self._emit_processing_status(
+                                "Fallback applied — "
+                                f"{'content preserved (patch markers detected)' if has_search else 'full rewrite applied'}"
+                            )
+
+            elif is_patch and is_new:
+                # Patch requested for non-existent artefact — create fresh
+                self._emit_processing_status(
+                    f"NOTE: Patch requested for new artefact '{resolved_title}'; "
+                    "creating with raw content"
+                )
+                result_art = self.discussion.artefacts.add(
+                    resolved_title, atype, full_content,
+                    language=lang, active=self.auto_activate, **attrs)
+
             else:
+                # ── Full content path ─────────────────────────────────────────
                 if is_new:
                     result_art = self.discussion.artefacts.add(
                         resolved_title, atype, full_content.strip(),
                         language=lang, active=self.auto_activate, **attrs)
                 else:
+                    self._emit_processing_status(
+                        f"Full rewrite of '{resolved_title}' "
+                        f"({len(full_content.splitlines())} lines)"
+                    )
                     result_art = self.discussion.artefacts.update(
                         resolved_title, new_content=full_content.strip(),
                         new_title=new_name, new_type=atype,
@@ -1091,7 +1330,7 @@ class _StreamState:
                     f"Artefact saved as version {result_art.get('version', '?')}"
                 )
 
-            # LCP Compliance: Artefacts are intercepted. We close processing WITHOUT sending raw content.
+            # LCP Compliance: close processing without forwarding raw content
             self._emit_processing_close()
 
             # Legacy event
@@ -1101,7 +1340,7 @@ class _StreamState:
                 "is_patch": is_patch, "attrs": attrs,
             })
 
-        # ── Notes (LCP Intercepted) ──────────────────────────────────────
+        # ── Notes ────────────────────────────────────────────────────────────
         elif prefix == "<note":
             title = attrs.get('title') or attrs.get('name', f'note_{uuid.uuid4().hex[:8]}')
 
@@ -1114,14 +1353,12 @@ class _StreamState:
             _fire_state_change(art, True)
 
             self._emit_processing_status("Note saved successfully")
-            # LCP Compliance: Close processing, raw content is kept in the artefact store only.
             self._emit_processing_close()
 
-            # Legacy event
             _cb(self.callback, full_content, self.sec_done_mt,
                 {"title": title, "content": full_content})
 
-        # ── Skills ───────────────────────────────────────────────────────
+        # ── Skills ───────────────────────────────────────────────────────────
         elif prefix == "<skill":
             title = attrs.get('title') or attrs.get('name', f'skill_{uuid.uuid4().hex[:8]}')
             desc  = attrs.get('description', '')
@@ -1141,11 +1378,10 @@ class _StreamState:
             self._emit_processing_status("Skill saved successfully")
             self._emit_processing_close()
 
-            # Legacy event
             _cb(self.callback, full_content, self.sec_done_mt,
                 {"title": title, "content": full_content, "category": cat, "description": desc})
 
-        # ── Inline widgets ───────────────────────────────────────────────
+        # ── Inline widgets ───────────────────────────────────────────────────
         elif prefix == "<lollms_inline":
             title       = attrs.get('title') or attrs.get('name', f'widget_{uuid.uuid4().hex[:8]}')
             widget_type = attrs.get('type', 'html')
@@ -1156,27 +1392,22 @@ class _StreamState:
             validated = _validate_widget_content(full_content, title)
             if validated is None:
                 self._emit_processing_status("Validation failed — widget discarded")
-                self._emit_processing_close()  # no final_content → nothing pending
+                self._emit_processing_close()
                 _cb(self.callback, "", self.sec_done_mt, {
                     "title": title, "content": "", "widget_type": widget_type,
                     "error": "Validation failed",
                 })
             else:
                 self._emit_processing_status("Validation passed")
-                
-                # [FIX] Wrap the validated content in the identification tag 
-                # so the frontend renderer detects it as an interactive block.
-                # Added newlines for proper markdown separation.
-                wrapped_widget = f'\n\n<lollms_inline title="{title}" type="{widget_type}">\n{validated}\n</lollms_inline>\n\n'
-                
-                # Store wrapped HTML as pending — flushed after state reset
+                wrapped_widget = (
+                    f'\n\n<lollms_inline title="{title}" type="{widget_type}">\n'
+                    f'{validated}\n</lollms_inline>\n\n'
+                )
                 self._emit_processing_close(wrapped_widget)
-                
-                # Legacy event (keep raw for backward compatibility)
                 _cb(self.callback, validated, self.sec_done_mt,
                     {"title": title, "content": validated, "widget_type": widget_type})
 
-        # ── Forms ────────────────────────────────────────────────────────
+        # ── Forms ────────────────────────────────────────────────────────────
         elif prefix == "<lollms_form":
             title = attrs.get('title') or attrs.get('name', f'form_{uuid.uuid4().hex[:8]}')
 
@@ -1192,7 +1423,6 @@ class _StreamState:
                 n = len(form_descriptor['fields'])
                 self._emit_processing_status(f"Found {n} field(s)")
 
-                # Reconstruct clean form tag from parsed descriptor
                 form_attrs_parts = []
                 if title:
                     form_attrs_parts.append(f'title="{title}"')
@@ -1220,19 +1450,16 @@ class _StreamState:
                 )
 
                 self._emit_processing_status("Form ready")
-                # Store form tag as pending — flushed after state reset
                 self._emit_processing_close(full_form_tag)
-                # Legacy event
                 _cb(self.callback, full_content, self.sec_done_mt, {
                     "title": title, "content": full_content, "form": form_descriptor,
                 })
             else:
                 self._emit_processing_status("Form parsing failed")
-                self._emit_processing_close()  # no final_content
+                self._emit_processing_close()
                 _cb(self.callback, "", self.sec_done_mt, {
                     "title": title, "content": "", "error": "Form parsing failed",
                 })
-
     # ---------------------------------------------------------------- accessors
 
     def get_accumulated_stream(self) -> str:
@@ -1781,6 +2008,7 @@ class ChatMixin:
         enable_skills:                bool = False,
         enable_forms:                 bool = True,
         enable_books:                 bool = False,
+        enable_presentations:         bool = False,
         enable_silent_artefact_explanation: bool = True,
         memory_manager=None,
         **kwargs
@@ -1858,7 +2086,9 @@ class ChatMixin:
             extra_instructions += self._build_form_instructions()
         if enable_books:
             extra_instructions += self._build_book_instructions()
-
+        if enable_presentations:
+            extra_instructions += self._build_presentation_instructions()
+            
         branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
         handle_instructions = _build_handle_instructions(branch_msgs_now)
         if handle_instructions:
