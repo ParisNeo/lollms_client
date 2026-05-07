@@ -400,6 +400,7 @@ RULES:
   • Never use external image URLs — use data URIs or <artefact_image> anchors.
 === END PRESENTATION ARTEFACTS ===
 """
+
     def _build_artefact_instructions(self) -> str:
         """
         Returns the system-prompt instructions for artifact operations.
@@ -471,7 +472,7 @@ RULES:
             "── Option D: REVERT",
             '<artifact name="filename.ext" revert_to="v3" />',
             "",
-            "╔══════════════════════════════════════════════════════════════════╗",
+"╔══════════════════════════════════════════════════════════════════╗",
             "║  SURGICAL UPDATE POLICY — READ BEFORE EVERY ARTEFACT EDIT       ║",
             "╠══════════════════════════════════════════════════════════════════╣",
             "║                                                                  ║",
@@ -483,16 +484,29 @@ RULES:
             "║    2. If changed_lines / total_lines > 0.60  → full rewrite OK. ║",
             "║    3. Otherwise                              → patch REQUIRED.   ║",
             "║                                                                  ║",
-            "║  SEARCH block rules:                                             ║",
-            "║    • Copy the lines CHARACTER-FOR-CHARACTER from the current     ║",
-            "║      artefact content, including all whitespace and indentation. ║",
+            "║  SEARCH block rules — HIGHEST PRIORITY:                         ║",
+            "║    • Copy lines VERBATIM from the artefact, including ALL        ║",
+            "║      leading spaces and indentation.                             ║",
+            "║      Example — if the file has:                                  ║",
+            "║        '        let audioCtx = null;'   (8 leading spaces)      ║",
+            "║      your SEARCH block MUST have those exact 8 leading spaces.  ║",
+            "║      Stripping indentation is the #1 cause of patch failures.   ║",
             "║    • Include ±2 unchanged context lines around every edit site   ║",
             "║      to make the match unambiguous.                              ║",
-            "║    • Never add comments, ellipses, or placeholders inside a      ║",
-            "║      SEARCH block — only verbatim content.                       ║",
+            "║    • NEVER add, remove, or alter inline comments inside a        ║",
+            "║      SEARCH block — copy them exactly as-is.                    ║",
+            "║    • NEVER add ellipses (...) or placeholder comments like       ║",
+            "║      '// ... rest unchanged' inside a SEARCH block.             ║",
+            "║    • NEVER collapse or add blank lines inside a SEARCH block.   ║",
             "║    • Each SEARCH block must be unique within the file; if the    ║",
             "║      same lines appear multiple times, widen the context until   ║",
             "║      the block is unique.                                        ║",
+            "║                                                                  ║",
+            "║  REPLACE block rules:                                            ║",
+            "║    • Indentation in the REPLACE block is applied relative to     ║",
+            "║      the indentation of the matched SEARCH block.               ║",
+            "║    • You may write the REPLACE block at column 0 — the system   ║",
+            "║      will re-indent it to match the file automatically.         ║",
             "║                                                                  ║",
             "║  If a patch is REJECTED (SEARCH did not match):                 ║",
             "║    • The system will show you the CURRENT file content.          ║",

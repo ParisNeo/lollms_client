@@ -1569,81 +1569,91 @@ class _StreamState:
         self.proc_has_opened = False
 
     # ---------------------------------------------------------------- Secondary event helpers
-
     def _fire_secondary_chunk(self, content: str):
         """
-        Buffer arriving secondary content and emit legacy chunk events.
- 
-        Status messages are emitted at meaningful SIZE MILESTONES rather than
-        on every 500-char tick, and vary by content type so the UI feels alive
-        instead of spamming identical lines.
+        Buffer arriving secondary content and emit progress status messages.
+
+        Strategy
+        --------
+        • Widgets / forms  : silent — no chunk events, no status spam.
+        • Artefacts / notes: scan the accumulated buffer for NEW structural
+          features (Markdown headers, class definitions, function definitions)
+          and fire ONE status message per chunk at most — for the *first* new
+          feature found in document order.  Falls back to size milestones only
+          when no new structural feature exists in this chunk.
+
+        Milestone tracking (`_fired_milestones`) is stored on the instance so
+        it persists across chunks of the same stream, but is reset at the start
+        of each new secondary tag (see _reset_secondary_state).
         """
         if not self.sec_chunk_mt or not content:
             return
- 
+
         attrs  = self.sec_open_attrs
         prefix = self.sec_prefix
- 
-        # Widgets and forms: buffer silently — no chunk events, no status spam
+
+        # Widgets and forms: buffer silently
         if prefix in ("<lollms_inline", "<lollms_form"):
             return
- 
-        # ── Dynamic Status Updates ──────────────────────────────────────────
-        # Instead of static milestones, we scan for structural features
-        # (Markdown headers, Code classes/functions) to report actual progress.
 
-        full_buffer = "".join(self.sec_content)
-        total_len = len(full_buffer)
-
+        # Lazy-init milestone tracker (also reset by _reset_secondary_state)
         if not hasattr(self, '_fired_milestones'):
             self._fired_milestones = set()
 
-        # 1. Structural Feature Detection
-        # We scan for ALL features and fire for the first NEW one found in this chunk.
+        full_buffer = "".join(self.sec_content)
+        total_len   = len(full_buffer)
 
-        # Markdown Header Detection
-        all_headers = re.findall(r'^(#{1,4})\s+(.+)$', full_buffer, re.MULTILINE)
-        for _, h_name in reversed(all_headers):
-            h_key = f"feat:hdr:{h_name}"
-            if h_key not in self._fired_milestones:
-                self._fired_milestones.add(h_key)
-                self._emit_processing_status(f"📖 Section: {h_name}")
-                return # Stop here to avoid multiple status messages in one chunk
+        # ── 1. Structural feature detection ──────────────────────────────────
+        # Scan the full buffer for all known features, fire for the FIRST one
+        # (in document order) that has not been reported yet.  One status
+        # message per chunk — we return immediately after firing.
 
-        # Classes Detection
-        all_classes = re.findall(r'class\s+([a-zA-Z0-9_]+)', full_buffer)
-        for c_name in reversed(all_classes):
-            c_key = f"feat:cls:{c_name}"
-            if c_key not in self._fired_milestones:
-                self._fired_milestones.add(c_key)
-                self._emit_processing_status(f"🏗️ Class: {c_name}")
-                return
-
-        # Functions Detection
-        all_funcs = re.findall(r'(?:def|function)\s+([a-zA-Z0-9_]+)\s*\(', full_buffer)
-        for f_name in reversed(all_funcs):
-            f_key = f"feat:fn:{f_name}"
-            if f_key not in self._fired_milestones:
-                self._fired_milestones.add(f_key)
-                self._emit_processing_status(f"⚙️ Implementing: {f_name}()")
-                return
-
-        # 2. Fallback to Flavour Milestones
-        # We only reach here if no NEW structural feature was found in this chunk.
-        _MILESTONES = {
-            1000:  "🔨 Refining content...",
-            5000:  "🚀 Adding depth...",
-            15000: "🏗️ Building substantial block...",
-            40000: "🌊 Working on a massive document...",
-        }
-        for threshold, message in sorted(_MILESTONES.items()):
-            m_key = f"ms:{threshold}"
-            if total_len >= threshold and m_key not in self._fired_milestones:
-                self._fired_milestones.add(m_key)
-                self._emit_processing_status(message)
+        # Markdown headers
+        for m in re.finditer(r'^(#{1,4})\s+(.+)$', full_buffer, re.MULTILINE):
+            key = f"feat:hdr:{m.group(2).strip()}"
+            if key not in self._fired_milestones:
+                self._fired_milestones.add(key)
+                self._emit_processing_status(f"📖 Section: {m.group(2).strip()}")
+                # Still fall through to emit the legacy chunk event below
                 break
- 
-        # ── Legacy chunk events for artefacts, notes, skills ──────────────────
+
+        else:
+            # Classes (only if no header was newly found above)
+            for m in re.finditer(r'class\s+([a-zA-Z0-9_]+)', full_buffer):
+                key = f"feat:cls:{m.group(1)}"
+                if key not in self._fired_milestones:
+                    self._fired_milestones.add(key)
+                    self._emit_processing_status(f"🏗️ Class: {m.group(1)}")
+                    break
+            else:
+                # Functions
+                for m in re.finditer(
+                    r'(?:def|function)\s+([a-zA-Z0-9_]+)\s*\(', full_buffer
+                ):
+                    key = f"feat:fn:{m.group(1)}"
+                    if key not in self._fired_milestones:
+                        self._fired_milestones.add(key)
+                        self._emit_processing_status(
+                            f"⚙️ Implementing: {m.group(1)}()"
+                        )
+                        break
+                else:
+                    # ── 2. Fallback size milestones ───────────────────────────
+                    # Only reached when no new structural feature exists at all.
+                    _MILESTONES = (
+                        (1_000,  "🔨 Refining content…"),
+                        (5_000,  "🚀 Adding depth…"),
+                        (15_000, "🏗️ Building substantial block…"),
+                        (40_000, "🌊 Working on a massive document…"),
+                    )
+                    for threshold, message in _MILESTONES:
+                        key = f"ms:{threshold}"
+                        if total_len >= threshold and key not in self._fired_milestones:
+                            self._fired_milestones.add(key)
+                            self._emit_processing_status(message)
+                            break
+
+        # ── Legacy chunk events for artefacts, notes, skills ─────────────────
         if prefix in ("<artifact", "<artefact"):
             _cb(self.callback, content, self.sec_chunk_mt, {
                 "title":    attrs.get('name') or attrs.get('title', ''),
@@ -1663,23 +1673,29 @@ class _StreamState:
                 "category":    attrs.get('category', ''),
                 "description": attrs.get('description', ''),
             })
- 
 
     def _fire_secondary_done(self):
-        """Process completed secondary content; emit processing status + close.
+        """
+        Process completed secondary content; emit processing status + close event.
 
-        For widgets and forms, the final bulk content (HTML / form tag) is passed
-        to _emit_processing_close() which stores it in self.pending_final_content.
-        _feed_secondary() will flush it after state reset — see class docstring.
+        Artefact patch path
+        -------------------
+        When the content contains SEARCH/REPLACE markers, apply_aider_patch() is
+        called against the current artefact content.  If the result is identical
+        to the original (patch failed to match), a correction prompt is sent to
+        the model (non-streaming, temperature=0.1) and the patched content is
+        retried.  This loop runs up to _MAX_PATCH_RETRIES times.
 
-        Artefact patch verification
-        ---------------------------
-        When is_patch=True, apply_aider_patch() is called and the result is
-        compared to the pre-patch content.  If the content is unchanged (patch
-        failed to match), a correction prompt is injected into the discussion's
-        temporary message chain and the LLM is asked to reissue the patch.  This
-        retry loop runs up to _MAX_PATCH_RETRIES times before giving up and
-        falling back to a full-content overwrite.
+        On the penultimate attempt the correction prompt explicitly allows a full
+        rewrite.  After all retries are exhausted the system falls back to a full
+        overwrite if the last model response contained no SEARCH markers, or
+        preserves the original and sets self.patch_error_occurred = True if it did.
+
+        Widget / form path
+        ------------------
+        The final bulk content is passed to _emit_processing_close() which stores
+        it in self.pending_final_content.  _feed_secondary() flushes it after
+        state reset — see class docstring.
         """
         if not self.sec_done_mt:
             return
@@ -1688,16 +1704,26 @@ class _StreamState:
         attrs        = dict(self.sec_open_attrs)
         prefix       = self.sec_prefix
 
+        # Reset milestone tracker so the next artefact starts fresh
+        self._fired_milestones = set()
+
         def _fire_state_change(art, is_new):
             if not self.callback:
                 return
             ev_type = "artifact_created" if is_new else "artifact_updated"
-            _cb(self.callback, json.dumps({
-                "type": ev_type, "title": art.get("title"),
-                "version": art.get("version"), "art_type": art.get("type")
-            }), MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefact": art, "is_new": is_new})
+            _cb(
+                self.callback,
+                json.dumps({
+                    "type":    ev_type,
+                    "title":   art.get("title"),
+                    "version": art.get("version"),
+                    "art_type": art.get("type"),
+                }),
+                MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED,
+                {"artefact": art, "is_new": is_new},
+            )
 
-        # ── Artefacts ────────────────────────────────────────────────────────
+        # ── Artefacts ─────────────────────────────────────────────────────────
         if prefix in ("<artifact", "<artefact"):
             tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
             new_name  = attrs.pop('rename', None)
@@ -1706,8 +1732,8 @@ class _StreamState:
             attrs.pop('images', None)
             attrs.pop('image_media_types', None)
 
-            existing_titles = self.discussion.artefacts._all_latest_titles()
-            resolved_title = tag_title if tag_title in existing_titles else (
+            existing_titles  = self.discussion.artefacts._all_latest_titles()
+            resolved_title   = tag_title if tag_title in existing_titles else (
                 _find_best_title_match(tag_title, existing_titles) or tag_title
             )
             is_new   = resolved_title not in existing_titles
@@ -1719,17 +1745,17 @@ class _StreamState:
 
             result_art = None
 
+            # ── Surgical patch path ───────────────────────────────────────────
             if is_patch and not is_new:
-                # ── Surgical patch path with verification + retry ──────────────
                 existing = self.discussion.artefacts.get(resolved_title)
                 if existing is None:
-                    # Artefact disappeared between stream start and close — fall back
                     self._emit_processing_status(
                         f"WARNING: '{resolved_title}' not found for patch; creating new"
                     )
                     result_art = self.discussion.artefacts.add(
                         resolved_title, atype, full_content,
-                        language=lang, active=self.auto_activate, **attrs)
+                        language=lang, active=self.auto_activate, **attrs,
+                    )
                 else:
                     patch_content  = full_content
                     original_text  = existing.get('content', '')
@@ -1744,24 +1770,20 @@ class _StreamState:
                                 original_text, patch_content
                             )
                         except ValueError as exc:
-                            patched = original_text  # treat exception as failed match
-                            # [FIX] Pipe the error directly to the UI Console
-                            err_msg = str(exc)
-                            if "SEARCH text not found" in err_msg:
-                                self._emit_processing_status(f"❌ Match Failed: {err_msg.splitlines()[0]}")
-                                if "indentation" in err_msg.lower():
-                                    self._emit_processing_status("💡 Tip: Indentation must match exactly (Check spaces vs tabs)")
-                            else:
-                                self._emit_processing_status(f"⚠️ Patch Error: {err_msg[:100]}")
+                            patched  = original_text
+                            err_text = str(exc)
+                            first_line = err_text.splitlines()[0]
+                            self._emit_processing_status(
+                                f"❌ Match Failed: {first_line}"
+                            )
 
                         if patched != original_text:
-                            # ── Patch succeeded ───────────────────────────────
                             old_lines = original_text.splitlines()
                             new_lines = patched.splitlines()
                             added   = sum(1 for l in new_lines if l not in old_lines)
                             removed = sum(1 for l in old_lines if l not in new_lines)
                             self._emit_processing_status(
-                                f"Patch accepted — +{added} / -{removed} lines"
+                                f"✅ Patch accepted — +{added} / -{removed} lines"
                             )
                             result_art = self.discussion.artefacts.update(
                                 resolved_title,
@@ -1773,72 +1795,72 @@ class _StreamState:
                             )
                             patch_accepted = True
                             break
-                        else:
-                            # ── Patch failed — request correction ─────────────
-                            self._emit_processing_status(
-                                f"Patch REJECTED (attempt {attempt}): "
-                                "SEARCH block did not match current content"
-                            )
-                            if attempt < _MAX_PATCH_RETRIES:
-                                # On the last attempt, allow/suggest a full rewrite
-                                current_file_map = original_text
-                                if attempt == _MAX_PATCH_RETRIES - 1:
-                                    current_file_map += "\n\n[SYSTEM NOTE: This is your last attempt. If the patch fails again, please provide the FULL content of the file instead of a patch.]"
 
-                                correction_prompt = _PATCH_RETRY_PROMPT_TEMPLATE.format(
-                                    title=resolved_title,
-                                    current_content=current_file_map,
-                                )
-                                # We synthesise a fresh patch by asking the model
-                                # directly via generate_text (non-streaming, low temp)
+                        # ── Patch failed — request correction ─────────────────
+                        self._emit_processing_status(
+                            f"Patch REJECTED (attempt {attempt}): "
+                            "SEARCH block did not match current content"
+                        )
+
+                        if attempt >= _MAX_PATCH_RETRIES:
+                            break
+
+                        # On the last retry, explicitly allow a full rewrite
+                        current_file_map = original_text
+                        if attempt == _MAX_PATCH_RETRIES - 1:
+                            current_file_map += (
+                                "\n\n[SYSTEM NOTE: This is your last attempt. "
+                                "If the patch still fails, provide the FULL file "
+                                "content instead of a patch.]"
+                            )
+
+                        correction_prompt = _PATCH_RETRY_PROMPT_TEMPLATE.format(
+                            title=resolved_title,
+                            current_content=current_file_map,
+                        )
+                        self._emit_processing_status(
+                            f"Requesting corrected patch from model…"
+                        )
+                        try:
+                            retry_raw = self.discussion.lollmsClient.generate_text(
+                                correction_prompt,
+                                n_predict=min(2048, len(original_text) + 512),
+                                temperature=0.1,
+                            )
+                            art_match = re.search(
+                                r'<art[ei]fact[^>]*>(.*?)</art[ei]fact>',
+                                retry_raw, re.DOTALL | re.IGNORECASE,
+                            )
+                            if art_match:
+                                patch_content = art_match.group(1)
                                 self._emit_processing_status(
-                                    f"Requesting corrected patch from model…"
+                                    "Corrected patch received — retrying…"
                                 )
-                                try:
-                                    retry_raw = self.discussion.lollmsClient.generate_text(
-                                        correction_prompt,
-                                        n_predict=min(2048, len(original_text) + 512),
-                                        temperature=0.1,
-                                    )
-                                    # Extract the artifact tag from the retry response
-                                    art_match = re.search(
-                                        r'<art[ei]fact[^>]*>(.*?)</art[ei]fact>',
-                                        retry_raw, re.DOTALL | re.IGNORECASE
-                                    )
-                                    if art_match:
-                                        patch_content = art_match.group(1)
-                                        self._emit_processing_status(
-                                            "Corrected patch received — retrying…"
-                                        )
-                                    else:
-                                        self._emit_processing_status(
-                                            "Model did not return a valid patch tag — aborting retry"
-                                        )
-                                        break
-                                except Exception as retry_exc:
-                                    self._emit_processing_status(
-                                        f"Retry generation failed: {str(retry_exc)[:80]}"
-                                    )
-                                    break
+                            else:
+                                self._emit_processing_status(
+                                    "Model did not return a valid patch tag — aborting retry"
+                                )
+                                break
+                        except Exception as retry_exc:
+                            self._emit_processing_status(
+                                f"Retry generation failed: {str(retry_exc)[:80]}"
+                            )
+                            break
 
                     if not patch_accepted:
-                        # ── All retries exhausted — fall back to full overwrite ─
                         self._emit_processing_status(
                             f"All {_MAX_PATCH_RETRIES} patch attempts failed. "
                             "Falling back to full content overwrite."
                         )
-                        # Use the last successfully generated patch_content if it
-                        # looked like a full rewrite (no SEARCH markers), otherwise
-                        # keep original to avoid data loss.
-                        has_search = bool(re.search(r'<{6,8}\s*SEARCH', patch_content, re.I))
+                        has_search     = bool(re.search(r'<{6,8}\s*SEARCH', patch_content, re.I))
                         fallback_content = original_text if has_search else patch_content
 
                         if fallback_content == original_text:
-                            # Content unchanged — preserve existing artefact, no version bump
                             result_art = existing
                             self.patch_error_occurred = True
                             self._emit_processing_status(
-                                "❌ CRITICAL: Patch failed and fallback was identical. No changes applied."
+                                "❌ CRITICAL: Patch failed and fallback was identical. "
+                                "No changes applied."
                             )
                         else:
                             result_art = self.discussion.artefacts.update(
@@ -1850,38 +1872,44 @@ class _StreamState:
                                 **attrs,
                             )
                             self._emit_processing_status(
-                                "Fallback applied — full rewrite applied"
+                                "Fallback applied — full rewrite used"
                             )
 
+            # ── Patch on a new artefact (shouldn't happen, but handle it) ─────
             elif is_patch and is_new:
-                # Patch requested for non-existent artefact — create fresh
                 self._emit_processing_status(
                     f"NOTE: Patch requested for new artefact '{resolved_title}'; "
                     "creating with raw content"
                 )
                 result_art = self.discussion.artefacts.add(
                     resolved_title, atype, full_content,
-                    language=lang, active=self.auto_activate, **attrs)
+                    language=lang, active=self.auto_activate, **attrs,
+                )
 
+            # ── Full content path ─────────────────────────────────────────────
             else:
-                # ── Full content path ─────────────────────────────────────────
                 if is_new:
                     result_art = self.discussion.artefacts.add(
                         resolved_title, atype, full_content.strip(),
-                        language=lang, active=self.auto_activate, **attrs)
+                        language=lang, active=self.auto_activate, **attrs,
+                    )
                 else:
                     self._emit_processing_status(
                         f"Full rewrite of '{resolved_title}' "
                         f"({len(full_content.splitlines())} lines)"
                     )
                     result_art = self.discussion.artefacts.update(
-                        resolved_title, new_content=full_content.strip(),
-                        new_title=new_name, new_type=atype,
-                        language=lang, active=self.auto_activate, **attrs)
+                        resolved_title,
+                        new_content=full_content.strip(),
+                        new_title=new_name,
+                        new_type=atype,
+                        language=lang,
+                        active=self.auto_activate,
+                        **attrs,
+                    )
 
             if result_art:
                 self.affected_artefacts.append(result_art)
-                # Ensure the message metadata is updated immediately so the UI bar refreshes
                 current_meta = dict(self.ai_message.metadata or {})
                 mod_list = current_meta.get("artefacts_modified", [])
                 if result_art.get("title") not in mod_list:
@@ -1894,65 +1922,57 @@ class _StreamState:
                     f"Artefact saved as version {result_art.get('version', '?')}"
                 )
 
-            # LCP Compliance: close processing without forwarding raw content
             self._emit_processing_close()
-
-            # Legacy event
             _cb(self.callback, full_content, self.sec_done_mt, {
-                "title": resolved_title, "content": full_content,
-                "art_type": atype, "language": lang,
-                "is_patch": is_patch, "attrs": attrs,
+                "title":    resolved_title,
+                "content":  full_content,
+                "art_type": atype,
+                "language": lang,
+                "is_patch": is_patch,
+                "attrs":    attrs,
             })
 
-        # ── Notes ────────────────────────────────────────────────────────────
+        # ── Notes ─────────────────────────────────────────────────────────────
         elif prefix == "<note":
             title = attrs.get('title') or attrs.get('name', f'note_{uuid.uuid4().hex[:8]}')
-
             self._emit_processing_status(f"Creating note '{title}'")
-
             art = self.discussion.artefacts.add(
                 title=title, artefact_type=ArtefactType.NOTE,
-                content=full_content.strip(), active=self.auto_activate)
+                content=full_content.strip(), active=self.auto_activate,
+            )
             self.affected_artefacts.append(art)
             _fire_state_change(art, True)
-
             self._emit_processing_status("Note saved successfully")
             self._emit_processing_close()
-
             _cb(self.callback, full_content, self.sec_done_mt,
                 {"title": title, "content": full_content})
 
-        # ── Skills ───────────────────────────────────────────────────────────
+        # ── Skills ────────────────────────────────────────────────────────────
         elif prefix == "<skill":
             title = attrs.get('title') or attrs.get('name', f'skill_{uuid.uuid4().hex[:8]}')
             desc  = attrs.get('description', '')
             cat   = attrs.get('category', '')
-
             self._emit_processing_status(f"Creating skill '{title}'")
             if cat:
                 self._emit_processing_status(f"Category: {cat}")
-
             art = self.discussion.artefacts.add(
                 title=title, artefact_type=ArtefactType.SKILL,
                 content=full_content.strip(), active=self.auto_activate,
-                description=desc, category=cat)
+                description=desc, category=cat,
+            )
             self.affected_artefacts.append(art)
             _fire_state_change(art, True)
-
             self._emit_processing_status("Skill saved successfully")
             self._emit_processing_close()
-
             _cb(self.callback, full_content, self.sec_done_mt,
                 {"title": title, "content": full_content, "category": cat, "description": desc})
 
-        # ── Inline widgets ───────────────────────────────────────────────────
+        # ── Inline widgets ────────────────────────────────────────────────────
         elif prefix == "<lollms_inline":
             title       = attrs.get('title') or attrs.get('name', f'widget_{uuid.uuid4().hex[:8]}')
             widget_type = attrs.get('type', 'html')
-
             self._emit_processing_status(f"Building {widget_type} widget '{title}'")
-            self._emit_processing_status("Validating HTML/CSS/JS content...")
-
+            self._emit_processing_status("Validating HTML/CSS/JS content…")
             validated = _validate_widget_content(full_content, title)
             if validated is None:
                 self._emit_processing_status("Validation failed — widget discarded")
@@ -1963,20 +1983,19 @@ class _StreamState:
                 })
             else:
                 self._emit_processing_status("Validation passed")
-                wrapped_widget = (
+                wrapped = (
                     f'\n\n<lollms_inline title="{title}" type="{widget_type}">\n'
                     f'{validated}\n</lollms_inline>\n\n'
                 )
-                self._emit_processing_close(wrapped_widget)
+                self._emit_processing_close(wrapped)
                 _cb(self.callback, validated, self.sec_done_mt,
                     {"title": title, "content": validated, "widget_type": widget_type})
 
-        # ── Forms ────────────────────────────────────────────────────────────
+        # ── Forms ─────────────────────────────────────────────────────────────
         elif prefix == "<lollms_form":
             title = attrs.get('title') or attrs.get('name', f'form_{uuid.uuid4().hex[:8]}')
-
             self._emit_processing_status(f"Building form '{title}'")
-            self._emit_processing_status("Parsing form fields...")
+            self._emit_processing_status("Parsing form fields…")
 
             form_descriptor = _parse_form_xml(
                 ' '.join(f'{k}="{v}"' for k, v in attrs.items()),
@@ -1995,36 +2014,28 @@ class _StreamState:
                 if attrs.get('submit_label'):
                     form_attrs_parts.append(f'submit_label="{attrs["submit_label"]}"')
 
-                field_lines = []
-                for field in form_descriptor['fields']:
-                    fa = [
-                        f'name="{field["name"]}"',
-                        f'label="{field["label"]}"',
-                        f'type="{field["type"]}"',
-                    ]
-                    if field.get('required'):
-                        fa.append('required="true"')
-                    field_lines.append('  <field ' + ' '.join(fa) + '/>')
-
+                field_lines = [
+                    '  <field '
+                    + f'name="{f["name"]}" label="{f["label"]}" type="{f["type"]}"'
+                    + (' required="true"' if f.get('required') else '')
+                    + '/>'
+                    for f in form_descriptor['fields']
+                ]
                 sep = " " if form_attrs_parts else ""
                 full_form_tag = (
                     f'<lollms_form{sep}{" ".join(form_attrs_parts)}>\n'
                     + ('\n'.join(field_lines) + '\n' if field_lines else '')
                     + '</lollms_form>'
                 )
-
                 self._emit_processing_status("Form ready")
                 self._emit_processing_close(full_form_tag)
-                _cb(self.callback, full_content, self.sec_done_mt, {
-                    "title": title, "content": full_content, "form": form_descriptor,
-                })
+                _cb(self.callback, full_content, self.sec_done_mt,
+                    {"title": title, "content": full_content, "form": form_descriptor})
             else:
                 self._emit_processing_status("Form parsing failed")
                 self._emit_processing_close()
-                _cb(self.callback, "", self.sec_done_mt, {
-                    "title": title, "content": "", "error": "Form parsing failed",
-                })
-    # ---------------------------------------------------------------- accessors
+                _cb(self.callback, "", self.sec_done_mt,
+                    {"title": title, "content": "", "error": "Form parsing failed"})   # ---------------------------------------------------------------- accessors
 
     def get_accumulated_stream(self) -> str:
         return "".join(self.stream_buf)

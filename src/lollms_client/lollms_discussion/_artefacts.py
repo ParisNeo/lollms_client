@@ -643,23 +643,42 @@ class ArtefactManager:
                     })
         return result
 
-    # --------------------------------------------------- aider-style patching
-
     @staticmethod
     def apply_aider_patch(original: str, patch_block: str) -> str:
         """
         Applies one or more aider SEARCH/REPLACE blocks to *original* text.
-        (Full docstring preserved from original — see source.)
+
+        Match passes (applied in order per segment until one succeeds):
+          1.  Exact                  – verbatim substring match
+          2.  Trailing-space         – ignores trailing whitespace per line
+          3.  Indentation-agnostic   – strip-compares; picks best-scored window;
+                                       re-indents replacement to match file indent
+          C1. Comment-stripped       – strips inline # and // comments before comparing
+          C2. Blank-line-collapsed   – collapses consecutive blank lines before comparing
+          D.  Core-delta             – extracts and patches only the changed lines
+
+        Key invariants:
+          • res_lines is recomputed from `result` at the start of EVERY segment
+            so that edits from a prior segment are always reflected.
+          • All fuzzy passes route through _apply_at() which re-indents the
+            replacement block to match the indentation of the matched region,
+            preserving relative indentation within the replacement.
+          • Pass 3 uses best-score selection (exact line bonus) to pick the
+            correct window when the same lines appear multiple times in the file.
         """
-        ASCIIColors.panel(patch_block, "applying the patch")
         import re as _re
 
+        ASCIIColors.panel(patch_block, "applying the patch")
+
+        # ── Regex sentinels ──────────────────────────────────────────────────
         SEARCH_RE  = _re.compile(r'^<{6,8}\s*SEARCH\s*$',  _re.IGNORECASE)
         SEP_RE     = _re.compile(r'^={5,}\s*$')
         REPLACE_RE = _re.compile(r'^>{6,8}\s*REPLACE\s*$', _re.IGNORECASE)
 
+        # ── Normalise line endings ───────────────────────────────────────────
         patch_block = patch_block.replace('\r\n', '\n').replace('\r', '\n')
 
+        # Ensure the block ends with a REPLACE marker
         lines = patch_block.split('\n')
         while lines and not lines[-1].strip():
             lines.pop()
@@ -667,17 +686,16 @@ class ArtefactManager:
             lines.append('>>>>>>> REPLACE')
         patch_block = '\n'.join(lines)
 
-        raw_lines = patch_block.split('\n')
+        # ── Parse all SEARCH / REPLACE segments ─────────────────────────────
         segments: List[Tuple[str, str]] = []
+        raw_lines = patch_block.split('\n')
         i = 0
         while i < len(raw_lines):
-            line = raw_lines[i].rstrip()
-            if SEARCH_RE.match(line):
+            if SEARCH_RE.match(raw_lines[i].rstrip()):
                 i += 1
                 search_lines: List[str] = []
                 while i < len(raw_lines):
-                    l = raw_lines[i].rstrip()
-                    if SEP_RE.match(l) or REPLACE_RE.match(l):
+                    if SEP_RE.match(raw_lines[i].rstrip()) or REPLACE_RE.match(raw_lines[i].rstrip()):
                         break
                     search_lines.append(raw_lines[i])
                     i += 1
@@ -688,18 +706,17 @@ class ArtefactManager:
                         f"Search text was:\n{''.join(search_lines)}"
                     )
 
-                separator_line = raw_lines[i].rstrip()
-
-                if REPLACE_RE.match(separator_line):
+                # SEARCH immediately followed by REPLACE (delete block)
+                if REPLACE_RE.match(raw_lines[i].rstrip()):
                     segments.append(('\n'.join(search_lines), ''))
                     i += 1
                     continue
 
+                # Consume separator, then collect REPLACE lines
                 i += 1
                 replace_lines: List[str] = []
                 while i < len(raw_lines):
-                    l = raw_lines[i].rstrip()
-                    if REPLACE_RE.match(l):
+                    if REPLACE_RE.match(raw_lines[i].rstrip()):
                         break
                     replace_lines.append(raw_lines[i])
                     i += 1
@@ -716,112 +733,281 @@ class ArtefactManager:
                 "block found.\nPatch preview:\n" + patch_block[:500]
             )
 
-        def normalize(t):
-            # Normalize line endings and strip trailing spaces from every line
-            lines = [l.rstrip() for l in t.replace('\r\n', '\n').split('\n')]
-            return '\n'.join(lines).strip()
+        # ════════════════════════════════════════════════════════════════════
+        # Helper functions
+        # ════════════════════════════════════════════════════════════════════
 
+        def _get_indent(line: str) -> int:
+            """Count leading spaces (tab = 1 space for indent purposes)."""
+            return len(line) - len(line.lstrip())
+
+        def _reindent(r_text: str, target_indent: int) -> str:
+            """
+            Shift every non-empty line in *r_text* so the block's base indent
+            maps to *target_indent*, preserving relative indentation within
+            the replacement.  Empty / whitespace-only lines become ''.
+            """
+            r_lines = r_text.splitlines()
+            first_nonempty = next((l for l in r_lines if l.strip()), None)
+            if first_nonempty is None:
+                return r_text
+            base   = _get_indent(first_nonempty)
+            delta  = target_indent - base
+
+            def shift(line: str) -> str:
+                if not line.strip():
+                    return ''
+                return ' ' * max(0, _get_indent(line) + delta) + line.lstrip()
+
+            return '\n'.join(shift(l) for l in r_lines)
+
+        def _apply_at(res_lines: List[str], start: int, length: int, r_text: str) -> str:
+            """
+            Splice *r_text* into *res_lines* at [start : start+length],
+            re-indenting to match the indent of res_lines[start].
+            """
+            reindented = _reindent(r_text, _get_indent(res_lines[start]))
+            return '\n'.join(res_lines[:start] + [reindented] + res_lines[start + length:])
+
+        def _window_score(window: List[str], s_lines: List[str]) -> float:
+            """
+            Score a candidate window against the search lines.
+            Higher = better match.
+              +1.0  per line that matches exactly
+              +0.5  per line that matches after rstrip()
+              +0.25 per line that matches after strip()  (indentation-agnostic)
+            """
+            score = 0.0
+            for w, s in zip(window, s_lines):
+                if w == s:
+                    score += 1.0
+                elif w.rstrip() == s.rstrip():
+                    score += 0.5
+                elif w.strip() == s.strip():
+                    score += 0.25
+            return score
+
+        def _strip_inline_comment(line: str) -> str:
+            """Remove trailing # (Python/shell) or // (C-style) comments."""
+            # Python / shell  — guard against stripping '#' inside strings
+            s = _re.sub(r'''(?x)(?<![\'\"\\])\s*\#[^\'\"]* $''', '', line)
+            if s != line:
+                return s.rstrip()
+            return _re.sub(r'\s*//.*$', '', line).rstrip()
+
+        def _comment_key(line: str) -> str:
+            return _strip_inline_comment(line).rstrip()
+
+        def _collapse_blanks(lines_in: List[str]) -> List[Tuple[int, str]]:
+            """
+            Return (original_index, line) pairs with runs of consecutive blank
+            lines collapsed to a single blank (keeping the first blank's index).
+            """
+            out: List[Tuple[int, str]] = []
+            prev_blank = False
+            for idx, l in enumerate(lines_in):
+                is_blank = not l.strip()
+                if is_blank and prev_blank:
+                    continue
+                out.append((idx, l))
+                prev_blank = is_blank
+            return out
+
+        # ════════════════════════════════════════════════════════════════════
+        # Per-segment matching loop
+        # ════════════════════════════════════════════════════════════════════
         result = original
-        for search_text, replace_text in segments:
-            # Strip leading/trailing newlines from the tags themselves
+
+        for seg_idx, (search_text, replace_text) in enumerate(segments):
             s_text = search_text.strip('\n')
             r_text = replace_text.strip('\n')
 
-            # 1. Try Exact Match First
+            # Recompute every iteration — prior segments may have changed result
+            res_lines = result.splitlines()
+            s_lines   = s_text.splitlines()
+            n_s       = len(s_lines)
+            n_r       = len(res_lines)
+            match_found = False
+
+            label = f"seg {seg_idx + 1}/{len(segments)}"
+
+            # ── Pass 1: Exact ────────────────────────────────────────────────
             if s_text in result:
                 result = result.replace(s_text, r_text, 1)
+                ASCIIColors.success(f"  [Patch] {label} Pass 1: exact match")
                 continue
 
-            # 2. Try Normalised Match (ignoring trailing spaces and line ending types)
-            res_lines = result.splitlines()
-            s_lines = s_text.splitlines()
-
-            match_found = False
-            # Pass A: Normalised match (ignores trailing spaces)
-            for i in range(len(res_lines) - len(s_lines) + 1):
-                window = res_lines[i : i + len(s_lines)]
+            # ── Pass 2: Trailing-space normalised ────────────────────────────
+            for i in range(n_r - n_s + 1):
+                window = res_lines[i : i + n_s]
                 if all(w.rstrip() == s.rstrip() for w, s in zip(window, s_lines)):
-                    pre = res_lines[:i]
-                    post = res_lines[i + len(s_lines):]
+                    pre  = res_lines[:i]
+                    post = res_lines[i + n_s:]
                     result = '\n'.join(pre + [r_text] + post)
                     match_found = True
+                    ASCIIColors.success(f"  [Patch] {label} Pass 2: trailing-space match at line {i+1}")
                     break
 
-            # Pass B: Indentation-Agnostic Match (if Pass A failed)
-            if not match_found:
-                for i in range(len(res_lines) - len(s_lines) + 1):
-                    window = res_lines[i : i + len(s_lines)]
-                    # Compare only the stripped content
-                    if all(w.strip() == s.strip() for w, s in zip(window, s_lines)) and any(s.strip() for s in s_lines):
-                        # Calculate indentation of the first line to try and preserve it
-                        original_indent = window[0][:len(window[0]) - len(window[0].lstrip())]
-                        # Indent the replacement text to match
-                        indented_r_text = '\n'.join(original_indent + l if l.strip() else l for l in r_text.splitlines())
-
-                        pre = res_lines[:i]
-                        post = res_lines[i + len(s_lines):]
-                        result = '\n'.join(pre + [indented_r_text] + post)
-                        match_found = True
-                        ASCIIColors.warning(f"  [Patch] Fixed match via indentation-agnostic logic at line {i+1}")
-                        break
             if match_found:
                 continue
 
-            # Pass D: Core Delta Matching (The "Surgical Strike" fallback)
-            # If the whole block fails, we try to match just the lines that are different.
-            if not match_found:
-                s_lines_full = search_text.splitlines()
-                r_lines_full = replace_text.splitlines()
-                
-                # Identify the "core" of the change (lines that are actually different)
-                diff_indices = [i for i, (s, r) in enumerate(zip(s_lines_full, r_lines_full)) if s != r]
-                if not diff_indices and len(s_lines_full) != len(r_lines_full):
-                    # If lengths differ, the whole thing is a change
-                    diff_indices = list(range(len(s_lines_full)))
-                
-                if diff_indices:
-                    start_diff = min(diff_indices)
-                    end_diff = max(diff_indices)
-                    # Take the different lines plus 1 line of context for safety
-                    core_search = "\n".join(s_lines_full[max(0, start_diff-1) : min(len(s_lines_full), end_diff+2)])
-                    core_replace = "\n".join(r_lines_full[max(0, start_diff-1) : min(len(r_lines_full), end_diff+2)])
-                    
-                    if core_search and core_search in result:
-                        result = result.replace(core_search, core_replace, 1)
-                        match_found = True
-                        ASCIIColors.success(f"  [Patch] Fixed match via Core-Delta fallback")
+            # ── Pass 3: Indentation-agnostic (best-scored window) ────────────
+            # Scans ALL candidate windows, scores each, picks the highest score.
+            # This handles:
+            #   a) LLM-generated patches at column 0 for indented code
+            #   b) Multiple identical blocks — correct occurrence is selected
+            #      by rewarding lines that match beyond just strip-equality
+            best_i     = -1
+            best_score = -1.0
+
+            for i in range(n_r - n_s + 1):
+                window = res_lines[i : i + n_s]
+                # All lines must match strip-wise; block must have content
+                if (
+                    all(w.strip() == s.strip() for w, s in zip(window, s_lines))
+                    and any(s.strip() for s in s_lines)
+                ):
+                    score = _window_score(window, s_lines)
+                    if score > best_score:
+                        best_score = score
+                        best_i     = i
+
+            if best_i >= 0:
+                result = _apply_at(res_lines, best_i, n_s, r_text)
+                match_found = True
+                ASCIIColors.warning(
+                    f"  [Patch] {label} Pass 3: indentation-agnostic match at line {best_i+1} "
+                    f"(score={best_score:.2f})"
+                )
 
             if match_found:
                 continue
 
-            # 4. All matches failed - Extensive Logging
+            # ── Pass C1: Comment-stripped ────────────────────────────────────
+            # Strip inline comments from both sides before comparing.
+            # The original file lines are used when splicing (comments preserved).
+            s_keys = [_comment_key(l) for l in s_lines]
 
-            # 3. All matches failed - Extensive Logging
+            best_i     = -1
+            best_score = -1.0
+
+            for i in range(n_r - n_s + 1):
+                window      = res_lines[i : i + n_s]
+                window_keys = [_comment_key(l) for l in window]
+                if (
+                    all(wk == sk for wk, sk in zip(window_keys, s_keys))
+                    and any(sk for sk in s_keys)
+                ):
+                    score = _window_score(window, s_lines)
+                    if score > best_score:
+                        best_score = score
+                        best_i     = i
+
+            if best_i >= 0:
+                result = _apply_at(res_lines, best_i, n_s, r_text)
+                match_found = True
+                ASCIIColors.warning(
+                    f"  [Patch] {label} Pass C1: comment-stripped match at line {best_i+1}"
+                )
+
+            if match_found:
+                continue
+
+            # ── Pass C2: Blank-line-collapsed ────────────────────────────────
+            # Collapse consecutive blank lines in both the file and the search
+            # block, then slide a window over the collapsed sequences.
+            # On match, map back to original line indices for splicing.
+            collapsed_res = _collapse_blanks(res_lines)
+            collapsed_s   = _collapse_blanks(s_lines)
+            cs_len        = len(collapsed_s)
+
+            best_i      = -1
+            best_orig_start = -1
+            best_orig_end   = -1
+            best_score  = -1.0
+
+            for i in range(len(collapsed_res) - cs_len + 1):
+                window = collapsed_res[i : i + cs_len]
+                if (
+                    all(
+                        w_line.rstrip() == s_line.rstrip()
+                        for (_, w_line), (_, s_line) in zip(window, collapsed_s)
+                    )
+                    and any(s_line.strip() for _, s_line in collapsed_s)
+                ):
+                    w_lines = [l for _, l in window]
+                    s_lines_c = [l for _, l in collapsed_s]
+                    score = _window_score(w_lines, s_lines_c)
+                    if score > best_score:
+                        best_score      = score
+                        best_i          = i
+                        best_orig_start = window[0][0]
+                        best_orig_end   = window[-1][0] + 1  # exclusive
+
+            if best_i >= 0:
+                result = _apply_at(res_lines, best_orig_start, best_orig_end - best_orig_start, r_text)
+                match_found = True
+                ASCIIColors.warning(
+                    f"  [Patch] {label} Pass C2: blank-collapsed match at line {best_orig_start+1}"
+                )
+
+            if match_found:
+                continue
+
+            # ── Pass D: Core-delta ────────────────────────────────────────────
+            # If the whole block didn't match, extract just the lines that differ
+            # plus 1 line of context and try to match that smaller target.
+            s_lines_full = search_text.splitlines()
+            r_lines_full = replace_text.splitlines()
+
+            diff_indices = [
+                idx for idx, (s, r) in enumerate(zip(s_lines_full, r_lines_full)) if s != r
+            ]
+            if not diff_indices and len(s_lines_full) != len(r_lines_full):
+                diff_indices = list(range(len(s_lines_full)))
+
+            if diff_indices:
+                lo = max(0, min(diff_indices) - 1)
+                hi = min(len(s_lines_full), max(diff_indices) + 2)
+                core_search  = '\n'.join(s_lines_full[lo:hi])
+                core_replace = '\n'.join(r_lines_full[lo:hi])
+
+                if core_search and core_search in result:
+                    result = result.replace(core_search, core_replace, 1)
+                    match_found = True
+                    ASCIIColors.success(f"  [Patch] {label} Pass D: core-delta match")
+
+            if match_found:
+                continue
+
+            # ── All passes failed — full diagnostics ─────────────────────────
             first_line = s_lines[0] if s_lines else ""
             hint = _find_closest_line(first_line, result)
 
-            # Diagnostic: Print character-by-character if they look similar
-            def get_debug_str(s):
+            def _debug_str(s: str) -> str:
                 return "|".join(f"{c}({ord(c)})" for c in s)
 
-            ASCIIColors.error(f"--- PATCH MATCH FAILURE ---")
-            ASCIIColors.yellow(f"Expected (first line): {first_line.rstrip()!r}")
-            ASCIIColors.yellow(f"Raw Expected        : {get_debug_str(first_line.rstrip())}")
-            ASCIIColors.cyan(f"Closest found       : {hint.rstrip()!r}")
-            ASCIIColors.cyan(f"Raw Closest         : {get_debug_str(hint.rstrip())}")
+            ASCIIColors.error(f"--- PATCH MATCH FAILURE [{label}] ---")
+            ASCIIColors.yellow(f"Expected (first line) : {first_line.rstrip()!r}")
+            ASCIIColors.yellow(f"Raw bytes expected    : {_debug_str(first_line.rstrip())}")
+            ASCIIColors.cyan(  f"Closest line in file  : {hint.rstrip()!r}")
+            ASCIIColors.cyan(  f"Raw bytes closest     : {_debug_str(hint.rstrip())}")
 
             if first_line.strip() == hint.strip() and first_line != hint:
-                ASCIIColors.red("Indentation mismatch detected! Check for tabs vs spaces.")
+                ASCIIColors.red(
+                    "Pure indentation mismatch — same content, different leading spaces. "
+                    "Pass 3 should have caught this; check that res_lines is recomputed "
+                    "inside the segment loop."
+                )
 
             raise ValueError(
-                f"SEARCH text not found in artefact content.\n"
+                f"SEARCH text not found in artefact content [{label}].\n"
                 f"Expected first line : {first_line.rstrip()!r}\n"
                 f"Closest line found  : {hint.rstrip()!r}\n"
-                f"Note: indentation must be identical. Check console for ASCII debug."
+                f"All passes exhausted. Check console for byte-level debug."
             )
 
-        return result
-
+        return result    
     # -------------------------------------------- LLM artifact XML parser
 
     def _apply_artefact_xml(
