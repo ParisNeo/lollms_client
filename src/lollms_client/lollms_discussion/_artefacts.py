@@ -651,6 +651,7 @@ class ArtefactManager:
         Applies one or more aider SEARCH/REPLACE blocks to *original* text.
         (Full docstring preserved from original — see source.)
         """
+        ASCIIColors.panel(patch_block, "applying the patch")
         import re as _re
 
         SEARCH_RE  = _re.compile(r'^<{6,8}\s*SEARCH\s*$',  _re.IGNORECASE)
@@ -819,7 +820,7 @@ class ArtefactManager:
                 f"Note: indentation must be identical. Check console for ASCII debug."
             )
 
-            return result
+        return result
 
     # -------------------------------------------- LLM artifact XML parser
 

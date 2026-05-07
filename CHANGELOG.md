@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-07 06:19]
+
+- fix(artefacts): ensure apply_patch always returns result on success
+
 ## [2026-05-06 09:38]
 
 - feat(lollms_discussion): enhance artefacts and chat prompt handling
