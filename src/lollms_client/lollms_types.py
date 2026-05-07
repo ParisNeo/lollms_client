@@ -122,6 +122,9 @@ class MSG_TYPE(Enum):
 
     MSG_TYPE_FORM_READY                 = 46 # complete parsed form descriptor ready for rendering
     MSG_TYPE_FORM_SUBMITTED             = 47 # user answers injected back into generation context
+
+    MSG_TYPE_CODING_PLAN_CHUNK          = 48 # streaming chunk of a coding/update plan
+    MSG_TYPE_CODING_PLAN_DONE           = 49 # complete coding plan ready for execution
     # ── Form / Frame system ───────────────────────────────────────────────────
     # lollms_form allows the AI to solicit structured data from the user.
     # The UI renders a rich, interactive form. Submission pauses the AI until

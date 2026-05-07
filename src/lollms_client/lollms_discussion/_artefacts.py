@@ -390,7 +390,7 @@ class ArtefactManager:
         bump_version:      bool = True,
         active:            Optional[bool] = None,
         **extra_data
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         latest = self.get(title)
         if latest is None:
             raise ValueError(f"Cannot update non-existent artefact '{title}'.")
@@ -437,7 +437,8 @@ class ArtefactManager:
             else latest.get('image_media_types', [])
         )
 
-        return self.add(
+        # Ensure we are not just overwriting the same version object in the list
+        result = self.add(
             title             = target_title,
             artefact_type     = new_type if new_type is not None else latest.get('type', ArtefactType.DOCUMENT),
             content           = use_content,
@@ -453,6 +454,9 @@ class ArtefactManager:
             active            = new_active,
             **merged_extra,
         )
+        # Verify the list reflects the new version
+        ASCIIColors.success(f"[ArtefactManager] Incremented '{target_title}' to v{new_version}")
+        return result
 
     def revert(self, title: str, target_version: int) -> Dict[str, Any]:
         target = self.get(title, target_version)
@@ -1126,7 +1130,7 @@ class ArtefactManager:
                             f"⚠ Aider patch FAILED for '{resolved_title}':\n  {e}\n"
                             "  Existing artefact is unchanged."
                         )
-                        result_artefact = existing
+                        result_artefact = None # Do not mark as affected
             else:
                 if is_new:
                     result_artefact = self.add(
@@ -1153,7 +1157,8 @@ class ArtefactManager:
 
             existing_titles = self._all_latest_titles()
 
-            affected.append(result_artefact)
+            if result_artefact:
+                affected.append(result_artefact)
 
             if event_callback and result_artefact:
                 try:

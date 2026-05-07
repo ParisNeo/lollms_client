@@ -72,20 +72,23 @@ _MAX_PATCH_RETRIES = 3
 
 _PATCH_RETRY_PROMPT_TEMPLATE = """\
 [CRITICAL: PATCH REJECTED]
-Your SEARCH/REPLACE block for '{title}' failed to match the file content. 
-This is usually because you included context lines or comments that do not exist.
+Your SEARCH/REPLACE block for '{title}' failed to match.
 
-ACTUAL CURRENT CONTENT OF '{title}':
+DIAGNOSTIC:
+- You expected to find: '{expected_first_line}'
+- The closest match in the file is: '{closest_line}'
+- Reason: Your search block does not match the actual file content character-for-character.
+
+ACTUAL CURRENT CONTENT OF '{title}' (Use this as your source of truth):
 ---
 {current_content}
 ---
 
 INSTRUCTIONS:
-1. Look at the ACTUAL content above.
-2. Identify the EXACT lines where your change should occur.
-3. Your SEARCH block must match those lines CHARACTER-FOR-CHARACTER (including spaces and comments).
-4. If you cannot find a unique anchor, provide a larger SEARCH block.
-5. If the file has changed significantly, you may provide the FULL content instead of a patch.
+1. Compare your previous SEARCH block against the ACTUAL content above.
+2. Notice the differences in casing, punctuation, or spacing.
+3. Your SEARCH block must match the ACTUAL content CHARACTER-FOR-CHARACTER.
+4. If you cannot find a stable context anchor, provide the FULL file content in your tag.
 
 Reissue your artifact tag now.
 """
@@ -94,6 +97,7 @@ _TAG_STARTS = [
     "<tool_call>",
     "<think>", "<think ",
     "<artifact", "<artefact",
+    "<coding_plan",
     "<generate_image", "<edit_image",
     "<revert_artifact", "<revert_artefact",
     "<generate_slides", "<street_view", "<schedule_task",
@@ -111,6 +115,8 @@ _SECONDARY_TAG_MAP = {
                        MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
     "<artefact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
                        MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artefact>"),
+    "<coding_plan":   ("coding_plan_start",   MSG_TYPE.MSG_TYPE_CODING_PLAN_CHUNK,
+                       MSG_TYPE.MSG_TYPE_CODING_PLAN_DONE,  "</coding_plan>"),
     "<note":          ("note_start",          MSG_TYPE.MSG_TYPE_NOTE_CHUNK,
                        MSG_TYPE.MSG_TYPE_NOTE_DONE,         "</note>"),
     "<skill":         ("skill_start",         MSG_TYPE.MSG_TYPE_SKILL_CHUNK,
@@ -1185,6 +1191,14 @@ class _StreamState:
         if not isinstance(chunk, str):
             return True
 
+        # ── STATUS MIMICRY TRAP ──
+        # If the LLM starts generating framework-only tags or status lines, we trigger an abort.
+        if "<processing" in chunk.lower() or chunk.strip().startswith("* "):
+            ASCIIColors.error(f"[Mimicry Trap] LLM attempted to generate internal status: {chunk!r}")
+            self.patch_error_occurred = True # Trigger the execution failure logic
+            self.proc_title = "Log Mimicry Detected"
+            return False
+
         self.stream_buf.append(chunk)
 
         pos = 0
@@ -1395,6 +1409,7 @@ class _StreamState:
         proc_type_map = {
             "<artifact":      "artefact_building",
             "<artefact":      "artefact_building",
+            "<coding_plan":   "coding_planning",
             "<note":          "note_building",
             "<skill":         "skill_building",
             "<lollms_inline": "widget_building",
@@ -1402,7 +1417,14 @@ class _StreamState:
         }
 
         # ── Determine Context: Building vs Editing ──
-        raw_title = self.sec_open_attrs.get('name') or self.sec_open_attrs.get('title', 'untitled')
+        raw_title = self.sec_open_attrs.get('name') or self.sec_open_attrs.get('title')
+
+        # Enforce titles for specialized tags
+        if not raw_title:
+            if prefix == "<coding_plan":
+                raw_title = "Strategic Planning"
+            else:
+                raw_title = "Untitled Task"
         existing_titles = self.discussion.artefacts._all_latest_titles()
         is_update = raw_title in existing_titles or _find_best_title_match(raw_title, existing_titles) is not None
 
@@ -1467,19 +1489,22 @@ class _StreamState:
             self.sec_close_scan = ""
             self.state          = self.STATE_NORMAL
 
-            # ── Flush pending final content (widget HTML / form tag) ────
-            # This MUST happen after state == STATE_NORMAL so that if the
-            # relay calls ss.feed(content) re-entrantly, the state machine
-            # won't match <lollms_form>/<lollms_inline> as a new secondary
-            # tag and emit a duplicate <processing> block.
+            # ── Flush pending final content (widget HTML / form tag / specialist tags) ──
+            # KEY FIX: We must ensure this content DOES NOT re-trigger the state machine.
             if self.pending_final_content:
                 content = self.pending_final_content
                 self.pending_final_content = ""
+
+                # We append to content so it's saved in the message
                 self.ai_message.content += content
+
+                # We emit via _cb, but we pass a 'was_processed' flag in meta.
+                # The relay in ChatMixin must check this flag to avoid re-feeding.
                 _cb(self.callback, content, MSG_TYPE.MSG_TYPE_CHUNK, {
                     "type": "processing_final_content",
                     "processing_type": saved_proc_type,
                     "content_length": len(content),
+                    "was_processed": True  # Sentinel to prevent double-execution
                 })
 
             # ── Continue with any text after the closing tag ────────────
@@ -1661,6 +1686,10 @@ class _StreamState:
                 "art_type": attrs.get('type', 'document'),
                 "language": attrs.get('language'),
             })
+        elif prefix == "<coding_plan":
+            _cb(self.callback, content, self.sec_chunk_mt, {
+                "chunk": content,
+            })
         elif prefix == "<note":
             _cb(self.callback, content, self.sec_chunk_mt, {
                 "title": attrs.get('title') or attrs.get('name', 'Note'),
@@ -1723,8 +1752,38 @@ class _StreamState:
                 {"artefact": art, "is_new": is_new},
             )
 
+        # ── Coding Plans ──────────────────────────────────────────────────────
+        if prefix == "<coding_plan":
+            self.proc_title = "Strategic Planning"
+            self._emit_processing_status("Plan formulated. Invoking Artifact Specialist...")
+
+            plan_text = full_content.strip()
+
+            try:
+                spec_result = self._execute_hyper_focused_artifact_update(plan_text)
+
+                if spec_result:
+                    self._emit_processing_status("Specialist implemented the plan successfully.")
+                    self.pending_final_content = spec_result
+
+                    # LOG TO TURN SCRATCHPAD
+                    if hasattr(self, "_turn_action_history"):
+                        # Extract artifact name if possible for the summary
+                        name_match = re.search(r'name=["\']([^"\']+)["\']', spec_result)
+                        art_name = name_match.group(1) if name_match else "unnamed artifact"
+                        self._turn_action_history.append(f"✓ SUCCESSFULLY implemented plan for: {art_name}")
+                else:
+                    self._emit_processing_status("⚠️ Specialist failed to generate valid tags.")
+                    if hasattr(self, "_turn_action_history"):
+                        self._turn_action_history.append("✗ FAILED to implement plan (No valid XML returned)")
+            except Exception as e:
+                self._emit_processing_status(f"❌ Specialist Error: {str(e)}")
+
+            self._emit_processing_close()
+            _cb(self.callback, full_content, self.sec_done_mt, {"plan": plan_text})
+
         # ── Artefacts ─────────────────────────────────────────────────────────
-        if prefix in ("<artifact", "<artefact"):
+        elif prefix in ("<artifact", "<artefact"):
             tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
             new_name  = attrs.pop('rename', None)
             atype     = attrs.pop('type', 'code')
@@ -1743,17 +1802,23 @@ class _StreamState:
                 f"{'Creating new' if is_new else 'Updating'} artefact '{resolved_title}'"
             )
 
+            # ── CAPTURE STATE BEFORE UPDATE ──
+            existing_before_update = self.discussion.artefacts.get(resolved_title)
+            original_content_snapshot = existing_before_update.get('content', '') if existing_before_update else None
+
             result_art = None
 
             # ── Surgical patch path ───────────────────────────────────────────
             if is_patch and not is_new:
-                existing = self.discussion.artefacts.get(resolved_title)
+                existing = existing_before_update
                 if existing is None:
                     self._emit_processing_status(
                         f"WARNING: '{resolved_title}' not found for patch; creating new"
                     )
+                    # Clean leaked sentinels from raw content if creating new from a failed patch
+                    clean_content = re.sub(r'<{5,8}\s*SEARCH.*?={5,8}.*?>{5,8}\s*REPLACE', '', full_content, flags=re.DOTALL).strip()
                     result_art = self.discussion.artefacts.add(
-                        resolved_title, atype, full_content,
+                        resolved_title, atype, clean_content,
                         language=lang, active=self.auto_activate, **attrs,
                     )
                 else:
@@ -1765,6 +1830,7 @@ class _StreamState:
                         self._emit_processing_status(
                             f"Applying patch (attempt {attempt}/{_MAX_PATCH_RETRIES})…"
                         )
+                        err_text = None
                         try:
                             patched = self.discussion.artefacts.apply_aider_patch(
                                 original_text, patch_content
@@ -1809,13 +1875,27 @@ class _StreamState:
                         current_file_map = original_text
                         if attempt == _MAX_PATCH_RETRIES - 1:
                             current_file_map += (
-                                "\n\n[SYSTEM NOTE: This is your last attempt. "
-                                "If the patch still fails, provide the FULL file "
-                                "content instead of a patch.]"
+                                "\n\n[!!! FINAL ATTEMPT !!!]\n"
+                                "Your patches are failing to match the anchors.\n"
+                                "FOR THIS TURN ONLY: Provide the COMPLETE and FINAL version of the file.\n"
+                                "Wrap the entire file content in the <artifact> tag.\n"
+                                "Do NOT use SEARCH/REPLACE blocks now."
                             )
+
+                        # Extract diagnostic hints from the patch error
+                        expected_hint = "Unknown"
+                        closest_hint  = "Unknown"
+                        if err_text:
+                            for line in err_text.splitlines():
+                                if "Expected first line :" in line:
+                                    expected_hint = line.split(":", 1)[1].strip().strip("'")
+                                elif "Closest line found  :" in line:
+                                    closest_hint = line.split(":", 1)[1].strip().strip("'")
 
                         correction_prompt = _PATCH_RETRY_PROMPT_TEMPLATE.format(
                             title=resolved_title,
+                            expected_first_line=expected_hint,
+                            closest_line=closest_hint,
                             current_content=current_file_map,
                         )
                         self._emit_processing_status(
@@ -1855,13 +1935,14 @@ class _StreamState:
                         has_search     = bool(re.search(r'<{6,8}\s*SEARCH', patch_content, re.I))
                         fallback_content = original_text if has_search else patch_content
 
-                        if fallback_content == original_text:
-                            result_art = existing
+                        if fallback_content.strip() == original_text.strip():
+                            result_art = None # Force it to be None so it's not added to affected_artefacts
                             self.patch_error_occurred = True
                             self._emit_processing_status(
-                                "❌ CRITICAL: Patch failed and fallback was identical. "
-                                "No changes applied."
+                                "❌ CRITICAL: No changes detected. Implementation failed."
                             )
+                            if hasattr(self, "_turn_action_history"):
+                                self._turn_action_history.append(f"✗ FAILED: Specialist returned content identical to the original for '{resolved_title}'. Mission NOT accomplished.")
                         else:
                             result_art = self.discussion.artefacts.update(
                                 resolved_title,
@@ -1872,8 +1953,10 @@ class _StreamState:
                                 **attrs,
                             )
                             self._emit_processing_status(
-                                "Fallback applied — full rewrite used"
+                                "✅ Full content overwrite applied"
                             )
+                            if hasattr(self, "_turn_action_history"):
+                                self._turn_action_history.append(f"✓ SUCCESSFULLY updated {resolved_title} via full rewrite")
 
             # ── Patch on a new artefact (shouldn't happen, but handle it) ─────
             elif is_patch and is_new:
@@ -1908,7 +1991,23 @@ class _StreamState:
                         **attrs,
                     )
 
+            # ── INTEGRITY VERIFICATION ──
+            has_real_changes = False
             if result_art:
+                def _clean_compare(s): return (s or "").replace('\r\n', '\n').strip()
+                new_c = _clean_compare(result_art.get("content", ""))
+                old_c = _clean_compare(original_content_snapshot)
+
+                if new_c != old_c or result_art.get("title") != resolved_title:
+                    has_real_changes = True
+                    diff = len(new_c) - len(old_c)
+                    ASCIIColors.green(f"  [Integrity] Change confirmed: {diff:+} chars.")
+                else:
+                    # If we had a patch accepted but content is same, it was a null-op
+                    ASCIIColors.red("  [Integrity] FAILED: Content is binary-identical to previous version.")
+
+            # Process success if we have a new artifact or confirmed changes
+            if result_art and (is_new or has_real_changes):
                 self.affected_artefacts.append(result_art)
                 current_meta = dict(self.ai_message.metadata or {})
                 mod_list = current_meta.get("artefacts_modified", [])
@@ -1921,7 +2020,20 @@ class _StreamState:
                 self._emit_processing_status(
                     f"Artefact saved as version {result_art.get('version', '?')}"
                 )
+                if hasattr(self, "_turn_action_history"):
+                    self._turn_action_history.append(f"✓ SUCCESSFULLY updated '{resolved_title}' to v{result_art.get('version')}")
+                else:
+                    # Fallback path: No real changes detected
+                    self.patch_error_occurred = True
+                    self._emit_processing_status(
+                        "❌ No changes detected: Content remains identical to original."
+                    )
+                if hasattr(self, "_turn_action_history"):
+                    error_msg = f"✗ FAILED: Specialist returned content for '{resolved_title}' that is binary-identical to the current version. No changes were saved."
+                    self._turn_action_history.append(error_msg)
+                    ASCIIColors.error(f"[Master Feedback] {error_msg}")
 
+                    
             self._emit_processing_close()
             _cb(self.callback, full_content, self.sec_done_mt, {
                 "title":    resolved_title,
@@ -2053,6 +2165,144 @@ class _StreamState:
     def get_clean_text_so_far(self) -> str:
         return self.ai_message.content
 
+    def _execute_hyper_focused_artifact_update(self, plan: str) -> str:
+        """
+        Invokes a specialized LLM call with a precision persona built on the fly.
+        Handles Code, Markdown, and Text with domain-specific accuracy.
+        """
+        # 1. Parse requested persona from plan or derive from context
+        persona_match = re.search(r"Specialist Persona:\s*([^\n\r]+)", plan, re.I)
+        requested_persona = persona_match.group(1).strip() if persona_match else "Surgical Artifact Specialist"
+
+        # 2. Gather Selective Memory Context
+        memory_block = ""
+        mm = getattr(self.discussion, 'memory_manager', None)
+        if mm:
+            # Parse requested memory IDs from the plan
+            mem_ids_match = re.search(r"Relevant Memories:\s*([^\n\r]+)", plan, re.I)
+            if mem_ids_match:
+                requested_ids = [idx.strip() for idx in mem_ids_match.group(1).split(",") if idx.strip()]
+                selected_memories = []
+                for rid in requested_ids:
+                    full_id = mm._resolve_id(rid)
+                    if full_id:
+                        m_data = mm.get(full_id)
+                        if m_data:
+                            selected_memories.append(f"[{m_data['id'][:8]}] {m_data['content']}")
+
+                if selected_memories:
+                    memory_block = "=== SELECTIVE PROJECT MEMORIES ===\n" + "\n".join(selected_memories) + "\n"
+
+        # 3. Gather full technical context using the discussion's own logic
+        full_context = self.discussion.get_full_data_zone()
+
+        # 4. Build the On-The-Fly Surgical System Prompt
+        surgical_prompt = (
+            f"You are the {requested_persona}.\n"
+            "You operate in a hyper-focused implementation sandbox.\n"
+            "Your ONLY task is to implement the provided PLAN by outputting updated <artifact> tags.\n"
+            "DO NOT create widgets, notes, or forms. DO NOT use conversational prose.\n\n"
+            "CORE PROTOCOL:\n"
+            "- MEMORY: If a [SELECTIVE PROJECT MEMORIES] block is provided, you MUST adhere to those constraints.\n"
+            "- TARGET ARTIFACTS: These are the files you must edit or create.\n"
+            "- SUPPORTING CONTEXT: These artifacts contain reference data (API docs, specs). Do NOT edit these; use them as the 'Source of Truth' to inform your changes to the Targets.\n"
+            "- If the plan concerns Code: Ensure idiomatic accuracy and architectural consistency.\n"
+            "- If the plan concerns Markdown/Text: Preserve tone, formatting, and structural depth.\n\n"
+            "STRICT CONSTRAINTS:\n"
+            "1. Output ONLY <artifact> tags (using SEARCH/REPLACE blocks for updates).\n"
+            "2. No conversation, no explanations, no markdown fences OUTSIDE the tags.\n"
+            "3. Provide exactly 2 lines of context in SEARCH blocks to ensure match uniqueness.\n"
+            "4. For new artifacts, provide 100% of the content.\n"
+            "5. Match indentation, punctuation, and blank lines character-for-character.\n"
+        )
+
+        # 5. Build the payload
+        user_payload = []
+        if memory_block:
+            user_payload.append(memory_block)
+
+        user_payload.append(f"=== CONTEXTUAL ARTEFACTS ===\n{full_context}")
+        user_payload.append(f"=== PLAN TO EXECUTE ===\n{plan}")
+        user_payload.append("Execute the plan now. Output only the required XML tags.")
+
+        final_payload = "\n\n".join(user_payload)
+
+        # ── DEBUG LOG: Show exactly what the implementation specialist sees ──
+        ASCIIColors.info("--- [DEBUG] HYPER-FOCUSED SPECIALIST INPUT ---")
+        ASCIIColors.cyan(f"Persona: {requested_persona}")
+        ASCIIColors.yellow(f"Payload Size: {len(final_payload)} chars")
+        if self.discussion.debug:
+            print(final_payload)
+        ASCIIColors.info("----------------------------------------------")
+
+        # 6. Call LLM at low temperature for maximum reliability
+        try:
+            raw_output = self.discussion.lollmsClient.generate_text(
+                prompt=final_payload,
+                system_prompt=surgical_prompt,
+                temperature=0.1,
+                n_predict=4096
+            )
+
+            # ── DEBUG LOG: Show Raw Specialist Response ──
+            ASCIIColors.info("--- [DEBUG] SPECIALIST RAW OUTPUT ---")
+            ASCIIColors.yellow(f"Output Length: {len(raw_output or '')} chars")
+            if self.discussion.debug:
+                ASCIIColors.white(raw_output)
+            ASCIIColors.info("-------------------------------------")
+
+            # 7. ANTI-HALLUCINATION FILTER
+            # Extract expected targets from the plan
+            targets_match = re.search(r"Target Artifacts:\s*([^\n\r]+)", plan, re.I)
+            if targets_match:
+                # Get list of valid names
+                allowed_names = [t.strip().lower() for t in targets_match.group(1).split(",")]
+
+                # Regex to find all artifact tags in output
+                tag_pattern = re.compile(r'(<art[ei]fact\s+[^>]*>.*?</art[ei]fact>)', re.DOTALL | re.IGNORECASE)
+                valid_tags = []
+
+                for tag_match in tag_pattern.finditer(raw_output):
+                    full_tag = tag_match.group(1)
+                    name_attr = re.search(r'(?:name|title)=["\']([^"\']+)["\']', full_tag, re.I)
+                    if name_attr:
+                        tag_name = name_attr.group(1).strip().lower()
+                        # STRICT MATCH: Only allow if explicitly in targets
+                        is_allowed = any((a in tag_name or tag_name in a) for a in allowed_names if a)
+
+                        if is_allowed:
+                            valid_tags.append(full_tag)
+                        else:
+                            # Log discarded but don't save
+                            ASCIIColors.warning(f"Discarding intermediate/unplanned artifact: {tag_name}")
+                    elif len(allowed_names) == 1:
+                        valid_tags.append(full_tag)
+
+                # Reconstruct output with only allowed tags
+                if valid_tags:
+                    sanitized_output = "\n\n".join(valid_tags)
+                else:
+                    ASCIIColors.error("[Specialist] No tags survived the whitelist. Discarding output.")
+                    return "" # Return empty to trigger the "Specialist failed" path
+
+                # Keep memory tags if present
+                mem_tags = re.findall(r'(<mem_[^>]*>.*?</mem_[^>]*>|<mem_[^>]*/>)', raw_output, re.DOTALL)
+                if mem_tags:
+                    sanitized_output += "\n" + "\n".join(mem_tags)
+
+                raw_output = sanitized_output
+
+            # Post-Generation: If the specialist used/created memories, process them immediately
+            if mm and ("<mem_" in raw_output):
+                _, mem_report = mm.process_llm_output(raw_output)
+                if any(mem_report.values()):
+                    self._turn_action_history.append(f"✓ Memory System updated by Specialist.")
+
+            return raw_output.strip()
+        except Exception as e:
+            ASCIIColors.error(f"Hyper-focused coding call failed: {e}")
+            return ""
+
     def flush_remaining_buffer(self):
         if self.state == self.STATE_BUFFERING and self.bracket_buf:
             self._flush_bracket_buf_as_text()
@@ -2159,6 +2409,12 @@ class ChatMixin:
             if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                 return ss.passthrough(chunk, msg_type, meta)
             if isinstance(chunk, str):
+                # If the meta flag 'was_processed' is present, it means this chunk
+                # is a result of a specialist or form and should NOT be re-analyzed
+                # by the state machine (preventing double-execution).
+                if meta and meta.get("was_processed"):
+                    return True
+
                 collected.append(chunk)
                 return ss.feed(chunk)
             return True
@@ -2619,7 +2875,7 @@ class ChatMixin:
         if "temperature" in kwargs:
             final_answer_temperature = kwargs.pop("temperature")
         else:
-            final_answer_temperature = 0.7
+            final_answer_temperature = None
 
         object.__setattr__(self, '_active_callback', callback)
 
@@ -3348,27 +3604,98 @@ class ChatMixin:
         # Virtual history to keep all LLM reasoning rounds linked without creating physical DB messages
         _virtual_history = self.get_branch(_current_branch_tip)
 
+        # ── Tenacious Context Cleanup ──
+        # If the history is getting long or poisoned by agentic loops, we collapse it.
+        branch = self.get_branch(_current_branch_tip)
+        agentic_turns = sum(1 for m in branch if m.metadata.get("mode") in ["agentic", "rlm_agentic"])
+
+        is_tenacious_mode = agentic_turns >= 2
+
+        if is_tenacious_mode:
+            ASCIIColors.warning("[Tenacious Mode] Collapsing history to PROJECT STATE to prevent mimicry poisoning.")
+            # We force a technical synopsis of everything BEFORE the current user message
+            self.summarize_and_prune(force_technical=True, preserve_last_n=1)
+            # Reload branch after pruning
+            branch = self.get_branch(_current_branch_tip)
+
         # ── Initialize Virtual History ──
-        # Virtual history to keep all LLM reasoning rounds linked without creating physical DB messages
-        # Start with the system prompt and the current branch
         _virtual_history = []
         if self.system_prompt:
             _virtual_history.append(SimpleNamespace(sender_type="system", content=self.system_prompt))
-        
-        # Add the existing branch messages
-        for m in self.get_branch(_current_branch_tip):
-            _virtual_history.append(m)
+
+        if is_tenacious_mode and self.pruning_summary:
+            # In Tenacious mode, we hide the messy history and anchor on the STATE.
+            active_art_list = [a.get('title') for a in self.artefacts.list(active_only=True)]
+            target_str = ", ".join(active_art_list) if active_art_list else "None (Create new if needed)"
+
+            synopsis_content = (
+                "╔══════════════════════════════════════════════════════════════════╗\n"
+                "║  📍 PROJECT STATE & TECHNICAL SYNOPSIS                           ║\n"
+                "╠══════════════════════════════════════════════════════════════════╣\n"
+                f"{self.pruning_summary}\n"
+                "║                                                                  ║\n"
+                f"║  PRIMARY WORK TARGETS: {target_str[:40]}...                      ║\n"
+                "╚══════════════════════════════════════════════════════════════════╝"
+            )
+            _virtual_history.append(SimpleNamespace(sender_type="system", content=synopsis_content))
+
+            # Virtual User Hint to prevent drift
+            if active_art_list:
+                hint = (
+                    f"[ARCHITECT NOTICE: Use the established architecture. "
+                    f"Prioritize updates to: {', '.join(active_art_list)}]"
+                )
+                _virtual_history.append(SimpleNamespace(sender_type="user", content=hint))
+
+            # Append only the last actual user message
+            if branch:
+                _virtual_history.append(branch[-1])
+        else:
+            # Standard history behavior
+            for m in branch:
+                _virtual_history.append(m)
 
         def _compact_repl(m):
-            """Helper to replace UI processing tags with LLM-friendly confirmation breadcrumbs."""
-            t = re.search(r'type="([^"]+)"', m.group(0))
-            n = re.search(r'title="([^"]+)"', m.group(0))
-            p_type = t.group(1) if t else "action"
-            p_name = n.group(1) if n else "task"
-            return f"\n[SYSTEM: {p_name} ({p_type}) executed successfully]\n"
+            """
+            Helper to replace UI processing tags with a neutral separator.
+            We use a non-prose separator to prevent the LLM from mimicking status logs.
+            """
+            return "\n---\n"
+
+        # This scratchpad persists across rounds of the SAME turn
+        _turn_action_history = []
+
+        # This scratchpad persists across rounds of the SAME turn
+        _turn_action_history = []
 
         while _round < max_reasoning_steps:
             _round += 1
+
+            # ── IMMEDIATE TERMINATION ──
+            # If the specialist already succeeded, we strip context and force a summary.
+            _mission_complete = any("✓ SUCCESSFULLY" in entry for entry in _turn_action_history)
+
+            if _mission_complete:
+                ASCIIColors.success("[Master] Success detected. Revoking tool access and forcing summary.")
+                # Kill the loop after this round
+                _round = max_reasoning_steps 
+                # Block all tools except the final answer
+                active_tool_registry = {
+                    "final_answer": tool_registry.get("final_answer"),
+                    "request_clarification": tool_registry.get("request_clarification")
+                }
+                # Hard-override the scratchpad
+                self.scratchpad = (
+                    "╔══════════════════════════════════════════════════════════════════╗\n"
+                    "║ 🛑 STOP: MISSION ACCOMPLISHED                                    ║\n"
+                    "╠══════════════════════════════════════════════════════════════════╣\n"
+                    "║ The artifacts are already updated. Tool access has been REVOKED. ║\n"
+                    "║ 1. DO NOT call any more tools.                                   ║\n"
+                    "║ 2. Summarize your work to the user now.                          ║\n"
+                    "╚══════════════════════════════════════════════════════════════════╝"
+                )
+            else:
+                active_tool_registry = tool_registry
             _did_something = False
 
             # Reset per-turn state
@@ -3377,6 +3704,24 @@ class ChatMixin:
 
             _saved_scratchpad = self.scratchpad
             state_lines = []
+
+            if _turn_action_history:
+                # ── CRITICAL STOP SIGNAL ──
+                # Check for REAL mission success to prevent runaway loops
+                if any("✓ SUCCESSFULLY implemented" in entry or "✓ SUCCESSFULLY updated" in entry for entry in _turn_action_history):
+                    state_lines.append("╔══════════════════════════════════════════════════════════════════╗")
+                    state_lines.append("║ 🛑 STOP: MISSION ACCOMPLISHED                                    ║")
+                    state_lines.append("╠══════════════════════════════════════════════════════════════════╣")
+                    state_lines.append("║ SUCCESS: The requested changes have been applied and saved.      ║")
+                    state_lines.append("║                                                                  ║")
+                    state_lines.append("║ 1. DO NOT emit any more <artifact> or <tool_call> tags.          ║")
+                    state_lines.append("║ 2. DO NOT describe internal 'processing' or 'updating' steps.    ║")
+                    state_lines.append("║ 3. PROVIDE your final summary to the user immediately.           ║")
+                    state_lines.append("╚══════════════════════════════════════════════════════════════════╝")
+
+                state_lines.append("=== TURN ACTION SCRATCHPAD (Completed so far) ===")
+                state_lines.extend(_turn_action_history)
+                state_lines.append("================================================")
 
             if _completed_tool_calls or _created_artefact_titles:
                 state_lines.append("=== AGENT STATE (already completed this turn — DO NOT repeat) ===")
@@ -3392,6 +3737,19 @@ class ChatMixin:
 
             if _round == 1 and not _completed_tool_calls:
                 state_lines.append("AVAILABLE TOOLS (quick list): " + ", ".join(tool_registry.keys()))
+
+            # --- PROACTIVE ARCHITECT DIRECTIVE ---
+            if any("internet_search" in call or "google" in call for call in _completed_tool_calls):
+                state_lines.append("╔══════════════════════════════════════════════════════════════════╗")
+                state_lines.append("║ 🛠️ ARCHITECT DIRECTIVE: SEARCH COMPLETE                          ║")
+                state_lines.append("╠══════════════════════════════════════════════════════════════════╣")
+                state_lines.append("║ You have retrieved external information. Your ONLY goal now is   ║")
+                state_lines.append("║ to apply this knowledge to the project artifacts.                ║")
+                state_lines.append("║                                                                  ║")
+                state_lines.append("║ 1. DO NOT call 'show_tools' or other diagnostic tools.           ║")
+                state_lines.append("║ 2. DO NOT build forms to ask the user for more choices.          ║")
+                state_lines.append("║ 3. PROCEED IMMEDIATELY to <coding_plan> and <artifact> update.   ║")
+                state_lines.append("╚══════════════════════════════════════════════════════════════════╝")
 
             self.scratchpad = "\n".join(state_lines) + ("\n\n" + (self.scratchpad or "") if self.scratchpad else "")
 
@@ -3412,6 +3770,8 @@ class ChatMixin:
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
+                    if meta and meta.get("was_processed"):
+                        return True
                     result = ss.feed(chunk)
                     if ss.tool_trigger: return False
                     return result
@@ -3425,15 +3785,28 @@ class ChatMixin:
             _gen_kwargs.pop("temperature", None)
             _gen_kwargs.pop("streaming_callback", None)
 
-            # Use virtual history for context to preserve "memory" of previous rounds without message spam
-            # Ensure roles are mapped correctly for the target API (system, user, assistant)
+            # ── VIRTUAL HISTORY SANITIZATION ──
             _formatted_messages = []
+            
+            # Ensure the FIRST message is the FULL system prompt (Instructions + Active Artifacts)
+            full_system_context = (self.system_prompt or "") + "\n\n" + self.get_full_data_zone()
+            _formatted_messages.append({"role": "system", "content": full_system_context.strip()})
+
             for m in _virtual_history:
+                if m.sender_type == "system":
+                    continue # Skip raw system prompts as we just added the full context above
                 role = m.sender_type
-                if role == "assistant": role = "assistant"
-                elif role == "user": role = "user"
-                else: role = "system"
-                _formatted_messages.append({"role": role, "content": m.content})
+                content = m.content or ""
+                if role == "assistant":
+                    # Replace ALL internal framework processing with a standard Blind Action marker.
+                    # This tells the AI "Work happened here" without giving it mimicry bait.
+                    content = re.sub(r'<processing.*?>.*?</processing>', '\n[BLIND_ACTION_EXECUTED]\n', content, flags=re.DOTALL)
+                    content = re.sub(r'<lollms_event.*?>', '', content)
+                    # Remove any leaked prose logs
+                    content = re.sub(r'^[ \t]*[*✓🏗️🔧✅❌].*$', '', content, flags=re.MULTILINE)
+
+                msg_role = "assistant" if role == "assistant" else ("user" if role == "user" else "system")
+                _formatted_messages.append({"role": msg_role, "content": content.strip()})
 
             self.lollmsClient.generate_from_messages(
                 messages=_formatted_messages,
@@ -3489,9 +3862,9 @@ class ChatMixin:
 
             if _round == 1 and not _did_something:
                 _output_clean = _round_clean.strip()
-                # Heuristic: if user said "update", "add", "change", "fix" but no tool/artifact triggered
-                _intent_to_act = any(kw in user_message.lower() for kw in ["update", "add", "change", "fix", "create", "make", "music", "color"])
-                
+                # Heuristic: if user intent suggests action but model only produced prose
+                _intent_to_act = any(kw in user_message.lower() for kw in ["update", "add", "change", "fix", "create", "make", "music", "color", "search", "write"])
+
                 _needs_correction = False
                 _correction_msg = ""
 
@@ -3500,7 +3873,20 @@ class ChatMixin:
                     _correction_msg = _TOOL_CALL_CORRECTION
                 elif _intent_to_act and not _artefacts_built:
                     _needs_correction = True
-                    _correction_msg = "[SYSTEM CORRECTION] You explained changes but did not emit the <artifact> tags to apply them. You MUST output the full <artifact> tag (or SEARCH/REPLACE block) to actually update the code. Do it now."
+                    _correction_msg = (
+                        "\n"
+                        "╔══════════════════════════════════════════════════════════════════╗\n"
+                        "║  🧠 MENTAL RESET — HALLUCINATION DETECTED                        ║\n"
+                        "╠══════════════════════════════════════════════════════════════════╣\n"
+                        "║  You claimed to be doing work but you ONLY produced prose.       ║\n"
+                        "║  The system DID NOT save any changes because you omitted the tags.║\n"
+                        "║                                                                  ║\n"
+                        "║  1. STOP typing tables or lists describing what you 'did'.       ║\n"
+                        "║  2. STOP acting like the work is finished. It is NOT.            ║\n"
+                        "║  3. EMIT the functional <artifact> or <tool_call> tags NOW.      ║\n"
+                        "║  4. If you do not emit a tag, this conversation cannot proceed.  ║\n"
+                        "╚══════════════════════════════════════════════════════════════════╝\n"
+                    )
 
                 if _needs_correction:
                     _round1_no_tool_call = True
@@ -3600,12 +3986,24 @@ class ChatMixin:
             all_events.append({"type": "step_start", "content": _step_lbl,
                                "id": _step_id, "offset": _current_offset})
 
+            # Convert tool_name to a readable title
+            tool_title = _tool_name.replace('_', ' ').title()
+            ss.proc_title = tool_title
             ss._emit_tool_processing_open(_tool_name, _tool_params)
 
-            if _tool_name not in tool_registry:
-                ss._emit_tool_processing_status(f"Tool '{_tool_name}' not found in registry")
-                _warning(callback, f"Unknown tool: {_tool_name}")
-                _result_str = f"Error: tool '{_tool_name}' not found"
+            # Check for mission-completion block
+            _already_done = any("✓ SUCCESSFULLY implemented" in entry for entry in _turn_action_history)
+
+            if _already_done and _tool_name not in ["final_answer", "request_clarification"]:
+                ss._emit_tool_processing_status("Tool Access Revoked: Mission already complete.")
+                _result = {"success": False, "error": "MISSION COMPLETE. Do not call more tools. Summarize now."}
+                _result_str = json.dumps(_result)
+                ss._emit_tool_processing_close("Blocked")
+            elif _tool_name not in active_tool_registry:
+                _err_msg = f"Tool '{_tool_name}' is currently DISABLED (Mission Complete)." if _mission_complete else f"Tool '{_tool_name}' not found."
+                ss._emit_tool_processing_status(_err_msg)
+                _warning(callback, _err_msg)
+                _result_str = f"Error: {_err_msg}"
                 _result     = {"error": _result_str}
                 _err_evt = {
                     "type": "tool_output", "content": _result_str,
@@ -3623,7 +4021,7 @@ class ChatMixin:
             else:
                 try:
                     ss._emit_tool_processing_status(f"Executing {_tool_name}...")
-                    _result = tool_registry[_tool_name](**_tool_params)
+                    _result = active_tool_registry[_tool_name](**_tool_params)
 
                     inferred_srcs = _infer_sources_from_json(_result, _tool_name)
                     res_label     = _tool_name.replace('_', ' ').title()
@@ -3691,6 +4089,10 @@ class ChatMixin:
                     if _result_keys:
                         result_summary += f" — result keys: {', '.join(_result_keys[:5])}"
                     ss._emit_tool_processing_status(result_summary)
+                    # Add to turn history for master agent awareness
+                    if hasattr(self, "_turn_action_history"):
+                        self._turn_action_history.append(f"✓ Tool '{_tool_name}' returned {len(inferred_srcs)} results.")
+
                     ss._emit_tool_processing_close(
                         f"Completed — output: {len(_raw_result_json):,} chars"
                     )
@@ -3709,8 +4111,12 @@ class ChatMixin:
                          "id": _step_id, "offset": _current_offset, "status": "success"},
                     ])
 
-                    ai_message.metadata["events"]  = list(all_events)
-                    ai_message.metadata["sources"] = list(collected_sources)
+                    # Ensure we preserve and update metadata without overwriting previous rounds
+                    current_meta = dict(ai_message.metadata or {})
+                    current_meta["events"] = list(all_events)
+                    current_meta["sources"] = list(collected_sources)
+                    ai_message.metadata = current_meta
+
                     if self._is_db_backed:
                         self.commit()
 
@@ -3810,17 +4216,12 @@ class ChatMixin:
                 _result_str_for_llm = _result_str
 
                 # ── Update virtual history for the next round ──
-                # Instead of just stripping, we replace processing tags with a compact confirmation.
-                # This prevents the LLM from thinking it didn't do anything (poisoning) 
-                # while keeping the context clean.
-                def _compact_repl(m):
-                    t = re.search(r'type="([^"]+)"', m.group(0))
-                    n = re.search(r'title="([^"]+)"', m.group(0))
-                    p_type = t.group(1) if t else "action"
-                    p_name = n.group(1) if n else "task"
-                    return f"\n[SYSTEM: {p_name} ({p_type}) executed successfully]\n"
+                # We replace functional processing tags with a neutral anchor to keep the history valid
+                # without providing "prose bait" for the model to mimic.
+                _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', '\n---\n', _so_far, flags=re.DOTALL)
 
-                _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
+                # Strip leading status markers from the history content
+                _clean_so_far_for_llm = re.sub(r'^[ \t]*[*✓🏗️🔧✅❌].*$', '', _clean_so_far_for_llm, flags=re.MULTILINE)
 
                 _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
                 _virtual_history.append(SimpleNamespace(sender_type="user", content=f"<tool_result name=\"{_tool_name}\">{_result_str_for_llm}</tool_result>"))
@@ -3972,7 +4373,12 @@ class ChatMixin:
         if tool_calls_this_turn:
             message_meta["tool_calls"]           = tool_calls_this_turn
         if all_events:
-            message_meta["events"]               = all_events
+            # Merge with any events already in metadata
+            existing_events = message_meta.get("events", [])
+            for evt in all_events:
+                if evt not in existing_events:
+                    existing_events.append(evt)
+            message_meta["events"] = existing_events
         if collected_sources:
             message_meta["sources"]              = collected_sources
         if queries_performed:

@@ -63,9 +63,15 @@ class UtilsMixin:
         if not branch_tip_id and format_type in ["lollms_text","openai_chat","ollama_chat","markdown"]:
             return "" if format_type in ["lollms_text","markdown"] else []
         branch = self.get_branch(branch_tip_id)
+        # Force a refresh of the artifacts zone before export
         system_prompt_part = (self._system_prompt or "").strip()
         data_zone_part     = self.get_full_data_zone()
         full_system_prompt = ""
+
+        # Add dynamic synopsis if available
+        if self.pruning_summary:
+            data_zone_part = f"--- PROJECT SYNOPSIS ---\n{self.pruning_summary}\n\n" + data_zone_part
+
         if not suppress_system_prompt:
             if system_prompt_part and data_zone_part:
                 full_system_prompt = f"{system_prompt_part}\n\n{data_zone_part}"
@@ -255,33 +261,57 @@ class UtilsMixin:
     
 
     
-    def summarize_and_prune(self, max_tokens, preserve_last_n=4):
+    def summarize_and_prune(self, max_tokens=None, preserve_last_n=4, force_technical=False):
+        """
+        Generates a persistent technical synopsis and prunes the context.
+        If force_technical=True, it generates a state-based synopsis instead of a prose summary.
+        """
         branch_tip_id = self.active_branch_id
         if not branch_tip_id:
             return
-        current_text   = self.export("lollms_text", branch_tip_id, 999999)
-        current_tokens = self.lollmsClient.count_tokens(current_text)
-        if current_tokens <= max_tokens:
-            return
+
         branch = self.get_branch(branch_tip_id)
-        if len(branch) <= preserve_last_n:
+
+        # Calculate fingerprint to detect changes
+        import hashlib
+        fingerprint = hashlib.sha256("".join([f"{m.id}:{hash(m.content)}" for m in branch]).encode()).hexdigest()
+
+        meta = dict(self.metadata or {})
+        if not force_technical and max_tokens:
+            current_text = self.export("lollms_text", branch_tip_id, 999999)
+            if self.lollmsClient.count_tokens(current_text) <= max_tokens:
+                return
+
+        if meta.get("last_synopsis_fingerprint") == fingerprint and self.pruning_summary:
+            return # Cache hit, nothing changed
+
+        if len(branch) <= preserve_last_n and not force_technical:
             return
-        to_prune = branch[:-preserve_last_n]
-        pruning_point = branch[-preserve_last_n]
-        text = "\n\n".join(f"{m.sender}: {m.content}" for m in to_prune)
+
+        # Technical Synopsis Prompt
+        to_sum = branch[:-preserve_last_n] if not force_technical else branch
+        text_to_sum = "\n\n".join(f"{m.sender}: {m.content}" for m in to_sum)
+
+        prompt = (
+            "You are a Technical State Auditor. Generate a 'Project State Synopsis'.\n"
+            "1. List all technical decisions made.\n"
+            "2. Identify the current goal and any constraints.\n"
+            "3. Summarize the state of any code or document logic discussed.\n"
+            "4. IGNORE all natural language greetings or prose logs.\n"
+            "Return a dense, technical block. DO NOT use conversational filler.\n\n"
+            f"--- LOGS ---\n{text_to_sum}\n--- SYNOPSIS:"
+        )
+
         try:
-            summary = self.lollmsClient.generate_text(
-                f"Summarize concisely, capturing key facts/decisions:\n---\n{text}\n---\nSUMMARY:",
-                n_predict=512, temperature=0.1
-            )
+            synopsis = self.lollmsClient.generate_text(prompt, n_predict=1024, temperature=0.1)
+            self.pruning_summary = synopsis.strip()
+            self.pruning_point_id = branch[-preserve_last_n].id if not force_technical else branch[-1].id
+            meta["last_synopsis_fingerprint"] = fingerprint
+            self.metadata = meta
+            self.touch()
+            ASCIIColors.success("[Tenacious Memory] Persistent Technical Synopsis updated.")
         except Exception as e:
-            # Reveal the logic failure in context pruning
             trace_exception(e)
-            print(f"[WARNING] Pruning failed: {e}")
-            return
-        self.pruning_summary = ((self.pruning_summary or "") + f"\n\n--- Summary ---\n{summary.strip()}").strip()
-        self.pruning_point_id = pruning_point.id
-        self.touch()
 
     def memorize(self, branch_tip_id=None):
         try:
