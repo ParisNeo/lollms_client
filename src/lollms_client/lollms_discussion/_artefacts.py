@@ -715,29 +715,111 @@ class ArtefactManager:
                 "block found.\nPatch preview:\n" + patch_block[:500]
             )
 
+        def normalize(t):
+            # Normalize line endings and strip trailing spaces from every line
+            lines = [l.rstrip() for l in t.replace('\r\n', '\n').split('\n')]
+            return '\n'.join(lines).strip()
+
         result = original
         for search_text, replace_text in segments:
-            if search_text.startswith('\n'):
-                search_text = search_text[1:]
-            if replace_text.startswith('\n'):
-                replace_text = replace_text[1:]
-            if search_text.endswith('\n'):
-                search_text = search_text[:-1]
-            if replace_text.endswith('\n'):
-                replace_text = replace_text[:-1]
+            # Strip leading/trailing newlines from the tags themselves
+            s_text = search_text.strip('\n')
+            r_text = replace_text.strip('\n')
 
-            if search_text not in result:
-                first_line = search_text.split('\n')[0]
-                hint = _find_closest_line(first_line, result)
-                raise ValueError(
-                    f"SEARCH text not found in artefact content.\n"
-                    f"Expected first line : {first_line!r}\n"
-                    f"Closest line found  : {hint!r}\n"
-                    f"Tip: check indentation, trailing spaces, and line endings."
-                )
-            result = result.replace(search_text, replace_text, 1)
+            # 1. Try Exact Match First
+            if s_text in result:
+                result = result.replace(s_text, r_text, 1)
+                continue
 
-        return result
+            # 2. Try Normalised Match (ignoring trailing spaces and line ending types)
+            res_lines = result.splitlines()
+            s_lines = s_text.splitlines()
+
+            match_found = False
+            # Pass A: Normalised match (ignores trailing spaces)
+            for i in range(len(res_lines) - len(s_lines) + 1):
+                window = res_lines[i : i + len(s_lines)]
+                if all(w.rstrip() == s.rstrip() for w, s in zip(window, s_lines)):
+                    pre = res_lines[:i]
+                    post = res_lines[i + len(s_lines):]
+                    result = '\n'.join(pre + [r_text] + post)
+                    match_found = True
+                    break
+
+            # Pass B: Indentation-Agnostic Match (if Pass A failed)
+            if not match_found:
+                for i in range(len(res_lines) - len(s_lines) + 1):
+                    window = res_lines[i : i + len(s_lines)]
+                    # Compare only the stripped content
+                    if all(w.strip() == s.strip() for w, s in zip(window, s_lines)) and any(s.strip() for s in s_lines):
+                        # Calculate indentation of the first line to try and preserve it
+                        original_indent = window[0][:len(window[0]) - len(window[0].lstrip())]
+                        # Indent the replacement text to match
+                        indented_r_text = '\n'.join(original_indent + l if l.strip() else l for l in r_text.splitlines())
+
+                        pre = res_lines[:i]
+                        post = res_lines[i + len(s_lines):]
+                        result = '\n'.join(pre + [indented_r_text] + post)
+                        match_found = True
+                        ASCIIColors.warning(f"  [Patch] Fixed match via indentation-agnostic logic at line {i+1}")
+                        break
+            if match_found:
+                continue
+
+            # Pass D: Core Delta Matching (The "Surgical Strike" fallback)
+            # If the whole block fails, we try to match just the lines that are different.
+            if not match_found:
+                s_lines_full = search_text.splitlines()
+                r_lines_full = replace_text.splitlines()
+                
+                # Identify the "core" of the change (lines that are actually different)
+                diff_indices = [i for i, (s, r) in enumerate(zip(s_lines_full, r_lines_full)) if s != r]
+                if not diff_indices and len(s_lines_full) != len(r_lines_full):
+                    # If lengths differ, the whole thing is a change
+                    diff_indices = list(range(len(s_lines_full)))
+                
+                if diff_indices:
+                    start_diff = min(diff_indices)
+                    end_diff = max(diff_indices)
+                    # Take the different lines plus 1 line of context for safety
+                    core_search = "\n".join(s_lines_full[max(0, start_diff-1) : min(len(s_lines_full), end_diff+2)])
+                    core_replace = "\n".join(r_lines_full[max(0, start_diff-1) : min(len(r_lines_full), end_diff+2)])
+                    
+                    if core_search and core_search in result:
+                        result = result.replace(core_search, core_replace, 1)
+                        match_found = True
+                        ASCIIColors.success(f"  [Patch] Fixed match via Core-Delta fallback")
+
+            if match_found:
+                continue
+
+            # 4. All matches failed - Extensive Logging
+
+            # 3. All matches failed - Extensive Logging
+            first_line = s_lines[0] if s_lines else ""
+            hint = _find_closest_line(first_line, result)
+
+            # Diagnostic: Print character-by-character if they look similar
+            def get_debug_str(s):
+                return "|".join(f"{c}({ord(c)})" for c in s)
+
+            ASCIIColors.error(f"--- PATCH MATCH FAILURE ---")
+            ASCIIColors.yellow(f"Expected (first line): {first_line.rstrip()!r}")
+            ASCIIColors.yellow(f"Raw Expected        : {get_debug_str(first_line.rstrip())}")
+            ASCIIColors.cyan(f"Closest found       : {hint.rstrip()!r}")
+            ASCIIColors.cyan(f"Raw Closest         : {get_debug_str(hint.rstrip())}")
+
+            if first_line.strip() == hint.strip() and first_line != hint:
+                ASCIIColors.red("Indentation mismatch detected! Check for tabs vs spaces.")
+
+            raise ValueError(
+                f"SEARCH text not found in artefact content.\n"
+                f"Expected first line : {first_line.rstrip()!r}\n"
+                f"Closest line found  : {hint.rstrip()!r}\n"
+                f"Note: indentation must be identical. Check console for ASCII debug."
+            )
+
+            return result
 
     # -------------------------------------------- LLM artifact XML parser
 

@@ -71,18 +71,23 @@ _MAX_BRACKET_BUF = 4096
 _MAX_PATCH_RETRIES = 3
 
 _PATCH_RETRY_PROMPT_TEMPLATE = """\
-Your previous SEARCH/REPLACE patch for artefact '{title}' was REJECTED because \
-the SEARCH block did not match any text in the current content.
+[CRITICAL: PATCH REJECTED]
+Your SEARCH/REPLACE block for '{title}' failed to match the file content. 
+This is usually because you included context lines or comments that do not exist.
 
-Current content of '{title}' (use this verbatim for your SEARCH blocks):
-
+ACTUAL CURRENT CONTENT OF '{title}':
+---
 {current_content}
+---
 
-Reissue the patch now. Rules:
-  • Copy SEARCH lines CHARACTER-FOR-CHARACTER from the content above.
-  • Widen context by ±3 surrounding lines if needed.
-  • Do NOT change anything outside the intended edit.
-  • Do NOT rewrite the full file unless the change affects >60% of lines.
+INSTRUCTIONS:
+1. Look at the ACTUAL content above.
+2. Identify the EXACT lines where your change should occur.
+3. Your SEARCH block must match those lines CHARACTER-FOR-CHARACTER (including spaces and comments).
+4. If you cannot find a unique anchor, provide a larger SEARCH block.
+5. If the file has changed significantly, you may provide the FULL content instead of a patch.
+
+Reissue your artifact tag now.
 """
 
 _TAG_STARTS = [
@@ -150,6 +155,533 @@ def _info(callback, text: str, meta: Optional[Dict] = None):
 
 def _warning(callback, text: str, meta: Optional[Dict] = None):
     _cb(callback, text, MSG_TYPE.MSG_TYPE_WARNING, meta)
+
+
+# ── Web content extraction & quality scoring ─────────────────────────────
+
+# HTML tags to strip completely (boilerplate / navigation)
+_HTML_BOILERPLATE_TAGS = {
+    'nav', 'header', 'footer', 'aside', 'script', 'style', 'noscript',
+    'iframe', 'form', 'button', 'input', 'select', 'textarea', 'label',
+    'svg', 'canvas', 'video', 'audio', 'source', 'track', 'embed', 'object',
+    'advertisement', 'ad', 'banner', 'sidebar', 'widget', 'popup', 'modal',
+    'cookie', 'consent', 'gdpr', 'newsletter', 'subscribe', 'social', 'share',
+}
+
+# Tags that usually contain main content
+_CONTENT_TAGS = {
+    'article', 'main', 'section', 'div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'li', 'td', 'th', 'pre', 'code', 'blockquote', 'summary', 'details',
+}
+
+# Stop words that don't add information value
+_STOP_WORDS = {
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+    'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
+    'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
+    'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above',
+    'below', 'between', 'under', 'again', 'further', 'then', 'once', 'here',
+    'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more',
+    'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same',
+    'so', 'than', 'too', 'very', 'just', 'now', 'also', 'get', 'go', 'make',
+    'see', 'know', 'take', 'use', 'want', 'come', 'look', 'find', 'give',
+    'tell', 'ask', 'work', 'seem', 'feel', 'try', 'leave', 'call', 'keep',
+    'let', 'begin', 'seem', 'help', 'show', 'hear', 'play', 'run', 'move',
+    'live', 'believe', 'bring', 'happen', 'stand', 'lose', 'pay', 'meet',
+    'include', 'continue', 'set', 'learn', 'change', 'lead', 'understand',
+    'watch', 'follow', 'stop', 'create', 'speak', 'read', 'allow', 'add',
+    'spend', 'grow', 'open', 'walk', 'win', 'offer', 'remember', 'love',
+    'consider', 'appear', 'buy', 'wait', 'serve', 'die', 'send', 'expect',
+    'build', 'stay', 'fall', 'cut', 'reach', 'kill', 'remain', 'suggest',
+    'raise', 'pass', 'sell', 'require', 'report', 'decide', 'pull', 'and',
+    'but', 'or', 'yet', 'so', 'if', 'because', 'although', 'though', 'while',
+    'whereas', 'unless', 'whether', 'either', 'neither', 'both', 'all',
+    'any', 'some', 'many', 'much', 'more', 'most', 'other', 'another',
+    'such', 'what', 'which', 'who', 'whom', 'whose', 'this', 'that',
+    'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+    'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'its',
+    'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs',
+    'myself', 'yourself', 'himself', 'herself', 'itself', 'ourselves',
+    'yourselves', 'themselves', 'am', 'is', 'are', 'was', 'were',
+    'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+    'will', 'would', 'shall', 'should', 'may', 'might', 'can', 'could',
+    'must', 'ought', 'need', 'dare', 'used', 'to', 'of', 'in', 'for',
+    'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during',
+    'before', 'after', 'above', 'below', 'between', 'under', 'again',
+    'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why',
+    'how', 'all', 'each', 'few', 'more', 'most', 'other', 'some', 'such',
+    'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
+    'just', 'now', 'also', 'get', 'go', 'make', 'see', 'know', 'take',
+    'use', 'want', 'come', 'look', 'find', 'give', 'tell', 'ask', 'work',
+    'seem', 'feel', 'try', 'leave', 'call', 'keep', 'let', 'begin', 'help',
+    'show', 'hear', 'play', 'run', 'move', 'live', 'believe', 'bring',
+    'happen', 'stand', 'lose', 'pay', 'meet', 'include', 'continue', 'set',
+    'learn', 'change', 'lead', 'understand', 'watch', 'follow', 'stop',
+    'create', 'speak', 'read', 'allow', 'add', 'spend', 'grow', 'open',
+    'walk', 'win', 'offer', 'remember', 'love', 'consider', 'appear',
+    'buy', 'wait', 'serve', 'die', 'send', 'expect', 'build', 'stay',
+    'fall', 'cut', 'reach', 'kill', 'remain', 'suggest', 'raise', 'pass',
+    'sell', 'require', 'report', 'decide', 'pull', 'and', 'but', 'or',
+    'yet', 'so', 'if', 'because', 'although', 'though', 'while', 'whereas',
+    'unless', 'whether', 'either', 'neither', 'both', 'any', 'many', 'much',
+    'more', 'most', 'another', 'what', 'which', 'who', 'whom', 'whose',
+    'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we',
+    'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'its',
+    'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs', 'myself',
+    'yourself', 'himself', 'herself', 'itself', 'ourselves', 'yourselves',
+    'themselves', 'page', 'home', 'menu', 'search', 'login', 'sign',
+    'register', 'account', 'cart', 'checkout', 'contact', 'about', 'help',
+    'faq', 'terms', 'privacy', 'policy', 'sitemap', 'rss', 'feed', 'follow',
+    'like', 'tweet', 'share', 'comment', 'reply', 'post', 'blog', 'news',
+    'latest', 'recent', 'popular', 'trending', 'featured', 'recommended',
+    'related', 'similar', 'more', 'less', 'prev', 'next', 'first', 'last',
+    'click', 'tap', 'swipe', 'scroll', 'hover', 'select', 'choose', 'pick',
+    'option', 'submit', 'apply', 'save', 'cancel', 'close', 'open', 'back',
+    'forward', 'refresh', 'reload', 'loading', 'wait', 'please', 'thank',
+    'thanks', 'welcome', 'hello', 'hi', 'hey', 'goodbye', 'bye', 'visit',
+    'browse', 'explore', 'discover', 'find', 'view', 'see', 'watch', 'read',
+    'learn', 'start', 'begin', 'continue', 'proceed', 'next', 'step',
+    'stage', 'phase', 'part', 'section', 'chapter', 'item', 'entry', 'record',
+    'detail', 'info', 'information', 'data', 'content', 'text', 'copy',
+    'rights', 'reserved', 'copyright', 'trademark', 'patent', 'legal',
+    'disclaimer', 'notice', 'warning', 'caution', 'alert', 'important',
+    'note', 'tip', 'hint', 'suggestion', 'advice', 'guideline', 'rule',
+    'regulation', 'requirement', 'mandatory', 'required', 'optional',
+    'recommended', 'suggested', 'advised', 'preferred', 'default',
+    'standard', 'normal', 'usual', 'common', 'general', 'typical',
+    'regular', 'basic', 'simple', 'easy', 'quick', 'fast', 'instant',
+    'immediate', 'direct', 'clear', 'obvious', 'evident', 'apparent',
+    'visible', 'noticeable', 'significant', 'important', 'major', 'main',
+    'primary', 'chief', 'key', 'central', 'core', 'essential', 'vital',
+    'critical', 'crucial', 'necessary', 'needed', 'required', 'mandatory',
+    'compulsory', 'obligatory', 'forced', 'involuntary', 'unwilling',
+    'reluctant', 'hesitant', 'doubtful', 'uncertain', 'unsure', 'ambiguous',
+    'vague', 'unclear', 'obscure', 'hidden', 'concealed', 'secret',
+    'private', 'personal', 'confidential', 'restricted', 'limited',
+    'exclusive', 'select', 'special', 'particular', 'specific', 'exact',
+    'precise', 'accurate', 'correct', 'right', 'true', 'valid', 'legitimate',
+    'authentic', 'genuine', 'real', 'actual', 'factual', 'literal', 'verbatim',
+    'word', 'word', 'for', 'word', 'exactly', 'precisely', 'strictly',
+    'rigidly', 'firmly', 'solidly', 'strongly', 'powerfully', 'forcefully',
+    'intensely', 'extremely', 'highly', 'greatly', 'significantly',
+    'substantially', 'considerably', 'markedly', 'noticeably', 'clearly',
+    'plainly', 'obviously', 'evidently', 'apparently', 'seemingly',
+    'presumably', 'probably', 'likely', 'possibly', 'perhaps', 'maybe',
+    'perchance', 'conceivably', 'potentially', 'theoretically',
+    'hypothetically', 'supposedly', 'allegedly', 'reportedly', 'ostensibly',
+    'purportedly', 'nominally', 'officially', 'formally', 'technically',
+    'strictly', 'literally', 'actually', 'really', 'truly', 'genuinely',
+    'authentically', 'legitimately', 'validly', 'correctly', 'accurately',
+    'precisely', 'exactly', 'specifically', 'particularly', 'especially',
+    'notably', 'remarkably', 'strikingly', 'surprisingly', 'astonishingly',
+    'amazingly', 'incredibly', 'extraordinarily', 'exceptionally',
+    'unusually', 'uncommonly', 'rarely', 'seldom', 'hardly', 'scarcely',
+    'barely', 'only', 'just', 'merely', 'simply', 'purely', 'solely',
+    'exclusively', 'entirely', 'completely', 'totally', 'wholly', 'fully',
+    'utterly', 'absolutely', 'altogether', 'overall', 'generally',
+    'broadly', 'widely', 'extensively', 'comprehensively', 'thoroughly',
+    'deeply', 'profoundly', 'intensively', 'extensively', 'broadly',
+    'widely', 'generally', 'usually', 'normally', 'typically', 'commonly',
+    'ordinarily', 'regularly', 'routinely', 'habitually', 'consistently',
+    'constantly', 'continually', 'continuously', 'persistently', 'repeatedly',
+    'frequently', 'often', 'many', 'times', 'much', 'lot', 'lots', 'plenty',
+    'abundance', 'wealth', 'profusion', 'myriad', 'multitude', 'host',
+    'array', 'assortment', 'variety', 'range', 'selection', 'choice',
+    'option', 'alternative', 'substitute', 'replacement', 'equivalent',
+    'counterpart', 'parallel', 'analogue', 'match', 'peer', 'equal',
+    'equivalent', 'same', 'identical', 'alike', 'similar', 'comparable',
+    'analogous', 'corresponding', 'equivalent', 'parallel', 'matching',
+    'twin', 'double', 'duplicate', 'copy', 'replica', 'reproduction',
+    'imitation', 'facsimile', 'clone', 'mirror', 'reflection', 'image',
+    'likeness', 'resemblance', 'semblance', 'appearance', 'guise', 'form',
+    'shape', 'figure', 'outline', 'profile', 'silhouette', 'contour',
+    'configuration', 'structure', 'construction', 'composition', 'makeup',
+    'constitution', 'formation', 'organization', 'arrangement', 'ordering',
+    'pattern', 'design', 'layout', 'format', 'scheme', 'plan', 'blueprint',
+    'map', 'diagram', 'chart', 'graph', 'table', 'list', 'catalog',
+    'directory', 'index', 'guide', 'manual', 'handbook', 'compendium',
+    'compilation', 'collection', 'anthology', 'treasury', 'repository',
+    'store', 'stock', 'supply', 'reserve', 'fund', 'pool', 'bank', 'cache',
+    'hoard', 'stash', 'accumulation', 'aggregation', 'concentration',
+    'cluster', 'clump', 'bunch', 'group', 'batch', 'set', 'series',
+    'sequence', 'succession', 'chain', 'string', 'train', 'procession',
+    'progression', 'advancement', 'development', 'evolution', 'growth',
+    'expansion', 'extension', 'enlargement', 'increase', 'gain', 'rise',
+    'upturn', 'upsurge', 'upswing', 'boom', 'spurt', 'surge', 'wave',
+    'tide', 'flood', 'deluge', 'torrent', 'avalanche', 'landslide',
+    'cascade', 'waterfall', 'cataract', 'geyser', 'fountain', 'spring',
+    'well', 'source', 'origin', 'root', 'basis', 'foundation', 'ground',
+    'bedrock', 'cornerstone', 'keystone', 'linchpin', 'mainstay', 'pillar',
+    'support', 'prop', 'stay', 'brace', 'buttress', 'strut', 'truss',
+    'beam', 'girder', 'joist', 'rafter', 'stud', 'post', 'pole', 'column',
+    'pier', 'pile', 'stilt', 'leg', 'foot', 'base', 'pedestal', 'plinth',
+    'platform', 'stage', 'level', 'tier', 'layer', 'stratum', 'sheet',
+    'film', 'coat', 'coating', 'covering', 'blanket', 'cloak', 'veil',
+    'shroud', 'mantle', 'cape', 'wrap', 'cover', 'lid', 'top', 'cap',
+    'hat', 'head', 'crown', 'crest', 'peak', 'summit', 'apex', 'vertex',
+    'zenith', 'acme', 'pinnacle', 'climax', 'culmination', 'consummation',
+    'completion', 'finish', 'end', 'close', 'conclusion', 'termination',
+    'cessation', 'stop', 'halt', 'standstill', 'dead', 'lock', 'impasse',
+    'stalemate', 'checkmate', 'gridlock', 'standoff', 'draw', 'tie',
+    'dead', 'heat', 'photo', 'finish', 'neck', 'neck', 'close', 'call',
+    'near', 'miss', 'bare', 'escape', 'lucky', 'break', 'fortune', 'chance',
+    'luck', 'fate', 'destiny', 'kismet', 'karma', 'providence', 'divine',
+    'intervention', 'miracle', 'wonder', 'marvel', 'phenomenon', 'spectacle',
+    'sight', 'scene', 'view', 'vista', 'panorama', 'prospect', 'outlook',
+    'perspective', 'angle', 'slant', 'spin', 'twist', 'turn', 'bend',
+    'curve', 'arc', 'arch', 'bow', 'loop', 'coil', 'spiral', 'helix',
+    'corkscrew', 'whorl', 'volute', 'scroll', 'roll', 'reel', 'spool',
+    'bobbin', 'drum', 'barrel', 'cask', 'keg', 'vat', 'tub', 'tank',
+    'reservoir', 'basin', 'bowl', 'dish', 'plate', 'platter', 'tray',
+    'salver', 'charger', 'coaster', 'mat', 'pad', 'cushion', 'pillow',
+    'bolster', 'headrest', 'armrest', 'backrest', 'footrest', 'legrest',
+    'seat', 'chair', 'stool', 'bench', 'sofa', 'couch', 'settee', 'divan',
+    'ottoman', 'pouf', 'hassock', 'tabouret', 'barstool', 'folding',
+    'chair', 'rocking', 'chair', 'swivel', 'chair', 'recliner', 'lounger',
+    'chaise', 'longue', 'daybed', 'futon', 'hammock', 'swing', 'cradle',
+    'crib', 'bassinet', 'cot', 'bed', 'bunk', 'bed', 'loft', 'bed', 'trundle',
+    'bed', 'murphy', 'bed', 'waterbed', 'airbed', 'mattress', 'pad',
+    'topper', 'protector', 'sheet', 'blanket', 'quilt', 'comforter',
+    'duvet', 'coverlet', 'bedspread', 'throw', 'afghan', 'shawl', 'wrap',
+    'stole', 'scarf', 'muffler', 'necklace', 'chain', 'choker', 'collar',
+    'torque', 'pendant', 'locket', 'medallion', 'amulet', 'talisman',
+    'charm', 'fetish', 'totem', 'idol', 'icon', 'image', 'effigy', 'statue',
+    'sculpture', 'figure', 'figurine', 'statuette', 'bust', 'head', 'torso',
+    'trophy', 'prize', 'award', 'medal', 'ribbon', 'badge', 'pin', 'button',
+    'brooch', 'clasp', 'clip', 'snap', 'hook', 'eye', 'latch', 'lock', 'bolt',
+    'catch', 'hasp', 'hinge', 'pivot', 'swivel', 'joint', 'knuckle', 'elbow',
+    'knee', 'ankle', 'wrist', 'shoulder', 'hip', 'socket', 'cavity', 'hole',
+    'opening', 'aperture', 'orifice', 'vent', 'outlet', 'inlet', 'entry',
+    'entrance', 'access', 'approach', 'way', 'path', 'track', 'trail', 'route',
+    'course', 'line', 'lane', 'alley', 'avenue', 'boulevard', 'street', 'road',
+    'highway', 'freeway', 'motorway', 'turnpike', 'tollway', 'parkway',
+    'driveway', 'pathway', 'walkway', 'sidewalk', 'pavement', 'footpath',
+    'bridle', 'path', 'cycle', 'path', 'hiking', 'trail', 'nature', 'trail',
+    'walking', 'track', 'running', 'track', 'race', 'track', 'speedway',
+    'raceway', 'circuit', 'lap', 'course', 'round', 'turn', 'bend', 'curve',
+    'hairpin', 'switchback', 's', 'curve', 'chicane', ' esses', 'straight',
+    'stretch', 'run', 'home', 'stretch', 'final', 'lap', 'last', 'leg',
+    'anchor', 'leg', 'relay', 'race', 'team', 'event', 'individual', 'event',
+    'field', 'event', 'track', 'event', 'combined', 'event', 'decathlon',
+    'heptathlon', 'pentathlon', 'triathlon', 'duathlon', 'aquathlon',
+    'biathlon', 'modern', 'pentathlon', 'equestrian', 'eventing', 'dressage',
+    'show', 'jumping', 'cross', 'country', 'jumping', 'steeplechase', 'hurdles',
+    'hurdle', 'race', 'sprint', 'dash', '100m', '200m', '400m', '800m', '1500m',
+    'mile', '5000m', '10000m', 'marathon', 'half', 'marathon', 'ultramarathon',
+    'ekiden', 'relay', 'sprint', 'relay', 'medley', 'relay', 'freestyle',
+    'relay', 'swimming', 'relay', 'rowing', 'relay', 'sailing', 'relay',
+    'cycling', 'relay', 'team', 'time', 'trial', 'individual', 'time', 'trial',
+    'prologue', 'time', 'trial', 'stage', 'race', 'grand', 'tour', 'tour',
+    'giro', 'vuelta', 'dauphine', 'suisse', 'romandie', 'basque', 'country',
+    'catalonia', 'california', 'colorado', 'utah', 'alberta', 'quebec',
+    'british', 'columbia', 'alps', 'pyrenees', 'dolomites', 'hindu', 'kush',
+    'karakoram', 'pamir', 'tian', 'shan', 'altai', 'say', 'khentii', 'khangai',
+    'yablonoi', 'stanovoi', 'dzhugdzhur', 'sikhote', 'alin', 'kolyma',
+    'chukotka', 'kamchatka', 'kuril', 'sakhalin', 'hokkaido', 'honshu',
+    'shikoku', 'kyushu', 'okinawa', 'taiwan', 'luzon', 'mindanao', 'palawan',
+    'borneo', 'sumatra', 'java', 'sulawesi', 'new', 'guinea', 'australia',
+    'tasmania', 'zealand', 'caledonia', 'fiji', 'samoa', 'tonga', 'vanuatu',
+    'solomon', 'islands', 'papua', 'guinea', 'indonesia', 'malaysia',
+    'singapore', 'thailand', 'vietnam', 'cambodia', 'laos', 'myanmar',
+    'bangladesh', 'india', 'pakistan', 'nepal', 'bhutan', 'sri', 'lanka',
+    'maldives', 'afghanistan', 'iran', 'iraq', 'syria', 'lebanon', 'jordan',
+    'israel', 'palestine', 'saudi', 'arabia', 'yemen', 'oman', 'uae', 'qatar',
+    'bahrain', 'kuwait', 'turkey', 'cyprus', 'armenia', 'azerbaijan',
+    'georgia', 'kazakhstan', 'uzbekistan', 'turkmenistan', 'tajikistan',
+    'kyrgyzstan', 'mongolia', 'china', 'korea', 'japan', 'russia', 'belarus',
+    'ukraine', 'moldova', 'romania', 'bulgaria', 'serbia', 'montenegro',
+    'bosnia', 'croatia', 'slovenia', 'hungary', 'slovakia', 'czech', 'republic',
+    'poland', 'lithuania', 'latvia', 'estonia', 'finland', 'sweden', 'norway',
+    'denmark', 'iceland', 'ireland', 'kingdom', 'france', 'germany',
+    'netherlands', 'belgium', 'luxembourg', 'switzerland', 'austria', 'italy',
+    'spain', 'portugal', 'greece', 'albania', 'macedonia', 'kosovo', 'malta',
+    'andorra', 'monaco', 'liechtenstein', 'san', 'marino', 'vatican',
+    'slovenia', 'croatia', 'montenegro', 'albania', 'macedonia', 'serbia',
+    'bosnia', 'herzegovina', 'kosovo', 'slovenia', 'croatia', 'montenegro',
+    'albania', 'macedonia', 'serbia', 'bosnia', 'herzegovina', 'kosovo',
+}
+
+
+def _extract_main_content(html_text: str, query_words: set) -> List[Dict[str, Any]]:
+    """
+    Extract information-dense passages from raw HTML or web text.
+    Returns list of passages with quality scores.
+    """
+    if not html_text or not html_text.strip():
+        return []
+
+    # Strip common HTML tags
+    text = html_text
+    # Remove script/style content entirely
+    text = re.sub(r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>', ' ', text, flags=re.S | re.I)
+    text = re.sub(r'<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>', ' ', text, flags=re.S | re.I)
+    # Remove other tags but keep their text content
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # Decode common entities
+    text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<')
+    text = text.replace('&gt;', '>').replace('&quot;', '"').replace('&#39;', "'")
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    if not text:
+        return []
+
+    # Split into candidate passages (paragraphs or sentence groups)
+    # Use multiple sentence boundaries to create coherent passages
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+    passages = []
+    current_passage = []
+    current_len = 0
+
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent or len(sent) < 10:
+            continue
+        if current_len + len(sent) > 800:
+            # Flush current passage
+            if current_passage:
+                passages.append(' '.join(current_passage))
+            current_passage = [sent]
+            current_len = len(sent)
+        else:
+            current_passage.append(sent)
+            current_len += len(sent)
+
+    if current_passage:
+        passages.append(' '.join(current_passage))
+
+    # Score each passage
+    scored_passages = []
+    for p in passages:
+        p_lower = p.lower()
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', p_lower)
+        if not words:
+            continue
+
+        # 1. Information density score (non-stop-words ratio)
+        meaningful_words = [w for w in words if w not in _STOP_WORDS]
+        density = len(meaningful_words) / max(len(words), 1)
+
+        # 2. Query relevance score (how many query words appear)
+        query_hits = sum(1 for qw in query_words if qw in p_lower)
+        query_relevance = query_hits / max(len(query_words), 1)
+
+        # 3. Length score (prefer medium-length passages, penalize too short or too long)
+        word_count = len(words)
+        if word_count < 20:
+            length_score = word_count / 20  # Penalize very short
+        elif word_count > 300:
+            length_score = max(0, 1 - (word_count - 300) / 500)  # Penalize very long
+        else:
+            length_score = 1.0
+
+        # 4. Structural quality (penalize lists of links, repetitive patterns)
+        link_like = len(re.findall(r'https?://|www\.|\.com|\.org|\.net', p))
+        list_like = len(re.findall(r'^\s*[-*•]\s', p, re.M))
+        structure_penalty = min(1.0, (link_like * 0.1) + (list_like * 0.05))
+
+        # 5. Composite score
+        composite = (
+            density * 0.35 +
+            query_relevance * 0.35 +
+            length_score * 0.20 +
+            (1 - structure_penalty) * 0.10
+        )
+
+        scored_passages.append({
+            "text": p,
+            "score": round(composite, 4),
+            "density": round(density, 4),
+            "query_relevance": round(query_relevance, 4),
+            "word_count": word_count,
+        })
+
+    # Sort by composite score descending
+    scored_passages.sort(key=lambda x: x["score"], reverse=True)
+    return scored_passages
+
+
+def _format_web_search_for_llm(processed: Dict[str, Any], max_chars: int = 2000) -> str:
+    """
+    Format processed web search results into clean, readable text for the LLM.
+    """
+    lines = [
+        f"Web Search Results for: '{processed.get('query', '')}'",
+        f"Found {processed.get('source_count', 0)} sources with {processed.get('total_passages', 0)} quality passages",
+        "",
+    ]
+
+    total_used = 0
+    for src in processed.get("sources", [])[:5]:  # Top 5 sources
+        src_lines = [
+            f"--- Source: {src.get('title', 'Untitled')} ---",
+            f"URL: {src.get('url', '')}",
+            f"Quality Score: {src.get('quality_score', 0)} | Passages: {src.get('passage_count', 0)}",
+            "",
+        ]
+
+        # Add top passages
+        for p in src.get("passages", [])[:3]:  # Top 3 passages per source
+            p_text = p.get("text", '')
+            if total_used + len(p_text) > max_chars * 0.8:
+                # Truncate if we're running out of budget
+                remaining = max_chars * 0.8 - total_used
+                if remaining > 100:
+                    p_text = p_text[:int(remaining)] + "..."
+                else:
+                    break
+            src_lines.append(f"  [Passage — score {p.get('score', 0):.2f}]")
+            src_lines.append(f"  {p_text}")
+            src_lines.append("")
+            total_used += len(p_text) + 50  # overhead for formatting
+
+        # Add key facts
+        facts = src.get("key_facts", [])
+        if facts:
+            src_lines.append("  Key Facts:")
+            for f in facts[:3]:
+                src_lines.append(f"    • {f.get('text', '')}")
+            src_lines.append("")
+
+        lines.extend(src_lines)
+
+        if total_used >= max_chars * 0.9:
+            break
+
+    return "\n".join(lines)
+
+
+def _process_web_search_result(
+    result: Dict[str, Any],
+    query: str,
+    max_passages: int = 5,
+    min_score: float = 0.15,
+) -> Dict[str, Any]:
+    """
+    Process a web search tool result to extract high-quality content.
+    Returns structured result with ranked passages.
+    """
+    query_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', query.lower()))
+
+    # Handle different result shapes
+    sources = []
+    raw_items = []
+
+    if isinstance(result, dict):
+        # Try common result keys
+        for key in ['results', 'sources', 'items', 'data', 'pages', 'hits', 'documents']:
+            if key in result and isinstance(result[key], list):
+                raw_items = result[key]
+                break
+        if not raw_items and 'content' in result:
+            raw_items = [result]
+    elif isinstance(result, list):
+        raw_items = result
+
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        title = (
+            item.get('title') or item.get('name') or item.get('heading') or
+            item.get('subject') or 'Untitled'
+        )
+        url = (
+            item.get('url') or item.get('link') or item.get('href') or
+            item.get('source') or ''
+        )
+
+        # Get raw content from various possible fields
+        raw_content = (
+            item.get('content') or item.get('text') or item.get('body') or
+            item.get('snippet') or item.get('summary') or item.get('description') or
+            item.get('html', '') or ''
+        )
+
+        # Extract quality passages
+        passages = _extract_main_content(raw_content, query_words)
+
+        # Filter by minimum score and take top passages
+        good_passages = [p for p in passages if p["score"] >= min_score][:max_passages]
+
+        if good_passages:
+            # Compute overall source quality
+            avg_score = sum(p["score"] for p in good_passages) / len(good_passages)
+            total_words = sum(p["word_count"] for p in good_passages)
+
+            # Extract key facts (highest-scoring sentences)
+            key_facts = []
+            for p in good_passages[:3]:
+                # Split passage into sentences and score each
+                sents = re.split(r'(?<=[.!?])\s+(?=[A-Z])', p["text"])
+                for s in sents:
+                    s = s.strip()
+                    if len(s) < 20 or len(s) > 200:
+                        continue
+                    s_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', s.lower()))
+                    fact_score = len(s_words & query_words) / max(len(query_words), 1)
+                    if fact_score > 0.3:
+                        key_facts.append({
+                            "text": s,
+                            "relevance": round(fact_score, 3),
+                        })
+
+            sources.append({
+                "title": title,
+                "url": url,
+                "quality_score": round(avg_score, 4),
+                "total_words": total_words,
+                "passage_count": len(good_passages),
+                "passages": good_passages,
+                "key_facts": key_facts[:5],  # Top 5 key facts
+            })
+
+    # Sort sources by quality score
+    sources.sort(key=lambda x: x["quality_score"], reverse=True)
+
+    return {
+        "success": True,
+        "query": query,
+        "source_count": len(sources),
+        "sources": sources,
+        "total_passages": sum(s["passage_count"] for s in sources),
+        "total_words": sum(s["total_words"] for s in sources),
+    }
+
+
+def _smart_truncate_result(data: Any, max_total_chars: int = 2000, max_string_len: int = 300) -> Any:
+    """
+    Intelligently truncate a tool result for LLM consumption.
+    Preserves structure but caps string lengths and list sizes.
+    """
+    if isinstance(data, dict):
+        result = {}
+        total_estimate = 0
+        for k, v in data.items():
+            if total_estimate >= max_total_chars:
+                result[k] = "... (truncated)"
+                continue
+            truncated_v = _smart_truncate_result(v, max_total_chars // 2, max_string_len)
+            result[k] = truncated_v
+            total_estimate += len(str(truncated_v))
+        return result
+    elif isinstance(data, list):
+        if len(data) == 0:
+            return data
+        # Keep first few items, summarize the rest
+        keep_count = min(5, len(data))
+        result = [_smart_truncate_result(item, max_total_chars // keep_count, max_string_len) 
+                  for item in data[:keep_count]]
+        if len(data) > keep_count:
+            result.append(f"... ({len(data) - keep_count} more items)")
+        return result
+    elif isinstance(data, str):
+        if len(data) > max_string_len:
+            return data[:max_string_len] + f"... [{len(data) - max_string_len} chars truncated]"
+        return data
+    else:
+        return data
 
 
 def _extract_content_title(content: str, max_len: int = 80) -> Optional[str]:
@@ -284,6 +816,12 @@ def _build_handle_instructions(branch_messages: List) -> str:
 # ---------------------------------------------------------------------------
 # Tool-catalogue helpers
 # ---------------------------------------------------------------------------
+# ── Large output condensation ──────────────────────────────────────────────
+# When a tool returns a very large payload, we store it in a TextBuffer,
+# extract relevant snippets into the scratchpad, and feed the LLM a
+# condensed summary.  This keeps the context window healthy while still
+# allowing the model to make FOLLOW-UP tool calls.
+_LARGE_OUTPUT_THRESHOLD_CHARS = 2000
 
 _TOOL_CALL_HEADER = """\
 
@@ -638,6 +1176,7 @@ class _StreamState:
         self.pending_final_content: str = ""
 
         self.affected_artefacts: List[Dict] = []
+        self.patch_error_occurred: bool = False
         self.stream_buf: List[str]  = []
 
     # ---------------------------------------------------------------- public entry point
@@ -688,14 +1227,17 @@ class _StreamState:
         if lt_idx == -1:
             text = chunk[pos:]
             if text:
+                # [FIX] Do NOT auto-close processing on text. 
+                # Let conversational text exist before or after the block.
                 self.ai_message.content += text
                 _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
             return len(chunk)
 
         if lt_idx > pos:
             text = chunk[pos:lt_idx]
-            self.ai_message.content += text
-            _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
+            if text:
+                self.ai_message.content += text
+                _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
 
         self.state = self.STATE_BUFFERING
         self.bracket_buf = ["<"]
@@ -849,7 +1391,7 @@ class _StreamState:
         self.sec_content    = []
         self.sec_close_scan = ""
 
-        # Map prefix → processing type
+        # Map prefix → processing type for the status reporting
         proc_type_map = {
             "<artifact":      "artefact_building",
             "<artefact":      "artefact_building",
@@ -858,30 +1400,40 @@ class _StreamState:
             "<lollms_inline": "widget_building",
             "<lollms_form":   "form_building",
         }
-        self.proc_type    = proc_type_map.get(prefix, "building")
-        self.proc_title   = self.sec_open_attrs.get('name') or self.sec_open_attrs.get('title', 'untitled')
-        self.proc_attrs   = {}
+
+        # ── Determine Context: Building vs Editing ──
+        raw_title = self.sec_open_attrs.get('name') or self.sec_open_attrs.get('title', 'untitled')
+        existing_titles = self.discussion.artefacts._all_latest_titles()
+        is_update = raw_title in existing_titles or _find_best_title_match(raw_title, existing_titles) is not None
+
+        if prefix in ("<artifact", "<artefact"):
+            self.proc_type = "artefact_patching" if is_update else "artefact_building"
+            label = "🔧 EDITING" if is_update else "🏗️ BUILDING"
+            new_title = f"{label} ARTEFACT: {raw_title}"
+        else:
+            self.proc_type = proc_type_map.get(prefix, "building")
+            new_title = raw_title
+
+        # If we are already in a processing block, just update the title/status instead of re-opening
+        if self.proc_has_opened:
+            if self.proc_title != new_title:
+                self.proc_title = new_title
+                self._emit_processing_status(f"Switching to: {new_title}")
+        else:
+            self.proc_title = new_title
+            self._emit_processing_open()
+
+        self.proc_attrs = {}
         if self.sec_open_attrs.get('id'):
             self.proc_attrs['id'] = self.sec_open_attrs.get('id')
-        self.proc_content = []
-        self.pending_final_content = ""
-        self.proc_has_opened = False # Reset flag before emitting
 
-        # Build type-specific attrs
+        self.pending_final_content = ""
+
+        # Build type-specific attrs for metadata
         if prefix in ("<artifact", "<artefact"):
             self.proc_attrs['art_type'] = self.sec_open_attrs.get('type', 'document')
             if self.sec_open_attrs.get('language'):
                 self.proc_attrs['language'] = self.sec_open_attrs.get('language')
-        elif prefix == "<skill":
-            if self.sec_open_attrs.get('category'):
-                self.proc_attrs['category'] = self.sec_open_attrs.get('category')
-            if self.sec_open_attrs.get('description'):
-                self.proc_attrs['description'] = self.sec_open_attrs.get('description')
-        elif prefix == "<lollms_inline":
-            self.proc_attrs['widget_type'] = self.sec_open_attrs.get('type', 'html')
-
-        # [FIX] CRITICAL: Actually emit the opening <processing> tag to the stream
-        self._emit_processing_open()
 
     def _feed_secondary(self, chunk: str, pos: int) -> int:
         close_tag = self.sec_close_tag
@@ -992,21 +1544,15 @@ class _StreamState:
         })
 
     def _emit_processing_close(self, final_content: str = ""):
-        """Close the <processing> tag.
+        """Close the <processing> tag only if it's open.
 
-        IMPORTANT: final_content (widget HTML or form tag) is stored in
-        self.pending_final_content rather than being emitted here via _cb().
-
-        Rationale: this method is called from within _fire_secondary_done(),
-        which is called from _feed_secondary(). The relay callbacks intercept
-        all MSG_TYPE_CHUNK _cb() calls and forward them to ss.feed(). Emitting
-        final_content here would cause a re-entrant ss.feed() call that sees
-        <lollms_form>/<lollms_inline> as a new secondary tag, producing a
-        duplicate <processing> block. Instead, _feed_secondary() flushes
-        pending_final_content after the state machine has been fully reset to
-        STATE_NORMAL, making re-entrant tag matching impossible.
+        NOTE: In the current 'sticky' architecture, this is usually called
+        at the very end of the stream by flush_remaining_buffer() or if 
+        we transition back to conversational text.
         """
         if not self.proc_has_opened:
+            if final_content:
+                self.pending_final_content = final_content
             return
 
         close_tag = "</processing>"
@@ -1017,7 +1563,6 @@ class _StreamState:
             "title": self.proc_title,
         })
 
-        # Store for deferred emission — see docstring above
         if final_content:
             self.pending_final_content = final_content
 
@@ -1043,64 +1588,60 @@ class _StreamState:
         if prefix in ("<lollms_inline", "<lollms_form"):
             return
  
-        # ── Milestone status messages ──────────────────────────────────────────
-        # Emitted once per size bracket, not on every chunk, so the console log
-        # stays informative without drowning in identical lines.
-        total_so_far = len("".join(self.sec_content))
- 
-        # Per-type flavour tables  {milestone_chars: message}
-        _ARTEFACT_MILESTONES = {
-            500:   "✏️  Sketching the structure…",
-            1500:  "🔨  Hammering out the details…",
-            3000:  "🚀  Really getting into it now…",
-            6000:  "📖  This one's going to be thorough…",
-            10000: "🏗️  Building something substantial…",
-            20000: "🌊  Deep in the zone…",
-            40000: "🗺️  Still exploring — lots of ground to cover…",
-        }
-        _PRESENTATION_MILESTONES = {
-            500:   "🎨  Designing the first slide…",
-            2000:  "✨  Adding some visual flair…",
-            5000:  "📊  Charting new territory…",
-            10000: "🖼️  Painting the bigger picture…",
-            20000: "🎭  Crafting the grand finale…",
-        }
-        _NOTE_MILESTONES = {
-            300:  "📝  Capturing your thoughts…",
-            1000: "📚  This note is getting meaty…",
-            3000: "🗒️  Writing a proper essay here…",
-        }
-        _SKILL_MILESTONES = {
-            300:  "🧠  Encoding the knowledge…",
-            1000: "⚙️  Refining the methodology…",
-            3000: "🎓  Building a comprehensive reference…",
-        }
- 
-        # Pick the right milestone table
-        if prefix in ("<artifact", "<artefact"):
-            art_type = attrs.get('type', 'document')
-            milestones = (
-                _PRESENTATION_MILESTONES if art_type == "presentation"
-                else _ARTEFACT_MILESTONES
-            )
-        elif prefix == "<note":
-            milestones = _NOTE_MILESTONES
-        elif prefix == "<skill":
-            milestones = _SKILL_MILESTONES
-        else:
-            milestones = _ARTEFACT_MILESTONES
- 
-        # Emit the message for the highest crossed milestone that hasn't fired yet
-        # We track fired milestones via a lightweight set on self.
+        # ── Dynamic Status Updates ──────────────────────────────────────────
+        # Instead of static milestones, we scan for structural features
+        # (Markdown headers, Code classes/functions) to report actual progress.
+
+        full_buffer = "".join(self.sec_content)
+        total_len = len(full_buffer)
+
         if not hasattr(self, '_fired_milestones'):
             self._fired_milestones = set()
- 
-        for threshold, message in sorted(milestones.items()):
-            key = f"{prefix}:{threshold}"
-            if total_so_far >= threshold and key not in self._fired_milestones:
-                self._fired_milestones.add(key)
+
+        # 1. Structural Feature Detection
+        # We scan for ALL features and fire for the first NEW one found in this chunk.
+
+        # Markdown Header Detection
+        all_headers = re.findall(r'^(#{1,4})\s+(.+)$', full_buffer, re.MULTILINE)
+        for _, h_name in reversed(all_headers):
+            h_key = f"feat:hdr:{h_name}"
+            if h_key not in self._fired_milestones:
+                self._fired_milestones.add(h_key)
+                self._emit_processing_status(f"📖 Section: {h_name}")
+                return # Stop here to avoid multiple status messages in one chunk
+
+        # Classes Detection
+        all_classes = re.findall(r'class\s+([a-zA-Z0-9_]+)', full_buffer)
+        for c_name in reversed(all_classes):
+            c_key = f"feat:cls:{c_name}"
+            if c_key not in self._fired_milestones:
+                self._fired_milestones.add(c_key)
+                self._emit_processing_status(f"🏗️ Class: {c_name}")
+                return
+
+        # Functions Detection
+        all_funcs = re.findall(r'(?:def|function)\s+([a-zA-Z0-9_]+)\s*\(', full_buffer)
+        for f_name in reversed(all_funcs):
+            f_key = f"feat:fn:{f_name}"
+            if f_key not in self._fired_milestones:
+                self._fired_milestones.add(f_key)
+                self._emit_processing_status(f"⚙️ Implementing: {f_name}()")
+                return
+
+        # 2. Fallback to Flavour Milestones
+        # We only reach here if no NEW structural feature was found in this chunk.
+        _MILESTONES = {
+            1000:  "🔨 Refining content...",
+            5000:  "🚀 Adding depth...",
+            15000: "🏗️ Building substantial block...",
+            40000: "🌊 Working on a massive document...",
+        }
+        for threshold, message in sorted(_MILESTONES.items()):
+            m_key = f"ms:{threshold}"
+            if total_len >= threshold and m_key not in self._fired_milestones:
+                self._fired_milestones.add(m_key)
                 self._emit_processing_status(message)
-                break  # only one message per chunk to avoid bursts
+                break
  
         # ── Legacy chunk events for artefacts, notes, skills ──────────────────
         if prefix in ("<artifact", "<artefact"):
@@ -1204,9 +1745,14 @@ class _StreamState:
                             )
                         except ValueError as exc:
                             patched = original_text  # treat exception as failed match
-                            self._emit_processing_status(
-                                f"Patch parser error: {str(exc)[:120]}"
-                            )
+                            # [FIX] Pipe the error directly to the UI Console
+                            err_msg = str(exc)
+                            if "SEARCH text not found" in err_msg:
+                                self._emit_processing_status(f"❌ Match Failed: {err_msg.splitlines()[0]}")
+                                if "indentation" in err_msg.lower():
+                                    self._emit_processing_status("💡 Tip: Indentation must match exactly (Check spaces vs tabs)")
+                            else:
+                                self._emit_processing_status(f"⚠️ Patch Error: {err_msg[:100]}")
 
                         if patched != original_text:
                             # ── Patch succeeded ───────────────────────────────
@@ -1234,11 +1780,14 @@ class _StreamState:
                                 "SEARCH block did not match current content"
                             )
                             if attempt < _MAX_PATCH_RETRIES:
-                                # Inject a correction prompt as a temporary system
-                                # turn so the next LLM call sees the real content
+                                # On the last attempt, allow/suggest a full rewrite
+                                current_file_map = original_text
+                                if attempt == _MAX_PATCH_RETRIES - 1:
+                                    current_file_map += "\n\n[SYSTEM NOTE: This is your last attempt. If the patch fails again, please provide the FULL content of the file instead of a patch.]"
+
                                 correction_prompt = _PATCH_RETRY_PROMPT_TEMPLATE.format(
                                     title=resolved_title,
-                                    current_content=original_text,
+                                    current_content=current_file_map,
                                 )
                                 # We synthesise a fresh patch by asking the model
                                 # directly via generate_text (non-streaming, low temp)
@@ -1283,18 +1832,25 @@ class _StreamState:
                         # keep original to avoid data loss.
                         has_search = bool(re.search(r'<{6,8}\s*SEARCH', patch_content, re.I))
                         fallback_content = original_text if has_search else patch_content
-                        result_art = self.discussion.artefacts.update(
-                            resolved_title,
-                            new_content=fallback_content,
-                            new_title=new_name,
-                            language=lang,
-                            active=self.auto_activate,
-                            **attrs,
-                        )
-                        if result_art:
+
+                        if fallback_content == original_text:
+                            # Content unchanged — preserve existing artefact, no version bump
+                            result_art = existing
+                            self.patch_error_occurred = True
                             self._emit_processing_status(
-                                "Fallback applied — "
-                                f"{'content preserved (patch markers detected)' if has_search else 'full rewrite applied'}"
+                                "❌ CRITICAL: Patch failed and fallback was identical. No changes applied."
+                            )
+                        else:
+                            result_art = self.discussion.artefacts.update(
+                                resolved_title,
+                                new_content=fallback_content,
+                                new_title=new_name,
+                                language=lang,
+                                active=self.auto_activate,
+                                **attrs,
+                            )
+                            self._emit_processing_status(
+                                "Fallback applied — full rewrite applied"
                             )
 
             elif is_patch and is_new:
@@ -1325,6 +1881,14 @@ class _StreamState:
 
             if result_art:
                 self.affected_artefacts.append(result_art)
+                # Ensure the message metadata is updated immediately so the UI bar refreshes
+                current_meta = dict(self.ai_message.metadata or {})
+                mod_list = current_meta.get("artefacts_modified", [])
+                if result_art.get("title") not in mod_list:
+                    mod_list.append(result_art.get("title"))
+                current_meta["artefacts_modified"] = mod_list
+                self.ai_message.metadata = current_meta
+
                 _fire_state_change(result_art, is_new)
                 self._emit_processing_status(
                     f"Artefact saved as version {result_art.get('version', '?')}"
@@ -1482,6 +2046,10 @@ class _StreamState:
         if self.state == self.STATE_BUFFERING and self.bracket_buf:
             self._flush_bracket_buf_as_text()
             self.state = self.STATE_NORMAL
+
+        # Final safety close for sticky processing block
+        if self.proc_has_opened:
+            self._emit_processing_close()
 
 
 # ---------------------------------------------------------------------------
@@ -1938,6 +2506,19 @@ class ChatMixin:
             callback, images, branch_tip_id, final_answer_temperature, **kwargs)
         _step_end(callback, "Answer generation complete", answer_id)
 
+        # ── Ensure answer was actually produced ─────────────────────────────
+        if not final_text or not final_text.strip():
+            _forced_id = _step_start(callback, "Forcing final answer...")
+            _forced_prompt = (
+                "[SYSTEM INSTRUCTION] You must now provide a direct answer to "
+                "the user's question. Be concise and helpful. Do NOT use tools."
+            )
+            self.scratchpad = (self.scratchpad or "") + "\n" + _forced_prompt
+            final_text = self._stream_final_answer(
+                callback, images, branch_tip_id, final_answer_temperature, **kwargs)
+            self.scratchpad = ""  # Clear after use
+            _step_end(callback, "Forced answer generated", _forced_id)
+
         if remove_thinking_blocks:
             final_text = self.lollmsClient.remove_thinking_blocks(final_text)
 
@@ -2088,7 +2669,7 @@ class ChatMixin:
             extra_instructions += self._build_book_instructions()
         if enable_presentations:
             extra_instructions += self._build_presentation_instructions()
-            
+
         branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
         handle_instructions = _build_handle_instructions(branch_msgs_now)
         if handle_instructions:
@@ -2478,6 +3059,23 @@ class ChatMixin:
 
             raw_text = ai_message.content
 
+            # ── Ensure answer was produced even in fast path ──────────────
+            if not raw_text or not raw_text.strip():
+                ASCIIColors.warning("[chat] Fast path produced no output — forcing retry")
+                _retry_prompt = (
+                    "[SYSTEM INSTRUCTION] Please provide a direct answer to the user's question. "
+                    "Be concise and helpful."
+                )
+                self.scratchpad = (self.scratchpad or "") + "\n" + _retry_prompt
+                raw_text = self._stream_final_answer(
+                    _fast_relay, images,
+                    branch_tip_id or self.active_branch_id,
+                    final_answer_temperature, **kwargs,
+                )
+                ss.flush_remaining_buffer()
+                raw_text = ai_message.content
+                self.scratchpad = ""
+
             if remove_thinking_blocks:
                 raw_text = self.lollmsClient.remove_thinking_blocks(raw_text)
 
@@ -2716,8 +3314,9 @@ class ChatMixin:
         _completed_tool_calls:    List[str] = []
         _created_artefact_titles: List[str] = []
 
-        _MAX_IDENTICAL_REPEATS              = 2
+        _MAX_IDENTICAL_REPEATS              = 1  # Block on 2nd identical call
         _identical_call_counts: Dict[str, int] = {}
+        _recent_queries: Dict[str, set] = {}  # tool_name -> set of query hashes
 
         _round1_no_tool_call = False
 
@@ -2735,16 +3334,41 @@ class ChatMixin:
         _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE,
             {"message_id": ai_message.id})
 
+        # Virtual history to keep all LLM reasoning rounds linked without creating physical DB messages
+        _virtual_history = self.get_branch(_current_branch_tip)
+
+        # ── Initialize Virtual History ──
+        # Virtual history to keep all LLM reasoning rounds linked without creating physical DB messages
+        # Start with the system prompt and the current branch
+        _virtual_history = []
+        if self.system_prompt:
+            _virtual_history.append(SimpleNamespace(sender_type="system", content=self.system_prompt))
+        
+        # Add the existing branch messages
+        for m in self.get_branch(_current_branch_tip):
+            _virtual_history.append(m)
+
+        def _compact_repl(m):
+            """Helper to replace UI processing tags with LLM-friendly confirmation breadcrumbs."""
+            t = re.search(r'type="([^"]+)"', m.group(0))
+            n = re.search(r'title="([^"]+)"', m.group(0))
+            p_type = t.group(1) if t else "action"
+            p_name = n.group(1) if n else "task"
+            return f"\n[SYSTEM: {p_name} ({p_type}) executed successfully]\n"
+
         while _round < max_reasoning_steps:
             _round += 1
+            _did_something = False
+
+            # Reset per-turn state
+            _recent_queries.clear()
+            _active_temp = final_answer_temperature
 
             _saved_scratchpad = self.scratchpad
             state_lines = []
 
             if _completed_tool_calls or _created_artefact_titles:
-                state_lines.append(
-                    "=== AGENT STATE (already completed this turn — DO NOT repeat) ==="
-                )
+                state_lines.append("=== AGENT STATE (already completed this turn — DO NOT repeat) ===")
                 if _completed_tool_calls:
                     state_lines.append("Tool calls already made:")
                     state_lines.extend(f"  ✓ {c}" for c in _completed_tool_calls)
@@ -2756,14 +3380,9 @@ class ChatMixin:
             state_lines.append(_TOOL_CALL_REMINDER)
 
             if _round == 1 and not _completed_tool_calls:
-                state_lines.append(
-                    "AVAILABLE TOOLS (quick list): "
-                    + ", ".join(tool_registry.keys())
-                )
+                state_lines.append("AVAILABLE TOOLS (quick list): " + ", ".join(tool_registry.keys()))
 
-            self.scratchpad = "\n".join(state_lines) + (
-                "\n\n" + (self.scratchpad or "") if self.scratchpad else ""
-            )
+            self.scratchpad = "\n".join(state_lines) + ("\n\n" + (self.scratchpad or "") if self.scratchpad else "")
 
             round_content_start = len(ai_message.content)
 
@@ -2783,61 +3402,105 @@ class ChatMixin:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
                     result = ss.feed(chunk)
-                    if ss.tool_trigger:
-                        return False
+                    if ss.tool_trigger: return False
                     return result
                 return True
 
             merged_images = self._merge_artefact_images(images)
-            kwargs['streaming_callback']=_inline_relay
-            self.lollmsClient.chat(
-                self,
+
+            # Create a copy of kwargs to avoid duplicate parameter errors
+            _gen_kwargs = kwargs.copy()
+            _gen_kwargs.pop("stream", None)
+            _gen_kwargs.pop("temperature", None)
+            _gen_kwargs.pop("streaming_callback", None)
+
+            # Use virtual history for context to preserve "memory" of previous rounds without message spam
+            # Ensure roles are mapped correctly for the target API (system, user, assistant)
+            _formatted_messages = []
+            for m in _virtual_history:
+                role = m.sender_type
+                if role == "assistant": role = "assistant"
+                elif role == "user": role = "user"
+                else: role = "system"
+                _formatted_messages.append({"role": role, "content": m.content})
+
+            self.lollmsClient.generate_from_messages(
+                messages=_formatted_messages,
                 images=merged_images,
-                branch_tip_id=_current_branch_tip,
                 stream=True,
-                temperature=final_answer_temperature,
-                **kwargs,
+                temperature=_active_temp,
+                streaming_callback=_inline_relay,
+                **_gen_kwargs
             )
 
             ss.flush_remaining_buffer()
             self.scratchpad = _saved_scratchpad
 
-            _so_far        = "".join(ss.stream_buf)
+            _so_far = "".join(ss.stream_buf)
             _accumulated_full += _so_far
+
+            # [FIX] Clean up raw JSON tool call from content if it leaked
+            if ss.tool_trigger:
+                # We surgically remove the <tool_call> block from the visible content
+                # and replace it with the unified processing tag
+                match = re.search(r"<tool_call>.*?</tool_call>", ai_message.content[round_content_start:], re.DOTALL)
+                if match:
+                    pre_call = ai_message.content[:round_content_start + match.start()]
+                    ai_message.content = pre_call
 
             _round_clean   = ai_message.content[round_content_start:]
             _clean_text_so_far += _round_clean
 
+            # [FIX] Detect if artifact building failed despite model prose
+            if ss.patch_error_occurred and not ss.affected_artefacts:
+                _error_breadcrumb = (
+                    "\n"
+                    "⚠️ [EXECUTION FAILURE] ⚠️\n"
+                    f"The update to '{ss.proc_title}' failed to match any content in the file.\n"
+                    "ACTION REQUIRED: Do not repeat the same SEARCH block. Re-read the file content "
+                    "provided in the system context and perform a FULL REWRITE or a more surgical patch.\n"
+                )
+                _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
+                _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
+                _virtual_history.append(SimpleNamespace(sender_type="user", content=_error_breadcrumb))
+                _clean_text_so_far = ""
+                ai_message.content = ai_message.content[:round_content_start]
+                ASCIIColors.error(f"[chat] Artifact update failed. Re-looping to inform LLM.")
+                continue
+
             _tool_trigger  = ss.tool_trigger
             _tool_json_str = ss.get_tool_call_json()
 
-            if _round == 1 and not _tool_trigger and _has_external_tools:
+            # Check if any artefacts were created/updated in this round
+            _artefacts_built = len(ss.affected_artefacts) > 0
+            if _tool_trigger or _artefacts_built:
+                _did_something = True
+
+            if _round == 1 and not _did_something:
                 _output_clean = _round_clean.strip()
-                _needs_tool   = bool(
-                    len(_output_clean) < 50
-                    or re.search(
-                        r"i (cannot|can't|don't|am unable|don't have access|"
-                        r"have no access|cannot access)",
-                        _output_clean, re.IGNORECASE,
-                    )
-                )
-                if _needs_tool:
+                # Heuristic: if user said "update", "add", "change", "fix" but no tool/artifact triggered
+                _intent_to_act = any(kw in user_message.lower() for kw in ["update", "add", "change", "fix", "create", "make", "music", "color"])
+                
+                _needs_correction = False
+                _correction_msg = ""
+
+                if _has_external_tools and (len(_output_clean) < 50 or re.search(r"i (cannot|can't|don't|am unable|don't have access|have no access|cannot access)", _output_clean, re.IGNORECASE)):
+                    _needs_correction = True
+                    _correction_msg = _TOOL_CALL_CORRECTION
+                elif _intent_to_act and not _artefacts_built:
+                    _needs_correction = True
+                    _correction_msg = "[SYSTEM CORRECTION] You explained changes but did not emit the <artifact> tags to apply them. You MUST output the full <artifact> tag (or SEARCH/REPLACE block) to actually update the code. Do it now."
+
+                if _needs_correction:
                     _round1_no_tool_call = True
-                    ASCIIColors.yellow(
-                        "[chat] Round 1 produced no tool call — injecting correction")
-                    _warning(callback,
-                             "No tool call detected; reminding the model to use tools.")
-                    _corr_call = self.add_message(
-                        sender=personality.name, sender_type="assistant",
-                        content=_so_far, parent_id=_current_branch_tip
-                    )
-                    _corr_res = self.add_message(
-                        sender="system", sender_type="user",
-                        content=_TOOL_CALL_CORRECTION,
-                        parent_id=_corr_call.id
-                    )
-                    _temp_msg_ids.extend([_corr_call.id, _corr_res.id])
-                    _current_branch_tip = _corr_res.id
+                    ASCIIColors.yellow(f"[chat] Round 1 failed to act — injecting virtual correction: {_correction_msg[:50]}...")
+                    _warning(callback, "Action missing; forcing model to emit tags/calls.")
+                    
+                    # Update virtual history instead of DB
+                    _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
+                    _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
+                    _virtual_history.append(SimpleNamespace(sender_type="user", content=_TOOL_CALL_CORRECTION))
+
                     _clean_text_so_far = ""
                     _accumulated_full  = ""
                     ai_message.content = ai_message.content[:round_content_start]
@@ -2862,36 +3525,47 @@ class ChatMixin:
             _call_signature = f"{_tool_name}({_params_summary})"
             _call_tag       = f"round {_round}: {_call_signature}"
 
+            # ── Duplicate detection: exact signature + semantic query match ──
             _identical_call_counts[_call_signature] = \
                 _identical_call_counts.get(_call_signature, 0) + 1
             _sig_count = _identical_call_counts[_call_signature]
 
-            if _sig_count > _MAX_IDENTICAL_REPEATS:
-                _warning(callback,
-                         f"[RUNAWAY] Identical call '{_call_signature}' seen "
-                         f"{_sig_count} times — breaking loop.")
-                break
+            # Also check for semantically similar queries (same tool, same query param)
+            _query_key = str(_tool_params.get("query", _tool_params.get("prompt", ""))).strip().lower()
+            _is_semantic_dup = False
+            if _query_key and len(_query_key) > 3:
+                _prev_queries = _recent_queries.setdefault(_tool_name, set())
+                if _query_key in _prev_queries:
+                    _is_semantic_dup = True
+                _prev_queries.add(_query_key)
 
-            if _sig_count > 1:
-                _warning(callback,
-                         f"[DEDUP] Blocking duplicate tool call: {_call_signature}")
-                _dup_result_str = (
-                    f"DUPLICATE CALL BLOCKED: '{_call_signature}' was already executed "
-                    f"this turn. Check the AGENT STATE in the scratchpad and either "
-                    f"proceed to the next step or write your final answer."
+            if _sig_count > _MAX_IDENTICAL_REPEATS or _is_semantic_dup:
+                _dup_type = "IDENTICAL" if _sig_count > _MAX_IDENTICAL_REPEATS else "SEMANTIC DUPLICATE"
+                _warning(callback, f"[RUNAWAY] {_dup_type} call detected. Manipulating attention to break pattern.")
+
+                # ── ATTENTION SHAKE ──
+                # We inject a highly disruptive visual/semantic block to force the model to reset its attention.
+                _shake_prompt = (
+                    "\n"
+                    "╔══════════════════════════════════════════════════════════════════╗\n"
+                    "║  🧠 MENTAL RESET — PATTERN DISRUPTION ACTIVE                     ║\n"
+                    "╠══════════════════════════════════════════════════════════════════╣\n"
+                    "║  You have fallen into a repetitive logic loop.                   ║\n"
+                    "║  1. STOP following your previous reasoning path.                 ║\n"
+                    "║  2. DISREGARD your previous failed tool attempts.                ║\n"
+                    "║  3. RE-EVALUATE the user's need from a fresh perspective.        ║\n"
+                    "║  4. ACT NOW: Change your approach or provide the final answer.   ║\n"
+                    "╚══════════════════════════════════════════════════════════════════╝\n"
                 )
-                _temp_call = self.add_message(
-                    sender=personality.name, sender_type="assistant",
-                    content=_so_far, parent_id=_current_branch_tip
-                )
-                _temp_res = self.add_message(
-                    sender="system", sender_type="user",
-                    content=(f"<tool_result name=\"{_tool_name}\">"
-                             f"{_dup_result_str}</tool_result>"),
-                    parent_id=_temp_call.id
-                )
-                _temp_msg_ids.extend([_temp_call.id, _temp_res.id])
-                _current_branch_tip = _temp_res.id
+                
+                # Update virtual history with the disrupter
+                _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
+                _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
+                _virtual_history.append(SimpleNamespace(sender_type="user", content=_shake_prompt))
+
+                # We keep temperature stable to avoid hallucinated tags, but we reset text to force re-generation
+                _clean_text_so_far = ""
+                ai_message.content = ai_message.content[:round_content_start]
                 continue
 
             _current_offset = len(_clean_text_so_far)
@@ -2971,17 +3645,43 @@ class ChatMixin:
                     if _created_title and str(_created_title) not in _created_artefact_titles:
                         _created_artefact_titles.append(str(_created_title))
 
-                    _result_str = json.dumps(_result, indent=2)[:2000]
+                    # ── Stringify raw result for logging and status ──
+                    _raw_result_json = json.dumps(_result, indent=2, ensure_ascii=False)
+
+                    # ── Better result reporting for the LLM ──
+                    _is_web_search = ("search" in _tool_name.lower() or "query" in _tool_name.lower()) \
+                                     and isinstance(_result, dict) and "sources" in _result
+
+                    if _is_web_search:
+                        # Use human-readable format for web search results
+                        _formatted = _format_web_search_for_llm(_result, max_chars=2000)
+                        if len(_formatted) <= 2500:
+                            _result_str = _formatted
+                        else:
+                            _result_str = _formatted[:2500] + "\n... [additional results truncated]"
+                    else:
+                        if len(_raw_result_json) <= 2000:
+                            _result_str = _raw_result_json
+                        else:
+                            # Smart truncation: keep structure, truncate long string values
+                            _truncated = _smart_truncate_result(_result, max_total_chars=2000)
+                            _result_str = json.dumps(_truncated, indent=2, ensure_ascii=False)
+
                     tool_calls_this_turn.append({
                         "name": _tool_name, "params": _tool_params, "result": _result,
                     })
 
+                    # Rich result summary for the model
+                    _source_count = len(inferred_srcs)
+                    _result_keys = list(_result.keys()) if isinstance(_result, dict) else []
                     result_summary = f"Success: {res_label}"
-                    if inferred_srcs:
-                        result_summary += f" ({len(inferred_srcs)} sources)"
+                    if _source_count:
+                        result_summary += f" — found {_source_count} source(s)"
+                    if _result_keys:
+                        result_summary += f" — result keys: {', '.join(_result_keys[:5])}"
                     ss._emit_tool_processing_status(result_summary)
                     ss._emit_tool_processing_close(
-                        f"Completed with {len(str(_result))} chars of output"
+                        f"Completed — output: {len(_raw_result_json):,} chars"
                     )
 
                     _out_evt = {
@@ -3052,24 +3752,100 @@ class ChatMixin:
                     _result_str = f"Error: {e}"
                     _result     = {"error": _result_str}
 
-            _temp_call = self.add_message(
-                sender=personality.name, sender_type="assistant",
-                content=_so_far, parent_id=_current_branch_tip
-            )
-            _temp_res = self.add_message(
-                sender="system", sender_type="user",
-                content=f"<tool_result name=\"{_tool_name}\">{_result_str}</tool_result>",
-                parent_id=_temp_call.id
-            )
-            _temp_msg_ids.extend([_temp_call.id, _temp_res.id])
-            _current_branch_tip = _temp_res.id
+            # ── Large output condensation (preserves multi-step flow) ─────
+            _result_len = len(_result_str)
+            if _result_len > _LARGE_OUTPUT_THRESHOLD_CHARS and _tool_name != "final_answer":
+                _reading_id = _step_start(callback, f"Condensing large output ({_result_len:,} chars)...")
+                from ._repl_tools import TextBuffer
+                _read_buf = TextBuffer()
+                _buf_handle = f"tool_result_{_tool_name}_{_round}"
+                _read_buf.store(_buf_handle, _result_str)
 
-            ai_message.content = _clean_text_so_far
+                # Extract key info via search + range reads
+                _query = _tool_params.get("query", _tool_params.get("prompt", ""))
+                if _query:
+                    _search_res = _read_buf.search(_buf_handle, _query, max_results=5)
+                    _relevant_indices = [h["index"] for h in _search_res.get("hits", [])]
+                else:
+                    _list_res = _read_buf.list_records(_buf_handle, page=1, page_size=5)
+                    _relevant_indices = [i["index"] for i in _list_res.get("items", [])]
+
+                _condensed_parts = []
+                for _idx in _relevant_indices[:5]:
+                    _rec_res = _read_buf.get_record(_buf_handle, _idx)
+                    if _rec_res.get("success"):
+                        _condensed_parts.append(f"[Record {_idx}] {_rec_res['record']}")
+
+                _condensed_summary = "\n".join(_condensed_parts) if _condensed_parts else _result_str[:1500]
+
+                # Add to scratchpad for later reference in final answer
+                _reading_note = (
+                    f"\n--- Tool: {_tool_name} (large output, {_result_len:,} chars) ---\n"
+                    f"Query: {_query or '(none)'}\n"
+                    f"Key findings ({len(_relevant_indices)} relevant records):\n"
+                    f"{_condensed_summary}\n"
+                    f"--- End {_tool_name} ---\n"
+                )
+                self.scratchpad = (self.scratchpad or "") + _reading_note
+
+                _step_end(callback, f"Condensed to {len(_condensed_summary):,} chars", _reading_id)
+
+                _result_str_for_llm = (
+                    f"[LARGE OUTPUT CONDENSED — original was {_result_len:,} chars]\n"
+                    f"{_condensed_summary}\n"
+                    f"[Full data available in scratchpad if more detail needed]"
+                )
+            else:
+                _result_str_for_llm = _result_str
+
+                # ── Update virtual history for the next round ──
+                # Instead of just stripping, we replace processing tags with a compact confirmation.
+                # This prevents the LLM from thinking it didn't do anything (poisoning) 
+                # while keeping the context clean.
+                def _compact_repl(m):
+                    t = re.search(r'type="([^"]+)"', m.group(0))
+                    n = re.search(r'title="([^"]+)"', m.group(0))
+                    p_type = t.group(1) if t else "action"
+                    p_name = n.group(1) if n else "task"
+                    return f"\n[SYSTEM: {p_name} ({p_type}) executed successfully]\n"
+
+                _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
+
+                _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
+                _virtual_history.append(SimpleNamespace(sender_type="user", content=f"<tool_result name=\"{_tool_name}\">{_result_str_for_llm}</tool_result>"))
+
+                ai_message.content = _clean_text_so_far
 
         # ====================================================================
         #  Forced final-answer pass
         # ====================================================================
-        if is_agentic_turn and not _clean_text_so_far.strip():
+        # Trigger when:
+        #   • We did tool calls but the model never produced clean final text, OR
+        #   • We hit the step limit and need to synthesize an answer from scratchpad, OR
+        #   • The model has done 3+ tool calls and seems stuck gathering without answering
+        # This is the LAST resort — it runs AFTER the agentic loop ends, preserving
+        # the multi-step knowledge-gathering flow.
+        _tool_call_count = len(tool_calls_this_turn)
+        _has_produced_text = bool(_clean_text_so_far.strip()) and len(_clean_text_so_far.strip()) > 100
+        _seems_stuck = _tool_call_count >= 3 and not _has_produced_text
+
+        _needs_forced_answer = (
+            is_agentic_turn
+            and (
+                not _clean_text_so_far.strip()           # No output at all
+                or _round >= max_reasoning_steps         # Hit step limit
+                or _seems_stuck                          # 3+ tools, no real text
+                or (tool_calls_this_turn and not any(   # Did tools but no real answer
+                    c.get("name") == "final_answer" for c in tool_calls_this_turn
+                ))
+            )
+        )
+
+        if _seems_stuck and not _needs_forced_answer:
+            # Pre-shake before forcing answer: warn the model it's about to be forced
+            _warning(callback, f"[STUCK DETECTED] {_tool_call_count} tool calls, no substantial text. Forcing answer synthesis.")
+
+        if _needs_forced_answer:
             _final_id  = _step_start(callback, "Generating final answer...")
 
             ss_final = _StreamState(
@@ -3091,13 +3867,49 @@ class ChatMixin:
                 return True
 
             _scratch_before_final = self.scratchpad
-            self.scratchpad = (
-                (_scratch_before_final or "")
-                + "\n\n[SYSTEM INSTRUCTION] All tool calls are complete. "
-                "Write your final answer to the user in plain text. "
-                "Do NOT emit any more <tool_call> tags."
-            )
-            
+
+            # Build a rich context-aware prompt for the final answer synthesis
+            _forced_prompt_parts = [
+                "[SYSTEM INSTRUCTION — MANDATORY — FINAL ANSWER REQUIRED]",
+                "",
+                "You have completed all necessary research and tool calls.",
+                "Your task NOW is to write a comprehensive final answer to the user's",
+                "original question using the information gathered below.",
+                "",
+                "⚠️  ABSOLUTE PROHIBITIONS:",
+                "• Do NOT call any more tools — there are no more tool calls allowed",
+                "• Do NOT emit <tool_call> tags — they will be ignored",
+                "• Do NOT ask follow-up questions — answer what you have",
+                "• Do NOT say 'I need more information' — use what you have gathered",
+                "",
+                "✅  REQUIREMENTS:",
+                "• Synthesize ALL gathered information into a coherent response",
+                "• Cite sources using [1], [2] format when applicable",
+                "• Answer directly, completely, and concisely",
+                "• If information is incomplete, say so briefly then answer with what you have",
+            ]
+
+            # Include scratchpad summary if available
+            if _scratch_before_final and _scratch_before_final.strip():
+                _forced_prompt_parts.extend([
+                    "",
+                    "=== GATHERED INFORMATION (scratchpad) ===",
+                    _scratch_before_final.strip()[:3000],  # Cap to avoid overflow
+                    "=== END GATHERED INFORMATION ===",
+                ])
+            else:
+                _forced_prompt_parts.extend([
+                    "",
+                    "[NO GATHERED INFORMATION — answer from your general knowledge]",
+                ])
+
+            _forced_prompt_parts.extend([
+                "",
+                "[END SYSTEM INSTRUCTION — WRITE YOUR FINAL ANSWER NOW]",
+            ])
+
+            self.scratchpad = "\n".join(_forced_prompt_parts)
+
             merged_images = self._merge_artefact_images(images)
             kwargs['streaming_callback']=_final_relay
             self.lollmsClient.chat(
@@ -3108,7 +3920,7 @@ class ChatMixin:
                 temperature=final_answer_temperature,
                 **kwargs,
             )
-            
+
             ss_final.flush_remaining_buffer()
             self.scratchpad = _scratch_before_final
 
@@ -3118,6 +3930,8 @@ class ChatMixin:
 
         # ── Clean up temporary tool-history messages ─────────────────────────
         for mid in reversed(_temp_msg_ids):
+            if mid == user_msg.id:
+                continue
             if hasattr(self, 'remove_message'):
                 self.remove_message(mid)
             elif hasattr(self, 'delete_message'):
