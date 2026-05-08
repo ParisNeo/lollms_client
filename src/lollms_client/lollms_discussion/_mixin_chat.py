@@ -2231,7 +2231,7 @@ class _StreamState:
         ASCIIColors.info("--- [DEBUG] HYPER-FOCUSED SPECIALIST INPUT ---")
         ASCIIColors.cyan(f"Persona: {requested_persona}")
         ASCIIColors.yellow(f"Payload Size: {len(final_payload)} chars")
-        if self.discussion.debug:
+        if self.discussion.lollmsClient.debug:
             print(final_payload)
         ASCIIColors.info("----------------------------------------------")
 
