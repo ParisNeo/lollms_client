@@ -22,6 +22,8 @@ import os
 
 import ollama
 import tiktoken
+from contextlib import contextmanager
+import threading
 BindingName = "OllamaBinding"
 
 
@@ -102,17 +104,50 @@ class OllamaBinding(LollmsLLMBinding):
         if self.service_key:
             self.ollama_client_headers['Authorization'] = f'Bearer {self.service_key}'
 
+        self._active_client = None
+        self._client_lock = threading.Lock()
+
+
+
+    @contextmanager
+    def _client(self):
+        """
+        Context manager that yields a fresh ollama.Client instance.
+        Ensures the underlying httpx client is closed after use.
+        """
+        client = ollama.Client(
+            host=self.host_address,
+            headers=self.ollama_client_headers if self.ollama_client_headers else None,
+            verify=self.verify_ssl_certificate
+        )
+        with self._client_lock:
+            self._active_client = client
         try:
-            self.ollama_client = ollama.Client(
-                host=self.host_address,
-                headers=self.ollama_client_headers if self.ollama_client_headers else None,
-                verify=self.verify_ssl_certificate # Passed to httpx.Client
-            )
-        except Exception as e:
-            ASCIIColors.error(f"Failed to initialize Ollama client: {e}")
-            self.ollama_client = None # Ensure it's None if initialization fails
-            # Optionally re-raise or handle so the binding is clearly unusable
-            raise ConnectionError(f"Could not connect or initialize Ollama client at {self.host_address}: {e}") from e
+            yield client
+        finally:
+            with self._client_lock:
+                self._active_client = None
+            try:
+                if hasattr(client, '_client') and client._client is not None:
+                    client._client.close()
+            except Exception as e:
+                ASCIIColors.warning(f"[{self.binding_name}] Error while closing ollama client: {e}")
+
+    def cancel(self) -> None:
+        """
+        Signal the binding to stop the current generation as soon as possible.
+        Closes the active ollama client to abort in-flight HTTP requests,
+        then sets the base-class cancellation event.
+        """
+        with self._client_lock:
+            active = self._active_client
+            if active is not None:
+                try:
+                    if hasattr(active, '_client') and active._client is not None:
+                        active._client.close()
+                except Exception as e:
+                    ASCIIColors.warning(f"[{self.binding_name}] Error while closing active ollama client in cancel(): {e}")
+        super().cancel()
 
     def generate_text(self,
                     prompt: str,
@@ -163,10 +198,6 @@ class OllamaBinding(LollmsLLMBinding):
         Returns:
             Union[str, dict]: Generated text or error dictionary if failed.
         """
-
-        if not self.ollama_client:
-             return {"status": False, "error": "Ollama client not initialized."}
-
         if streaming_callback:
             stream = True
 
@@ -185,106 +216,111 @@ class OllamaBinding(LollmsLLMBinding):
         think = think if "gpt-oss" not in self.model_name else reasoning_effort
 
         try:
-            if images: # Multimodal
-                # ollama-python expects paths or bytes for images
-                processed_images = []
-                for img_path in images:
-                    # Assuming img_path is a file path. ollama-python will read and encode it.
-                    # If images were base64 strings, they would need decoding to bytes first.
-                    if img_path.startswith("data:image/png;base64,"):
-                        img_path = img_path[len("data:image/png;base64,"):]
-                    processed_images.append(img_path)
+            with self._client() as client:
+                if images: # Multimodal
+                    # ollama-python expects paths or bytes for images
+                    processed_images = []
+                    for img_path in images:
+                        # Assuming img_path is a file path. ollama-python will read and encode it.
+                        # If images were base64 strings, they would need decoding to bytes first.
+                        if img_path.startswith("data:image/png;base64,"):
+                            img_path = img_path[len("data:image/png;base64,"):]
+                        processed_images.append(img_path)
 
-                messages = [
-                            {'role': 'system', 'content':system_prompt},
-                        ]
-                if split:
-                    messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
-                    if processed_images:
-                        messages[-1]["images"]=processed_images
-                else:
-                    messages.append({'role': 'user', 'content': prompt, 'images': processed_images if processed_images else None})
-                if stream:
-                    response_stream = self.ollama_client.chat(
-                        model=self.model_name,
-                        messages=messages,
-                        stream=True,
-                        think=think,
-                        options=options if options else None
-                    )
-                    in_thinking = False
-                    for chunk in response_stream:
-                        if chunk.message.thinking and not in_thinking:
-                            full_response_text += "<think>\n"
-                            in_thinking = True
-                            
-                        if chunk.message.content:# Ensure there is content to process
-                            chunk_content = chunk.message.content
-                            if in_thinking:
-                                full_response_text += "\n</think>\n"                            
-                                in_thinking = False
-                            full_response_text += chunk_content
-                            if streaming_callback:
-                                if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                    break # Callback requested stop
-                    return full_response_text
-                else: # Not streaming
-                    response = self.ollama_client.chat(
-                        model=self.model_name,
-                        messages=messages,
-                        stream=False,
-                        think=think,
-                        options=options if options else None
-                    )
-                    full_response_text = response.message.content
-                    if think:
-                        full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
-                    return full_response_text
-            else: # Text-only
-                messages = [
-                            {'role': 'system', 'content':system_prompt},
-                        ]
-                if split:
-                    messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
-                else:
-                    messages.append({'role': 'user', 'content': prompt})
+                    messages = [
+                                {'role': 'system', 'content':system_prompt},
+                            ]
+                    if split:
+                        messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
+                        if processed_images:
+                            messages[-1]["images"]=processed_images
+                    else:
+                        messages.append({'role': 'user', 'content': prompt, 'images': processed_images if processed_images else None})
+                    if stream:
+                        response_stream = client.chat(
+                            model=self.model_name,
+                            messages=messages,
+                            stream=True,
+                            think=think,
+                            options=options if options else None
+                        )
+                        in_thinking = False
+                        for chunk in response_stream:
+                            if self.is_cancelled():
+                                break
+                            if chunk.message.thinking and not in_thinking:
+                                full_response_text += "<think>\n"
+                                in_thinking = True
+                                
+                            if chunk.message.content:# Ensure there is content to process
+                                chunk_content = chunk.message.content
+                                if in_thinking:
+                                    full_response_text += "\n<think>\n"                            
+                                    in_thinking = False
+                                full_response_text += chunk_content
+                                if streaming_callback:
+                                    if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                        break # Callback requested stop
+                        return full_response_text
+                    else: # Not streaming
+                        response = client.chat(
+                            model=self.model_name,
+                            messages=messages,
+                            stream=False,
+                            think=think,
+                            options=options if options else None
+                        )
+                        full_response_text = response.message.content
+                        if think:
+                            full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
+                        return full_response_text
+                else: # Text-only
+                    messages = [
+                                {'role': 'system', 'content':system_prompt},
+                            ]
+                    if split:
+                        messages += self.split_discussion(prompt,user_keyword=user_keyword, ai_keyword=ai_keyword)
+                    else:
+                        messages.append({'role': 'user', 'content': prompt})
 
-                if stream:
-                    response_stream = self.ollama_client.chat(
-                        model=self.model_name,
-                        messages=messages,
-                        stream=True,
-                        think=think,
-                        options=options if options else None
-                    )
-                    in_thinking = False
-                    for chunk in response_stream:
-                        if chunk.message.thinking and not in_thinking:
-                            full_response_text += "<think>\n"
-                            in_thinking = True
-                            
-                        if chunk.message.content:# Ensure there is content to process
-                            chunk_content = chunk.message.content
-                            if in_thinking:
-                                full_response_text += "\n</think>\n"                            
-                                in_thinking = False
-                            full_response_text += chunk_content
-                            if streaming_callback:
-                                if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                    break # Callback requested stop
-                    return full_response_text
-                else: # Not streaming
-                    response = self.ollama_client.chat(
-                        model=self.model_name,
-                        messages=messages,
-                        stream=False,
-                        think=think,
-                        options=options if options else None
-                    )
-                    full_response_text = response.message.content
-                    if think and response.message.thinking:
-                        full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
-                    return full_response_text
+                    if stream:
+                        response_stream = client.chat(
+                            model=self.model_name,
+                            messages=messages,
+                            stream=True,
+                            think=think,
+                            options=options if options else None
+                        )
+                        in_thinking = False
+                        for chunk in response_stream:
+                            if self.is_cancelled():
+                                break
+                            if chunk.message.thinking and not in_thinking:
+                                full_response_text += "<think>\n"
+                                in_thinking = True
+                                
+                            if chunk.message.content:# Ensure there is content to process
+                                chunk_content = chunk.message.content
+                                if in_thinking:
+                                    full_response_text += "\n<think>\n"                            
+                                    in_thinking = False
+                                full_response_text += chunk_content
+                                if streaming_callback:
+                                    if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                        break # Callback requested stop
+                        return full_response_text
+                    else: # Not streaming
+                        response = client.chat(
+                            model=self.model_name,
+                            messages=messages,
+                            stream=False,
+                            think=think,
+                            options=options if options else None
+                        )
+                        full_response_text = response.message.content
+                        if think and response.message.thinking:
+                            full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
+                        return full_response_text
                     
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
@@ -317,9 +353,6 @@ class OllamaBinding(LollmsLLMBinding):
                         reasoning_summary: Optional[bool] = "auto", # auto
                         **kwargs
                         ) -> Union[str, dict]:
-        if not self.ollama_client:
-            return {"status": False, "error": "Ollama client not initialized."}
-
         options = {}
         if n_predict is not None: options['num_predict'] = n_predict
         if temperature is not None: options['temperature'] = float(temperature)
@@ -387,34 +420,37 @@ class OllamaBinding(LollmsLLMBinding):
         full_response_text = ""
 
         try:
-            if stream:
-                response_stream = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=ollama_messages,
-                    stream=True,
-                    think = think,
-                    options=options if options else None
-                )
-                for chunk_dict in response_stream:
-                    chunk_content = chunk_dict.get('message', {}).get('content', '')
-                    if chunk_content:
-                        full_response_text += chunk_content
-                        if streaming_callback:
-                            if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
-                return full_response_text
-            else:
-                response = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=ollama_messages,
-                    stream=False,
-                    think=think if "gpt-oss" not in self.model_name else reasoning_effort,
-                    options=options if options else None
-                )
-                full_response_text = response.message.content
-                if think:
-                    full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
-                return full_response_text
+            with self._client() as client:
+                if stream:
+                    response_stream = client.chat(
+                        model=self.model_name,
+                        messages=ollama_messages,
+                        stream=True,
+                        think = think,
+                        options=options if options else None
+                    )
+                    for chunk_dict in response_stream:
+                        if self.is_cancelled():
+                            break
+                        chunk_content = chunk_dict.get('message', {}).get('content', '')
+                        if chunk_content:
+                            full_response_text += chunk_content
+                            if streaming_callback:
+                                if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                    break
+                    return full_response_text
+                else:
+                    response = client.chat(
+                        model=self.model_name,
+                        messages=ollama_messages,
+                        stream=False,
+                        think=think if "gpt-oss" not in self.model_name else reasoning_effort,
+                        options=options if options else None
+                    )
+                    full_response_text = response.message.content
+                    if think:
+                        full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
+                    return full_response_text
 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
@@ -471,9 +507,6 @@ class OllamaBinding(LollmsLLMBinding):
         Returns:
             Union[str, dict]: The generated text or an error dictionary.
         """
-        if not self.ollama_client:
-             return {"status": "error", "message": "Ollama client not initialized."}
-
         # 1. Export the discussion to the Ollama chat format
         # This handles system prompts, user/assistant roles, and base64-encoded images.
         messages = discussion.export("ollama_chat", branch_tip_id)
@@ -498,44 +531,47 @@ class OllamaBinding(LollmsLLMBinding):
         ASCIIColors.panel(f"Generation with think: {think}")
 
         try:
-            # 3. Call the Ollama API
-            if stream:
-                response_stream = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=messages,
-                    stream=True,
-                    think=think,
-                    options=options if options else None
-                )
-                in_thinking = False
-                for chunk in response_stream:
-                    if chunk.message.thinking and not in_thinking:
-                        full_response_text += "<think>\n"
-                        in_thinking = True
-                        
-                    if chunk.message.content:# Ensure there is content to process
-                        chunk_content = chunk.message.content
-                        if in_thinking:
-                            full_response_text += "\n</think>\n"                            
-                            in_thinking = False
-                        full_response_text += chunk_content
-                        if streaming_callback:
-                            if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break # Callback requested stop
+            with self._client() as client:
+                # 3. Call the Ollama API
+                if stream:
+                    response_stream = client.chat(
+                        model=self.model_name,
+                        messages=messages,
+                        stream=True,
+                        think=think,
+                        options=options if options else None
+                    )
+                    in_thinking = False
+                    for chunk in response_stream:
+                        if self.is_cancelled():
+                            break
+                        if chunk.message.thinking and not in_thinking:
+                            full_response_text += "<think>\n"
+                            in_thinking = True
+                            
+                        if chunk.message.content:# Ensure there is content to process
+                            chunk_content = chunk.message.content
+                            if in_thinking:
+                                full_response_text += "\n<think>\n"                            
+                                in_thinking = False
+                            full_response_text += chunk_content
+                            if streaming_callback:
+                                if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                    break # Callback requested stop
 
-                return full_response_text
-            else: # Not streaming
-                response = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=messages,
-                    stream=False,
-                    think=think,
-                    options=options if options else None
-                )
-                full_response_text = response.message.content
-                if think:
-                    full_response_text = "<think>\n"+response.message.thinking+"\n</think>\n"+full_response_text
-                return full_response_text
+                    return full_response_text
+                else: # Not streaming
+                    response = client.chat(
+                        model=self.model_name,
+                        messages=messages,
+                        stream=False,
+                        think=think,
+                        options=options if options else None
+                    )
+                    full_response_text = response.message.content
+                    if think:
+                        full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
+                    return full_response_text
 
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
@@ -626,21 +662,19 @@ class OllamaBinding(LollmsLLMBinding):
         Raises:
             Exception: if embedding fails or Ollama client is not available.
         """
-        if not self.ollama_client:
-             raise Exception("Ollama client not initialized.")
-
         model_to_use = kwargs.get("model", "bge-m3")
         if not model_to_use:
             raise ValueError("Model name for embedding must be specified either in init or via kwargs.")
-            
+
         ollama_options = kwargs.get("options", None)
         try:
-            response = self.ollama_client.embeddings(
-                model=model_to_use, 
-                prompt=text,
-                options=ollama_options
-            )
-            return response['embedding']
+            with self._client() as client:
+                response = client.embeddings(
+                    model=model_to_use, 
+                    prompt=text,
+                    options=ollama_options
+                )
+                return response['embedding']
         except ollama.ResponseError as e:
             error_message = f"Ollama API Embeddings ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
             ASCIIColors.error(error_message)
@@ -681,34 +715,30 @@ class OllamaBinding(LollmsLLMBinding):
         Returns:
             dict: Dictionary with status (bool) and message (str).
         """
-        if not self.ollama_client:
-             msg = "Ollama client not initialized. Cannot pull model."
-             ASCIIColors.error(msg)
-             return {"status": False, "message": msg}
-
         try:
-            ASCIIColors.info(f"Pulling model {model_name}...")
-            # Stream the pull progress
-            for progress in self.ollama_client.pull(model_name, stream=True):
-                # Send raw progress to callback if provided
-                if progress_callback:
-                    progress_callback(progress)
-                
-                # Default console logging
-                status = progress.get('status', '')
-                completed = progress.get('completed')
-                total = progress.get('total')
-                
-                if completed and total:
-                    percent = (completed / total) * 100
-                    print(f"\r{status}: {percent:.2f}%", end="", flush=True)
-                else:
-                     print(f"\r{status}", end="", flush=True)
-            
-            print() # Clear line
-            msg = f"Model {model_name} pulled successfully."
-            ASCIIColors.success(msg)
-            return {"status": True, "message": msg}
+            with self._client() as client:
+                ASCIIColors.info(f"Pulling model {model_name}...")
+                # Stream the pull progress
+                for progress in client.pull(model_name, stream=True):
+                    # Send raw progress to callback if provided
+                    if progress_callback:
+                        progress_callback(progress)
+
+                    # Default console logging
+                    status = progress.get('status', '')
+                    completed = progress.get('completed')
+                    total = progress.get('total')
+
+                    if completed and total:
+                        percent = (completed / total) * 100
+                        print(f"\r{status}: {percent:.2f}%", end="", flush=True)
+                    else:
+                        print(f"\r{status}", end="", flush=True)
+
+                print() # Clear line
+                msg = f"Model {model_name} pulled successfully."
+                ASCIIColors.success(msg)
+                return {"status": True, "message": msg}
 
         except ollama.ResponseError as e:
             msg = f"Ollama API Pull Error: {e.error or 'Unknown error'} (status code: {e.status_code})"
@@ -853,22 +883,20 @@ class OllamaBinding(LollmsLLMBinding):
             List[Dict[str, str]]: A list of model information dictionaries.
                                   Each dict has 'model_name', 'owned_by', 'created_datetime'.
         """
-        if not self.ollama_client:
-            ASCIIColors.error("Ollama client not initialized. Cannot list models.")
-            return []
         try:
-            ASCIIColors.debug(f"Listing ollama models from {self.host_address}")
-            response_data = self.ollama_client.list() # This returns {'models': [{'name':..., 'modified_at':..., ...}]}
-            
-            model_info_list = []
-            if 'models' in response_data:
-                for model_entry in response_data['models']:
-                    model_info_list.append({
-                        'model_name': model_entry.get('model'),
-                        'owned_by': "", # Ollama API doesn't provide a direct "owned_by" field.
-                        'created_datetime': model_entry.get('modified_at') 
-                    })
-            return model_info_list
+            with self._client() as client:
+                ASCIIColors.debug(f"Listing ollama models from {self.host_address}")
+                response_data = client.list() # This returns {'models': [{'name':..., 'modified_at':..., ...}]}
+
+                model_info_list = []
+                if 'models' in response_data:
+                    for model_entry in response_data['models']:
+                        model_info_list.append({
+                            'model_name': model_entry.get('model'),
+                            'owned_by': "", # Ollama API doesn't provide a direct "owned_by" field.
+                            'created_datetime': model_entry.get('modified_at') 
+                        })
+                return model_info_list
         except ollama.ResponseError as e:
             ASCIIColors.error(f"Ollama API list_models ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code}) from {self.host_address}")
             return []
@@ -951,45 +979,42 @@ class OllamaBinding(LollmsLLMBinding):
             list[dict]: A list of dictionaries, each representing a running model with a standardized set of keys.
                         Returns an empty list if the client is not initialized or if an error occurs.
         """
-        if not self.ollama_client:
-            ASCIIColors.warning("Ollama client not initialized. Cannot list running models.")
-            return []
-
         try:
-            running_models_response = self.ollama_client.ps()
-            
-            models_list = running_models_response.get('models', [])
-            standardized_models = []
+            with self._client() as client:
+                running_models_response = client.ps()
 
-            for model_data in models_list:
-                details = model_data.get('details', {})
-                
-                size = model_data.get("size", 0)
-                size_vram = model_data.get("size_vram", 0)
-                
-                # Calculate spread
-                gpu_usage = 0
-                cpu_usage = 0
-                if size > 0:
-                    gpu_usage = min(100, (size_vram / size) * 100)
-                    cpu_usage = max(0, 100 - gpu_usage)
+                models_list = running_models_response.get('models', [])
+                standardized_models = []
 
-                flat_model_info = {
-                    "model_name": model_data.get("name"),
-                    "size": size,
-                    "vram_size": size_vram,
-                    "gpu_usage_percent": round(gpu_usage, 2),
-                    "cpu_usage_percent": round(cpu_usage, 2),
-                    "expires_at": model_data.get("expires_at"),
-                    "parameters_size": details.get("parameter_size"),
-                    "quantization_level": details.get("quantization_level"),
-                    "parent_model": details.get("parent_model"),
-                    # Add context_size if it exists in the details
-                    "context_size": details.get("context_length") 
-                }
-                standardized_models.append(flat_model_info)
-            
-            return standardized_models
+                for model_data in models_list:
+                    details = model_data.get('details', {})
+
+                    size = model_data.get("size", 0)
+                    size_vram = model_data.get("size_vram", 0)
+
+                    # Calculate spread
+                    gpu_usage = 0
+                    cpu_usage = 0
+                    if size > 0:
+                        gpu_usage = min(100, (size_vram / size) * 100)
+                        cpu_usage = max(0, 100 - gpu_usage)
+
+                    flat_model_info = {
+                        "model_name": model_data.get("name"),
+                        "size": size,
+                        "vram_size": size_vram,
+                        "gpu_usage_percent": round(gpu_usage, 2),
+                        "cpu_usage_percent": round(cpu_usage, 2),
+                        "expires_at": model_data.get("expires_at"),
+                        "parameters_size": details.get("parameter_size"),
+                        "quantization_level": details.get("quantization_level"),
+                        "parent_model": details.get("parent_model"),
+                        # Add context_size if it exists in the details
+                        "context_size": details.get("context_length") 
+                    }
+                    standardized_models.append(flat_model_info)
+
+                return standardized_models
 
         except Exception as e:
             ASCIIColors.error(f"Failed to list running models from Ollama at {self.host_address}: {e}")

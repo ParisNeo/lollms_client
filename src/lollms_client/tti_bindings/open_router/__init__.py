@@ -86,7 +86,7 @@ class OpenRouterTTIBinding(LollmsTTIBinding):
         payload["image_config"] = image_config
 
         try:
-            ASCIIColors.info(f"Open Router TTI Request: Model={model}, Aspect Ratio={aspect_ratio}")
+            ASCIIColors.panel(f"[bold]Model:[/bold]{model}\n[bold]Aspect Ratio:[/bold]{aspect_ratio}","[bold]Open Router TTI Request:[/bold]")
             response = requests.post(
                 f"{self.host_address}/chat/completions", 
                 headers=headers, 

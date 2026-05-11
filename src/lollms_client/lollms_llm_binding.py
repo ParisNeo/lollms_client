@@ -102,9 +102,59 @@ class LollmsLLMBinding(LollmsBaseBinding):
         self.end_header_id_template = ": "
         self.system_message_template = "system"
 
+
+        # ── Cancellation state ────────────────────────────────────────────────
+        # A threading.Event so it is safe to set() from any thread (including
+        # the async event loop via call_soon_threadsafe) and check from the
+        # blocking generation thread.
+        import threading
+        self._cancel_event = threading.Event()
+
         # build text processor
         self.tp = LollmsTextProcessor(self)
-    
+
+    # ── Cancellation API ─────────────────────────────────────────────────────
+
+    def cancel(self) -> None:
+        """
+        Signal the binding to stop the current generation as soon as possible.
+
+        The base implementation sets a threading.Event that:
+          - is checked by the default streaming callback guard (see
+            _is_cancelled() below), and
+          - should be checked inside any subclass generate_text() /
+            generate_from_messages() loop.
+
+        Subclasses that hold a live HTTP session (e.g. httpx, requests) should
+        override this method, close/cancel that session, and then call
+        super().cancel() so the event is set too.
+
+        Example override for an httpx-based binding::
+
+            def cancel(self) -> None:
+                if self._http_client is not None:
+                    self._http_client.close()   # aborts in-flight request
+                super().cancel()
+        """
+        ASCIIColors.warning(f"[{self.binding_name}] cancel() called — setting cancel event.")
+        self._cancel_event.set()
+
+    def reset_cancel(self) -> None:
+        """
+        Clear the cancellation flag so the binding is ready for a new generation.
+        Must be called before each new generate_text() / generate_from_messages()
+        call (the server layer is responsible for doing this).
+        """
+        self._cancel_event.clear()
+
+    def is_cancelled(self) -> bool:
+        """
+        Returns True if cancel() has been called and the flag has not yet been
+        reset via reset_cancel().  Subclasses can call this inside tight
+        generation loops as a cooperative cancellation check.
+        """
+        return self._cancel_event.is_set()
+
     @property
     def system_full_header(self) -> str:
         return f"{self.start_header_id_template}{self.system_message_template}{self.end_header_id_template}"

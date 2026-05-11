@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-11 01:37]
+
+- feat(bindings): extend LLM and TTI binding implementations
+
 ## [2026-05-07 10:51]
 
 - feat(discussion): add MSG_TYPE_FORM_READY and expand prompt/chat artefact handling
