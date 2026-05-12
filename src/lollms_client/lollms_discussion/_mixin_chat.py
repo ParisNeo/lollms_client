@@ -2247,7 +2247,7 @@ class _StreamState:
             # ── DEBUG LOG: Show Raw Specialist Response ──
             ASCIIColors.info("--- [DEBUG] SPECIALIST RAW OUTPUT ---")
             ASCIIColors.yellow(f"Output Length: {len(raw_output or '')} chars")
-            if self.discussion.debug:
+            if self.discussion.lollmsClient.debug:
                 ASCIIColors.white(raw_output)
             ASCIIColors.info("-------------------------------------")
 
