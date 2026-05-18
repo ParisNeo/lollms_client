@@ -726,6 +726,17 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         else:
             popen_kwargs["start_new_session"] = True
+            # On Linux/Unix, llama.cpp releases ship shared libraries (.so)
+            # in the same directory as the binary. Ensure the dynamic linker
+            # can find them by adding bin_dir to LD_LIBRARY_PATH.
+            env = os.environ.copy()
+            ld_path = env.get("LD_LIBRARY_PATH", "")
+            bin_dir_str = str(self.bin_dir)
+            if ld_path:
+                env["LD_LIBRARY_PATH"] = f"{bin_dir_str}:{ld_path}"
+            else:
+                env["LD_LIBRARY_PATH"] = bin_dir_str
+            popen_kwargs["env"] = env
 
         proc = subprocess.Popen(cmd, **popen_kwargs)
 
