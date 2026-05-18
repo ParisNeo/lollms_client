@@ -1,0 +1,124 @@
+title: 'Voxtral Local TTS'
+author: 'ParisNeo & Mistral AI'
+version: 1.0.0
+binding_name: 'voxtral_local'
+
+description: |
+  Fully local TTS binding for Mistral's open-weight Voxtral-4B-TTS-2603 model.
+  The model runs on your own GPU via vLLM-Omni — no API key or internet
+  connection required after the initial model download.
+
+  Architecture
+  ────────────
+  A persistent FastAPI gateway (this binding's server/main.py) is managed as a
+  background subprocess.  It in turn spawns a vLLM-Omni child process that
+  hosts the model weights.  Synthesis requests are forwarded from the client
+  binding → gateway → vLLM-Omni and results returned as raw audio bytes.
+
+  This two-layer design means multiple worker processes share a single copy of
+  the 8 GB model in VRAM — identical to the XTTS binding's philosophy.
+
+  Hardware requirements
+  ─────────────────────
+  Minimum: 1 × GPU with ≥ 16 GB VRAM (BF16 weights ~8 GB + inference overhead)
+  Recommended: 1 × RTX 3090 / RTX 4080 / A10G or better
+  CPU-only: supported but very slow (add --device cpu)
+
+  Features
+  ────────
+  • 20 built-in preset voices (American/British English, French, Spanish, German)
+  • Zero-shot voice cloning from a 3–25 s reference WAV/MP3
+  • 9 supported languages: en, fr, de, es, nl, pt, it, hi, ar
+  • OpenAI-compatible /v1/audio/speech endpoint
+  • Voice upload via /upload_voice for persistent custom voices
+
+global_input_parameters:
+  - name: "host"
+    type: "str"
+    default: "localhost"
+    description: "Host the gateway server binds to."
+
+  - name: "port"
+    type: "int"
+    default: 8030
+    description: >
+      Port for the gateway. The vLLM-Omni backend binds to port+1
+      (default 8031) on localhost only.
+
+  - name: "hf_token"
+    type: "str"
+    default: ""
+    description: >
+      HuggingFace access token. Can also be set via the HF_TOKEN environment
+      variable. Required only if the model repo is gated.
+
+  - name: "device"
+    type: "str"
+    default: "auto"
+    description: "Device to run the model on: 'auto', 'cuda', 'cpu'."
+
+  - name: "auto_start_server"
+    type: "bool"
+    default: false
+    description: "Automatically start the server on binding initialisation."
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "mistralai/Voxtral-4B-TTS-2603"
+    description: "HuggingFace model ID for the Voxtral model."
+
+  - name: "default_voice"
+    type: "str"
+    default: "af_bella"
+    description: "Fallback voice used when none is specified in a generation call."
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The text to synthesise."
+
+  - name: "voice"
+    type: "str"
+    default: "af_bella"
+    description: >
+      Preset voice name (e.g. 'bm_george') OR the name of a previously uploaded
+      custom voice file for zero-shot cloning.
+
+  - name: "language"
+    type: "str"
+    default: "en"
+    description: "BCP-47 language code: en, fr, de, es, nl, pt, it, hi, ar."
+
+  - name: "response_format"
+    type: "str"
+    default: "wav"
+    description: "Audio output format: wav, mp3, opus, flac, pcm."
+
+  - name: "speed"
+    type: "float"
+    default: 1.0
+    description: "Playback speed multiplier (0.25–4.0)."
+
+commands:
+  - name: "upload_voice"
+    title: "Upload Voice"
+    description: >
+      Upload a WAV or MP3 reference file (3–25 s recommended) to enable
+      zero-shot voice cloning for that speaker.
+    parameters:
+      - name: "voice_path"
+        type: "str"
+        description: "Local path to the reference audio file."
+        mandatory: true
+      - name: "voice_name"
+        type: "str"
+        description: "Name to register the voice under. Defaults to filename stem."
+        mandatory: false
+    output:
+      - name: "success"
+        type: "bool"
+      - name: "voice_name"
+        type: "str"
+      - name: "message"
+        type: "str"

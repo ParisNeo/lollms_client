@@ -28,9 +28,9 @@ from ._mixin_chat   import ChatMixin
 from ._mixin_utils  import UtilsMixin
 from ._mixin_branch import BranchMixin, BranchInfo, MessageNode
 from ._mixin_memory import MemoryMixin
+from ._mixin_file_import import FileImportMixin
 
-
-class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixin, MemoryMixin):
+class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixin, MemoryMixin, FileImportMixin):
     """
     Represents and manages a single discussion.
 
@@ -108,4 +108,5 @@ __all__ = [
     "BranchInfo",
     "MessageNode",
     "MemoryMixin",
+    "FileImportMixin"
 ]

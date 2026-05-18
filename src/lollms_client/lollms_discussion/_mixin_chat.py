@@ -62,7 +62,11 @@ if TYPE_CHECKING:
 # Hard cap on bracket buffer size
 # ---------------------------------------------------------------------------
 _MAX_BRACKET_BUF = 4096
-
+# Marker injected into virtual history to replace processed <processing> blocks.
+# Uses Unicode chars unlikely to appear in any LLM output naturally.
+# The streaming scrubber strips this if the model reproduces it anyway.
+_EXEC_MARKER = "\u00b7\u1d3d\u0427\u00d8\u0441\u00b7"  # ·ᴽЧØс·
+_EXEC_MARKER_RE = re.compile(re.escape(_EXEC_MARKER) + r'|(\[BLIND_ACTION_EXECUTED\])')
 # ---------------------------------------------------------------------------
 # All tag prefixes that must NEVER leak to the chat bubble
 # ---------------------------------------------------------------------------
@@ -108,7 +112,12 @@ _TAG_STARTS = [
     "<use_handle",
     "<processing",     # Unified processing indicator
 ]
-
+# Non-XML tokens to suppress from the output stream entirely
+_SUPPRESS_TOKENS = [
+    "[BLIND_ACTION_EXECUTED]",
+    # Add future markers here
+]
+_MAX_SUPPRESS_BUF = 64
 # Secondary-stream tag type mapping
 _SECONDARY_TAG_MAP = {
     "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
@@ -126,6 +135,7 @@ _SECONDARY_TAG_MAP = {
     "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_FORM_READY,
                        MSG_TYPE.MSG_TYPE_FORM_READY,        "</lollms_form>"),
 }
+
 
 
 # ---------------------------------------------------------------------------
@@ -1184,6 +1194,9 @@ class _StreamState:
         self.affected_artefacts: List[Dict] = []
         self.patch_error_occurred: bool = False
         self.stream_buf: List[str]  = []
+        self.clean_prose: List[str] = []   # only actual MSG_TYPE_CHUNK prose, no processing XML
+        self.suppress_buf: List[str] = []
+        self._in_suppress: bool = False
 
     # ---------------------------------------------------------------- public entry point
 
@@ -1236,26 +1249,37 @@ class _StreamState:
     # ---------------------------------------------------------------- STATE_NORMAL
 
     def _feed_normal(self, chunk: str, pos: int) -> int:
-        lt_idx = chunk.find("<", pos)
+        # Check for both '<' (XML tags) and '[' (suppress tokens)
+        next_special = -1
+        for c in ('<', '['):
+            idx = chunk.find(c, pos)
+            if idx != -1 and (next_special == -1 or idx < next_special):
+                next_special = idx
+                next_char = c
 
-        if lt_idx == -1:
+        if next_special == -1:
             text = chunk[pos:]
             if text:
-                # [FIX] Do NOT auto-close processing on text. 
-                # Let conversational text exist before or after the block.
                 self.ai_message.content += text
+                self.clean_prose.append(text)
                 _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
             return len(chunk)
 
-        if lt_idx > pos:
-            text = chunk[pos:lt_idx]
+        if next_special > pos:
+            text = chunk[pos:next_special]
             if text:
                 self.ai_message.content += text
+                self.clean_prose.append(text)
                 _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
 
-        self.state = self.STATE_BUFFERING
-        self.bracket_buf = ["<"]
-        return lt_idx + 1
+        if next_char == '<':
+            self.state = self.STATE_BUFFERING
+            self.bracket_buf = ["<"]
+        else:  # '['
+            self.state = self.STATE_BUFFERING
+            self.bracket_buf = ["["]
+            self._suppress_mode = True  # flag that we're in a [...] buffer
+        return next_special + 1
 
     # ---------------------------------------------------------------- STATE_BUFFERING
 
@@ -1312,6 +1336,7 @@ class _StreamState:
         self.bracket_buf.clear()
         if text:
             self.ai_message.content += text
+            self.clean_prose.append(text)
             _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
 
     def _match_secondary_prefix(self, b_str: str) -> Optional[str]:
@@ -1404,6 +1429,11 @@ class _StreamState:
         self.sec_open_attrs = _parse_tag_attrs(opening_tag)
         self.sec_content    = []
         self.sec_close_scan = ""
+
+        # Line-based status buffering (reset per secondary tag)
+        self._status_line_buffer = ""
+        self._status_lines_processed = 0
+        self._status_context_lines = []
 
         # Map prefix → processing type for the status reporting
         proc_type_map = {
@@ -1625,58 +1655,82 @@ class _StreamState:
         if not hasattr(self, '_fired_milestones'):
             self._fired_milestones = set()
 
-        full_buffer = "".join(self.sec_content)
-        total_len   = len(full_buffer)
+        # ── LINE-BASED STATUS EMIT ───────────────────────────────────────────
+        # Only emit status updates when complete lines have been received.
+        # Buffer partial lines across chunks; process only on newline.
+        if not hasattr(self, '_status_line_buffer'):
+            self._status_line_buffer = ""
+            self._status_lines_processed = 0
 
-        # ── 1. Structural feature detection ──────────────────────────────────
-        # Scan the full buffer for all known features, fire for the FIRST one
-        # (in document order) that has not been reported yet.  One status
-        # message per chunk — we return immediately after firing.
+        self._status_line_buffer += content
 
-        # Markdown headers
-        for m in re.finditer(r'^(#{1,4})\s+(.+)$', full_buffer, re.MULTILINE):
-            key = f"feat:hdr:{m.group(2).strip()}"
-            if key not in self._fired_milestones:
-                self._fired_milestones.add(key)
-                self._emit_processing_status(f"📖 Section: {m.group(2).strip()}")
-                # Still fall through to emit the legacy chunk event below
-                break
+        # Extract only newly-completed lines (those ending in \n)
+        lines_to_process = []
+        while '\n' in self._status_line_buffer:
+            line, self._status_line_buffer = self._status_line_buffer.split('\n', 1)
+            lines_to_process.append(line)
 
+        # If no complete lines yet, skip status emission entirely
+        if not lines_to_process:
+            pass  # Will fall through to legacy chunk events below
         else:
-            # Classes (only if no header was newly found above)
-            for m in re.finditer(r'class\s+([a-zA-Z0-9_]+)', full_buffer):
-                key = f"feat:cls:{m.group(1)}"
+            # Rebuild a pseudo-buffer from only the lines we're scanning now,
+            # plus enough context from prior lines for regex anchoring.
+            # We keep a sliding window of the last 5 lines for context.
+            if not hasattr(self, '_status_context_lines'):
+                self._status_context_lines = []
+            self._status_context_lines.extend(lines_to_process)
+            # Trim context window to last 50 lines to prevent unbounded growth
+            self._status_context_lines = self._status_context_lines[-50:]
+
+            scan_buffer = '\n'.join(self._status_context_lines)
+            total_len = len("".join(self.sec_content)) + len(self._status_line_buffer)
+
+            # ── 1. Structural feature detection ──────────────────────────────
+            # Scan only newly-completed lines for features not yet reported.
+            # Markdown headers
+            for m in re.finditer(r'^(#{1,4})\s+(.+)$', scan_buffer, re.MULTILINE):
+                key = f"feat:hdr:{m.group(2).strip()}"
                 if key not in self._fired_milestones:
                     self._fired_milestones.add(key)
-                    self._emit_processing_status(f"🏗️ Class: {m.group(1)}")
+                    self._emit_processing_status(f"📖 Section: {m.group(2).strip()}")
                     break
+
             else:
-                # Functions
-                for m in re.finditer(
-                    r'(?:def|function)\s+([a-zA-Z0-9_]+)\s*\(', full_buffer
-                ):
-                    key = f"feat:fn:{m.group(1)}"
+                # Classes (only if no header was newly found above)
+                for m in re.finditer(r'class\s+([a-zA-Z0-9_]+)', scan_buffer):
+                    key = f"feat:cls:{m.group(1)}"
                     if key not in self._fired_milestones:
                         self._fired_milestones.add(key)
-                        self._emit_processing_status(
-                            f"⚙️ Implementing: {m.group(1)}()"
-                        )
+                        self._emit_processing_status(f"🏗️ Class: {m.group(1)}")
                         break
                 else:
-                    # ── 2. Fallback size milestones ───────────────────────────
-                    # Only reached when no new structural feature exists at all.
-                    _MILESTONES = (
-                        (1_000,  "🔨 Refining content…"),
-                        (5_000,  "🚀 Adding depth…"),
-                        (15_000, "🏗️ Building substantial block…"),
-                        (40_000, "🌊 Working on a massive document…"),
-                    )
-                    for threshold, message in _MILESTONES:
-                        key = f"ms:{threshold}"
-                        if total_len >= threshold and key not in self._fired_milestones:
+                    # Functions
+                    for m in re.finditer(
+                        r'(?:def|function)\s+([a-zA-Z0-9_]+)\s*\(', scan_buffer
+                    ):
+                        key = f"feat:fn:{m.group(1)}"
+                        if key not in self._fired_milestones:
                             self._fired_milestones.add(key)
-                            self._emit_processing_status(message)
+                            self._emit_processing_status(
+                                f"⚙️ Implementing: {m.group(1)}()"
+                            )
                             break
+                    else:
+                        # ── 2. Fallback size milestones ───────────────────────
+                        # Only reached when no new structural feature exists.
+                        _MILESTONES = (
+                            (1_000,  "🔨 Refining content…"),
+                            (5_000,  "🚀 Adding depth…"),
+                            (15_000, "🏗️ Building substantial block…"),
+                            (40_000, "🌊 Working on a massive document…"),
+                        )
+                        for threshold, message in _MILESTONES:
+                            key = f"ms:{threshold}"
+                            if total_len >= threshold and key not in self._fired_milestones:
+                                self._fired_milestones.add(key)
+                                self._emit_processing_status(message)
+                                break
 
         # ── Legacy chunk events for artefacts, notes, skills ─────────────────
         if prefix in ("<artifact", "<artefact"):
@@ -1735,6 +1789,9 @@ class _StreamState:
 
         # Reset milestone tracker so the next artefact starts fresh
         self._fired_milestones = set()
+        self._status_line_buffer = ""
+        self._status_lines_processed = 0
+        self._status_context_lines = []
 
         def _fire_state_change(art, is_new):
             if not self.callback:
@@ -2829,7 +2886,114 @@ class ChatMixin:
                 "sources": sources, "artefacts": affected}
 
     # ------------------------------------------------------------------ chat
-
+    def _should_compress_agentic_history(self, branch: List) -> bool:
+        """
+        Return True when the branch contains ≥2 turns that performed artifact
+        updates.  Those turns carry build-mode noise (status lines, XML
+        fragments, retry loops) that degrades the model's language quality
+        on subsequent creative or analytical turns.
+        """
+        artifact_turns = sum(
+            1 for m in branch
+            if isinstance(m.metadata, dict) and (
+                m.metadata.get("artefacts_modified") or
+                m.metadata.get("mode") in ("agentic", "rlm_agentic")
+            )
+        )
+        return artifact_turns >= 2
+ 
+    def _build_compressed_history(self, branch: List) -> List:
+        """
+        Collapse all past agentic / artifact turns into a single synthetic
+        system message: a terse PROJECT STATE summary built from live artefact
+        data plus a brief change log from message metadata.
+ 
+        Only the last clean (non-agentic) user→assistant exchange is preserved
+        verbatim to give the model an immediate conversational anchor.
+ 
+        Returns a new virtual-history list ready for generate_from_messages().
+        """
+        import re as _re
+ 
+        # 1. Live artifact inventory ─────────────────────────────────────────
+        active_arts = self.artefacts.list(active_only=True)
+        art_lines = []
+        for a in active_arts:
+            lang  = f" [{a.get('language')}]" if a.get('language') else ""
+            lines = len((a.get('content') or '').splitlines())
+            art_lines.append(
+                f"  • {a['title']}  "
+                f"(v{a.get('version', 1)}, {a.get('type', '?')}{lang}, {lines} lines)"
+            )
+        art_summary = "\n".join(art_lines) if art_lines else "  (none)"
+ 
+        # 2. Change log from message metadata (last 10 changes) ──────────────
+        decisions: List[str] = []
+        for m in branch:
+            meta     = m.metadata if isinstance(m.metadata, dict) else {}
+            modified = meta.get("artefacts_modified", [])
+            for title in modified:
+                art = self.artefacts.get(title)
+                if art:
+                    decisions.append(
+                        f"  • '{title}' → v{art.get('version', 1)}"
+                    )
+        decision_block = (
+            "\n".join(decisions[-10:]) if decisions else "  (none recorded)"
+        )
+ 
+        synopsis = (
+            "╔══ PROJECT STATE SYNOPSIS ══════════════════════════════════════════╗\n"
+            "║  Build history suppressed — only current state shown below.        ║\n"
+            "╠════════════════════════════════════════════════════════════════════╣\n"
+            "║  ACTIVE ARTIFACTS                                                  ║\n"
+            f"{art_summary}\n"
+            "║                                                                    ║\n"
+            "║  RECENT CHANGES                                                    ║\n"
+            f"{decision_block}\n"
+            "╠════════════════════════════════════════════════════════════════════╣\n"
+            "║  Respond naturally. Do NOT reference build logs or status output.  ║\n"
+            "╚════════════════════════════════════════════════════════════════════╝"
+        )
+ 
+        # 3. Find last clean (non-agentic) user→assistant exchange ───────────
+        last_user_msg: Any = None
+        last_ai_msg:   Any = None
+        for m in reversed(branch):
+            meta = m.metadata if isinstance(m.metadata, dict) else {}
+            is_agentic = (
+                meta.get("mode") in ("agentic", "rlm_agentic") or
+                bool(meta.get("artefacts_modified"))
+            )
+            if m.sender_type == "assistant" and last_ai_msg is None and not is_agentic:
+                # Strip residual processing markup
+                clean = _re.sub(
+                    r'<processing.*?>.*?</processing>', '',
+                    m.content or '', flags=_re.DOTALL
+                ).strip()
+                last_ai_msg = SimpleNamespace(
+                    sender_type="assistant", content=clean, metadata={}
+                )
+            elif m.sender_type == "user" and last_user_msg is None:
+                last_user_msg = m
+            if last_user_msg and last_ai_msg:
+                break
+ 
+        # 4. Assemble compressed virtual history ─────────────────────────────
+        compressed: List = []
+        if self.system_prompt:
+            compressed.append(SimpleNamespace(
+                sender_type="system", content=self.system_prompt
+            ))
+        compressed.append(SimpleNamespace(
+            sender_type="system", content=synopsis
+        ))
+        if last_user_msg:
+            compressed.append(last_user_msg)
+        if last_ai_msg:
+            compressed.append(last_ai_msg)
+        return compressed
+    
     def chat(
         self,
         user_message: str,
@@ -2862,31 +3026,29 @@ class ChatMixin:
         **kwargs
     ) -> Dict[str, Any]:
         self.scratchpad = ""
-
+ 
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
-
-        # ── Memory ────────────────────────────────────────────────────────
-        _mm = self._get_memory_manager(memory_manager)
+ 
+        # ── Memory ────────────────────────────────────────────────────────────
+        _mm      = self._get_memory_manager(memory_manager)
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
         self._memory_pre_turn(_mm, token_counter=_counter)
         _mem_instructions = self._build_memory_system_instructions(_mm)
-
+ 
         if "temperature" in kwargs:
             final_answer_temperature = kwargs.pop("temperature")
         else:
             final_answer_temperature = None
-
+ 
         object.__setattr__(self, '_active_callback', callback)
-
+ 
         # ====================================================================
         #  SWARM DISPATCH
         # ====================================================================
         if swarm:
             from lollms_client.lollms_swarm import SwarmOrchestrator, SwarmConfig as _SC
-
             _swarm_config = swarm_config if swarm_config is not None else _SC()
-
             if add_user_message:
                 user_msg = self.add_message(
                     sender=kwargs.get("user_name", "user"),
@@ -2897,7 +3059,6 @@ class ChatMixin:
                 )
             else:
                 user_msg = None
-
             orchestrator = SwarmOrchestrator(
                 discussion  = self,
                 agents      = swarm,
@@ -2912,13 +3073,13 @@ class ChatMixin:
             if self._is_db_backed and self.autosave:
                 self.commit()
             return result
-
-        # ── Effective image flags ────────────────────────────────────────────
+ 
+        # ── Effective image flags ─────────────────────────────────────────────
         _tti_available = getattr(self.lollmsClient, 'tti', None) is not None
         _eff_img_gen   = enable_image_generation and _tti_available
         _eff_img_edit  = enable_image_editing     and _tti_available
-
-        # ── System-prompt instructions ───────────────────────────────────────
+ 
+        # ── System-prompt instructions ────────────────────────────────────────
         extra_instructions = self._build_artefact_instructions()
         if _mem_instructions:
             extra_instructions += _mem_instructions
@@ -2936,37 +3097,37 @@ class ChatMixin:
             extra_instructions += self._build_book_instructions()
         if enable_presentations:
             extra_instructions += self._build_presentation_instructions()
-
+ 
         branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
         handle_instructions = _build_handle_instructions(branch_msgs_now)
         if handle_instructions:
             extra_instructions += handle_instructions
-
+ 
         if extra_instructions.strip():
             original_sp = self._system_prompt or ""
             if extra_instructions not in original_sp:
                 object.__setattr__(self, "_system_prompt", original_sp + extra_instructions)
-
-        # ── Generation parameters ────────────────────────────────────────────
+ 
+        # ── Generation parameters ─────────────────────────────────────────────
         kwargs.pop("temperature", None)
         decision_temperature       = kwargs.get("decision_temperature",       0.3)
         final_answer_temperature   = kwargs.get("final_answer_temperature",   final_answer_temperature)
         rag_top_k                  = kwargs.get("rag_top_k",                  5)
         rag_min_similarity_percent = kwargs.get("rag_min_similarity_percent", 0.5)
         preflight_rag_enabled      = kwargs.get("preflight_rag",              True)
-
-        # ── RLM detection ────────────────────────────────────────────────────
+ 
+        # ── RLM detection ─────────────────────────────────────────────────────
         rlm_enabled          = False
         rlm_context_var_name = "USER_INPUT_CONTEXT"
         actual_user_content  = user_message
-
+ 
         if tools:
             rlm_enabled = (
                 any(t.get("name") == "python_exec" for t in tools.values() if isinstance(t, dict))
                 and
                 any(t.get("name") == "llm_query"   for t in tools.values() if isinstance(t, dict))
             )
-
+ 
         if rlm_enabled and len(user_message) > 10000:
             actual_user_content = "\n".join([
                 "<RLM_STUB>",
@@ -2975,8 +3136,8 @@ class ChatMixin:
                 "Use python_exec() to access the full content.",
                 "</RLM_STUB>",
             ])
-
-        # ── Add user message ─────────────────────────────────────────────────
+ 
+        # ── Add user message ──────────────────────────────────────────────────
         if add_user_message:
             user_msg = self.add_message(
                 sender=kwargs.get("user_name", "user"),
@@ -2993,15 +3154,13 @@ class ChatMixin:
                 raise ValueError("Regeneration failed: active branch tip not found.")
             user_msg = LollmsMessage(self, self._message_index[self.active_branch_id])
             images   = user_msg.get_active_images()
-
-        # ── Source inference helper ──────────────────────────────────────────
+ 
+        # ── Source inference helper ───────────────────────────────────────────
         def _infer_sources_from_json(data: Any, tool_name: str) -> List[Dict]:
             found_sources = []
-
             def looks_like_source(d: dict) -> bool:
                 title_keys = {'title', 'name', 'label', 'header', 'id', 'filename'}
                 return any(k in d for k in title_keys)
-
             def scan(obj: Any):
                 if isinstance(obj, list):
                     for item in obj:
@@ -3016,11 +3175,9 @@ class ChatMixin:
                             scan(v)
                         else:
                             scan(v)
-
             scan(data)
             if not found_sources and isinstance(data, dict) and looks_like_source(data):
                 found_sources.append(data)
-
             normalized = []
             for item in found_sources:
                 title = (item.get('title') or item.get('name') or item.get('label') or
@@ -3042,8 +3199,8 @@ class ChatMixin:
                     "relevance_score": score, "metadata": metadata, "tool": tool_name
                 })
             return normalized
-
-        # ── Document zone extraction helper ──────────────────────────────────
+ 
+        # ── Document zone extraction helper ───────────────────────────────────
         def _extract_docs(zone_content):
             if not zone_content:
                 return []
@@ -3059,18 +3216,18 @@ class ChatMixin:
                     zone_content, re.DOTALL,
                 )
             ]
-
+ 
         all_documents: List[Dict] = []
         for zone_content, zone_label in [
-            (self.discussion_data_zone, "discussion"),
-            (self.user_data_zone,       "user"),
+            (self.discussion_data_zone,  "discussion"),
+            (self.user_data_zone,        "user"),
             (None if personality.has_data else self.personality_data_zone, "personality"),
         ]:
             if zone_content:
                 for d in _extract_docs(zone_content):
                     d["zone"] = zone_label
                     all_documents.append(d)
-
+ 
         # ====================================================================
         #  Tool registry
         # ====================================================================
@@ -3078,20 +3235,20 @@ class ChatMixin:
         tool_descriptions: List[str]      = []
         rag_registry:      Dict[str, Any] = {}
         rag_tool_specs:    Dict[str, Any] = {}
-
+ 
         composable_answer  = {"sections": [], "complete": False, "last_updated": None}
         scratchpad_state   = {"notes": {}, "history": [], "assumptions": {}, "corrections": []}
         collected_sources: List[Dict] = []
         queries_performed: List[Dict] = []
         self_corrections:  List[Dict] = []
-
+ 
         def get_current_answer():
             active    = [s for s in composable_answer["sections"] if s.get("status") == "active"]
             full_text = "\n\n".join(s["content"] for s in active)
             return {"success": True, "full_text": full_text, "sections": active,
                     "total_sections": len(active), "total_length": len(full_text),
                     "last_updated": composable_answer.get("last_updated")}
-
+ 
         def _make_wrapper(fn: Any, params_spec: List[Dict]) -> Any:
             def _wrapped(**kw):
                 try:
@@ -3101,8 +3258,7 @@ class ChatMixin:
                         if pn in kw:
                             call_args[pn] = kw[pn]
                         elif not p.get("optional", False):
-                            return {"error": f"Missing required parameter: {pn}",
-                                    "success": False}
+                            return {"error": f"Missing required parameter: {pn}", "success": False}
                         elif "default" in p:
                             call_args[pn] = p["default"]
                     result = fn(**call_args)
@@ -3114,7 +3270,7 @@ class ChatMixin:
                 except Exception as exc:
                     return {"error": str(exc), "success": False}
             return _wrapped
-
+ 
         def _sig(params: List[Dict]) -> str:
             parts = []
             for p in params:
@@ -3127,7 +3283,7 @@ class ChatMixin:
                 else:
                     parts.append(f"{pn}: {pt}")
             return ", ".join(parts)
-
+ 
         def _register(name, fn, params, description, output=None):
             tool_registry[name] = _make_wrapper(fn, params)
             tool_descriptions.append(f"- {name}({_sig(params)}): {description}")
@@ -3137,8 +3293,8 @@ class ChatMixin:
                     "default_top_k":   rag_top_k,
                     "default_min_sim": rag_min_similarity_percent,
                 }
-
-        # ── Layer 1: caller-supplied tools ───────────────────────────────────
+ 
+        # ── Layer 1: caller-supplied tools ────────────────────────────────────
         for tool_name, tool_spec in (tools or {}).items():
             if not isinstance(tool_spec, dict):
                 continue
@@ -3152,8 +3308,8 @@ class ChatMixin:
                 description = tool_spec.get("description", f"Execute {tool_name}"),
                 output      = tool_spec.get("output", []),
             )
-
-        # ── Layer 2: personality.tool_specs() ────────────────────────────────
+ 
+        # ── Layer 2: personality.tool_specs() ─────────────────────────────────
         _pt_specs = {}
         try:
             _pt_specs = personality.tool_specs(
@@ -3162,10 +3318,9 @@ class ChatMixin:
         except Exception as _pte:
             _warning(callback, f"  Personality tool discovery failed: {_pte}")
             trace_exception(_pte)
-
+ 
         if _pt_specs:
-            _pt_step_id = _step_start(callback,
-                                      f"Loading {len(_pt_specs)} personality tool(s)...")
+            _pt_step_id = _step_start(callback, f"Loading {len(_pt_specs)} personality tool(s)...")
             for pt_name, pt_spec in _pt_specs.items():
                 fn = pt_spec.get("callable")
                 if not callable(fn):
@@ -3179,8 +3334,8 @@ class ChatMixin:
                 )
             _step_end(callback, f"{len(_pt_specs)} personality tool(s) ready", _pt_step_id,
                       {"tool_count": len(_pt_specs)})
-
-        # ── Layer 3: personality RAG tool ────────────────────────────────────
+ 
+        # ── Layer 3: personality RAG tool ─────────────────────────────────────
         if personality.has_data:
             def _personality_rag(query: str) -> Dict[str, Any]:
                 result = personality.query_data(query)
@@ -3200,17 +3355,16 @@ class ChatMixin:
                 result["sources"] = sources_filtered
                 result["count"]   = len(sources_filtered)
                 return result
-
+ 
             _register(
                 name        = "search_personality_knowledge",
                 fn          = _personality_rag,
-                params      = [{"name": "query", "type": "str",
-                                "description": "Search query"}],
+                params      = [{"name": "query", "type": "str", "description": "Search query"}],
                 description = "Search the personality's knowledge base",
                 output      = [{"name": "sources", "type": "list"}],
             )
-
-        # ── Personality system prompt ─────────────────────────────────────────
+ 
+        # ── Personality system prompt ──────────────────────────────────────────
         if personality.system_prompt:
             veracity = (
                 "\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
@@ -3223,8 +3377,8 @@ class ChatMixin:
                 self, "_system_prompt",
                 personality.system_prompt + veracity + extra_instructions,
             )
-
-        # ── Pre-flight RAG ───────────────────────────────────────────────────
+ 
+        # ── Pre-flight RAG ────────────────────────────────────────────────────
         if preflight_rag_enabled and personality.has_data:
             preflight_id = _step_start(callback, "Pre-flight knowledge retrieval...")
             ctx = self.export("markdown", suppress_system_prompt=True)
@@ -3243,12 +3397,10 @@ class ChatMixin:
                             src  = chunk.get("source", "")
                             meta = chunk.get("metadata", {})
                             title = (
-                                chunk.get("title")
-                                or meta.get("title")
-                                or meta.get("filename")
-                                or meta.get("name")
-                                or (src.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if src else "")
-                                or f"Source {idx + 1}"
+                                chunk.get("title") or meta.get("title") or
+                                meta.get("filename") or meta.get("name") or
+                                (src.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if src else "") or
+                                f"Source {idx + 1}"
                             )
                             fmt += (
                                 f"[Source {idx+1}] ({src}, "
@@ -3275,12 +3427,12 @@ class ChatMixin:
                 trace_exception(e)
             _step_end(callback, "Pre-flight retrieval complete", preflight_id,
                       {"source_count": len(collected_sources)})
-
+ 
         # ====================================================================
         #  FAST PATH — no external tools registered
         # ====================================================================
         _has_external_tools = bool(tool_registry)
-
+ 
         if not _has_external_tools:
             ss = _StreamState(
                 discussion            = self,
@@ -3292,7 +3444,7 @@ class ChatMixin:
                 enable_forms          = enable_forms,
                 auto_activate_artefacts = auto_activate_artefacts,
             )
-
+ 
             ai_message = self.add_message(
                 sender=personality.name,
                 sender_type="assistant",
@@ -3303,30 +3455,34 @@ class ChatMixin:
                 metadata={"mode": "direct"},
             )
             ss.ai_message = ai_message
-
+ 
             def _fast_relay(chunk, msg_type=None, meta=None):
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
                     return ss.feed(chunk)
                 return True
-
+ 
             raw_text = self._stream_final_answer(
                 _fast_relay, images,
                 branch_tip_id or self.active_branch_id,
                 final_answer_temperature, **kwargs,
             )
-
+ 
             ss.flush_remaining_buffer()
-
+ 
             if raw_text and not ai_message.content:
                 for ch in raw_text:
                     ss.feed(ch)
                 ss.flush_remaining_buffer()
-
+ 
             raw_text = ai_message.content
-
-            # ── Ensure answer was produced even in fast path ──────────────
+ 
+            # Scrub any leaked internal markers
+            if _EXEC_MARKER_RE.search(raw_text or ""):
+                raw_text = _EXEC_MARKER_RE.sub('', raw_text).strip()
+                ai_message.content = raw_text
+ 
             if not raw_text or not raw_text.strip():
                 ASCIIColors.warning("[chat] Fast path produced no output — forcing retry")
                 _retry_prompt = (
@@ -3342,17 +3498,16 @@ class ChatMixin:
                 ss.flush_remaining_buffer()
                 raw_text = ai_message.content
                 self.scratchpad = ""
-
+ 
             if remove_thinking_blocks:
                 raw_text = self.lollmsClient.remove_thinking_blocks(raw_text)
-
+ 
             branch_for_handles = self.get_branch(ai_message.id)
             raw_after_handles, handle_arts = _apply_handles(
                 raw_text, branch_for_handles, self.artefacts
             )
-
             ai_message.content = raw_after_handles
-
+ 
             cleaned, affected_pp = self._post_process_llm_response(
                 raw_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
                 auto_activate_artefacts,
@@ -3365,13 +3520,12 @@ class ChatMixin:
             affected = handle_arts + ss.affected_artefacts + affected_pp
             if cleaned != raw_after_handles:
                 ai_message.content = cleaned
-
-            # Memory tag processing
+ 
             _mem_cleaned, _mem_report = self._process_memory_tags(
                 ai_message.content, _mm, callback)
             if _mem_cleaned != ai_message.content:
                 ai_message.content = _mem_cleaned
-
+ 
             if affected and callback:
                 _cb(callback, json.dumps([a.get("title") for a in affected]),
                     MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
@@ -3388,11 +3542,11 @@ class ChatMixin:
                 "artefacts":        affected,
                 "memory_report":    _mem_report,
             }
-
+ 
         # ====================================================================
         #  Built-in tools (only when external tools exist)
         # ====================================================================
-
+ 
         if enable_show_tools:
             def _show_tools_impl():
                 catalogue: List[Dict[str, Any]] = []
@@ -3418,10 +3572,10 @@ class ChatMixin:
                 _cb(callback, json.dumps(catalogue, indent=2),
                     MSG_TYPE.MSG_TYPE_TOOLS_LIST, {"tools": catalogue})
                 return {"success": True, "tool_count": len(catalogue), "tools": catalogue}
-
+ 
             tool_registry["show_tools"] = _show_tools_impl
             tool_descriptions.append("- show_tools(): Display the full list of available tools")
-
+ 
         if enable_extract_artefact:
             def _extract_artefact_text_impl(
                 source_title: str, new_title: str,
@@ -3432,13 +3586,11 @@ class ChatMixin:
             ) -> Dict[str, Any]:
                 source = self.artefacts.get(source_title)
                 if source is None:
-                    return {"success": False,
-                            "error": f"Artifact '{source_title}' not found."}
+                    return {"success": False, "error": f"Artifact '{source_title}' not found."}
                 all_lines = source.get("content", "").splitlines()
                 total = len(all_lines)
                 if total == 0:
-                    return {"success": False,
-                            "error": f"Artifact '{source_title}' is empty."}
+                    return {"success": False, "error": f"Artifact '{source_title}' is empty."}
                 sh = start_line_hint.strip().lower()
                 eh = end_line_hint.strip().lower()
                 if not sh:
@@ -3483,7 +3635,7 @@ class ChatMixin:
                     "total_lines": total, "lines_extracted": end_idx - start_idx + 1,
                     "artefact_id": new_art.get("id"),
                 }
-
+ 
             tool_registry["extract_artifact_text"] = _extract_artefact_text_impl
             tool_descriptions.append(
                 "- extract_artifact_text(source_title: str, new_title: str, "
@@ -3491,14 +3643,14 @@ class ChatMixin:
                 "artefact_type: str = 'document', language: str = ''): "
                 "Extract a range from an artifact by line-prefix anchors"
             )
-
+ 
         if enable_repl_tools:
             try:
                 from ._repl_tools import TextBuffer, register_repl_tools as _reg_repl
                 _reg_repl(tool_registry, tool_descriptions, TextBuffer(), self.artefacts)
             except ImportError as _e:
                 _warning(callback, f"REPL text tools unavailable: {_e}")
-
+ 
         if enable_final_answer:
             tool_registry["final_answer"] = lambda: {
                 "status":  "final",
@@ -3507,7 +3659,7 @@ class ChatMixin:
                 "success": True,
             }
             tool_descriptions.append("- final_answer(): Signal that the answer is ready")
-
+ 
         if enable_request_clarification:
             tool_registry["request_clarification"] = lambda question: {
                 "status": "clarification", "question": question, "success": True,
@@ -3515,16 +3667,13 @@ class ChatMixin:
             tool_descriptions.append(
                 "- request_clarification(question: str): Ask user for clarification"
             )
-
+ 
         object.__setattr__(
             self, "_system_prompt",
-            _build_tool_system_prompt(
-                self._system_prompt or "",
-                tool_descriptions,
-            )
+            _build_tool_system_prompt(self._system_prompt or "", tool_descriptions)
         )
-
-        # ── Context compression ──────────────────────────────────────────────
+ 
+        # ── Context compression ───────────────────────────────────────────────
         if self.max_context_size is not None:
             _cr = self._compress_context(callback, self.max_context_size)
             if _cr["needed"] and _cr["artefact_pressure"]:
@@ -3540,8 +3689,7 @@ class ChatMixin:
                         if callback:
                             _cb(callback, json.dumps(deactivated),
                                 MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED,
-                                {"artefacts": deactivated,
-                                 "action": "deactivated_for_compression"})
+                                {"artefacts": deactivated, "action": "deactivated_for_compression"})
                         tokens_after = self._compress_context(
                             callback, self.max_context_size
                         ).get("tokens_after", _cr["tokens_before"])
@@ -3552,21 +3700,17 @@ class ChatMixin:
                         "not_found": not_found,
                         "tokens_freed_estimate": _cr["tokens_before"] - tokens_after,
                     }
-
                 tool_registry["deactivate_artefacts"] = _deactivate_artefacts_impl
                 tool_descriptions.insert(0,
                     "- deactivate_artefacts(titles: list[str]): "
                     "CONTEXT PRESSURE -- deactivate unneeded artifacts first")
                 object.__setattr__(
                     self, "_system_prompt",
-                    _build_tool_system_prompt(
-                        (self._system_prompt or ""),
-                        tool_descriptions,
-                    )
+                    _build_tool_system_prompt(self._system_prompt or "", tool_descriptions)
                 )
-
+ 
         # ====================================================================
-        #  Agentic loop
+        #  Agentic loop setup
         # ====================================================================
         start_time            = datetime.now()
         is_agentic_turn       = False
@@ -3577,16 +3721,16 @@ class ChatMixin:
         _round                = 0
         _temp_msg_ids:        List[str] = []
         _current_branch_tip   = branch_tip_id or self.active_branch_id
-
+ 
         _completed_tool_calls:    List[str] = []
         _created_artefact_titles: List[str] = []
-
-        _MAX_IDENTICAL_REPEATS              = 1  # Block on 2nd identical call
+ 
+        _MAX_IDENTICAL_REPEATS              = 1
         _identical_call_counts: Dict[str, int] = {}
-        _recent_queries: Dict[str, set] = {}  # tool_name -> set of query hashes
-
+        _recent_queries: Dict[str, set]        = {}
+ 
         _round1_no_tool_call = False
-
+ 
         ai_message = self.add_message(
             sender=personality.name,
             sender_type="assistant",
@@ -3600,91 +3744,99 @@ class ChatMixin:
             self.commit()
         _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE,
             {"message_id": ai_message.id})
-
-        # Virtual history to keep all LLM reasoning rounds linked without creating physical DB messages
-        _virtual_history = self.get_branch(_current_branch_tip)
-
-        # ── Tenacious Context Cleanup ──
-        # If the history is getting long or poisoned by agentic loops, we collapse it.
+ 
+        # ── Virtual history: use compression when ≥2 artifact turns exist ────
         branch = self.get_branch(_current_branch_tip)
-        agentic_turns = sum(1 for m in branch if m.metadata.get("mode") in ["agentic", "rlm_agentic"])
-
-        is_tenacious_mode = agentic_turns >= 2
-
-        if is_tenacious_mode:
-            ASCIIColors.warning("[Tenacious Mode] Collapsing history to PROJECT STATE to prevent mimicry poisoning.")
-            # We force a technical synopsis of everything BEFORE the current user message
-            self.summarize_and_prune(force_technical=True, preserve_last_n=1)
-            # Reload branch after pruning
-            branch = self.get_branch(_current_branch_tip)
-
-        # ── Initialize Virtual History ──
-        _virtual_history = []
-        if self.system_prompt:
-            _virtual_history.append(SimpleNamespace(sender_type="system", content=self.system_prompt))
-
-        if is_tenacious_mode and self.pruning_summary:
-            # In Tenacious mode, we hide the messy history and anchor on the STATE.
-            active_art_list = [a.get('title') for a in self.artefacts.list(active_only=True)]
-            target_str = ", ".join(active_art_list) if active_art_list else "None (Create new if needed)"
-
-            synopsis_content = (
-                "╔══════════════════════════════════════════════════════════════════╗\n"
-                "║  📍 PROJECT STATE & TECHNICAL SYNOPSIS                           ║\n"
-                "╠══════════════════════════════════════════════════════════════════╣\n"
-                f"{self.pruning_summary}\n"
-                "║                                                                  ║\n"
-                f"║  PRIMARY WORK TARGETS: {target_str[:40]}...                      ║\n"
-                "╚══════════════════════════════════════════════════════════════════╝"
+ 
+        if self._should_compress_agentic_history(branch):
+            ASCIIColors.info(
+                "[chat] ≥2 artifact-update turns in history — "
+                "compressing to PROJECT STATE synopsis"
             )
-            _virtual_history.append(SimpleNamespace(sender_type="system", content=synopsis_content))
-
-            # Virtual User Hint to prevent drift
-            if active_art_list:
-                hint = (
-                    f"[ARCHITECT NOTICE: Use the established architecture. "
-                    f"Prioritize updates to: {', '.join(active_art_list)}]"
-                )
-                _virtual_history.append(SimpleNamespace(sender_type="user", content=hint))
-
-            # Append only the last actual user message
-            if branch:
-                _virtual_history.append(branch[-1])
+            _virtual_history = self._build_compressed_history(branch)
+            is_tenacious_mode = False  # compression already handles this
         else:
-            # Standard history behavior
-            for m in branch:
-                _virtual_history.append(m)
-
+            # Standard path: tenacious mode kicks in at 2+ agentic turns
+            agentic_turns = sum(
+                1 for m in branch
+                if m.metadata.get("mode") in ["agentic", "rlm_agentic"]
+            )
+            is_tenacious_mode = agentic_turns >= 2
+ 
+            if is_tenacious_mode:
+                ASCIIColors.warning(
+                    "[Tenacious Mode] Collapsing history to PROJECT STATE "
+                    "to prevent mimicry poisoning."
+                )
+                self.summarize_and_prune(force_technical=True, preserve_last_n=1)
+                branch = self.get_branch(_current_branch_tip)
+ 
+            _virtual_history = []
+            if self.system_prompt:
+                _virtual_history.append(SimpleNamespace(
+                    sender_type="system", content=self.system_prompt
+                ))
+ 
+            if is_tenacious_mode and self.pruning_summary:
+                active_art_list = [a.get('title') for a in self.artefacts.list(active_only=True)]
+                target_str = (
+                    ", ".join(active_art_list) if active_art_list
+                    else "None (Create new if needed)"
+                )
+                synopsis_content = (
+                    "╔══════════════════════════════════════════════════════════════════╗\n"
+                    "║  📍 PROJECT STATE & TECHNICAL SYNOPSIS                           ║\n"
+                    "╠══════════════════════════════════════════════════════════════════╣\n"
+                    f"{self.pruning_summary}\n"
+                    "║                                                                  ║\n"
+                    f"║  PRIMARY WORK TARGETS: {target_str[:40]}...                      ║\n"
+                    "╚══════════════════════════════════════════════════════════════════╝"
+                )
+                _virtual_history.append(SimpleNamespace(
+                    sender_type="system", content=synopsis_content
+                ))
+                if active_art_list:
+                    hint = (
+                        f"[ARCHITECT NOTICE: Use the established architecture. "
+                        f"Prioritize updates to: {', '.join(active_art_list)}]"
+                    )
+                    _virtual_history.append(SimpleNamespace(
+                        sender_type="user", content=hint
+                    ))
+                if branch:
+                    _virtual_history.append(branch[-1])
+            else:
+                for m in branch:
+                    _virtual_history.append(m)
+ 
+        # ── Helper: replace processing blocks with opaque exec marker ─────────
         def _compact_repl(m):
-            """
-            Helper to replace UI processing tags with a neutral separator.
-            We use a non-prose separator to prevent the LLM from mimicking status logs.
-            """
-            return "\n---\n"
-
-        # This scratchpad persists across rounds of the SAME turn
-        _turn_action_history = []
-
-        # This scratchpad persists across rounds of the SAME turn
-        _turn_action_history = []
-
+            """Replace <processing>…</processing> with an opaque non-prose marker."""
+            return f"\n{_EXEC_MARKER}\n"
+ 
+        # ── Per-turn action scratchpad ─────────────────────────────────────────
+        _turn_action_history: List[str] = []
+ 
+        # ====================================================================
+        #  Main agentic loop
+        # ====================================================================
         while _round < max_reasoning_steps:
             _round += 1
-
-            # ── IMMEDIATE TERMINATION ──
-            # If the specialist already succeeded, we strip context and force a summary.
-            _mission_complete = any("✓ SUCCESSFULLY" in entry for entry in _turn_action_history)
-
+ 
+            # ── Mission-complete fast exit ────────────────────────────────────
+            _mission_complete = any(
+                "✓ SUCCESSFULLY" in entry for entry in _turn_action_history
+            )
+ 
             if _mission_complete:
-                ASCIIColors.success("[Master] Success detected. Revoking tool access and forcing summary.")
-                # Kill the loop after this round
-                _round = max_reasoning_steps 
-                # Block all tools except the final answer
+                ASCIIColors.success(
+                    "[Master] Success detected. Revoking tool access and forcing summary."
+                )
+                _round = max_reasoning_steps
                 active_tool_registry = {
-                    "final_answer": tool_registry.get("final_answer"),
-                    "request_clarification": tool_registry.get("request_clarification")
+                    "final_answer":          tool_registry.get("final_answer"),
+                    "request_clarification": tool_registry.get("request_clarification"),
                 }
-                # Hard-override the scratchpad
                 self.scratchpad = (
                     "╔══════════════════════════════════════════════════════════════════╗\n"
                     "║ 🛑 STOP: MISSION ACCOMPLISHED                                    ║\n"
@@ -3696,35 +3848,38 @@ class ChatMixin:
                 )
             else:
                 active_tool_registry = tool_registry
-            _did_something = False
-
-            # Reset per-turn state
+ 
             _recent_queries.clear()
-            _active_temp = final_answer_temperature
-
+            _active_temp    = final_answer_temperature
             _saved_scratchpad = self.scratchpad
-            state_lines = []
-
+ 
+            # ── Build per-round state block ───────────────────────────────────
+            state_lines: List[str] = []
+ 
             if _turn_action_history:
-                # ── CRITICAL STOP SIGNAL ──
-                # Check for REAL mission success to prevent runaway loops
-                if any("✓ SUCCESSFULLY implemented" in entry or "✓ SUCCESSFULLY updated" in entry for entry in _turn_action_history):
-                    state_lines.append("╔══════════════════════════════════════════════════════════════════╗")
-                    state_lines.append("║ 🛑 STOP: MISSION ACCOMPLISHED                                    ║")
-                    state_lines.append("╠══════════════════════════════════════════════════════════════════╣")
-                    state_lines.append("║ SUCCESS: The requested changes have been applied and saved.      ║")
-                    state_lines.append("║                                                                  ║")
-                    state_lines.append("║ 1. DO NOT emit any more <artifact> or <tool_call> tags.          ║")
-                    state_lines.append("║ 2. DO NOT describe internal 'processing' or 'updating' steps.    ║")
-                    state_lines.append("║ 3. PROVIDE your final summary to the user immediately.           ║")
-                    state_lines.append("╚══════════════════════════════════════════════════════════════════╝")
-
+                if any(
+                    "✓ SUCCESSFULLY implemented" in e or "✓ SUCCESSFULLY updated" in e
+                    for e in _turn_action_history
+                ):
+                    state_lines += [
+                        "╔══════════════════════════════════════════════════════════════════╗",
+                        "║ 🛑 STOP: MISSION ACCOMPLISHED                                    ║",
+                        "╠══════════════════════════════════════════════════════════════════╣",
+                        "║ SUCCESS: The requested changes have been applied and saved.      ║",
+                        "║                                                                  ║",
+                        "║ 1. DO NOT emit any more <artifact> or <tool_call> tags.          ║",
+                        "║ 2. DO NOT describe internal 'processing' or 'updating' steps.    ║",
+                        "║ 3. PROVIDE your final summary to the user immediately.           ║",
+                        "╚══════════════════════════════════════════════════════════════════╝",
+                    ]
                 state_lines.append("=== TURN ACTION SCRATCHPAD (Completed so far) ===")
                 state_lines.extend(_turn_action_history)
                 state_lines.append("================================================")
-
+ 
             if _completed_tool_calls or _created_artefact_titles:
-                state_lines.append("=== AGENT STATE (already completed this turn — DO NOT repeat) ===")
+                state_lines.append(
+                    "=== AGENT STATE (already completed this turn — DO NOT repeat) ==="
+                )
                 if _completed_tool_calls:
                     state_lines.append("Tool calls already made:")
                     state_lines.extend(f"  ✓ {c}" for c in _completed_tool_calls)
@@ -3732,29 +3887,38 @@ class ChatMixin:
                     state_lines.append("Artifacts / notes already created:")
                     state_lines.extend(f"  ✓ {t}" for t in _created_artefact_titles)
                 state_lines.append("=== END AGENT STATE ===")
-
+ 
             state_lines.append(_TOOL_CALL_REMINDER)
-
+ 
             if _round == 1 and not _completed_tool_calls:
-                state_lines.append("AVAILABLE TOOLS (quick list): " + ", ".join(tool_registry.keys()))
-
-            # --- PROACTIVE ARCHITECT DIRECTIVE ---
-            if any("internet_search" in call or "google" in call for call in _completed_tool_calls):
-                state_lines.append("╔══════════════════════════════════════════════════════════════════╗")
-                state_lines.append("║ 🛠️ ARCHITECT DIRECTIVE: SEARCH COMPLETE                          ║")
-                state_lines.append("╠══════════════════════════════════════════════════════════════════╣")
-                state_lines.append("║ You have retrieved external information. Your ONLY goal now is   ║")
-                state_lines.append("║ to apply this knowledge to the project artifacts.                ║")
-                state_lines.append("║                                                                  ║")
-                state_lines.append("║ 1. DO NOT call 'show_tools' or other diagnostic tools.           ║")
-                state_lines.append("║ 2. DO NOT build forms to ask the user for more choices.          ║")
-                state_lines.append("║ 3. PROCEED IMMEDIATELY to <coding_plan> and <artifact> update.   ║")
-                state_lines.append("╚══════════════════════════════════════════════════════════════════╝")
-
-            self.scratchpad = "\n".join(state_lines) + ("\n\n" + (self.scratchpad or "") if self.scratchpad else "")
-
+                state_lines.append(
+                    "AVAILABLE TOOLS (quick list): " + ", ".join(tool_registry.keys())
+                )
+ 
+            if any(
+                "internet_search" in call or "google" in call
+                for call in _completed_tool_calls
+            ):
+                state_lines += [
+                    "╔══════════════════════════════════════════════════════════════════╗",
+                    "║ 🛠️ ARCHITECT DIRECTIVE: SEARCH COMPLETE                          ║",
+                    "╠══════════════════════════════════════════════════════════════════╣",
+                    "║ You have retrieved external information. Your ONLY goal now is   ║",
+                    "║ to apply this knowledge to the project artifacts.                ║",
+                    "║                                                                  ║",
+                    "║ 1. DO NOT call 'show_tools' or other diagnostic tools.           ║",
+                    "║ 2. DO NOT build forms to ask the user for more choices.          ║",
+                    "║ 3. PROCEED IMMEDIATELY to <coding_plan> and <artifact> update.   ║",
+                    "╚══════════════════════════════════════════════════════════════════╝",
+                ]
+ 
+            self.scratchpad = (
+                "\n".join(state_lines) +
+                ("\n\n" + (self.scratchpad or "") if self.scratchpad else "")
+            )
+ 
             round_content_start = len(ai_message.content)
-
+ 
             ss = _StreamState(
                 discussion            = self,
                 callback              = callback,
@@ -3765,7 +3929,7 @@ class ChatMixin:
                 enable_forms          = enable_forms,
                 auto_activate_artefacts = auto_activate_artefacts,
             )
-
+ 
             def _inline_relay(chunk, msg_type=None, meta=None):
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
@@ -3773,107 +3937,163 @@ class ChatMixin:
                     if meta and meta.get("was_processed"):
                         return True
                     result = ss.feed(chunk)
-                    if ss.tool_trigger: return False
+                    if ss.tool_trigger:
+                        return False
                     return result
                 return True
-
+ 
             merged_images = self._merge_artefact_images(images)
-
-            # Create a copy of kwargs to avoid duplicate parameter errors
+ 
             _gen_kwargs = kwargs.copy()
-            _gen_kwargs.pop("stream", None)
-            _gen_kwargs.pop("temperature", None)
-            _gen_kwargs.pop("streaming_callback", None)
-
-            # ── VIRTUAL HISTORY SANITIZATION ──
-            _formatted_messages = []
-            
-            # Ensure the FIRST message is the FULL system prompt (Instructions + Active Artifacts)
-            full_system_context = (self.system_prompt or "") + "\n\n" + self.get_full_data_zone()
-            _formatted_messages.append({"role": "system", "content": full_system_context.strip()})
-
+            _gen_kwargs.pop("stream",              None)
+            _gen_kwargs.pop("temperature",         None)
+            _gen_kwargs.pop("streaming_callback",  None)
+ 
+            # ── Build sanitized message list for this round ───────────────────
+            # The system context (instructions + active artifacts) is always
+            # injected fresh as the first message so the model has a clean view.
+            # All prior assistant turns are stripped of processing XML and the
+            # opaque exec marker is used in place of those blocks.
+            # This prevents the model from treating framework markers as prose
+            # it should reproduce.
+            _formatted_messages: List[Dict[str, str]] = []
+ 
+            full_system_context = (
+                (self.system_prompt or "") + "\n\n" + self.get_full_data_zone()
+            )
+            _formatted_messages.append({
+                "role":    "system",
+                "content": full_system_context.strip(),
+            })
+ 
             for m in _virtual_history:
                 if m.sender_type == "system":
-                    continue # Skip raw system prompts as we just added the full context above
-                role = m.sender_type
+                    # Already injected above; skip to avoid duplication
+                    continue
+                role    = m.sender_type
                 content = m.content or ""
+ 
                 if role == "assistant":
-                    # Replace ALL internal framework processing with a standard Blind Action marker.
-                    # This tells the AI "Work happened here" without giving it mimicry bait.
-                    content = re.sub(r'<processing.*?>.*?</processing>', '\n[BLIND_ACTION_EXECUTED]\n', content, flags=re.DOTALL)
+                    # Replace all processing blocks with the opaque marker
+                    content = re.sub(
+                        r'<processing.*?>.*?</processing>',
+                        f'\n{_EXEC_MARKER}\n',
+                        content, flags=re.DOTALL
+                    )
                     content = re.sub(r'<lollms_event.*?>', '', content)
-                    # Remove any leaked prose logs
-                    content = re.sub(r'^[ \t]*[*✓🏗️🔧✅❌].*$', '', content, flags=re.MULTILINE)
-
-                msg_role = "assistant" if role == "assistant" else ("user" if role == "user" else "system")
-                _formatted_messages.append({"role": msg_role, "content": content.strip()})
-
+                    # Strip any leaked status / log lines
+                    content = re.sub(
+                        r'^[ \t]*[*✓🏗️🔧✅❌·ᴽЧØс].*$', '',
+                        content, flags=re.MULTILINE
+                    )
+                    # Strip the marker itself — the model must never see it in
+                    # an assistant turn it can learn to reproduce
+                    content = _EXEC_MARKER_RE.sub('', content)
+ 
+                msg_role = (
+                    "assistant" if role == "assistant"
+                    else ("user" if role == "user" else "system")
+                )
+                content = content.strip()
+                if content:
+                    _formatted_messages.append({"role": msg_role, "content": content})
+ 
             self.lollmsClient.generate_from_messages(
-                messages=_formatted_messages,
-                images=merged_images,
-                stream=True,
-                temperature=_active_temp,
-                streaming_callback=_inline_relay,
+                messages           = _formatted_messages,
+                images             = merged_images,
+                stream             = True,
+                temperature        = _active_temp,
+                streaming_callback = _inline_relay,
                 **_gen_kwargs
             )
-
+ 
             ss.flush_remaining_buffer()
             self.scratchpad = _saved_scratchpad
-
+ 
+            # ── Post-round scrub: remove any leaked internal markers ───────────
+            if _EXEC_MARKER_RE.search(ai_message.content):
+                ASCIIColors.warning(
+                    "[chat] Scrubbing leaked internal markers from ai_message.content"
+                )
+                ai_message.content = _EXEC_MARKER_RE.sub('', ai_message.content).strip()
+ 
             _so_far = "".join(ss.stream_buf)
             _accumulated_full += _so_far
-
-            # [FIX] Clean up raw JSON tool call from content if it leaked
+ 
+            # Clean up raw tool_call block from visible content if it leaked
             if ss.tool_trigger:
-                # We surgically remove the <tool_call> block from the visible content
-                # and replace it with the unified processing tag
-                match = re.search(r"<tool_call>.*?</tool_call>", ai_message.content[round_content_start:], re.DOTALL)
+                match = re.search(
+                    r"<tool_call>.*?</tool_call>",
+                    ai_message.content[round_content_start:], re.DOTALL
+                )
                 if match:
-                    pre_call = ai_message.content[:round_content_start + match.start()]
-                    ai_message.content = pre_call
-
-            _round_clean   = ai_message.content[round_content_start:]
+                    ai_message.content = (
+                        ai_message.content[:round_content_start + match.start()]
+                    )
+ 
+            _round_clean       = "".join(ss.clean_prose)
             _clean_text_so_far += _round_clean
-
-            # [FIX] Detect if artifact building failed despite model prose
+ 
+            # ── Artifact-update failure: re-loop with correction ───────────────
             if ss.patch_error_occurred and not ss.affected_artefacts:
                 _error_breadcrumb = (
                     "\n"
                     "⚠️ [EXECUTION FAILURE] ⚠️\n"
                     f"The update to '{ss.proc_title}' failed to match any content in the file.\n"
-                    "ACTION REQUIRED: Do not repeat the same SEARCH block. Re-read the file content "
-                    "provided in the system context and perform a FULL REWRITE or a more surgical patch.\n"
+                    "ACTION REQUIRED: Do not repeat the same SEARCH block. Re-read the file "
+                    "content provided in the system context and perform a FULL REWRITE or a "
+                    "more surgical patch.\n"
                 )
-                _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
-                _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
-                _virtual_history.append(SimpleNamespace(sender_type="user", content=_error_breadcrumb))
+                _clean_so_far_for_llm = re.sub(
+                    r'<processing.*?>.*?</processing>',
+                    _compact_repl, _so_far, flags=re.DOTALL
+                )
+                _virtual_history.append(SimpleNamespace(
+                    sender_type="assistant", content=_clean_so_far_for_llm.strip()
+                ))
+                _virtual_history.append(SimpleNamespace(
+                    sender_type="user", content=_error_breadcrumb
+                ))
                 _clean_text_so_far = ""
+                ss.clean_prose.clear()
                 ai_message.content = ai_message.content[:round_content_start]
-                ASCIIColors.error(f"[chat] Artifact update failed. Re-looping to inform LLM.")
+                ASCIIColors.error(
+                    "[chat] Artifact update failed — re-looping to inform LLM."
+                )
                 continue
-
+ 
             _tool_trigger  = ss.tool_trigger
             _tool_json_str = ss.get_tool_call_json()
-
-            # Check if any artefacts were created/updated in this round
+ 
             _artefacts_built = len(ss.affected_artefacts) > 0
-            if _tool_trigger or _artefacts_built:
-                _did_something = True
-
+            _did_something   = _tool_trigger or _artefacts_built
+ 
+            # ── Round-1 correction: model produced prose instead of action ────
             if _round == 1 and not _did_something:
                 _output_clean = _round_clean.strip()
-                # Heuristic: if user intent suggests action but model only produced prose
-                _intent_to_act = any(kw in user_message.lower() for kw in ["update", "add", "change", "fix", "create", "make", "music", "color", "search", "write"])
-
+                _intent_to_act = any(
+                    kw in user_message.lower()
+                    for kw in [
+                        "update", "add", "change", "fix", "create", "make",
+                        "music", "color", "search", "write",
+                    ]
+                )
                 _needs_correction = False
-                _correction_msg = ""
-
-                if _has_external_tools and (len(_output_clean) < 50 or re.search(r"i (cannot|can't|don't|am unable|don't have access|have no access|cannot access)", _output_clean, re.IGNORECASE)):
+                _correction_msg   = ""
+ 
+                if _has_external_tools and (
+                    len(_output_clean) < 50 or
+                    re.search(
+                        r"i (cannot|can't|don't|am unable|have no access|cannot access)",
+                        _output_clean, re.IGNORECASE
+                    )
+                ):
                     _needs_correction = True
-                    _correction_msg = _TOOL_CALL_CORRECTION
+                    _correction_msg   = _TOOL_CALL_CORRECTION
+ 
                 elif _intent_to_act and not _artefacts_built:
                     _needs_correction = True
-                    _correction_msg = (
+                    _correction_msg   = (
                         "\n"
                         "╔══════════════════════════════════════════════════════════════════╗\n"
                         "║  🧠 MENTAL RESET — HALLUCINATION DETECTED                        ║\n"
@@ -3887,25 +4107,34 @@ class ChatMixin:
                         "║  4. If you do not emit a tag, this conversation cannot proceed.  ║\n"
                         "╚══════════════════════════════════════════════════════════════════╝\n"
                     )
-
+ 
                 if _needs_correction:
                     _round1_no_tool_call = True
-                    ASCIIColors.yellow(f"[chat] Round 1 failed to act — injecting virtual correction: {_correction_msg[:50]}...")
+                    ASCIIColors.yellow(
+                        f"[chat] Round 1 failed to act — injecting correction."
+                    )
                     _warning(callback, "Action missing; forcing model to emit tags/calls.")
-                    
-                    # Update virtual history instead of DB
-                    _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
-                    _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
-                    _virtual_history.append(SimpleNamespace(sender_type="user", content=_TOOL_CALL_CORRECTION))
-
+                    _clean_so_far_for_llm = re.sub(
+                        r'<processing.*?>.*?</processing>',
+                        _compact_repl, _so_far, flags=re.DOTALL
+                    )
+                    _virtual_history.append(SimpleNamespace(
+                        sender_type="assistant", content=_clean_so_far_for_llm.strip()
+                    ))
+                    _virtual_history.append(SimpleNamespace(
+                        sender_type="user", content=_TOOL_CALL_CORRECTION
+                    ))
                     _clean_text_so_far = ""
                     _accumulated_full  = ""
                     ai_message.content = ai_message.content[:round_content_start]
                     continue
-
+ 
             if not _tool_trigger:
                 break
-
+ 
+            # ====================================================================
+            #  Tool execution
+            # ====================================================================
             is_agentic_turn = True
             try:
                 _call_data   = json.loads(_tool_json_str or "{}")
@@ -3915,33 +4144,36 @@ class ChatMixin:
                 trace_exception(e)
                 _warning(callback, f"Failed to parse tool call: {e}")
                 break
-
+ 
             _params_summary = ", ".join(
                 f"{k}={str(v)[:40]}" for k, v in _tool_params.items()
             )
             _call_signature = f"{_tool_name}({_params_summary})"
             _call_tag       = f"round {_round}: {_call_signature}"
-
-            # ── Duplicate detection: exact signature + semantic query match ──
-            _identical_call_counts[_call_signature] = \
+ 
+            # Duplicate / semantic-loop detection
+            _identical_call_counts[_call_signature] = (
                 _identical_call_counts.get(_call_signature, 0) + 1
+            )
             _sig_count = _identical_call_counts[_call_signature]
-
-            # Also check for semantically similar queries (same tool, same query param)
-            _query_key = str(_tool_params.get("query", _tool_params.get("prompt", ""))).strip().lower()
+ 
+            _query_key    = str(
+                _tool_params.get("query", _tool_params.get("prompt", ""))
+            ).strip().lower()
             _is_semantic_dup = False
             if _query_key and len(_query_key) > 3:
                 _prev_queries = _recent_queries.setdefault(_tool_name, set())
                 if _query_key in _prev_queries:
                     _is_semantic_dup = True
                 _prev_queries.add(_query_key)
-
+ 
             if _sig_count > _MAX_IDENTICAL_REPEATS or _is_semantic_dup:
-                _dup_type = "IDENTICAL" if _sig_count > _MAX_IDENTICAL_REPEATS else "SEMANTIC DUPLICATE"
-                _warning(callback, f"[RUNAWAY] {_dup_type} call detected. Manipulating attention to break pattern.")
-
-                # ── ATTENTION SHAKE ──
-                # We inject a highly disruptive visual/semantic block to force the model to reset its attention.
+                _dup_type = (
+                    "IDENTICAL" if _sig_count > _MAX_IDENTICAL_REPEATS
+                    else "SEMANTIC DUPLICATE"
+                )
+                _warning(callback,
+                         f"[RUNAWAY] {_dup_type} call — injecting pattern-break.")
                 _shake_prompt = (
                     "\n"
                     "╔══════════════════════════════════════════════════════════════════╗\n"
@@ -3954,17 +4186,21 @@ class ChatMixin:
                     "║  4. ACT NOW: Change your approach or provide the final answer.   ║\n"
                     "╚══════════════════════════════════════════════════════════════════╝\n"
                 )
-                
-                # Update virtual history with the disrupter
-                _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
-                _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
-                _virtual_history.append(SimpleNamespace(sender_type="user", content=_shake_prompt))
-
-                # We keep temperature stable to avoid hallucinated tags, but we reset text to force re-generation
+                _clean_so_far_for_llm = re.sub(
+                    r'<processing.*?>.*?</processing>',
+                    _compact_repl, _so_far, flags=re.DOTALL
+                )
+                _virtual_history.append(SimpleNamespace(
+                    sender_type="assistant", content=_clean_so_far_for_llm.strip()
+                ))
+                _virtual_history.append(SimpleNamespace(
+                    sender_type="user", content=_shake_prompt
+                ))
                 _clean_text_so_far = ""
+                ss.clean_prose.clear()
                 ai_message.content = ai_message.content[:round_content_start]
                 continue
-
+ 
             _current_offset = len(_clean_text_so_far)
             _call_id        = str(uuid.uuid4())
             _call_evt = {
@@ -3974,33 +4210,42 @@ class ChatMixin:
             }
             _cb(callback, _call_evt["content"], MSG_TYPE.MSG_TYPE_TOOL_CALL, _call_evt)
             all_events.append(_call_evt)
-
-            _marker = f"\n<lollms_event id=\"{_call_id}\" />\n"
+ 
+            _marker    = f"\n<lollms_event id=\"{_call_id}\" />\n"
             _clean_text_so_far    += _marker
             ai_message.content     = _clean_text_so_far
             ai_message.metadata["events"] = list(all_events)
-
+ 
             _step_lbl = f"Running: {_tool_name.replace('_', ' ').title()}"
             _step_id  = _step_start(callback, _step_lbl,
                                     {"tool": _tool_name, "offset": _current_offset})
             all_events.append({"type": "step_start", "content": _step_lbl,
                                "id": _step_id, "offset": _current_offset})
-
-            # Convert tool_name to a readable title
+ 
             tool_title = _tool_name.replace('_', ' ').title()
             ss.proc_title = tool_title
             ss._emit_tool_processing_open(_tool_name, _tool_params)
-
-            # Check for mission-completion block
-            _already_done = any("✓ SUCCESSFULLY implemented" in entry for entry in _turn_action_history)
-
+ 
+            _already_done = any(
+                "✓ SUCCESSFULLY implemented" in entry
+                for entry in _turn_action_history
+            )
+ 
             if _already_done and _tool_name not in ["final_answer", "request_clarification"]:
-                ss._emit_tool_processing_status("Tool Access Revoked: Mission already complete.")
-                _result = {"success": False, "error": "MISSION COMPLETE. Do not call more tools. Summarize now."}
+                ss._emit_tool_processing_status(
+                    "Tool Access Revoked: Mission already complete."
+                )
+                _result     = {"success": False,
+                               "error": "MISSION COMPLETE. Do not call more tools. Summarize now."}
                 _result_str = json.dumps(_result)
                 ss._emit_tool_processing_close("Blocked")
+ 
             elif _tool_name not in active_tool_registry:
-                _err_msg = f"Tool '{_tool_name}' is currently DISABLED (Mission Complete)." if _mission_complete else f"Tool '{_tool_name}' not found."
+                _err_msg = (
+                    f"Tool '{_tool_name}' is currently DISABLED (Mission Complete)."
+                    if _mission_complete else
+                    f"Tool '{_tool_name}' not found."
+                )
                 ss._emit_tool_processing_status(_err_msg)
                 _warning(callback, _err_msg)
                 _result_str = f"Error: {_err_msg}"
@@ -4013,16 +4258,18 @@ class ChatMixin:
                 _cb(callback, _err_evt["content"], MSG_TYPE.MSG_TYPE_TOOL_OUTPUT, _err_evt)
                 _step_end(callback, f"Unknown tool '{_tool_name}'",
                           _step_id, {"status": "failed"})
-                all_events.extend([_err_evt,
-                    {"type": "step_end",
-                     "content": f"Unknown tool '{_tool_name}'",
-                     "id": _step_id, "offset": _current_offset, "status": "failed"}])
+                all_events.extend([
+                    _err_evt,
+                    {"type": "step_end", "content": f"Unknown tool '{_tool_name}'",
+                     "id": _step_id, "offset": _current_offset, "status": "failed"},
+                ])
                 ss._emit_tool_processing_close("Failed: tool not found")
+ 
             else:
                 try:
                     ss._emit_tool_processing_status(f"Executing {_tool_name}...")
                     _result = active_tool_registry[_tool_name](**_tool_params)
-
+ 
                     inferred_srcs = _infer_sources_from_json(_result, _tool_name)
                     res_label     = _tool_name.replace('_', ' ').title()
                     llm_block     = f"### [Source List: {res_label}]\n"
@@ -4037,13 +4284,13 @@ class ChatMixin:
                         llm_block += "---\n"
                     if not inferred_srcs:
                         llm_block += json.dumps(_result, indent=2)
-
+ 
                     self.scratchpad = (self.scratchpad or "") + (
                         f"\n--- Tool: {res_label} (round {_round}) ---\n"
                         f"{llm_block}\n"
                         f"--- End {res_label} ---\n"
                     )
-
+ 
                     _completed_tool_calls.append(_call_tag)
                     _created_title = (
                         _result.get("title") or _result.get("name") or
@@ -4053,50 +4300,43 @@ class ChatMixin:
                     )
                     if _created_title and str(_created_title) not in _created_artefact_titles:
                         _created_artefact_titles.append(str(_created_title))
-
-                    # ── Stringify raw result for logging and status ──
+ 
                     _raw_result_json = json.dumps(_result, indent=2, ensure_ascii=False)
-
-                    # ── Better result reporting for the LLM ──
-                    _is_web_search = ("search" in _tool_name.lower() or "query" in _tool_name.lower()) \
-                                     and isinstance(_result, dict) and "sources" in _result
-
+ 
+                    _is_web_search = (
+                        ("search" in _tool_name.lower() or "query" in _tool_name.lower())
+                        and isinstance(_result, dict) and "sources" in _result
+                    )
                     if _is_web_search:
-                        # Use human-readable format for web search results
                         _formatted = _format_web_search_for_llm(_result, max_chars=2000)
-                        if len(_formatted) <= 2500:
-                            _result_str = _formatted
-                        else:
-                            _result_str = _formatted[:2500] + "\n... [additional results truncated]"
+                        _result_str = (
+                            _formatted[:2500] + "\n... [additional results truncated]"
+                            if len(_formatted) > 2500 else _formatted
+                        )
                     else:
                         if len(_raw_result_json) <= 2000:
                             _result_str = _raw_result_json
                         else:
-                            # Smart truncation: keep structure, truncate long string values
-                            _truncated = _smart_truncate_result(_result, max_total_chars=2000)
+                            _truncated  = _smart_truncate_result(_result, max_total_chars=2000)
                             _result_str = json.dumps(_truncated, indent=2, ensure_ascii=False)
-
+ 
                     tool_calls_this_turn.append({
                         "name": _tool_name, "params": _tool_params, "result": _result,
                     })
-
-                    # Rich result summary for the model
+ 
                     _source_count = len(inferred_srcs)
-                    _result_keys = list(_result.keys()) if isinstance(_result, dict) else []
+                    _result_keys  = list(_result.keys()) if isinstance(_result, dict) else []
                     result_summary = f"Success: {res_label}"
                     if _source_count:
                         result_summary += f" — found {_source_count} source(s)"
                     if _result_keys:
                         result_summary += f" — result keys: {', '.join(_result_keys[:5])}"
                     ss._emit_tool_processing_status(result_summary)
-                    # Add to turn history for master agent awareness
-                    if hasattr(self, "_turn_action_history"):
-                        self._turn_action_history.append(f"✓ Tool '{_tool_name}' returned {len(inferred_srcs)} results.")
-
+ 
                     ss._emit_tool_processing_close(
                         f"Completed — output: {len(_raw_result_json):,} chars"
                     )
-
+ 
                     _out_evt = {
                         "type": "tool_output", "content": _result_str,
                         "id": str(uuid.uuid4()), "tool": _tool_name,
@@ -4110,16 +4350,15 @@ class ChatMixin:
                         {"type": "step_end", "content": f"Done: {_tool_name}",
                          "id": _step_id, "offset": _current_offset, "status": "success"},
                     ])
-
-                    # Ensure we preserve and update metadata without overwriting previous rounds
+ 
                     current_meta = dict(ai_message.metadata or {})
-                    current_meta["events"] = list(all_events)
+                    current_meta["events"]  = list(all_events)
                     current_meta["sources"] = list(collected_sources)
                     ai_message.metadata = current_meta
-
+ 
                     if self._is_db_backed:
                         self.commit()
-
+ 
                     _q       = _tool_params.get("query", _tool_params.get("prompt", ""))
                     raw_srcs = _result.get("sources", [])
                     if not raw_srcs:
@@ -4139,12 +4378,18 @@ class ChatMixin:
                         for _doc in raw_srcs:
                             if not isinstance(_doc, dict):
                                 continue
-                            _doc_title   = (_doc.get("title") or _doc.get("name") or
-                                            _doc.get("source") or f"{_tool_name} Result")
-                            _doc_content = (_doc.get("content") or _doc.get("summary") or
-                                            _doc.get("snippet") or "")
-                            _doc_link    = (_doc.get("link") or _doc.get("url") or
-                                            _doc.get("source") or "")
+                            _doc_title   = (
+                                _doc.get("title") or _doc.get("name") or
+                                _doc.get("source") or f"{_tool_name} Result"
+                            )
+                            _doc_content = (
+                                _doc.get("content") or _doc.get("summary") or
+                                _doc.get("snippet") or ""
+                            )
+                            _doc_link = (
+                                _doc.get("link") or _doc.get("url") or
+                                _doc.get("source") or ""
+                            )
                             collected_sources.append({
                                 "title":           _doc_title,
                                 "content":         _doc_content,
@@ -4155,7 +4400,7 @@ class ChatMixin:
                                 "index":           len(collected_sources) + 1,
                                 "tool":            _tool_name,
                             })
-
+ 
                 except Exception as e:
                     trace_exception(e)
                     ss._emit_tool_processing_status(f"Error during execution: {str(e)[:100]}")
@@ -4164,38 +4409,40 @@ class ChatMixin:
                     _step_end(callback, f"Error: {e}", _step_id, {"status": "error"})
                     all_events.append({
                         "type": "step_end", "content": f"Error: {e}",
-                        "id": _step_id, "offset": _current_offset, "status": "error"
+                        "id": _step_id, "offset": _current_offset, "status": "error",
                     })
                     _result_str = f"Error: {e}"
                     _result     = {"error": _result_str}
-
-            # ── Large output condensation (preserves multi-step flow) ─────
+ 
+            # ── Large output condensation ─────────────────────────────────────
             _result_len = len(_result_str)
             if _result_len > _LARGE_OUTPUT_THRESHOLD_CHARS and _tool_name != "final_answer":
-                _reading_id = _step_start(callback, f"Condensing large output ({_result_len:,} chars)...")
+                _reading_id = _step_start(
+                    callback, f"Condensing large output ({_result_len:,} chars)..."
+                )
                 from ._repl_tools import TextBuffer
-                _read_buf = TextBuffer()
+                _read_buf   = TextBuffer()
                 _buf_handle = f"tool_result_{_tool_name}_{_round}"
                 _read_buf.store(_buf_handle, _result_str)
-
-                # Extract key info via search + range reads
+ 
                 _query = _tool_params.get("query", _tool_params.get("prompt", ""))
                 if _query:
-                    _search_res = _read_buf.search(_buf_handle, _query, max_results=5)
+                    _search_res       = _read_buf.search(_buf_handle, _query, max_results=5)
                     _relevant_indices = [h["index"] for h in _search_res.get("hits", [])]
                 else:
-                    _list_res = _read_buf.list_records(_buf_handle, page=1, page_size=5)
+                    _list_res         = _read_buf.list_records(_buf_handle, page=1, page_size=5)
                     _relevant_indices = [i["index"] for i in _list_res.get("items", [])]
-
+ 
                 _condensed_parts = []
                 for _idx in _relevant_indices[:5]:
                     _rec_res = _read_buf.get_record(_buf_handle, _idx)
                     if _rec_res.get("success"):
                         _condensed_parts.append(f"[Record {_idx}] {_rec_res['record']}")
-
-                _condensed_summary = "\n".join(_condensed_parts) if _condensed_parts else _result_str[:1500]
-
-                # Add to scratchpad for later reference in final answer
+ 
+                _condensed_summary = (
+                    "\n".join(_condensed_parts) if _condensed_parts
+                    else _result_str[:1500]
+                )
                 _reading_note = (
                     f"\n--- Tool: {_tool_name} (large output, {_result_len:,} chars) ---\n"
                     f"Query: {_query or '(none)'}\n"
@@ -4204,9 +4451,8 @@ class ChatMixin:
                     f"--- End {_tool_name} ---\n"
                 )
                 self.scratchpad = (self.scratchpad or "") + _reading_note
-
-                _step_end(callback, f"Condensed to {len(_condensed_summary):,} chars", _reading_id)
-
+                _step_end(callback,
+                          f"Condensed to {len(_condensed_summary):,} chars", _reading_id)
                 _result_str_for_llm = (
                     f"[LARGE OUTPUT CONDENSED — original was {_result_len:,} chars]\n"
                     f"{_condensed_summary}\n"
@@ -4214,52 +4460,56 @@ class ChatMixin:
                 )
             else:
                 _result_str_for_llm = _result_str
-
-                # ── Update virtual history for the next round ──
-                # We replace functional processing tags with a neutral anchor to keep the history valid
-                # without providing "prose bait" for the model to mimic.
-                _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', '\n---\n', _so_far, flags=re.DOTALL)
-
-                # Strip leading status markers from the history content
-                _clean_so_far_for_llm = re.sub(r'^[ \t]*[*✓🏗️🔧✅❌].*$', '', _clean_so_far_for_llm, flags=re.MULTILINE)
-
-                _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
-                _virtual_history.append(SimpleNamespace(sender_type="user", content=f"<tool_result name=\"{_tool_name}\">{_result_str_for_llm}</tool_result>"))
-
-                ai_message.content = _clean_text_so_far
-
+ 
+            # ── Update virtual history for the next round ─────────────────────
+            # Strip processing blocks and status markers; use the opaque marker.
+            _clean_so_far_for_llm = re.sub(
+                r'<processing.*?>.*?</processing>',
+                _compact_repl, _so_far, flags=re.DOTALL
+            )
+            _clean_so_far_for_llm = re.sub(
+                r'^[ \t]*[*✓🏗️🔧✅❌].*$', '',
+                _clean_so_far_for_llm, flags=re.MULTILINE
+            )
+            # Final safety: remove the marker itself so the model can't see it
+            _clean_so_far_for_llm = _EXEC_MARKER_RE.sub('', _clean_so_far_for_llm)
+ 
+            _virtual_history.append(SimpleNamespace(
+                sender_type="assistant",
+                content=_clean_so_far_for_llm.strip()
+            ))
+            _virtual_history.append(SimpleNamespace(
+                sender_type="user",
+                content=f'<tool_result name="{_tool_name}">{_result_str_for_llm}</tool_result>'
+            ))
+            ai_message.content = _clean_text_so_far
+            ss.clean_prose.clear()
+ 
         # ====================================================================
         #  Forced final-answer pass
         # ====================================================================
-        # Trigger when:
-        #   • We did tool calls but the model never produced clean final text, OR
-        #   • We hit the step limit and need to synthesize an answer from scratchpad, OR
-        #   • The model has done 3+ tool calls and seems stuck gathering without answering
-        # This is the LAST resort — it runs AFTER the agentic loop ends, preserving
-        # the multi-step knowledge-gathering flow.
-        _tool_call_count = len(tool_calls_this_turn)
-        _has_produced_text = bool(_clean_text_so_far.strip()) and len(_clean_text_so_far.strip()) > 100
+        _tool_call_count   = len(tool_calls_this_turn)
+        _has_produced_text = (
+            bool(_clean_text_so_far.strip()) and
+            len(_clean_text_so_far.strip()) > 100
+        )
         _seems_stuck = _tool_call_count >= 3 and not _has_produced_text
-
+ 
         _needs_forced_answer = (
-            is_agentic_turn
-            and (
-                not _clean_text_so_far.strip()           # No output at all
-                or _round >= max_reasoning_steps         # Hit step limit
-                or _seems_stuck                          # 3+ tools, no real text
-                or (tool_calls_this_turn and not any(   # Did tools but no real answer
-                    c.get("name") == "final_answer" for c in tool_calls_this_turn
+            is_agentic_turn and (
+                not _clean_text_so_far.strip()
+                or _round >= max_reasoning_steps
+                or _seems_stuck
+                or (tool_calls_this_turn and not any(
+                    c.get("name") == "final_answer"
+                    for c in tool_calls_this_turn
                 ))
             )
         )
-
-        if _seems_stuck and not _needs_forced_answer:
-            # Pre-shake before forcing answer: warn the model it's about to be forced
-            _warning(callback, f"[STUCK DETECTED] {_tool_call_count} tool calls, no substantial text. Forcing answer synthesis.")
-
+ 
         if _needs_forced_answer:
-            _final_id  = _step_start(callback, "Generating final answer...")
-
+            _final_id = _step_start(callback, "Generating final answer...")
+ 
             ss_final = _StreamState(
                 callback              = callback,
                 ai_message            = ai_message,
@@ -4270,17 +4520,16 @@ class ChatMixin:
                 discussion            = self,
             )
             ai_message.content = ""
-
+ 
             def _final_relay(chunk, msg_type=None, meta=None):
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss_final.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
                     return ss_final.feed(chunk)
                 return True
-
+ 
             _scratch_before_final = self.scratchpad
-
-            # Build a rich context-aware prompt for the final answer synthesis
+ 
             _forced_prompt_parts = [
                 "[SYSTEM INSTRUCTION — MANDATORY — FINAL ANSWER REQUIRED]",
                 "",
@@ -4300,13 +4549,12 @@ class ChatMixin:
                 "• Answer directly, completely, and concisely",
                 "• If information is incomplete, say so briefly then answer with what you have",
             ]
-
-            # Include scratchpad summary if available
+ 
             if _scratch_before_final and _scratch_before_final.strip():
                 _forced_prompt_parts.extend([
                     "",
                     "=== GATHERED INFORMATION (scratchpad) ===",
-                    _scratch_before_final.strip()[:3000],  # Cap to avoid overflow
+                    _scratch_before_final.strip()[:3000],
                     "=== END GATHERED INFORMATION ===",
                 ])
             else:
@@ -4314,33 +4562,33 @@ class ChatMixin:
                     "",
                     "[NO GATHERED INFORMATION — answer from your general knowledge]",
                 ])
-
+ 
             _forced_prompt_parts.extend([
                 "",
                 "[END SYSTEM INSTRUCTION — WRITE YOUR FINAL ANSWER NOW]",
             ])
-
+ 
             self.scratchpad = "\n".join(_forced_prompt_parts)
-
+ 
             merged_images = self._merge_artefact_images(images)
-            kwargs['streaming_callback']=_final_relay
+            kwargs['streaming_callback'] = _final_relay
             self.lollmsClient.chat(
                 self,
-                images=merged_images,
-                branch_tip_id=_current_branch_tip,
-                stream=True,
-                temperature=final_answer_temperature,
+                images             = merged_images,
+                branch_tip_id      = _current_branch_tip,
+                stream             = True,
+                temperature        = final_answer_temperature,
                 **kwargs,
             )
-
+ 
             ss_final.flush_remaining_buffer()
             self.scratchpad = _scratch_before_final
-
-            _accumulated_full += "".join(ss_final.stream_buf)
-            _clean_text_so_far = ai_message.content
+ 
+            _accumulated_full  += "".join(ss_final.stream_buf)
+            _clean_text_so_far  = ai_message.content
             _step_end(callback, "Final answer generated", _final_id)
-
-        # ── Clean up temporary tool-history messages ─────────────────────────
+ 
+        # ── Clean up temporary tool-history messages ──────────────────────────
         for mid in reversed(_temp_msg_ids):
             if mid == user_msg.id:
                 continue
@@ -4350,43 +4598,48 @@ class ChatMixin:
                 self.delete_message(mid)
             else:
                 self.db_manager.delete_message(mid)
-
+ 
+        # ── Final content cleanup ─────────────────────────────────────────────
         import re as _re
         _clean = _re.sub(
-            r"<tool_call>.*?(?:</tool_call>|$)", "", _clean_text_so_far, flags=_re.DOTALL
+            r"<tool_call>.*?(?:</tool_call>|$)", "",
+            _clean_text_so_far, flags=_re.DOTALL
         ).strip()
+        # Remove any residual internal markers
+        _clean = _EXEC_MARKER_RE.sub('', _clean).strip()
         if remove_thinking_blocks:
             _clean = self.lollmsClient.remove_thinking_blocks(_clean)
-
+ 
         end_time    = datetime.now()
         duration    = (end_time - start_time).total_seconds()
         token_count = self.lollmsClient.count_tokens(_clean)
         tok_per_sec = (token_count / duration) if duration > 0 else 0
-
+ 
         message_meta: Dict[str, Any] = {
-            "mode": ("rlm_agentic" if rlm_enabled
-                     else ("agentic" if is_agentic_turn else "direct")),
+            "mode": (
+                "rlm_agentic" if rlm_enabled
+                else ("agentic" if is_agentic_turn else "direct")
+            ),
             "duration_seconds":  duration,
             "token_count":       token_count,
             "tokens_per_second": tok_per_sec,
         }
         if tool_calls_this_turn:
-            message_meta["tool_calls"]           = tool_calls_this_turn
+            message_meta["tool_calls"] = tool_calls_this_turn
         if all_events:
-            # Merge with any events already in metadata
             existing_events = message_meta.get("events", [])
             for evt in all_events:
                 if evt not in existing_events:
                     existing_events.append(evt)
             message_meta["events"] = existing_events
         if collected_sources:
-            message_meta["sources"]              = collected_sources
+            message_meta["sources"]       = collected_sources
         if queries_performed:
-            message_meta["query_history"]        = queries_performed
+            message_meta["query_history"] = queries_performed
         if is_agentic_turn:
-            message_meta["scratchpad"]           = scratchpad_state
+            message_meta["scratchpad"]    = scratchpad_state
         if self_corrections:
-            message_meta["self_corrections"]     = self_corrections
+            message_meta["self_corrections"] = self_corrections
         if _pt_specs:
             message_meta["personality_tools_used"] = [
                 n for n in _pt_specs
@@ -4394,22 +4647,22 @@ class ChatMixin:
             ]
         if _round1_no_tool_call:
             message_meta["round1_correction_applied"] = True
-
+ 
         self.scratchpad = ""
-
+ 
         ai_message.content          = _clean
         ai_message.raw_content      = _accumulated_full
         ai_message.tokens           = token_count
         ai_message.generation_speed = tok_per_sec
         ai_message.metadata         = message_meta
-
+ 
         branch_for_final_handles = self.get_branch(ai_message.id)
         _clean_after_handles, handle_arts = _apply_handles(
             _clean, branch_for_final_handles, self.artefacts
         )
         if _clean_after_handles != _clean:
             ai_message.content = _clean_after_handles
-
+ 
         cleaned_content, affected_pp = self._post_process_llm_response(
             _clean_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
             auto_activate_artefacts,
@@ -4422,7 +4675,7 @@ class ChatMixin:
         affected_artefacts = handle_arts + affected_pp
         if cleaned_content != _clean_after_handles:
             ai_message.content = cleaned_content
-
+ 
         if affected_artefacts:
             message_meta["artefacts_modified"] = [a.get("title") for a in affected_artefacts]
             ai_message.metadata = message_meta
@@ -4430,18 +4683,18 @@ class ChatMixin:
                 _cb(callback, json.dumps(message_meta["artefacts_modified"]),
                     MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED,
                     {"artefacts": affected_artefacts})
-
-        # Memory tag processing on final cleaned content
+ 
         _mem_cleaned, _mem_report = self._process_memory_tags(
-            ai_message.content, _mm, callback)
+            ai_message.content, _mm, callback
+        )
         if _mem_cleaned != ai_message.content:
             ai_message.content = _mem_cleaned
-
+ 
         if self._is_db_backed and self.autosave:
             self.commit()
-
+ 
         object.__setattr__(self, '_active_callback', None)
-
+ 
         return {
             "user_message":     user_msg,
             "ai_message":       ai_message,
@@ -4451,7 +4704,6 @@ class ChatMixin:
             "artefacts":        affected_artefacts,
             "memory_report":    _mem_report,
         }
-
 
 # ---------------------------------------------------------------------------
 # Handle resolution — called after generation completes

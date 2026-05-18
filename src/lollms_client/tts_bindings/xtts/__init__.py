@@ -173,7 +173,7 @@ class XTTSClientBinding(LollmsTTSBinding):
         self.server_process = subprocess.Popen(command, creationflags=creationflags)
         ASCIIColors.info("XTTS server process launched in the background.")
 
-    def _wait_for_server(self, timeout=15):
+    def _wait_for_server(self, timeout=20):
         """Waits for the server to become responsive."""
         ASCIIColors.info("Waiting for XTTS server to become available...")
         start_time = time.time()
@@ -210,7 +210,7 @@ class XTTSClientBinding(LollmsTTSBinding):
         payload.update(kwargs)
         
         try:
-            response = requests.post(f"{self.base_url}/generate_audio", json=payload, timeout=300)
+            response = requests.post(f"{self.base_url}/generate_audio", json=payload, timeout=-1)
             response.raise_for_status()
             return response.content
         except requests.exceptions.RequestException as e:

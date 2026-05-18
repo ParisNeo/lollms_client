@@ -142,11 +142,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         # ── Paths ─────────────────────────────────────────────────────────────
         self.binding_dir = Path(__file__).parent
         # Use binaries_path from config if provided, otherwise default to relative 'bin'
-        binaries_path = kwargs.get("binaries_path")
-        if binaries_path:
-            self.bin_dir = Path(binaries_path).resolve()
-        else:
-            self.bin_dir = self.binding_dir / "bin"
+        binaries_path = kwargs.get("binaries_path", "data/bin/llm/llama_cpp_server")
+        self.bin_dir = Path(binaries_path).resolve()
         
         self.models_dir = Path(
             kwargs.get("models_path", "data/models/llama_cpp_models")

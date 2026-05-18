@@ -294,6 +294,336 @@ class LollmsClient():
         if self.llm: return self.llm.generate_from_messages(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
+    def generate_with_tools(
+        self,
+        prompt: str,
+        tools: List[Union[str, Path, Dict[str, Any]]],
+        system_prompt: str = "",
+        temperature: float = 0.7,
+        n_predict: int = 4096,
+        max_tool_rounds: int = 10,
+        streaming_callback: Optional[Callable] = None,
+        auto_execute: bool = True,
+        **extra,
+    ) -> Dict[str, Any]:
+        """
+        Generate a response with access to tools (file-based or inline).
+
+        Parameters
+        ----------
+        prompt : str
+            The user prompt / task description.
+        tools : list
+            Mixed list of:
+              • ``str`` or ``Path`` — file path to a lollms-format tool script
+              • ``dict`` — inline tool spec with ``{"name": ..., "callable": ..., ...}``
+        system_prompt : str
+            Optional system prompt override.
+        temperature : float
+            Sampling temperature.
+        n_predict : int
+            Max tokens per generation.
+        max_tool_rounds : int
+            Maximum agentic tool-call loops before forcing final answer.
+        streaming_callback : callable
+            Optional streaming callback ``(chunk, msg_type, meta) -> bool``.
+        auto_execute : bool
+            If True, automatically execute tool calls and feed results back.
+
+        Returns
+        -------
+        dict
+            {
+                "response": str,           # Final text response
+                "tool_calls": list,        # All tool calls made
+                "tool_results": list,      # All tool execution results
+                "rounds": int,             # Number of agentic rounds
+            }
+        """
+        from ascii_colors import ASCIIColors
+        from lollms_client.lollms_agent import ToolsManager
+
+        if self.llm is None:
+            raise RuntimeError("LLM binding not initialized.")
+
+        # ── 1. Build unified tool registry ──────────────────────────────
+        tools_mgr = ToolsManager()
+        inline_tools = tools_mgr.build_inline_tools_dict(tools)
+
+        if not inline_tools:
+            # No valid tools — fall back to plain generation
+            return {
+                "response": self.generate_text(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    temperature=temperature,
+                    n_predict=n_predict,
+                    streaming_callback=streaming_callback,
+                    **extra,
+                ),
+                "tool_calls": [],
+                "tool_results": [],
+                "rounds": 0,
+            }
+
+        # ── 2. Build tool descriptions for the system prompt ──────────────
+        tool_descriptions: List[str] = []
+        for name, spec in inline_tools.items():
+            params = spec.get("parameters", [])
+            param_str = ", ".join(
+                f"{p['name']}: {p['type']}" + (" (optional)" if p.get("optional") else "")
+                for p in params
+            )
+            desc = spec.get("description", f"Execute {name}")
+            tool_descriptions.append(f"- {name}({param_str}): {desc}")
+
+        tool_header = (
+            "╔══════════════════════════════════════════════════════════════════╗\n"
+            "║  TOOL USE — MANDATORY FORMAT                                     ║\n"
+            "╠══════════════════════════════════════════════════════════════════╣\n"
+            "║  You have external tools. To use one you MUST use EXACTLY this  ║\n"
+            "║  format — copy the pattern below character-for-character:        ║\n"
+            "║                                                                  ║\n"
+            "║    <tool_call>{\"name\": \"tool_name\",                              ║\n"
+            "║                \"parameters\": {\"key\": \"value\"}}</tool_call>       ║\n"
+            "║                                                                  ║\n"
+            "║  CRITICAL:                                                       ║\n"
+            "║    • The ENTIRE tool call must be wrapped in <tool_call> tags    ║\n"
+            "║    • NO markdown code fences (no ```json)                        ║\n"
+            "║    • NO raw JSON without the XML wrapper                         ║\n"
+            "║    • NO explanations before or after the tool call               ║\n"
+            "║    • ONLY the <tool_call> line when calling a tool               ║\n"
+            "║                                                                  ║\n"
+            "║  Rules:                                                          ║\n"
+            "║    • One tool call per response turn.                            ║\n"
+            "║    • After calling ALL needed tools, write your final answer.    ║\n"
+            "║    • If the user explicitly asks you to use a tool, USE IT.      ║\n"
+            "╚══════════════════════════════════════════════════════════════════╝\n\n"
+            "TOOLS AVAILABLE:\n"
+        )
+
+        tool_block = tool_header + "\n".join(tool_descriptions)
+
+        # ── 3. Prepare conversation state ─────────────────────────────────
+        full_system = system_prompt.rstrip()
+        if full_system:
+            full_system += "\n\n"
+        full_system += tool_block
+
+        conversation: List[Dict[str, str]] = [
+            {"role": "system", "content": full_system},
+            {"role": "user", "content": prompt},
+        ]
+
+        all_tool_calls: List[Dict[str, Any]] = []
+        all_tool_results: List[Dict[str, Any]] = []
+        rounds = 0
+
+        # ── 4. Agentic loop ───────────────────────────────────────────────
+        while rounds < max_tool_rounds:
+            rounds += 1
+
+            # Generate response
+            gen_kwargs: Dict[str, Any] = {
+                "temperature": temperature,
+                "n_predict": n_predict,
+                **extra,
+            }
+            if streaming_callback:
+                gen_kwargs["streaming_callback"] = streaming_callback
+
+            try:
+                raw_response = self.generate_from_messages(
+                    messages=conversation,
+                    **gen_kwargs,
+                )
+            except Exception as e:
+                ASCIIColors.error(f"generate_with_tools: generation failed: {e}")
+                return {
+                    "response": f"[Error during generation: {e}]",
+                    "tool_calls": all_tool_calls,
+                    "tool_results": all_tool_results,
+                    "rounds": rounds,
+                }
+
+            if not isinstance(raw_response, str):
+                raw_response = str(raw_response) if raw_response is not None else ""
+
+            # ── 5. Parse tool calls ─────────────────────────────────────────
+            # Primary: XML-wrapped tool calls <tool_call>...</tool_call>
+            tool_call_pattern = re.compile(
+                r'<tool_call>(.*?)</tool_call>',
+                re.DOTALL | re.IGNORECASE,
+            )
+            matches = list(tool_call_pattern.finditer(raw_response))
+
+            # Fallback: detect raw JSON tool calls (models sometimes omit XML tags)
+            tool_json_str = None
+            visible_response = raw_response.strip()
+
+            if matches:
+                # Extract the first tool call (one per turn)
+                match = matches[0]
+                tool_json_str = match.group(1).strip()
+                visible_response = raw_response[:match.start()].strip()
+            else:
+                # Try to detect raw JSON that looks like a tool call
+                # Pattern: {"name": "tool_...", "parameters": {...}}
+                json_obj_pattern = re.compile(
+                    r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\s*\}',
+                    re.DOTALL,
+                )
+
+                json_match = json_obj_pattern.search(raw_response)
+                if json_match:
+                    tool_json_str = json_match.group(0).strip()
+                    # Determine visible response (text before the JSON object)
+                    json_start = json_match.start()
+                    visible_response = raw_response[:json_start].strip()
+                    ASCIIColors.warning(
+                        f"Model emitted raw JSON tool call (missing <tool_call> tags). "
+                        f"Tool: {json_match.group(1)}"
+                    )
+
+            if not tool_json_str:
+                # No tool call — this is the final answer
+                cleaned = tool_call_pattern.sub('', raw_response).strip()
+                return {
+                    "response": cleaned,
+                    "tool_calls": all_tool_calls,
+                    "tool_results": all_tool_results,
+                    "rounds": rounds,
+                }
+
+            # ALWAYS add assistant message to maintain strict user/assistant
+            # alternation required by llama.cpp Jinja chat templates.
+            # Even if visible_response is empty, the assistant "spoke" (the tool call).
+            conversation.append({"role": "assistant", "content": visible_response})
+
+            # Parse tool call JSON
+            try:
+                call_data = json.loads(tool_json_str)
+            except json.JSONDecodeError as e:
+                ASCIIColors.warning(f"Failed to parse tool call JSON: {e}")
+                conversation.append({
+                    "role": "user",
+                    "content": f"Error: Invalid tool call JSON. {e}",
+                })
+                continue
+
+            tool_name = call_data.get("name", "")
+            tool_params = call_data.get("parameters", {})
+
+            call_record = {
+                "round": rounds,
+                "name": tool_name,
+                "parameters": tool_params,
+                "raw": tool_json_str,
+            }
+            all_tool_calls.append(call_record)
+
+            if not auto_execute:
+                # Manual mode: return the tool call for external handling
+                return {
+                    "response": visible_response,
+                    "tool_calls": all_tool_calls,
+                    "tool_results": all_tool_results,
+                    "pending_tool": call_record,
+                    "rounds": rounds,
+                }
+
+            # ── 6. Execute tool ─────────────────────────────────────────────
+            if tool_name not in inline_tools:
+                error_msg = f"Error: Tool '{tool_name}' not found in registry."
+                ASCIIColors.warning(error_msg)
+                result = {"error": error_msg, "success": False}
+            else:
+                tool_spec = inline_tools[tool_name]
+                fn = tool_spec.get("callable")
+                if not callable(fn):
+                    error_msg = f"Error: Tool '{tool_name}' has no callable."
+                    ASCIIColors.warning(error_msg)
+                    result = {"error": error_msg, "success": False}
+                else:
+                    try:
+                        # Normalize parameters: lollms-format tools use `args: dict`
+                        # but some inline tools may use kwargs. Try kwargs first,
+                        # fall back to single dict arg if signature mismatch.
+                        try:
+                            result = fn(**tool_params)
+                        except TypeError as te:
+                            if "unexpected keyword argument" in str(te):
+                                result = fn(tool_params)
+                            else:
+                                raise
+
+                        # Normalize result to dict if it's a plain string
+                        if isinstance(result, str):
+                            result = {"output": result, "success": True}
+                        elif not isinstance(result, dict):
+                            result = {"output": str(result), "success": True}
+
+                    except Exception as e:
+                        error_msg = f"Error executing {tool_name}: {e}"
+                        ASCIIColors.warning(error_msg)
+                        result = {"error": error_msg, "success": False}
+
+            result_record = {
+                "round": rounds,
+                "name": tool_name,
+                "result": result,
+            }
+            all_tool_results.append(result_record)
+
+            # Format result for LLM context
+            if isinstance(result, dict) and result.get("success"):
+                result_text = result.get("output", json.dumps(result, indent=2))
+            else:
+                result_text = json.dumps(result, indent=2, ensure_ascii=False)
+
+            # Truncate very large results
+            max_result_len = 4000
+            if len(result_text) > max_result_len:
+                result_text = result_text[:max_result_len] + f"\n... [{len(result_text) - max_result_len} chars truncated]"
+
+            # Add tool result to conversation
+            conversation.append({
+                "role": "user",
+                "content": (
+                    f'<tool_result name="{tool_name}">\n'
+                    f"{result_text}\n"
+                    f"</tool_result>"
+                ),
+            })
+
+        # ── 7. Max rounds exceeded — force final answer ───────────────────
+        ASCIIColors.warning(f"generate_with_tools: max rounds ({max_tool_rounds}) exceeded")
+        conversation.append({
+            "role": "user",
+            "content": (
+                "[SYSTEM] Maximum tool rounds reached. "
+                "Provide your final answer now without calling any more tools."
+            ),
+        })
+
+        try:
+            final_response = self.generate_from_messages(
+                messages=conversation,
+                temperature=temperature,
+                n_predict=n_predict,
+                **{k: v for k, v in extra.items() if k not in ("temperature", "n_predict")},
+            )
+        except Exception as e:
+            final_response = f"[Error generating final answer: {e}]"
+
+        cleaned = tool_call_pattern.sub('', str(final_response)).strip()
+        return {
+            "response": cleaned,
+            "tool_calls": all_tool_calls,
+            "tool_results": all_tool_results,
+            "rounds": rounds,
+        }
+
     def chat(self, *args, **kwargs) -> Union[str, dict]:
         if self.llm: return self.llm.chat(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")

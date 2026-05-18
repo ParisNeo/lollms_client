@@ -153,6 +153,105 @@ except Exception as e:
 
 ```
 
+### Agentic Tool-Enabled Generation (`generate_with_tools`)
+
+The `generate_with_tools` method enables LLMs to act as agents that can discover, call, and chain external tools. This is the foundation for building autonomous AI assistants that can search the web, query databases, execute code, or interact with APIs.
+
+**Key Features:**
+- **File-based tools**: Load tools from lollms-format Python scripts (`tool_*.py` with docstring-described arguments)
+- **Inline tools**: Pass tool dicts directly with `{"name": ..., "callable": ..., "parameters": [...]}`
+- **Automatic execution**: The agentic loop parses `<tool_call>` tags, executes tools, and feeds results back
+- **Multi-step reasoning**: The model can chain multiple tool calls across rounds to solve complex tasks
+
+**Tool Format (lollms scripts):**
+A tool script is a Python file containing:
+- `TOOL_LIBRARY_NAME`, `TOOL_LIBRARY_DESC`, `TOOL_LIBRARY_ICON` metadata
+- An optional `init_tool_library()` for dependency setup
+- One or more `tool_*` functions with docstring-described arguments
+
+```python
+from lollms_client import LollmsClient
+from ascii_colors import ASCIIColors
+from pathlib import Path
+
+# Create a simple calculator tool file
+tool_content = '''
+TOOL_LIBRARY_NAME = 'Calculator'
+TOOL_LIBRARY_DESC = 'Basic arithmetic operations'
+TOOL_LIBRARY_ICON = '🧮'
+
+def tool_calculate(args: dict):
+    """
+    Perform arithmetic calculations.
+
+    Args:
+        args: dict with keys:
+            - expression (str): Mathematical expression to evaluate (e.g., "2 + 2 * 5")
+    """
+    try:
+        expression = args.get('expression', '')
+        # Safe evaluation using limited operators
+        allowed = {"__builtins__": {}}
+        allowed.update({k: v for k, v in __import__('math').__dict__.items()})
+        result = eval(expression, allowed, {})
+        return f"Result: {result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+'''
+
+tool_path = Path.home() / ".lollms_hub" / "tools" / "calculator.py"
+tool_path.parent.mkdir(parents=True, exist_ok=True)
+tool_path.write_text(tool_content, encoding="utf-8")
+
+try:
+    lc = LollmsClient(
+        llm_binding_name="llama_cpp_server",
+        llm_binding_config={
+            "models_path": "data/models/llama_cpp_models",
+            "ctx_size": 4096,
+            "n_gpu_layers": -1,
+        }
+    )
+    
+    # Load a model first...
+    # lc.llm.load_model("your-model.gguf")
+
+    result = lc.generate_with_tools(
+        prompt="What is the square root of 144 plus 25?",
+        tools=[str(tool_path)],  # Pass file path(s) or inline dicts
+        system_prompt="You are a helpful math assistant. Use the calculator tool when needed.",
+        temperature=0.7,
+        n_predict=1024,
+        max_tool_rounds=5,
+        auto_execute=True,
+    )
+
+    ASCIIColors.green(f"\nFinal Answer: {result['response']}")
+    ASCIIColors.cyan(f"Tool calls made: {len(result['tool_calls'])}")
+    for tc in result['tool_calls']:
+        print(f"  - {tc['name']}: {tc['parameters']}")
+
+except Exception as e:
+    ASCIIColors.error(f"Error during tool generation: {e}")
+```
+
+**Return Value:**
+The method returns a comprehensive result dict:
+
+```python
+{
+    "response": str,        # Final text answer from the model
+    "tool_calls": [          # All tool calls made during the session
+        {"round": int, "name": str, "parameters": dict, "raw": str}
+    ],
+    "tool_results": [        # All tool execution results
+        {"round": int, "name": str, "result": dict}
+    ],
+    "rounds": int,           # Number of agentic rounds executed
+    "pending_tool": dict,     # Present only if auto_execute=False (manual mode)
+}
+```
+
 ### Advanced Structured Content Generation (`generate_structured_content`)
 
 The `generate_structured_content` method is a powerful utility for forcing an LLM's output into a specific JSON format. It's ideal for extracting information, getting consistent tool parameters, or any task requiring reliable, machine-readable output.
@@ -678,6 +777,295 @@ When you run `agent_example.py`, a sophisticated process unfolds:
 8.  **Final Synthesis:** The LLM now has the user's request, the rules, the code it wrote, and the code's output. It synthesizes all of this into a final, comprehensive answer for the user.
 
 This example showcases how `lollms-client` allows you to build powerful, knowledgeable, and capable agents by simply composing personalities with data and tools.
+
+## Agentic Workflows with Personality and Tools
+
+The `Agent` class combines `LollmsClient`, `LollmsPersonality`, and tool execution into a single, powerful unit for building autonomous agents. This enables multi-step reasoning where the agent can chain tool calls, reflect on results, and synthesize comprehensive answers.
+
+### Building a Research Agent with Multi-Step Reasoning
+
+This example demonstrates a **Research Agent** that:
+1. Uses a custom personality with research-focused system prompts
+2. Loads multiple tools (arXiv search + Wikipedia search)
+3. Performs multi-step reasoning: searches arXiv → searches Wikipedia → synthesizes findings
+4. Uses `Agent.generate_with_tools()` for the full agentic loop
+
+```python
+#!/usr/bin/env python3
+"""
+research_agent_example.py
+=========================
+A full agentic workflow demonstrating:
+- Custom personality definition
+- Multiple file-based tools
+- Multi-step reasoning with tool chaining
+- Agent.generate_with_tools() with rich metadata
+"""
+
+import sys
+import json
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from lollms_client import LollmsClient
+from lollms_client.lollms_agent import Agent, ToolsManager, AgentRole
+from lollms_client.lollms_personality import LollmsPersonality
+from lollms_client.lollms_types import MSG_TYPE
+
+
+# ── Tool Definitions ─────────────────────────────────────────────────────────
+
+ARXIV_TOOL = '''TOOL_LIBRARY_NAME = 'ArXiv Explorer'
+TOOL_LIBRARY_DESC = 'Search scientific papers on ArXiv.'
+TOOL_LIBRARY_ICON = '🔬'
+
+def init_tool_library() -> None:
+    import pipmaster as pm
+    pm.ensure_packages({'arxiv': '>=2.1.0'})
+
+def tool_search_papers(args: dict):
+    """
+    Search for scientific papers on ArXiv.
+
+    Args:
+        args: dict with keys:
+            - query (str): Scientific keywords
+            - count (int, optional): Number of papers (default: 3)
+            - year_start (int, optional): Start year filter
+            - year_end (int, optional): End year filter
+    """
+    import arxiv
+    try:
+        query = args.get('query', '')
+        count = args.get('count', 3)
+        search = arxiv.Search(query=query, max_results=100)
+        client = arxiv.Client()
+        results = []
+        for res in client.results(search):
+            authors = ', '.join(a.name for a in res.authors)
+            date = res.published.strftime('%Y-%m-%d') if res.published else "Unknown"
+            results.append(
+                f"[{res.entry_id}] {res.title}\\n"
+                f"Authors: {authors} | Published: {date}\\n"
+                f"Abstract: {res.summary[:400]}..."
+            )
+            if len(results) >= count:
+                break
+        return "\\n\\n".join(results) if results else "No papers found."
+    except Exception as e:
+        return f"Error: {str(e)}"
+'''
+
+WIKI_TOOL = '''TOOL_LIBRARY_NAME = 'Wikipedia Search'
+TOOL_LIBRARY_DESC = 'Search and retrieve article summaries from Wikipedia.'
+TOOL_LIBRARY_ICON = '📖'
+
+def init_tool_library() -> None:
+    import pipmaster as pm
+    pm.ensure_packages({'wikipedia': '>=1.4.0'})
+
+def tool_search_wikipedia(args: dict):
+    """
+    Search Wikipedia for articles.
+
+    Args:
+        args: dict with keys:
+            - query (str): Search term
+            - max_results (int, optional): Max results (default: 3)
+    """
+    import wikipedia
+    try:
+        query = args.get('query', '')
+        limit = args.get('max_results', 3)
+        search_results = wikipedia.search(query)
+        output = []
+        for title in search_results[:limit]:
+            try:
+                page = wikipedia.summary(title, sentences=5)
+                output.append(f"--- {title} ---\\n{page}")
+            except: 
+                continue
+        return "\\n\\n".join(output) if output else "No results found."
+    except Exception as e:
+        return f"Error: {str(e)}"
+'''
+
+
+def setup_tools():
+    """Create tool files in the lollms hub directory."""
+    tools_dir = Path.home() / ".lollms_hub" / "tools"
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    
+    arxiv_path = tools_dir / "arxiv_search.py"
+    wiki_path = tools_dir / "wikipedia_search.py"
+    
+    if not arxiv_path.exists():
+        arxiv_path.write_text(ARXIV_TOOL, encoding="utf-8")
+    if not wiki_path.exists():
+        wiki_path.write_text(WIKI_TOOL, encoding="utf-8")
+    
+    return str(arxiv_path), str(wiki_path)
+
+
+def main():
+    print("=" * 70)
+    print("🔬 Research Agent — Multi-Step Reasoning Demo")
+    print("=" * 70)
+
+    # ── 1. Setup tools ──────────────────────────────────────────────────
+    arxiv_path, wiki_path = setup_tools()
+    print(f"📁 Tools ready: arxiv_search.py, wikipedia_search.py")
+
+    # ── 2. Create LollmsClient ──────────────────────────────────────────
+    client = LollmsClient(
+        llm_binding_name="llama_cpp_server",
+        llm_binding_config={
+            "models_path": "data/models/llama_cpp_models",
+            "binaries_path": "data/bin/llm/llama_cpp_server",
+            "ctx_size": 8192,
+            "n_gpu_layers": -1,
+            "n_threads": 4,
+            "idle_timeout": 300,
+        },
+    )
+
+    # Download/load model (Ministral 3B for this demo)
+    zoo = client.llm.get_zoo()
+    model_idx = 1  # Ministral-3-3B-Instruct-2512
+    chosen = zoo[model_idx]
+    model_file = chosen["filename"]
+
+    model_path = Path("data/models/llama_cpp_models") / model_file
+    if not model_path.exists():
+        print(f"\n⬇️  Downloading {chosen['name']}...")
+        client.llm.download_from_zoo(model_idx)
+    print(f"\n🔌 Loading {model_file}...")
+    client.llm.load_model(model_file)
+
+    # ── 3. Create Personality ───────────────────────────────────────────
+    personality = LollmsPersonality(
+        name="ResearchAgent",
+        system_prompt=(
+            "You are an expert research assistant with deep knowledge of "
+            "computer science and artificial intelligence. Your workflow:\n"
+            "1. Search arXiv for the latest academic papers on the topic\n"
+            "2. Search Wikipedia for foundational concepts and background\n"
+            "3. Synthesize findings into a comprehensive, well-structured report\n"
+            "4. Cite sources clearly and highlight key insights\n\n"
+            "Always use tools when available — never rely solely on training data."
+        ),
+    )
+
+    # ── 4. Create Agent ────────────────────────────────────────────────
+    agent = Agent(
+        lc=client,
+        personality=personality,
+        name="ResearchAgent",
+        role=AgentRole.DOMAIN_EXPERT,
+        model_params={"temperature": 0.7, "n_predict": 2048},
+        max_tokens_per_turn=4096,
+    )
+    print(f"\n🤖 Agent created: {agent}")
+
+    # ── 5. Multi-step research query ──────────────────────────────────
+    query = (
+        "I want to understand the current state of reasoning in large language models. "
+        "Find recent papers from 2024-2025, then look up background on chain-of-thought "
+        "reasoning, and finally synthesize a comprehensive overview with citations."
+    )
+
+    print("\n" + "-" * 70)
+    print("📝 RESEARCH QUERY:")
+    print("-" * 70)
+    print(query)
+    print("-" * 70)
+
+    # ── 6. Execute agentic generation ─────────────────────────────────
+    print("\n🔍 Starting multi-step research (this may take several rounds)...\n")
+
+    result = agent.generate_with_tools(
+        prompt=query,
+        tools=[arxiv_path, wiki_path],  # Both tools available
+        system_prompt=personality.system_prompt,
+        temperature=0.7,
+        n_predict=4096,
+        max_tool_rounds=10,  # Allow multiple tool chains
+        auto_execute=True,
+    )
+
+    # ── 7. Display results ────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("📊 EXECUTION METADATA")
+    print("=" * 70)
+    print(f"Total rounds:     {result['rounds']}")
+    print(f"Tool calls made:  {len(result['tool_calls'])}")
+    
+    for i, tc in enumerate(result['tool_calls'], 1):
+        print(f"\n  Round {tc['round']} — {tc['name']}")
+        print(f"    Parameters: {json.dumps(tc['parameters'], indent=2)}")
+        # Show result summary
+        tr = next((r for r in result['tool_results'] if r['round'] == tc['round']), None)
+        if tr:
+            res = tr['result']
+            status = "✅" if res.get('success') else "❌"
+            output = str(res.get('output', res))[:200]
+            print(f"    Result: {status} {output}...")
+
+    print("\n" + "=" * 70)
+    print("📝 FINAL SYNTHESIZED REPORT")
+    print("=" * 70)
+    print(result['response'])
+
+    # ── 8. Cleanup ─────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("🧹 Cleanup")
+    print("=" * 70)
+    client.llm.unload_model()
+    print("✅ Done!")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**How Multi-Step Reasoning Works:**
+
+1. **Round 1**: The agent receives the query and decides to search arXiv for recent papers on LLM reasoning. It emits a `<tool_call>` for `tool_search_papers`.
+
+2. **Tool Execution**: The arXiv tool executes and returns 3 recent papers with abstracts.
+
+3. **Round 2**: The agent sees the arXiv results and decides it needs background on chain-of-thought reasoning. It emits a `<tool_call>` for `tool_search_wikipedia`.
+
+4. **Tool Execution**: The Wikipedia tool returns foundational concepts and explanations.
+
+5. **Round 3**: With both academic and encyclopedic sources in context, the agent synthesizes a comprehensive report with proper citations and key insights.
+
+6. **Final Answer**: The agent produces a structured response combining all gathered information.
+
+**Key Agent Configuration Options:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `tools` | List of file paths (`.py`) or inline tool dicts |
+| `max_tool_rounds` | Maximum agentic loops (default: 10) |
+| `auto_execute` | If `False`, returns pending tool for manual execution |
+| `system_prompt` | Override personality's system prompt for this call |
+| `temperature` | Sampling temperature for generation |
+| `n_predict` | Max tokens per generation step |
+
+**Using `generate_with_tools_sync()`:**
+
+For simple fire-and-forget usage, the sync wrapper returns only the final text:
+
+```python
+answer = agent.generate_with_tools_sync(
+    prompt="What are the latest papers on quantum computing?",
+    tools=[arxiv_path],
+)
+print(answer)  # Just the final response string
+```
 
 ## Using LoLLMs Client with Different Bindings
 
