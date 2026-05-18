@@ -127,6 +127,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         self.flash_attn: bool = bool(kwargs.get("flash_attn", False))
         self.mmap: bool = bool(kwargs.get("mmap", True))
         self.mlock: bool = bool(kwargs.get("mlock", False))
+        self.multimodal: bool = bool(kwargs.get("multimodal", True))
         self.rope_scale: Optional[float] = kwargs.get("rope_scale", None)
         self.rope_freq_base: Optional[float] = kwargs.get("rope_freq_base", None)
         self.rope_freq_scale: Optional[float] = kwargs.get("rope_freq_scale", None)
@@ -596,8 +597,13 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         Locates the vision projector for *model_path* via (in order):
         1. Explicit registry entry.
         2. Naming-convention patterns next to the model.
-        3. Any file containing 'mmproj' in the same directory.
+        3. Fuzzy match only if the projector name contains the model's base name.
+
+        Never returns a projector whose dimensions are likely incompatible.
         """
+        if not self.multimodal:
+            return None
+
         registry = self._load_mm_registry()
         if model_path.name in registry:
             proj = self.models_dir / registry[model_path.name]
@@ -605,14 +611,20 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 return proj
 
         stem = model_path.stem
-        clean = re.sub(r"\.(Q\d_.*|f16|f32)$", "", stem, flags=re.IGNORECASE)
+        # Strip quantization suffixes and common version tags to get the base model name
+        clean = re.sub(r"[-\.]?(Q\d+_[A-Za-z0-9]+|IQ\d+_[A-Za-z0-9]+|f16|f32|bf16)$", "", stem, flags=re.IGNORECASE)
+        clean = re.sub(r"[-\.]?v?\d+(\.\d+)*$", "", clean, flags=re.IGNORECASE).rstrip("-._")
+
+        # Strict naming-convention candidates
         candidates = [
             f"{stem}.mmproj",
             f"{stem}-mmproj.gguf",
             f"{stem}.mmproj.gguf",
             f"{clean}.mmproj",
             f"{clean}-mmproj.gguf",
+            f"{clean}.mmproj.gguf",
             f"mmproj-{stem}.gguf",
+            f"mmproj-{clean}.gguf",
             "mmproj.gguf",
         ]
         for c in candidates:
@@ -620,17 +632,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             if pot.exists():
                 return pot
 
-        try:
-            for f in model_path.parent.iterdir():
-                if (
-                    f.is_file()
-                    and "mmproj" in f.name.lower()
-                    and f != model_path
-                    and f.suffix in {".gguf", ".mmproj", ".bin"}
-                ):
-                    return f
-        except Exception:
-            pass
+        # No fuzzy fallback. If no strict match is found, vision is disabled.
+        # The user must explicitly bind a projector via bind_multimodal_model().
         return None
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -695,38 +698,39 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         model_path = self.models_dir / model_name
         if not model_path.exists():
             raise FileNotFoundError(f"Model not found: {model_path}")
+        if model_path.stat().st_size == 0:
+            raise RuntimeError(f"Model file is empty (corrupted download?): {model_path}")
 
         port = get_free_port()
         cmd = self._build_server_cmd(model_path, port)
         base_url = f"http://{self.host}:{port}/v1"
 
+        # Prepare a log file for stdout/stderr to capture crash reasons
+        safe_name = "".join(c for c in model_name if c.isalnum() or c in ("-", "_", "."))
+        log_file_path = self.servers_dir / f"{safe_name}_error.log"
+
         ASCIIColors.info(f"Spawning '{model_name}' on port {port} …")
+        ASCIIColors.info(f"Command: {' '.join(cmd)}")
+        ASCIIColors.info(f"Log file: {log_file_path}")
 
-        # Prepare a log file for stderr to capture crash reasons
-        log_file_path = self.servers_dir / f"{model_name.replace('.gguf', '')}_error.log"
-
-        # We need to capture stderr to read it if the process crashes
-        # On Windows, we still want it detached, but we can redirect stderr to a file
+        # Open a single log file for both stdout and stderr to capture all output
+        # Using CREATE_NO_WINDOW on Windows instead of DETACHED_PROCESS so that
+        # the process still has a valid stdout/stderr handle that flushes reliably.
+        log_f = open(log_file_path, "w", encoding="utf-8")
         popen_kwargs: Dict[str, Any] = {
-            "stdout": subprocess.DEVNULL,
+            "stdout": log_f,
+            "stderr": subprocess.STDOUT,  # Merge stderr into stdout stream
         }
 
         if platform.system() == "Windows":
-            # On Windows, we can't easily read stderr from a detached process without a pipe
-            # So we redirect stderr to a file for later inspection
-            popen_kwargs["stderr"] = open(log_file_path, "w", encoding="utf-8")
-            popen_kwargs["creationflags"] = (
-                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         else:
-            # On Linux/Mac, we can use start_new_session and capture stderr
-            # But to keep it detached, we still redirect to file or pipe
-            # For better debugging, let's use a pipe but ensure the process detaches
-            # Actually, to keep it truly detached and readable, file is safer
-            popen_kwargs["stderr"] = open(log_file_path, "w", encoding="utf-8")
             popen_kwargs["start_new_session"] = True
 
         proc = subprocess.Popen(cmd, **popen_kwargs)
+
+        # Give the process a moment to start and write any immediate errors
+        time.sleep(0.5)
 
         # Wait up to 120 s for the health endpoint to respond
         deadline = time.time() + 120
@@ -735,6 +739,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                 r = requests.get(f"http://{self.host}:{port}/health", timeout=1)
                 if r.status_code in (200, 503):   # 503 = loading, still alive
                     if r.status_code == 200:
+                        log_f.close()
                         return proc.pid, port, base_url
             except Exception:
                 pass
@@ -742,13 +747,21 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             try:
                 r2 = requests.get(f"{base_url}/models", timeout=1)
                 if r2.status_code == 200:
+                    log_f.close()
                     return proc.pid, port, base_url
             except Exception:
                 pass
 
             # Check if the process died
             if proc.poll() is not None:
-                # Process exited. Read the error log if it exists
+                # Process exited. Ensure log is flushed, then read it.
+                try:
+                    log_f.flush()
+                    os.fsync(log_f.fileno())
+                except Exception:
+                    pass
+                log_f.close()
+
                 error_msg = f"Server process for '{model_name}' exited early (code {proc.returncode})."
 
                 if log_file_path.exists():
@@ -756,25 +769,23 @@ class LlamaCppServerBinding(LollmsLLMBinding):
                         with open(log_file_path, "r", encoding="utf-8") as f:
                             stderr_content = f.read()
                         if stderr_content.strip():
-                            # Log the first 10 lines of stderr to console
-                            error_lines = stderr_content.splitlines()[:10]
+                            # Errors are usually at the END of the log, show the last 30 lines
+                            all_lines = stderr_content.splitlines()
+                            error_lines = all_lines[-30:]
                             error_details = "\n".join(error_lines)
-                            ASCIIColors.error(f"Server stderr (first 10 lines):\n{error_details}")
+                            ASCIIColors.error(f"Server log (last 30 lines):\n{error_details}")
 
-                            if len(error_lines) > 10:
+                            if len(all_lines) > 30:
+                                error_details = "\n".join(all_lines[-50:])
                                 error_details += "\n... (truncated, see log file)"
 
                             error_msg += f"\n\nDetailed error output:\n{error_details}\n\nLog saved to: {log_file_path}"
                         else:
-                            error_msg += f"\nNo stderr output captured. Check log file: {log_file_path}"
+                            error_msg += f"\nNo output captured in log file: {log_file_path}"
                     except Exception as read_err:
                         error_msg += f"\nFailed to read error log: {read_err}"
                 else:
                     error_msg += f"\nNo error log generated. Check permissions or model integrity."
-
-                # Close the file handle if it's still open
-                if hasattr(popen_kwargs["stderr"], "close"):
-                    popen_kwargs["stderr"].close()
 
                 raise RuntimeError(error_msg)
 
@@ -782,9 +793,10 @@ class LlamaCppServerBinding(LollmsLLMBinding):
 
         # Timeout reached
         proc.terminate()
-        # Close file handle
-        if "stderr" in popen_kwargs and hasattr(popen_kwargs["stderr"], "close"):
-            popen_kwargs["stderr"].close()
+        try:
+            log_f.close()
+        except Exception:
+            pass
 
         raise TimeoutError(f"Server for '{model_name}' failed to become ready within 120 s.")
 

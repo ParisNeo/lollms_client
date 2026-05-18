@@ -4054,9 +4054,10 @@ class ChatMixin:
                 _virtual_history.append(SimpleNamespace(
                     sender_type="user", content=_error_breadcrumb
                 ))
-                _clean_text_so_far = ""
+                # Preserve accumulated content; only reset the clean prose tracker
+                # so the next round starts fresh but history is kept.
+                _clean_text_so_far = ai_message.content[:round_content_start]
                 ss.clean_prose.clear()
-                ai_message.content = ai_message.content[:round_content_start]
                 ASCIIColors.error(
                     "[chat] Artifact update failed — re-looping to inform LLM."
                 )
@@ -4080,7 +4081,7 @@ class ChatMixin:
                 )
                 _needs_correction = False
                 _correction_msg   = ""
- 
+
                 if _has_external_tools and (
                     len(_output_clean) < 50 or
                     re.search(
@@ -4090,7 +4091,7 @@ class ChatMixin:
                 ):
                     _needs_correction = True
                     _correction_msg   = _TOOL_CALL_CORRECTION
- 
+
                 elif _intent_to_act and not _artefacts_built:
                     _needs_correction = True
                     _correction_msg   = (
@@ -4107,7 +4108,7 @@ class ChatMixin:
                         "║  4. If you do not emit a tag, this conversation cannot proceed.  ║\n"
                         "╚══════════════════════════════════════════════════════════════════╝\n"
                     )
- 
+
                 if _needs_correction:
                     _round1_no_tool_call = True
                     ASCIIColors.yellow(
@@ -4124,8 +4125,9 @@ class ChatMixin:
                     _virtual_history.append(SimpleNamespace(
                         sender_type="user", content=_TOOL_CALL_CORRECTION
                     ))
-                    _clean_text_so_far = ""
-                    _accumulated_full  = ""
+                    # Preserve prior accumulated content; reset trackers for next round
+                    _clean_text_so_far = ai_message.content[:round_content_start]
+                    _accumulated_full  = _accumulated_full[:len("".join(ss.stream_buf[:0]))] or ""
                     ai_message.content = ai_message.content[:round_content_start]
                     continue
  
@@ -4473,7 +4475,7 @@ class ChatMixin:
             )
             # Final safety: remove the marker itself so the model can't see it
             _clean_so_far_for_llm = _EXEC_MARKER_RE.sub('', _clean_so_far_for_llm)
- 
+
             _virtual_history.append(SimpleNamespace(
                 sender_type="assistant",
                 content=_clean_so_far_for_llm.strip()
@@ -4482,22 +4484,26 @@ class ChatMixin:
                 sender_type="user",
                 content=f'<tool_result name="{_tool_name}">{_result_str_for_llm}</tool_result>'
             ))
-            ai_message.content = _clean_text_so_far
+            # CRITICAL FIX: Preserve the full accumulated content in ai_message.content,
+            # not just the clean prose. This ensures tool results and all text survive.
+            ai_message.content = _accumulated_full
             ss.clean_prose.clear()
  
         # ====================================================================
         #  Forced final-answer pass
         # ====================================================================
         _tool_call_count   = len(tool_calls_this_turn)
+        # Use ai_message.content as the source of truth for text produced,
+        # since it accumulates everything including between tool calls.
         _has_produced_text = (
-            bool(_clean_text_so_far.strip()) and
-            len(_clean_text_so_far.strip()) > 100
+            bool(ai_message.content.strip()) and
+            len(ai_message.content.strip()) > 100
         )
         _seems_stuck = _tool_call_count >= 3 and not _has_produced_text
- 
+
         _needs_forced_answer = (
             is_agentic_turn and (
-                not _clean_text_so_far.strip()
+                not ai_message.content.strip()
                 or _round >= max_reasoning_steps
                 or _seems_stuck
                 or (tool_calls_this_turn and not any(
@@ -4506,10 +4512,13 @@ class ChatMixin:
                 ))
             )
         )
- 
+
         if _needs_forced_answer:
             _final_id = _step_start(callback, "Generating final answer...")
- 
+
+            # Preserve all content generated so far; final answer appends to it
+            _content_before_final = ai_message.content
+
             ss_final = _StreamState(
                 callback              = callback,
                 ai_message            = ai_message,
@@ -4519,7 +4528,7 @@ class ChatMixin:
                 enable_forms          = enable_forms,
                 discussion            = self,
             )
-            ai_message.content = ""
+            # Do NOT clear ai_message.content — the final answer should append
  
             def _final_relay(chunk, msg_type=None, meta=None):
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
@@ -4583,8 +4592,11 @@ class ChatMixin:
  
             ss_final.flush_remaining_buffer()
             self.scratchpad = _scratch_before_final
- 
+
+            # The final answer has been streaming into ai_message.content;
+            # ensure we capture the complete result including any prior content.
             _accumulated_full  += "".join(ss_final.stream_buf)
+            # ai_message.content already contains _content_before_final + new final text
             _clean_text_so_far  = ai_message.content
             _step_end(callback, "Final answer generated", _final_id)
  
@@ -4601,9 +4613,12 @@ class ChatMixin:
  
         # ── Final content cleanup ─────────────────────────────────────────────
         import re as _re
+        # Use ai_message.content as the primary source — it contains the
+        # complete accumulated text including all rounds and final answer.
+        _raw_final = ai_message.content or _clean_text_so_far or ""
         _clean = _re.sub(
             r"<tool_call>.*?(?:</tool_call>|$)", "",
-            _clean_text_so_far, flags=_re.DOTALL
+            _raw_final, flags=_re.DOTALL
         ).strip()
         # Remove any residual internal markers
         _clean = _EXEC_MARKER_RE.sub('', _clean).strip()
@@ -4650,8 +4665,10 @@ class ChatMixin:
  
         self.scratchpad = ""
  
+        # CRITICAL: Ensure we save the complete content, not just the cleaned version.
+        # The raw_content preserves everything; content is the user-visible version.
         ai_message.content          = _clean
-        ai_message.raw_content      = _accumulated_full
+        ai_message.raw_content      = _accumulated_full or ai_message.content
         ai_message.tokens           = token_count
         ai_message.generation_speed = tok_per_sec
         ai_message.metadata         = message_meta

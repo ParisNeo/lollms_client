@@ -78,13 +78,20 @@ try:
 except ImportError:
     _PM_AVAILABLE = False
 
-def _ensure_installed(package_name: str, import_name: Optional[str] = None) -> None:
+def _ensure_installed(
+    package_name: str,
+    import_name: Optional[str] = None,
+    package_version: Optional[str] = None,
+) -> None:
     """
     Ensure an optional package is installed using pipmaster.
-    Falls back to ImportError if pipmaster is not available.
+    Falls back to a plain import check if pipmaster is not available.
     """
     if _PM_AVAILABLE:
-        pm.ensure_packages(package_name)
+        if package_version:
+            pm.ensure_packages({package_name: package_version})
+        else:
+            pm.ensure_packages(package_name)
     else:
         # Try a plain import; let the caller handle ImportError
         __import__(import_name or package_name)
@@ -228,19 +235,24 @@ def _extract_text_file(path: Path) -> str:
 # ── PDF ────────────────────────────────────────────────────────────────────
 
 def _extract_pdf_text(path: Path) -> str:
-    """Extract text from all PDF pages, joined with page separators."""
-    _ensure_installed("pymupdf", "fitz")
+    """Extract text from all PDF pages as Markdown, preserving tables."""
+    _ensure_installed("pymupdf4llm")
     try:
-        import fitz  # pymupdf
-        doc = fitz.open(str(path))
+        import pymupdf4llm
+
+        # to_markdown returns one big string covering all pages
+        # page_chunks=True returns a list of dicts, one per page
+        chunks: list[dict] = pymupdf4llm.to_markdown(str(path), page_chunks=True)
+
         pages = []
-        for i, page in enumerate(doc):
-            text = page.get_text("text").strip()
-            pages.append(f"## Page {i + 1}\n\n{text}" if text else f"## Page {i + 1}\n\n[No text]")
-        doc.close()
+        for i, chunk in enumerate(chunks):
+            md = (chunk.get("text") or "").strip()
+            pages.append(f"## Page {i + 1}\n\n{md}" if md else f"## Page {i + 1}\n\n[No text]")
+
         return "\n\n".join(pages)
+
     except ImportError:
-        ASCIIColors.warning("[FileImport] pymupdf not installed — falling back to pypdf")
+        ASCIIColors.warning("[FileImport] pymupdf4llm not installed — falling back to pypdf")
         _ensure_installed("pypdf")
         try:
             from pypdf import PdfReader
@@ -248,10 +260,35 @@ def _extract_pdf_text(path: Path) -> str:
             pages = []
             for i, page in enumerate(reader.pages):
                 text = (page.extract_text() or "").strip()
-                pages.append(f"## Page {i + 1}\n\n{text}" if text else f"## Page {i + 1}\n\n[No text]")
+                pages.append(
+                    f"## Page {i + 1}\n\n{text}" if text else f"## Page {i + 1}\n\n[No text]"
+                )
             return "\n\n".join(pages)
         except Exception as e2:
             raise RuntimeError(f"PDF text extraction failed: {e2}") from e2
+
+
+def _dataframe_to_markdown(df: Any) -> str:
+    """Convert a pandas DataFrame to a Markdown table."""
+    try:
+        import pandas as pd
+        if not isinstance(df, pd.DataFrame):
+            return ""
+        # Replace newlines in cells with spaces to avoid breaking table format
+        clean_df = df.copy()
+        for col in clean_df.columns:
+            clean_df[col] = clean_df[col].astype(str).str.replace("\n", " ").str.replace("\r", " ")
+        return clean_df.to_markdown(index=False)
+    except Exception:
+        # Minimal fallback if pandas to_markdown fails
+        lines = []
+        # Header
+        headers = [str(c) for c in df.columns]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for _, row in df.iterrows():
+            lines.append("| " + " | ".join(str(v) for v in row) + " |")
+        return "\n".join(lines)
 
 
 def _extract_pdf_pages_as_images(
@@ -263,7 +300,7 @@ def _extract_pdf_pages_as_images(
     Render each PDF page to a JPEG image.
     Returns list of (base64_str, media_type).
     """
-    _ensure_installed("pymupdf", "fitz")
+    _ensure_installed("pymupdf4llm", "fitz")
     try:
         import fitz
         doc   = fitz.open(str(path))
@@ -295,7 +332,7 @@ def _extract_pdf_pages_as_images(
 
 def _pdf_text_with_image_anchors(path: Path, art_title: str) -> Tuple[str, List[Tuple[str, str]]]:
     """
-    Extract PDF text and render pages as images simultaneously.
+    Extract PDF text as Markdown and render pages as images simultaneously.
     Returns (text_with_anchors, [(b64, media_type), ...]).
     """
     _ensure_installed("pymupdf", "fitz")
@@ -307,15 +344,47 @@ def _pdf_text_with_image_anchors(path: Path, art_title: str) -> Tuple[str, List[
         pages_text: List[str] = []
         images: List[Tuple[str, str]] = []
 
+        _has_md = hasattr(fitz.Page, "get_text") and "markdown" in getattr(fitz, "TEXT_FORMATS", set())
+
         for i, page in enumerate(doc):
-            text     = page.get_text("text").strip()
             pix      = page.get_pixmap(matrix=mat, alpha=False)
             img_bytes = pix.tobytes("jpeg")
             resized, mt = _resize_image_bytes(img_bytes)
             images.append((_b64_encode(resized), mt))
 
             anchor   = f'<artefact_image id="{make_image_id(art_title, i)}" />'
-            text_blk = text if text else "[No selectable text on this page]"
+
+            if _has_md:
+                md = page.get_text("markdown").strip()
+                text_blk = md if md else "[No selectable text on this page]"
+            else:
+                # Structured fallback with table detection
+                text_blocks = []
+                blocks = page.get_text("blocks")
+                if blocks:
+                    for b in blocks:
+                        if len(b) >= 5:
+                            txt = str(b[4]).strip()
+                            if txt:
+                                text_blocks.append(txt)
+
+                tables_md = []
+                try:
+                    tabs = page.find_tables()
+                    for tab in tabs.tables:
+                        df = tab.to_pandas()
+                        if df is not None and not df.empty:
+                            tables_md.append(_dataframe_to_markdown(df))
+                except Exception:
+                    pass
+
+                if tables_md:
+                    combined = "\n\n".join(text_blocks) + "\n\n" + "\n\n".join(tables_md)
+                else:
+                    combined = "\n\n".join(text_blocks)
+
+                text_blk = combined if combined else "[No selectable text on this page]"
+
             pages_text.append(f"## Page {i + 1}\n\n{anchor}\n\n{text_blk}")
 
         doc.close()
