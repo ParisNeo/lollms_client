@@ -87,7 +87,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         using pipmaster, which handles complex packages like PyTorch.
         """
         ASCIIColors.info(f"Setting up virtual environment in: {self.venv_dir}")
-        pm_v = pm.PackageManager(venv_path=str(self.venv_dir))
+        pm_v = pm.PackageManager(venv_path=str(self.venv_dir), create_if_not_exist=True)
 
         # --- PyTorch Installation ---
         ASCIIColors.info(f"Installing server dependencies")
@@ -115,12 +115,12 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                 result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
                 ASCIIColors.green("NVIDIA GPU detected. Installing CUDA-enabled PyTorch.")
                 # Using a common and stable CUDA version. Adjust if needed.
-                torch_index_url = "https://download.pytorch.org/whl/cu128"
+                torch_index_url = "https://download.pytorch.org/whl/cu124"
             except (FileNotFoundError, subprocess.CalledProcessError):
                 ASCIIColors.yellow("`nvidia-smi` not found or failed. Installing standard PyTorch. If you have an NVIDIA GPU, please ensure drivers are installed and in PATH.")
 
         # Base packages including torch. pm.ensure_packages handles verbose output.
-        pm_v.ensure_packages(["torch", "torchvision"], index_url=torch_index_url)
+        pm_v.ensure_packages(["torch", "torchvision", "torchaudio"], index_url=torch_index_url)
 
         # Standard dependencies
         ASCIIColors.info(f"Installing transformers dependencies")
@@ -144,13 +144,14 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             pass
         # Git-based diffusers to get the latest version
         ASCIIColors.info(f"Installing diffusers library from github")
-        pm_v.ensure_packages([
+        pm_v.ensure_packages(
             {
-                "name": "diffusers",
-                "vcs": "git+https://github.com/huggingface/diffusers.git",
-                "condition": ">=0.35.1"
+                "diffusers": {
+                    "vcs": "git+https://github.com/huggingface/diffusers.git",
+                    "condition": ">=0.35.1"
+                }
             }
-        ])
+        )
 
         ASCIIColors.green("Server dependencies are satisfied.")
 

@@ -1,0 +1,182 @@
+title: 'vLLM-Omni TTS'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'vllm_omni_tts'
+
+description: |
+  Universal local TTS binding for any vLLM-Omni-compatible model.
+  Zero manual setup required — dependencies are auto-installed on first use.
+
+  Supported models
+  ────────────────
+  Model                                     VRAM   Voice cloning  Presets
+  ─────────────────────────────────────────────────────────────────────────
+  mistralai/Voxtral-4B-TTS-2603             ~5 GB  No*            11 (en)
+  Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice     ~3 GB  No             10 (multi)
+  Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign     ~3 GB  No             NL instruct
+  Qwen/Qwen3-TTS-12Hz-1.7B-Base            ~3 GB  Yes            None
+  fishaudio/s2-pro                          ~8 GB  Yes            None
+  FunAudioLLM/Fun-CosyVoice3-0.5B-2512     ~2 GB  Yes            None
+  k2-fsa/OmniVoice                          ~4 GB  Yes            None
+  openbmb/VoxCPM2                           ~5 GB  Yes            Some
+  OpenMOSS-Team/MOSS-TTS-Nano               ~1 GB  Yes            None
+
+  * Voxtral open-weight release omits the voice encoder.
+
+  OS compatibility
+  ────────────────
+  Linux  : Full GPU support
+  WSL2   : Full GPU support (CUDA passthrough)
+  macOS  : CPU-only
+  Windows: Not supported — friendly setup instructions are printed.
+
+global_input_parameters:
+  - name: "host"
+    type: "str"
+    default: "localhost"
+    description: "Host the vLLM-Omni server binds to."
+
+  - name: "port"
+    type: "int"
+    default: 8030
+    description: "Port the vLLM-Omni server listens on."
+
+  - name: "auto_start_server"
+    type: "bool"
+    default: false
+    description: >
+      Start vLLM-Omni automatically on binding init.
+      If false (default), the server starts lazily on the first API call.
+
+  - name: "hf_token"
+    type: "str"
+    default: ""
+    description: >
+      HuggingFace access token. Also readable from the HF_TOKEN environment
+      variable. Required for gated model repos.
+
+  - name: "device"
+    type: "str"
+    default: "auto"
+    description: "Compute device: 'auto', 'cuda', 'cpu'."
+
+  - name: "gpu_memory_utilization"
+    type: "float"
+    default: 0.6
+    description: >
+      Fraction of GPU VRAM vLLM-Omni may use (0.0–1.0).
+      0.6 is safe for 8 GB GPUs.  Raise to 0.85 on 16 GB+ cards.
+
+  - name: "extra_args"
+    type: "list"
+    default: []
+    description: >
+      Extra CLI arguments appended to the vllm serve command.
+      Used for model-specific flags such as:
+        ["--trust-remote-code"]
+        ["--trust-remote-code", "--enforce-eager",
+         "--deploy-config", "vllm_omni/deploy/qwen3_tts.yaml"]
+
+  - name: "venv_dir"
+    type: "str"
+    default: "<binding_root>/.venv_vllm_omni"
+    description: "Path to the dedicated Python venv."
+
+  - name: "python_version"
+    type: "str"
+    default: "3.10"
+    description: "Python version used for the dedicated venv."
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "mistralai/Voxtral-4B-TTS-2603"
+    description: "HuggingFace model ID or local path for the TTS model."
+
+  - name: "default_voice"
+    type: "str"
+    default: ""
+    description: >
+      Default voice when none is specified in generate_audio().
+      Leave empty to let the model choose.
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The text to synthesise."
+
+  - name: "voice"
+    type: "str"
+    default: ""
+    description: >
+      Voice ID — meaning is model-dependent:
+        Voxtral / Qwen3-CustomVoice : preset name (e.g. 'bm_george', 'Ethan')
+        Qwen3-VoiceDesign           : free-form NL description
+                                      (e.g. "warm deep British male, slow paced")
+        Fish Speech / CosyVoice3    : uploaded custom voice name
+      Falls back to default_voice when omitted.
+
+  - name: "language"
+    type: "str"
+    default: "en"
+    description: "Language code: en, fr, de, es, nl, pt, it, hi, ar."
+
+  - name: "response_format"
+    type: "str"
+    default: "wav"
+    description: "Audio format: wav, mp3, flac, opus, pcm."
+
+  - name: "speed"
+    type: "float"
+    default: 1.0
+    description: "Playback speed multiplier (0.25–4.0)."
+
+  - name: "instructions"
+    type: "str"
+    default: ""
+    description: >
+      Optional style/emotion prompt forwarded to the model.
+      Supported by Voxtral and Qwen3-TTS models.
+
+commands:
+  - name: "upload_voice"
+    title: "Upload Custom Voice"
+    description: >
+      Upload a reference audio file for zero-shot voice cloning.
+      Supported by Qwen3-TTS-Base, Fish Speech S2 Pro, CosyVoice3,
+      OmniVoice, VoxCPM2, MOSS-TTS-Nano.
+      Providing ref_text (the transcript) significantly improves quality.
+    parameters:
+      - name: "voice_path"
+        type: "str"
+        description: "Local path to WAV/MP3/FLAC file (3–25 s recommended)."
+        mandatory: true
+      - name: "voice_name"
+        type: "str"
+        description: "Name to register. Defaults to filename stem."
+        mandatory: false
+      - name: "ref_text"
+        type: "str"
+        description: "Exact transcript of the reference audio (improves quality)."
+        mandatory: false
+    output:
+      - name: "success"
+        type: "bool"
+      - name: "voice_name"
+        type: "str"
+      - name: "message"
+        type: "str"
+
+  - name: "delete_voice"
+    title: "Delete Custom Voice"
+    description: "Remove a previously uploaded custom voice from the server."
+    parameters:
+      - name: "voice_name"
+        type: "str"
+        description: "Registered name of the voice to delete."
+        mandatory: true
+    output:
+      - name: "success"
+        type: "bool"
+      - name: "message"
+        type: "str"

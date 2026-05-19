@@ -1,0 +1,78 @@
+title: 'Mistral Voxtral TTS'
+author: 'ParisNeo & Mistral AI'
+version: 1.0.0
+binding_name: 'mistral_tts'
+
+description: |
+  Cloud TTS binding for Mistral's Voxtral TTS API (voxtral-tts-2603).
+  Converts text to speech via the Mistral AI REST endpoint at
+  https://api.mistral.ai/v1/audio/speech.
+
+  No local model or server is required. Authentication is performed with a
+  Mistral API key, which can be supplied via the 'api_key' config field or
+  the MISTRAL_API_KEY environment variable.
+
+  Supported voices (Voxtral-TTS-2603):
+    af_heart, af_bella, af_nicole, af_sarah, af_sky,
+    am_adam, am_michael,
+    bf_emma, bf_isabella,
+    bm_george, bm_lewis
+
+global_input_parameters:
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: >
+      Your Mistral API key. Can also be set via the MISTRAL_API_KEY
+      environment variable. Required for all requests.
+
+  - name: "base_url"
+    type: "str"
+    default: "https://api.mistral.ai/v1/audio/speech"
+    description: "Override the Mistral TTS endpoint URL (advanced use only)."
+
+  - name: "response_format"
+    type: "str"
+    default: "wav"
+    description: >
+      Audio format returned by the API. Supported values: wav, mp3, opus, flac.
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: "voxtral-tts-2603"
+    description: "The Mistral TTS model to use."
+
+  - name: "default_voice"
+    type: "str"
+    default: "af_bella"
+    description: >
+      The voice to use when none is specified in a generation call.
+      Must be one of the supported Mistral voice IDs.
+
+generate_audio_parameters:
+  - name: "text"
+    type: "str"
+    description: "The text to synthesise."
+
+  - name: "voice"
+    type: "str"
+    default: "af_bella"
+    description: >
+      Mistral voice ID. Available voices:
+        af_heart, af_bella, af_nicole, af_sarah, af_sky,
+        am_adam, am_michael,
+        bf_emma, bf_isabella,
+        bm_george, bm_lewis
+
+  - name: "language"
+    type: "str"
+    default: "en"
+    description: >
+      BCP-47 language code (e.g. 'en', 'fr', 'es'). Passed to the API
+      as a hint; Voxtral auto-detects language when omitted.
+
+  - name: "speed"
+    type: "float"
+    default: 1.0
+    description: "Playback speed multiplier (0.25 – 4.0). Optional."

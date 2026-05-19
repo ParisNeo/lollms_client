@@ -120,6 +120,11 @@ input_parameters:
     description: "KV-cache value quantisation type."
     mandatory: false
     default: null
+  - name: multimodal
+    type: bool
+    description: "Enable automatic vision projector (mmproj) detection. Disable if you only use text models."
+    mandatory: false
+    default: true
   - name: max_active_models
     type: int
     description: "Maximum simultaneous model servers (-1 = unlimited)."
