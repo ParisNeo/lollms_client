@@ -408,16 +408,72 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             ASCIIColors.error(error_msg)
             return {"status": False, "message": error_msg}
 
-    def update_llama_cpp(self) -> dict:
+    def update(self) -> dict:
         """Updates or reinstalls the llama.cpp binaries.
 
         This is the command entry point for the 'update' command.
-        It forces a re-download of the latest binaries.
+        It performs a complete update by:
+        1. Closing any running server
+        2. Deleting existing installation
+        3. Installing the latest llama.cpp server binaries
 
         Returns:
-        dict: {"status": bool, "message": str}
+            dict: {"status": bool, "message": str}
         """
-        return self.install_llama_cpp(force=True)
+        try:
+            ASCIIColors.info("Starting llama.cpp update procedure...")
+
+            # Step 1: Close any running server
+            if self.model_name:
+                ASCIIColors.info(f"Stopping current server for model: {self.model_name}")
+                self.unload_model(self.model_name)
+
+            # Also check for any other running servers and stop them
+            for rf in list(self.servers_dir.glob("*.json")):
+                try:
+                    with open(rf, "r") as f:
+                        data = json.load(f)
+                    model_name = data.get("model_name", "unknown")
+                    if model_name != self.model_name:
+                        ASCIIColors.info(f"Stopping additional server: {model_name}")
+                        self.unload_model(model_name)
+                except Exception as e:
+                    ASCIIColors.warning(f"Could not stop server from registry {rf.name}: {e}")
+
+            # Small delay to ensure processes are fully terminated
+            time.sleep(2)
+
+            # Step 2: Delete existing installation
+            exe = self._get_server_executable()
+            if exe.exists():
+                ASCIIColors.info(f"Removing existing binary: {exe}")
+                exe.unlink()
+
+            # Also remove any other llama-server binaries in the bin directory
+            for f in self.bin_dir.iterdir():
+                if f.is_file():
+                    name_lower = f.name.lower()
+                    if "llama" in name_lower and "server" in name_lower:
+                        ASCIIColors.info(f"Removing additional binary: {f.name}")
+                        f.unlink()
+
+            # Step 3: Install latest binaries (force re-download)
+            ASCIIColors.info("Downloading and installing latest llama.cpp binaries...")
+            result = self.install_llama_cpp(force=True)
+
+            if result.get("status", False):
+                ASCIIColors.success("llama.cpp update completed successfully.")
+                return {"status": True, "message": "llama.cpp binaries have been successfully updated."}
+            else:
+                error_msg = result.get("message", "Unknown error during update")
+                ASCIIColors.error(f"Update failed: {error_msg}")
+                return {"status": False, "message": f"Update failed: {error_msg}"}
+
+        except Exception as e:
+            error_msg = f"Update procedure failed: {str(e)}"
+            ASCIIColors.error(error_msg)
+            trace_exception(e)
+            return {"status": False, "message": error_msg}
 
     # ──────────────────────────────────────────────────────────────────────────
     # Registry helpers
