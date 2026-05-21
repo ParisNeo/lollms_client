@@ -173,6 +173,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                         ASCIIColors.warning(
                             "Invalid or missing virtual environment. Reinstalling..."
                         )
+
                         self.install_server_dependencies()
 
                     if sys.platform == "win32":
@@ -200,12 +201,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                             self.hf_token
                         ])
 
-                    creationflags = 0
-
-                    self.server_process = subprocess.Popen(
-                        command,
-                        creationflags=creationflags
-                    )
+                    self.server_process = subprocess.Popen(command)
 
                     ASCIIColors.info(
                         f"Diffusers server launched on "
@@ -216,6 +212,11 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                         start_time = time.time()
 
                         while True:
+                            if self.server_process.poll() is not None:
+                                raise RuntimeError(
+                                    "Diffusers server process terminated unexpectedly."
+                                )
+
                             if self.is_server_running():
                                 ASCIIColors.success(
                                     "Diffusers server is ready."
@@ -226,7 +227,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
                             if elapsed >= timeout_s:
                                 raise TimeoutError(
-                                    f"Server failed to start within {timeout_s} seconds."
+                                    f"Server failed to start within "
+                                    f"{timeout_s} seconds."
                                 )
 
                             time.sleep(1)
@@ -245,12 +247,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         thread.start()
 
         if wait:
-            thread.join(timeout=timeout_s + 5)
-
-            if not self.is_server_running():
-                raise RuntimeError(
-                    "Diffusers server thread terminated before server became available."
-                )
+            thread.join()
 
     def _wait_for_server(self, timeout=30):
         """Waits for the server to become responsive."""

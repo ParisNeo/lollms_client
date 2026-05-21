@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-21 01:36]
+
+- fix(diffusers): improve server startup reliability and bump version to 1.13.21
+
 ## [2026-05-21 01:24]
 
 - chore(deps): bump pipmaster to >=1.1.13 across project files
