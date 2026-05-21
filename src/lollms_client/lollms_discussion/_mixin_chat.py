@@ -2918,13 +2918,18 @@ class ChatMixin:
         # 1. Live artifact inventory ─────────────────────────────────────────
         active_arts = self.artefacts.list(active_only=True)
         art_lines = []
-        for a in active_arts:
-            lang  = f" [{a.get('language')}]" if a.get('language') else ""
-            lines = len((a.get('content') or '').splitlines())
-            art_lines.append(
-                f"  • {a['title']}  "
-                f"(v{a.get('version', 1)}, {a.get('type', '?')}{lang}, {lines} lines)"
-            )
+        if active_arts:
+            art_lines.append("=== ACTIVE ARTIFACTS (must update these, do not recreate) ===")
+            for a in active_arts:
+                lang  = f" [{a.get('language')}]" if a.get('language') else ""
+                preview = (a.get('content') or '')[:60].replace('\n', ' ')
+                art_lines.append(
+                    f"  • [{a['type']}] \"{a['title']}\" "
+                    f"({a.get('version', 1)} version(s), {len(a.get('content',''))} chars) "
+                    f"— lang: {lang}"
+                    f"— starts: {preview!r}"
+                )
+            art_lines.append("=== END ACTIVE ARTIFACTS ===")
         art_summary = "\n".join(art_lines) if art_lines else "  (none)"
  
         # 2. Change log from message metadata (last 10 changes) ──────────────
@@ -3013,7 +3018,6 @@ class ChatMixin:
         enable_show_tools:            bool = True,
         enable_extract_artefact:      bool = True,
         enable_final_answer:          bool = True,
-        enable_request_clarification: bool = True,
         enable_repl_tools:            bool = True,
         enable_inline_widgets:        bool = True,
         enable_notes:                 bool = True,
@@ -3498,6 +3502,26 @@ class ChatMixin:
                 ss.flush_remaining_buffer()
                 raw_text = ai_message.content
                 self.scratchpad = ""
+
+            # ADD: detect "described but didn't act" on fast path
+            _intent_keywords = ["update", "add", "change", "fix", "create", "build", "write", "make"]
+            _user_intends_to_act = any(kw in user_message.lower() for kw in _intent_keywords)
+            if (_user_intends_to_act
+                    and not ss.affected_artefacts
+                    and len(ai_message.content.strip()) > 30
+                    and bool(self.artefacts.list(active_only=True))):
+                # Model wrote prose about what it would do but didn't emit an <artifact> tag
+                # while active artifacts exist. Re-run with correction injected.
+                self.scratchpad = (
+                    "\n⚠️ CORRECTION: You wrote a description but did not emit any <artifact> tag. "
+                    "Active artifacts exist. You MUST emit the <artifact> tag with your changes NOW. "
+                    "Do not write prose — emit the XML directly.\n"
+                    + (self.scratchpad or "")
+                )
+                # clear and re-run (similar to existing retry_prompt pattern)
+                ai_message.content = ""
+                raw_text = self._stream_final_answer(...)
+                ss.flush_remaining_buffer()                
  
             if remove_thinking_blocks:
                 raw_text = self.lollmsClient.remove_thinking_blocks(raw_text)
@@ -3659,15 +3683,7 @@ class ChatMixin:
                 "success": True,
             }
             tool_descriptions.append("- final_answer(): Signal that the answer is ready")
- 
-        if enable_request_clarification:
-            tool_registry["request_clarification"] = lambda question: {
-                "status": "clarification", "question": question, "success": True,
-            }
-            tool_descriptions.append(
-                "- request_clarification(question: str): Ask user for clarification"
-            )
- 
+  
         object.__setattr__(
             self, "_system_prompt",
             _build_tool_system_prompt(self._system_prompt or "", tool_descriptions)
@@ -3834,8 +3850,7 @@ class ChatMixin:
                 )
                 _round = max_reasoning_steps
                 active_tool_registry = {
-                    "final_answer":          tool_registry.get("final_answer"),
-                    "request_clarification": tool_registry.get("request_clarification"),
+                    "final_answer": tool_registry.get("final_answer"),
                 }
                 self.scratchpad = (
                     "╔══════════════════════════════════════════════════════════════════╗\n"
@@ -3998,6 +4013,27 @@ class ChatMixin:
                 if content:
                     _formatted_messages.append({"role": msg_role, "content": content})
  
+            # Images
+            _binding = getattr(self.lollmsClient, 'llm', None)
+            _vision_ok = getattr(_binding, 'supports_vision', True)  # default True for compat
+            if merged_images and not _vision_ok:
+                # Build a text description fallback
+                _img_note = (
+                    "\n[SYSTEM: The user attached an image but this model has no vision capability. "
+                    "Tell the user you cannot see images and ask them to describe it.]\n"
+                )
+                self.scratchpad = (self.scratchpad or "") + _img_note
+                merged_images = []  # don't pass images that will be silently dropped
+
+            elif merged_images:
+                # Force weak models to acknowledge the image first
+                _img_preamble = (
+                    f"\n[VISION INPUT: {len(merged_images)} image(s) attached. "
+                    "You MUST look at the image(s) and base your answer on what you actually see. "
+                    "Do NOT answer from memory or conversation history when image content is relevant.]\n"
+                )
+                self.scratchpad = (self.scratchpad or "") + _img_preamble
+
             self.lollmsClient.generate_from_messages(
                 messages           = _formatted_messages,
                 images             = merged_images,
@@ -4137,9 +4173,27 @@ class ChatMixin:
             # ====================================================================
             #  Tool execution
             # ====================================================================
+            def _parse_tool_call_lenient(raw: str) -> dict:
+                """Try json.loads first, then regex extraction as fallback."""
+                raw = raw.strip()
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+                # Fallback: extract name and parameters by regex
+                name_match = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
+                params_match = re.search(r'"parameters"\s*:\s*(\{[^}]*\})', raw, re.DOTALL)
+                if name_match:
+                    name = name_match.group(1)
+                    try:
+                        params = json.loads(params_match.group(1)) if params_match else {}
+                    except Exception:
+                        params = {}
+                    return {"name": name, "parameters": params}
+                return {}
             is_agentic_turn = True
             try:
-                _call_data   = json.loads(_tool_json_str or "{}")
+                _call_data   = _parse_tool_call_lenient(_tool_json_str or "{}")
                 _tool_name   = _call_data.get("name", "")
                 _tool_params = _call_data.get("parameters", {})
             except Exception as e:
@@ -4233,7 +4287,7 @@ class ChatMixin:
                 for entry in _turn_action_history
             )
  
-            if _already_done and _tool_name not in ["final_answer", "request_clarification"]:
+            if _already_done and _tool_name not in ["final_answer"]:
                 ss._emit_tool_processing_status(
                     "Tool Access Revoked: Mission already complete."
                 )

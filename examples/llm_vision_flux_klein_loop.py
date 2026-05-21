@@ -50,8 +50,8 @@ LLM_MODEL_NAME = "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
 LLM_MMPROJ_NAME = "mmproj-mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"  # adjust to your actual filename
 
 LLM_BINDING_CONFIG = {
-    "models_path": "data/models/llama_cpp_models",
-    "binaries_path": "data/bin/llm/llama_cpp_server",
+    "models_path": "e:/data/models/llama_cpp_models",
+    "binaries_path": "e:/data/bin/llm/llama_cpp_server",
     "ctx_size": 8192,
     "n_gpu_layers": -1,      # offload all to GPU if available
     "n_threads": 4,
@@ -62,14 +62,15 @@ LLM_BINDING_CONFIG = {
 }
 
 # TTI: FLUX.2 Klein 4B distilled (smallest, fastest, Apache 2.0)
-FLUX_MODEL_NAME = "black-forest-labs/FLUX.2-klein-4B"
+FLUX_MODEL_NAME = "diffusers/FLUX.1-dev-bnb-4bit"
 FLUX_BINDING_CONFIG = {
     "host": "localhost",
     "port": 9632,
     "model_name": FLUX_MODEL_NAME,
     "auto_start_server": True,
     "wait_for_server": True,
-    "models_path": "./data/tti_models/diffusers",
+    "venv_path": "e:/data/tti_venv",
+    "models_path": "e:/data/tti_models/diffusers",
     "device": "cuda",
     "torch_dtype_str": "bfloat16",
     "num_inference_steps": 4,      # Klein distilled: 4 steps is enough

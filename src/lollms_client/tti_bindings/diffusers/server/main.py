@@ -13,6 +13,7 @@ import pipmaster as pm
 pm.ensure_packages("requests")
 
 import requests
+from huggingface_hub import snapshot_download
 from tqdm import tqdm
 import json
 import shutil
@@ -28,8 +29,7 @@ import sys
 import platform
 import inspect
 
-pm.ensure_packages(["ascii_colors>=0.11.10", "torch", "pillow"])
-pm.ensure_packages("git+https://github.com/huggingface/diffusers.git")
+pm.ensure_packages(["ascii_colors>=0.11.10", "torch", "pillow", "diffusers"])
 
 from ascii_colors import trace_exception, ASCIIColors
 
@@ -47,13 +47,15 @@ sys.path.insert(0, str(binding_root))
 
 try:
     import torch
+    from diffusers import (
+        AutoPipelineForText2Image, AutoPipelineForImage2Image, AutoPipelineForInpainting,
+        DiffusionPipeline, StableDiffusionPipeline,
+        QwenImageEditPipeline, QwenImageEditPlusPipeline,
+    )
 except Exception as ex:
     trace_exception(ex)    
-from diffusers import (
-    AutoPipelineForText2Image, AutoPipelineForImage2Image, AutoPipelineForInpainting,
-    DiffusionPipeline, StableDiffusionPipeline,
-    QwenImageEditPipeline, QwenImageEditPlusPipeline,
-)
+    input("Press a button to continue")
+    sys.exit(-1)
 from PIL import Image
 DIFFUSERS_AVAILABLE = True
 
@@ -1310,18 +1312,29 @@ def pull_model_endpoint(payload: PullModelRequest):
         dest_dir.mkdir(parents=True, exist_ok=True)
         try:
             ASCIIColors.cyan(f"Pulling HF model '{model_id}' into {dest_dir}")
-            load_params: Dict[str, Any] = {}
-            if state.config.get("hf_cache_path"):
-                load_params["cache_dir"] = str(state.config["hf_cache_path"])
-            if state.config.get("hf_token"):
-                load_params["token"] = state.config["hf_token"]
-            load_params["local_files_only"] = False
-            pipe = DiffusionPipeline.from_pretrained(model_id, **load_params)
-            pipe.save_pretrained(dest_dir)
-            del pipe
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+
+            # Download directly to destination, bypassing default HF cache
+            token = state.config.get("hf_token")
+            snapshot_download(
+                repo_id=model_id,
+                local_dir=dest_dir,
+                local_dir_use_symlinks=False,
+                token=token,
+            )
+
+            # If no model_index.json, load and re-save to ensure proper diffusers format
+            if not (dest_dir / "model_index.json").exists():
+                ASCIIColors.info("No model_index.json found. Converting to Diffusers format...")
+                load_params: Dict[str, Any] = {}
+                if token:
+                    load_params["token"] = token
+                pipe = DiffusionPipeline.from_pretrained(str(dest_dir), **load_params)
+                pipe.save_pretrained(dest_dir)
+                del pipe
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             ASCIIColors.green(f"Model '{model_id}' pulled to {dest_dir}")
             return {"status": "ok", "model_name": folder_name}
         except Exception as e:

@@ -10,6 +10,8 @@ from pathlib import Path
 from ascii_colors import trace_exception
 from typing import Optional, List, Dict, Any, Union, Callable
 
+
+
 # Ensure pipmaster is available.
 try:
     import pipmaster as pm
@@ -45,7 +47,8 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
-        self.venv_dir = Path("./venv/tti_diffusers_venv")
+        
+        self.venv_dir =  Path(kwargs.get("venv_path", "./venv/tti_diffusers_venv"))
         self.models_path = Path(kwargs.get("models_path", "./data/tti_models/diffusers")).resolve()
         self.extra_models_path = kwargs.get("extra_models_path")
         self.hf_token = kwargs.get("hf_token", "")  # NEW
@@ -115,7 +118,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                 result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
                 ASCIIColors.green("NVIDIA GPU detected. Installing CUDA-enabled PyTorch.")
                 # Using a common and stable CUDA version. Adjust if needed.
-                torch_index_url = "https://download.pytorch.org/whl/cu124"
+                torch_index_url = "https://download.pytorch.org/whl/cu128"
             except (FileNotFoundError, subprocess.CalledProcessError):
                 ASCIIColors.yellow("`nvidia-smi` not found or failed. Installing standard PyTorch. If you have an NVIDIA GPU, please ensure drivers are installed and in PATH.")
 
@@ -144,39 +147,32 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             pass
         # Git-based diffusers to get the latest version
         ASCIIColors.info(f"Installing diffusers library from github")
-        pm_v.ensure_packages(
-            {
-                "diffusers": {
-                    "vcs": "git+https://github.com/huggingface/diffusers.git",
-                    "condition": ">=0.35.1"
-                }
-            }
-        )
+        pm_v.ensure_packages("diffusers")
 
         ASCIIColors.green("Server dependencies are satisfied.")
 
-    def start_server(self, wait=True, timeout_s=20):
+    def start_server(self, wait: bool = True, timeout_s: int = 20):
         """
-        Launches the FastAPI server in a background thread and returns immediately.
-        This method should only be called from within a file lock.
+        Launches the FastAPI server in a background thread.
         """
         import threading
-        
+        import subprocess
+        import sys
+        import time
 
         def _start_server_background():
-            """Helper method to start the server in a background thread."""
-            # Use a lock file in the binding's server directory for consistency across instances
-            lock_path = self.server_dir / "diffusers_server.lock"
+            lock_path = self.venv_dir / "diffusers_server.lock"
             lock = FileLock(lock_path)
-            with lock.acquire(timeout=0):
-                try:
+
+            try:
+                with lock.acquire(timeout=0):
                     server_script = self.server_dir / "main.py"
-                    if not server_script.exists():
-                        # Fallback for old structure
-                        server_script = self.binding_root / "server.py"
-                        if not server_script.exists():
-                            raise FileNotFoundError(f"Server script not found at {server_script}. Make sure it's in a 'server' subdirectory.")
-                    if not self.venv_dir.exists():
+                    venv_cfg = self.venv_dir / "pyvenv.cfg"
+
+                    if not venv_cfg.exists():
+                        ASCIIColors.warning(
+                            "Invalid or missing virtual environment. Reinstalling..."
+                        )
                         self.install_server_dependencies()
 
                     if sys.platform == "win32":
@@ -193,32 +189,68 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     ]
 
                     if self.extra_models_path:
-                        resolved_extra_path = Path(self.extra_models_path).resolve()
-                        command.extend(["--extra-models-path", str(resolved_extra_path)])
+                        command.extend([
+                            "--extra-models-path",
+                            str(Path(self.extra_models_path).resolve())
+                        ])
 
                     if self.hf_token:
-                        command.extend(["--hf-token", self.hf_token])
+                        command.extend([
+                            "--hf-token",
+                            self.hf_token
+                        ])
 
-                    if self.extra_models_path:
-                        resolved_extra_path = Path(self.extra_models_path).resolve()
-                        command.extend(["--extra-models-path", str(resolved_extra_path)])
+                    creationflags = 0
 
-                    creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
-                    self.server_process = subprocess.Popen(command, creationflags=creationflags)
-                    ASCIIColors.info("Diffusers server process launched in the background.")
-                    #while(not self.is_server_running()):
-                    #    time.sleep(1)
-                    
-                except Exception as e:
-                    ASCIIColors.error(f"Failed to start Diffusers server: {e}")
-                    raise
+                    self.server_process = subprocess.Popen(
+                        command,
+                        creationflags=creationflags
+                    )
 
-        # Start the server in a background thread
-        thread = threading.Thread(target=_start_server_background, daemon=True)
+                    ASCIIColors.info(
+                        f"Diffusers server launched on "
+                        f"http://{self.host}:{self.port}"
+                    )
+
+                    if wait:
+                        start_time = time.time()
+
+                        while True:
+                            if self.is_server_running():
+                                ASCIIColors.success(
+                                    "Diffusers server is ready."
+                                )
+                                return
+
+                            elapsed = time.time() - start_time
+
+                            if elapsed >= timeout_s:
+                                raise TimeoutError(
+                                    f"Server failed to start within {timeout_s} seconds."
+                                )
+
+                            time.sleep(1)
+
+            except Exception as ex:
+                ASCIIColors.error(
+                    f"Failed to start Diffusers server: {ex}"
+                )
+                raise
+
+        thread = threading.Thread(
+            target=_start_server_background,
+            daemon=True
+        )
+
         thread.start()
-        if wait:
-            thread.join()
 
+        if wait:
+            thread.join(timeout=timeout_s + 5)
+
+            if not self.is_server_running():
+                raise RuntimeError(
+                    "Diffusers server thread terminated before server became available."
+                )
 
     def _wait_for_server(self, timeout=30):
         """Waits for the server to become responsive."""

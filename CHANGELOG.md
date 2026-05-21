@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-21 01:24]
+
+- chore(deps): bump pipmaster to >=1.1.13 across project files
+
 ## [2026-05-18 21:19]
 
 - fix(llama_cpp_server): ensure shared libs are found on Linux/Unix
