@@ -2651,7 +2651,7 @@ class ChatMixin:
         auto_activate_artefacts: bool = True,
         enable_inline_widgets:   bool = True,
         enable_notes:            bool = True,
-        enable_skills:           bool = False,
+        enable_skills:           bool = True,
         enable_forms:            bool = True,
         enable_silent_artefact_explanation: bool = True,
         memory_manager=None,
