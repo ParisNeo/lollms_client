@@ -1220,7 +1220,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         do_stream   = self._resolve(stream, True if cb else (self.default_stream or False))
 
         try:
-            messages = discussion.export("openai_chat")
+            messages = discussion.export("openai_chat", branch_tip_id)
             return self._run_chat_messages(
                 messages,
                 n_predict=n_predict, stream=do_stream, temperature=temperature,
