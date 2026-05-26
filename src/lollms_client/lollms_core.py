@@ -693,8 +693,12 @@ class LollmsClient():
         return self.n_ctx or self.default_ctx_size or 4096
 
     def list_models(self):
-        if self.llm: return self.llm.list_models()
-        raise RuntimeError("LLM binding not initialized.")
+        models = []
+        if self.llm: models += self.llm.list_models()
+        if self.tti: models +=  self.tti.list_models()
+        if self.tts: models +=  self.tts.list_models()
+        if self.stt: models +=  self.stt.list_models()
+        return models
 
     def listMountedPersonalities(self) -> Union[List[Dict], Dict]:
         if self.llm and hasattr(self.llm, 'lollms_listMountedPersonalities'):
