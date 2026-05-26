@@ -289,8 +289,10 @@ document.addEventListener("DOMContentLoaded", () => {
         const targetBtn = document.querySelector(`.tab-btn[data-tab="${targetTabId}"]`);
         const targetContent = document.getElementById(targetTabId);
 
-        if (targetBtn && targetContent) {
+        if (targetBtn) {
             targetBtn.classList.add("active");
+        }
+        if (targetContent) {
             targetContent.classList.add("active");
         }
     }
@@ -2329,6 +2331,9 @@ document.addEventListener("DOMContentLoaded", () => {
             const defaultVal = p.default !== undefined ? p.default : "";
             const desc = p.description || "";
 
+            // Detect secret fields (API keys, tokens, etc.)
+            const isSecret = key.toLowerCase().includes("key") || key.toLowerCase().includes("token") || p.is_secret;
+
             if (type === "bool" || type === "boolean") {
                 return `
                     <div class="input-group">
@@ -2345,6 +2350,16 @@ document.addEventListener("DOMContentLoaded", () => {
                         <input type="number" id="tti-cfg-${key}" data-tti-key="${key}" data-type="${type}" value="${defaultVal}" step="${type === 'float' || type === 'number' ? '0.01' : '1'}" />
                         <span style="font-size:10px; color:var(--text-secondary); margin-top:2px;">${desc}</span>
                     </div>`;
+            } else if (isSecret) {
+                return `
+                    <div class="input-group">
+                        <label for="tti-cfg-${key}">${label}</label>
+                        <div style="position: relative; display: flex; align-items: center; width: 100%;">
+                            <input type="password" id="tti-cfg-${key}" data-tti-key="${key}" value="${defaultVal}" placeholder="${desc}" style="padding-right: 40px;" />
+                            <button type="button" class="btn-toggle-secret" data-target="tti-cfg-${key}" style="position: absolute; right: 8px; background: none; border: none; color: var(--accent-color); cursor: pointer; font-size: 16px; outline: none; padding: 4px;" title="Toggle Visibility">👁️</button>
+                        </div>
+                        <span style="font-size:10px; color:var(--text-secondary); margin-top:2px;">${desc}</span>
+                    </div>`;
             } else {
                 return `
                     <div class="input-group">
@@ -2354,6 +2369,18 @@ document.addEventListener("DOMContentLoaded", () => {
                     </div>`;
             }
         }).join("");
+
+        // Attach event listeners for secret toggles
+        ttiConfigForm.querySelectorAll(".btn-toggle-secret").forEach(btn => {
+            btn.addEventListener("click", () => {
+                const targetInput = document.getElementById(btn.dataset.target);
+                if (targetInput) {
+                    const isPassword = targetInput.type === "password";
+                    targetInput.type = isPassword ? "text" : "password";
+                    btn.textContent = isPassword ? "🔒" : "👁️";
+                }
+            });
+        });
     }
 
     function collectTtiBindingConfig() {
@@ -2974,58 +3001,59 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function loadSettingsIntoUI() {
         try {
+            console.log("🔍 Loading settings into UI...");
             const res = await fetch("/api/settings");
             const data = await res.json();
-            
+
+            console.log("📦 Settings data:", data);
+
+            // First, load all binding options
             await fetchBindings();
+            console.log("📋 Available bindings loaded:", availableBindings.map(b => b.binding_name));
+            console.log("📋 SelBinding options:", Array.from(selBinding.options).map(o => o.value));
+
             await fetchTtiBindings();
             await fetchProfiles();
 
             if (data.success && data.llm_binding_name) {
-                // Pre-select binding and load its form fields
-                selBinding.value = data.llm_binding_name;
-                renderConfigForm(data.llm_binding_name);
+                console.log("💾 Saved binding name:", data.llm_binding_name);
 
-                // Populate config inputs first
-                const config = data.llm_binding_config || {};
-                for (const [key, value] of Object.entries(config)) {
-                    const input = document.getElementById(`cfg-${key}`);
-                    if (input) {
-                        if (input.type === "checkbox") {
-                            input.checked = !!value;
-                        } else {
-                            input.value = Array.isArray(value) ? JSON.stringify(value) : value;
-                        }
-                    }
-                }
+                // Verify the saved binding exists in the loaded options before selecting it
+                const bindingExists = availableBindings.some(b => b.binding_name === data.llm_binding_name);
+                console.log("✅ Binding exists check:", bindingExists);
 
-                // Trigger validation with the loaded config values directly
-                const valRes = await fetch("/api/bindings/llm/test", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ binding_name: data.llm_binding_name, config: config })
-                });
-                const valData = await valRes.json();
-                if (valData.success && Array.isArray(valData.models)) {
-                    discoveredLlmModels = valData.models;
-                    renderLlmModelDropdown(discoveredLlmModels);
-                    modelGroup.style.display = "flex";
-                    currentBindingConfig = config;
-                    
-                    if (config.model_name) {
-                        selModel.value = config.model_name;
-                        selModel.dispatchEvent(new Event("change"));
-                    }
-                }
+                if (bindingExists) {
+                    console.log("⚙️ Pre-selecting binding:", data.llm_binding_name);
 
-                // ── Load TTI Configuration ──
-                if (data.tti_binding_name) {
-                    selTtiBinding.value = data.tti_binding_name;
-                    renderTtiConfigForm(data.tti_binding_name);
+                    // Pre-select binding
+                    selBinding.value = data.llm_binding_name;
+                    console.log("✅ selBinding.value set to:", selBinding.value);
 
-                    const ttiConfig = data.tti_binding_config || {};
-                    for (const [key, value] of Object.entries(ttiConfig)) {
-                        const input = document.getElementById(`tti-cfg-${key}`);
+                    // Wait for DOM to render the selection, then trigger change event
+                    setTimeout(() => {
+                        console.log("🔁 Verifying binding selection after DOM render...");
+                        console.log("📋 selBinding.value after timeout:", selBinding.value);
+
+                        // IMPORTANT: Trigger change event to populate config form
+                        const changeEvent = new Event('change', { bubbles: true });
+                        selBinding.dispatchEvent(changeEvent);
+                        console.log("📤 Change event dispatched for binding selection");
+
+                        // Verify selection persisted
+                        setTimeout(() => {
+                            console.log("🔍 Final verification - selBinding.value:", selBinding.value);
+                            if (selBinding.value !== data.llm_binding_name) {
+                                console.error("❌ Binding selection was reset! Re-applying...");
+                                selBinding.value = data.llm_binding_name;
+                                console.log("✅ Re-applied binding selection:", selBinding.value);
+                            }
+                        }, 50);
+                    }, 100);
+
+                    // Populate config inputs first
+                    const config = data.llm_binding_config || {};
+                    for (const [key, value] of Object.entries(config)) {
+                        const input = document.getElementById(`cfg-${key}`);
                         if (input) {
                             if (input.type === "checkbox") {
                                 input.checked = !!value;
@@ -3035,26 +3063,99 @@ document.addEventListener("DOMContentLoaded", () => {
                         }
                     }
 
-                    // Trigger validation with TTI config directly
-                    const ttiValRes = await fetch("/api/bindings/tti/test", {
+                    // Trigger validation with the loaded config values directly
+                    const valRes = await fetch("/api/bindings/llm/test", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ binding_name: data.tti_binding_name, config: ttiConfig })
+                        body: JSON.stringify({ binding_name: data.llm_binding_name, config: config })
                     });
-                    const ttiValData = await ttiValRes.json();
-                    if (ttiValData.success && Array.isArray(ttiValData.models)) {
-                        discoveredTtiModels = ttiValData.models;
-                        renderTtiModelDropdown(discoveredTtiModels);
-                        ttiModelGroup.style.display = "flex";
-                        currentTtiBindingConfig = ttiConfig;
+                    const valData = await valRes.json();
+                    if (valData.success && Array.isArray(valData.models)) {
+                        discoveredLlmModels = valData.models;
+                        renderLlmModelDropdown(discoveredLlmModels);
+                        modelGroup.style.display = "flex";
+                        currentBindingConfig = config;
 
-                        if (ttiConfig.model_name) {
-                            selTtiModel.value = ttiConfig.model_name;
-                            selTtiModel.dispatchEvent(new Event("change"));
+                        if (config.model_name) {
+                            selModel.value = config.model_name;
+                            selModel.dispatchEvent(new Event("change"));
                         }
+                    } else {
+                        console.warn("Saved binding validation failed:", valData.error);
+                    }
+                } else {
+                    console.warn(`❌ Saved binding '${data.llm_binding_name}' not found in available bindings.`);
+                    console.log("📋 Available binding names:", availableBindings.map(b => b.binding_name));
+                }
+
+                // ── Load TTI Configuration ──
+                if (data.tti_binding_name) {
+                    const ttiBindingExists = availableTtiBindings.some(b => b.binding_name === data.tti_binding_name);
+
+                    if (ttiBindingExists) {
+                        selTtiBinding.value = data.tti_binding_name;
+                        console.log("⚙️ TTI Pre-selecting binding:", data.tti_binding_name);
+
+                        // Wait for DOM to render the selection, then trigger change event
+                        setTimeout(() => {
+                            console.log("🔁 Verifying TTI binding selection after DOM render...");
+                            console.log("📋 selTtiBinding.value after timeout:", selTtiBinding.value);
+
+                            // IMPORTANT: Trigger change event to populate TTI config form
+                            const ttiChangeEvent = new Event('change', { bubbles: true });
+                            selTtiBinding.dispatchEvent(ttiChangeEvent);
+                            console.log("📤 TTI Change event dispatched for binding selection");
+
+                            // Verify selection persisted
+                            setTimeout(() => {
+                                console.log("🔍 Final TTI verification - selTtiBinding.value:", selTtiBinding.value);
+                                if (selTtiBinding.value !== data.tti_binding_name) {
+                                    console.error("❌ TTI Binding selection was reset! Re-applying...");
+                                    selTtiBinding.value = data.tti_binding_name;
+                                    console.log("✅ Re-applied TTI binding selection:", selTtiBinding.value);
+                                }
+                            }, 50);
+                        }, 100);
+
+                        renderTtiConfigForm(data.tti_binding_name);
+
+                        const ttiConfig = data.tti_binding_config || {};
+                        for (const [key, value] of Object.entries(ttiConfig)) {
+                            const input = document.getElementById(`tti-cfg-${key}`);
+                            if (input) {
+                                if (input.type === "checkbox") {
+                                    input.checked = !!value;
+                                } else {
+                                    input.value = Array.isArray(value) ? JSON.stringify(value) : value;
+                                }
+                            }
+                        }
+
+                        // Trigger validation with TTI config directly
+                        const ttiValRes = await fetch("/api/bindings/tti/test", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ binding_name: data.tti_binding_name, config: ttiConfig })
+                        });
+                        const ttiValData = await ttiValRes.json();
+                        if (ttiValData.success && Array.isArray(ttiValData.models)) {
+                            discoveredTtiModels = ttiValData.models;
+                            renderTtiModelDropdown(discoveredTtiModels);
+                            ttiModelGroup.style.display = "flex";
+                            currentTtiBindingConfig = ttiConfig;
+
+                            if (ttiConfig.model_name) {
+                                selTtiModel.value = ttiConfig.model_name;
+                                selTtiModel.dispatchEvent(new Event("change"));
+                            }
+                        } else {
+                            console.warn("Saved TTI binding validation failed:", ttiValData.error);
+                        }
+                    } else {
+                        console.warn(`Saved TTI binding '${data.tti_binding_name}' not found in available bindings.`);
                     }
                 }
-                
+
                 if (data.personality_name) {
                     setTimeout(() => {
                         headerPersonality.value = data.personality_name;
@@ -3063,20 +3164,23 @@ document.addEventListener("DOMContentLoaded", () => {
             } else {
                 // ── First Run Guidance ──
                 // Pre-populate with 'ollama' local guidance to assist the user on first launch
-                selBinding.value = "ollama";
-                selBinding.dispatchEvent(new Event("change"));
-                
-                const hostInput = document.getElementById("cfg-host_address");
-                if (hostInput) hostInput.value = "http://localhost:11434";
-                
+                const ollamaExists = availableBindings.some(b => b.binding_name === "ollama");
+                if (ollamaExists) {
+                    selBinding.value = "ollama";
+                    selBinding.dispatchEvent(new Event("change"));
+
+                    const hostInput = document.getElementById("cfg-host_address");
+                    if (hostInput) hostInput.value = "http://localhost:11434";
+                }
+
                 btnOpenSettings.click();
             }
-            
+
             // Populate models list first before setting values
             await fetchCurrentModels();
             await fetchCurrentTtiModels();
             await fetchPersonalities();
-            
+
             // Explicitly sync the top header dropdown value with the saved setting
             if (data.success && data.llm_binding_config && data.llm_binding_config.model_name) {
                 headerModel.value = data.llm_binding_config.model_name;
