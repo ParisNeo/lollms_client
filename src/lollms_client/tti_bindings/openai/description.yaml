@@ -1,46 +1,93 @@
 title: "OpenAI TTI"
 author: "ParisNeo"
-version: 1.1.0
+version: 1.2.0
 binding_name: "openai"
 description: |
-  Binding for OpenAI Image Generation API.
-  Uses the unified image generation endpoint supporting both creation and editing.
-  Compatible with models like gpt-image-1 and future OpenAI image models.
+  Binding for OpenAI-compatible Image Generation APIs.
+  Supports the official OpenAI endpoint as well as any OpenAI-compatible server
+  (Ollama, LM Studio, LocalAI, vLLM, Together AI, Mistral, Groq, etc.).
+  Compatible with gpt-image-1, gpt-5, gpt-5-image, DALL-E 2/3, and future models.
 
 global_input_parameters:
-  - name: "api_key"
+  - name: "service_key"
     type: "str"
-    description: "Your OpenAI API Key. If empty, OPENAI_API_KEY environment variable will be used."
+    description: "Your API key. For OpenAI use your sk-... key. For local servers (Ollama, LM Studio) this can be left empty or set to any non-empty string."
     mandatory: false
     is_secret: true
+    default: ""
+
+  - name: "host_address"
+    type: "str"
+    description: "Base URL of the OpenAI-compatible server (e.g. 'http://localhost:11434/v1' for Ollama, 'http://localhost:1234/v1' for LM Studio). Leave empty to use the official OpenAI API."
+    mandatory: false
+    default: ""
+
+  - name: "verify_ssl_certificate"
+    type: "bool"
+    description: "Verify the server's SSL certificate. Disable only when connecting to a server with a self-signed certificate."
+    mandatory: false
+    default: true
+
+  - name: "certificate_file_path"
+    type: "str"
+    description: "Path to a custom CA bundle or client certificate file (.pem) used for SSL verification. Leave empty to use the system default CA store."
+    mandatory: false
     default: ""
 
 model_input_parameters:
   - name: "model_name"
     type: "str"
-    description: "OpenAI image model to use."
+    description: "Image model to use. OpenAI models: 'gpt-image-1', 'gpt-5', 'gpt-5-image', 'dall-e-3', 'dall-e-2'. For custom servers, enter the model ID exposed by that server."
     mandatory: true
     default: "gpt-image-1"
-    options: ["gpt-image-1"]
+    options:
+      - "gpt-image-1"
+      - "gpt-5"
+      - "gpt-5-image"
+      - "dall-e-3"
+      - "dall-e-2"
 
   - name: "size"
     type: "str"
-    description: "Output image size."
+    description: "Output image size. Valid values depend on the model — 'auto' lets the model choose the best fit (gpt-image-1 / gpt-5 only)."
     mandatory: false
     default: "1024x1024"
-    options: ["256x256", "512x512", "1024x1024", "2048x2048"]
+    options:
+      - "auto"
+      - "1024x1024"
+      - "1536x1024"
+      - "1024x1536"
+      - "1792x1024"
+      - "1024x1792"
+      - "512x512"
+      - "256x256"
 
   - name: "quality"
     type: "str"
-    description: "Image quality setting."
+    description: "Image quality. 'auto' / 'low' / 'medium' / 'high' for gpt-image-1 and gpt-5; 'standard' / 'hd' for DALL-E 3; ignored for DALL-E 2."
     mandatory: false
-    default: "standard"
-    options: ["standard", "hd"]
+    default: "auto"
+    options:
+      - "auto"
+      - "low"
+      - "medium"
+      - "high"
+      - "standard"
+      - "hd"
+
+  - name: "style"
+    type: "str"
+    description: "Visual style, only supported by DALL-E 3. 'vivid' produces hyper-real images; 'natural' produces more subdued, realistic images."
+    mandatory: false
+    default: "vivid"
+    options:
+      - "vivid"
+      - "natural"
 
 commands:
   - name: list_models
     title: "Refresh Models"
-    description: "Fetches the current list of available OpenAI image models."
+    description: "Fetches the current list of image-capable models from the configured server."
     parameters: []
     output:
       - name: models
@@ -48,7 +95,7 @@ commands:
 
   - name: get_credits
     title: "Get Credits"
-    description: "Get total credits and usage (if available from OpenAI billing API)."
+    description: "Get total credits purchased and used (official OpenAI endpoint only; returns null for custom hosts)."
     parameters: []
     output:
       - name: credits
@@ -56,7 +103,7 @@ commands:
 
   - name: list_services
     title: "List Services"
-    description: "Returns available OpenAI services."
+    description: "Returns available OpenAI TTI services."
     parameters: []
     output:
       - name: services
@@ -65,16 +112,51 @@ commands:
 generate_image_parameters:
   - name: "prompt"
     type: "str"
-    description: "The prompt describing the image to generate."
+    description: "Text prompt describing the image to generate."
     default: ""
+
+  - name: "negative_prompt"
+    type: "str"
+    description: "Elements to avoid in the image (merged into the prompt text; OpenAI has no native negative-prompt field)."
+    default: ""
+
+  - name: "width"
+    type: "int"
+    description: "Desired output width in pixels. Mapped to the nearest size string supported by the chosen model."
+    default: 1024
+
+  - name: "height"
+    type: "int"
+    description: "Desired output height in pixels. Mapped to the nearest size string supported by the chosen model."
+    default: 1024
 
 edit_image_parameters:
   - name: "prompt"
     type: "str"
-    description: "The prompt describing the edit to apply."
+    description: "Instruction describing the edit to apply."
+    default: ""
+
+  - name: "negative_prompt"
+    type: "str"
+    description: "Elements to avoid in the edited image."
     default: ""
 
   - name: "images"
     type: "str"
-    description: "Input image(s) for editing. Can be base64, URL, or file path."
+    description: "Source image(s) for editing. Accepts a file path, HTTP/S URL, data-URL, raw base64 string, or a PIL Image object."
     default: ""
+
+  - name: "mask"
+    type: "str"
+    description: "Optional RGBA mask image (transparent areas mark regions to regenerate). Accepts the same formats as 'images'. Supported by DALL-E 2 and gpt-image-1."
+    default: ""
+
+  - name: "width"
+    type: "int"
+    description: "Desired output width in pixels."
+    default: 1024
+
+  - name: "height"
+    type: "int"
+    description: "Desired output height in pixels."
+    default: 1024
