@@ -1,4 +1,4 @@
-# lollms_binding.py
+# lollms_llm_binding.py
 from __future__ import annotations
 from abc import abstractmethod
 import importlib
@@ -589,10 +589,13 @@ class LollmsLLMBindingManager:
         }
 
     @staticmethod
-    def get_bindings_list(llm_bindings_dir: Union[str, Path]) -> List[Dict]:
+    def get_bindings_list(llm_bindings_dir: Union[str, Path]=None) -> List[Dict]:
         """
         Lists all available LLM bindings by scanning a directory.
         """
+        if not llm_bindings_dir:
+            llm_bindings_dir = Path(__file__).parent/"llm_bindings"
+
         bindings_dir = Path(llm_bindings_dir)
         if not bindings_dir.is_dir():
             return []
