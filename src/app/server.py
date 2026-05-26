@@ -2529,8 +2529,13 @@ async def cancel_chat_generation_endpoint():
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point for the application."""
     ASCIIColors.cyan("==================================================================")
     ASCIIColors.green("🎬 Starting Lollms Multimodal Document Viewer on http://localhost:9680")
     ASCIIColors.cyan("==================================================================")
     uvicorn.run(app, host="localhost", port=9680)
+
+
+if __name__ == "__main__":
+    main()
