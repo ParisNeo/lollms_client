@@ -966,6 +966,19 @@ class ModelManager:
         if not model_name:
             raise ValueError("Model name cannot be empty for loading.")
 
+        # Ensure device and dtype are resolved before loading
+        if self.config.get("device", "auto").lower() == "auto":
+            if torch.cuda.is_available():
+                self.config["device"] = "cuda"
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.config["device"] = "mps"
+            else:
+                self.config["device"] = "cpu"
+
+        # Resolve dtype if auto
+        if self.config.get("torch_dtype_str", "auto").lower() == "auto":
+            self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
+
         ASCIIColors.info(f"Loading Diffusers model: {model_name} for task: {task}")
         model_path = self._resolve_model_path(model_name)
         torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config["torch_dtype_str"].lower())
