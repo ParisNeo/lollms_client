@@ -565,7 +565,44 @@ document.addEventListener("DOMContentLoaded", () => {
                 const art = await artRes.json();
                 rawView.value = art.content;
 
-                if (matched.type === "code") {
+                const isHtml = title.endsWith(".html") || title.endsWith(".htm") || 
+                               (matched.language && matched.language === "html") || 
+                               art.content.trim().toLowerCase().startsWith("<!doctype html>") || 
+                               art.content.trim().toLowerCase().startsWith("<html>");
+
+                if (isHtml) {
+                    if (codeEditors[title]) {
+                        try { codeEditors[title].toTextArea(); } catch(e) {}
+                        delete codeEditors[title];
+                    }
+                    renderedView.innerHTML = `
+                        <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <span style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; font-weight: bold;">HTML Source</span>
+                            <button class="btn btn-primary" id="btn-run-code-${safeId}" style="width:auto; padding: 6px 14px; font-size: 12px;">▶ Run HTML</button>
+                        </div>
+                        <textarea id="cm-rendered-${safeId}"></textarea>
+                        <div id="code-run-output-${safeId}" style="display:none; margin-top: 12px; flex-direction: column; gap: 6px;"></div>
+                    `;
+                    const txtArea = renderedView.querySelector(`#cm-rendered-${safeId}`);
+                    const cm = CodeMirror.fromTextArea(txtArea, {
+                        mode: "htmlmixed",
+                        theme: "dracula",
+                        lineNumbers: true,
+                        readOnly: true,
+                        lineWrapping: true,
+                        tabSize: 4,
+                    });
+                    cm.setValue(art.content);
+                    codeEditors[title] = cm;
+
+                    const runBtn = renderedView.querySelector(`#btn-run-code-${safeId}`);
+                    runBtn.addEventListener("click", () => {
+                        const blob = new Blob([art.content], { type: "text/html" });
+                        const url = URL.createObjectURL(blob);
+                        window.open(url, "_blank");
+                        setTimeout(() => URL.revokeObjectURL(url), 60000);
+                    });
+                } else if (matched.type === "code") {
                     const lang = matched.language || "";
                     if (lang === "graphviz" || art.content.includes("digraph") || art.content.includes("graph")) {
                         renderedView.innerHTML = `<div class="empty-viewer-msg"><span class="spinner inline" style="margin-right: 8px;"></span> Compiling Graphviz DOT logic...</div>`;
@@ -2307,9 +2344,13 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch("/api/bindings/tti");
             const data = await res.json();
             if (data.success) {
+                const currentValue = selTtiBinding.value;
                 availableTtiBindings = data.bindings;
                 selTtiBinding.innerHTML = `<option value="">-- Select TTI Binding --</option>` +
                     availableTtiBindings.map(b => `<option value="${b.binding_name}">${b.title || b.binding_name}</option>`).join("");
+                if (currentValue) {
+                    selTtiBinding.value = currentValue;
+                }
             }
         } catch (err) {
             console.error("Failed to fetch TTI bindings:", err);
@@ -2591,9 +2632,13 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch("/api/bindings/llm");
             const data = await res.json();
             if (data.success) {
+                const currentValue = selBinding.value;
                 availableBindings = data.bindings;
                 selBinding.innerHTML = `<option value="">-- Select Binding --</option>` +
                     availableBindings.map(b => `<option value="${b.binding_name}">${b.title || b.binding_name}</option>`).join("");
+                if (currentValue) {
+                    selBinding.value = currentValue;
+                }
             }
         } catch (err) {
             console.error("Failed to fetch bindings:", err);
@@ -4041,6 +4086,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Clear and reload chronological history
         await fetchMessageHistory();
+
+        if (!regenerate) {
+            // Remove the welcome message if present
+            const welcome = chatHistory.querySelector(".chat-welcome-msg");
+            if (welcome) welcome.remove();
+
+            // Append user bubble immediately
+            renderMessageBubble(`temp-user-${Date.now()}`, "user", text);
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
 
         let currentProse = "";
         let chatActiveProc = null;

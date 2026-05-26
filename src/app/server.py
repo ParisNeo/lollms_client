@@ -690,7 +690,7 @@ async def list_tti_bindings():
                         pass
 
                 unified_params = []
-                for key in ("global_input_parameters", "model_input_parameters", "input_parameters"):
+                for key in ("global_input_parameters", "model_input_parameters", "input_parameters", "server_parameters", "binding_parameters"):
                     if isinstance(data.get(key), list):
                         unified_params.extend(data[key])
 
@@ -924,7 +924,7 @@ async def list_llm_bindings():
 
                 # Flatten global / model-specific / legacy parameter lists into one UI-facing list
                 unified_params = []
-                for key in ("global_input_parameters", "model_input_parameters", "input_parameters"):
+                for key in ("global_input_parameters", "model_input_parameters", "input_parameters", "server_parameters", "binding_parameters"):
                     if isinstance(data.get(key), list):
                         unified_params.extend(data[key])
 

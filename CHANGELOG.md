@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-26 17:29]
+
+- feat: enhance TTI parameter handling and art display
+
 ## [2026-05-22 15:20]
 
 - feat: update structured generation and synchronize core bindings

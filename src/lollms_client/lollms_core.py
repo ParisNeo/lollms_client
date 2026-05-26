@@ -667,30 +667,11 @@ class LollmsClient():
     def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
         """
         Retrieves the context size for the active model.
-        Queries the running llama.cpp server's /props endpoint first, 
-        falling back to the configured context size.
+        Delegates directly to the active LLM binding.
         """
-        target = model_name or self.model_name
-        if target:
-            info = self._get_server_info(target)
-            if info:
-                try:
-                    base = info["url"].rstrip("/")
-                    if base.endswith("/v1"):
-                        base = base[:-3]
-                    r = requests.get(f"{base}/props", timeout=2)
-                    if r.status_code == 200:
-                        props = r.json()
-                        for key in ("total_slots", "n_ctx", "ctx_size", "context_size"):
-                            if key in props:
-                                if key == "total_slots":
-                                    return int(props[key]) * self.n_parallel
-                                return int(props[key])
-                except Exception as e:
-                    ASCIIColors.warning(f"Could not query /props for ctx size: {e}")
-
-        # Fall back to the configured context size (self.n_ctx) or default_ctx_size
-        return self.n_ctx or self.default_ctx_size or 4096
+        if self.llm:
+            return self.llm.get_ctx_size(model_name)
+        return 4096
 
     def list_models(self):
         models = []
