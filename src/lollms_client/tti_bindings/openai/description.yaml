@@ -37,15 +37,12 @@ global_input_parameters:
 model_input_parameters:
   - name: "model_name"
     type: "str"
-    description: "Image model to use. OpenAI models: 'gpt-image-1', 'gpt-5', 'gpt-5-image', 'dall-e-3', 'dall-e-2'. For custom servers, enter the model ID exposed by that server."
+    description: "Image model to use. The list is populated live from the configured server's models endpoint."
     mandatory: true
     default: "gpt-image-1"
-    options:
-      - "gpt-image-1"
-      - "gpt-5"
-      - "gpt-5-image"
-      - "dall-e-3"
-      - "dall-e-2"
+    options_from_command: "list_models"
+    options_value_key: "model_name"
+    options_display_key: "display_name"
 
   - name: "size"
     type: "str"
