@@ -1,20 +1,243 @@
-title: LOLLMS WebUI TTI Binding
-author: ParisNeo
-creation_date: 2024-04-10
-last_update_date: 2025-08-13
+title: "LoLLMS TTI Server"
+author: "ParisNeo"
+version: 1.0.0
 description: |
-  A client binding that connects to a running LOLLMS WebUI server to perform text-to-image generation.
-  It acts as a remote control for the TTI capabilities of the main LOLLMS application.
-input_parameters:
-  - name: host_address
-    type: str
-    description: "The host address and port of the LOLLMS WebUI server (e.g., 'http://localhost:9600')."
+  OpenAI-compatible Text-to-Image server backed by any LollmsTTIBinding.
+  Exposes /v1/images/generations, /v1/images/edits, and /v1/models endpoints
+  that are 100% compatible with the OpenAI Images API.
+  The 'model' field is optional in every request — when omitted the server
+  uses whatever model is currently configured in the active TTI binding.
+
+server_parameters:
+  - name: "host"
+    type: "str"
+    description: "Network interface to bind to."
     mandatory: false
-  - name: service_key
-    type: str
-    description: "The client_id for authenticating with the LOLLMS server, if required by the server's configuration."
+    default: "0.0.0.0"
+
+  - name: "port"
+    type: "int"
+    description: "TCP port to listen on."
     mandatory: false
-  - name: verify_ssl_certificate
-    type: bool
-    description: "Whether to verify SSL certificates if the LOLLMS server is using HTTPS."
+    default: 7860
+
+  - name: "api_key"
+    type: "str"
+    description: "Bearer token used to protect this server's endpoints. Leave empty to run open (no authentication)."
     mandatory: false
+    is_secret: true
+    default: ""
+    env: "LOLLMS_TTI_API_KEY"
+
+  - name: "reload"
+    type: "bool"
+    description: "Enable uvicorn auto-reload. For development only."
+    mandatory: false
+    default: false
+
+binding_parameters:
+  - name: "binding"
+    type: "str"
+    description: "Name of the LollmsTTIBinding to load (e.g. 'openai', 'open_router', 'diffusers')."
+    mandatory: true
+    default: "openai"
+
+  - name: "model"
+    type: "str"
+    description: "Default model name forwarded to the binding. Optional — when absent the binding uses its own configured default. Clients can also override this per-request."
+    mandatory: false
+    default: ""
+
+  - name: "service_key"
+    type: "str"
+    description: "API key forwarded to the TTI binding (e.g. your OpenAI or OpenRouter key). Falls back to the LOLLMS_TTI_SERVICE_KEY or OPENAI_API_KEY environment variables."
+    mandatory: false
+    is_secret: true
+    default: ""
+    env: "LOLLMS_TTI_SERVICE_KEY"
+
+  - name: "host_address"
+    type: "str"
+    description: "Base URL of the OpenAI-compatible backend the binding should call (e.g. 'http://localhost:11434/v1' for Ollama). Leave empty to use the binding's own default (official OpenAI for the openai binding)."
+    mandatory: false
+    default: ""
+
+  - name: "verify_ssl_certificate"
+    type: "bool"
+    description: "Verify the backend server's SSL certificate. Disable only when the backend uses a self-signed certificate."
+    mandatory: false
+    default: true
+
+  - name: "certificate_file_path"
+    type: "str"
+    description: "Path to a custom CA bundle or client certificate file (.pem) for SSL verification of the backend. Leave empty to use the system default CA store."
+    mandatory: false
+    default: ""
+
+endpoints:
+  - method: "POST"
+    path: "/v1/images/generations"
+    description: "Generate one or more images from a text prompt. OpenAI-compatible JSON body."
+    request_fields:
+      - name: "prompt"
+        type: "str"
+        description: "Text prompt describing the image to generate."
+        mandatory: true
+
+      - name: "model"
+        type: "str"
+        description: "Model to use. Optional — omit (or pass 'lollms') to use the server's configured default."
+        mandatory: false
+        default: ""
+
+      - name: "n"
+        type: "int"
+        description: "Number of images to generate (1–10)."
+        mandatory: false
+        default: 1
+
+      - name: "size"
+        type: "str"
+        description: "Output dimensions, e.g. '1024x1024'. Overrides width/height when provided."
+        mandatory: false
+        default: ""
+
+      - name: "quality"
+        type: "str"
+        description: "Image quality hint forwarded to the binding (e.g. 'auto', 'hd', 'standard')."
+        mandatory: false
+        default: ""
+
+      - name: "style"
+        type: "str"
+        description: "Style hint forwarded to the binding (DALL-E 3: 'vivid' or 'natural')."
+        mandatory: false
+        default: ""
+
+      - name: "response_format"
+        type: "str"
+        description: "Response format. Only 'b64_json' is supported; 'url' falls back to 'b64_json'."
+        mandatory: false
+        default: "b64_json"
+
+      - name: "negative_prompt"
+        type: "str"
+        description: "Elements to avoid in the generated image (lollms extension)."
+        mandatory: false
+        default: ""
+
+      - name: "width"
+        type: "int"
+        description: "Desired width in pixels (lollms extension, overridden by 'size' when both are set)."
+        mandatory: false
+        default: 1024
+
+      - name: "height"
+        type: "int"
+        description: "Desired height in pixels (lollms extension, overridden by 'size' when both are set)."
+        mandatory: false
+        default: 1024
+
+  - method: "POST"
+    path: "/v1/images/edits"
+    description: "Edit an existing image. Multipart/form-data body (OpenAI-compatible)."
+    request_fields:
+      - name: "image"
+        type: "file"
+        description: "Source image to edit (PNG, JPEG, or WebP)."
+        mandatory: true
+
+      - name: "prompt"
+        type: "str"
+        description: "Instruction describing the edit to apply."
+        mandatory: true
+
+      - name: "mask"
+        type: "file"
+        description: "Optional RGBA mask — transparent areas mark regions to regenerate."
+        mandatory: false
+
+      - name: "model"
+        type: "str"
+        description: "Model to use. Optional — omit to use the server's configured default."
+        mandatory: false
+        default: ""
+
+      - name: "n"
+        type: "int"
+        description: "Number of edited images to generate (1–10)."
+        mandatory: false
+        default: 1
+
+      - name: "size"
+        type: "str"
+        description: "Output dimensions, e.g. '1024x1024'."
+        mandatory: false
+        default: ""
+
+      - name: "quality"
+        type: "str"
+        description: "Image quality hint forwarded to the binding."
+        mandatory: false
+        default: ""
+
+      - name: "response_format"
+        type: "str"
+        description: "Response format. Only 'b64_json' is supported."
+        mandatory: false
+        default: "b64_json"
+
+      - name: "negative_prompt"
+        type: "str"
+        description: "Elements to avoid in the edited image (lollms extension)."
+        mandatory: false
+        default: ""
+
+      - name: "width"
+        type: "int"
+        description: "Desired output width in pixels (lollms extension)."
+        mandatory: false
+        default: 1024
+
+      - name: "height"
+        type: "int"
+        description: "Desired output height in pixels (lollms extension)."
+        mandatory: false
+        default: 1024
+
+  - method: "GET"
+    path: "/v1/models"
+    description: "List available TTI models reported by the active binding."
+
+  - method: "GET"
+    path: "/v1/models/{model_id}"
+    description: "Retrieve details for a single model by ID."
+
+  - method: "GET"
+    path: "/health"
+    description: "Liveness probe. Returns binding name and status."
+
+cli_usage: |
+  # Minimal — official OpenAI backend
+  python lollms_tti_server.py --binding openai --service-key sk-...
+
+  # Local Ollama backend with a pre-set default model
+  python lollms_tti_server.py \
+      --binding openai \
+      --host-address http://localhost:11434/v1 \
+      --model sdxl \
+      --verify-ssl false
+
+  # OpenRouter backend
+  python lollms_tti_server.py \
+      --binding open_router \
+      --service-key sk-or-...
+
+  # Protect the server with a bearer token
+  python lollms_tti_server.py --binding openai --service-key sk-... --api-key my-secret
+
+  # Then use with any OpenAI client (model field is optional)
+  # from openai import OpenAI
+  # client = OpenAI(base_url="http://localhost:7860/v1", api_key="my-secret")
+  # client.images.generate(prompt="A sunset over Paris")           # no model needed
+  # client.images.generate(model="dall-e-3", prompt="A sunrise")   # explicit model OK
