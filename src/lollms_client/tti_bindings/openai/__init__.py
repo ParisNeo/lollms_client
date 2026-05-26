@@ -412,51 +412,66 @@ class OpenAITTIBinding(LollmsTTIBinding):
 
     def list_models(self) -> List[Dict[str, Any]]:
         """
-        Return available OpenAI image-generation models.
+        Return available image-generation models from the configured server.
 
-        Queries the live API and augments with our capability registry so
-        that models released after the last registry update are still surfaced.
+        Strategy:
+        1. Call the server's /v1/models endpoint via the SDK.
+        2. For the official OpenAI host, filter by TTI keywords + registry IDs.
+        3. For custom/compatible hosts (Ollama, LM Studio, vLLM …) return ALL
+           models the server reports — the server already limits its list to
+           what it supports, so we don't filter.
+        4. Merge any registry entries not returned by the server so that known
+           models are always reachable even on partial API implementations.
+        5. Fall back to the static list only when the endpoint is unreachable.
         """
+        is_official_openai = not self.host_address  # empty / None → official API
+
         try:
             api_models = self.client.models.list()
         except Exception as exc:
-            ASCIIColors.warning(f"Could not reach OpenAI models endpoint: {exc}")
+            ASCIIColors.warning(f"Could not reach models endpoint: {exc}")
             return _FALLBACK_MODELS
 
         tti_keywords = {"image", "dall", "vision"}
-        # Also include any model in our own registry.
-        registry_ids = set(_MODEL_CAPS.keys())
+        registry_ids  = set(_MODEL_CAPS.keys())
 
-        seen: set = set()
+        seen:   set               = set()
         result: List[Dict[str, Any]] = []
 
         for m in api_models.data:
-            mid = m.id
+            mid      = m.id
             mid_lower = mid.lower()
 
-            is_tti = (
-                any(kw in mid_lower for kw in tti_keywords)
-                or mid in registry_ids
-            )
-            if is_tti and mid not in seen:
+            # On official OpenAI we keep only image-capable models.
+            # On custom hosts we trust the server and keep everything.
+            if is_official_openai:
+                is_tti = (
+                    any(kw in mid_lower for kw in tti_keywords)
+                    or mid in registry_ids
+                )
+                if not is_tti:
+                    continue
+
+            if mid not in seen:
                 seen.add(mid)
                 caps = self._caps(mid)
                 result.append({
                     "model_name":   mid,
                     "display_name": mid,
-                    "description":  (
-                        f"OpenAI image model — "
+                    "description": (
                         f"edit={'yes' if caps['edit'] else 'no'}, "
                         f"sizes={caps['sizes']}"
                     ),
                 })
 
-        # Ensure every model in our registry appears even if not yet in the API list.
+        # Always make sure every known registry model is present.
         for entry in _FALLBACK_MODELS:
             if entry["model_name"] not in seen:
                 seen.add(entry["model_name"])
                 result.append(entry)
 
+        ASCIIColors.info(f"list_models → {len(result)} model(s) from "
+                         f"{self.host_address or 'api.openai.com'}")
         return sorted(result, key=lambda x: x["display_name"]) or _FALLBACK_MODELS
 
     # ------------------------------------------------------------------
