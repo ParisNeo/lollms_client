@@ -33,10 +33,51 @@ pm.ensure_packages(["ascii_colors>=0.11.10", "torch", "pillow", "diffusers"])
 
 from ascii_colors import trace_exception, ASCIIColors
 
+class SafeDict(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._popped_shapes = {}
+
+    def pop(self, key, *args):
+        if key in self:
+            val = super().pop(key)
+            if hasattr(val, "shape"):
+                self._popped_shapes[key] = val.shape
+            return val
+        if args:
+            return args[0]
+            
+        import torch
+        ASCIIColors.warning(f"[SafeDict] GGUF conversion key '{key}' was missing. Supplying fallback tensor.")
+        
+        # Resolve shape dynamically from peer keys if possible
+        base_key = key.rsplit(".", 1)[0]
+        suffix = key.rsplit(".", 1)[-1]
+        
+        if suffix == "bias":
+            weight_key = f"{base_key}.weight"
+            if weight_key in self._popped_shapes:
+                out_features = self._popped_shapes[weight_key][0]
+                return torch.zeros(out_features, dtype=torch.bfloat16)
+            if "time_in" in key or "vector_in" in key:
+                return torch.zeros(3072, dtype=torch.bfloat16)
+            return torch.zeros(256, dtype=torch.bfloat16)
+            
+        elif suffix == "weight":
+            if "time_in" in key or "vector_in" in key:
+                shape = (3072, 256)
+            else:
+                shape = (256, 256)
+            self._popped_shapes[key] = shape
+            return torch.zeros(shape, dtype=torch.bfloat16)
+            
+        return torch.zeros((256, 256), dtype=torch.bfloat16)
+
 class PullModelRequest(BaseModel):
     hf_id: Optional[str] = Field(default=None, description="Hugging Face repo id or URL, e.g. 'stabilityai/sdxl-turbo'")
     safetensors_url: Optional[str] = Field(default=None, description="Direct URL to a .safetensors file")
     local_name: Optional[str] = Field(default=None, description="Optional name/folder under models/")
+    allow_patterns: Optional[List[str]] = Field(default=None, description="Selective file list/patterns to download.")
 
 # Add binding root to sys.path to ensure local modules can be imported if structured that way.
 binding_root = Path(__file__).resolve().parent.parent
@@ -361,20 +402,20 @@ class ModelManager:
                 self._download_civitai_model(model_name)
             return local_path
 
-        if state.extra_models_path and state.extra_models_path.exists():
-            found_paths = list(state.extra_models_path.rglob(model_name))
-            if found_paths:
-                ASCIIColors.info(f"Found model in extra path: {found_paths[0]}")
-                return found_paths[0]
+        flat_name = model_name.replace("/", "__")
 
-        found_paths = list(self.models_path.rglob(model_name))
-        if found_paths:
-            ASCIIColors.info(f"Found model in primary path: {found_paths[0]}")
-            return found_paths[0]
-
-        local_path = self.models_path / model_name
-        if local_path.exists():
-            return local_path
+        for root in [self.models_path, getattr(state, "extra_models_path", None)]:
+            if not root or not root.exists():
+                continue
+            p = root / flat_name
+            if p.exists():
+                return p
+            p = root / model_name
+            if p.exists():
+                return p
+            found = list(root.rglob(flat_name)) or list(root.rglob(model_name))
+            if found:
+                return found[0]
 
         return model_name
 
@@ -462,7 +503,7 @@ class ModelManager:
         level      = self.config.get("quant_level")
         components = self.config.get("quant_components")  # may be None → auto
         model_name = self.config.get("model_name", "")
-        family     = _model_family(model_name)
+        family = _model_family(model_name)
         torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config.get("torch_dtype_str", "bfloat16"), torch.bfloat16)
 
         # ── smart component defaults ────────────────────────────────────────────
@@ -562,6 +603,177 @@ class ModelManager:
     # ------------------------------------------------------------------
     # Core loader — branched by model family
     # ------------------------------------------------------------------
+    def _load_gguf_pipeline(self, model_name: str, model_path: Union[str, Path], quant_cfg: Dict[str, Any]):
+        """
+        Loads a GGUF model (such as a GGUF transformer) and integrates it into a standard pipeline.
+        """
+        import torch
+        from diffusers import GGUFQuantizationConfig
+
+        # ── Monkeypatch the Diffusers conversion function to prevent KeyErrors on pruned models (like FLUX.2 Klein) ──
+        import diffusers.loaders.single_file_utils as sfu
+        import diffusers.loaders.single_file_model as sfm
+
+        # Get original reference
+        original_convert_fn = sfu.convert_flux_transformer_checkpoint_to_diffusers
+
+        def patched_convert_fn(checkpoint, *args, **kwargs):
+            ASCIIColors.info("[SafeDict] Intercepting GGUF checkpoint conversion with SafeDict wrapper.")
+            
+            # --- Dynamic Dimension Adaptor on torch.split ---
+            original_torch_split = torch.split
+
+            def patched_torch_split(tensor, split_size_or_sections, dim=0, *args_split, **kwargs_split):
+                if isinstance(split_size_or_sections, (list, tuple)):
+                    actual_sum = sum(split_size_or_sections)
+                    tensor_dim_size = tensor.shape[dim]
+                    if actual_sum != tensor_dim_size:
+                        new_sizes = list(split_size_or_sections)
+                        new_sizes[-1] = tensor_dim_size - sum(new_sizes[:-1])
+                        ASCIIColors.warning(
+                            f"[SafeDict] Adjusting torch.split sizes from {split_size_or_sections} "
+                            f"to {new_sizes} to match tensor dim {tensor_dim_size}"
+                        )
+                        split_size_or_sections = tuple(new_sizes)
+                return original_torch_split(tensor, split_size_or_sections, dim=dim, *args_split, **kwargs_split)
+
+            # Apply localized hook to python torch module
+            safe_checkpoint = SafeDict(checkpoint)
+            original_split_ref = torch.split
+            torch.split = patched_torch_split
+            if hasattr(sfu, "torch"):
+                sfu.torch.split = patched_torch_split
+                
+            try:
+                return original_convert_fn(safe_checkpoint, *args, **kwargs)
+            finally:
+                # Always restore original methods
+                torch.split = original_split_ref
+                if hasattr(sfu, "torch"):
+                    sfu.torch.split = original_split_ref
+
+        # 1. Patch single_file_utils namespace
+        sfu.convert_flux_transformer_checkpoint_to_diffusers = patched_convert_fn
+
+        # 2. Patch single_file_model namespace
+        if hasattr(sfm, "convert_flux_transformer_checkpoint_to_diffusers"):
+            sfm.convert_flux_transformer_checkpoint_to_diffusers = patched_convert_fn
+
+        # 3. Patch the SINGLE_FILE_LOADABLE_CLASSES dictionary by name or partial name match
+        patched_count = 0
+        if hasattr(sfm, "SINGLE_FILE_LOADABLE_CLASSES") and isinstance(sfm.SINGLE_FILE_LOADABLE_CLASSES, dict):
+            for key, val in sfm.SINGLE_FILE_LOADABLE_CLASSES.items():
+                if isinstance(val, dict):
+                    fn = val.get("checkpoint_mapping_fn")
+                    if fn and (
+                        fn == original_convert_fn or 
+                        getattr(fn, "__name__", "") == "convert_flux_transformer_checkpoint_to_diffusers" or
+                        "convert_flux_transformer" in getattr(fn, "__name__", "")
+                    ):
+                        val["checkpoint_mapping_fn"] = patched_convert_fn
+                        patched_count += 1
+                        ASCIIColors.info(f"[SafeDict] Successfully monkeypatched SINGLE_FILE_LOADABLE_CLASSES['{key}']")
+        
+        if patched_count == 0:
+            ASCIIColors.warning("[SafeDict] Warning: No matching loader class was found in SINGLE_FILE_LOADABLE_CLASSES to patch.")
+
+        # Resolve local GGUF file path
+        gguf_file = Path(model_path)
+        if gguf_file.exists() and gguf_file.is_dir():
+            gguf_files = list(gguf_file.glob("*.gguf"))
+            if gguf_files:
+                # Prioritize GGUF file matching our selected quantization level
+                gguf_level = quant_cfg.get("gguf_level", "Q4_K_M")
+                level_match = [f for f in gguf_files if gguf_level.lower() in f.name.lower()]
+                gguf_file = level_match[0] if level_match else gguf_files[0]
+            else:
+                raise FileNotFoundError(f"No .gguf file found in folder: {model_path}")
+        elif not gguf_file.exists():
+            raise FileNotFoundError(f"GGUF file path does not exist: {model_path}")
+
+        ASCIIColors.info(f"Loading GGUF transformer from single file: {gguf_file}")
+
+        compute_dtype = quant_cfg.get("compute_dtype", torch.bfloat16)
+        family = _model_family(model_name)
+
+        # ── Determine Base Shell & Config Repository Early ──
+        base_shell = self.config.get("gguf_base_shell")
+        if not base_shell:
+            if "klein" in model_name.lower():
+                base_shell = "black-forest-labs/FLUX.2-klein-4B"
+            elif "flux.2" in model_name.lower() or "flux2" in model_name.lower():
+                base_shell = "black-forest-labs/FLUX.2-dev"
+            elif "kontext" in model_name.lower():
+                base_shell = "black-forest-labs/FLUX.1-Kontext-dev"
+            elif "fill" in model_name.lower():
+                base_shell = "black-forest-labs/FLUX.1-Fill-dev"
+            elif "redux" in model_name.lower():
+                base_shell = "black-forest-labs/FLUX.1-Redux-dev"
+            elif family == "qwen":
+                base_shell = "Qwen/Qwen-Image-Edit-2509"
+            else:
+                base_shell = "black-forest-labs/FLUX.1-dev"
+
+        # Determine config repository dynamically to allow custom gated-bypass shells or fallback to base_shell
+        gguf_config_shell = self.config.get("gguf_config_shell") or base_shell
+        gguf_subfolder = self.config.get("gguf_subfolder") or "transformer"
+
+        load_params_single = {
+            "quantization_config": GGUFQuantizationConfig(compute_dtype=compute_dtype),
+            "torch_dtype": compute_dtype,
+            "config": gguf_config_shell,
+            "subfolder": gguf_subfolder,
+        }
+        
+        hf_token = self.config.get("hf_token") or os.environ.get("HF_TOKEN")
+        if hf_token:
+            load_params_single["token"] = hf_token
+
+        # Resolve the correct Model Class for GGUF loading
+        if family == "qwen":
+            try:
+                from diffusers import QwenImageTransformer2DModel
+                model_class = QwenImageTransformer2DModel
+            except ImportError:
+                from diffusers import FluxTransformer2DModel
+                model_class = FluxTransformer2DModel
+        else:
+            from diffusers import FluxTransformer2DModel
+            model_class = FluxTransformer2DModel
+
+        # Load GGUF Transformer natively using the correct class
+        transformer = model_class.from_single_file(
+            str(gguf_file),
+            **load_params_single
+        )
+
+        ASCIIColors.info(f"Assembling Pipeline using base shell: {base_shell}")
+
+        load_params = {
+            "transformer": transformer,
+            "torch_dtype": compute_dtype,
+        }
+        if hf_token:
+            load_params["token"] = hf_token
+        if self.config.get("hf_cache_path"):
+            load_params["cache_dir"] = str(self.config["hf_cache_path"])
+        if not self.config["safety_checker_on"]:
+            load_params["safety_checker"] = None
+
+        # Resolve Pipeline Class
+        if family == "qwen":
+            try:
+                from diffusers import QwenImageEditPlusPipeline
+                pipeline_class = QwenImageEditPlusPipeline
+            except ImportError:
+                from diffusers import FluxPipeline
+                pipeline_class = FluxPipeline
+        else:
+            from diffusers import FluxPipeline
+            pipeline_class = FluxPipeline
+
+        self.pipeline = pipeline_class.from_pretrained(base_shell, **load_params)
+
     def _execute_load_pipeline(self, task: str, model_path: Union[str, Path], torch_dtype: Any):
         if platform.system() == "Windows":
             os.environ["HF_HUB_ENABLE_SYMLINKS"] = "0"
@@ -578,7 +790,7 @@ class ModelManager:
         hf_params = {
             **base_params,
             "use_safetensors": self.config["use_safetensors"],
-            "token": self.config.get("hf_token"),
+            "token": self.config.get("hf_token") or os.environ.get("HF_TOKEN"),
             "local_files_only": self.config["local_files_only"],
         }
         if self.config.get("hf_variant"):
@@ -596,8 +808,13 @@ class ModelManager:
             hf_params.setdefault("device_map", "auto")
 
         try:
+            # ── GGUF Quantization override (Must happen first!) ──
+            if _is_gguf_quant:
+                self._load_gguf_pipeline(model_name, model_path, quant_cfg)
+                use_device_map = False
+
             # ── FLUX.1 Kontext ────────────────────────────────────────────────────
-            if family == "flux_kontext":
+            elif family == "flux_kontext":
                 if FluxKontextPipeline is None:
                     raise ImportError("FluxKontextPipeline not available. Upgrade diffusers: pip install git+https://github.com/huggingface/diffusers.git")
                 ASCIIColors.info(f"Loading FLUX.1 Kontext pipeline for '{model_name}'.")
@@ -681,15 +898,6 @@ class ModelManager:
                 if _is_gguf_quant:
                     self._load_gguf_pipeline(model_name, model_path, quant_cfg)
                     use_device_map = False
-                else:
-                    is_safetensors_file = str(model_path).endswith(".safetensors")
-                if is_safetensors_file:
-                    ASCIIColors.info(f"Loading standard model from local .safetensors file: {model_path}")
-                    try:
-                        self.pipeline = AutoPipelineForText2Image.from_single_file(model_path, **base_params)
-                    except Exception as e:
-                        ASCIIColors.warning(f"Failed to load with AutoPipeline, falling back to StableDiffusionPipeline: {e}")
-                        self.pipeline = StableDiffusionPipeline.from_single_file(model_path, **base_params)
                 else:
                     ASCIIColors.info(f"Loading standard model from Hub: {model_path}")
                     is_large = "stable-diffusion-3" in str(model_path)
@@ -1314,26 +1522,34 @@ def pull_model_endpoint(payload: PullModelRequest):
             ASCIIColors.cyan(f"Pulling HF model '{model_id}' into {dest_dir}")
 
             # Download directly to destination, bypassing default HF cache
-            token = state.config.get("hf_token")
-            snapshot_download(
-                repo_id=model_id,
-                local_dir=dest_dir,
-                local_dir_use_symlinks=False,
-                token=token,
-            )
+            token = state.config.get("hf_token") or os.environ.get("HF_TOKEN")
+            download_params = {
+                "repo_id": model_id,
+                "local_dir": dest_dir,
+                "local_dir_use_symlinks": False,
+                "token": token,
+            }
+            if payload.allow_patterns:
+                download_params["allow_patterns"] = payload.allow_patterns
+
+            snapshot_download(**download_params)
 
             # If no model_index.json, load and re-save to ensure proper diffusers format
             if not (dest_dir / "model_index.json").exists():
-                ASCIIColors.info("No model_index.json found. Converting to Diffusers format...")
-                load_params: Dict[str, Any] = {}
+                ASCIIColors.info("No model_index.json found. Attempting to convert to Diffusers format...")
+                token = state.config.get("hf_token")
+                load_params = {}
                 if token:
                     load_params["token"] = token
-                pipe = DiffusionPipeline.from_pretrained(str(dest_dir), **load_params)
-                pipe.save_pretrained(dest_dir)
-                del pipe
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                try:
+                    pipe = DiffusionPipeline.from_pretrained(str(dest_dir), **load_params)
+                    pipe.save_pretrained(dest_dir)
+                    del pipe
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as ex:
+                    ASCIIColors.warning(f"Could not convert directory to a standard Diffusers pipeline: {ex}. This folder might contain raw checkpoints/single-file weights.")
 
             ASCIIColors.green(f"Model '{model_id}' pulled to {dest_dir}")
             return {"status": "ok", "model_name": folder_name}

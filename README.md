@@ -29,6 +29,7 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 *   📝 **Advanced Structured Content Generation:** Reliably generate structured JSON output from natural language prompts using the `generate_structured_content` helper method, enforcing a specific schema.
 *   💬 **Advanced Discussion Management:** Robustly manage conversation histories with `LollmsDiscussion`, featuring branching, context exporting, and automatic pruning.
 *   🧠 **Persistent Memory & Data Zones:** `LollmsDiscussion` now supports multiple, distinct data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field. This allows for sophisticated context layering and state management, enabling agents to learn and remember over time.
+*   🧠 **Persistent Human-Inspired Memory System:** Features a tiered biological-like memory system (Working, Deep, and Archived layers) that supports time-based decay, usage reinforcement, and AI-assisted "dreaming" consolidation and selective forgetting.
 *   ✍️ **Structured Memorization:** The `memorize()` method analyzes a conversation to extract its essence (e.g., a problem and its solution), creating a structured "memory" with a title and content. These memories are stored and can be explicitly loaded into the AI's context, providing a more robust and manageable long-term memory system.
 *   📊 **Detailed Context Analysis:** The `get_context_status()` method provides a rich, detailed breakdown of the prompt context, showing the content and token count for each individual component (system prompt, data zones, message history).
 *   ⚙️ **Standardized Configuration Management:** A unified dictionary-based system (`llm_binding_config`) to configure any binding in a consistent manner.
@@ -508,6 +509,36 @@ with tempfile.TemporaryDirectory() as tmpdir:
 2.  **`get_context_status()`:** Before each generation, we call this method. The output shows a `system_context` block with a token count for all combined zones and a `breakdown` field that lets us see the content of each individual zone that contributed to it.
 3.  **`memorize()`:** After the user mentions their favorite language, `memorize()` is called. The LLM analyzes the last turn, identifies this new, important fact, and appends it to the `discussion.memory` zone.
 4.  **Recall:** In the final turn, when asked to recall the favorite language, the AI has access to the updated `memory` content within its system context and can correctly answer "Rust". This demonstrates true long-term, stateful memory.
+
+### Human-Inspired Multi-Level Memory System
+
+`LollmsDiscussion` incorporates a biological-inspired persistent memory system (`LollmsMemoryManager`) consisting of three hierarchical layers:
+- **Level 1 — Working Memory**: Active, high-importance facts currently in focus. Injected directly into the conversation context. Capped by a token budget; excess memories are automatically demoted to Deep Memory.
+- **Level 2 — Deep Memory**: Long-term memories that have faded due to lack of use. Not injected in full. Instead, compact *handles* (stubs) are displayed in the context so the LLM knows they exist and can call `<mem_load id="XXXXXXXX" />` to load them back to active Working Memory.
+- **Level 3 — Archived Memory**: Extremely old or low-importance memories. Never loaded automatically. Subject to automatic pruning or re-activation during the periodic dream consolidation pass.
+
+#### Memory XML Commands
+
+The memory manager intercepts several XML tags emitted by the model during a chat turn to manipulate its database state:
+- `<mem_new importance="0.9">Your fact here</mem_new>`: Store a new long-term memory.
+- `<mem_tag id="UUID" />`: Retrieve or reference a memory (boosts importance).
+- `<mem_update id="UUID">New updated content</mem_update>`: Actively update a memory's content.
+- `<mem_delete id="UUID" />`: Permanently delete a memory.
+- `<mem_load id="UUID" />`: Load a deep memory handle back to active Working Memory.
+
+#### The Dream Consolidation Cycle (`dream()`)
+
+To manage and organize its memories over time, the AI periodically executes a "dream cycle". You can trigger this at the end of chat turns or in a background worker:
+- **Reinforcement**: Memories that are frequently tagged/retrieved have their importance boosted logarithmically.
+- **Decay**: Unused memories decay over time and are automatically demoted (Working → Deep → Archived).
+- **LLM-Assisted Selective Forgetting**: Archive memories falling below the `forget_threshold` (e.g., 0.02) are evaluated by the subconscious "Dreamer" LLM. If the dreamer decides they contain critical architectural/preference rules, they are restored to active status; otherwise, they are permanently pruned.
+
+#### Logical vs. Physical Scoping
+
+The system supports both shared and isolated scopes across multiple conversations using a single parameters layout:
+- **Logical User Scoping (Cross-Discussion Propagation)**: Point your `LollmsMemoryManager` to a shared database path and assign `owner_id` to the unique User ID (e.g., `owner_id="user_ParisNeo"`). Memories learned in Chat A will propagate automatically to Chat B.
+- **Discussion Isolation**: Set `owner_id` to the specific Discussion Thread ID (e.g. `owner_id=discussion.id`) to confine learned facts to that specific context.
+- **Physical Partitioning**: Provide user-specific file paths (e.g. `sqlite:///app_data/users/{user_id}/long_term_memory.db`) for full physical filesystem data isolation.
 
 ### Managing Multimodal Context: Activating and Deactivating Images
 
@@ -1905,28 +1936,3 @@ blocks = tp.extract_code_blocks(
 * ✅ JSON Schema & Pydantic support
 * ✅ Decision helpers (yes/no, multichoice, ranking)
 * ✅ Graceful fallback strategies
-
----
-
-## 🏁 Summary
-
-The **Lollms Text Processor** turns a raw LLM into a **reliable production tool**.
-
-> `lc.llm` generates
-> `lc.llm.tp` structures, validates, and secures
-
-A core component of **LOLLMS — one tool to rule them all** 🚀
-
-
-
-## Contributing
-
-Contributions are welcome! Whether it's bug reports, feature suggestions, documentation improvements, or new bindings, please feel free to open an issue or submit a pull request on our [GitHub repository](https://github.com/ParisNeo/lollms_client).
-
-## License
-
-This project is licensed under the **Apache 2.0 License**. See the [LICENSE](LICENSE) file for details.
-
-## Changelog
-
-For a list of changes and updates, please refer to the [CHANGELOG.md](CHANGELOG.md) file.

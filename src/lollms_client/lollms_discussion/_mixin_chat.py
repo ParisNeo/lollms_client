@@ -111,14 +111,13 @@ _TAG_STARTS = [
     "<lollms_event",
     "<use_handle",
     "<processing",     # Unified processing indicator
+    "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete"
 ]
-# Non-XML tokens to suppress from the output stream entirely
 _SUPPRESS_TOKENS = [
     "[BLIND_ACTION_EXECUTED]",
     # Add future markers here
 ]
 _MAX_SUPPRESS_BUF = 64
-# Secondary-stream tag type mapping
 _SECONDARY_TAG_MAP = {
     "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
                        MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
@@ -134,6 +133,10 @@ _SECONDARY_TAG_MAP = {
                        MSG_TYPE.MSG_TYPE_WIDGET_DONE,       "</lollms_inline>"),
     "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_FORM_READY,
                        MSG_TYPE.MSG_TYPE_FORM_READY,        "</lollms_form>"),
+    "<mem_new":       ("memory_new",          MSG_TYPE.MSG_TYPE_INFO,
+                       MSG_TYPE.MSG_TYPE_INFO,              "</mem_new>"),
+    "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,
+                       MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
 }
 
 
@@ -1150,14 +1153,26 @@ class _StreamState:
         enable_inline_widgets: bool,
         enable_forms: bool,
         auto_activate_artefacts: bool = True,
+        enable_artefacts: bool = True,
+        enable_in_message_status: bool = True,
     ):
         self.discussion            = discussion
         self.callback              = callback
         self.ai_message            = ai_message
-        self.enable_notes          = enable_notes
-        self.enable_skills         = enable_skills
-        self.enable_inline_widgets = enable_inline_widgets
-        self.enable_forms          = enable_forms
+        self.enable_artefacts      = enable_artefacts
+        self.enable_in_message_status = enable_in_message_status
+
+        if not enable_artefacts:
+            self.enable_notes          = False
+            self.enable_skills         = False
+            self.enable_inline_widgets = False
+            self.enable_forms          = False
+        else:
+            self.enable_notes          = enable_notes
+            self.enable_skills         = enable_skills
+            self.enable_inline_widgets = enable_inline_widgets
+            self.enable_forms          = enable_forms
+
         self.auto_activate         = auto_activate_artefacts
 
         self.state: str             = self.STATE_NORMAL
@@ -1296,6 +1311,16 @@ class _StreamState:
                 self.tool_buf = [b_str]
                 return new_pos
 
+            b_str_lower = b_str.lower()
+            # Intercept self-closing memory tags instantly inside buffering
+            if any(b_str_lower.startswith(prefix) for prefix in ("<mem_tag", "<mem_load", "<mem_delete")) or (
+                b_str_lower.startswith("<mem_new") and b_str_lower.endswith("/>")
+            ):
+                self._handle_memory_tag_stream(b_str)
+                self.bracket_buf.clear()
+                self.state = self.STATE_NORMAL
+                return new_pos
+
             matched_prefix = self._match_secondary_prefix(b_str)
             if matched_prefix:
                 self.bracket_buf.clear()
@@ -1339,10 +1364,96 @@ class _StreamState:
             self.clean_prose.append(text)
             _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
 
+    def _handle_memory_tag_stream(self, tag_str: str) -> str:
+        """Process a memory tag in real-time and output inline <processing> statuses."""
+        mm = self.discussion.memory_manager
+        if not mm:
+            return ""
+
+        tag_str = tag_str.strip()
+        tag_lower = tag_str.lower()
+        op_type = ""
+        details = ""
+
+        if tag_lower.startswith("<mem_tag"):
+            m = mm._PAT_TAG.match(tag_str)
+            if m:
+                full_id = mm._resolve_id(m.group(1))
+                if full_id:
+                    res = mm.tag(full_id)
+                    if res:
+                        op_type = "memory_update"
+                        details = f"Acknowledged/reinforced memory: '{res['content'][:40]}...'"
+        elif tag_lower.startswith("<mem_load"):
+            m = mm._PAT_LOAD.match(tag_str)
+            if m:
+                full_id = mm._resolve_id(m.group(1))
+                if full_id:
+                    res = mm.load_to_working(full_id)
+                    if res:
+                        op_type = "memory_update"
+                        details = f"Loaded deep memory: '{res['content'][:40]}...'"
+        elif tag_lower.startswith("<mem_delete"):
+            m = mm._PAT_DELETE.match(tag_str)
+            if m:
+                full_id = mm._resolve_id(m.group(1))
+                if full_id and mm.delete(full_id):
+                    op_type = "memory_update"
+                    details = f"Deleted memory ID: {m.group(1)}"
+        elif tag_lower.startswith("<mem_new") and tag_str.endswith("/>"):
+            m = mm._PAT_NEW.match(tag_str)
+            if m:
+                attrs = {attr_m.group(1).lower(): attr_m.group(2)
+                         for attr_m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', m.group(1))}
+                imp_str = attrs.get("importance")
+                try:
+                    imp = float(imp_str) if imp_str else mm.config.default_importance
+                except ValueError:
+                    imp = mm.config.default_importance
+                content = attrs.get("content", "")
+                if content:
+                    res = mm.add(content.strip(), importance=max(0.0, min(1.0, imp)))
+                    if res:
+                        op_type = "memory_update"
+                        details = f"Created new memory (Imp: {imp:.1%}): '{content[:40]}...'"
+
+        if op_type and details:
+            if self.enable_in_message_status:
+                self.proc_type = op_type
+                self.proc_title = "Memory System Update"
+                self._emit_processing_open()
+                self._emit_processing_status(details)
+                self._emit_processing_close()
+            # Send informational updates to callbacks
+            _cb(self.callback, details, MSG_TYPE.MSG_TYPE_INFO, {"type": "memory_update", "report": {}})
+            return tag_str
+        return ""
+
+    def _auto_pull_deep_memory_cues(self, user_message: str):
+        """Auto-grep deep memories matching keywords in user_message."""
+        # Clean punctuation to allow robust matches on words like 'language?'
+        cleaned_text = re.sub(r'[^\w\s]', ' ', user_message)
+        words = set(cleaned_text.lower().split())
+        if not words:
+            return
+
+        mm = self.discussion.memory_manager
+        if not mm:
+            return
+
+        matching_deep = mm.query(user_message, top_k=3, level=2)
+        for m in matching_deep:
+            mm.load_to_working(m["id"])
+            ASCIIColors.cyan(
+                f"[Memory] Detected deep memory cue — Auto-pulled '{m['id'][:8]}' "
+                f"('{m['content'][:30]}...') into Working Memory."
+            )
+
     def _match_secondary_prefix(self, b_str: str) -> Optional[str]:
         b_str_lower = b_str.lower()
         for prefix in _SECONDARY_TAG_MAP:
             if b_str_lower.startswith(prefix.lower()):
+                if prefix in ("<artifact", "<artefact") and not self.enable_artefacts: continue
                 if prefix in ("<note",)  and not self.enable_notes:           continue
                 if prefix in ("<skill",) and not self.enable_skills:          continue
                 if prefix in ("<lollms_inline",) and not self.enable_inline_widgets: continue
@@ -1364,6 +1475,8 @@ class _StreamState:
 
     def _emit_tool_processing_open(self, tool_name: str, params: Dict[str, Any]):
         """Emit opening <processing> tag for tool call execution."""
+        if not self.enable_in_message_status:
+            return
         params_str = json.dumps(params, ensure_ascii=False)[:200]
         params_escaped = params_str.replace('"', '&quot;')
         tag = f'<processing type="tool_execution" tool="{tool_name}" params="{params_escaped}">'
@@ -1373,29 +1486,35 @@ class _StreamState:
             "processing_type": "tool_execution",
             "tool": tool_name,
             "params": params,
+            "was_processed": True,
         })
         self.proc_has_opened = True
         self.proc_type = "tool_execution"
 
     def _emit_tool_processing_status(self, status_text: str):
         """Stream a status update for tool execution."""
-        if not self.proc_has_opened:
-            return
         line = f"\n* {status_text}"
         self.proc_content.append(line)
-        self.ai_message.content += line
-        _cb(self.callback, line, MSG_TYPE.MSG_TYPE_CHUNK, {
-            "type": "processing_status",
-            "processing_type": "tool_execution",
-            "status": status_text,
-        })
+        if self.enable_in_message_status:
+            if not self.proc_has_opened:
+                return
+            self.ai_message.content += line
+            _cb(self.callback, line, MSG_TYPE.MSG_TYPE_CHUNK, {
+                "type": "processing_status",
+                "processing_type": "tool_execution",
+                "status": status_text,
+                "was_processed": True,
+            })
 
     def _emit_tool_processing_close(self, result_summary: str = ""):
         """Close the tool execution processing tag.
-        
+
         Note: result_summary is plain text (no XML tags) so it is safe to emit
         directly via _cb without risk of re-entrant tag matching.
         """
+        if not self.enable_in_message_status:
+            return
+
         if not self.proc_has_opened:
             return
 
@@ -1404,6 +1523,7 @@ class _StreamState:
         _cb(self.callback, close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_close",
             "processing_type": "tool_execution",
+            "was_processed": True,
         })
 
         if result_summary:
@@ -1444,6 +1564,8 @@ class _StreamState:
             "<skill":         "skill_building",
             "<lollms_inline": "widget_building",
             "<lollms_form":   "form_building",
+            "<mem_new":       "memory_update",
+            "<mem_update":    "memory_update",
         }
 
         # ── Determine Context: Building vs Editing ──
@@ -1453,6 +1575,8 @@ class _StreamState:
         if not raw_title:
             if prefix == "<coding_plan":
                 raw_title = "Strategic Planning"
+            elif prefix in ("<mem_new", "<mem_update"):
+                raw_title = "Memory System Update"
             else:
                 raw_title = "Untitled Task"
         existing_titles = self.discussion.artefacts._all_latest_titles()
@@ -1462,6 +1586,9 @@ class _StreamState:
             self.proc_type = "artefact_patching" if is_update else "artefact_building"
             label = "🔧 EDITING" if is_update else "🏗️ BUILDING"
             new_title = f"{label} ARTEFACT: {raw_title}"
+        elif prefix in ("<mem_new", "<mem_update"):
+            self.proc_type = "memory_update"
+            new_title = "Memory System Update"
         else:
             self.proc_type = proc_type_map.get(prefix, "building")
             new_title = raw_title
@@ -1521,6 +1648,7 @@ class _StreamState:
 
             # ── Flush pending final content (widget HTML / form tag / specialist tags) ──
             # KEY FIX: We must ensure this content DOES NOT re-trigger the state machine.
+            # ── Flush pending final content (widget HTML / form tag / specialist tags) ──
             if self.pending_final_content:
                 content = self.pending_final_content
                 self.pending_final_content = ""
@@ -1528,14 +1656,24 @@ class _StreamState:
                 # We append to content so it's saved in the message
                 self.ai_message.content += content
 
-                # We emit via _cb, but we pass a 'was_processed' flag in meta.
-                # The relay in ChatMixin must check this flag to avoid re-feeding.
-                _cb(self.callback, content, MSG_TYPE.MSG_TYPE_CHUNK, {
-                    "type": "processing_final_content",
-                    "processing_type": saved_proc_type,
-                    "content_length": len(content),
-                    "was_processed": True  # Sentinel to prevent double-execution
-                })
+                # If it is a specialist artifact or plan result, do NOT emit it as a raw MSG_TYPE_CHUNK chunk to the UI,
+                # to prevent the WebUI's client-side parser from opening redundant/empty processing blocks.
+                # Instead, we emit it on MSG_TYPE_ARTEFACT_DONE.
+                if saved_proc_type in ("artefact_building", "artefact_patching", "coding_planning"):
+                    _cb(self.callback, content, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE, {
+                        "type": "processing_final_content",
+                        "processing_type": saved_proc_type,
+                        "content_length": len(content),
+                        "was_processed": True
+                    })
+                else:
+                    # For other widget/form types, emit as normal chunk
+                    _cb(self.callback, content, MSG_TYPE.MSG_TYPE_CHUNK, {
+                        "type": "processing_final_content",
+                        "processing_type": saved_proc_type,
+                        "content_length": len(content),
+                        "was_processed": True  # Sentinel to prevent double-execution
+                    })
 
             # ── Continue with any text after the closing tag ────────────
             if post_close:
@@ -1569,6 +1707,8 @@ class _StreamState:
 
     def _emit_processing_open(self):
         """Emit the opening <processing> tag with attributes."""
+        if not self.enable_in_message_status:
+            return
         if self.proc_has_opened:
             return
         attrs_str = f' type="{self.proc_type}" title="{self.proc_title}"'
@@ -1582,21 +1722,24 @@ class _StreamState:
             "processing_type": self.proc_type,
             "title": self.proc_title,
             "attrs": self.proc_attrs,
+            "was_processed": True,
         })
         self.proc_has_opened = True
 
     def _emit_processing_status(self, status_text: str):
         """Stream a status line inside the processing tag."""
-        if not self.proc_has_opened:
-            self._emit_processing_open()
         line = f"\n* {status_text}"
         self.proc_content.append(line)
-        self.ai_message.content += line
-        _cb(self.callback, line, MSG_TYPE.MSG_TYPE_CHUNK, {
-            "type": "processing_status",
-            "processing_type": self.proc_type,
-            "status": status_text,
-        })
+        if self.enable_in_message_status:
+            if not self.proc_has_opened:
+                self._emit_processing_open()
+            self.ai_message.content += line
+            _cb(self.callback, line, MSG_TYPE.MSG_TYPE_CHUNK, {
+                "type": "processing_status",
+                "processing_type": self.proc_type,
+                "status": status_text,
+                "was_processed": True,
+            })
 
     def _emit_processing_close(self, final_content: str = ""):
         """Close the <processing> tag only if it's open.
@@ -1605,6 +1748,11 @@ class _StreamState:
         at the very end of the stream by flush_remaining_buffer() or if 
         we transition back to conversational text.
         """
+        if not self.enable_in_message_status:
+            if final_content:
+                self.pending_final_content = final_content
+            return
+
         if not self.proc_has_opened:
             if final_content:
                 self.pending_final_content = final_content
@@ -1616,6 +1764,7 @@ class _StreamState:
             "type": "processing_close",
             "processing_type": self.proc_type,
             "title": self.proc_title,
+            "was_processed": True,
         })
 
         if final_content:
@@ -1848,6 +1997,10 @@ class _StreamState:
             attrs.pop('images', None)
             attrs.pop('image_media_types', None)
 
+            commit_message = attrs.pop('commit_message', None)
+            version_tags_raw = attrs.pop('version_tags', None)
+            version_tags = [t.strip().lower() for t in version_tags_raw.split(',') if t.strip()] if version_tags_raw else None
+
             existing_titles  = self.discussion.artefacts._all_latest_titles()
             resolved_title   = tag_title if tag_title in existing_titles else (
                 _find_best_title_match(tag_title, existing_titles) or tag_title
@@ -1855,13 +2008,23 @@ class _StreamState:
             is_new   = resolved_title not in existing_titles
             is_patch = bool(re.search(r'<{6,8}\s*SEARCH', full_content, re.I))
 
+            existing_before_update = self.discussion.artefacts.get(resolved_title)
+            if existing_before_update and existing_before_update.get("type") == "data":
+                self._emit_processing_status(
+                    f"❌ REJECTED: Standard text/markdown editing is forbidden on Data Interface '{resolved_title}'. "
+                    "You must use the 'execute_python_data_query' tool to modify this dataset."
+                )
+                self.patch_error_occurred = True
+                self._emit_processing_close()
+                return
+
             self._emit_processing_status(
                 f"{'Creating new' if is_new else 'Updating'} artefact '{resolved_title}'"
             )
 
             # ── CAPTURE STATE BEFORE UPDATE ──
-            existing_before_update = self.discussion.artefacts.get(resolved_title)
             original_content_snapshot = existing_before_update.get('content', '') if existing_before_update else None
+            existing_before_update = self.discussion.artefacts.get(resolved_title)
 
             result_art = None
 
@@ -1876,7 +2039,9 @@ class _StreamState:
                     clean_content = re.sub(r'<{5,8}\s*SEARCH.*?={5,8}.*?>{5,8}\s*REPLACE', '', full_content, flags=re.DOTALL).strip()
                     result_art = self.discussion.artefacts.add(
                         resolved_title, atype, clean_content,
-                        language=lang, active=self.auto_activate, **attrs,
+                        language=lang, active=self.auto_activate,
+                        commit_message=commit_message, version_tags=version_tags,
+                        **attrs,
                     )
                 else:
                     patch_content  = full_content
@@ -1914,6 +2079,8 @@ class _StreamState:
                                 new_title=new_name,
                                 language=lang,
                                 active=self.auto_activate,
+                                commit_message=commit_message,
+                                version_tags=version_tags,
                                 **attrs,
                             )
                             patch_accepted = True
@@ -1996,7 +2163,7 @@ class _StreamState:
                             result_art = None # Force it to be None so it's not added to affected_artefacts
                             self.patch_error_occurred = True
                             self._emit_processing_status(
-                                "❌ CRITICAL: No changes detected. Implementation failed."
+                                "❌ No changes detected: Content remains identical to original."
                             )
                             if hasattr(self, "_turn_action_history"):
                                 self._turn_action_history.append(f"✗ FAILED: Specialist returned content identical to the original for '{resolved_title}'. Mission NOT accomplished.")
@@ -2007,6 +2174,8 @@ class _StreamState:
                                 new_title=new_name,
                                 language=lang,
                                 active=self.auto_activate,
+                                commit_message=commit_message,
+                                version_tags=version_tags,
                                 **attrs,
                             )
                             self._emit_processing_status(
@@ -2021,9 +2190,13 @@ class _StreamState:
                     f"NOTE: Patch requested for new artefact '{resolved_title}'; "
                     "creating with raw content"
                 )
+                # Clean leaked sentinels from raw content if creating new from a failed patch
+                clean_content = re.sub(r'<{5,8}\s*SEARCH.*?={5,8}.*?>{5,8}\s*REPLACE', '', full_content, flags=re.DOTALL).strip()
                 result_art = self.discussion.artefacts.add(
-                    resolved_title, atype, full_content,
-                    language=lang, active=self.auto_activate, **attrs,
+                    resolved_title, atype, clean_content,
+                    language=lang, active=self.auto_activate,
+                    commit_message=commit_message, version_tags=version_tags,
+                    **attrs,
                 )
 
             # ── Full content path ─────────────────────────────────────────────
@@ -2031,7 +2204,9 @@ class _StreamState:
                 if is_new:
                     result_art = self.discussion.artefacts.add(
                         resolved_title, atype, full_content.strip(),
-                        language=lang, active=self.auto_activate, **attrs,
+                        language=lang, active=self.auto_activate,
+                        commit_message=commit_message, version_tags=version_tags,
+                        **attrs,
                     )
                 else:
                     self._emit_processing_status(
@@ -2045,6 +2220,8 @@ class _StreamState:
                         new_type=atype,
                         language=lang,
                         active=self.auto_activate,
+                        commit_message=commit_message,
+                        version_tags=version_tags,
                         **attrs,
                     )
 
@@ -2064,7 +2241,8 @@ class _StreamState:
                     ASCIIColors.red("  [Integrity] FAILED: Content is binary-identical to previous version.")
 
             # Process success if we have a new artifact or confirmed changes
-            if result_art and (is_new or has_real_changes):
+            # Process success if we have a new artifact, confirmed changes, or it is a full overwrite (not a patch)
+            if result_art and (is_new or has_real_changes or not is_patch):
                 self.affected_artefacts.append(result_art)
                 current_meta = dict(self.ai_message.metadata or {})
                 mod_list = current_meta.get("artefacts_modified", [])
@@ -2079,14 +2257,14 @@ class _StreamState:
                 )
                 if hasattr(self, "_turn_action_history"):
                     self._turn_action_history.append(f"✓ SUCCESSFULLY updated '{resolved_title}' to v{result_art.get('version')}")
-                else:
-                    # Fallback path: No real changes detected
-                    self.patch_error_occurred = True
-                    self._emit_processing_status(
-                        "❌ No changes detected: Content remains identical to original."
-                    )
+            else:
+                # Fallback path: No real changes detected on a patch
+                self.patch_error_occurred = True
+                self._emit_processing_status(
+                    "❌ No changes detected: Content remains identical to original."
+                )
                 if hasattr(self, "_turn_action_history"):
-                    error_msg = f"✗ FAILED: Specialist returned content for '{resolved_title}' that is binary-identical to the current version. No changes were saved."
+                    error_msg = f"Flux FAILED: Specialist returned content for '{resolved_title}' that is binary-identical to the current version. No changes were saved."
                     self._turn_action_history.append(error_msg)
                     ASCIIColors.error(f"[Master Feedback] {error_msg}")
 
@@ -2100,6 +2278,33 @@ class _StreamState:
                 "is_patch": is_patch,
                 "attrs":    attrs,
             })
+
+        # ── Memory (Standard Tags with inner content) ─────────────────────────
+        elif prefix == "<mem_new":
+            tag_title = attrs.get('importance')
+            try:
+                imp = float(tag_title) if tag_title else self.discussion.memory_manager.config.default_importance
+            except ValueError:
+                imp = self.discussion.memory_manager.config.default_importance
+
+            res = self.discussion.memory_manager.add(full_content.strip(), importance=max(0.0, min(1.0, imp)))
+            if res:
+                self.affected_artefacts.append(res)
+                self._emit_processing_status(f"Created new memory (Imp: {imp:.1%}): '{full_content[:40]}...'")
+            self._emit_processing_close()
+            _cb(self.callback, full_content, self.sec_done_mt, {"importance": imp, "content": full_content})
+
+        elif prefix == "<mem_update":
+            tag_id = attrs.get('id')
+            if tag_id:
+                full_id = self.discussion.memory_manager._resolve_id(tag_id)
+                if full_id:
+                    res = self.discussion.memory_manager.update(full_id, full_content.strip())
+                    if res:
+                        self.affected_artefacts.append(res)
+                        self._emit_processing_status(f"Updated memory [{tag_id[:8]}]: '{full_content[:40]}...'")
+            self._emit_processing_close()
+            _cb(self.callback, full_content, self.sec_done_mt, {"id": tag_id, "content": full_content})
 
         # ── Notes ─────────────────────────────────────────────────────────────
         elif prefix == "<note":
@@ -2255,7 +2460,7 @@ class _StreamState:
 
         # 4. Build the On-The-Fly Surgical System Prompt
         surgical_prompt = (
-            f"You are the {requested_persona}.\n"
+            "You are the " + requested_persona + ".\n"
             "You operate in a hyper-focused implementation sandbox.\n"
             "Your ONLY task is to implement the provided PLAN by outputting updated <artifact> tags.\n"
             "DO NOT create widgets, notes, or forms. DO NOT use conversational prose.\n\n"
@@ -2266,17 +2471,22 @@ class _StreamState:
             "- If the plan concerns Code: Ensure idiomatic accuracy and architectural consistency.\n"
             "- If the plan concerns Markdown/Text: Preserve tone, formatting, and structural depth.\n\n"
             "STRICT CONSTRAINTS:\n"
-            "1. Output ONLY <artifact> tags (using SEARCH/REPLACE blocks for updates).\n"
-            "2. No conversation, no explanations, no markdown fences OUTSIDE the tags.\n"
-            "3. Provide exactly 2 lines of context in SEARCH blocks to ensure match uniqueness.\n"
-            "4. For new artifacts, provide 100% of the content.\n"
-            "5. Match indentation, punctuation, and blank lines character-for-character.\n"
+            "1. Output ONLY <artifact> tags. You MUST specify the name attribute matching the target file exactly, e.g. <artifact name=\"math_ops.py\" type=\"code\">\n"
+            "2. For modifying existing artifacts, you MUST use SEARCH/REPLACE blocks inside the tag.\n"
+            "3. No conversation, no explanations, no markdown fences OUTSIDE the tags.\n"
+            "4. Provide exactly 2 lines of context in SEARCH blocks to ensure match uniqueness.\n"
+            "5. For new artifacts, provide 100% of the content.\n"
+            "6. Match indentation, punctuation, and blank lines character-for-character.\n"
         )
 
         # 5. Build the payload
         user_payload = []
         if memory_block:
             user_payload.append(memory_block)
+
+        # Inject the scratchpad containing sequential reading summaries if populated
+        if getattr(self.discussion, "scratchpad", "").strip():
+            user_payload.append(f"=== RECENT SEARCH & SCAN RESULTS ===\n{self.discussion.scratchpad.strip()}")
 
         user_payload.append(f"=== CONTEXTUAL ARTEFACTS ===\n{full_context}")
         user_payload.append(f"=== PLAN TO EXECUTE ===\n{plan}")
@@ -2454,12 +2664,14 @@ class ChatMixin:
         ss = _StreamState(
             discussion            = self,
             callback              = callback,
-            ai_message            = LollmsMessage(self, SimpleNamespace(content="", metadata={})),
+            ai_message            = LollmsMessage(self, SimpleNamespace(id=None, content="", metadata={})),
             enable_notes          = kwargs.get("enable_notes", True),
             enable_skills         = kwargs.get("enable_skills", False),
             enable_inline_widgets = kwargs.get("enable_inline_widgets", True),
             enable_forms          = kwargs.get("enable_forms", True),
             auto_activate_artefacts = kwargs.get("auto_activate_artefacts", True),
+            enable_artefacts      = kwargs.get("enable_artefacts", True),
+            enable_in_message_status = kwargs.get("enable_in_message_status", True),
         )
 
         def _streaming_relay(chunk, msg_type=None, meta=None):
@@ -2655,17 +2867,25 @@ class ChatMixin:
         enable_forms:            bool = True,
         enable_silent_artefact_explanation: bool = True,
         memory_manager=None,
+        enable_artefacts:        bool = True,
+        enable_memory:           bool = True,
+        enable_auto_dream:       bool = True,
+        enable_deep_memory_pulling: bool = True,
+        enable_in_message_status: bool = True,
         **kwargs
-    ) -> Dict[str, Any]:
+        ) -> Dict[str, Any]:
         self.scratchpad = ""
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
 
         # ── Memory ────────────────────────────────────────────────────────
-        _mm = self._get_memory_manager(memory_manager)
+        _mm = self._get_memory_manager(memory_manager) if enable_memory else None
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
-        self._memory_pre_turn(_mm, token_counter=_counter)
-        _mem_instructions = self._build_memory_system_instructions(_mm)
+        if _mm:
+            self._memory_pre_turn(_mm, user_message=user_message, enable_deep_memory_pulling=enable_deep_memory_pulling, token_counter=_counter)
+            _mem_instructions = self._build_memory_system_instructions(_mm)
+        else:
+            _mem_instructions = ""
 
         object.__setattr__(self, '_active_callback', callback)
 
@@ -2679,24 +2899,33 @@ class ChatMixin:
                 return True
             return m in ["ok", "merci", "thanks", "cool", "yes", "no", "oui", "non"]
 
-        extra_instructions = self._build_artefact_instructions()
+        extra_instructions = ""
+        if enable_artefacts:
+            extra_instructions += self._build_artefact_instructions()
+            if enable_inline_widgets:
+                extra_instructions += self._build_inline_widget_instructions()
+            if enable_notes:
+                extra_instructions += self._build_note_instructions()
+            if enable_skills:
+                extra_instructions += self._build_skill_instructions()
+            if enable_forms:
+                extra_instructions += self._build_form_instructions()
+
+            branch_msgs = self.get_branch(branch_tip_id or self.active_branch_id)
+            handle_instructions = _build_handle_instructions(branch_msgs)
+            if handle_instructions:
+                extra_instructions += handle_instructions
+
         if _mem_instructions:
             extra_instructions += _mem_instructions
         if enable_image_generation or enable_image_editing:
             extra_instructions += self._build_image_generation_instructions()
-        if enable_inline_widgets:
-            extra_instructions += self._build_inline_widget_instructions()
-        if enable_notes:
-            extra_instructions += self._build_note_instructions()
-        if enable_skills:
-            extra_instructions += self._build_skill_instructions()
-        if enable_forms:
-            extra_instructions += self._build_form_instructions()
 
-        branch_msgs = self.get_branch(branch_tip_id or self.active_branch_id)
-        handle_instructions = _build_handle_instructions(branch_msgs)
-        if handle_instructions:
-            extra_instructions += handle_instructions
+        if debug or self.lollmsClient.debug:
+            ASCIIColors.cyan("=== [DEBUG] SIMPLIFIED CHAT STATE ===")
+            ASCIIColors.yellow(f"  • Active Artifacts: {[a['title'] for a in self.artefacts.list(active_only=True)]}")
+            ASCIIColors.yellow(f"  • Scratchpad Summary: {self.scratchpad[:500]}...")
+            ASCIIColors.info("=====================================")
 
         if extra_instructions.strip():
             original_sp = self._system_prompt or ""
@@ -2716,12 +2945,14 @@ class ChatMixin:
         ss = _StreamState(
             discussion            = self,
             callback              = callback,
-            ai_message            = LollmsMessage(self, SimpleNamespace(content="", metadata={})),
+            ai_message            = LollmsMessage(self, SimpleNamespace(id=None, content="", metadata={})),
             enable_notes          = enable_notes,
             enable_skills         = enable_skills,
             enable_inline_widgets = enable_inline_widgets,
             enable_forms          = enable_forms,
             auto_activate_artefacts = auto_activate_artefacts,
+            enable_artefacts      = enable_artefacts,
+            enable_in_message_status = enable_in_message_status,
         )
 
         def _finish(text):
@@ -2744,11 +2975,11 @@ class ChatMixin:
                 text_after_handles, ai,
                 enable_image_generation, enable_image_editing,
                 auto_activate_artefacts,
-                enable_inline_widgets=enable_inline_widgets,
-                enable_notes=enable_notes,
-                enable_skills=enable_skills,
-                enable_forms=enable_forms,
-                enable_silent_artefact_explanation=enable_silent_artefact_explanation,
+                enable_inline_widgets=enable_inline_widgets if enable_artefacts else False,
+                enable_notes=enable_notes if enable_artefacts else False,
+                enable_skills=enable_skills if enable_artefacts else False,
+                enable_forms=enable_forms if enable_artefacts else False,
+                enable_silent_artefact_explanation=enable_silent_artefact_explanation if enable_artefacts else False,
             )
             affected = handle_artefacts + ss.affected_artefacts + affected_pp
             if cleaned != text_after_handles:
@@ -2763,10 +2994,30 @@ class ChatMixin:
             if affected and callback:
                 _cb(callback, json.dumps([a.get("title") for a in affected]),
                     MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
+            
+            # Auto-dream pass
+            dream_report = None
+            if enable_auto_dream and _mm is not None:
+                try:
+                    dream_report = _mm.dream(self.lollmsClient)
+                    if dream_report and not dream_report.get("skipped"):
+                        ASCIIColors.cyan(f"[Memory] Auto-Dream complete: {dream_report}")
+                        if callback:
+                            try:
+                                callback(
+                                    json.dumps(dream_report, default=str), 
+                                    MSG_TYPE.MSG_TYPE_INFO, 
+                                    {"type": "memory_dream", "report": dream_report}
+                                )
+                            except Exception:
+                                pass
+                except Exception as dream_err:
+                    ASCIIColors.warning(f"[Memory] Auto-dream execution failed: {dream_err}")
+
             object.__setattr__(self, '_active_callback', None)
             return {"user_message": user_msg, "ai_message": ai,
                     "sources": [], "artefacts": affected,
-                    "memory_report": mem_report}
+                    "memory_report": mem_report, "dream_report": dream_report}
 
         if is_fast(user_message):
             _info(callback, "Simple response path")
@@ -2825,6 +3076,12 @@ class ChatMixin:
         if scratchpad:
             self.scratchpad = scratchpad.strip()
 
+        # Inject active working/deep memory into the scratchpad so the LLM sees it
+        if _mm:
+            mem_block = self._build_memory_context_block(_mm, token_counter=_counter)
+            if mem_block:
+                self.scratchpad = (self.scratchpad or "") + "\n\n" + mem_block
+
         answer_id  = _step_start(callback, "Generating answer...")
         final_text = self._stream_final_answer(
             callback, images, branch_tip_id, final_answer_temperature, **kwargs)
@@ -2867,11 +3124,11 @@ class ChatMixin:
             final_text_after_handles, ai,
             enable_image_generation, enable_image_editing,
             auto_activate_artefacts,
-            enable_inline_widgets=enable_inline_widgets,
-            enable_notes=enable_notes,
-            enable_skills=enable_skills,
-            enable_forms=enable_forms,
-            enable_silent_artefact_explanation=enable_silent_artefact_explanation,
+            enable_inline_widgets=enable_inline_widgets if enable_artefacts else False,
+            enable_notes=enable_notes if enable_artefacts else False,
+            enable_skills=enable_skills if enable_artefacts else False,
+            enable_forms=enable_forms if enable_artefacts else False,
+            enable_silent_artefact_explanation=enable_silent_artefact_explanation if enable_artefacts else False,
         )
         affected = handle_artefacts + affected
         if cleaned != final_text_after_handles:
@@ -2958,7 +3215,7 @@ class ChatMixin:
             f"{decision_block}\n"
             "╠════════════════════════════════════════════════════════════════════╣\n"
             "║  Respond naturally. Do NOT reference build logs or status output.  ║\n"
-            "╚════════════════════════════════════════════════════════════════════╝"
+            "╚══════════════════════════════════════════════════════════════════╝"
         )
  
         # 3. Find last clean (non-agentic) user→assistant exchange ───────────
@@ -3027,25 +3284,36 @@ class ChatMixin:
         enable_presentations:         bool = False,
         enable_silent_artefact_explanation: bool = True,
         memory_manager=None,
+        enable_artefacts:             bool = True,
+        enable_memory:                bool = True,
+        enable_auto_dream:            bool = True,
+        enable_deep_memory_pulling:   bool = True,
         **kwargs
-    ) -> Dict[str, Any]:
+        ) -> Dict[str, Any]:
         self.scratchpad = ""
- 
+
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
- 
+
         # ── Memory ────────────────────────────────────────────────────────────
-        _mm      = self._get_memory_manager(memory_manager)
+        _mm      = self._get_memory_manager(memory_manager) if enable_memory else None
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
-        self._memory_pre_turn(_mm, token_counter=_counter)
-        _mem_instructions = self._build_memory_system_instructions(_mm)
- 
+        if _mm:
+            self._memory_pre_turn(_mm, user_message=user_message, enable_deep_memory_pulling=enable_deep_memory_pulling, token_counter=_counter)
+            _mem_instructions = self._build_memory_system_instructions(_mm)
+            # Inject active working/deep memory content so the LLM actually sees it
+            mem_block = self._build_memory_context_block(_mm, token_counter=_counter)
+            if mem_block:
+                self.scratchpad = (self.scratchpad or "") + "\n\n" + mem_block
+        else:
+            _mem_instructions = ""
+
         if "temperature" in kwargs:
             final_answer_temperature = kwargs.pop("temperature")
         else:
             final_answer_temperature = None
  
-        object.__setattr__(self, '_active_callback', callback)
+        object.__setattr__(self, '_active_callback', None)
  
         # ====================================================================
         #  SWARM DISPATCH
@@ -3084,29 +3352,32 @@ class ChatMixin:
         _eff_img_edit  = enable_image_editing     and _tti_available
  
         # ── System-prompt instructions ────────────────────────────────────────
-        extra_instructions = self._build_artefact_instructions()
+        extra_instructions = ""
+        if enable_artefacts:
+            extra_instructions += self._build_artefact_instructions()
+            if enable_inline_widgets:
+                extra_instructions += self._build_inline_widget_instructions()
+            if enable_notes:
+                extra_instructions += self._build_note_instructions()
+            if enable_skills:
+                extra_instructions += self._build_skill_instructions()
+            if enable_forms:
+                extra_instructions += self._build_form_instructions()
+            if enable_books:
+                extra_instructions += self._build_book_instructions()
+            if enable_presentations:
+                extra_instructions += self._build_presentation_instructions()
+
+            branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
+            handle_instructions = _build_handle_instructions(branch_msgs_now)
+            if handle_instructions:
+                extra_instructions += handle_instructions
+
         if _mem_instructions:
             extra_instructions += _mem_instructions
         if _eff_img_gen or _eff_img_edit:
             extra_instructions += self._build_image_generation_instructions()
-        if enable_inline_widgets:
-            extra_instructions += self._build_inline_widget_instructions()
-        if enable_notes:
-            extra_instructions += self._build_note_instructions()
-        if enable_skills:
-            extra_instructions += self._build_skill_instructions()
-        if enable_forms:
-            extra_instructions += self._build_form_instructions()
-        if enable_books:
-            extra_instructions += self._build_book_instructions()
-        if enable_presentations:
-            extra_instructions += self._build_presentation_instructions()
- 
-        branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
-        handle_instructions = _build_handle_instructions(branch_msgs_now)
-        if handle_instructions:
-            extra_instructions += handle_instructions
- 
+
         if extra_instructions.strip():
             original_sp = self._system_prompt or ""
             if extra_instructions not in original_sp:
@@ -3247,7 +3518,7 @@ class ChatMixin:
         self_corrections:  List[Dict] = []
  
         def get_current_answer():
-            active    = [s for s in composable_answer["sections"] if s.get("status") == "active"]
+            active = [s for s in composable_answer["sections"] if s.get("status") == "active"]
             full_text = "\n\n".join(s["content"] for s in active)
             return {"success": True, "full_text": full_text, "sections": active,
                     "total_sections": len(active), "total_length": len(full_text),
@@ -3339,6 +3610,120 @@ class ChatMixin:
             _step_end(callback, f"{len(_pt_specs)} personality tool(s) ready", _pt_step_id,
                       {"tool_count": len(_pt_specs)})
  
+        # ── Layer 2.5: Autonomous Python Data Query Tool ──────────────────────
+        # Automatically registered whenever an active data/database artifact is present in the discussion.
+        active_data = [a for a in self.artefacts.list(active_only=True) if a.get("type") == "data"]
+        if active_data:
+            def _execute_python_data_query_tool_impl(code: str) -> Dict[str, Any]:
+                title = active_data[0]["title"]
+                ext = active_data[0].get("file_ext", ".csv")
+                current_version = active_data[0].get("version", 1)
+                new_version = current_version + 1
+                workspace_dir = Path("./data_workspace")
+                source_file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+                new_file_path = workspace_dir / f"{title}_v{new_version}{ext}"
+
+                if not source_file_path.exists():
+                    return {"success": False, "error": f"Raw data file '{title}_v{current_version}{ext}' is missing from workspace."}
+
+                import pandas as pd
+                import numpy as np
+                import base64
+                import io
+                import sys
+                import shutil
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+
+                local_vars = {
+                    "pd": pd,
+                    "plt": plt,
+                    "np": np
+                }
+
+                sep = ","
+                try:
+                    if ext in (".db", ".sqlite", ".sqlite3"):
+                        shutil.copy(str(source_file_path), str(new_file_path))
+                        import sqlite3
+                        conn = sqlite3.connect(str(new_file_path))
+                        local_vars["conn"] = conn
+                        local_vars["cursor"] = conn.cursor()
+                    elif ext in (".xlsx", ".xls"):
+                        xl = pd.ExcelFile(str(source_file_path))
+                        dfs = {sheet: pd.read_excel(str(source_file_path), sheet_name=sheet) for sheet in xl.sheet_names}
+                        local_vars["dfs"] = dfs
+                        if len(dfs) == 1:
+                            local_vars["df"] = list(dfs.values())[0]
+                    else:
+                        sep = ";" if ext == ".csv" and ";" in source_file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+                        local_vars["df"] = pd.read_csv(str(source_file_path), sep=sep)
+                except Exception as e:
+                    return {"success": False, "error": f"Failed to load dataset: {e}"}
+
+                old_stdout = sys.stdout
+                redirected_output = io.StringIO()
+                sys.stdout = redirected_output
+
+                plot_b64 = None
+                try:
+                    plt.clf()
+                    plt.close('all')
+                    exec(code, {}, local_vars)
+                    fig_nums = plt.get_fignums()
+                    if fig_nums:
+                        buf = io.BytesIO()
+                        plt.savefig(buf, format="png", bbox_inches='tight')
+                        buf.seek(0)
+                        plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+                    if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
+                        local_vars["conn"].commit()
+                        local_vars["conn"].close()
+                    elif ext in (".xlsx", ".xls") and "dfs" in local_vars:
+                        with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
+                            for sheet_name, sheet_df in local_vars["dfs"].items():
+                                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    elif "df" in local_vars:
+                        local_vars["df"].to_csv(new_file_path, index=False, sep=sep)
+
+                    from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                    new_schema, _ = _parse_data_file(new_file_path, title, version=new_version, progress_cb=None)
+                    self.artefacts.update(
+                        title=title,
+                        new_content=new_schema,
+                        new_type="data",
+                        active=True,
+                        file_ext=ext,
+                        version=new_version
+                    )
+                except Exception as e:
+                    sys.stdout = old_stdout
+                    if new_file_path.exists() and ext not in (".db", ".sqlite", ".sqlite3"):
+                        new_file_path.unlink()
+                    return {"success": False, "error": str(e), "output": redirected_output.getvalue()}
+                finally:
+                    sys.stdout = old_stdout
+
+                out_str = redirected_output.getvalue()
+                result = {
+                    "success": True,
+                    "output": out_str or "Code executed successfully (no stdout prints)."
+                }
+                if plot_b64:
+                    result["plot_b64"] = plot_b64
+                    result["output"] += "\n\n[SYSTEM: A matplotlib visualization was generated. The user can view it in their UI.]"
+                return result
+
+            _register(
+                name="execute_python_data_query",
+                fn=_execute_python_data_query_tool_impl,
+                params=[{"name": "code", "type": "str", "description": "The Python code using pandas (via 'df' or 'dfs' dict) or sqlite3 (via 'conn' connection and 'cursor') to analyze or modify the loaded datasets."}],
+                description="MANDATORY FOR DATA MODIFICATION: Execute sandboxed Python code to analyze or modify/write to the active datasets (CSV, Excel, SQLite). Use this tool whenever the user asks to add columns, perform calculations, compute stats, or run SQL queries. Do NOT attempt to use <artifact> tags to modify 'data' type artifacts.",
+                output=[{"name": "output", "type": "str"}]
+            )
+
         # ── Layer 3: personality RAG tool ─────────────────────────────────────
         if personality.has_data:
             def _personality_rag(query: str) -> Dict[str, Any]:
@@ -3447,6 +3832,7 @@ class ChatMixin:
                 enable_inline_widgets = enable_inline_widgets,
                 enable_forms          = enable_forms,
                 auto_activate_artefacts = auto_activate_artefacts,
+                enable_artefacts      = enable_artefacts,
             )
  
             ai_message = self.add_message(
@@ -3464,6 +3850,8 @@ class ChatMixin:
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
+                    if meta and meta.get("was_processed"):
+                        return True
                     return ss.feed(chunk)
                 return True
  
@@ -3520,7 +3908,11 @@ class ChatMixin:
                 )
                 # clear and re-run (similar to existing retry_prompt pattern)
                 ai_message.content = ""
-                raw_text = self._stream_final_answer(...)
+                raw_text = self._stream_final_answer(
+                    _fast_relay, images,
+                    branch_tip_id or self.active_branch_id,
+                    final_answer_temperature, **kwargs,
+                )
                 ss.flush_remaining_buffer()                
  
             if remove_thinking_blocks:
@@ -3535,11 +3927,11 @@ class ChatMixin:
             cleaned, affected_pp = self._post_process_llm_response(
                 raw_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
                 auto_activate_artefacts,
-                enable_inline_widgets=enable_inline_widgets,
-                enable_notes=enable_notes,
-                enable_skills=enable_skills,
-                enable_forms=enable_forms,
-                enable_silent_artefact_explanation=enable_silent_artefact_explanation,
+                enable_inline_widgets=enable_inline_widgets if enable_artefacts else False,
+                enable_notes=enable_notes if enable_artefacts else False,
+                enable_skills=enable_skills if enable_artefacts else False,
+                enable_forms=enable_forms if enable_artefacts else False,
+                enable_silent_artefact_explanation=enable_silent_artefact_explanation if enable_artefacts else False,
             )
             affected = handle_arts + ss.affected_artefacts + affected_pp
             if cleaned != raw_after_handles:
@@ -3549,10 +3941,26 @@ class ChatMixin:
                 ai_message.content, _mm, callback)
             if _mem_cleaned != ai_message.content:
                 ai_message.content = _mem_cleaned
- 
-            if affected and callback:
-                _cb(callback, json.dumps([a.get("title") for a in affected]),
-                    MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
+            
+            # Auto-dream pass
+            dream_report = None
+            if enable_auto_dream and _mm is not None:
+                try:
+                    dream_report = _mm.dream(self.lollmsClient)
+                    if dream_report and not dream_report.get("skipped"):
+                        ASCIIColors.cyan(f"[Memory] Auto-Dream complete: {dream_report}")
+                        if callback:
+                            try:
+                                callback(
+                                    json.dumps(dream_report, default=str), 
+                                    MSG_TYPE.MSG_TYPE_INFO, 
+                                    {"type": "memory_dream", "report": dream_report}
+                                )
+                            except Exception:
+                                pass
+                except Exception as dream_err:
+                    ASCIIColors.warning(f"[Memory] Auto-dream execution failed: {dream_err}")
+
             if self._is_db_backed and self.autosave:
                 self.commit()
             self.scratchpad = ""
@@ -3565,6 +3973,7 @@ class ChatMixin:
                 "self_corrections": None,
                 "artefacts":        affected,
                 "memory_report":    _mem_report,
+                "dream_report":     dream_report,
             }
  
         # ====================================================================
@@ -3775,7 +4184,7 @@ class ChatMixin:
             # Standard path: tenacious mode kicks in at 2+ agentic turns
             agentic_turns = sum(
                 1 for m in branch
-                if m.metadata.get("mode") in ["agentic", "rlm_agentic"]
+                if m.metadata.get("mode") in ("agentic", "rlm_agentic")
             )
             is_tenacious_mode = agentic_turns >= 2
  
@@ -3931,7 +4340,14 @@ class ChatMixin:
                 "\n".join(state_lines) +
                 ("\n\n" + (self.scratchpad or "") if self.scratchpad else "")
             )
- 
+
+            if debug or self.lollmsClient.debug:
+                ASCIIColors.cyan("=== [DEBUG] MAIN CHAT LOOP STATE ===")
+                ASCIIColors.yellow(f"  • Round: {_round}")
+                ASCIIColors.yellow(f"  • Active Artifacts: {[a['title'] for a in self.artefacts.list(active_only=True)]}")
+                ASCIIColors.yellow(f"  • Scratchpad Summary: {self.scratchpad[:500]}...")
+                ASCIIColors.info("====================================")
+
             round_content_start = len(ai_message.content)
  
             ss = _StreamState(
@@ -3940,9 +4356,10 @@ class ChatMixin:
                 ai_message            = ai_message,
                 enable_notes          = enable_notes,
                 enable_skills         = enable_skills,
-                enable_inline_widgets = enable_inline_widgets,
+                enable_inline_widgets = inline_widgets if 'inline_widgets' in locals() else enable_inline_widgets,
                 enable_forms          = enable_forms,
                 auto_activate_artefacts = auto_activate_artefacts,
+                enable_artefacts      = enable_artefacts,
             )
  
             def _inline_relay(chunk, msg_type=None, meta=None):
@@ -3976,6 +4393,8 @@ class ChatMixin:
             full_system_context = (
                 (self.system_prompt or "") + "\n\n" + self.get_full_data_zone()
             )
+            if self.scratchpad:
+                full_system_context += "\n\n" + f"=== SCRATCHPAD / TEMPORARY CONTEXT ===\n{self.scratchpad}\n=== END SCRATCHPAD ==="
             _formatted_messages.append({
                 "role":    "system",
                 "content": full_system_context.strip(),
@@ -4195,9 +4614,12 @@ class ChatMixin:
             try:
                 _call_data   = _parse_tool_call_lenient(_tool_json_str or "{}")
                 _tool_name   = _call_data.get("name", "")
-                _tool_params = _call_data.get("parameters", {})
+                _tool_params = dict(_call_data.get("parameters", {}) or {})
+                # Merge top-level keys as fallbacks for flat parameters
+                for k, v in _call_data.items():
+                    if k not in ("name", "parameters"):
+                        _tool_params.setdefault(k, v)
             except Exception as e:
-                trace_exception(e)
                 _warning(callback, f"Failed to parse tool call: {e}")
                 break
  
@@ -4588,6 +5010,8 @@ class ChatMixin:
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss_final.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
+                    if meta and meta.get("was_processed"):
+                        return True
                     return ss_final.feed(chunk)
                 return True
  
@@ -4843,3 +5267,5 @@ def _apply_handles(
 
     cleaned = handle_pattern.sub(_handle_match, cleaned)
     return cleaned.strip(), affected
+
+

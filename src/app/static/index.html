@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lollms Multimodal Document & Artifact Workspace</title>
+    <link rel="stylesheet" href="/style.css">
+    <!-- Load Markdown Parser -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Load KaTeX for Math rendering -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js"></script>
+    <!-- Load Graphviz Viz.js libraries for conceptual graph rendering -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/viz.js/2.1.2/viz.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/viz.js/2.1.2/full.render.js"></script>
+    <!-- Load CodeMirror 5 for Python Tool Editor -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/dracula.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/python/python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/xml/xml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/javascript/javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/css/css.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/htmlmixed/htmlmixed.min.js"></script>
+</head>
+<body>
+    <!-- 🗃️ Workspace Selection Screen (Startup Grid Overlay) -->
+    <div id="workspace-selection-screen" class="modal-overlay" style="display: none; background-color: var(--bg-app); z-index: 200;">
+        <div class="workspace-grid-container" style="max-width: 900px; width: 100%; margin: auto; padding: 40px; display: flex; flex-direction: column; gap: 24px;">
+            <div style="text-align: center; margin-bottom: 12px;">
+                <h1 style="font-size: 28px; font-weight: 800; color: var(--text-primary); letter-spacing: -0.03em; margin-bottom: 8px;">🗃️ Sovereign Workspaces</h1>
+                <p style="color: var(--text-secondary); font-size: 14px;">Select or create an isolated, secure workspace environment to organize your projects.</p>
+            </div>
+
+            <div class="workspace-card-grid" id="workspace-card-grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 20px;">
+                <!-- Workspace cards are dynamically rendered here -->
+            </div>
+        </div>
+    </div>
+
+    <header class="app-header">
+        <div class="logo">🧠 LoLLMS Artifact & Chat Workspace</div>
+        <div class="header-controls">
+            <div style="position: relative; display: inline-block;">
+                <select id="header-model-select" class="header-select" title="Active Model">
+                    <option value="">-- Model --</option>
+                </select>
+                <span class="spinner inline" id="header-model-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
+            </div>
+            <div style="position: relative; display: inline-block;">
+                <select id="header-tti-model-select" class="header-select" title="Active TTI Model">
+                    <option value="">-- TTI Model --</option>
+                </select>
+                <span class="spinner inline" id="header-tti-model-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
+            </div>
+            <div style="position: relative; display: inline-block;">
+                <select id="header-personality-select" class="header-select" title="Active Personality">
+                    <option value="">-- Personality --</option>
+                </select>
+                <span class="spinner inline" id="header-personality-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
+            </div>
+            <button id="btn-back-to-workspaces" class="btn-icon" title="Switch Workspace" style="margin-right: 4px;">🗃️</button>
+            <button id="btn-open-settings" class="btn-icon" title="Settings">⚙️</button>
+        </div>
+        <div class="status-badge" id="server-status">Initializing...</div>
+    </header>
+
+    <main class="app-container">
+        <!-- Area 1: Left Panel (Session Artifacts & Stored Memories) -->
+        <aside class="panel sidebar-left">
+            <div class="panel-section" style="margin-bottom: 0;">
+                <button class="btn btn-primary" id="btn-create-tool" style="background-color: var(--chat-user-bg); color: white; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                    <span>🛠️</span> Create New Tool
+                </button>
+            </div>
+
+            <div class="panel-section">
+                <div class="sidebar-section-header">
+                    <h2>📂 Active Artifacts</h2>
+                    <button class="part-export-btn" id="btn-export-artifacts-part" title="Export artifacts...">📤 Export</button>
+                </div>
+                <ul class="artifact-list" id="artifacts-list">
+                    <li class="empty-msg">No active artifacts in session.</li>
+                </ul>
+            </div>
+
+            <div class="panel-section">
+                <div class="sidebar-section-header">
+                    <h2>🧠 Stored Memories</h2>
+                    <div style="display:flex;gap:6px;">
+                        <button class="part-export-btn" id="btn-add-memory-part" title="Import a new memory">➕ Add</button>
+                        <button class="part-export-btn" id="btn-export-memories-part" title="Export memories...">📤 Export</button>
+                    </div>
+                </div>
+                <p class="section-desc">Tiered persistent SQLite memory.</p>
+                <ul class="memory-list" id="memories-list">
+                    <li class="empty-msg">No memories stored yet.</li>
+                </ul>
+            </div>
+
+            <div class="panel-section">
+                <div class="sidebar-section-header">
+                    <h2>🛠️ Discovered Tools</h2>
+                    <button class="part-export-btn" id="btn-export-tools-part" title="Export tools...">📤 Export</button>
+                </div>
+                <p class="section-desc">Active local LCP tools.</p>
+                <ul class="tool-list" id="tools-list">
+                    <li class="empty-msg">No discovered tools.</li>
+                </ul>
+            </div>
+        </aside>
+
+        <!-- Area 2: Center Panel (Tabbed Workspace: Chat & Open Artifacts) -->
+        <section class="panel workspace-center">
+            <!-- Dynamic Tab Bar on Top -->
+            <div class="workspace-tabs" id="workspace-tabs">
+                <button class="tab-btn active" data-tab="tab-chat" id="tab-btn-chat">💬 Chat Companion</button>
+            </div>
+
+            <!-- Tab Content Containers -->
+            <div class="workspace-content-viewport" id="workspace-content-viewport">
+                
+                <!-- Always-Present Chat Companion Tab Content -->
+                <div class="tab-content active" id="tab-chat">
+                    <!-- Context Budget Progress Bar -->
+                    <div class="context-budget-container">
+                        <div class="context-budget-header">
+                            <span>🧠 Context Budget</span>
+                            <span id="context-budget-text">0 / 8,192 tokens (0%)</span>
+                        </div>
+                        <div class="context-budget-bar-bg" id="context-budget-bar">
+                            <!-- Segment bars will be dynamically injected here -->
+                        </div>
+                        <div class="context-budget-legend" id="context-budget-legend">
+                            <!-- Legend items will be injected here -->
+                        </div>
+                    </div>
+
+                    <!-- Chat Message Area -->
+                    <div class="chat-history" id="chat-history">
+                        <div class="chat-welcome-msg">
+                            Ask Lollms questions. You can chat freely with or without loaded artifacts. 
+                            Click on the <strong>+</strong> button below to import local files or internet content!
+                        </div>
+                    </div>
+
+                    <!-- Chat Input and Import Button -->
+                    <div class="chat-input-row">
+                        <button class="btn-import-modal" id="btn-open-import" title="Ingest local files or internet content">+</button>
+                        <div class="chat-input-wrapper">
+                            <input type="text" id="chat-input" placeholder="Type your message or run a macro...">
+                            <button class="btn btn-secondary" id="btn-chat-clear" style="width: auto; border-radius: 18px; margin-right: 4px; padding: 6px 12px; font-size: 12px;" title="Clear conversation history">🧹 Clear</button>
+                            <button class="btn btn-primary" id="btn-chat-send">Send</button>
+                            <button class="btn btn-secondary" id="btn-chat-stop" style="display: none; width: auto; background-color: #ef4444; color: white; border-color: #ef4444; border-radius: 18px;" title="Stop active text generation">🛑 Stop</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Dynamic Artifact Tabs get appended here dynamically by app.js -->
+            </div>
+        </section>
+
+        <!-- Area 3: Right Panel (Macros) -->
+        <aside class="panel sidebar-right">
+            <h2>⚡ Macro Operations</h2>
+            <p class="section-desc">Macros trigger high-level AI analysis across all currently active/loaded artifacts in the session.</p>
+            <div class="macro-list">
+                <button class="macro-btn" id="macro-summarize" title="Generate a comprehensive summary of all active artifacts">
+                    <span class="macro-icon">📝</span>
+                    <div class="macro-meta">
+                        <span class="macro-name">Summarize Content</span>
+                        <span class="macro-desc">Creates a unified technical summary of all active documents.</span>
+                    </div>
+                </button>
+                <button class="macro-btn" id="macro-compare" title="Generate a comparative analysis across all active artifacts">
+                    <span class="macro-icon">⚖️</span>
+                    <div class="macro-meta">
+                        <span class="macro-name">Compare Documents</span>
+                        <span class="macro-desc">Synthesizes differences, overlaps, and contradictions.</span>
+                    </div>
+                </button>
+                <button class="macro-btn" id="macro-graph" title="Generate a Graphviz concept relationship map">
+                    <span class="macro-icon">🕸️</span>
+                    <div class="macro-meta">
+                        <span class="macro-name">Build Knowledge Graph</span>
+                        <span class="macro-desc">Creates an interactive Graphviz network of key concepts.</span>
+                    </div>
+                </button>
+                <button class="macro-btn" id="macro-report" title="Generate a comprehensive, structured technical report">
+                    <span class="macro-icon">📊</span>
+                    <div class="macro-meta">
+                        <span class="macro-name">Generate Full Report</span>
+                        <span class="macro-desc">Creates a beautifully structured, multi-section PDF report artifact.</span>
+                    </div>
+                </button>
+                <button class="macro-btn" id="macro-infographic" title="Generate a visually stunning infographic artifact (Requires active TTI)">
+                    <span class="macro-icon">🖼️</span>
+                    <div class="macro-meta">
+                        <span class="macro-name">Build Infographic</span>
+                        <span class="macro-desc">Fuses data into a visual poster artifact using the TTI engine.</span>
+                    </div>
+                </button>
+                <button class="macro-btn" id="macro-presentation" title="Convert active artifacts into a beautiful slide deck">
+                    <span class="macro-icon">🎬</span>
+                    <div class="macro-meta">
+                        <span class="macro-name">Build Presentation</span>
+                        <span class="macro-desc">Creates an interactive, styled HTML5 presentation slide deck.</span>
+                    </div>
+                </button>
+            </div>
+        </aside>
+    </main>
+
+    <!-- 📥 Combined Ingestion Modal -->
+    <div class="modal-overlay" id="import-modal" style="display: none;">
+        <div class="modal-container">
+            <div class="modal-header">
+                <h2>📥 Ingest & Import Content</h2>
+                <button class="modal-close-btn" id="btn-close-import">×</button>
+            </div>
+            
+            <div class="modal-tabs">
+                <button class="modal-tab active" data-modal-tab="modal-tab-local">Local File</button>
+                <button class="modal-tab" data-modal-tab="modal-tab-internet">Internet Source</button>
+                <button class="modal-tab" data-modal-tab="modal-tab-skills">Skills Scanner</button>
+                <button class="modal-tab" data-modal-tab="modal-tab-bundle">Portable Bundle</button>
+                <button class="modal-tab" data-modal-tab="modal-tab-personalities">🎭 Personalities</button>
+            </div>
+
+            <div class="modal-body">
+                <!-- Local File Ingestion Pane -->
+                <div class="modal-tab-content-pane active" id="modal-tab-local">
+                    <div class="drop-zone" id="upload-dropzone">
+                        <p>Drag & drop PDF, DOCX, PPTX, MD, CSV, XLSX, DB, or Image file here, or click to upload (supports multiple files)</p>
+                        <input type="file" id="file-input" hidden multiple>
+                    </div>
+                    <div class="input-group">
+                        <label for="import-mode">Import Mode</label>
+                        <select id="import-mode">
+                            <option value="text_images" selected>Text + Images (Renders entire pages)</option>
+                            <option value="text_embedded_images">Text + Embedded Images (Extracts diagrams/pics)</option>
+                            <option value="text">Text Only (Extracts text without rendering)</option>
+                            <option value="images_only">Images Only (Converts pages strictly to images)</option>
+                            <option value="ocr">OCR Transcription (Extracts visual text via Vision LLM)</option>
+                            <option value="data">Data Interface (Spreadsheet / SQLite DB Tables)</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label for="custom-title">Custom Title (Optional)</label>
+                        <input type="text" id="custom-title" placeholder="e.g. quarterly_report">
+                    </div>
+                    <button class="btn btn-primary" id="btn-submit">Process Document</button>
+                </div>
+
+                <!-- Internet Ingestion Pane -->
+                <div class="modal-tab-content-pane" id="modal-tab-internet">
+                    <div class="input-group">
+                        <label for="internet-source-type">Source Type</label>
+                        <select id="internet-source-type">
+                            <option value="web" selected>Web Search (DuckDuckGo)</option>
+                            <option value="wikipedia">Wikipedia Article</option>
+                            <option value="arxiv">Arxiv Academic Paper</option>
+                            <option value="github">GitHub File / Issue</option>
+                            <option value="stackoverflow">StackOverflow Question</option>
+                            <option value="youtube">YouTube Video Transcript</option>
+                        </select>
+                    </div>
+
+                    <!-- Dynamic Fields (Shown/Hidden based on type) -->
+                    <div class="internet-fields" id="fields-web">
+                        <div class="input-group">
+                            <label for="web-query">Search Query</label>
+                            <input type="text" id="web-query" placeholder="e.g. latest Rust releases">
+                        </div>
+                    </div>
+
+                    <div class="internet-fields" id="fields-wikipedia" style="display:none;">
+                        <div class="input-group">
+                            <label for="wiki-query">Article Title or URL</label>
+                            <input type="text" id="wiki-query" placeholder="e.g. Machine Learning">
+                        </div>
+                    </div>
+
+                    <div class="internet-fields" id="fields-arxiv" style="display:none;">
+                        <div class="input-group">
+                            <label for="arxiv-query">Paper Title / Keywords</label>
+                            <input type="text" id="arxiv-query" placeholder="e.g. Attention is all you need">
+                        </div>
+                        <div class="input-group">
+                            <label for="arxiv-author">Author (Optional)</label>
+                            <input type="text" id="arxiv-author" placeholder="e.g. Vaswani">
+                        </div>
+                        <div class="input-group">
+                            <label for="arxiv-mode">Download Mode</label>
+                            <select id="arxiv-mode">
+                                <option value="abstract" selected>Abstract Only (Fast)</option>
+                                <option value="full">Full PDF Text (Slower)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="internet-fields" id="fields-github" style="display:none;">
+                        <div class="input-group">
+                            <label for="github-url">GitHub File / Issue URL</label>
+                            <input type="text" id="github-url" placeholder="https://github.com/...">
+                        </div>
+                    </div>
+
+                    <div class="internet-fields" id="fields-stackoverflow" style="display:none;">
+                        <div class="input-group">
+                            <label for="stackoverflow-url">StackOverflow Question URL</label>
+                            <input type="text" id="stackoverflow-url" placeholder="https://stackoverflow.com/questions/...">
+                        </div>
+                    </div>
+
+                    <div class="internet-fields" id="fields-youtube" style="display:none;">
+                        <div class="input-group">
+                            <label for="youtube-url">YouTube Video URL or ID</label>
+                            <input type="text" id="youtube-url" placeholder="https://www.youtube.com/watch?v=...">
+                        </div>
+                        <div class="input-group">
+                            <label for="youtube-language">Language Code</label>
+                            <input type="text" id="youtube-language" value="en">
+                        </div>
+                    </div>
+
+                    <button class="btn btn-primary" id="btn-internet-search">Search / Ingest</button>
+
+                    <!-- Search Results -->
+                    <div class="search-results-container" id="search-results-container" style="display:none;">
+                        <h3>🔍 Search Results</h3>
+                        <ul class="search-results-list" id="search-results-list"></ul>
+                        <button class="btn btn-primary" id="btn-internet-import-selected" style="margin-top: 10px;" disabled>Import Selected</button>
+                    </div>
+                </div>
+
+                <!-- Skills Scan Pane -->
+                <div class="modal-tab-content-pane" id="modal-tab-skills">
+                    <p class="section-desc">Load a single Markdown skill file (.md) or point the system to scan a directory recursively.</p>
+                    <div class="input-group" style="margin-bottom: 12px;">
+                        <button class="btn btn-secondary" id="btn-import-single-skill">Load Single Skill File</button>
+                        <input type="file" id="single-skill-input" hidden accept=".md">
+                    </div>
+                    <div class="input-group">
+                        <label for="skills-scan-path">Local Folder Scan Path</label>
+                        <input type="text" id="skills-scan-path" placeholder="e.g. ./skills or C:\my_skills">
+                    </div>
+                    <button class="btn btn-secondary" id="btn-scan-skills">Scan & Load Folder</button>
+                </div>
+
+                <!-- Portable Bundle Import Pane -->
+                <div class="modal-tab-content-pane" id="modal-tab-bundle">
+                    <p class="section-desc">Select a previously exported portable bundle (.json) to restore its data, metadata, and binary attachments.</p>
+                    <button class="btn btn-secondary" id="btn-import-bundle">Import Bundle File</button>
+                    <input type="file" id="bundle-input" hidden accept=".json">
+                </div>
+
+                <!-- Personalities Ingestion Pane -->
+                <div class="modal-tab-content-pane" id="modal-tab-personalities">
+                    <p class="section-desc">Manage your workspace personas. Download from the Zoo, import a zipped custom personality, or export an existing persona.</p>
+
+                    <div style="display: flex; gap: 16px; margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 16px;">
+                        <div style="flex: 1; border-right: 1px solid var(--border-color); padding-right: 16px;">
+                            <h3 style="color: var(--accent-color); font-size: 13px; margin-bottom: 8px;">📥 Download from Zoo</h3>
+                            <p class="section-desc">Fetch specialized personalities directly from the official Lollms zoo repository.</p>
+                            <div class="input-group">
+                                <label for="zoo-category">Category</label>
+                                <input type="text" id="zoo-category" placeholder="e.g. generic, assistant, coding">
+                            </div>
+                            <div class="input-group">
+                                <label for="zoo-persona">Persona Name</label>
+                                <input type="text" id="zoo-persona" placeholder="e.g. lollms, designer, gpt4">
+                            </div>
+                            <button class="btn btn-primary" id="btn-download-zoo-persona">Download & Install</button>
+                        </div>
+                        <div style="width: 240px; display: flex; flex-direction: column; gap: 12px; justify-content: center;">
+                            <h3 style="color: var(--accent-color); font-size: 13px;">📦 Import Custom Persona</h3>
+                            <button class="btn btn-secondary" id="btn-import-personality">Import Zipped Personality</button>
+                            <input type="file" id="personality-zip-input" hidden accept=".zip">
+                        </div>
+                    </div>
+
+                    <div class="panel-section">
+                        <h3 style="color: var(--accent-color); font-size: 13px;">🎭 Installed Personalities</h3>
+                        <ul class="artifact-list" id="modal-personalities-list" style="margin-top: 10px; max-height: 200px; overflow-y: auto;">
+                            <li class="empty-msg">No custom personalities installed yet.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Ingestion Progress Loader -->
+            <div class="progress-container" id="progress-container" style="display: none;">
+                <div class="progress-header">
+                    <span id="progress-status-text">Ingesting file...</span>
+                    <span class="spinner"></span>
+                </div>
+                <div class="progress-bar-bg">
+                    <div class="progress-bar-fill" id="progress-bar-fill"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 📤 Contextual Export Details Modal -->
+    <div class="modal-overlay" id="export-details-modal" style="display: none;">
+        <div class="modal-container" style="width: 500px;">
+            <div class="modal-header">
+                <h2 id="export-modal-title">📤 Export Selection</h2>
+                <button class="modal-close-btn" id="btn-close-export-modal">×</button>
+            </div>
+            <div class="modal-body" id="export-modal-body">
+                <!-- Content gets dynamically populated by app.js based on click -->
+            </div>
+            <div class="modal-footer" style="padding: 16px 24px; border-top: 1px solid var(--border-color); display: flex; gap: 12px; justify-content: flex-end;">
+                <button class="btn btn-secondary" id="btn-cancel-export" style="width: auto;">Cancel</button>
+                <button class="btn btn-primary" id="btn-confirm-export" style="width: auto;">Export</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ⚙️ Settings Modal -->
+    <div class="modal-overlay" id="settings-modal" style="display: none;">
+        <div class="modal-container" style="width: 720px; max-height: 90vh;">
+            <div class="modal-header">
+                <h2>⚙️ System Settings</h2>
+                <button class="modal-close-btn" id="btn-close-settings">×</button>
+            </div>
+            <div class="modal-tabs">
+                <button class="modal-tab active" data-settings-tab="tab-settings-llm">🤖 LLM Binding</button>
+                <button class="modal-tab" data-settings-tab="tab-settings-tti">🎨 TTI (Image Gen)</button>
+                <button class="modal-tab" data-settings-tab="tab-settings-profiles">📂 Profiles</button>
+                <button class="modal-tab" data-settings-tab="tab-settings-stt" disabled>🎙️ STT (Soon)</button>
+                <button class="modal-tab" data-settings-tab="tab-settings-tts" disabled>🔊 TTS (Soon)</button>
+            </div>
+            <div class="modal-body">
+                <div class="settings-tab-pane active" id="tab-settings-llm">
+                    <div class="artifact-sub-tabs" style="padding: 0 0 10px 0; margin-bottom: 12px; background: none;">
+                        <button class="sub-tab-btn active" data-llm-sub-tab="params">⚙️ Parameters</button>
+                        <button class="sub-tab-btn" data-llm-sub-tab="commands" id="btn-llm-commands-sub-tab">⚡ Custom Commands</button>
+                    </div>
+
+                    <div class="llm-sub-pane active" id="llm-sub-pane-params">
+                        <div class="input-group">
+                            <label for="settings-llm-binding">Binding Provider</label>
+                            <select id="settings-llm-binding">
+                                <option value="">-- Select Binding --</option>
+                            </select>
+                        </div>
+                        <div id="settings-llm-config-form" class="settings-config-form">
+                            <p class="empty-msg">Select a binding to configure its parameters.</p>
+                        </div>
+                    </div>
+
+                    <div class="llm-sub-pane" id="llm-sub-pane-commands" style="display: none; flex-direction: column; gap: 12px;">
+                        <p class="section-desc">Run custom utility commands defined by this LLM binding (e.g. downloading model files from Hugging Face).</p>
+                        <div class="input-group">
+                            <label for="settings-llm-command-select">Available Commands</label>
+                            <select id="settings-llm-command-select">
+                                <option value="">-- Select Command --</option>
+                            </select>
+                        </div>
+                        <div id="settings-llm-command-form" class="settings-config-form" style="display: none;"></div>
+                        <button class="btn btn-primary" id="btn-execute-llm-command" style="display: none; width: auto; align-self: flex-start;">⚡ Run Command</button>
+                        <div id="llm-command-status" class="validation-status" style="display: none;"></div>
+                    </div>
+                    <div class="settings-actions">
+                        <button class="btn btn-secondary" id="btn-validate-binding" style="width:auto; display:inline-block;">🔌 Validate & Load Models</button>
+                    </div>
+                    <div class="input-group" id="settings-model-group" style="display:none;">
+                        <label for="settings-llm-model-search">Search & Filter Models</label>
+                        <input type="text" id="settings-llm-model-search" placeholder="🔍 Type keyword to filter, e.g. qwen, llama..." style="margin-bottom: 8px; padding: 8px 12px; font-size: 12.5px;" />
+                        <label for="settings-llm-model">Available Models</label>
+                        <select id="settings-llm-model"></select>
+                        <div id="settings-model-info" class="model-meta-info" style="display:none;"></div>
+                    </div>
+                    <div class="settings-actions" id="settings-apply-group" style="display:none;">
+                        <button class="btn btn-primary" id="btn-apply-settings" style="width:auto; display:inline-block;">💾 Apply Configuration</button>
+                    </div>
+                    <div id="settings-validation-status" class="validation-status"></div>
+                </div>
+                <!-- TTI Ingestion Pane -->
+                <div class="settings-tab-pane" id="tab-settings-tti">
+                    <div class="artifact-sub-tabs" style="padding: 0 0 10px 0; margin-bottom: 12px; background: none;">
+                        <button class="sub-tab-btn active" data-tti-sub-tab="params">⚙️ Parameters</button>
+                        <button class="sub-tab-btn" data-tti-sub-tab="commands" id="btn-tti-commands-sub-tab">⚡ Custom Commands</button>
+                    </div>
+
+                    <div class="tti-sub-pane active" id="tti-sub-pane-params">
+                        <p class="section-desc">Configure Text-to-Image (TTI) generation. <strong>HINT:</strong> Use the local <code>diffusers</code> binding for fully offline GPU/CPU generation, or select cloud-based APIs to generate images remotely.</p>
+                        <div class="input-group">
+                            <label for="settings-tti-binding">TTI Binding Provider</label>
+                            <select id="settings-tti-binding">
+                                <option value="">-- Select TTI Binding --</option>
+                            </select>
+                        </div>
+                        <div id="settings-tti-config-form" class="settings-config-form">
+                            <p class="empty-msg">Select a TTI binding provider to configure its parameters.</p>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary" id="btn-validate-tti-binding" style="width:auto; display:inline-block;">🔌 Validate & Load Models</button>
+                        </div>
+                        <div class="input-group" id="settings-tti-model-group" style="display:none;">
+                            <label for="settings-tti-model-search">Search & Filter TTI Models</label>
+                            <input type="text" id="settings-tti-model-search" placeholder="🔍 Type keyword to filter, e.g. schnell, dev, sdxl..." style="margin-bottom: 8px; padding: 8px 12px; font-size: 12.5px;" />
+                            <label for="settings-tti-model">Available TTI Models / Styles</label>
+                            <select id="settings-tti-model"></select>
+                        </div>
+                        <div id="settings-tti-validation-status" class="validation-status"></div>
+                    </div>
+
+                    <div class="tti-sub-pane" id="tti-sub-pane-commands" style="display: none; flex-direction: column; gap: 12px;">
+                        <p class="section-desc">Run custom utility commands defined by this TTI binding (e.g. downloading model files from Hugging Face).</p>
+                        <div class="input-group">
+                            <label for="settings-tti-command-select">Available Commands</label>
+                            <select id="settings-tti-command-select">
+                                <option value="">-- Select Command --</option>
+                            </select>
+                        </div>
+                        <div id="settings-tti-command-form" class="settings-config-form" style="display: none;"></div>
+                        <button class="btn btn-primary" id="btn-execute-tti-command" style="display: none; width: auto; align-self: flex-start;">⚡ Run Command</button>
+                        <div id="tti-command-status" class="validation-status" style="display: none;"></div>
+                    </div>
+                </div>
+
+                <!-- Profiles Management Pane -->
+                <div class="settings-tab-pane" id="tab-settings-profiles">
+                    <p class="section-desc">Save, manage, and instantly hot-swap your configuration profiles (e.g. switching between local and remote setups).</p>
+                    <div style="display: flex; gap: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 16px; margin-bottom: 16px;">
+                        <div style="flex: 1;">
+                            <h3 style="color: var(--accent-color); font-size: 13px; margin-bottom: 8px;">💾 Save Current Profile</h3>
+                            <div class="input-group">
+                                <label for="profile-save-name">Profile Name</label>
+                                <input type="text" id="profile-save-name" placeholder="e.g. Local Gemma, OpenAI Cloud">
+                            </div>
+                            <button class="btn btn-primary" id="btn-save-profile" style="width: auto;">Save Profile</button>
+                        </div>
+                    </div>
+                    <div class="panel-section">
+                        <h3 style="color: var(--accent-color); font-size: 13px;">📂 Available Profiles</h3>
+                        <ul class="artifact-list" id="settings-profiles-list" style="margin-top: 10px; max-height: 200px; overflow-y: auto;">
+                            <li class="empty-msg">No profiles saved yet.</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="settings-tab-pane" id="tab-settings-stt">
+                    <p class="empty-msg">STT configuration coming soon.</p>
+                </div>
+                <div class="settings-tab-pane" id="tab-settings-tts">
+                    <p class="empty-msg">TTS configuration coming soon.</p>
+                </div>
+            </div>
+            <div class="modal-footer" style="padding: 16px 24px; border-top: 1px solid var(--border-color); display: flex; gap: 12px; justify-content: flex-end; align-items: center; background-color: var(--bg-panel); flex-shrink: 0;">
+                <div id="settings-apply-group" style="display: none;"></div>
+                <button class="btn btn-secondary" id="btn-cancel-settings" style="width: auto;">Cancel</button>
+                <button class="btn btn-primary" id="btn-apply-settings" style="width: auto;">💾 Save Configuration</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

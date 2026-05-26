@@ -1,0 +1,33 @@
+title: 'LCP (LollmsCommunicationProtocol)'
+author: 'ParisNeo'
+version: 1.2.0
+binding_name: 'lcp'
+creation_date: 2024-08-13
+last_update_date: 2026-05-25
+description: >
+  This binding discovers and executes tools defined locally in a specified folder.
+  Each tool is defined by a standalone Python file (.py). The LCP engine automatically
+  parses function names, arguments, type annotations, and docstrings using Abstract
+  Syntax Trees (AST) to build the schema on-the-fly, completely eliminating the need for
+  duplicate JSON files. Backwards compatibility with legacy .mcp.json schemas is also supported.
+creation_date: 2024-08-13
+last_update_date: 2024-08-13
+description: >
+  This binding discovers and executes tools defined locally in a specified folder.
+  Each tool is defined by a Python file and a corresponding MCP JSON file.
+  It's a simple way to add custom, local functionalities to the agent without needing a separate server.
+input_parameters:
+  - name: tools_folders
+    type: list
+    description: "List of folder paths containing local LCP tool definitions. If not provided, falls back to tools_folder_path or default tools."
+    mandatory: false
+
+  - name: tool_files
+    type: list
+    description: "List of direct file paths to standalone Python tool libraries (.py)."
+    mandatory: false
+
+  - name: tools_folder_path
+    type: str
+    description: "Path to a single folder containing local LCP tool definitions (Legacy fallback)."
+    mandatory: false

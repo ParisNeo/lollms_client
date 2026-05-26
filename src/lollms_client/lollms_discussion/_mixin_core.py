@@ -176,6 +176,11 @@ class CoreMixin:
     def _rebuild_message_index(self):
         if self._is_db_backed and self._session and self._session.is_active \
                 and self._db_discussion in self._session:
+            try:
+                # Flush pending unsaved additions to the transaction so they survive refresh
+                self._session.flush()
+            except Exception:
+                pass
             self._session.refresh(self._db_discussion, ['messages'])
         self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
 

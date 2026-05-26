@@ -73,10 +73,27 @@ FULL TEMPLATE (copy and extend):
   /* ── Slideshow container ── */
   .presentation { width: 100%; }
  
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+  }
+  .presentation {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    overflow: hidden;
+  }
   /* ── Each slide is a 16:9 canvas ── */
   .slide {
-    position: relative;
+    position: absolute;
+    top: 50%;
+    left: 50%;
     width: 1920px; height: 1080px;
+    margin-left: -960px;
+    margin-top: -540px;
+    transform-origin: center center;
     overflow: hidden;
     display: none;          /* JS controls visibility */
   }
@@ -314,14 +331,28 @@ function initCharts() {
 (function() {
   var slides  = Array.from(document.querySelectorAll('.slide'));
   var current = 0;
- 
+
+  function doScale() {
+    var maxW = 1920;
+    var maxH = 1080;
+    var winW = window.innerWidth;
+    var winH = window.innerHeight;
+    var scale = Math.min(winW / maxW, winH / maxH);
+    slides.forEach(function(s) {
+      s.style.transform = 'scale(' + scale + ')';
+    });
+  }
+  window.addEventListener('resize', doScale);
+  window.addEventListener('load', doScale);
+
   function show(n) {
     slides.forEach(function(s, i) { s.classList.toggle('active', i === n); });
     current = n;
     document.getElementById('slide-counter').textContent =
       (n + 1) + ' / ' + slides.length;
+    doScale();
   }
- 
+
   show(0);
  
   document.getElementById('btn-prev').onclick = function() {
@@ -601,6 +632,23 @@ RULES:
             "→ Always add a human explanation outside the tag",
             "→ Preserve <artefact_image> anchors when patching image-bearing artifacts",
             "",
+            "╔══════════════════════════════════════════════════════════════════╗",
+            "║  🚨 DATA INTERFACE POLICY — FORBIDDEN TO EDIT DIRECTLY           ║",
+            "╠══════════════════════════════════════════════════════════════════╣",
+            "║  You are STRICTLY FORBIDDEN from editing or updating Data        ║",
+            "║  Interface artifacts (type='data') using standard <artifact>     ║",
+            "║  tags or search/replace blocks!                                  ║",
+            "║                                                                  ║",
+            "║  • To modify a CSV, Excel sheet, or SQLite database, you MUST   ║",
+            "║    call the `execute_python_data_query` tool.                     ║",
+            "║  • Write Python code to load, alter (add/update columns/rows),   ║",
+            "║    and save the data.                                            ║",
+            "║  • After the tool executes, the system will automatically        ║",
+            "║    re-extract and update the active Markdown schema.             ║",
+            "║  • Any attempt to use `<artifact>` tags on 'data' type will be   ║",
+            "║    automatically REJECTED by the system.                         ║",
+            "╚══════════════════════════════════════════════════════════════════╝",
+            "",
             "=== END ARTIFACT SYSTEM ===",
             "",
         ]
@@ -613,16 +661,23 @@ RULES:
         lines = [
             "",
             "=== IMAGE GENERATION / EDITING ===",
-            "You can generate or edit images using the following XML tags.",
+            "You are equipped with a powerful Text-to-Image (TTI) engine to generate and edit images on-the-fly.",
             "",
-            "To generate a new image:",
-            '<generate_image width="512" height="512">',
-            "  A detailed description of the image you want to generate",
+            "🚨 MANDATORY PROTOCOL (READ CAREFULLY):",
+            "- If the user asks you to generate, draw, paint, create, or show an image, picture, or illustration",
+            "  (or uses equivalent prompt verbs like 'crée une image', 'dessine', 'génère' in any language),",
+            "  you MUST output the `<generate_image>` XML tag.",
+            "- DO NOT write long prose descriptions or tell the user you will try to create it — simply output the tag directly.",
+            "- Translate the user's request into a highly detailed English prompt inside the tag describing the subject, style, lighting, and aesthetic.",
+            "",
+            "Syntax for creating a new image:",
+            '<generate_image width="1024" height="1024">',
+            "  Detailed English prompt describing the image to generate...",
             "</generate_image>",
             "",
-            "To edit an existing image artifact:",
+            "Syntax for editing an existing image artifact:",
             '<edit_image name="artifact_name">',
-            "  Description of how to edit / modify the image",
+            "  Detailed English prompt describing the edits/modifications...",
             "</edit_image>",
             "=== END IMAGE INSTRUCTIONS ===",
             "",
@@ -856,7 +911,7 @@ EXAMPLE OF CORRECT FORM:
                 event_callback=_artefact_event,
             )
 
-        # ── 2. Image generation → message.images ─────────────────────────────
+        # ── 2. Image generation → message.images & Workspace Artifacts ──
         if has_gen:
             tti = getattr(self.lollmsClient, 'tti', None)
             if tti is None:
@@ -884,6 +939,8 @@ EXAMPLE OF CORRECT FORM:
                         if img_bytes:
                             import base64
                             img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+                            # 1. Append to chat bubble image pack
                             ai_message.add_image_pack(
                                 images=[img_b64],
                                 group_type="generated",
@@ -891,8 +948,21 @@ EXAMPLE OF CORRECT FORM:
                                 title=attrs.get('name', f'gen_{uuid.uuid4().hex[:6]}'),
                                 prompt=prompt,
                             )
+
+                            # 2. Ingest as persistent image workspace artifact
+                            art_title = attrs.get('name', attrs.get('title', f"generated_image_{uuid.uuid4().hex[:6]}"))
+                            art = self.artefacts.add(
+                                title=art_title,
+                                artefact_type=ArtefactType.IMAGE,
+                                content=f"### Generated Image: '{prompt}'\n\n<artefact_image id=\"{art_title}::0\" />",
+                                images=[img_b64],
+                                image_media_types=["image/png"],
+                                active=auto_activate_artefacts
+                            )
+                            affected_artefacts.append(art)
+
                             ASCIIColors.success(
-                                f"Generated image ({width}×{height}) added to message.")
+                                f"Generated image ({width}×{height}) and created workspace artifact '{art_title}'.")
                     except Exception as e:
                         ASCIIColors.warning(f"Image generation failed: {e}")
                     return ''

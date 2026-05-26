@@ -56,10 +56,15 @@ def get_free_port(start_port: int = 9624, max_port: int = 10000) -> int:
 def _encode_image(image_path_or_url: str) -> Optional[str]:
     """
     Encodes an image as a base64 data-URI for use in OpenAI-style vision payloads.
-    Accepts local file paths OR http(s) URLs.
+    Accepts local file paths, http(s) URLs, base64 data-URIs, or raw base64 strings.
     Returns None on failure.
     """
     try:
+        if image_path_or_url.startswith("data:image/"):
+            return image_path_or_url
+        if len(image_path_or_url) > 1000 and not image_path_or_url.startswith(("http://", "https://", "/")):
+            # Highly likely to be raw base64 data — default to JPEG
+            return f"data:image/jpeg;base64,{image_path_or_url}"
         if image_path_or_url.startswith(("http://", "https://")):
             resp = requests.get(image_path_or_url, timeout=15)
             resp.raise_for_status()
@@ -80,7 +85,7 @@ def _encode_image(image_path_or_url: str) -> Optional[str]:
         b64 = base64.b64encode(data).decode()
         return f"data:{content_type};base64,{b64}"
     except Exception as e:
-        ASCIIColors.warning(f"Failed to encode image '{image_path_or_url}': {e}")
+        ASCIIColors.warning(f"Failed to encode image '{image_path_or_url[:100]}...': {e}")
         return None
 
 
@@ -114,27 +119,57 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         super().__init__(BindingName, **kwargs)
         self.config = kwargs
 
+        def _clean(val, parse_fn=None):
+            if val is None:
+                return None
+            if isinstance(val, str) and val.strip().lower() in ("null", "none", ""):
+                return None
+            if parse_fn:
+                try:
+                    return parse_fn(val)
+                except Exception:
+                    return None
+            return val
+
         # ── Network / server config ───────────────────────────────────────────
         self.host = kwargs.get("host", "localhost")
 
         # ── Model config ──────────────────────────────────────────────────────
-        self.model_name: Optional[str] = kwargs.get("model_name", "") or None
-        self.n_ctx: int = int(kwargs.get("ctx_size", 4096))
-        self.n_gpu_layers: int = int(kwargs.get("n_gpu_layers", -1))
-        self.n_threads: Optional[int] = kwargs.get("n_threads", None)
-        self.n_parallel: int = int(kwargs.get("n_parallel", 1))
-        self.batch_size: int = int(kwargs.get("batch_size", 512))
-        self.flash_attn: bool = bool(kwargs.get("flash_attn", False))
-        self.mmap: bool = bool(kwargs.get("mmap", True))
-        self.mlock: bool = bool(kwargs.get("mlock", False))
-        self.multimodal: bool = bool(kwargs.get("multimodal", True))
-        self.rope_scale: Optional[float] = kwargs.get("rope_scale", None)
-        self.rope_freq_base: Optional[float] = kwargs.get("rope_freq_base", None)
-        self.rope_freq_scale: Optional[float] = kwargs.get("rope_freq_scale", None)
-        self.tensor_split: Optional[str] = kwargs.get("tensor_split", None)  # "0.5,0.5" …
-        self.main_gpu: Optional[int] = kwargs.get("main_gpu", None)
-        self.cache_type_k: Optional[str] = kwargs.get("cache_type_k", None)  # "f16", "q8_0" …
-        self.cache_type_v: Optional[str] = kwargs.get("cache_type_v", None)
+        self.model_name: Optional[str] = _clean(kwargs.get("model_name", "")) or None
+
+        val_ctx = _clean(kwargs.get("ctx_size"), int)
+        self.n_ctx: int = val_ctx if val_ctx is not None else 4096
+
+        val_layers = _clean(kwargs.get("n_gpu_layers"), int)
+        self.n_gpu_layers: int = val_layers if val_layers is not None else -1
+
+        self.n_threads: Optional[int] = _clean(kwargs.get("n_threads"), int)
+
+        val_parallel = _clean(kwargs.get("n_parallel"), int)
+        self.n_parallel: int = val_parallel if val_parallel is not None else 1
+
+        val_batch = _clean(kwargs.get("batch_size"), int)
+        self.batch_size: int = val_batch if val_batch is not None else 512
+
+        val_flash = _clean(kwargs.get("flash_attn"))
+        self.flash_attn: bool = bool(val_flash) if val_flash is not None else False
+
+        val_mmap = _clean(kwargs.get("mmap"))
+        self.mmap: bool = bool(val_mmap) if val_mmap is not None else True
+
+        val_mlock = _clean(kwargs.get("mlock"))
+        self.mlock: bool = bool(val_mlock) if val_mlock is not None else False
+
+        val_multi = _clean(kwargs.get("multimodal"))
+        self.multimodal: bool = bool(val_multi) if val_multi is not None else True
+
+        self.rope_scale: Optional[float] = _clean(kwargs.get("rope_scale"), float)
+        self.rope_freq_base: Optional[float] = _clean(kwargs.get("rope_freq_base"), float)
+        self.rope_freq_scale: Optional[float] = _clean(kwargs.get("rope_freq_scale"), float)
+        self.tensor_split: Optional[str] = _clean(kwargs.get("tensor_split"))  # "0.5,0.5" …
+        self.main_gpu: Optional[int] = _clean(kwargs.get("main_gpu"), int)
+        self.cache_type_k: Optional[str] = _clean(kwargs.get("cache_type_k"))  # "f16", "q8_0" …
+        self.cache_type_v: Optional[str] = _clean(kwargs.get("cache_type_v"))
 
         # ── Capacity / lifecycle ──────────────────────────────────────────────
         self.max_active_models: int = int(kwargs.get("max_active_models", 1))

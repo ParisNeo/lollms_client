@@ -34,44 +34,46 @@ class LollmsClient():
     Provides a unified interface to manage and use different bindings for various modalities.
     """
     def __init__(self,
-                 # Optional Modality Binding Names
-                 llm_binding_name: Optional[str] = None,
-                 tts_binding_name: Optional[str] = None,
-                 tti_binding_name: Optional[str] = None,
-                 stt_binding_name: Optional[str] = None,
-                 ttv_binding_name: Optional[str] = None,
-                 ttm_binding_name: Optional[str] = None,
-                 tools_binding_name: Optional[str] = None,
+        # Optional Modality Binding Names
+        llm_binding_name: Optional[str] = None,
+        tts_binding_name: Optional[str] = None,
+        tti_binding_name: Optional[str] = None,
+        stt_binding_name: Optional[str] = None,
+        ttv_binding_name: Optional[str] = None,
+        ttm_binding_name: Optional[str] = None,
+        tools_binding_name: Optional[str] = None,
 
-                 # Modality Binding Directories
-                 llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
-                 tts_bindings_dir: Path = Path(__file__).parent / "tts_bindings",
-                 tti_bindings_dir: Path = Path(__file__).parent / "tti_bindings",
-                 stt_bindings_dir: Path = Path(__file__).parent / "stt_bindings",
-                 ttv_bindings_dir: Path = Path(__file__).parent / "ttv_bindings",
-                 ttm_bindings_dir: Path = Path(__file__).parent / "ttm_bindings",
-                 tools_bindings_dir: Path = Path(__file__).parent / "tools_bindings",
+        # Modality Binding Directories
+        llm_bindings_dir: Path = Path(__file__).parent / "llm_bindings",
+        tts_bindings_dir: Path = Path(__file__).parent / "tts_bindings",
+        tti_bindings_dir: Path = Path(__file__).parent / "tti_bindings",
+        stt_bindings_dir: Path = Path(__file__).parent / "stt_bindings",
+        ttv_bindings_dir: Path = Path(__file__).parent / "ttv_bindings",
+        ttm_bindings_dir: Path = Path(__file__).parent / "ttm_bindings",
+        tools_bindings_dir: Path = Path(__file__).parent / "tools_bindings",
 
-                 # Configurations
-                 llm_binding_config: Optional[Dict[str, any]] = None,
-                 tts_binding_config: Optional[Dict[str, any]] = None, 
-                 tti_binding_config: Optional[Dict[str, any]] = None, 
-                 stt_binding_config: Optional[Dict[str, any]] = None, 
-                 ttv_binding_config: Optional[Dict[str, any]] = None, 
-                 ttm_binding_config: Optional[Dict[str, any]] = None, 
-                 tools_binding_config: Optional[Dict[str, any]] = None,
-                 user_name ="user",
-                 ai_name = "assistant",
-                 callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
+        # Configurations
+        llm_binding_config: Optional[Dict[str, any]] = None,
+        tts_binding_config: Optional[Dict[str, any]] = None, 
+        tti_binding_config: Optional[Dict[str, any]] = None, 
+        stt_binding_config: Optional[Dict[str, any]] = None, 
+        ttv_binding_config: Optional[Dict[str, any]] = None, 
+        ttm_binding_config: Optional[Dict[str, any]] = None, 
+        tools_binding_config: Optional[Dict[str, any]] = None,
+        user_name ="user",
+        ai_name = "assistant",
+        callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
 
-                 debug: Optional[bool] = False,
-                 **kwargs
-                 ):
+        debug: Optional[bool] = False,
+        cooperative_vram_management: Optional[bool] = False,
+        **kwargs
+        ):
         """
         Initialize the LollmsClient with LLM and optional modality bindings.
         """
 
         self.debug = debug
+        self.cooperative_vram_management = cooperative_vram_management
         if callback: callback("🚀 Initializing **Lollms Client**...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
         
         self.llm_binding_manager = LollmsLLMBindingManager(llm_bindings_dir)
@@ -282,15 +284,45 @@ class LollmsClient():
     def get_available_llm_bindings(self) -> List[str]: 
         return self.llm_binding_manager.get_available_bindings()
 
+    def _cooperative_unload_except(self, active_modality: str):
+        if not getattr(self, "cooperative_vram_management", False):
+            return
+
+        modalities = {
+            "llm": self.llm,
+            "tts": self.tts,
+            "tti": self.tti,
+            "stt": self.stt,
+            "ttv": self.ttv,
+            "ttm": self.ttm,
+        }
+
+        for name, binding in modalities.items():
+            if name != active_modality and binding:
+                ASCIIColors.info(f"[Cooperative VRAM] Unloading {name.upper()} model to free VRAM for {active_modality.upper()}...")
+                try:
+                    binding.unload_model()
+                except Exception as e:
+                    ASCIIColors.warning(f"Failed to unload {name.upper()} model: {e}")
+
+    def _cooperative_unload_tti(self):
+        self._cooperative_unload_except("llm")
+
+    def _cooperative_unload_llm(self):
+        self._cooperative_unload_except("tti")
+
     def generate_text(self, *args, **kwargs) -> Union[str, dict]:
+        self._cooperative_unload_except("llm")
         if self.llm: return self.llm.generate_text(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
-    
+
     def generate(self, *args, **kwargs) -> Union[str, dict]:
+        self._cooperative_unload_except("llm")
         if self.llm: return self.llm.generate_text(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def generate_from_messages(self, *args, **kwargs) -> Union[str, dict]:
+        self._cooperative_unload_except("llm")
         if self.llm: return self.llm.generate_from_messages(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
@@ -625,18 +657,40 @@ class LollmsClient():
         }
 
     def chat(self, *args, **kwargs) -> Union[str, dict]:
+        self._cooperative_unload_tti()
         if self.llm: return self.llm.chat(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def embed(self, *args, **kwargs):
         if self.llm: return self.llm.embed(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
-    def get_ctx_size(self, *args, **kwargs) -> Optional[int]:
+    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
         """
-        Retrieves context size for a model from a hardcoded list.
+        Retrieves the context size for the active model.
+        Queries the running llama.cpp server's /props endpoint first, 
+        falling back to the configured context size.
         """
-        if self.llm: return self.llm.get_ctx_size(*args, **kwargs)
-        raise RuntimeError("LLM binding not initialized.")
+        target = model_name or self.model_name
+        if target:
+            info = self._get_server_info(target)
+            if info:
+                try:
+                    base = info["url"].rstrip("/")
+                    if base.endswith("/v1"):
+                        base = base[:-3]
+                    r = requests.get(f"{base}/props", timeout=2)
+                    if r.status_code == 200:
+                        props = r.json()
+                        for key in ("total_slots", "n_ctx", "ctx_size", "context_size"):
+                            if key in props:
+                                if key == "total_slots":
+                                    return int(props[key]) * self.n_parallel
+                                return int(props[key])
+                except Exception as e:
+                    ASCIIColors.warning(f"Could not query /props for ctx size: {e}")
+
+        # Fall back to the configured context size (self.n_ctx) or default_ctx_size
+        return self.n_ctx or self.default_ctx_size or 4096
 
     def list_models(self):
         if self.llm: return self.llm.list_models()
@@ -694,26 +748,32 @@ class LollmsClient():
 
     # --- Wrappers for other Modality Bindings ---
     def generate_image(self, *args, **kwargs):
+        self._cooperative_unload_except("tti")
         if self.tti: return self.tti.generate_image(*args, **kwargs)
         raise RuntimeError("TTI binding not initialized.")
 
     def edit_image(self, *args, **kwargs):
+        self._cooperative_unload_except("tti")
         if self.tti: return self.tti.edit_image(*args, **kwargs)
         raise RuntimeError("TTI binding not initialized.")
 
     def generate_audio(self, *args, **kwargs):
+        self._cooperative_unload_except("tts")
         if self.tts: return self.tts.generate_audio(*args, **kwargs)
         raise RuntimeError("TTS binding not initialized.")
 
     def transcribe_audio(self, *args, **kwargs):
+        self._cooperative_unload_except("stt")
         if self.stt: return self.stt.transcribe_audio(*args, **kwargs)
         raise RuntimeError("STT binding not initialized.")
 
     def generate_video(self, *args, **kwargs):
+        self._cooperative_unload_except("ttv")
         if self.ttv: return self.ttv.generate_video(*args, **kwargs)
         raise RuntimeError("TTV binding not initialized.")
 
     def generate_music(self, *args, **kwargs):
+        self._cooperative_unload_except("ttm")
         if self.ttm: return self.ttm.generate_music(*args, **kwargs)
         raise RuntimeError("TTM binding not initialized.")
 

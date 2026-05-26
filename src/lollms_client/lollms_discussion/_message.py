@@ -54,6 +54,26 @@ class LollmsMessage:
         return [img for i, img in enumerate(self.images)
                 if i < len(self.active_images) and self.active_images[i]]
 
+    def toggle_image_activation(self, index: int, active: Optional[bool] = None):
+        """Toggles the activation state of an individual image index."""
+        current_images = self.images or []
+        if index < 0 or index >= len(current_images):
+            return
+        
+        if self.active_images is None or not isinstance(self.active_images, list) or len(self.active_images) != len(current_images):
+            flags = [True] * len(current_images)
+        else:
+            flags = list(self.active_images)
+            
+        if active is not None:
+            flags[index] = bool(active)
+        else:
+            flags[index] = not flags[index]
+            
+        self.active_images = flags
+        if self._discussion._is_db_backed:
+            self._discussion.commit()
+
     def _sync_active_images_flags(self):
         current_images = self.images or []
         if not current_images:

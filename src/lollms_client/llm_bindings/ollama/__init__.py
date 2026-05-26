@@ -109,6 +109,53 @@ class OllamaBinding(LollmsLLMBinding):
 
 
 
+    def clean_message_images(self, messages: List[Dict]) -> List[Dict]:
+        """
+        Ensures all base64-encoded images in the messages list are clean,
+        raw base64 strings (stripping any 'data:image/...;base64,' prefix).
+        """
+        cleaned_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            images = msg.get("images") or []
+
+            # Extract images from content if it is structured (OpenAI format)
+            text_parts = []
+            if isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") in ("input_image", "image_url"):
+                        base64_data = item.get("image_url")
+                        if isinstance(base64_data, str):
+                            cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data)
+                            images.append(cleaned)
+                        elif isinstance(base64_data, dict):
+                            url_val = base64_data.get("url") or base64_data.get("base64") or ""
+                            cleaned = re.sub(r"^data:image/[^;]+;base64,", "", url_val)
+                            images.append(cleaned)
+                content = "\n".join([p for p in text_parts if p.strip()])
+
+            cleaned_images = []
+            for img in images:
+                if isinstance(img, str):
+                    cleaned = re.sub(r"^data:image/[^;]+;base64,", "", img)
+                    cleaned_images.append(cleaned)
+                else:
+                    cleaned_images.append(img)
+
+            cleaned_msg = {
+                "role": role,
+                "content": content
+            }
+            if cleaned_images:
+                cleaned_msg["images"] = cleaned_images
+
+            cleaned_messages.append(cleaned_msg)
+
+        return cleaned_messages
+
     @contextmanager
     def _client(self):
         """
@@ -148,6 +195,23 @@ class OllamaBinding(LollmsLLMBinding):
                 except Exception as e:
                     ASCIIColors.warning(f"[{self.binding_name}] Error while closing active ollama client in cancel(): {e}")
         super().cancel()
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        """
+        Unloads the current model from Ollama's memory/VRAM.
+        """
+        target_model = model_name or self.model_name
+        if not target_model:
+            ASCIIColors.warning(f"[{self.binding_name}] No active model to unload.")
+            return False
+        try:
+            with self._client() as client:
+                client.generate(model=target_model, keep_alive=0)
+            ASCIIColors.success(f"[{self.binding_name}] Successfully requested Ollama to unload model '{target_model}'.")
+            return True
+        except Exception as e:
+            ASCIIColors.warning(f"[{self.binding_name}] Failed to unload Ollama model '{target_model}': {e}")
+            return False
 
     def generate_text(self,
                     prompt: str,
@@ -236,14 +300,17 @@ class OllamaBinding(LollmsLLMBinding):
                             messages[-1]["images"]=processed_images
                     else:
                         messages.append({'role': 'user', 'content': prompt, 'images': processed_images if processed_images else None})
+                    chat_kwargs = {
+                        "model": self.model_name,
+                        "messages": messages,
+                        "stream": True,
+                        "options": options if options else None
+                    }
+                    if think:
+                        chat_kwargs["think"] = think
+
                     if stream:
-                        response_stream = client.chat(
-                            model=self.model_name,
-                            messages=messages,
-                            stream=True,
-                            think=think,
-                            options=options if options else None
-                        )
+                        response_stream = client.chat(**chat_kwargs)
                         in_thinking = False
                         for chunk in response_stream:
                             if self.is_cancelled():
@@ -263,13 +330,15 @@ class OllamaBinding(LollmsLLMBinding):
                                         break # Callback requested stop
                         return full_response_text
                     else: # Not streaming
-                        response = client.chat(
-                            model=self.model_name,
-                            messages=messages,
-                            stream=False,
-                            think=think,
-                            options=options if options else None
-                        )
+                        chat_kwargs = {
+                            "model": self.model_name,
+                            "messages": messages,
+                            "stream": False,
+                            "options": options if options else None
+                        }
+                        if think:
+                            chat_kwargs["think"] = think
+                        response = client.chat(**chat_kwargs)
                         full_response_text = response.message.content
                         if think:
                             full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
@@ -364,71 +433,22 @@ class OllamaBinding(LollmsLLMBinding):
         if n_threads is not None: options['num_thread'] = n_threads
         if ctx_size is not None: options['num_ctx'] = ctx_size
 
-        def normalize_message(msg: Dict) -> Dict:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            text_parts = []
-            images = []
-
-            if isinstance(content, str):
-                text_parts.append(content)
-            elif isinstance(content, list):
-                for item in content:
-                    if item.get("type") == "text":
-                        text_parts.append(item.get("text", ""))
-                    elif item.get("type") == "input_image" or  item.get("type") == "image_url":
-                        base64_data = item.get("image_url")
-                        if base64_data:
-                            if isinstance(base64_data, str):
-                                # ⚠️ remove prefix "data:image/...;base64,"
-                                cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data)
-                                images.append(cleaned)
-                            elif base64_data and isinstance(base64_data, dict) :
-                                if "base64" in base64_data:
-                                    cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data["base64"])
-                                    images.append(cleaned)
-                                elif "url" in base64_data :
-                                    if base64_data["url"].lower().startswith("http"):
-                                        images.append(base64_data["url"])
-                                    else:
-                                        cleaned = re.sub(r"^data:image/[^;]+;base64,", "", base64_data["url"])
-                                        images.append(cleaned)
-
-
-            return {
-                "role": role,
-                "content": "\n".join([p for p in text_parts if p.strip()]),
-                "images": images if images else None
-            }
-
-        ollama_messages = []
-        
-        for m in messages:
-            nm = normalize_message(m)
-            if nm["images"]:
-                ollama_messages.append({
-                    "role": nm["role"],
-                    "content": nm["content"],
-                    "images": nm["images"]
-                })
-            else:
-                ollama_messages.append({
-                    "role": nm["role"],
-                    "content": nm["content"]
-                })
-
+        ollama_messages = self.clean_message_images(messages)
         full_response_text = ""
 
         try:
             with self._client() as client:
+                chat_kwargs = {
+                    "model": self.model_name,
+                    "messages": ollama_messages,
+                    "options": options if options else None
+                }
+
                 if stream:
-                    response_stream = client.chat(
-                        model=self.model_name,
-                        messages=ollama_messages,
-                        stream=True,
-                        think = think,
-                        options=options if options else None
-                    )
+                    chat_kwargs["stream"] = True
+                    if think:
+                        chat_kwargs["think"] = think
+                    response_stream = client.chat(**chat_kwargs)
                     for chunk_dict in response_stream:
                         if self.is_cancelled():
                             break
@@ -440,13 +460,11 @@ class OllamaBinding(LollmsLLMBinding):
                                     break
                     return full_response_text
                 else:
-                    response = client.chat(
-                        model=self.model_name,
-                        messages=ollama_messages,
-                        stream=False,
-                        think=think if "gpt-oss" not in self.model_name else reasoning_effort,
-                        options=options if options else None
-                    )
+                    chat_kwargs["stream"] = False
+                    eff_think = think if "gpt-oss" not in self.model_name else reasoning_effort
+                    if eff_think:
+                        chat_kwargs["think"] = eff_think
+                    response = client.chat(**chat_kwargs)
                     full_response_text = response.message.content
                     if think:
                         full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
@@ -510,6 +528,7 @@ class OllamaBinding(LollmsLLMBinding):
         # 1. Export the discussion to the Ollama chat format
         # This handles system prompts, user/assistant roles, and base64-encoded images.
         messages = discussion.export("ollama_chat", branch_tip_id)
+        ollama_messages = self.clean_message_images(messages)
 
         # 2. Build the generation options dictionary
         options = {
@@ -532,15 +551,18 @@ class OllamaBinding(LollmsLLMBinding):
 
         try:
             with self._client() as client:
+                chat_kwargs = {
+                    "model": self.model_name,
+                    "messages": ollama_messages,
+                    "options": options if options else None
+                }
+
                 # 3. Call the Ollama API
                 if stream:
-                    response_stream = client.chat(
-                        model=self.model_name,
-                        messages=messages,
-                        stream=True,
-                        think=think,
-                        options=options if options else None
-                    )
+                    chat_kwargs["stream"] = True
+                    if think:
+                        chat_kwargs["think"] = think
+                    response_stream = client.chat(**chat_kwargs)
                     in_thinking = False
                     for chunk in response_stream:
                         if self.is_cancelled():
@@ -548,7 +570,7 @@ class OllamaBinding(LollmsLLMBinding):
                         if chunk.message.thinking and not in_thinking:
                             full_response_text += "<think>\n"
                             in_thinking = True
-                            
+
                         if chunk.message.content:# Ensure there is content to process
                             chunk_content = chunk.message.content
                             if in_thinking:
@@ -561,13 +583,10 @@ class OllamaBinding(LollmsLLMBinding):
 
                     return full_response_text
                 else: # Not streaming
-                    response = client.chat(
-                        model=self.model_name,
-                        messages=messages,
-                        stream=False,
-                        think=think,
-                        options=options if options else None
-                    )
+                    chat_kwargs["stream"] = False
+                    if think:
+                        chat_kwargs["think"] = think
+                    response = client.chat(**chat_kwargs)
                     full_response_text = response.message.content
                     if think:
                         full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text

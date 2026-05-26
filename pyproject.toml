@@ -44,6 +44,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/ParisNeo/lollms_client"
 
+[project.scripts]
+lollms-client-app = "app.server:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 exclude = ["lollms_client.egg-info*", "lollms_client.llm_bindings.llama_cpp_server.bin"]

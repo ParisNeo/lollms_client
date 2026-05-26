@@ -56,6 +56,13 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         if self.auto_start_server:
             self.ensure_server_is_running(self.wait_for_server)
 
+        # Always sync current configuration to the server on startup
+        if self.config.get("model_name"):
+            try:
+                self.set_settings(self.config)
+            except Exception as e:
+                ASCIIColors.warning(f"Could not sync initial settings to server: {e}")
+
 
     def is_server_running(self) -> bool:
         """Checks if the server is already running and responsive."""
@@ -67,6 +74,14 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             return False
         return False
 
+    def _is_port_available(self, host: str, port: int) -> bool:
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((host, port))
+                return True
+        except OSError:
+            return False
 
     def ensure_server_is_running(self, wait= False):
         """
@@ -81,8 +96,18 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         if self.is_server_running():
             ASCIIColors.green("Diffusers Server is already running and responsive.")
             return
-        else:
-            self.start_server(wait)
+
+        # If the port is busy by another application, find a free port
+        original_port = self.port
+        while not self._is_port_available(self.host, self.port):
+            ASCIIColors.warning(f"Port {self.port} is busy. Trying next port...")
+            self.port += 1
+            self.base_url = f"http://{self.host}:{self.port}"
+
+        if self.port != original_port:
+            ASCIIColors.info(f"Selected new port {self.port} for Diffusers server.")
+
+        self.start_server(wait)
 
     def install_server_dependencies(self):
         """
@@ -149,9 +174,12 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         ASCIIColors.info(f"Installing diffusers library from github")
         pm_v.ensure_packages("diffusers")
 
+        ASCIIColors.info(f"Installing GGUF support libraries")
+        pm_v.ensure_packages({"gguf":">=0.13.0"})
+
         ASCIIColors.green("Server dependencies are satisfied.")
 
-    def start_server(self, wait: bool = True, timeout_s: int = 20):
+    def start_server(self, wait: bool = True, timeout_s: int = 40):
         """
         Launches the FastAPI server in a background thread.
         """
@@ -421,7 +449,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
     
     def get_zoo(self):
         return [
-            {"name": "Stable Diffusion 1.5", "description": "The classic and versatile SD1.5 base model.", "size": "4GB", "type": "checkpoint", "link": "runwayml/stable-diffusion-v1-5"},
+            {"name": "Stable Diffusion 1.5", "description": "The classic and versatile SD1.5 base model.", "size": "4.27GB", "type": "checkpoint", "link": "runwayml/stable-diffusion-v1-5"},
             {"name": "Stable Diffusion 2.1", "description": "The 768x768 base model from the SD2.x series.", "size": "5GB", "type": "checkpoint", "link": "stabilityai/stable-diffusion-2-1"},
             {"name": "Stable Diffusion XL 1.0", "description": "Official 1024x1024 text-to-image model from Stability AI.", "size": "7GB", "type": "checkpoint", "link": "stabilityai/stable-diffusion-xl-base-1.0"},
             {"name": "SDXL Turbo", "description": "A fast, real-time text-to-image model based on SDXL.", "size": "7GB", "type": "checkpoint", "link": "stabilityai/sdxl-turbo"},
@@ -436,9 +464,89 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             {"name": "DreamShaper 8", "description": "Versatile SD1.5 style model (CivitAI).", "size": "2GB", "type": "checkpoint", "link": "https://civitai.com/api/download/models/128713"},
             {"name": "Juggernaut XL", "description": "Artistic SDXL (CivitAI).", "size": "7GB", "type": "checkpoint", "link": "https://civitai.com/api/download/models/133005"},
             {"name": "Stable Diffusion 3 Medium", "description": "SOTA model with advanced prompt understanding (Gated).", "size": "Unknown", "type": "checkpoint", "link": "stabilityai/stable-diffusion-3-medium-diffusers"},
+            {"name": "Instruct-Pix2Pix", "description": "Instruction-based image editing (SD1.5).", "size": "4.3GB", "type": "checkpoint", "link": "timbrooks/instruct-pix2pix"},
             {"name": "FLUX.1 Schnell", "description": "Powerful and fast next-gen model (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.1-schnell"},
             {"name": "FLUX.1 Dev", "description": "Larger developer version of FLUX.1 (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.1-dev"},
-        ]
+            {"name": "FLUX.2 Klein 4B", "description": "Distilled, fast, commercial-friendly 4B parameter model.", "size": "16GB", "type": "checkpoint", "link": "black-forest-labs/FLUX.2-klein-4B"},
+            {"name": "FLUX.2 Klein 4B FP8", "description": "Pre-quantized 8-bit compact variant of FLUX.2 Klein.", "size": "13GB", "type": "checkpoint", "link": "black-forest-labs/FLUX.2-klein-4b-fp8"},
+            {"name": "FLUX.2 Klein 4B GGUF", "description": "Ultra-low memory GGUF quantized 4B Klein model.", "size": "8GB", "type": "checkpoint", "link": "unsloth/FLUX.2-klein-4B-GGUF"},
+            {"name": "FLUX.2 Klein 9B", "description": "9B parameter distilled model (Non-commercial).", "size": "36GB", "type": "checkpoint", "link": "black-forest-labs/FLUX.2-klein-9B"},
+            {"name": "FLUX.2 Dev 12B", "description": "Next-generation 12B guidance model (Gated).", "size": "Unknown", "type": "checkpoint", "link": "black-forest-labs/FLUX.2-dev"},
+            {"name": "Qwen2.5-VL 7B Instruct", "description": "Advanced Qwen vision-language and image editing model.", "size": "15GB", "type": "checkpoint", "link": "Qwen/Qwen2.5-VL-7B-Instruct"},
+            {"name": "FLUX.1 Dev GGUF (Unsloth)", "description": "Optimized 12B FLUX.1 Developer GGUF model.", "size": "Variable", "type": "checkpoint", "link": "unsloth/FLUX.1-dev-GGUF"},
+            {"name": "FLUX.1 Schnell GGUF (Unsloth)", "description": "Optimized 4-step FLUX.1 Schnell GGUF model.", "size": "Variable", "type": "checkpoint", "link": "unsloth/FLUX.1-schnell-GGUF"},
+            {"name": "FLUX.2 Dev GGUF (Unsloth)", "description": "Optimized 32B FLUX.2 Developer GGUF model.", "size": "Variable", "type": "checkpoint", "link": "unsloth/FLUX.2-dev-GGUF"},
+            {"name": "FLUX.2 Klein 9B GGUF (Unsloth)", "description": "Optimized 9B FLUX.2 Klein GGUF model.", "size": "Variable", "type": "checkpoint", "link": "unsloth/FLUX.2-klein-9B-GGUF"},
+            {"name": "FLUX.1 Kontext Dev GGUF (Unsloth)", "description": "12B in-context image editing GGUF model.", "size": "Variable", "type": "checkpoint", "link": "unsloth/FLUX.1-Kontext-dev-GGUF"},
+            {"name": "Qwen Image Edit 2511 GGUF (Unsloth)", "description": "Qwen 20B image editing and instruction GGUF model.", "size": "Variable", "type": "checkpoint", "link": "unsloth/Qwen-Image-Edit-2511-GGUF"},
+            ]
+
+    def get_zoo_model_config(self, index_or_name: Union[int, str]) -> Dict[str, Any]:
+        """
+        Returns the optimized configuration dictionary for a given model from the zoo.
+        Accepts either the integer index or the string key/name.
+        """
+        zoo = self.get_zoo()
+        item = None
+        if isinstance(index_or_name, int):
+            if 0 <= index_or_name < len(zoo):
+                item = zoo[index_or_name]
+        else:
+            name_lower = index_or_name.lower()
+            item = next((x for x in zoo if x["name"].lower() == name_lower or x["link"].lower() == name_lower), None)
+
+        if not item:
+            raise ValueError(f"Model '{index_or_name}' not found in the Diffusers TTI Zoo.")
+
+        link = item["link"]
+        config = {
+            "model_name": link,
+            "width": 1024,
+            "height": 1024,
+            "seed": -1,
+        }
+
+        # ── Apply optimized defaults based on model family ──
+        if "flux.2" in link.lower() or "flux2" in link.lower() or "flux.1" in link.lower() or "flux1" in link.lower():
+            config.update({
+                "num_inference_steps": 4 if "schnell" in link.lower() or "klein" in link.lower() else 50,
+                "guidance_scale": 1.0 if "schnell" in link.lower() or "klein" in link.lower() else 3.5,
+                "torch_dtype_str": "bfloat16",
+            })
+            if "gguf" in link.lower():
+                config.update({
+                    "quant_backend": "gguf",
+                    "quant_level": "Q4_K_M",
+                    "allow_patterns": ["*Q4_K_M.gguf", "*.json", "*.txt"]
+                })
+        elif "qwen" in link.lower():
+            config.update({
+                "num_inference_steps": 40,
+                "guidance_scale": 1.0,
+                "torch_dtype_str": "bfloat16",
+            })
+            if "gguf" in link.lower():
+                config.update({
+                    "quant_backend": "gguf",
+                    "quant_level": "Q4_K_M",
+                    "allow_patterns": ["*Q4_K_M.gguf", "*.json", "*.txt"]
+                })
+        elif "stable-diffusion-xl" in link.lower() or "sdxl" in link.lower():
+            config.update({
+                "num_inference_steps": 4 if "turbo" in link.lower() else 30,
+                "guidance_scale": 0.0 if "turbo" in link.lower() else 7.5,
+                "torch_dtype_str": "float16",
+            })
+        elif "stable-diffusion-v1-5" in link.lower() or "pix2pix" in link.lower():
+            config.update({
+                "num_inference_steps": 25,
+                "guidance_scale": 7.5,
+                "width": 512,
+                "height": 512,
+                "torch_dtype_str": "float16",
+            })
+
+        return config
 
     def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
         zoo = self.get_zoo()
@@ -462,7 +570,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         except Exception:
             return [{"error": "Could not connect to server to get process status."}]
 
-    def pull_model(self, model_name: str, local_name: Optional[str] = None, progress_callback: Callable[[dict], None] = None) -> dict:
+    def pull_model(self, model_name: str, local_name: Optional[str] = None, allow_patterns: Optional[List[str]] = None, progress_callback: Callable[[dict], None] = None) -> dict:
         """
         Pulls a model from Hugging Face or URL via the server.
         """
@@ -478,14 +586,16 @@ class DiffusersTTIBinding(LollmsTTIBinding):
              if "huggingface.co/" in model_name:
                  model_name = model_name.split("huggingface.co/")[-1]
              payload["hf_id"] = model_name
-        
+
         if local_name:
             payload["local_name"] = local_name
-            
+        if allow_patterns:
+            payload["allow_patterns"] = allow_patterns
+
         try:
             if progress_callback:
                 progress_callback({"status": "starting", "message": f"Sending pull request for {model_name}..."})
-            
+
             ASCIIColors.info(f"Sending pull request for {model_name}...")
             # Use a very long timeout as downloads can be huge (GBs)
             response = requests.post(f"{self.base_url}/pull_model", json=payload, timeout=7200) 

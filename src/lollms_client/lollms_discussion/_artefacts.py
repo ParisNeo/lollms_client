@@ -69,8 +69,10 @@ class ArtefactType:
     DOCUMENT      = "document"
     IMAGE         = "image"
     PRESENTATION  = "presentation"
+    DATA          = "data"
+    TOOL          = "tool"
 
-    ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE, PRESENTATION}
+    ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE, PRESENTATION, DATA, TOOL}
 
     LABELS = {
         FILE:          "File",
@@ -80,7 +82,9 @@ class ArtefactType:
         CODE:          "Code",
         DOCUMENT:      "Document",
         IMAGE:         "Image",
-        PRESENTATION:  "Presentation"
+        PRESENTATION:  "Presentation",
+        DATA:          "Data Interface",
+        TOOL:          "Tool"
     }
 
     @classmethod
@@ -266,6 +270,8 @@ class ArtefactManager:
             if "version"          not in fixed: fixed["version"]          = 1; dirty = True
             if "created_at"       not in fixed: fixed["created_at"]       = now; dirty = True
             if "updated_at"       not in fixed: fixed["updated_at"]       = now; dirty = True
+            if "commit_message"   not in fixed: fixed["commit_message"]   = None; dirty = True
+            if "version_tags"     not in fixed: fixed["version_tags"]     = []; dirty = True
             migrated.append(fixed)
         if dirty:
             new_meta = (self._discussion.metadata or {}).copy()
@@ -305,6 +311,8 @@ class ArtefactManager:
         tags:              Optional[List[str]] = None,
         version:           int = 1,
         active:            bool = True,
+        commit_message:    Optional[str] = None,
+        version_tags:      Optional[List[str]] = None,
         **extra_data
     ) -> Dict[str, Any]:
         if artefact_type not in ArtefactType.ALL:
@@ -343,6 +351,8 @@ class ArtefactManager:
             "active":           active,
             "created_at":       now,
             "updated_at":       now,
+            "commit_message":   commit_message,
+            "version_tags":     version_tags or [],
             **extra_data,
         }
         artefacts.append(new_artefact)
@@ -354,8 +364,29 @@ class ArtefactManager:
         if not candidates:
             return None
         if version is not None:
+            # Robust type-coercing search to handle both int and string representation
+            for a in candidates:
+                curr_v = a.get('version')
+                if str(curr_v) == str(version):
+                    return a
+                # Also handle dotted semantic version strings (like "1.0.0" matching version 1)
+                try:
+                    if int(float(str(curr_v).split('.')[0])) == int(version):
+                        return a
+                except Exception:
+                    pass
             return next((a for a in candidates if a.get('version') == version), None)
-        return max(candidates, key=lambda a: a.get('version', 0))
+
+        def _safe_sort_key(a):
+            try:
+                v = a.get('version', 0)
+                if isinstance(v, str):
+                    v = int(float(v.split('.')[0]))
+                return int(v)
+            except Exception:
+                return 0
+
+        return max(candidates, key=_safe_sort_key)
 
     def get_by_id(self, artefact_id: str) -> Optional[Dict[str, Any]]:
         return next((a for a in self._get_all_raw() if a.get('id') == artefact_id), None)
@@ -389,6 +420,8 @@ class ArtefactManager:
         new_title:         Optional[str] = None,
         bump_version:      bool = True,
         active:            Optional[bool] = None,
+        commit_message:    Optional[str] = None,
+        version_tags:      Optional[List[str]] = None,
         **extra_data
     ) -> Optional[Dict[str, Any]]:
         latest = self.get(title)
@@ -407,7 +440,7 @@ class ArtefactManager:
         internal_keys = {
             "id", "title", "type", "version", "content", "images", "image_media_types",
             "audios", "videos", "zip", "language", "url", "tags", "active",
-            "created_at", "updated_at", "artefact_type"
+            "created_at", "updated_at", "artefact_type", "commit_message", "version_tags"
         }
         merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
         merged_extra.update(extra_data)
@@ -452,6 +485,8 @@ class ArtefactManager:
             tags              = new_tags if new_tags is not None else latest.get('tags', []),
             version           = new_version,
             active            = new_active,
+            commit_message    = commit_message if commit_message is not None else latest.get('commit_message'),
+            version_tags      = version_tags if version_tags is not None else latest.get('version_tags', []),
             **merged_extra,
         )
         # Verify the list reflects the new version
@@ -499,7 +534,17 @@ class ArtefactManager:
         all_versions = [a for a in self._get_all_raw() if a.get('title') == title]
         if not all_versions:
             return []
-        all_versions.sort(key=lambda a: a.get('version', 0))
+
+        def _safe_sort_key(a):
+            try:
+                v = a.get('version', 0)
+                if isinstance(v, str):
+                    v = int(float(v.split('.')[0]))
+                return int(v)
+            except Exception:
+                return 0
+
+        all_versions.sort(key=_safe_sort_key)
         active_version = None
         for a in all_versions:
             if a.get('active', False):
@@ -630,24 +675,56 @@ class ArtefactManager:
             if target is None:
                 raise ValueError(f"Target version {target_version} of '{title}' not found.")
 
-            # Everything except target gets deleted
+            # Compile squashed commit messages
+            squashed_messages = []
             for a in all_versions:
                 v = a.get('version', 0)
-                if v == target_version:
-                    to_preserve.append(v)
-                else:
+                msg = a.get('commit_message')
+                if v != target_version and msg:
+                    squashed_messages.append(f"v{v}: {msg}")
+
+            # Collect deletions and space reclaimed
+            for a in all_versions:
+                v = a.get('version', 0)
+                if v != target_version:
                     to_delete.append(v)
                     space_reclaimed += len(a.get('content', ''))
+                else:
+                    to_preserve.append(1)
 
-            # Renumber target to version 1
-            if target_version != 1:
-                artefacts = self._get_all_raw()
-                for a in artefacts:
-                    if a.get('title') == title and a.get('version') == target_version:
+            # Perform the deletions and update the target version in a single pass
+            artefacts = self._get_all_raw()
+            new_list = []
+            for a in artefacts:
+                if a.get('title') == title:
+                    v = a.get('version', 0)
+                    if v == target_version:
                         a['version'] = 1
                         a['updated_at'] = datetime.utcnow().isoformat()
-                self._save_all(artefacts)
-                new_baseline = 1
+                        if squashed_messages:
+                            orig_msg = a.get('commit_message') or "Baseline commit"
+                            a['commit_message'] = f"{orig_msg}\n\nSquashed history:\n" + "\n".join(squashed_messages)
+                        new_list.append(a)
+                    elif v in to_delete:
+                        continue
+                    else:
+                        new_list.append(a)
+                else:
+                    new_list.append(a)
+
+            self._save_all(new_list)
+            ASCIIColors.info(
+                f"[ArtefactManager] Squashed '{title}' around target version {target_version}: "
+                f"deleted {len(to_delete)} version(s) ({to_delete}), "
+                f"re-baselined version {target_version} to v1."
+            )
+            return {
+                "success":      True,
+                "deleted":      to_delete,
+                "preserved":    [1],
+                "new_baseline": 1,
+                "space_reclaimed_estimate": space_reclaimed,
+            }
 
         elif keep_versions is not None:
             keep_set = set(keep_versions)
@@ -687,11 +764,30 @@ class ArtefactManager:
         if not to_preserve:
             raise ValueError("Squash would delete all versions. At least one must remain.")
 
-        # Execute deletion
+        # Execute deletion and squash history compilation into the active version
         if to_delete:
+            squashed_messages = []
+            for v_num in sorted(to_delete):
+                matching_version = next((a for a in all_versions if a.get('version') == v_num), None)
+                if matching_version and matching_version.get('commit_message'):
+                    squashed_messages.append(f"v{v_num}: {matching_version['commit_message']}")
+
             artefacts = self._get_all_raw()
-            new_list = [a for a in artefacts
-                        if not (a.get('title') == title and a.get('version') in to_delete)]
+
+            # Find the oldest preserved version to receive the squashed messages
+            receiver_version = min(to_preserve) if to_preserve else None
+
+            new_list = []
+            for a in artefacts:
+                if a.get('title') == title:
+                    v = a.get('version', 0)
+                    if v in to_delete:
+                        continue
+                    if v == receiver_version and squashed_messages:
+                        orig_msg = a.get('commit_message') or "Preserved baseline"
+                        a['commit_message'] = f"{orig_msg}\n\nSquashed history:\n" + "\n".join(squashed_messages)
+                new_list.append(a)
+
             self._save_all(new_list)
             ASCIIColors.info(
                 f"[ArtefactManager] Squashed '{title}': deleted {len(to_delete)} version(s) "
@@ -801,6 +897,152 @@ class ArtefactManager:
             return True
         return False
 
+    # --------------------------------------------------------- version tags & git-like features
+
+    def tag_version(self, title: str, version: int, tag_name: str) -> bool:
+        """
+        Assigns a Git-like tag (e.g. 'stable', 'v1.0-milestone') to a specific version.
+        Deletes the tag from any other versions of this same artefact to ensure uniqueness.
+        """
+        tag_name = tag_name.strip().lower()
+        if not tag_name:
+            return False
+
+        artefacts = self._get_all_raw()
+        found = False
+        changed = False
+
+        # Unbind tag_name from other versions of this artefact first
+        for a in artefacts:
+            if a.get('title') == title:
+                tags = list(a.get('version_tags', []))
+                if tag_name in tags:
+                    tags.remove(tag_name)
+                    a['version_tags'] = tags
+                    changed = True
+                if a.get('version') == version:
+                    tags.append(tag_name)
+                    a['version_tags'] = tags
+                    found = True
+                    changed = True
+
+        if found:
+            self._save_all(artefacts)
+            ASCIIColors.success(f"[ArtefactManager] Tagged '{title}' v{version} with '{tag_name}'")
+            return True
+        return False
+
+    def remove_tag(self, title: str, tag_name: str) -> bool:
+        """Deletes a tag from all versions of this artefact."""
+        tag_name = tag_name.strip().lower()
+        artefacts = self._get_all_raw()
+        changed = False
+        for a in artefacts:
+            if a.get('title') == title:
+                tags = list(a.get('version_tags', []))
+                if tag_name in tags:
+                    tags.remove(tag_name)
+                    a['version_tags'] = tags
+                    changed = True
+        if changed:
+            self._save_all(artefacts)
+            ASCIIColors.info(f"[ArtefactManager] Removed tag '{tag_name}' from '{title}'")
+            return True
+        return False
+
+    def resolve_tag(self, title: str, tag_name: str) -> Optional[int]:
+        """Resolves a tag name to its corresponding version number."""
+        tag_name = tag_name.strip().lower()
+        for a in self._get_all_raw():
+            if a.get('title') == title and tag_name in a.get('version_tags', []):
+                return a.get('version')
+        return None
+
+    def get_log(self, title: str) -> List[Dict[str, Any]]:
+        """
+        Returns a complete, chronological Git-like version log for an artefact.
+        """
+        all_versions = [a for a in self._get_all_raw() if a.get('title') == title]
+        all_versions.sort(key=lambda a: a.get('version', 0), reverse=True) # newest first
+
+        log = []
+        for a in all_versions:
+            log.append({
+                "commit_hash":    a.get("id"),
+                "version":        a.get("version", 1),
+                "author":         a.get("author", "AI Specialist"),
+                "commit_message": a.get("commit_message") or f"Update '{title}' to version {a.get('version')}",
+                "tags":           a.get("version_tags", []),
+                "created_at":     a.get("created_at"),
+                "size_chars":     len(a.get("content", "")),
+                "is_active":      a.get("active", False)
+            })
+        return log
+
+    def revert_to_tag(self, title: str, tag_name: str) -> Dict[str, Any]:
+        """Reverts the active artefact version to the version bound to the tag."""
+        version = self.resolve_tag(title, tag_name)
+        if version is None:
+            raise ValueError(f"Tag '{tag_name}' not found for artefact '{title}'.")
+        return self.revert(title, version)
+
+    # --------------------------------------------------------- version tags & git-like features
+
+
+    def remove_tag(self, title: str, tag_name: str) -> bool:
+        """Deletes a tag from all versions of this artefact."""
+        tag_name = tag_name.strip().lower()
+        artefacts = self._get_all_raw()
+        changed = False
+        for a in artefacts:
+            if a.get('title') == title:
+                tags = list(a.get('version_tags', []))
+                if tag_name in tags:
+                    tags.remove(tag_name)
+                    a['version_tags'] = tags
+                    changed = True
+        if changed:
+            self._save_all(artefacts)
+            ASCIIColors.info(f"[ArtefactManager] Removed tag '{tag_name}' from '{title}'")
+            return True
+        return False
+
+    def resolve_tag(self, title: str, tag_name: str) -> Optional[int]:
+        """Resolves a tag name to its corresponding version number."""
+        tag_name = tag_name.strip().lower()
+        for a in self._get_all_raw():
+            if a.get('title') == title and tag_name in a.get('version_tags', []):
+                return a.get('version')
+        return None
+
+    def get_log(self, title: str) -> List[Dict[str, Any]]:
+        """
+        Returns a complete, chronological Git-like version log for an artefact.
+        """
+        all_versions = [a for a in self._get_all_raw() if a.get('title') == title]
+        all_versions.sort(key=lambda a: a.get('version', 0), reverse=True) # newest first
+
+        log = []
+        for a in all_versions:
+            log.append({
+                "commit_hash":    a.get("id"),
+                "version":        a.get("version", 1),
+                "author":         a.get("author", "AI Specialist"),
+                "commit_message": a.get("commit_message") or f"Update '{title}' to version {a.get('version')}",
+                "tags":           a.get("version_tags", []),
+                "created_at":     a.get("created_at"),
+                "size_chars":     len(a.get("content", "")),
+                "is_active":      a.get("active", False)
+            })
+        return log
+
+    def revert_to_tag(self, title: str, tag_name: str) -> Dict[str, Any]:
+        """Reverts the active artefact version to the version bound to the tag."""
+        version = self.resolve_tag(title, tag_name)
+        if version is None:
+            raise ValueError(f"Tag '{tag_name}' not found for artefact '{title}'.")
+        return self.revert(title, version)
+
     # --------------------------------------------------------- activation
 
     def activate(self, title: str, version: Optional[int] = None):
@@ -853,8 +1095,10 @@ class ArtefactManager:
             if total_versions > 1:
                 version_str += f" | {total_versions} total versions exist"
             meta_str = ""
-            if item.get('author'):      meta_str += f" | Author: {item['author']}"
-            if item.get('description'): meta_str += f"\nDescription: {item['description']}"
+            # Omit metadata fields from LLM-facing context zone for skills to conserve tokens
+            if atype != ArtefactType.SKILL:
+                if item.get('author'):      meta_str += f" | Author: {item['author']}"
+                if item.get('description'): meta_str += f"\nDescription: {item['description']}"
             label  = ArtefactType.LABELS.get(atype, atype.capitalize())
             header = f"###[{label}] {item['title']} ({version_str}){meta_str}{url_line}"
 
@@ -868,7 +1112,15 @@ class ArtefactManager:
                     f"The actual image data has been appended to the conversation context. -->"
                 )
 
-            if item.get('content', '').strip():
+            # Check if this content is truncated for context budget reasons
+            deactivated_contents = getattr(self._discussion, "deactivated_contents", set())
+            is_truncated = item['title'] in deactivated_contents
+
+            if is_truncated:
+                seq_summaries = getattr(self._discussion, "sequential_summaries", {})
+                art_summary = seq_summaries.get(item['title'], "Detailed summary not available.")
+                parts.append(f"{header}{img_note}\n[THE FOLLOWING IS A DETAILED SEQUENTIAL EXTRACTED SUMMARY OF THIS DOCUMENT DUE TO CONTEXT WINDOW LIMITATIONS]:\n{art_summary}")
+            elif item.get('content', '').strip():
                 # For code artefacts that have no image anchors, keep the fence.
                 # For document artefacts that embed image anchors, use plain text
                 # so the anchors are not hidden inside a code block.
@@ -1355,6 +1607,11 @@ class ArtefactManager:
             language    = attrs.pop('language', None)
             version_str = attrs.pop('version', '1')
             version     = int(version_str) if version_str.isdigit() else 1
+
+            commit_message = attrs.pop('commit_message', None)
+            version_tags_raw = attrs.pop('version_tags', None)
+            version_tags = [t.strip().lower() for t in version_tags_raw.split(',') if t.strip()] if version_tags_raw else None
+
             # Strip any image-related attrs the LLM might have hallucinated
             attrs.pop('images', None)
             attrs.pop('image_media_types', None)
@@ -1394,6 +1651,7 @@ class ArtefactManager:
                     result_artefact = self.add(
                         title=resolved_title, artefact_type=atype, content=content,
                         language=language, version=version, active=auto_activate,
+                        commit_message=commit_message, version_tags=version_tags,
                         **attrs
                     )
                     is_new = True
@@ -1409,6 +1667,8 @@ class ArtefactManager:
                             language=language,
                             bump_version=True,
                             active=auto_activate,
+                            commit_message=commit_message,
+                            version_tags=version_tags,
                             **attrs
                         )
                         final_title = result_artefact.get('title', resolved_title)
@@ -1429,6 +1689,7 @@ class ArtefactManager:
                         title=resolved_title, artefact_type=atype,
                         content=content.strip(),
                         language=language, version=version, active=auto_activate,
+                        commit_message=commit_message, version_tags=version_tags,
                         **attrs
                     )
                 else:
@@ -1440,6 +1701,8 @@ class ArtefactManager:
                         language=language,
                         bump_version=True,
                         active=auto_activate,
+                        commit_message=commit_message,
+                        version_tags=version_tags,
                         **attrs
                     )
                     final_title = result_artefact.get('title', resolved_title)
@@ -1544,3 +1807,106 @@ class ArtefactManager:
 
     def remove_artefact(self, title, version=None) -> int:
         return self.remove(title, version)
+
+    def get_associated_images(self, title: str) -> List[Dict[str, Any]]:
+        """
+        Retrieves all images associated with the artefact 'title'.
+        Checks both the artefact's own images and any companion 'title::images' artefact.
+        """
+        images = []
+        # 1. Main artefact images
+        main_art = self.get(title)
+        if main_art:
+            imgs = main_art.get("images") or []
+            mtypes = main_art.get("image_media_types") or []
+            for idx, img_b64 in enumerate(imgs):
+                mtype = mtypes[idx] if idx < len(mtypes) else "image/jpeg"
+                images.append({
+                    "id": make_image_id(title, idx),
+                    "data": img_b64,
+                    "media_type": mtype,
+                    "title": title,
+                    "index": idx,
+                })
+
+        # 2. Companion images artefact
+        comp_title = f"{title}::images"
+        comp_art = self.get(comp_title)
+        if comp_art:
+            imgs = comp_art.get("images") or []
+            mtypes = comp_art.get("image_media_types") or []
+            for idx, img_b64 in enumerate(imgs):
+                mtype = mtypes[idx] if idx < len(mtypes) else "image/jpeg"
+                images.append({
+                    "id": make_image_id(comp_title, idx),
+                    "data": img_b64,
+                    "media_type": mtype,
+                    "title": comp_title,
+                    "index": idx,
+                })
+        return images
+
+    def export_artefact_bundle(self, title: str) -> Optional[Dict[str, Any]]:
+        """
+        Exports an artefact and all of its associated images/companion files
+        into a single, self-contained JSON-serializable bundle.
+        """
+        main_art = self.get(title)
+        if not main_art:
+            return None
+
+        bundle = {
+            "version": 1,
+            "exported_at": datetime.utcnow().isoformat(),
+            "main_artefact": {k: v for k, v in main_art.items() if k != "id"},
+            "companion_artefacts": []
+        }
+
+        # Find companion images artefact
+        comp_title = f"{title}::images"
+        comp_art = self.get(comp_title)
+        if comp_art:
+            bundle["companion_artefacts"].append({k: v for k, v in comp_art.items() if k != "id"})
+
+        return bundle
+
+    def import_artefact_bundle(self, bundle: Dict[str, Any], activate: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Imports a previously exported artefact bundle back into the discussion.
+        """
+        if not isinstance(bundle, dict) or "main_artefact" not in bundle:
+            raise ValueError("Invalid artefact bundle format")
+
+        main_info = bundle["main_artefact"]
+        main_art = self.add(
+            title             = main_info["title"],
+            artefact_type     = main_info.get("type", ArtefactType.DOCUMENT),
+            content           = main_info.get("content", ""),
+            images            = main_info.get("images"),
+            image_media_types = main_info.get("image_media_types"),
+            audios            = main_info.get("audios"),
+            videos            = main_info.get("videos"),
+            zip_content       = main_info.get("zip"),
+            language          = main_info.get("language"),
+            url               = main_info.get("url"),
+            tags              = main_info.get("tags"),
+            active            = activate
+        )
+
+        for comp_info in bundle.get("companion_artefacts", []):
+            self.add(
+                title             = comp_info["title"],
+                artefact_type     = comp_info.get("type", ArtefactType.IMAGE),
+                content           = comp_info.get("content", ""),
+                images            = comp_info.get("images"),
+                image_media_types = comp_info.get("image_media_types"),
+                audios            = comp_info.get("audios"),
+                videos            = comp_info.get("videos"),
+                zip_content       = comp_info.get("zip"),
+                language          = comp_info.get("language"),
+                url               = comp_info.get("url"),
+                tags              = comp_info.get("tags"),
+                active            = activate
+            )
+
+        return main_art

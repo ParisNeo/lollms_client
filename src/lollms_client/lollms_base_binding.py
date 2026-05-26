@@ -54,9 +54,28 @@ class LollmsBaseBinding(ABC):
         """
         pass
 
-    def ps(self) -> List[Any]:
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        """
+        Unload the model from memory/VRAM.
+        Default base/remote implementation simulates freeing 0 bytes.
+        """
+        target = model_name or getattr(self, "model_name", "unknown")
+        ASCIIColors.info(f"[{self.binding_name}] Simulating model unload for remote/unsupported binding. Liberated model '{target}' with 0 bytes.")
+        return True
+
+    def ps(self) -> List[Dict[str, Any]]:
         """
         Verify resources or processes associated with this binding.
-        Returns a list of status information.
+        Returns a list of status information. Default remote/API simulation.
         """
-        return []
+        target = getattr(self, "model_name", "unknown")
+        return [{
+            "model_name": target,
+            "is_loaded": True,
+            "device": "cloud/api",
+            "vram_size": 0,
+            "gpu_usage_percent": 0.0,
+            "cpu_usage_percent": 0.0,
+            "ref_count": 1,
+            "status": "active (remote simulation)"
+        }]

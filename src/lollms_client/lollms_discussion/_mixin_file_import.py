@@ -61,6 +61,8 @@ import mimetypes
 import os
 import re
 import uuid
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -102,14 +104,18 @@ def _ensure_installed(
 
 IMPORT_MODE_TEXT        = "text"
 IMPORT_MODE_TEXT_IMAGES = "text_images"
+IMPORT_MODE_TEXT_EMBEDDED_IMAGES = "text_embedded_images"
 IMPORT_MODE_IMAGES_ONLY = "images_only"
 IMPORT_MODE_OCR         = "ocr"
+IMPORT_MODE_DATA        = "data"
 
 ALL_IMPORT_MODES = {
     IMPORT_MODE_TEXT,
     IMPORT_MODE_TEXT_IMAGES,
+    IMPORT_MODE_TEXT_EMBEDDED_IMAGES,
     IMPORT_MODE_IMAGES_ONLY,
     IMPORT_MODE_OCR,
+    IMPORT_MODE_DATA,
 }
 
 # Extensions treated as source code → ArtefactType.CODE
@@ -197,6 +203,43 @@ def _detect_artefact_type(path: Path) -> str:
     if ext in _IMAGE_EXTENSIONS:
         return ArtefactType.IMAGE
     return ArtefactType.DOCUMENT
+
+
+def _parse_yaml_frontmatter(content: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Parses YAML frontmatter enclosed by triple-dashes (---) near the top of a file.
+    Enforces strict checks to differentiate skill files from Hugging Face model/dataset README cards,
+    while remaining robust to leading BOMs, whitespace, or injected page headers.
+    """
+    import re
+    content_stripped = content.strip()
+
+    # Search for frontmatter block anywhere within the first 1000 characters
+    m = re.search(r'---(.*?)---', content_stripped[:1000], re.DOTALL)
+    if not m:
+        return None, content
+
+    yaml_str = m.group(1).strip()
+    start_idx = m.start()
+    end_idx = m.end()
+    body = content_stripped[:start_idx] + content_stripped[end_idx:]
+
+    metadata = {}
+    for line in yaml_str.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip().strip("'\"")
+        metadata[k] = v
+
+    # Enforce presence of essential skill schema keys (name and category)
+    # Hugging Face cards never use category or author as top-level metadata keys.
+    if "name" not in metadata or "category" not in metadata:
+        return None, content
+
+    return metadata, body.strip()
 
 
 def _detect_language(path: Path) -> Optional[str]:
@@ -291,10 +334,66 @@ def _dataframe_to_markdown(df: Any) -> str:
         return "\n".join(lines)
 
 
+def _pdf_text_with_embedded_images(path: Path, art_title: str, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Extract PDF text as Markdown and extract raw embedded images.
+    Returns (text_with_anchors, [(b64, media_type), ...]).
+    """
+    _ensure_installed("pymupdf", "fitz")
+    try:
+        import fitz
+        doc    = fitz.open(str(path))
+        pages_text: List[str] = []
+        images: List[Tuple[str, str]] = []
+
+        _has_md = hasattr(fitz.Page, "get_text") and "markdown" in getattr(fitz, "TEXT_FORMATS", set())
+
+        img_count = 0
+        for i, page in enumerate(doc):
+            if progress_cb:
+                try:
+                    progress_cb(f"Extracting embedded images from page {i + 1}/{len(doc)}...")
+                except Exception:
+                    pass
+            if _has_md:
+                md = page.get_text("markdown").strip()
+                text_blk = md if md else "[No selectable text on this page]"
+            else:
+                text_blk = (page.get_text() or "").strip() or "[No selectable text on this page]"
+
+            # Find and extract raw embedded images on this page
+            image_list = page.get_images(full=True)
+            page_anchors = []
+            for img_info in image_list:
+                xref = img_info[0]
+                base_image = doc.extract_image(xref)
+                img_bytes = base_image["image"]
+                img_ext = base_image["ext"]
+                mt = f"image/{img_ext}"
+
+                # Resize if extremely large to prevent context bloat
+                resized, mt2 = _resize_image_bytes(img_bytes, fmt=img_ext.upper())
+                images.append((_b64_encode(resized), mt2))
+
+                anchor = f'<artefact_image id="{make_image_id(art_title, img_count)}" />'
+                page_anchors.append(anchor)
+                img_count += 1
+
+            anchors_text = "\n\n".join(page_anchors) + "\n\n" if page_anchors else ""
+            pages_text.append(f"## Page {i + 1}\n\n{anchors_text}{text_blk}")
+
+        doc.close()
+        return "\n\n".join(pages_text), images
+    except Exception as e:
+        ASCIIColors.warning(f"Failed to extract raw embedded images: {e}. Falling back to standard text extraction.")
+        return _extract_pdf_text(path), []
+
+
 def _extract_pdf_pages_as_images(
     path: Path,
     dpi: int = _PDF_RENDER_DPI,
     max_dim: int = _MAX_LLM_IMAGE_DIM,
+    progress_cb: Optional[Callable[[str], None]] = None,
 ) -> List[Tuple[str, str]]:
     """
     Render each PDF page to a JPEG image.
@@ -307,7 +406,12 @@ def _extract_pdf_pages_as_images(
         zoom  = dpi / 72.0
         mat   = fitz.Matrix(zoom, zoom)
         pages = []
-        for page in doc:
+        for i, page in enumerate(doc):
+            if progress_cb:
+                try:
+                    progress_cb(f"Rendering page {i + 1}/{len(doc)}...")
+                except Exception:
+                    pass
             pix = page.get_pixmap(matrix=mat, alpha=False)
             img_bytes = pix.tobytes("jpeg")
             resized, mt = _resize_image_bytes(img_bytes, max_dim=max_dim, fmt="JPEG")
@@ -320,7 +424,12 @@ def _extract_pdf_pages_as_images(
             from pdf2image import convert_from_path
             pil_pages = convert_from_path(str(path), dpi=dpi)
             pages = []
-            for img in pil_pages:
+            for i, img in enumerate(pil_pages):
+                if progress_cb:
+                    try:
+                        progress_cb(f"Rendering page {i + 1}/{len(pil_pages)}...")
+                    except Exception:
+                        pass
                 b64, mt = _pil_image_to_b64(img)
                 img_bytes = base64.b64decode(b64)
                 resized, mt2 = _resize_image_bytes(img_bytes, max_dim=max_dim)
@@ -330,7 +439,7 @@ def _extract_pdf_pages_as_images(
             raise RuntimeError(f"PDF page rendering failed: {e2}") from e2
 
 
-def _pdf_text_with_image_anchors(path: Path, art_title: str) -> Tuple[str, List[Tuple[str, str]]]:
+def _pdf_text_with_image_anchors(path: Path, art_title: str, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, List[Tuple[str, str]]]:
     """
     Extract PDF text as Markdown and render pages as images simultaneously.
     Returns (text_with_anchors, [(b64, media_type), ...]).
@@ -347,6 +456,11 @@ def _pdf_text_with_image_anchors(path: Path, art_title: str) -> Tuple[str, List[
         _has_md = hasattr(fitz.Page, "get_text") and "markdown" in getattr(fitz, "TEXT_FORMATS", set())
 
         for i, page in enumerate(doc):
+            if progress_cb:
+                try:
+                    progress_cb(f"Rendering page {i + 1}/{len(doc)}...")
+                except Exception:
+                    pass
             pix      = page.get_pixmap(matrix=mat, alpha=False)
             img_bytes = pix.tobytes("jpeg")
             resized, mt = _resize_image_bytes(img_bytes)
@@ -621,6 +735,141 @@ def _ocr_images_with_llm(
 # Main dispatcher
 # ---------------------------------------------------------------------------
 
+def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Ingests a CSV, XLSX/XLS, or SQLite Database file, extracts its structural schema 
+    (columns, types, row counts, and descriptive statistics), and writes the original 
+    file to a local data workspace under a versioned suffix. Returns a compact Markdown 
+    schema for LLM context.
+    """
+    _ensure_installed("pandas")
+    _ensure_installed("openpyxl")
+    import pandas as pd
+
+    ext = path.suffix.lower()
+    schema_parts = [f"# Data Interface: {art_title}\n"]
+
+    try:
+        if ext in (".db", ".sqlite", ".sqlite3"):
+            if progress_cb: progress_cb("Connecting to SQLite database...")
+            import sqlite3
+            conn = sqlite3.connect(str(path))
+            cursor = conn.cursor()
+
+            # List all tables in the database
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = [row[0] for row in cursor.fetchall()]
+            schema_parts.append(f"Format: SQLite Relational Database (.db) | Total Tables: {len(tables)}\n")
+
+            for idx, table in enumerate(tables):
+                if progress_cb: progress_cb(f"Analyzing table '{table}' ({idx+1}/{len(tables)})...")
+                # Get table schema (columns and types)
+                cursor.execute(f"PRAGMA table_info({table});")
+                columns_info = cursor.fetchall()
+                # Get exact row count
+                cursor.execute(f"SELECT COUNT(*) FROM {table};")
+                row_count = cursor.fetchone()[0]
+
+                schema_parts.append(f"## Table: {table}")
+                schema_parts.append(f"- Total Rows: {row_count:,} | Columns: {len(columns_info)}")
+                schema_parts.append("### Columns & Schema:")
+                for col in columns_info:
+                    pk_marker = " — PRIMARY KEY" if col[5] else ""
+                    schema_parts.append(f"  • {col[1]} ({col[2] or 'ANY'}){pk_marker}")
+
+                # Fetch a quick markdown preview using pandas
+                try:
+                    df = pd.read_sql_query(f"SELECT * FROM {table} LIMIT 3;", conn)
+                    schema_parts.append("### Preview (First 3 Rows):")
+                    schema_parts.append(df.to_markdown(index=False))
+                except Exception as ex:
+                    schema_parts.append(f"  (Failed to read table preview: {ex})")
+
+                schema_parts.append("\n---\n")
+            conn.close()
+
+        elif ext in (".xlsx", ".xls"):
+            if progress_cb: progress_cb("Reading Excel sheets...")
+            xl = pd.ExcelFile(str(path))
+            sheets = xl.sheet_names
+            schema_parts.append(f"Format: Excel (.xlsx) | Total Sheets: {len(sheets)}\n")
+
+            for idx, sheet in enumerate(sheets):
+                if progress_cb: progress_cb(f"Analyzing sheet '{sheet}' ({idx+1}/{len(sheets)})...")
+                df = pd.read_excel(str(path), sheet_name=sheet, nrows=5)
+                full_df = pd.read_excel(str(path), sheet_name=sheet)
+                row_count = len(full_df)
+
+                schema_parts.append(f"## Sheet: {sheet}")
+                schema_parts.append(f"- Total Rows: {row_count:,} | Columns: {len(df.columns)}")
+                schema_parts.append("### Columns & Types:")
+                for col in full_df.columns:
+                    dtype = str(full_df[col].dtype)
+                    nulls = int(full_df[col].isnull().sum())
+                    schema_parts.append(f"  • {col} ({dtype}) — {nulls} missing values")
+
+                numeric_cols = full_df.select_dtypes(include=["number"]).columns
+                if not numeric_cols.empty:
+                    schema_parts.append("### Numeric Column Statistics:")
+                    stats_df = full_df[numeric_cols].describe().loc[["min", "max", "mean"]]
+                    schema_parts.append(stats_df.to_markdown())
+
+                schema_parts.append("### Preview (First 3 Rows):")
+                schema_parts.append(df.head(3).to_markdown(index=False))
+                schema_parts.append("\n---\n")
+
+        else:
+            if progress_cb: progress_cb("Reading CSV headers...")
+            sep = ","
+            if ext in (".tsv", ".tab"):
+                sep = "\t"
+            else:
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        line = f.readline()
+                        if ";" in line: sep = ";"
+                        elif "\t" in line: sep = "\t"
+                except Exception:
+                    pass
+
+            df = pd.read_csv(str(path), sep=sep, nrows=5)
+            full_df = pd.read_csv(str(path), sep=sep)
+            row_count = len(full_df)
+
+            schema_parts.append(f"Format: CSV (.csv) | Separator: {repr(sep)}\n")
+            schema_parts.append(f"- Total Rows: {row_count:,} | Columns: {len(df.columns)}")
+            schema_parts.append("### Columns & Types:")
+            for col in full_df.columns:
+                dtype = str(full_df[col].dtype)
+                nulls = int(full_df[col].isnull().sum())
+                schema_parts.append(f"  • {col} ({dtype}) — {nulls} missing values")
+
+            numeric_cols = full_df.select_dtypes(include=["number"]).columns
+            if not numeric_cols.empty:
+                schema_parts.append("### Numeric Column Statistics:")
+                stats_df = full_df[numeric_cols].describe().loc[["min", "max", "mean"]]
+                schema_parts.append(stats_df.to_markdown())
+
+            schema_parts.append("### Preview (First 3 Rows):")
+            schema_parts.append(df.head(3).to_markdown(index=False))
+
+    except Exception as e:
+        ASCIIColors.error(f"Failed to parse structured data file: {e}")
+        schema_parts.append(f"⚠️ Failed to extract full structure: {e}")
+
+    # Copy the raw file to the data workspace so our execution tools can find it
+    workspace_dir = Path("./data_workspace")
+    workspace_dir.mkdir(exist_ok=True)
+    # Save with unique title and version suffix
+    shutil_dest = workspace_dir / f"{art_title}_v{version}{ext}"
+    import shutil
+    if path.resolve() != shutil_dest.resolve():
+        shutil.copy(str(path), str(shutil_dest))
+    ASCIIColors.info(f"Raw data file saved to workspace: {shutil_dest}")
+
+    return "\n\n".join(schema_parts), []
+
+
 class FileImportMixin:
     """
     Adds import_file() to LollmsDiscussion.
@@ -709,6 +958,46 @@ class FileImportMixin:
         is_xlsx       = ext == ".xlsx"
         is_image_file = ext in _IMAGE_EXTENSIONS
 
+        # ── data mode ────────────────────────────────────────────────────────
+        if mode == IMPORT_MODE_DATA:
+            is_data_file = ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3")
+            if not is_data_file:
+                warnings.append(f"data mode requested but '{ext}' is not a CSV or Excel file.")
+                mode = IMPORT_MODE_TEXT
+            else:
+                _progress("Analyzing structured data file...")
+                text, images_data = _parse_data_file(path, title, version=1, progress_cb=progress_cb)
+                atype = ArtefactType.DATA
+
+                existing = self.artefacts.get(title)
+                if existing is None:
+                    art = self.artefacts.add(
+                        title=title,
+                        artefact_type=atype,
+                        content=text,
+                        active=activate,
+                        file_ext=ext,
+                        version=1
+                    )
+                else:
+                    art = self.artefacts.update(
+                        title=title,
+                        new_content=text,
+                        new_type=atype,
+                        active=activate,
+                        file_ext=ext,
+                        version=1
+                    )
+                _progress("Data analysis complete.")
+                return {
+                    "text_artefact": art,
+                    "image_artefact": None,
+                    "mode": mode,
+                    "page_count": 0,
+                    "image_count": 0,
+                    "warnings": warnings,
+                }
+
         # ── images_only: pure image files ────────────────────────────────────
         if mode == IMPORT_MODE_IMAGES_ONLY:
             images_data: List[Tuple[str, str]] = []
@@ -721,7 +1010,7 @@ class FileImportMixin:
 
             elif is_pdf:
                 _progress("Rendering PDF pages…")
-                images_data = _extract_pdf_pages_as_images(path)
+                images_data = _extract_pdf_pages_as_images(path, progress_cb=progress_cb)
                 page_count  = len(images_data)
 
             elif is_pptx:
@@ -747,12 +1036,20 @@ class FileImportMixin:
                     content           = f"Images extracted from '{path.name}' ({image_count} page(s)).",
                     images            = imgs_b64,
                     image_media_types = imgs_mt,
-                    active            = False,   # deactivated by default
+                    active            = activate,   # Respect active parameter!
                 )
-                _progress(f"Image artefact created: '{title}::images' ({image_count} image(s), deactivated)")
+                _progress(f"Image artefact created: '{title}::images' ({image_count} image(s), active={activate})")
+
+                # Generate anchors text
+                anchors_content = f"# {title} (Images Only)\n\n" + "\n\n".join(
+                    f"## Page {i + 1}\n\n<artefact_image id=\"{make_image_id(f'{title}::images', i)}\" />"
+                    for i in range(image_count)
+                )
+                text_artefact = self._import_save_text(title, anchors_content, path, activate)
+                _progress(f"Companion text/anchors artefact created: '{title}' (active={activate})")
 
             return {
-                "text_artefact":  None,
+                "text_artefact":  text_artefact,
                 "image_artefact": image_artefact,
                 "mode":           mode,
                 "page_count":     page_count,
@@ -827,7 +1124,8 @@ class FileImportMixin:
             }
 
         # ── text and text_images modes ───────────────────────────────────────
-        include_images = (mode == IMPORT_MODE_TEXT_IMAGES)
+        include_images = (mode in (IMPORT_MODE_TEXT_IMAGES, IMPORT_MODE_TEXT_EMBEDDED_IMAGES))
+        extract_embedded = (mode == IMPORT_MODE_TEXT_EMBEDDED_IMAGES)
         text:   str                    = ""
         images_data: List[Tuple[str, str]] = []
 
@@ -837,9 +1135,12 @@ class FileImportMixin:
             # No image extraction for plain text
 
         elif is_pdf:
-            if include_images:
+            if extract_embedded:
+                _progress("Extracting PDF text + raw embedded images…")
+                text, images_data = _pdf_text_with_embedded_images(path, title, progress_cb=progress_cb)
+            elif include_images:
                 _progress("Extracting PDF text + rendering pages…")
-                text, images_data = _pdf_text_with_image_anchors(path, title)
+                text, images_data = _pdf_text_with_image_anchors(path, title, progress_cb=progress_cb)
             else:
                 _progress("Extracting PDF text…")
                 text = _extract_pdf_text(path)
@@ -934,7 +1235,24 @@ class FileImportMixin:
         activate: bool,
     ) -> Dict:
         """Create or update the text artefact for the imported content."""
-        atype    = _detect_artefact_type(path)
+        # Parse YAML frontmatter dynamically to detect skills
+        metadata, body = _parse_yaml_frontmatter(text)
+
+        if metadata:
+            title = metadata.get("name", title)
+            atype = ArtefactType.SKILL
+            text = body
+            extra_data = {
+                "description": metadata.get("description", ""),
+                "category": metadata.get("category", "lollms_client/general"),
+                "author": metadata.get("author", "Unknown"),
+                "skill_version": metadata.get("version", "1.0.0"),
+                "created_at": metadata.get("created", datetime.utcnow().isoformat())
+            }
+        else:
+            atype = _detect_artefact_type(path)
+            extra_data = {}
+
         language = _detect_language(path)
 
         existing = self.artefacts.get(title)
@@ -945,8 +1263,9 @@ class FileImportMixin:
                 content       = text,
                 language      = language,
                 active        = activate,
+                **extra_data
             )
-            ASCIIColors.success(f"[FileImport] Created artefact '{title}'")
+            ASCIIColors.success(f"[FileImport] Created artefact '{title}' of type '{atype}'")
         else:
             art = self.artefacts.update(
                 title       = title,
@@ -954,8 +1273,9 @@ class FileImportMixin:
                 new_type    = atype,
                 language    = language,
                 active      = activate,
+                **extra_data
             )
             ASCIIColors.success(
-                f"[FileImport] Updated artefact '{title}' → v{art.get('version', '?')}"
+                f"[FileImport] Updated artefact '{title}' → v{art.get('version', '?')} of type '{atype}'"
             )
         return art
