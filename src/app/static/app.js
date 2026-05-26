@@ -2757,56 +2757,61 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    btnApply.addEventListener("click", async () => {
-        if (!selBinding.value || !selModel.value) {
-            valStatus.className = "validation-status error";
-            valStatus.textContent = "Please validate an LLM binding and select a model before applying.";
-            return;
-        }
-        btnApply.disabled = true;
-        btnApply.textContent = "Applying...";
-
-        // Collect LLM configuration directly from the form inputs
-        const payload = {
-            llm_binding_name: selBinding.value,
-            llm_binding_config: { ...collectBindingConfig(), model_name: selModel.value }
-        };
-
-        // Collect optional TTI configuration directly from the form inputs
-        if (selTtiBinding.value && selTtiModel.value) {
-            payload["tti_binding_name"] = selTtiBinding.value;
-            payload["tti_binding_config"] = { ...collectTtiBindingConfig(), model_name: selTtiModel.value };
-        }
-
-        try {
-            const res = await fetch("/api/settings", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-
-            if (data.success) {
-                valStatus.className = "validation-status success";
-                valStatus.textContent = "✅ Configuration applied successfully.";
-                await fetchCurrentModels();
-                setTimeout(() => {
-                    settingsModal.style.display = "none";
-                    valStatus.className = "validation-status";
-                    valStatus.textContent = "";
-                }, 800);
-            } else {
+    // Bind the LLM-specific apply button (if it exists separately in the future)
+    // Currently, btnApply is bound to the LLM tab button, but we need the global one.
+    const btnApplyGlobal = document.getElementById("btn-apply-global-settings");
+    if (btnApplyGlobal) {
+        btnApplyGlobal.addEventListener("click", async () => {
+            if (!selBinding.value || !selModel.value) {
                 valStatus.className = "validation-status error";
-                valStatus.textContent = `❌ Apply failed: ${data.error || "Unknown error"}`;
+                valStatus.textContent = "Please validate an LLM binding and select a model before applying.";
+                return;
             }
-        } catch (err) {
-            valStatus.className = "validation-status error";
-            valStatus.textContent = `❌ Apply request failed: ${err}`;
-        } finally {
-            btnApply.disabled = false;
-            btnApply.textContent = "💾 Apply Configuration";
-        }
-    });
+            btnApplyGlobal.disabled = true;
+            btnApplyGlobal.textContent = "Applying...";
+
+            // Collect LLM configuration directly from the form inputs
+            const payload = {
+                llm_binding_name: selBinding.value,
+                llm_binding_config: { ...collectBindingConfig(), model_name: selModel.value }
+            };
+
+            // Collect optional TTI configuration directly from the form inputs
+            if (selTtiBinding.value && selTtiModel.value) {
+                payload["tti_binding_name"] = selTtiBinding.value;
+                payload["tti_binding_config"] = { ...collectTtiBindingConfig(), model_name: selTtiModel.value };
+            }
+
+            try {
+                const res = await fetch("/api/settings", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    valStatus.className = "validation-status success";
+                    valStatus.textContent = "✅ Configuration applied successfully.";
+                    await fetchCurrentModels();
+                    setTimeout(() => {
+                        settingsModal.style.display = "none";
+                        valStatus.className = "validation-status";
+                        valStatus.textContent = "";
+                    }, 800);
+                } else {
+                    valStatus.className = "validation-status error";
+                    valStatus.textContent = `❌ Apply failed: ${data.error || "Unknown error"}`;
+                }
+            } catch (err) {
+                valStatus.className = "validation-status error";
+                valStatus.textContent = `❌ Apply request failed: ${err}`;
+            } finally {
+                btnApplyGlobal.disabled = false;
+                btnApplyGlobal.textContent = "💾 Save Configuration";
+            }
+        });
+    }
 
     async function fetchPersonalities() {
         try {
