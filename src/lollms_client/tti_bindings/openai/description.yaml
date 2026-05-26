@@ -9,17 +9,17 @@ description: |
   Compatible with gpt-image-1, gpt-5, gpt-5-image, DALL-E 2/3, and future models.
 
 global_input_parameters:
+  - name: "host_address"
+    type: "str"
+    description: "Base URL of the OpenAI-compatible server (e.g. 'http://localhost:11434/v1' for Ollama, 'http://localhost:1234/v1' for LM Studio). Leave empty to use the official OpenAI API."
+    mandatory: false
+    default: ""
+    
   - name: "service_key"
     type: "str"
     description: "Your API key. For OpenAI use your sk-... key. For local servers (Ollama, LM Studio) this can be left empty or set to any non-empty string."
     mandatory: false
     is_secret: true
-    default: ""
-
-  - name: "host_address"
-    type: "str"
-    description: "Base URL of the OpenAI-compatible server (e.g. 'http://localhost:11434/v1' for Ollama, 'http://localhost:1234/v1' for LM Studio). Leave empty to use the official OpenAI API."
-    mandatory: false
     default: ""
 
   - name: "verify_ssl_certificate"
@@ -37,12 +37,15 @@ global_input_parameters:
 model_input_parameters:
   - name: "model_name"
     type: "str"
-    description: "Image model to use. The list is populated live from the configured server's models endpoint."
+    description: "Image model to use. OpenAI models: 'gpt-image-1', 'gpt-5', 'gpt-5-image', 'dall-e-3', 'dall-e-2'. For custom servers, enter the model ID exposed by that server."
     mandatory: true
     default: "gpt-image-1"
-    options_from_command: "list_models"
-    options_value_key: "model_name"
-    options_display_key: "display_name"
+    options:
+      - "gpt-image-1"
+      - "gpt-5"
+      - "gpt-5-image"
+      - "dall-e-3"
+      - "dall-e-2"
 
   - name: "size"
     type: "str"
