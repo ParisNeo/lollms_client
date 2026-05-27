@@ -6,9 +6,9 @@ description: Connects to a LoLLMs service or any other OpenAI-compatible API end
 global_input_parameters:
   - name: host_address
     type: str
-    description: "The base URL of the LoLLMs or OpenAI-compatible service (e.g., 'http://localhost:9642/v1')."
+    description: "The base URL of the LoLLMs or OpenAI-compatible service (e.g., 'http://localhost:9642')."
     mandatory: false
-    default: "http://localhost:9642/v1"
+    default: "http://localhost:9642"
   - name: service_key
     type: str
     description: "The API key for the service. Can also be set via the LOLLMS_API_KEY environment variable."

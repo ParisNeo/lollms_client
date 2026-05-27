@@ -17,10 +17,12 @@ import queue
 import threading
 import asyncio
 import inspect
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Callable, List, Any
-
+from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
+from lollms_client.lollms_discussion import ArtefactType
 
 # Ensure correct workspace import resolution
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -234,6 +236,10 @@ class YoutubeImportRequest(BaseModel):
     auto_load: bool = True
 
 
+class GenerateImageForMessageRequest(BaseModel):
+    prompt: Optional[str] = None
+
+
 class DataQueryRequest(BaseModel):
     title: str
     code: str
@@ -306,6 +312,11 @@ class UpdateArtifactRequest(BaseModel):
     commit_message: Optional[str] = "Manual update via Raw Editor"
 
 
+class UpdateImageArtifactRequest(BaseModel):
+    image_b64: str
+    commit_message: Optional[str] = "Edit image via Photoshop UI"
+
+
 class WorkspaceRequest(BaseModel):
     name: str
 
@@ -367,8 +378,10 @@ class DummyClient:
         )
         if callback:
             callback('<mem_tag id="099372fa" />', MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            # Simulate a highly-fluid word-by-word streaming typing effect
             for word in reply.split(" "):
                 callback(word + " ", MSG_TYPE.MSG_TYPE_CHUNK)
+                time.sleep(0.04)
         return reply
 
 needs_configuration = False
@@ -472,9 +485,9 @@ async def import_document(
 
 
 @app.get("/api/images/{title}/{index}")
-async def get_binary_image(title: str, index: int):
+async def get_binary_image(title: str, index: int, version: Optional[int] = None):
     """Locates and serves decoded base64 sub-images as binary stream."""
-    images = discussion.artefacts.get_associated_images(title)
+    images = discussion.artefacts.get_associated_images(title, version)
     for img in images:
         if img["index"] == index:
             import base64
@@ -725,6 +738,26 @@ async def test_tti_binding_endpoint(payload: BindingTestRequest):
         return {"success": True, "models": models}
     except Exception as e:
         trace_exception(e)
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/bindings/tti/zoo")
+async def get_tti_zoo_endpoint(payload: BindingTestRequest):
+    """Retrieves the model zoo list for a specified TTI binding."""
+    try:
+        import importlib
+        module_path = f"lollms_client.tti_bindings.{payload.binding_name}"
+        module = importlib.import_module(module_path)
+        binding_class = getattr(module, getattr(module, "BindingName", None), None)
+        if not binding_class:
+            return {"success": False, "error": "Binding class not found."}
+
+        instance = binding_class(**payload.config)
+        zoo = []
+        if hasattr(instance, "get_zoo") and callable(getattr(instance, "get_zoo")):
+            zoo = instance.get_zoo()
+        return {"success": True, "zoo": zoo}
+    except Exception as e:
         return {"success": False, "error": str(e)}
 
 
@@ -1017,13 +1050,16 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
         else:
             discussion.max_context_size = 4096
 
-        save_app_config({
+        # Merge with existing configuration to prevent wiping out other fields like active_workspace
+        current_config = load_app_config()
+        current_config.update({
             "llm_binding_name": payload.llm_binding_name,
             "llm_binding_config": payload.llm_binding_config,
             "tti_binding_name": payload.tti_binding_name,
             "tti_binding_config": payload.tti_binding_config,
             "personality_name": payload.personality_name
         })
+        save_app_config(current_config)
         needs_configuration = False
         return {"success": True, "model_name": LLM_MODEL_NAME}
     except Exception as e:
@@ -1383,6 +1419,43 @@ async def update_artifact_endpoint(title: str, payload: UpdateArtifactRequest):
         return {"success": True, "version": res.get("version", 1)}
     except HTTPException:
         raise
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/artifacts/{title}/select_version")
+async def select_artifact_version_endpoint(title: str, version: int):
+    """Activates a specific version of an artifact, deactivating all other versions in the context."""
+    try:
+        discussion.artefacts.activate(title, version)
+        discussion.commit()
+        return {"success": True, "active_version": version}
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/artifacts/{title}/update_image")
+async def update_image_artifact_endpoint(title: str, payload: UpdateImageArtifactRequest):
+    """Updates the image data of a named image-type artifact, incrementing its version."""
+    try:
+        existing = discussion.artefacts.get(title)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Artifact not found.")
+
+        b64_data = payload.image_b64.split(";base64,")[1] if ";base64," in payload.image_b64 else payload.image_b64
+
+        # Update the image list (overwriting the first image)
+        res = discussion.artefacts.update(
+            title=title,
+            new_images=[b64_data],
+            bump_version=True,
+            active=existing.get("active", True),
+            commit_message=payload.commit_message
+        )
+        discussion.commit()
+        return {"success": True, "version": res.get("version", 1)}
     except Exception as e:
         trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -2119,7 +2192,7 @@ def _execute_sequential_reading_subroutine(discussion, user_message: str, max_to
 async def chat_with_document(request: ChatRequest):
     """Streams conversational chat turns, integrating active memories and artifacts."""
     user_message = request.message
-    if not user_message.strip():
+    if not request.regenerate and not user_message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
     async def chat_event_generator():
@@ -2286,41 +2359,42 @@ async def export_artifact_endpoint(title: str, format: str, version: Optional[in
 
 class EditMessageRequest(BaseModel):
     content: str
+    metadata: Optional[Dict[str, Any]] = None
 
 
-@app.get("/api/discussions/viewer_session/messages")
-async def get_session_messages_endpoint():
-    """Retrieves the full chronological list of messages in the active branch."""
+@app.post("/api/discussions/viewer_session/messages/{message_id}/edit")
+async def edit_session_message_endpoint(message_id: str, payload: EditMessageRequest):
+    """Edits the content of an individual message in place."""
     try:
-        discussion._rebuild_message_index()
-        branch = discussion.get_branch(discussion.active_branch_id)
-        return [
-            {
-                "id": m.id,
-                "sender": m.sender,
-                "sender_type": m.sender_type,
-                "content": m.content,
-                "model_name": m.model_name or "unknown",
-                "tokens": m.tokens or 0,
-                "generation_speed": m.generation_speed or 0,
-                "metadata": m.metadata or {},
-                "created_at": m.created_at.isoformat() if m.created_at else None
-            }
-            for m in branch
-        ]
+        msg = discussion.get_message(message_id)
+        if not msg:
+            raise HTTPException(status_code=404, detail="Message not found.")
+
+        msg.content = payload.content.strip()
+        if payload.metadata is not None:
+            msg.metadata = {**(msg.metadata or {}), **payload.metadata}
+        discussion.touch()
+        discussion.commit()
+        return {"success": True, "content": msg.content}
     except Exception as e:
         trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/discussions/viewer_session/messages/{message_id}")
-async def delete_session_message_endpoint(message_id: str):
-    """Deletes a single message from the discussion tree."""
+async def delete_session_message_endpoint(message_id: str, prune: bool = False):
+    """Deletes a message from the tree (supports recursive subtree pruning)."""
     try:
-        ok = discussion.remove_message(message_id)
-        if ok:
-            discussion.commit()
-            return {"success": True}
+        if prune:
+            count = discussion.prune_branch(message_id)
+            if count > 0:
+                discussion.commit()
+                return {"success": True, "pruned_count": count}
+        else:
+            ok = discussion.remove_message(message_id)
+            if ok:
+                discussion.commit()
+                return {"success": True}
         raise HTTPException(status_code=404, detail="Message not found.")
     except Exception as e:
         trace_exception(e)
@@ -2376,6 +2450,151 @@ async def regenerate_session_message_endpoint(message_id: str):
         # Get the user prompt to send back to the frontend for automatic resending
         user_prompt = discussion.get_message(discussion.active_branch_id).content
         return {"success": True, "prompt": user_prompt}
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/discussions/viewer_session/messages/{message_id}/generate_image")
+async def generate_image_for_message_endpoint(message_id: str, payload: Optional[GenerateImageForMessageRequest] = None):
+    """Retries or manually generates an image from <generate_image>, <edit_image>, or missing <artefact_image> tags in a message."""
+    try:
+        msg = discussion.get_message(message_id)
+        if not msg:
+            raise HTTPException(status_code=404, detail="Message not found.")
+
+        # Parse the <generate_image>, <edit_image>, or <artefact_image> tag from the message content
+        match_gen = re.search(r'<generate_image\s*([^>]*)>(.*?)</generate_image>', msg.content, re.DOTALL | re.IGNORECASE)
+        match_edit = re.search(r'<edit_image\s*([^>]*)>(.*?)</edit_image>', msg.content, re.DOTALL | re.IGNORECASE)
+        match_art = re.search(r'<artefact_image\s+id=["\']([^"\']+)["\']\s*(?:\/>|>)', msg.content, re.IGNORECASE)
+
+        if not match_gen and not match_edit and not match_art:
+            raise HTTPException(status_code=400, detail="No image generation, editing, or artifact image tag found in this message.")
+
+        is_edit = False
+        if match_edit:
+            is_edit = True
+            match = match_edit
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', match.group(1))}
+            prompt = match.group(2).strip()
+            art_title = attrs.get('name', attrs.get('title', f"edited_image_{uuid.uuid4().hex[:6]}"))
+        elif match_gen:
+            match = match_gen
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', match.group(1))}
+            prompt = match.group(2).strip()
+            art_title = attrs.get('name', attrs.get('title', f"generated_image_{uuid.uuid4().hex[:6]}"))
+        else:
+            # Re-generation of a deleted / missing artifact image
+            match = match_art
+            image_id = match.group(1)
+            parts = image_id.split("::")
+            art_title = "::".join(parts[:-1])
+            is_edit = "edit" in art_title.lower()
+            prompt = payload.prompt.strip() if (payload and payload.prompt) else f"Creative illustration for {art_title}"
+            attrs = {"name": art_title}
+
+        # ── Update prompt if edited by user ──
+        if payload and payload.prompt:
+            new_prompt = payload.prompt.strip()
+            if new_prompt and new_prompt != prompt:
+                if not match_art:
+                    # Replace inside the tag in message content
+                    tag_start = match.group(0).split(prompt)[0]
+                    tag_end = match.group(0).split(prompt)[-1]
+                    new_tag = f"{tag_start}{new_prompt}{tag_end}"
+                    msg.content = msg.content.replace(match.group(0), new_tag)
+                prompt = new_prompt
+                discussion.touch()
+                discussion.commit()
+
+        tti = getattr(client, 'tti', None)
+        if tti is None:
+            raise HTTPException(status_code=400, detail="TTI (Text-to-Image) engine is not active or configured. Please set a TTI binding in settings first.")
+
+        if is_edit:
+            # For editing, find the source image
+            source_b64: Optional[str] = None
+            artefact_name = attrs.get('name', '')
+            if artefact_name:
+                a = discussion.artefacts.get(artefact_name)
+                if a and a.get('images'):
+                    source_b64 = a['images'][-1]
+            if source_b64 is None:
+                active_imgs = msg.get_active_images()
+                if active_imgs:
+                    source_b64 = active_imgs[-1]
+            if source_b64 is None:
+                raise HTTPException(status_code=400, detail="Source image not found for editing.")
+
+            img_bytes = tti.edit_image(image=source_b64, prompt=prompt)
+            art_prefix = "edited_image"
+            group_type = "edited"
+        else:
+            width = int(attrs.get('width', 1024) if attrs.get('width', '').isdigit() else 1024)
+            height = int(attrs.get('height', 1024) if attrs.get('height', '').isdigit() else 1024)
+            img_bytes = tti.generate_image(prompt=prompt, width=width, height=height)
+            art_prefix = "generated_image"
+            group_type = "generated"
+
+        if not img_bytes:
+            raise HTTPException(status_code=500, detail="TTI engine returned empty image data.")
+
+        import base64
+        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+        # Add to image pack
+        msg.add_image_pack(
+            images=[img_b64],
+            group_type=group_type,
+            active_by_default=True,
+            title=attrs.get('name', f'img_{uuid.uuid4().hex[:6]}'),
+            prompt=prompt,
+        )
+
+        # Ingest as persistent workspace artifact, supporting multiple versions
+        art_title = attrs.get('name', attrs.get('title', f"{art_prefix}_{uuid.uuid4().hex[:6]}"))
+        existing_art = discussion.artefacts.get(art_title)
+
+        if existing_art is None:
+            # First creation
+            art = discussion.artefacts.add(
+                title=art_title,
+                artefact_type=ArtefactType.IMAGE,
+                content=f"### {group_type.capitalize()} Image: '{prompt}'\n\n<artefact_image id=\"{art_title}::0\" />",
+                images=[img_b64],
+                image_media_types=["image/png"],
+                active=True
+            )
+        else:
+            # Dynamic update to create a new version of the generated image
+            art = discussion.artefacts.update(
+                title=art_title,
+                new_content=f"### {group_type.capitalize()} Image (Version {existing_art.get('version', 1) + 1}): '{prompt}'\n\n<artefact_image id=\"{art_title}::{existing_art.get('version', 1)}\" />",
+                new_images=existing_art.get("images", []) + [img_b64],
+                new_image_media_types=existing_art.get("image_media_types", []) + ["image/png"],
+                bump_version=True,
+                active=True
+            )
+
+        # Retrieve the updated/newest tag so it points to the correct version's image index
+        new_tag = f'\n<artefact_image id="{art_title}::{art.get("version", 1) - 1}" />\n'
+
+        # Replace the tag with the correct artefact_image anchor pointing to the newly generated version
+        # Find the tag in current message content (since we might have updated the prompt earlier in this function)
+        fresh_match_gen = re.search(r'<generate_image\s*([^>]*)>(.*?)</generate_image>', msg.content, re.DOTALL | re.IGNORECASE)
+        fresh_match_edit = re.search(r'<edit_image\s*([^>]*)>(.*?)</edit_image>', msg.content, re.DOTALL | re.IGNORECASE)
+        fresh_match_art = re.search(r'<artefact_image\s+id=["\']([^"\']+)["\']\s*(?:\/>|>)', msg.content, re.IGNORECASE)
+        current_match = fresh_match_edit if is_edit else (fresh_match_gen or fresh_match_art)
+
+        if current_match:
+            msg.content = msg.content.replace(current_match.group(0), new_tag)
+
+        discussion.touch()
+        discussion.commit()
+
+        return {"success": True, "title": art_title, "content": msg.content}
+    except HTTPException:
+        raise
     except Exception as e:
         trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -2477,6 +2696,26 @@ async def select_workspace_endpoint(payload: WorkspaceRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class SubmitFormRequest(BaseModel):
+    answers: Dict[str, Any]
+
+
+@app.post("/api/discussions/{discussion_id}/forms/{form_id}/submit")
+async def submit_form_endpoint(discussion_id: str, form_id: str, payload: SubmitFormRequest):
+    """Injects the user's form answers directly into the active conversation context."""
+    try:
+        ok = discussion.submit_form_response(form_id, payload.answers)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Form not found or already submitted.")
+        discussion.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/api/workspaces/{name}")
 async def delete_workspace_endpoint(name: str):
     """Deletes an isolated workspace folder."""
@@ -2495,6 +2734,26 @@ async def delete_workspace_endpoint(name: str):
         shutil.rmtree(str(target_dir))
         return {"success": True}
     raise HTTPException(status_code=404, detail="Workspace not found.")
+
+
+@app.post("/api/settings/open_folder")
+async def open_settings_folder_endpoint():
+    """Opens the persistent application config directory in the OS file explorer."""
+    import subprocess
+    import platform
+    try:
+        path_str = str(APP_DIR.resolve())
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(path_str)
+        elif system == "Darwin":  # macOS
+            subprocess.Popen(["open", path_str])
+        else:  # Linux
+            subprocess.Popen(["xdg-open", path_str])
+        return {"success": True}
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/chat/clear")
@@ -2524,6 +2783,134 @@ async def cancel_chat_generation_endpoint():
             raise HTTPException(status_code=500, detail=str(e))
     return {"success": False, "error": "No active LLM binding to cancel."}
 
+
+@app.get("/api/discussions/viewer_session/messages")
+async def get_session_messages_endpoint():
+    """Retrieves the full chronological list of messages in the active branch with sibling details."""
+    try:
+        discussion._rebuild_message_index()
+        branch = discussion.get_branch(discussion.active_branch_id)
+        serialized = []
+        for m in branch:
+            siblings = discussion.get_siblings(m.id)
+            sibling_ids = [sib.id for sib in siblings]
+            active_index = sibling_ids.index(m.id) if m.id in sibling_ids else 0
+            
+            serialized.append({
+                "id": m.id,
+                "sender": m.sender,
+                "sender_type": m.sender_type,
+                "content": m.content,
+                "model_name": m.model_name or "unknown",
+                "tokens": m.tokens or 0,
+                "generation_speed": m.generation_speed or 0,
+                "metadata": m.metadata or {},
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "siblings": sibling_ids,
+                "active_sibling_index": active_index
+            })
+        return serialized
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/discussions/viewer_session/branches")
+async def get_session_branches_endpoint():
+    """Lists all leaves / branches in the current discussion."""
+    try:
+        branches = discussion.list_branches()
+        return [b.to_dict() for b in branches]
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SwitchBranchRequest(BaseModel):
+    leaf_id: str
+
+
+@app.post("/api/discussions/viewer_session/branches/switch")
+async def switch_session_branch_endpoint(payload: SwitchBranchRequest):
+    """Switches the active branch pointer to the selected leaf_id."""
+    try:
+        ok = discussion.switch_branch(payload.leaf_id)
+        if ok:
+            discussion.commit()
+            return {"success": True, "active_branch_id": discussion.active_branch_id}
+        raise HTTPException(status_code=404, detail="Selected branch leaf not found.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ForkMessageRequest(BaseModel):
+    initial_content: str
+
+
+@app.post("/api/discussions/viewer_session/messages/{message_id}/fork")
+async def fork_session_message_endpoint(message_id: str, payload: ForkMessageRequest):
+    """Forks the conversation tree starting a new branch from message_id (supports root-level None fork)."""
+    try:
+        p_id = None if (message_id == "null" or not message_id) else message_id
+        if p_id is None:
+            new_msg = discussion.add_message(
+                sender=discussion.lollmsClient.user_name if (discussion.lollmsClient and hasattr(discussion.lollmsClient, "user_name")) else "user",
+                sender_type="user",
+                content=payload.initial_content.strip(),
+                parent_id=None
+            )
+        else:
+            new_msg = discussion.fork_from(
+                message_id=p_id,
+                initial_content=payload.initial_content.strip()
+            )
+        discussion.commit()
+        return {
+            "success": True,
+            "message_id": new_msg.id,
+            "active_branch_id": discussion.active_branch_id
+        }
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/discussions/viewer_session/messages/{message_id}/siblings/cycle")
+async def cycle_message_sibling_endpoint(message_id: str, direction: int = 1):
+    """Cycles the active branch to the next/prev sibling of the specifically clicked message_id."""
+    try:
+        discussion._rebuild_message_index()
+        siblings = discussion.get_siblings(message_id)
+        if not siblings:
+            raise HTTPException(status_code=404, detail="No siblings found for this message.")
+
+        sibling_ids = [sib.id for sib in siblings]
+        if message_id not in sibling_ids:
+            raise HTTPException(status_code=404, detail="Message not found among siblings.")
+
+        current_idx = sibling_ids.index(message_id)
+        new_idx = (current_idx + direction) % len(siblings)
+        new_sibling = siblings[new_idx]
+
+        # Find the deepest leaf under the selected sibling to switch the branch cleanly
+        new_leaf = discussion._find_deepest_leaf(new_sibling.id) or new_sibling.id
+        discussion.active_branch_id = new_leaf
+        discussion.touch()
+        discussion.commit()
+
+        return {
+            "success": True,
+            "message_id": new_sibling.id,
+            "active_branch_id": discussion.active_branch_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Mount static folder
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

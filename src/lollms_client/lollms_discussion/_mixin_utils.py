@@ -88,7 +88,31 @@ class UtilsMixin:
         _scratchpad = getattr(self, "scratchpad", "") or ""
 
         def get_full_content(msg):
-            return msg.content.strip()
+            content = msg.content.strip()
+            if msg.sender_type == 'assistant':
+                # Strip completed/closed processing blocks
+                content = re.sub(
+                    r'<processing.*?>.*?</processing>',
+                    '',
+                    content, flags=re.DOTALL | re.IGNORECASE
+                )
+                # Strip any unclosed processing tags
+                content = re.sub(
+                    r'<processing[^>]*>',
+                    '',
+                    content, flags=re.IGNORECASE
+                )
+                # Strip any remaining closing tags
+                content = content.replace("</processing>", "")
+                # Strip framework-emitted status, checklist lines, and actions
+                lines = []
+                for line in content.splitlines():
+                    l_strip = line.strip()
+                    if l_strip.startswith(("*", "✓", "🏗️", "🔧", "✅", "❌", "·ᴽЧØс·", "[BLIND_ACTION_EXECUTED]")):
+                        continue
+                    lines.append(line)
+                content = "\n".join(lines).strip()
+            return content
 
         # Helper: find the forward index of the last user message in a list
         def _last_user_index(branch_list):
@@ -501,19 +525,21 @@ class UtilsMixin:
     def get_active_images(self, branch_tip_id=None):
         """
         Returns all active images for the chat context:
-        discussion-level images + per-message active images.
-
-        Artefact images (``ArtefactType.IMAGE``) are intentionally excluded here.
-        They live in ``message.images`` once generated, and can be accessed
-        separately via ``self.artefacts.get_active_images()`` for UI/export use.
+        discussion-level images + per-message active images + active artifact images.
         """
         discussion_imgs = self.get_discussion_images()
         active = [i['data'] for i in discussion_imgs if i.get('active', True)]
         branch = self.get_branch(branch_tip_id or self.active_branch_id)
-        if not branch:
-            return active
-        for msg in branch:
-            active.extend(msg.get_active_images())
+        if branch:
+            for msg in branch:
+                active.extend(msg.get_active_images())
+
+        # Merge active image-type artifacts so the LLM gets the selected version's pixels
+        active_art_images = self.artefacts.get_context_images()
+        for img in active_art_images:
+            if img.get("data") and img["data"] not in active:
+                active.append(img["data"])
+
         return active
 
     def switch_to_branch(self, branch_id):

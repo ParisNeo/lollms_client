@@ -33,12 +33,16 @@ def _parse_html_slides(html_content: str) -> List[Dict[str, Any]]:
             for li in re.findall(r'<li[^>]*>(.*?)</li>', sec, re.DOTALL | re.IGNORECASE):
                 bullets.append(re.sub(r'<[^>]+>', '', li).strip())
 
+            img_match = re.search(r'<artefact_image\s+id=["\']([^"\']+)["\']', sec, re.IGNORECASE)
+            image_id = img_match.group(1) if img_match else None
+
             slides.append({
                 "index": idx,
                 "title": title,
                 "subtitle": subtitle,
                 "bullets": [b for b in bullets if b],
-                "notes": notes
+                "notes": notes,
+                "image_id": image_id
             })
         return slides
 
@@ -73,12 +77,17 @@ def _parse_html_slides(html_content: str) -> List[Dict[str, Any]]:
             h = sec.find(["h1", "h2"])
             title = h.get_text().strip()
 
+        # Find image anchor inside slide section
+        img_match = re.search(r'<artefact_image\s+id=["\']([^"\']+)["\']', str(sec), re.IGNORECASE)
+        image_id = img_match.group(1) if img_match else None
+
         slides.append({
             "index": idx,
             "title": title,
             "subtitle": subtitle,
             "bullets": bullets,
-            "notes": notes
+            "notes": notes,
+            "image_id": image_id
         })
 
     return slides
@@ -127,6 +136,8 @@ class ExportMixin:
                 return self._export_text_as_docx(art), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             elif fmt == "pptx":
                 return self._export_text_as_pptx(art), "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            elif fmt == "zip":
+                return self._export_as_zip(art), "application/zip"
             else:
                 raise ValueError(f"Unsupported export format '{export_format}' for text artifacts.")
 
@@ -171,19 +182,69 @@ class ExportMixin:
     def _export_text_as_pdf(self, art: Dict[str, Any]) -> bytes:
         import pipmaster as pm
         pm.ensure_packages("reportlab")
-        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.pagesizes import letter, landscape
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib import colors
 
         content = art.get("content", "")
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=54, leftMargin=54, topMargin=54, bottomMargin=54)
+        atype = art.get("type", "document")
+        is_presentation = atype == "presentation" or "article class=\"presentation\"" in content
+
+        # Define custom background drawer to match the dark aesthetic "vibes" (#0b0f19)
+        def draw_dark_background(canvas, document):
+            canvas.saveState()
+            canvas.setFillColor(colors.HexColor('#0b0f19'))
+            canvas.rect(0, 0, document.pagesize[0], document.pagesize[1], fill=1, stroke=0)
+            canvas.restoreState()
+
+        if is_presentation:
+            doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), rightMargin=54, leftMargin=54, topMargin=54, bottomMargin=54)
+        else:
+            doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=54, leftMargin=54, topMargin=54, bottomMargin=54)
 
         styles = getSampleStyleSheet()
         story = []
 
-        # Title
+        if is_presentation:
+            slides_data = _parse_html_slides(content)
+            if slides_data:
+                h1_style = ParagraphStyle('H1Style', parent=styles['Heading2'], fontSize=24, leading=28, spaceBefore=12, spaceAfter=8, textColor=colors.HexColor('#f8fafc'))
+                h2_style = ParagraphStyle('H2Style', parent=styles['Heading3'], fontSize=16, leading=20, spaceBefore=10, spaceAfter=6, textColor=colors.HexColor('#94a3b8'))
+                normal_style = ParagraphStyle('NormalStyle', parent=styles['Normal'], fontSize=12, leading=16, spaceAfter=10, textColor=colors.HexColor('#cbd5e1'))
+                notes_style = ParagraphStyle('NotesStyle', parent=normal_style, fontName='Helvetica-Oblique', fontSize=10, leading=13, textColor=colors.HexColor('#a0a0c0'))
+
+                for s_idx, s_data in enumerate(slides_data):
+                    if s_idx > 0:
+                        story.append(PageBreak())
+                    story.append(Paragraph(f"Slide {s_idx + 1}: {s_data['title']}", h1_style))
+                    if s_data["subtitle"]:
+                        story.append(Paragraph(s_data["subtitle"], h2_style))
+                    story.append(Spacer(1, 15))
+                    for bullet in s_data["bullets"]:
+                        story.append(Paragraph(f"• {bullet}", normal_style))
+
+                    # Embed active image artifacts if generated in this slide
+                    if s_data.get("image_id"):
+                        img_bytes = self._get_image_bytes_by_id(s_data["image_id"])
+                        if img_bytes:
+                            from reportlab.platypus import Image as RLImage
+                            try:
+                                rl_img = RLImage(io.BytesIO(img_bytes), width=240, height=135)
+                                story.append(Spacer(1, 10))
+                                story.append(rl_img)
+                            except Exception as img_err:
+                                ASCIIColors.warning(f"Failed to embed image in PDF: {img_err}")
+
+                    if s_data["notes"]:
+                        story.append(Spacer(1, 15))
+                        story.append(Paragraph(f"<i>Speaker Notes:</i> {s_data['notes']}", notes_style))
+
+                doc.build(story, onFirstPage=draw_dark_background, onLaterPages=draw_dark_background)
+                return buffer.getvalue()
+
+        # Title (for standard documents only)
         title_style = ParagraphStyle(
             'TitleStyle',
             parent=styles['Heading1'],
@@ -193,35 +254,6 @@ class ExportMixin:
             spaceAfter=20
         )
         story.append(Paragraph(art["title"], title_style))
-
-        atype = art.get("type", "document")
-        if atype == "presentation" or "article class=\"presentation\"" in content:
-            slides_data = _parse_html_slides(content)
-            if slides_data:
-                normal_style = styles['Normal']
-                normal_style.fontSize = 12
-                normal_style.leading = 16
-                normal_style.spaceAfter = 10
-
-                h1_style = ParagraphStyle('H1Style', parent=styles['Heading2'], fontSize=20, leading=24, spaceBefore=12, spaceAfter=8, textColor=colors.HexColor('#0f172a'))
-                h2_style = ParagraphStyle('H2Style', parent=styles['Heading3'], fontSize=15, leading=18, spaceBefore=10, spaceAfter=6, textColor=colors.HexColor('#334155'))
-
-                for s_idx, s_data in enumerate(slides_data):
-                    if s_idx > 0:
-                        story.append(PageBreak())
-                    story.append(Paragraph(f"Slide {s_idx + 1}: {s_data['title']}", h1_style))
-                    if s_data["subtitle"]:
-                        story.append(Paragraph(s_data["subtitle"], h2_style))
-                    story.append(Spacer(1, 10))
-                    for bullet in s_data["bullets"]:
-                        story.append(Paragraph(f"• {bullet}", normal_style))
-                    if s_data["notes"]:
-                        story.append(Spacer(1, 15))
-                        notes_style = ParagraphStyle('NotesStyle', parent=normal_style, fontName='Helvetica-Oblique', fontSize=10, leading=13, textColor=colors.HexColor('#475569'))
-                        story.append(Paragraph(f"<i>Speaker Notes:</i> {s_data['notes']}", notes_style))
-
-                doc.build(story)
-                return buffer.getvalue()
 
         # Parse simple markdown into Paragraphs
         normal_style = styles['Normal']
@@ -324,11 +356,29 @@ class ExportMixin:
         pm.ensure_packages("python-pptx")
         from pptx import Presentation
         from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor
 
         content = art.get("content", "")
         prs = Presentation()
 
         atype = art.get("type", "document")
+        is_dark = 'data-theme="dark"' in content.lower()
+
+        if is_dark:
+            title_color = RGBColor(248, 250, 252)  # #f8fafc
+            text_color = RGBColor(203, 213, 225)   # #cbd5e1
+        else:
+            title_color = RGBColor(15, 23, 42)     # #0f172a
+            text_color = RGBColor(51, 65, 85)      # #334155
+
+        def _apply_text_color(shape, color):
+            if not shape.has_text_frame:
+                return
+            for p in shape.text_frame.paragraphs:
+                p.font.color.rgb = color
+                for r in p.runs:
+                    r.font.color.rgb = color
+
         if atype == "presentation" or "article class=\"presentation\"" in content:
             slides_data = _parse_html_slides(content)
             if slides_data:
@@ -336,9 +386,17 @@ class ExportMixin:
                 first = slides_data[0]
                 slide_layout = prs.slide_layouts[0]
                 slide = prs.slides.add_slide(slide_layout)
+                
+                if is_dark:
+                    slide.background.fill.solid()
+                    slide.background.fill.fore_color.rgb = RGBColor(9, 9, 11)  # #09090b
+                
                 slide.shapes.title.text = first["title"] or art["title"]
+                _apply_text_color(slide.shapes.title, title_color)
+                
                 if len(slide.placeholders) > 1:
                     slide.placeholders[1].text = first["subtitle"] or "Exported from LoLLMS"
+                    _apply_text_color(slide.placeholders[1], text_color)
                 if first["notes"] and slide.notes_slide:
                     slide.notes_slide.notes_text_frame.text = first["notes"]
 
@@ -346,13 +404,67 @@ class ExportMixin:
                 slide_layout_content = prs.slide_layouts[1]
                 for s_data in slides_data[1:]:
                     slide = prs.slides.add_slide(slide_layout_content)
+                    
+                    if is_dark:
+                        slide.background.fill.solid()
+                        slide.background.fill.fore_color.rgb = RGBColor(9, 9, 11)  # #09090b
+                    
                     slide.shapes.title.text = s_data["title"]
+                    _apply_text_color(slide.shapes.title, title_color)
+                    
                     tf = slide.placeholders[1].text_frame
-                    tf.text = s_data["subtitle"] if s_data["subtitle"] else ""
+                    
+                    first_para = True
+                    if s_data["subtitle"]:
+                        tf.paragraphs[0].text = s_data["subtitle"]
+                        _apply_text_color(slide.placeholders[1], text_color)
+                        first_para = False
+                    
                     for bullet in s_data["bullets"]:
-                        p = tf.add_paragraph()
-                        p.text = bullet
-                        p.level = 0
+                        # Clean bullet text: normalize spaces and strip newlines to prevent text wrapping on next line
+                        bullet_clean = " ".join(bullet.split())
+                        # Remove leading special bullet symbols to prevent duplicate bullets in PowerPoint
+                        bullet_clean = re.sub(r'^[▶◆●■•\*\-\s\d\.\)]+', '', bullet_clean).strip()
+                        if not bullet_clean:
+                            continue
+                        
+                        if first_para:
+                            p = tf.paragraphs[0]
+                            p.text = bullet_clean
+                            p.level = 0
+                            first_para = False
+                        else:
+                            p = tf.add_paragraph()
+                            p.text = bullet_clean
+                            p.level = 0
+                        
+                        # Apply custom text color inside the paragraph runs
+                        p.font.color.rgb = text_color
+                        for r in p.runs:
+                            r.font.color.rgb = text_color
+                            
+                    # Add Image if found on the slide
+                    if s_data.get("image_id"):
+                        # Resize text placeholder to left half safely by preserving its inherited coordinates
+                        tf_shape = slide.placeholders[1]
+                        orig_left = tf_shape.left
+                        orig_top = tf_shape.top
+                        orig_height = tf_shape.height
+                        
+                        tf_shape.left = orig_left
+                        tf_shape.top = orig_top
+                        tf_shape.width = Inches(5.0)
+                        tf_shape.height = orig_height
+                        
+                        img_bytes = self._get_image_bytes_by_id(s_data["image_id"])
+                        if img_bytes:
+                            slide.shapes.add_picture(
+                                io.BytesIO(img_bytes),
+                                left=Inches(6.2),
+                                top=orig_top,
+                                width=Inches(3.5)
+                            )
+
                     if s_data["notes"] and slide.notes_slide:
                         slide.notes_slide.notes_text_frame.text = s_data["notes"]
 
@@ -469,3 +581,264 @@ class ExportMixin:
         except Exception as e:
             trace_exception(e)
             raise RuntimeError(f"Excel export failed: {e}")
+
+def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
+    import base64
+    parts = image_id.split("::")
+    if len(parts) < 2:
+        return None
+    try:
+        img_index = int(parts[-1])
+    except ValueError:
+        return None
+    title = "::".join(parts[:-1])
+
+    # Check both main and companion
+    main_art = self.artefacts.get(title)
+    comp_art = self.artefacts.get(f"{title}::images")
+
+    target_art = None
+    target_index = None
+
+    if comp_art and img_index < len(comp_art.get("images", [])):
+        target_art = comp_art
+        target_index = img_index
+    elif main_art and img_index < len(main_art.get("images", [])):
+        target_art = main_art
+        target_index = img_index
+
+    if target_art:
+        imgs = target_art.get("images", [])
+        if 0 <= target_index < len(imgs):
+            b64_str = imgs[target_index]
+            if b64_str:
+                if ";base64," in b64_str:
+                    b64_str = b64_str.split(";base64,")[1]
+                return base64.b64decode(b64_str)
+    return None
+
+def _export_as_zip(self, art: Dict[str, Any]) -> bytes:
+    import zipfile
+    import io
+    import base64
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        content = art.get("content", "")
+        title = art["title"]
+
+        # 1. Parse and extract all embedded image anchors
+        img_pattern = re.compile(r'<artefact_image\s+id=["\']([^"\']+)["\']', re.IGNORECASE)
+        image_ids = img_pattern.findall(content)
+
+        # Track replaced image paths to update HTML refs
+        replacements = {}
+        for img_id in image_ids:
+            if "::" in img_id:
+                img_bytes = self._get_image_bytes_by_id(img_id)
+                if img_bytes:
+                    parts = img_id.split("::")
+                    img_index = int(parts[-1])
+                    img_title = "::".join(parts[:-1])
+                    # Save image to zip under images/
+                    safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{img_title}_{img_index}.png")
+                    zip_image_path = f"images/{safe_filename}"
+                    z.writestr(zip_image_path, img_bytes)
+                    replacements[img_id] = zip_image_path
+
+        # 2. Update all <artefact_image> XML tags with relative <img> links in the zip's HTML index
+        updated_content = content
+        for img_id, rel_path in replacements.items():
+            tag_pattern = re.compile(rf'<artefact_image\s+id=["\']{re.escape(img_id)}["\']\s*(?:\/>|>)', re.IGNORECASE)
+            updated_content = tag_pattern.sub(f'<img src="{rel_path}" style="width:100%; height:100%; object-fit:cover;" />', updated_content)
+
+        # Write the main index file to the zip
+        index_filename = f"{title}.html" if not title.endswith(".html") else title
+        z.writestr(index_filename, updated_content.encode("utf-8"))
+
+        # 3. Search and bundle any sister/companion files (e.g., CSS/JS artifacts)
+        related = self.artefacts.list()
+        for r in related:
+            r_title = r["title"]
+            if r_title != title and (r_title.startswith(title.split(".")[0]) or r_title == f"{title}::images"):
+                if r_title == f"{title}::images":
+                    continue  # Images already processed individually
+                r_content = r.get("content", "")
+                if r_content:
+                    z.writestr(r_title, r_content.encode("utf-8"))
+
+    return buffer.getvalue()
+
+def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
+    import base64
+    parts = image_id.split("::")
+    if len(parts) < 2:
+        return None
+    try:
+        img_index = int(parts[-1])
+    except ValueError:
+        return None
+    title = "::".join(parts[:-1])
+
+    # Check both main and companion
+    main_art = self.artefacts.get(title)
+    comp_art = self.artefacts.get(f"{title}::images")
+
+    target_art = None
+    target_index = None
+
+    if comp_art and img_index < len(comp_art.get("images", [])):
+        target_art = comp_art
+        target_index = img_index
+    elif main_art and img_index < len(main_art.get("images", [])):
+        target_art = main_art
+        target_index = img_index
+
+    if target_art:
+        imgs = target_art.get("images", [])
+        if 0 <= target_index < len(imgs):
+            b64_str = imgs[target_index]
+            if b64_str:
+                if ";base64," in b64_str:
+                    b64_str = b64_str.split(";base64,")[1]
+                return base64.b64decode(b64_str)
+    return None
+
+def _export_as_zip(self, art: Dict[str, Any]) -> bytes:
+    import zipfile
+    import io
+    import base64
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        content = art.get("content", "")
+        title = art["title"]
+
+        # 1. Parse and extract all embedded image anchors
+        img_pattern = re.compile(r'<artefact_image\s+id=["\']([^"\']+)["\']', re.IGNORECASE)
+        image_ids = img_pattern.findall(content)
+
+        # Track replaced image paths to update HTML refs
+        replacements = {}
+        for img_id in image_ids:
+            if "::" in img_id:
+                img_bytes = self._get_image_bytes_by_id(img_id)
+                if img_bytes:
+                    parts = img_id.split("::")
+                    img_index = int(parts[-1])
+                    img_title = "::".join(parts[:-1])
+                    # Save image to zip under images/
+                    safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{img_title}_{img_index}.png")
+                    zip_image_path = f"images/{safe_filename}"
+                    z.writestr(zip_image_path, img_bytes)
+                    replacements[img_id] = zip_image_path
+
+        # 2. Update all <artefact_image> XML tags with relative <img> links in the zip's HTML index
+        updated_content = content
+        for img_id, rel_path in replacements.items():
+            tag_pattern = re.compile(rf'<artefact_image\s+id=["\']{re.escape(img_id)}["\']\s*(?:\/>|>)', re.IGNORECASE)
+            updated_content = tag_pattern.sub(f'<img src="{rel_path}" style="width:100%; height:100%; object-fit:cover;" />', updated_content)
+
+        # Write the main index file to the zip
+        index_filename = f"{title}.html" if not title.endswith(".html") else title
+        z.writestr(index_filename, updated_content.encode("utf-8"))
+
+        # 3. Search and bundle any sister/companion files (e.g., CSS/JS artifacts)
+        related = self.artefacts.list()
+        for r in related:
+            r_title = r["title"]
+            if r_title != title and (r_title.startswith(title.split(".")[0]) or r_title == f"{title}::images"):
+                if r_title == f"{title}::images":
+                    continue  # Images already processed individually
+                r_content = r.get("content", "")
+                if r_content:
+                    z.writestr(r_title, r_content.encode("utf-8"))
+
+    return buffer.getvalue()
+
+    def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
+        import base64
+        parts = image_id.split("::")
+        if len(parts) < 2:
+            return None
+        try:
+            img_index = int(parts[-1])
+        except ValueError:
+            return None
+        title = "::".join(parts[:-1])
+
+        # Check both main and companion
+        main_art = self.artefacts.get(title)
+        comp_art = self.artefacts.get(f"{title}::images")
+
+        target_art = None
+        target_index = None
+
+        if comp_art and img_index < len(comp_art.get("images", [])):
+            target_art = comp_art
+            target_index = img_index
+        elif main_art and img_index < len(main_art.get("images", [])):
+            target_art = main_art
+            target_index = img_index
+
+        if target_art:
+            imgs = target_art.get("images", [])
+            if 0 <= target_index < len(imgs):
+                b64_str = imgs[target_index]
+                if b64_str:
+                    if ";base64," in b64_str:
+                        b64_str = b64_str.split(";base64,")[1]
+                    return base64.b64decode(b64_str)
+        return None
+
+    def _export_as_zip(self, art: Dict[str, Any]) -> bytes:
+        import zipfile
+        import io
+        import base64
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+            content = art.get("content", "")
+            title = art["title"]
+
+            # 1. Parse and extract all embedded image anchors
+            img_pattern = re.compile(r'<artefact_image\s+id=["\']([^"\']+)["\']', re.IGNORECASE)
+            image_ids = img_pattern.findall(content)
+
+            # Track replaced image paths to update HTML refs
+            replacements = {}
+            for img_id in image_ids:
+                if "::" in img_id:
+                    img_bytes = self._get_image_bytes_by_id(img_id)
+                    if img_bytes:
+                        parts = img_id.split("::")
+                        img_index = int(parts[-1])
+                        img_title = "::".join(parts[:-1])
+                        # Save image to zip under images/
+                        safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{img_title}_{img_index}.png")
+                        zip_image_path = f"images/{safe_filename}"
+                        z.writestr(zip_image_path, img_bytes)
+                        replacements[img_id] = zip_image_path
+
+            # 2. Update all <artefact_image> XML tags with relative <img> links in the zip's HTML index
+            updated_content = content
+            for img_id, rel_path in replacements.items():
+                tag_pattern = re.compile(rf'<artefact_image\s+id=["\']{re.escape(img_id)}["\']\s*(?:\/>|>)', re.IGNORECASE)
+                updated_content = tag_pattern.sub(f'<img src="{rel_path}" style="width:100%; height:100%; object-fit:cover;" />', updated_content)
+
+            # Write the main index file to the zip
+            index_filename = f"{title}.html" if not title.endswith(".html") else title
+            z.writestr(index_filename, updated_content.encode("utf-8"))
+
+            # 3. Search and bundle any sister/companion files (e.g., CSS/JS artifacts)
+            related = self.artefacts.list()
+            for r in related:
+                r_title = r["title"]
+                if r_title != title and (r_title.startswith(title.split(".")[0]) or r_title == f"{title}::images"):
+                    if r_title == f"{title}::images":
+                        continue  # Images already processed individually
+                    r_content = r.get("content", "")
+                    if r_content:
+                        z.writestr(r_title, r_content.encode("utf-8"))
+
+        return buffer.getvalue()

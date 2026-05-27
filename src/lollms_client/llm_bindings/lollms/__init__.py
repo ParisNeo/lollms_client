@@ -98,9 +98,14 @@ class LollmsBinding(LollmsLLMBinding):
             personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
         """
         super().__init__(BindingName, **kwargs)
-        self.host_address=kwargs.get("host_address","http://localhost:9642/v1").rstrip("/")
-        if not self.host_address.endswith("v1"):
-            self.host_address += "/v1"  
+        host = kwargs.get("host_address", "http://localhost:9642").rstrip("/")
+        if host.endswith("/lollms/v1"):
+            host = host[:-10].rstrip("/")
+        elif host.endswith("/v1"):
+            host = host[:-3].rstrip("/")
+
+        self.base_address = host
+        self.host_address = f"{self.base_address}/v1"
         self.model_name=kwargs.get("model_name")
         self.service_key=kwargs.get("service_key")
         self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
@@ -117,15 +122,15 @@ class LollmsBinding(LollmsLLMBinding):
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     def lollms_listMountedPersonalities(self, host_address:str|None=None):
-        host_address = host_address if host_address else self.host_address
-        url = f"{host_address}/personalities"
+        base = host_address.replace("/v1", "").replace("/lollms/v1", "").rstrip("/") if host_address else self.base_address
+        url = f"{base}/personalities"
 
         headers = {
             "Authorization": f"Bearer {self.service_key}",
             "Accept": "application/json",
         }
 
-        response = requests.get(url, headers=headers, timeout=30)
+        response = requests.get(url, headers=headers, timeout=5)
 
         if response.status_code == 200:
             try:
@@ -133,8 +138,18 @@ class LollmsBinding(LollmsLLMBinding):
                 return text
             except Exception as ex:
                 return {"status": False, "error": str(ex)}
-        else:
-            return {"status": False, "error": response.text}
+
+        # Fallback to personalities under alternative prefixes
+        for fallback_url in (f"{base}/v1/personalities", f"{base}/lollms/v1/personalities"):
+            try:
+                response = requests.get(fallback_url, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    text = json.loads(response.content.decode("utf-8"))
+                    return text
+            except Exception:
+                pass
+
+        return {"status": False, "error": f"Failed to list personalities: HTTP {response.status_code}"}
 
   
     def _build_openai_params(self, messages: list, **kwargs) -> dict:
@@ -501,19 +516,35 @@ class LollmsBinding(LollmsLLMBinding):
         return output    
     def tokenize(self, text: str) -> list:
         """
-        Tokenize the input text into a list of characters.
-
-        Args:
-            text (str): The text to tokenize.
-
-        Returns:
-            list: List of individual characters.
+        Tokenize the input text using the remote tokenize endpoint or fallback.
         """
+        if text is None:
+            return []
+
+        try:
+            url = f"{self.host_address}/tokenize"
+            headers = {}
+            if self.service_key:
+                headers["Authorization"] = f"Bearer {self.service_key}"
+
+            payload = {
+                "model": self.model_name,
+                "text": text
+            }
+
+            response = requests.post(url, json=payload, headers=headers, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if "tokens" in data:
+                    return data["tokens"]
+        except Exception as e:
+            ASCIIColors.warning(f"Remote tokenization failed: {e}. Falling back to local tiktoken.")
+
         try:
             return tiktoken.model.encoding_for_model(self.model_name).encode(text)
-        except:
+        except Exception:
             return tiktoken.model.encoding_for_model("gpt-3.5-turbo").encode(text)
-            
+
     def detokenize(self, tokens: list) -> str:
         """
         Convert a list of tokens back to text.
@@ -531,15 +562,63 @@ class LollmsBinding(LollmsLLMBinding):
 
     def count_tokens(self, text: str) -> int:
         """
-        Count tokens from a text.
+        Count tokens from a text using the remote tokenize endpoint or fallback.
+        """
+        if text is None:
+            return 0
 
-        Args:
-            tokens (list): List of tokens to detokenize.
+        try:
+            url = f"{self.host_address}/tokenize"
+            headers = {}
+            if self.service_key:
+                headers["Authorization"] = f"Bearer {self.service_key}"
 
-        Returns:
-            int: Number of tokens in text.
-        """        
+            payload = {
+                "model": self.model_name,
+                "text": text
+            }
+
+            response = requests.post(url, json=payload, headers=headers, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if "count" in data:
+                    return int(data["count"])
+                elif "tokens" in data:
+                    return len(data["tokens"])
+        except Exception as e:
+            ASCIIColors.warning(f"Remote token count failed: {e}. Falling back to local count.")
+
         return len(self.tokenize(text))
+
+    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
+        """
+        Retrieves the exact context size of the model from the remote lollms server.
+        """
+        target_model = model_name or self.model_name
+        if not target_model:
+            return self.default_ctx_size
+
+        try:
+            # Construct the lollms specific v1 endpoint URL
+            url = f"{self.base_address}/lollms/v1/context_size"
+
+            headers = {}
+            if self.service_key:
+                headers["Authorization"] = f"Bearer {self.service_key}"
+
+            payload = {"model": target_model}
+
+            response = requests.post(url, json=payload, headers=headers, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if "context_size" in data:
+                    size = int(data["context_size"])
+                    ASCIIColors.warning(f"Using remote context size for model '{target_model}': {size}")
+                    return size
+        except Exception as e:
+            ASCIIColors.warning(f"Could not retrieve remote context size for '{target_model}': {e}. Falling back to default.")
+
+        return super().get_ctx_size(model_name)
 
         
     def embed(self, text: str, **kwargs) -> list:

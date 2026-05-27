@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🧠 LoLLMS Creative Image Editor</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg-editor: #0f172a;
+            --bg-bar: #1e293b;
+            --border-color: #334155;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent-color: #f59e0b;
+            --accent-hover: #d97706;
+            --success-color: #10b981;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-editor);
+            color: var(--text-primary);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Header */
+        header {
+            background-color: var(--bg-bar);
+            border-bottom: 1px solid var(--border-color);
+            padding: 14px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 10;
+        }
+
+        h1 {
+            font-size: 16px;
+            font-weight: 700;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 12px;
+        }
+
+        .btn {
+            background-color: var(--border-color);
+            color: var(--text-primary);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 12.5px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn:hover {
+            background-color: #475569;
+        }
+
+        .btn-primary {
+            background-color: var(--accent-color);
+            color: #020617;
+        }
+
+        .btn-primary:hover {
+            background-color: var(--accent-hover);
+        }
+
+        /* Editor Workspace */
+        .workspace {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* Left Toolbar */
+        .toolbar-left {
+            width: 70px;
+            background-color: var(--bg-bar);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px 0;
+            gap: 12px;
+        }
+
+        .tool-btn {
+            background: none;
+            border: 1px solid transparent;
+            color: var(--text-secondary);
+            width: 44px;
+            height: 44px;
+            border-radius: 8px;
+            font-size: 20px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s;
+        }
+
+        .tool-btn:hover {
+            color: var(--text-primary);
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        .tool-btn.active {
+            color: var(--accent-color);
+            background-color: rgba(245, 158, 11, 0.1);
+            border-color: var(--accent-color);
+        }
+
+        /* Central Canvas Viewport */
+        .canvas-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: auto;
+            padding: 20px;
+            /* Photoshop Transparency Grid */
+            background-color: #111827;
+            background-image: linear-gradient(45deg, #1f2937 25%, transparent 25%),
+                              linear-gradient(-45deg, #1f2937 25%, transparent 25%),
+                              linear-gradient(45deg, transparent 75%, #1f2937 75%),
+                              linear-gradient(-45deg, transparent 75%, #1f2937 75%);
+            background-size: 20px 20px;
+            background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+        }
+
+        canvas {
+            border: 1px dashed var(--border-color);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            cursor: crosshair;
+            max-width: 100%;
+            max-height: 100%;
+        }
+
+        /* Right Panel */
+        .properties-panel {
+            width: 280px;
+            background-color: var(--bg-bar);
+            border-left: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            gap: 24px;
+            overflow-y: auto;
+        }
+
+        h3 {
+            font-size: 12px;
+            color: var(--accent-color);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 4px;
+        }
+
+        .setting-row {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 14px;
+        }
+
+        .setting-row label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+
+        .setting-row input[type="range"] {
+            width: 100%;
+            accent-color: var(--accent-color);
+            cursor: pointer;
+        }
+
+        .setting-row input[type="text"], .setting-row input[type="number"], .setting-row select {
+            background-color: var(--bg-editor);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            outline: none;
+        }
+
+        /* History States List */
+        .history-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .history-item {
+            background-color: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-color);
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1 id="editor-title">🧠 LoLLMS Creative Image Editor — Loading...</h1>
+        <div class="header-actions">
+            <button class="btn" id="btn-undo" title="Undo action (Ctrl+Z)">↩️ Undo</button>
+            <button class="btn" id="btn-redo" title="Redo action (Ctrl+Y)">↪️ Redo</button>
+            <button class="btn" id="btn-download" title="Download image to local computer">📥 Download PNG</button>
+            <button class="btn btn-primary" id="btn-save" title="Save & commit edited image as a new database version">💾 Save & Ingest</button>
+        </div>
+    </header>
+
+    <main class="workspace">
+        <!-- Tools Sidebar -->
+        <aside class="toolbar-left">
+            <button class="tool-btn active" id="tool-brush" data-tool="brush" title="Paint Brush">🖌️</button>
+            <button class="tool-btn" id="tool-eraser" data-tool="eraser" title="Eraser">🧼</button>
+            <button class="tool-btn" id="tool-text" data-tool="text" title="Insert Text Label">📝</button>
+            <button class="tool-btn" id="tool-crop" data-tool="crop" title="Selection Crop (Click & Drag rectangle, then release)">✂️</button>
+            <button class="tool-btn" id="tool-rotate" data-tool="rotate" title="Rotate 90° Clockwise">🔄</button>
+        </aside>
+
+        <!-- Main Canvas Viewport -->
+        <section class="canvas-container">
+            <canvas id="editor-canvas"></canvas>
+        </section>
+
+        <!-- Right Properties Panel -->
+        <aside class="properties-panel">
+            <!-- Tool Settings Section -->
+            <div id="section-tool-props">
+                <h3>🛠️ Tool Options</h3>
+                <div class="setting-row" id="row-color">
+                    <label>Color</label>
+                    <input type="color" id="tool-color" value="#f59e0b" style="width: 100%; height: 32px; border: none; cursor: pointer; background: none;">
+                </div>
+                <div class="setting-row" id="row-brush-size">
+                    <label>Brush Size (1 - 100)</label>
+                    <input type="range" id="tool-brush-size" min="1" max="100" value="10">
+                </div>
+                <div class="setting-row" id="row-text-content" style="display: none;">
+                    <label>Text Label</label>
+                    <input type="text" id="tool-text-content" value="LoLLMS Artwork">
+                    <label style="margin-top: 8px;">Font Size</label>
+                    <input type="number" id="tool-text-size" value="32">
+                </div>
+            </div>
+
+            <!-- Adjustment Sliders Section -->
+            <div id="section-adjustments">
+                <h3>🌓 Adjustment Layers</h3>
+                <div class="setting-row">
+                    <label id="lbl-brightness">Brightness (100%)</label>
+                    <input type="range" id="adj-brightness" min="0" max="200" value="100">
+                </div>
+                <div class="setting-row">
+                    <label id="lbl-contrast">Contrast (100%)</label>
+                    <input type="range" id="adj-contrast" min="0" max="200" value="100">
+                </div>
+                <div class="setting-row">
+                    <label id="lbl-saturation">Saturation (100%)</label>
+                    <input type="range" id="adj-saturation" min="0" max="200" value="100">
+                </div>
+                <div class="setting-row">
+                    <label id="lbl-blur">Blur (0px)</label>
+                    <input type="range" id="adj-blur" min="0" max="20" value="0">
+                </div>
+                <div class="setting-row">
+                    <label id="lbl-grayscale">Grayscale (0%)</label>
+                    <input type="range" id="adj-grayscale" min="0" max="100" value="0">
+                </div>
+                <div class="setting-row">
+                    <label id="lbl-sepia">Sepia (0%)</label>
+                    <input type="range" id="adj-sepia" min="0" max="100" value="0">
+                </div>
+                <div class="setting-row">
+                    <label id="lbl-invert">Invert (0%)</label>
+                    <input type="range" id="adj-invert" min="0" max="100" value="0">
+                </div>
+                <button class="btn btn-primary" id="btn-apply-filters" style="width: 100%; justify-content: center;">Bake Filters into Image</button>
+            </div>
+
+            <!-- History log -->
+            <div>
+                <h3>📜 Layer History</h3>
+                <ul class="history-list" id="history-list">
+                    <li class="history-item">Baseline loaded</li>
+                </ul>
+            </div>
+        </aside>
+    </main>
+
+    <script>
+        // ── 🔔 Modern Toast Notification System ──
+        function showNotification(message, type = "info", duration = 4500) {
+            // Dynamically inject CSS keyframes if missing
+            if (!document.getElementById("toast-animation-styles")) {
+                const style = document.createElement("style");
+                style.id = "toast-animation-styles";
+                style.textContent = `
+                    @keyframes slideIn {
+                        from { transform: translateY(-30px); opacity: 0; }
+                        to { transform: translateY(0); opacity: 1; }
+                    }
+                `;
+                document.head.appendChild(style);
+            }
+
+            let container = document.getElementById("notification-container");
+            if (!container) {
+                container = document.createElement("div");
+                container.id = "notification-container";
+                container.style.position = "fixed";
+                container.style.top = "24px";
+                container.style.right = "24px";
+                container.style.zIndex = "200000";
+                container.style.display = "flex";
+                container.style.flexDirection = "column";
+                container.style.gap = "12px";
+                container.style.maxWidth = "380px";
+                container.style.width = "calc(100% - 48px)";
+                container.style.pointerEvents = "none";
+                document.body.appendChild(container);
+            }
+
+            const toast = document.createElement("div");
+            toast.className = `toast-notification ${type}`;
+            toast.style.padding = "14px 18px";
+            toast.style.borderRadius = "8px";
+            toast.style.color = "#ffffff";
+            toast.style.fontSize = "13px";
+            toast.style.fontWeight = "600";
+            toast.style.boxShadow = "0 10px 25px rgba(0, 0, 0, 0.4)";
+            toast.style.display = "flex";
+            toast.style.alignItems = "center";
+            toast.style.gap = "10px";
+            toast.style.pointerEvents = "auto";
+            toast.style.animation = "slideIn 0.25s ease-out";
+            toast.style.transition = "opacity 0.25s ease, transform 0.25s ease";
+
+            let bg = "var(--chat-user-bg, #4f46e5)";
+            let icon = "ℹ️";
+            if (type === "success") {
+                bg = "var(--success-color, #10b981)";
+                icon = "✅";
+            } else if (type === "error") {
+                bg = "#ef4444";
+                icon = "❌";
+            } else if (type === "warning") {
+                bg = "var(--accent-color, #f59e0b)";
+                icon = "⚠️";
+            }
+            toast.style.backgroundColor = bg;
+            toast.style.borderLeft = "4px solid rgba(0, 0, 0, 0.25)";
+
+            toast.innerHTML = `
+                <span style="font-size: 16px;">${icon}</span>
+                <span style="flex: 1; line-height: 1.4;">${message}</span>
+                <span class="toast-close" style="cursor: pointer; font-size: 18px; font-weight: bold; opacity: 0.6; transition: opacity 0.15s; user-select: none; margin-left: 8px;">×</span>
+            `;
+
+            container.appendChild(toast);
+
+            const closeBtn = toast.querySelector(".toast-close");
+            closeBtn.addEventListener("mouseover", () => closeBtn.style.opacity = "1");
+            closeBtn.addEventListener("mouseout", () => closeBtn.style.opacity = "0.6");
+            closeBtn.onclick = () => dismiss();
+
+            let dismissTimer = setTimeout(dismiss, duration);
+
+            function dismiss() {
+                clearTimeout(dismissTimer);
+                toast.style.opacity = "0";
+                toast.style.transform = "translateY(-12px)";
+                setTimeout(() => {
+                    toast.remove();
+                }, 250);
+            }
+        }
+
+        // Overwrite the native alert dialog with our beautiful custom notifications
+        window.alert = function(message) {
+            let type = "info";
+            const msgLower = String(message).toLowerCase();
+            if (msgLower.includes("success") || msgLower.includes("complete") || msgLower.includes("ready") || msgLower.includes("imported") || msgLower.includes("restored") || msgLower.includes("saved") || msgLower.includes("active") || msgLower.includes("passed")) {
+                type = "success";
+            } else if (msgLower.includes("fail") || msgLower.includes("error") || msgLower.includes("exception") || msgLower.includes("rejected") || msgLower.includes("invalid") || msgLower.includes("missing")) {
+                type = "error";
+            } else if (msgLower.includes("please") || msgLower.includes("select") || msgLower.includes("enter") || msgLower.includes("specify") || msgLower.includes("choose") || msgLower.includes("warn")) {
+                type = "warning";
+            }
+            showNotification(message, type);
+        };
+
+        // ── Parse Query Parameters ──
+        const params = new URLSearchParams(window.location.search);
+        const title = params.get("title");
+        const index = params.get("index") || 0;
+
+        const canvas = document.getElementById("editor-canvas");
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        const titleHeader = document.getElementById("editor-title");
+
+        let baseImage = new Image();
+        let activeTool = "brush"; // "brush" | "eraser" | "text" | "crop" | "rotate"
+        let brushColor = "#f59e0b";
+        let brushSize = 10;
+        let textSize = 32;
+
+        let drawing = false;
+        let startX = 0, startY = 0;
+
+        // Undo/Redo Stacks
+        let undoStack = [];
+        let redoStack = [];
+        const maxHistory = 30;
+
+        // ── 🔌 Load Image from API ──
+        if (title) {
+            titleHeader.textContent = `🎨 Editing: ${title} (Index ${index})`;
+            baseImage.crossOrigin = "anonymous";
+            baseImage.src = `/api/images/${encodeURIComponent(title)}/${index}`;
+            baseImage.onload = () => {
+                canvas.width = baseImage.width;
+                canvas.height = baseImage.height;
+                ctx.drawImage(baseImage, 0, 0);
+                saveState("Initial load");
+            };
+        } else {
+            titleHeader.textContent = "🎨 New Sandbox Canvas";
+            canvas.width = 800;
+            canvas.height = 600;
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            saveState("Create blank canvas");
+        }
+
+        // ── 🖌️ Tool Picker ──
+        const toolButtons = document.querySelectorAll(".tool-btn");
+        toolButtons.forEach(btn => {
+            btn.addEventListener("click", () => {
+                const toolName = btn.dataset.tool;
+                if (toolName === "rotate") {
+                    rotateCanvas(90);
+                    return;
+                }
+
+                toolButtons.forEach(b => b.classList.remove("active"));
+                btn.classList.add("active");
+                activeTool = toolName;
+
+                // Toggle settings visibility based on tool
+                document.getElementById("row-color").style.display = (toolName === "eraser" || toolName === "crop") ? "none" : "flex";
+                document.getElementById("row-brush-size").style.display = (toolName === "text" || toolName === "crop") ? "none" : "flex";
+                document.getElementById("row-text-content").style.display = toolName === "text" ? "flex" : "none";
+            });
+        });
+
+        // ── 🎨 Brush & Text Events ──
+        document.getElementById("tool-color").addEventListener("input", (e) => brushColor = e.target.value);
+        document.getElementById("tool-brush-size").addEventListener("input", (e) => brushSize = parseInt(e.target.value, 10));
+        document.getElementById("tool-text-size").addEventListener("input", (e) => textSize = parseInt(e.target.value, 10));
+
+        // ── ↩️ History Management ──
+        function saveState(label = "Action") {
+            const state = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            undoStack.push({
+                state: state,
+                width: canvas.width,
+                height: canvas.height,
+                label: label
+            });
+            if (undoStack.length > maxHistory) {
+                undoStack.shift();
+            }
+            redoStack = []; // Clear redo
+            updateHistoryUI();
+        }
+
+        function restoreState(entry) {
+            canvas.width = entry.width;
+            canvas.height = entry.height;
+            ctx.putImageData(entry.state, 0, 0);
+        }
+
+        document.getElementById("btn-undo").addEventListener("click", () => {
+            if (undoStack.length <= 1) return; // preserve baseline
+            const current = undoStack.pop();
+            redoStack.push(current);
+            const prev = undoStack[undoStack.length - 1];
+            restoreState(prev);
+            updateHistoryUI();
+        });
+
+        document.getElementById("btn-redo").addEventListener("click", () => {
+            if (redoStack.length === 0) return;
+            const next = redoStack.pop();
+            undoStack.push(next);
+            restoreState(next);
+            updateHistoryUI();
+        });
+
+        function updateHistoryUI() {
+            const list = document.getElementById("history-list");
+            if (undoStack.length === 0) {
+                list.innerHTML = `<li class="history-item">No states</li>`;
+                return;
+            }
+            list.innerHTML = undoStack.map(h => `
+                <li class="history-item">✓ ${h.label} (${h.width}×${h.height})</li>
+            `).join("");
+        }
+
+        // ── 🖊️ Canvas Drawing / Cropping Mouse Events ──
+        canvas.addEventListener("mousedown", (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = (e.clientX - rect.left) * scaleX;
+            const y = (e.clientY - rect.top) * scaleY;
+            startX = x;
+            startY = y;
+
+            if (activeTool === "brush" || activeTool === "eraser") {
+                drawing = true;
+                ctx.beginPath();
+                ctx.moveTo(x, y);
+                ctx.lineCap = "round";
+                ctx.lineJoin = "round";
+                ctx.strokeStyle = activeTool === "eraser" ? "transparent" : brushColor;
+                ctx.globalCompositeOperation = activeTool === "eraser" ? "destination-out" : "source-over";
+                ctx.lineWidth = brushSize;
+            } else if (activeTool === "text") {
+                ctx.globalCompositeOperation = "source-over";
+                ctx.font = `bold ${textSize}px sans-serif`;
+                ctx.fillStyle = brushColor;
+                const txt = document.getElementById("tool-text-content").value || "Text";
+                ctx.fillText(txt, x, y);
+                saveState(`Add text: "${txt.substring(0, 10)}"`);
+            } else if (activeTool === "crop") {
+                drawing = true;
+            }
+        });
+
+        canvas.addEventListener("mousemove", (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = (e.clientX - rect.left) * scaleX;
+            const y = (e.clientY - rect.top) * scaleY;
+
+            if (drawing) {
+                if (activeTool === "brush" || activeTool === "eraser") {
+                    ctx.lineTo(x, y);
+                    ctx.stroke();
+                } else if (activeTool === "crop") {
+                    // Draw selection box overlay
+                    restoreState(undoStack[undoStack.length - 1]);
+                    ctx.globalCompositeOperation = "source-over";
+                    ctx.strokeStyle = "#f59e0b";
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([6, 6]);
+                    ctx.strokeRect(startX, startY, x - startX, y - startY);
+                    ctx.setLineDash([]);
+                }
+            }
+        });
+
+        canvas.addEventListener("mouseup", (e) => {
+            if (drawing) {
+                const rect = canvas.getBoundingClientRect();
+                const scaleX = canvas.width / rect.width;
+                const scaleY = canvas.height / rect.height;
+                const x = (e.clientX - rect.left) * scaleX;
+                const y = (e.clientY - rect.top) * scaleY;
+                drawing = false;
+
+                if (activeTool === "brush" || activeTool === "eraser") {
+                    saveState(activeTool === "brush" ? "Paint brush stroke" : "Erase stroke");
+                } else if (activeTool === "crop") {
+                    restoreState(undoStack[undoStack.length - 1]); // restore clean state before crop selection rect
+                    executeCrop(startX, startY, x - startX, y - startY);
+                }
+            }
+        });
+
+        // ── ✂️ Crop execution ──
+        function executeCrop(x, y, w, h) {
+            if (w === 0 || h === 0) return;
+            const xMin = w < 0 ? x + w : x;
+            const yMin = h < 0 ? y + h : y;
+            const width = Math.abs(w);
+            const height = Math.abs(h);
+
+            const tempCanvas = document.createElement("canvas");
+            tempCanvas.width = width;
+            tempCanvas.height = height;
+            const tempCtx = tempCanvas.getContext("2d");
+            tempCtx.drawImage(canvas, xMin, yMin, width, height, 0, 0, width, height);
+
+            canvas.width = width;
+            canvas.height = height;
+            ctx.drawImage(tempCanvas, 0, 0);
+            saveState(`Crop Selection (${width}×${height})`);
+        }
+
+        // ── 🔄 Rotation execution ──
+        function rotateCanvas(degrees) {
+            const tempCanvas = document.createElement("canvas");
+            tempCanvas.width = degrees === 90 || degrees === 270 ? canvas.height : canvas.width;
+            tempCanvas.height = degrees === 90 || degrees === 270 ? canvas.width : canvas.height;
+            const tempCtx = tempCanvas.getContext("2d");
+
+            tempCtx.translate(tempCanvas.width / 2, tempCanvas.height / 2);
+            tempCtx.rotate((degrees * Math.PI) / 180);
+            tempCtx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+
+            canvas.width = tempCanvas.width;
+            canvas.height = tempCanvas.height;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(tempCanvas, 0, 0);
+            saveState(`Rotate ${degrees}° Clockwise`);
+        }
+
+        // ── 🌓 Filter sliders ──
+        const sliders = {
+            brightness: document.getElementById("adj-brightness"),
+            contrast: document.getElementById("adj-contrast"),
+            saturation: document.getElementById("adj-saturation"),
+            blur: document.getElementById("adj-blur"),
+            grayscale: document.getElementById("adj-grayscale"),
+            sepia: document.getElementById("adj-sepia"),
+            invert: document.getElementById("adj-invert")
+        };
+
+        Object.keys(sliders).forEach(key => {
+            sliders[key].addEventListener("input", (e) => {
+                const label = document.getElementById(`lbl-${key}`);
+                const value = e.target.value;
+                const unit = key === "blur" ? "px" : "%";
+                label.textContent = `${key.charAt(0).toUpperCase() + key.slice(1)} (${value}${unit})`;
+                applyVisualPreviewFilters();
+            });
+        });
+
+        function applyVisualPreviewFilters() {
+            const b = sliders.brightness.value;
+            const c = sliders.contrast.value;
+            const s = sliders.saturation.value;
+            const bl = sliders.blur.value;
+            const g = sliders.grayscale.value;
+            const sep = sliders.sepia.value;
+            const inv = sliders.invert.value;
+
+            // Apply filter via CSS directly to the Canvas element for instant non-destructive GPU preview
+            canvas.style.filter = `brightness(${b}%) contrast(${c}%) saturate(${s}%) blur(${bl}px) grayscale(${g}%) sepia(${sep}%) invert(${inv}%)`;
+        }
+
+        // Bake filters permanently on clicking "Bake Filters"
+        document.getElementById("btn-apply-filters").addEventListener("click", () => {
+            const tempCanvas = document.createElement("canvas");
+            tempCanvas.width = canvas.width;
+            tempCanvas.height = canvas.height;
+            const tempCtx = tempCanvas.getContext("2d");
+
+            const b = sliders.brightness.value;
+            const c = sliders.contrast.value;
+            const s = sliders.saturation.value;
+            const bl = sliders.blur.value;
+            const g = sliders.grayscale.value;
+            const sep = sliders.sepia.value;
+            const inv = sliders.invert.value;
+
+            tempCtx.filter = `brightness(${b}%) contrast(${c}%) saturate(${s}%) blur(${bl}px) grayscale(${g}%) sepia(${sep}%) invert(${inv}%)`;
+            tempCtx.drawImage(canvas, 0, 0);
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            canvas.style.filter = "none"; // reset GPU filter
+            ctx.drawImage(tempCanvas, 0, 0);
+
+            // Reset sliders
+            sliders.brightness.value = 100;
+            sliders.contrast.value = 100;
+            sliders.saturation.value = 100;
+            sliders.blur.value = 0;
+            sliders.grayscale.value = 0;
+            sliders.sepia.value = 0;
+            sliders.invert.value = 0;
+
+            Object.keys(sliders).forEach(key => {
+                const label = document.getElementById(`lbl-${key}`);
+                const unit = key === "blur" ? "px" : "%";
+                label.textContent = `${key.charAt(0).toUpperCase() + key.slice(1)} (${sliders[key].value}${unit})`;
+            });
+
+            saveState("Bake filter adjustments");
+        });
+
+        // ── 📥 Download local PNG copy ──
+        document.getElementById("btn-download").addEventListener("click", () => {
+            const link = document.createElement("a");
+            link.download = `${title || 'canvas'}_edited.png`;
+            link.href = canvas.toDataURL("image/png");
+            link.click();
+        });
+
+        // ── 💾 Save & Commit Version directly back to DB ──
+        const saveBtn = document.getElementById("btn-save");
+        saveBtn.addEventListener("click", async () => {
+            if (!title) {
+                alert("Cannot save back to discussion in standalone sandbox mode. Use 'Download PNG' to save locally.");
+                return;
+            }
+
+            saveBtn.disabled = true;
+            saveBtn.textContent = "Saving to database...";
+
+            // Bake any active preview filters automatically before saving
+            if (canvas.style.filter !== "none" && canvas.style.filter !== "") {
+                document.getElementById("btn-apply-filters").click();
+            }
+
+            const imgB64 = canvas.toDataURL("image/png");
+
+            try {
+                const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/update_image`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ image_b64: imgB64 })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert(`Successfully committed edited artifact version! (Active version incremented to v${data.version})`);
+                    // Reload original workspace tab to render new version
+                    if (window.opener && !window.opener.closed) {
+                        try {
+                            window.opener.location.reload();
+                        } catch(e) {}
+                    }
+                    window.close();
+                } else {
+                    alert(`Database ingestion failed: ${data.detail || data.error}`);
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = "💾 Save & Ingest";
+                }
+            } catch (err) {
+                alert(`Network save request failed: ${err}`);
+                saveBtn.disabled = false;
+                saveBtn.textContent = "💾 Save & Ingest";
+            }
+        });
+
+        // Keyboard Shortcuts (Ctrl+Z / Ctrl+Y)
+        window.addEventListener("keydown", (e) => {
+            if (e.ctrlKey && e.key === "z") {
+                e.preventDefault();
+                document.getElementById("btn-undo").click();
+            } else if (e.ctrlKey && e.key === "y") {
+                e.preventDefault();
+                document.getElementById("btn-redo").click();
+            }
+        });
+    </script>
+</body>
+</html>

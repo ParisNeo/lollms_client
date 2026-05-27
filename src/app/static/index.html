@@ -25,6 +25,14 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/htmlmixed/htmlmixed.min.js"></script>
 </head>
 <body>
+    <!-- 🧠 Global Page Loader Overlay (Prevents flash of unpopulated UI) -->
+    <div id="global-page-loader" class="global-page-loader">
+        <div class="loader-content">
+            <span class="spinner" style="width: 50px; height: 50px; border-width: 4px;"></span>
+            <span id="global-loader-text">🧠 Initializing Workspace... Please wait.</span>
+        </div>
+    </div>
+
     <!-- 🗃️ Workspace Selection Screen (Startup Grid Overlay) -->
     <div id="workspace-selection-screen" class="modal-overlay" style="display: none; background-color: var(--bg-app); z-index: 200;">
         <div class="workspace-grid-container" style="max-width: 900px; width: 100%; margin: auto; padding: 40px; display: flex; flex-direction: column; gap: 24px;">
@@ -122,7 +130,15 @@
             <div class="workspace-content-viewport" id="workspace-content-viewport">
                 
                 <!-- Always-Present Chat Companion Tab Content -->
-                <div class="tab-content active" id="tab-chat">
+                <div class="tab-content active" id="tab-chat" style="position: relative;">
+                    <!-- Connection Spinner Overlay -->
+                    <div id="connection-overlay" class="connection-overlay-inline">
+                        <div class="connection-spinner-container">
+                            <span class="spinner" style="width: 40px; height: 40px; border-width: 3px;"></span>
+                            <span id="connection-overlay-text">🧠 Connecting to LLM server... Please wait.</span>
+                        </div>
+                    </div>
+
                     <!-- Context Budget Progress Bar -->
                     <div class="context-budget-container">
                         <div class="context-budget-header">
@@ -139,9 +155,12 @@
 
                     <!-- Chat Message Area -->
                     <div class="chat-history" id="chat-history">
-                        <div class="chat-welcome-msg">
-                            Ask Lollms questions. You can chat freely with or without loaded artifacts. 
-                            Click on the <strong>+</strong> button below to import local files or internet content!
+                        <!-- Thinking Indicator -->
+                        <div id="thinking-indicator" class="typing-indicator">
+                            <span class="typing-dot"></span>
+                            <span class="typing-dot"></span>
+                            <span class="typing-dot"></span>
+                            <span style="font-size: 11.5px; font-weight: bold; color: var(--text-secondary); margin-left: 4px;">Lollms is thinking...</span>
                         </div>
                     </div>
 
@@ -206,6 +225,13 @@
                     <div class="macro-meta">
                         <span class="macro-name">Build Presentation</span>
                         <span class="macro-desc">Creates an interactive, styled HTML5 presentation slide deck.</span>
+                    </div>
+                </button>
+                <button class="macro-btn" id="macro-test-form" title="Generate an interactive form to test the form rendering engine">
+                    <span class="macro-icon">📋</span>
+                    <div class="macro-meta">
+                        <span class="macro-name">Test Interactive Form</span>
+                        <span class="macro-desc">Requests the model to generate a rich, interactive form to gather inputs.</span>
                     </div>
                 </button>
             </div>
@@ -403,6 +429,52 @@
         </div>
     </div>
 
+    <!-- 🎬 Presentation Builder Dashboard Modal -->
+    <div class="modal-overlay" id="presentation-dashboard-modal" style="display: none;">
+        <div class="modal-container" style="width: 500px;">
+            <div class="modal-header">
+                <h2>🎬 Build Slide Presentation</h2>
+                <button class="modal-close-btn" id="btn-close-presentation-modal">×</button>
+            </div>
+            <div class="modal-body">
+                <p class="section-desc">Configure the design, length, and structure of your presentation slide deck. Lollms will synthesize your active artifacts into a custom HTML5 presentation.</p>
+
+                <div class="input-group">
+                    <label for="pres-style">Design Theme / Style</label>
+                    <select id="pres-style">
+                        <option value="dark" selected>Modern Dark (Gradients, Neon Accents)</option>
+                        <option value="light">Professional Light (Clean, Minimalist, Corporate)</option>
+                        <option value="creative">Creative (Vibrant, Bold Typography, High Contrast)</option>
+                        <option value="minimal">Minimal Slate (Elegant Gray, Flat, Balanced)</option>
+                    </select>
+                </div>
+
+                <div class="input-group">
+                    <label for="pres-slides-count">Expected Slide Panels</label>
+                    <input type="number" id="pres-slides-count" min="3" max="25" value="5">
+                </div>
+
+                <div class="input-group">
+                    <label for="pres-structure-hints">Structure Outline & Key Hints</label>
+                    <textarea id="pres-structure-hints" rows="3" placeholder="e.g., Slide 1: Intro, Slide 2: Problem, Slide 3: Solution, Slide 4: Architecture, Slide 5: Contact. Focus heavily on technical specifications." style="background-color: var(--bg-editor); border: 1px solid var(--border-color); color: var(--text-primary); padding: 10px; border-radius: 6px; font-size: 13px; width: 100%; resize: vertical; outline: none;"></textarea>
+                </div>
+
+                <div class="input-group" style="display: flex; flex-direction: row; gap: 8px; align-items: center; margin-top: 10px;">
+                    <input type="checkbox" id="pres-embed-images" style="width: auto; cursor: pointer; accent-color: var(--accent-color);" checked>
+                    <label for="pres-embed-images" style="cursor: pointer; text-transform: none; font-size: 12.5px; font-weight: bold;">Authorize Embedding Active Images</label>
+                </div>
+
+                <div id="pres-available-images-info" style="display: none; font-size: 11px; color: var(--success-color); margin-top: 6px; padding: 6px 10px; background-color: rgba(16, 185, 129, 0.05); border-radius: 4px; border: 1px dashed rgba(16, 185, 129, 0.2);">
+                    <!-- Dynamic info about available active images -->
+                </div>
+            </div>
+            <div class="modal-footer" style="padding: 16px 24px; border-top: 1px solid var(--border-color); display: flex; gap: 12px; justify-content: flex-end; background-color: var(--bg-panel);">
+                <button class="btn btn-secondary" id="btn-cancel-presentation" style="width: auto;">Cancel</button>
+                <button class="btn btn-primary" id="btn-build-presentation" style="width: auto;">🎬 Build Presentation</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 📤 Contextual Export Details Modal -->
     <div class="modal-overlay" id="export-details-modal" style="display: none;">
         <div class="modal-container" style="width: 500px;">
@@ -431,6 +503,7 @@
                 <button class="modal-tab active" data-settings-tab="tab-settings-llm">🤖 LLM Binding</button>
                 <button class="modal-tab" data-settings-tab="tab-settings-tti">🎨 TTI (Image Gen)</button>
                 <button class="modal-tab" data-settings-tab="tab-settings-profiles">📂 Profiles</button>
+                <button class="modal-tab" data-settings-tab="tab-settings-advanced">🛠️ Advanced</button>
                 <button class="modal-tab" data-settings-tab="tab-settings-stt" disabled>🎙️ STT (Soon)</button>
                 <button class="modal-tab" data-settings-tab="tab-settings-tts" disabled>🔊 TTS (Soon)</button>
             </div>
@@ -485,6 +558,7 @@
                     <div class="artifact-sub-tabs" style="padding: 0 0 10px 0; margin-bottom: 12px; background: none;">
                         <button class="sub-tab-btn active" data-tti-sub-tab="params">⚙️ Parameters</button>
                         <button class="sub-tab-btn" data-tti-sub-tab="commands" id="btn-tti-commands-sub-tab">⚡ Custom Commands</button>
+                        <button class="sub-tab-btn" data-tti-sub-tab="zoo" id="btn-tti-zoo-sub-tab">🦁 Zoo</button>
                     </div>
 
                     <div class="tti-sub-pane active" id="tti-sub-pane-params">
@@ -522,6 +596,18 @@
                         <button class="btn btn-primary" id="btn-execute-tti-command" style="display: none; width: auto; align-self: flex-start;">⚡ Run Command</button>
                         <div id="tti-command-status" class="validation-status" style="display: none;"></div>
                     </div>
+
+                    <div class="tti-sub-pane" id="tti-sub-pane-zoo" style="display: none; flex-direction: column; gap: 12px;">
+                        <p class="section-desc">Download models directly from the Diffusers/TTI model zoo.</p>
+                        <div class="input-group">
+                            <label for="settings-tti-zoo-search">Search TTI Zoo</label>
+                            <input type="text" id="settings-tti-zoo-search" placeholder="🔍 Type keyword to filter zoo models..." style="padding: 8px 12px; font-size: 12.5px; margin-bottom: 8px;" />
+                            <label for="settings-tti-zoo-select">Available Zoo Models</label>
+                            <select id="settings-tti-zoo-select" style="padding: 8px; font-size: 13px;"></select>
+                        </div>
+                        <button class="btn btn-primary" id="btn-download-tti-zoo" style="width: auto; align-self: flex-start;">📥 Download Selected Model</button>
+                        <div id="tti-zoo-status" class="validation-status" style="display: none;"></div>
+                    </div>
                 </div>
 
                 <!-- Profiles Management Pane -->
@@ -542,6 +628,17 @@
                         <ul class="artifact-list" id="settings-profiles-list" style="margin-top: 10px; max-height: 200px; overflow-y: auto;">
                             <li class="empty-msg">No profiles saved yet.</li>
                         </ul>
+                    </div>
+                </div>
+
+                <!-- Advanced Settings Pane -->
+                <div class="settings-tab-pane" id="tab-settings-advanced">
+                    <p class="section-desc">Manage advanced configuration folders, directories, and developer-level controls.</p>
+
+                    <div class="panel-section" style="margin-top: 10px;">
+                        <h3 style="color: var(--accent-color); font-size: 13px;">📂 Persistent App Configuration</h3>
+                        <p class="section-desc">Open your local configuration directory in the OS file explorer to inspect, backup, or manually edit settings files, saved profiles, and logs.</p>
+                        <button class="btn btn-secondary" id="btn-open-settings-folder" style="width: auto; font-size: 12.5px; padding: 8px 16px;">📂 Open Settings Folder</button>
                     </div>
                 </div>
 

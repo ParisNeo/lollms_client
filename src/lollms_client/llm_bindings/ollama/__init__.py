@@ -567,15 +567,26 @@ class OllamaBinding(LollmsLLMBinding):
                     for chunk in response_stream:
                         if self.is_cancelled():
                             break
-                        if chunk.message.thinking and not in_thinking:
-                            full_response_text += "<think>\n"
-                            in_thinking = True
 
-                        if chunk.message.content:# Ensure there is content to process
+                        # Process and stream thinking tokens dynamically to prevent idle silences
+                        if chunk.message.thinking:
+                            if not in_thinking:
+                                in_thinking = True
+                                if streaming_callback:
+                                    streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            if streaming_callback:
+                                streaming_callback(chunk.message.thinking, MSG_TYPE.MSG_TYPE_CHUNK)
+                            full_response_text += chunk.message.thinking
+                            continue
+
+                        # When transitioning from thinking to content, close the reasoning tag
+                        if in_thinking:
+                            in_thinking = False
+                            if streaming_callback:
+                                streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+                        if chunk.message.content: # Ensure there is content to process
                             chunk_content = chunk.message.content
-                            if in_thinking:
-                                full_response_text += "\n<think>\n"                            
-                                in_thinking = False
                             full_response_text += chunk_content
                             if streaming_callback:
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):

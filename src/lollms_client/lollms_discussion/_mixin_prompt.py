@@ -121,12 +121,24 @@ FULL TEMPLATE (copy and extend):
   }
   #viewer-controls button {
     background: none; border: none; color: #fff;
-    font-size: 20px; cursor: pointer; padding: 4px 8px;
-    border-radius: 6px; transition: background 0.2s;
+    font-size: 16px; cursor: pointer; padding: 6px 12px;
+    border-radius: 18px; transition: background 0.2s;
   }
   #viewer-controls button:hover { background: rgba(255,255,255,0.15); }
   #slide-counter { min-width: 60px; text-align: center; opacity: 0.8; }
- 
+
+  /* ── Speaker Notes panel ── */
+  #speaker-notes-panel {
+    display: none;
+    position: fixed; bottom: 84px; left: 50%; transform: translateX(-50%);
+    width: 80%; max-width: 800px; background: rgba(11, 15, 25, 0.9);
+    border: 1px solid rgba(255,255,255,0.15); border-radius: 12px;
+    padding: 16px 20px; color: #cbd5e1; font-size: 14px;
+    line-height: 1.5; backdrop-filter: blur(8px); z-index: 9998;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+  }
+  #speaker-notes-panel.active { display: block; }
+
   /* ── Overview mode (ESC) ── */
   #overview {
     display: none; position: fixed; inset: 0;
@@ -280,9 +292,13 @@ FULL TEMPLATE (copy and extend):
   <span id="slide-counter">1 / 1</span>
   <button id="btn-next" title="Next (→)">&#8594;</button>
   <button id="btn-fs"   title="Fullscreen (F)">&#x26F6;</button>
+  <button id="btn-notes" title="Toggle Speaker Notes (N)">💬 Notes</button>
   <button id="btn-ov"   title="Overview (Esc)">&#8942;</button>
 </div>
- 
+
+<!-- ── Speaker Notes panel ── -->
+<div id="speaker-notes-panel"></div>
+
 <!-- ── Overview panel ── -->
 <div id="overview"></div>
  
@@ -351,10 +367,14 @@ function initCharts() {
     document.getElementById('slide-counter').textContent =
       (n + 1) + ' / ' + slides.length;
     doScale();
+    updateNotes();
   }
 
   show(0);
- 
+
+  // Periodically trigger doScale to auto-correct scaling inside hidden tabs/iframes
+  setInterval(doScale, 500);
+
   document.getElementById('btn-prev').onclick = function() {
     show((current - 1 + slides.length) % slides.length);
   };
@@ -390,12 +410,33 @@ function initCharts() {
   function toggleOverview() {
     if (ov.classList.toggle('active')) buildOverview();
   }
- 
+
+  /* Speaker Notes Panel */
+  var btnNotes = document.getElementById('btn-notes');
+  var notesPanel = document.getElementById('speaker-notes-panel');
+
+  btnNotes.onclick = toggleNotes;
+
+  function toggleNotes() {
+    notesPanel.classList.toggle('active');
+    btnNotes.classList.toggle('active');
+    updateNotes();
+  }
+
+  function updateNotes() {
+    var activeSlide = slides[current];
+    if (activeSlide) {
+      var notes = activeSlide.getAttribute('data-notes') || 'No speaker notes for this slide.';
+      notesPanel.innerHTML = '<strong>📝 Speaker Notes:</strong><p style="margin-top:6px; font-weight:normal;">' + notes + '</p>';
+    }
+  }
+
   document.addEventListener('keydown', function(e) {
     if (e.key === 'ArrowRight' || e.key === 'ArrowDown')  show((current+1) % slides.length);
     if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')    show((current-1+slides.length) % slides.length);
     if (e.key === 'Escape')    { if (ov.classList.contains('active')) toggleOverview(); }
     if (e.key === 'f' || e.key === 'F') document.getElementById('btn-fs').click();
+    if (e.key === 'n' || e.key === 'N') toggleNotes();
   });
 })();
 </script>
@@ -516,7 +557,8 @@ RULES:
             "  - Specialist Persona: [Define the specific expertise needed, e.g., 'React Senior Developer', 'Legal Analyst', 'SVG Optimization Expert']",
             "  - Target Artifacts: [Comma-separated list of exact artifact names to be modified or created. ONLY these will be saved.]",
             "  - Implementation Details: [Logic steps for code, or section updates for text]",
-            "  - Supporting Context: [List of artifacts containing reference info, like API docs or design specs]",
+            "  - Supporting Context: [List of artifacts containing reference info, like API docs or design specs. Evaluate which of the active documents are relevant to pass as reference context.]",
+            "  - Relevant Skills: [List of exact skill titles containing reusable techniques or guidelines needed for this task. Evaluate which of the active skills are relevant to pass.]",
             "  - Relevant Memories: [List 8-char IDs of specific memories required for this task. Leave empty if none apply.]",
             "</coding_plan>",
             "",
@@ -859,10 +901,8 @@ EXAMPLE OF CORRECT FORM:
         masked_text = re.sub(r'`[^`]+`',           mask_code_block, masked_text)
 
         has_artefact = bool(re.search(r'<(?:revert_)?art[ei]fact[\s>]', masked_text, re.IGNORECASE))
-        has_gen      = enable_image_generation and bool(
-            re.search(r'<generate_image[\s>]', masked_text, re.IGNORECASE))
-        has_edit     = enable_image_editing and bool(
-            re.search(r'<edit_image[\s>]', masked_text, re.IGNORECASE))
+        has_gen      = False
+        has_edit     = False
         has_note     = enable_notes and bool(
             re.search(r'<note[\s>]', masked_text, re.IGNORECASE))
         has_skill    = enable_skills and bool(
@@ -963,6 +1003,7 @@ EXAMPLE OF CORRECT FORM:
 
                             ASCIIColors.success(
                                 f"Generated image ({width}×{height}) and created workspace artifact '{art_title}'.")
+                            return f'\n<artefact_image id="{art_title}::0" />\n'
                     except Exception as e:
                         ASCIIColors.warning(f"Image generation failed: {e}")
                     return ''
@@ -1014,14 +1055,27 @@ EXAMPLE OF CORRECT FORM:
                         if img_bytes:
                             import base64
                             edited_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+                            art_title = attrs.get('name', attrs.get('title', f"edited_image_{uuid.uuid4().hex[:6]}"))
                             ai_message.add_image_pack(
                                 images=[edited_b64],
                                 group_type="edited",
                                 active_by_default=True,
-                                title=f"edit_{uuid.uuid4().hex[:6]}",
+                                title=art_title,
                                 prompt=prompt,
                             )
-                            ASCIIColors.success("Edited image added to message.")
+
+                            art = self.artefacts.add(
+                                title=art_title,
+                                artefact_type=ArtefactType.IMAGE,
+                                content=f"### Edited Image: '{prompt}'\n\n<artefact_image id=\"{art_title}::0\" />",
+                                images=[edited_b64],
+                                image_media_types=["image/png"],
+                                active=auto_activate_artefacts
+                            )
+                            affected_artefacts.append(art)
+                            ASCIIColors.success("Edited image added to message and saved as workspace artifact.")
+                            return f'\n<artefact_image id="{art_title}::0" />\n'
                     except Exception as e:
                         ASCIIColors.warning(f"Image edit failed: {e}")
                     return ''

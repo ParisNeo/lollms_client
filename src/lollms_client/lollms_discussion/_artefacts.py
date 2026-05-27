@@ -1046,7 +1046,26 @@ class ArtefactManager:
     # --------------------------------------------------------- activation
 
     def activate(self, title: str, version: Optional[int] = None):
-        self._set_active(title, version, True)
+        artefacts = self._get_all_raw()
+        changed = False
+        if version is not None:
+            # Set only the requested version as active, deactivating all other versions
+            for a in artefacts:
+                if a.get('title') == title:
+                    if a.get('version') == version:
+                        a['active'] = True
+                    else:
+                        a['active'] = False
+                    changed = True
+        else:
+            # Set the latest version as active, deactivating older versions
+            latest_v = max([a.get('version', 1) for a in artefacts if a.get('title') == title], default=None)
+            for a in artefacts:
+                if a.get('title') == title:
+                    a['active'] = (a.get('version') == latest_v)
+                    changed = True
+        if changed:
+            self._save_all(artefacts)
 
     def deactivate(self, title: str, version: Optional[int] = None):
         self._set_active(title, version, False)
@@ -1808,14 +1827,14 @@ class ArtefactManager:
     def remove_artefact(self, title, version=None) -> int:
         return self.remove(title, version)
 
-    def get_associated_images(self, title: str) -> List[Dict[str, Any]]:
+    def get_associated_images(self, title: str, version: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Retrieves all images associated with the artefact 'title'.
         Checks both the artefact's own images and any companion 'title::images' artefact.
         """
         images = []
         # 1. Main artefact images
-        main_art = self.get(title)
+        main_art = self.get(title, version)
         if main_art:
             imgs = main_art.get("images") or []
             mtypes = main_art.get("image_media_types") or []

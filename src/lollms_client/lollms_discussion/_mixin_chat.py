@@ -118,6 +118,16 @@ _SUPPRESS_TOKENS = [
     # Add future markers here
 ]
 _MAX_SUPPRESS_BUF = 64
+def _is_fast_message(msg: str) -> bool:
+    """Heuristic to detect short greetings or single-word confirmations."""
+    m = msg.lower().strip()
+    if not m:
+        return True
+    if len(m) < 20 and any(x in m for x in ["bonjour", "salut", "hello", "hi", "hey", "test"]):
+        return True
+    return m in ["ok", "merci", "thanks", "cool", "yes", "no", "oui", "non"]
+
+
 _SECONDARY_TAG_MAP = {
     "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
                        MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
@@ -955,21 +965,15 @@ _HTML_TAG_RE = re.compile(r'<(?:html|head|body|div|span|script|style|p|h[1-6]|'
 
 
 def _validate_widget_content(raw: str, title: str) -> Optional[str]:
-    cleaned = _NON_WEB_FENCE_RE.sub('', raw).strip()
-    sole_fence = re.match(r'^```(?:html)?\s*\n([\s\S]+?)\n```\s*$', cleaned, re.IGNORECASE)
-    if sole_fence:
-        cleaned = sole_fence.group(1).strip()
+    # Leniently strip any leading/trailing markdown code block fences if present
+    cleaned = raw.strip()
+    # Strip opening ```html, ```xml, ```, etc.
+    cleaned = re.sub(r'^```[a-zA-Z0-9]*\s*\n', '', cleaned, flags=re.IGNORECASE)
+    # Strip closing ```
+    cleaned = re.sub(r'\n```\s*$', '', cleaned)
+    cleaned = cleaned.strip()
     if not cleaned:
-        ASCIIColors.warning(
-            f"[Widget '{title}'] Content is empty after stripping non-web fences. "
-            "Widget discarded."
-        )
-        return None
-    if not _HTML_TAG_RE.search(cleaned):
-        ASCIIColors.warning(
-            f"[Widget '{title}'] No HTML tags found after cleaning. "
-            f"Content preview: {cleaned[:120]!r}. Widget discarded."
-        )
+        ASCIIColors.warning(f"[Widget '{title}'] Content is empty after cleaning. Widget discarded.")
         return None
     return cleaned
 
@@ -1058,10 +1062,10 @@ def _parse_form_xml(tag_attrs_str: str, body: str) -> Optional[Dict[str, Any]]:
     ASCIIColors.warning(f"[Form] Could not parse form body. Returning empty form.")
     return form
 
-
 def _format_form_answers_for_llm(form_descriptor: Dict, answers: Dict[str, Any]) -> str:
     lines = [
-        f"=== FORM RESPONSE: {form_descriptor.get('title', 'User Form')} ===",
+        f"### 📋 Form Submission: {form_descriptor.get('title', 'User Form')}",
+        "",
     ]
     fields = form_descriptor.get("fields", [])
     field_map = {f["name"]: f for f in fields if f.get("type") != "section"}
@@ -1072,9 +1076,9 @@ def _format_form_answers_for_llm(form_descriptor: Dict, answers: Dict[str, Any])
             display = value[:2000] + f"… [+{len(value)-2000} chars truncated]"
         else:
             display = value
-        lines.append(f"  {label}: {display}")
+        lines.append(f"* **{label}**: {display}")
 
-    lines.append("=== END FORM RESPONSE ===")
+    lines.append("\n*Form submitted successfully.*")
     return "\n".join(lines)
 
 
@@ -1191,8 +1195,8 @@ class _StreamState:
         self.sec_close_scan: str    = ""
 
         # Unified processing state
-        self.proc_type: str          = ""
-        self.proc_title: str         = ""
+        self.proc_type: str          = "general_processing"
+        self.proc_title: str         = "Processing"
         self.proc_attrs: Dict        = {}
         self.proc_content: List[str] = []
         self.proc_has_opened: bool   = False
@@ -1228,6 +1232,23 @@ class _StreamState:
             return False
 
         self.stream_buf.append(chunk)
+
+        if self.proc_has_opened and self.proc_type == "agent_reasoning":
+            self.reasoning_chunks_count += 1
+
+            # Every 12-15 chunks, emit a comforting milestone status
+            _REASONING_STATUSES = [
+                (15,  "Analyzing conversation context & constraints..."),
+                (35,  "Mapping technical goals & file structures..."),
+                (60,  "Querying active local memories & learned guidelines..."),
+                (90,  "Scanning workspace folder for relevant source files..."),
+                (130, "Structuring coding plan and verifying logic..."),
+                (180, "Formulating final specialized response strategy..."),
+            ]
+            for threshold, status_msg in _REASONING_STATUSES:
+                if self.reasoning_chunks_count == threshold:
+                    self._emit_processing_status(status_msg)
+                    break
 
         pos = 0
         while pos < len(chunk):
@@ -1275,6 +1296,8 @@ class _StreamState:
         if next_special == -1:
             text = chunk[pos:]
             if text:
+                if self.proc_has_opened and self.proc_type == "agent_reasoning":
+                    self._emit_processing_close()
                 self.ai_message.content += text
                 self.clean_prose.append(text)
                 _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -1283,6 +1306,8 @@ class _StreamState:
         if next_special > pos:
             text = chunk[pos:next_special]
             if text:
+                if self.proc_has_opened and self.proc_type == "agent_reasoning":
+                    self._emit_processing_close()
                 self.ai_message.content += text
                 self.clean_prose.append(text)
                 _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -1307,6 +1332,8 @@ class _StreamState:
             new_pos = gt_idx + 1
 
             if "<tool_call>" in b_str:
+                if self.proc_has_opened and self.proc_type == "agent_reasoning":
+                    self._emit_processing_close()
                 self.state = self.STATE_TOOL_CALL
                 self.tool_buf = [b_str]
                 return new_pos
@@ -1316,6 +1343,8 @@ class _StreamState:
             if any(b_str_lower.startswith(prefix) for prefix in ("<mem_tag", "<mem_load", "<mem_delete")) or (
                 b_str_lower.startswith("<mem_new") and b_str_lower.endswith("/>")
             ):
+                if self.proc_has_opened and self.proc_type == "agent_reasoning":
+                    self._emit_processing_close()
                 self._handle_memory_tag_stream(b_str)
                 self.bracket_buf.clear()
                 self.state = self.STATE_NORMAL
@@ -1360,6 +1389,8 @@ class _StreamState:
         text = "".join(self.bracket_buf)
         self.bracket_buf.clear()
         if text:
+            if self.proc_has_opened and self.proc_type == "agent_reasoning":
+                self._emit_processing_close()
             self.ai_message.content += text
             self.clean_prose.append(text)
             _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -1474,26 +1505,28 @@ class _StreamState:
     # ---------------------------------------------------------------- Tool processing helpers
 
     def _emit_tool_processing_open(self, tool_name: str, params: Dict[str, Any]):
-        """Emit opening <processing> tag for tool call execution."""
+        """Emit opening <processing> tag for tool call execution with full types and details."""
         if not self.enable_in_message_status:
             return
+        self.proc_type = "tool_execution"
+        self.proc_title = f"Executing {tool_name.replace('_', ' ').title()}"
         params_str = json.dumps(params, ensure_ascii=False)[:200]
         params_escaped = params_str.replace('"', '&quot;')
-        tag = f'<processing type="tool_execution" tool="{tool_name}" params="{params_escaped}">'
+        tag = f'<processing type="tool_execution" title="{self.proc_title}" tool="{tool_name}" params="{params_escaped}">\n'
         self.ai_message.content += tag
         _cb(self.callback, tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_open",
             "processing_type": "tool_execution",
+            "title": self.proc_title,
             "tool": tool_name,
             "params": params,
             "was_processed": True,
         })
         self.proc_has_opened = True
-        self.proc_type = "tool_execution"
 
     def _emit_tool_processing_status(self, status_text: str):
         """Stream a status update for tool execution."""
-        line = f"\n* {status_text}"
+        line = f"* {status_text}\n"
         self.proc_content.append(line)
         if self.enable_in_message_status:
             if not self.proc_has_opened:
@@ -1518,7 +1551,7 @@ class _StreamState:
         if not self.proc_has_opened:
             return
 
-        close_tag = "</processing>"
+        close_tag = "</processing>\n\n"
         self.ai_message.content += close_tag
         _cb(self.callback, close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_close",
@@ -1540,6 +1573,9 @@ class _StreamState:
     # ---------------------------------------------------------------- STATE_SECONDARY
 
     def _enter_secondary(self, opening_tag: str, prefix: str):
+        if self.proc_has_opened and self.proc_type == "agent_reasoning":
+            self._emit_processing_close()
+
         ann_type, chunk_mt, done_mt, close_tag = _SECONDARY_TAG_MAP[prefix]
 
         self.sec_prefix     = prefix
@@ -1715,7 +1751,7 @@ class _StreamState:
         for k, v in self.proc_attrs.items():
             if v:
                 attrs_str += f' {k}="{v}"'
-        tag = f"<processing{attrs_str}>"
+        tag = f"<processing{attrs_str}>\n"
         self.ai_message.content += tag
         _cb(self.callback, tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_open",
@@ -1728,7 +1764,7 @@ class _StreamState:
 
     def _emit_processing_status(self, status_text: str):
         """Stream a status line inside the processing tag."""
-        line = f"\n* {status_text}"
+        line = f"* {status_text}\n"
         self.proc_content.append(line)
         if self.enable_in_message_status:
             if not self.proc_has_opened:
@@ -1758,7 +1794,7 @@ class _StreamState:
                 self.pending_final_content = final_content
             return
 
-        close_tag = "</processing>"
+        close_tag = "</processing>\n\n"
         self.ai_message.content += close_tag
         _cb(self.callback, close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_close",
@@ -2377,10 +2413,15 @@ class _StreamState:
             )
 
             if form_descriptor and form_descriptor.get('fields'):
+                form_id = form_descriptor.get("id") or str(uuid.uuid4())
+                form_descriptor["id"] = form_id
+                self.discussion._get_pending_forms()[form_id] = form_descriptor
+
                 n = len(form_descriptor['fields'])
                 self._emit_processing_status(f"Found {n} field(s)")
 
                 form_attrs_parts = []
+                form_attrs_parts.append(f'id="{form_id}"')
                 if title:
                     form_attrs_parts.append(f'title="{title}"')
                 if attrs.get('description'):
@@ -2388,13 +2429,22 @@ class _StreamState:
                 if attrs.get('submit_label'):
                     form_attrs_parts.append(f'submit_label="{attrs["submit_label"]}"')
 
-                field_lines = [
-                    '  <field '
-                    + f'name="{f["name"]}" label="{f["label"]}" type="{f["type"]}"'
-                    + (' required="true"' if f.get('required') else '')
-                    + '/>'
-                    for f in form_descriptor['fields']
-                ]
+                field_lines = []
+                for f in form_descriptor['fields']:
+                    attrs_parts = [
+                        f'name="{f["name"]}"',
+                        f'label="{f["label"]}"',
+                        f'type="{f["type"]}"'
+                    ]
+                    if f.get('required'):
+                        attrs_parts.append('required="true"')
+                    if f.get('options'):
+                        opts_str = ",".join(f['options']) if isinstance(f['options'], list) else str(f['options'])
+                        attrs_parts.append(f'options="{opts_str}"')
+                    for k in ('default', 'placeholder', 'min', 'max', 'step'):
+                        if f.get(k) is not None:
+                            attrs_parts.append(f'{k}="{f[k]}"')
+                    field_lines.append('  <field ' + ' '.join(attrs_parts) + ' />')
                 sep = " " if form_attrs_parts else ""
                 full_form_tag = (
                     f'<lollms_form{sep}{" ".join(form_attrs_parts)}>\n'
@@ -2432,41 +2482,122 @@ class _StreamState:
         Invokes a specialized LLM call with a precision persona built on the fly.
         Handles Code, Markdown, and Text with domain-specific accuracy.
         """
-        # 1. Parse requested persona from plan or derive from context
+        # 1. Parse requested persona and task parameters from plan or derive from context
         persona_match = re.search(r"Specialist Persona:\s*([^\n\r]+)", plan, re.I)
         requested_persona = persona_match.group(1).strip() if persona_match else "Surgical Artifact Specialist"
 
-        # 2. Gather Selective Memory Context
+        goal_match = re.search(r"Goal:\s*([^\n\r]+)", plan, re.I)
+        goal = goal_match.group(1).strip() if goal_match else "Implement requested modifications."
+
+        details_match = re.search(r"Implementation Details:\s*([^\n\r]+)", plan, re.I)
+        details = details_match.group(1).strip() if details_match else "Surgically apply plan logic."
+
+        # 2. Extract parent custom personality traits to inject into spinoff persona
+        parent_prompt = self.discussion.system_prompt or ""
+        # Strip system system-instructions to isolate the pure custom personality traits (style, role, core guidelines)
+        custom_traits = parent_prompt.split("=== ARTIFACT SYSTEM ===")[0].strip()
+        is_generic = not custom_traits or "You are Lollms" in custom_traits or "You are a helpful" in custom_traits or len(custom_traits) < 50
+
+        inherited_traits_block = ""
+        if not is_generic:
+            inherited_traits_block = f"=== INHERITED PERSONALITY TRAITS ===\n{custom_traits}\n"
+
+        # 3. Gather Selective Memory Context
         memory_block = ""
+        selected_mem_list = []
         mm = getattr(self.discussion, 'memory_manager', None)
         if mm:
             # Parse requested memory IDs from the plan
             mem_ids_match = re.search(r"Relevant Memories:\s*([^\n\r]+)", plan, re.I)
             if mem_ids_match:
                 requested_ids = [idx.strip() for idx in mem_ids_match.group(1).split(",") if idx.strip()]
-                selected_memories = []
                 for rid in requested_ids:
                     full_id = mm._resolve_id(rid)
                     if full_id:
                         m_data = mm.get(full_id)
                         if m_data:
-                            selected_memories.append(f"[{m_data['id'][:8]}] {m_data['content']}")
+                            selected_mem_list.append(f"[{m_data['id'][:8]}] {m_data['content']}")
 
-                if selected_memories:
-                    memory_block = "=== SELECTIVE PROJECT MEMORIES ===\n" + "\n".join(selected_memories) + "\n"
+                if selected_mem_list:
+                    memory_block = "=== SELECTIVE PROJECT MEMORIES ===\n" + "\n".join(selected_mem_list) + "\n"
 
-        # 3. Gather full technical context using the discussion's own logic
-        full_context = self.discussion.get_full_data_zone()
+        # 4. Parse selected artifacts, supporting context, and skills from plan to construct focused data context
+        target_match = re.search(r"Target Artifacts:\s*([^\n\r]+)", plan, re.I)
+        supporting_match = re.search(r"Supporting Context:\s*([^\n\r]+)", plan, re.I)
+        skills_match = re.search(r"Relevant Skills:\s*([^\n\r]+)", plan, re.I)
 
-        # 4. Build the On-The-Fly Surgical System Prompt
+        target_names = [name.strip() for name in target_match.group(1).split(",") if name.strip()] if target_match else []
+        supporting_names = [name.strip() for name in supporting_match.group(1).split(",") if name.strip()] if supporting_match else []
+        skill_names = [name.strip() for name in skills_match.group(1).split(",") if name.strip()] if skills_match else []
+
+        existing_titles = self.discussion.artefacts._all_latest_titles()
+
+        resolved_targets = []
+        for name in target_names:
+            resolved = name if name in existing_titles else _find_best_title_match(name, existing_titles)
+            if resolved:
+                resolved_targets.append(resolved)
+            else:
+                resolved_targets.append(name)
+
+        resolved_supporting = []
+        for name in supporting_names:
+            resolved = name if name in existing_titles else _find_best_title_match(name, existing_titles)
+            if resolved:
+                resolved_supporting.append(resolved)
+
+        resolved_skills = []
+        for name in skill_names:
+            resolved = name if name in existing_titles else _find_best_title_match(name, existing_titles)
+            if resolved:
+                resolved_skills.append(resolved)
+
+        # Build selective context (only including assessed relevant content to reduce context noise)
+        parts = []
+        udz = (self.discussion.user_data_zone or "").strip()
+        ddz = (self.discussion.discussion_data_zone or "").strip()
+        pdz = (self.discussion.personality_data_zone or "").strip()
+
+        if udz:
+            parts.append(f"-- User Data Zone --\n{udz}")
+        if ddz:
+            parts.append(f"-- Discussion Data Zone --\n{ddz}")
+        if pdz:
+            parts.append(f"-- Personality Data Zone --\n{pdz}")
+
+        all_selected_titles = set(resolved_targets + resolved_supporting + resolved_skills)
+        if all_selected_titles:
+            parts.append("## Selected Artifacts & Skills")
+            for title in all_selected_titles:
+                art = self.discussion.artefacts.get(title)
+                if art:
+                    atype = art.get('type', 'document')
+                    lang = art.get('language') or ''
+                    fence = f"```{lang}" if lang else "```"
+                    content_text = art.get('content', '').strip()
+                    label = ArtefactType.LABELS.get(atype, atype.capitalize())
+                    header = f"###[{label}] {art['title']} (v{art['version']})"
+                    if atype == ArtefactType.CODE or (lang and "<artefact_image" not in content_text):
+                        parts.append(f"{header}\n{fence}\n{content_text}\n```")
+                    else:
+                        parts.append(f"{header}\n{content_text}")
+
+        full_context = "\n\n".join(parts)
+
+        # 5. Build the On-The-Fly Spinoff System Prompt
         surgical_prompt = (
-            "You are the " + requested_persona + ".\n"
-            "You operate in a hyper-focused implementation sandbox.\n"
+            f"You are the {requested_persona}.\n"
+            "You are a specialized spinoff persona spawned by the main system architect specifically to complete this implementation.\n"
+            "You operate in a hyper-focused sandbox environment isolated from the main conversation's noise.\n\n"
             "Your ONLY task is to implement the provided PLAN by outputting updated <artifact> tags.\n"
             "DO NOT create widgets, notes, or forms. DO NOT use conversational prose.\n\n"
+            f"{inherited_traits_block}"
+            "=== TASK-SPECIFIC DEFINITION ===\n"
+            f"• Goal: {goal}\n"
+            f"• Details: {details}\n\n"
             "CORE PROTOCOL:\n"
             "- MEMORY: If a [SELECTIVE PROJECT MEMORIES] block is provided, you MUST adhere to those constraints.\n"
-            "- TARGET ARTIFACTS: These are the files you must edit or create.\n"
+            "- TARGET ARTEFACTS: These are the files you must edit or create.\n"
             "- SUPPORTING CONTEXT: These artifacts contain reference data (API docs, specs). Do NOT edit these; use them as the 'Source of Truth' to inform your changes to the Targets.\n"
             "- If the plan concerns Code: Ensure idiomatic accuracy and architectural consistency.\n"
             "- If the plan concerns Markdown/Text: Preserve tone, formatting, and structural depth.\n\n"
@@ -2479,7 +2610,21 @@ class _StreamState:
             "6. Match indentation, punctuation, and blank lines character-for-character.\n"
         )
 
-        # 5. Build the payload
+        # Ingest active conversation images (e.g. error screenshots) to forward to the specialist
+        active_images = self.discussion.get_active_images()
+
+        # Report the agent details and selective choices via the processing block if active or callback
+        self._emit_processing_status(f"Spawning specialized spinoff agent: '{requested_persona}'")
+        self._emit_processing_status(f"Spinoff Persona System Prompt:\n{surgical_prompt}")
+        self._emit_processing_status(f"User Intent: {goal}")
+        self._emit_processing_status(f"Target Artifacts to edit: {', '.join(resolved_targets) if resolved_targets else 'None'}")
+        self._emit_processing_status(f"Supporting Context provided: {', '.join(resolved_supporting) if resolved_supporting else 'None'}")
+        self._emit_processing_status(f"Skills provided: {', '.join(resolved_skills) if resolved_skills else 'None'}")
+        self._emit_processing_status(f"Memories provided: {', '.join(selected_mem_list) if selected_mem_list else 'None'}")
+        self._emit_processing_status(f"Images forwarded to agent: {len(active_images) if active_images else 0}")
+        self._emit_processing_status(f"Parent Scratchpad size: {len(getattr(self.discussion, 'scratchpad', '') or '')} characters")
+
+        # 6. Build the payload
         user_payload = []
         if memory_block:
             user_payload.append(memory_block)
@@ -2507,6 +2652,7 @@ class _StreamState:
             raw_output = self.discussion.lollmsClient.generate_text(
                 prompt=final_payload,
                 system_prompt=surgical_prompt,
+                images=active_images if active_images else None,
                 temperature=0.1,
                 n_predict=4096
             )
@@ -2941,6 +3087,12 @@ class ChatMixin:
                 images=images,
                 **kwargs,
             )
+        else:
+            if self.active_branch_id not in self._message_index:
+                raise ValueError("Regeneration failed: active branch tip not found.")
+            user_msg = LollmsMessage(self, self._message_index[self.active_branch_id])
+            images   = user_msg.get_active_images()
+            user_message = user_msg.content
 
         ss = _StreamState(
             discussion            = self,
@@ -3019,7 +3171,7 @@ class ChatMixin:
                     "sources": [], "artefacts": affected,
                     "memory_report": mem_report, "dream_report": dream_report}
 
-        if is_fast(user_message):
+        if _is_fast_message(user_message):
             _info(callback, "Simple response path")
             return _finish(self._stream_final_answer(
                 callback, images, branch_tip_id, 0.1, **kwargs))
@@ -3429,7 +3581,67 @@ class ChatMixin:
                 raise ValueError("Regeneration failed: active branch tip not found.")
             user_msg = LollmsMessage(self, self._message_index[self.active_branch_id])
             images   = user_msg.get_active_images()
- 
+            user_message = user_msg.content
+
+        # ── Fast Path Bypass ──────────────────────────────────────────────────
+        if _is_fast_message(user_message):
+            ai_message = self.add_message(
+                sender=personality.name,
+                sender_type="assistant",
+                content="",
+                parent_id=user_msg.id if user_msg else None,
+                model_name=self.lollmsClient.llm.model_name,
+                binding_name=self.lollmsClient.llm.binding_name,
+                metadata={"mode": "direct_fast_path"},
+            )
+
+            ss_fast = _StreamState(
+                discussion            = self,
+                callback              = callback,
+                ai_message            = ai_message,
+                enable_notes          = False,
+                enable_skills         = False,
+                enable_inline_widgets = False,
+                enable_forms          = False,
+                auto_activate_artefacts = False,
+                enable_artefacts      = False,
+            )
+
+            def _fast_relay(chunk, msg_type=None, meta=None):
+                if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
+                    return ss_fast.passthrough(chunk, msg_type, meta)
+                if isinstance(chunk, str):
+                    return ss_fast.feed(chunk)
+                return True
+
+            _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"message_id": ai_message.id})
+
+            raw_text = self._stream_final_answer(
+                _fast_relay, images,
+                branch_tip_id or self.active_branch_id,
+                0.1,  # Low temperature for deterministic greetings
+                **kwargs,
+            )
+            ss_fast.flush_remaining_buffer()
+
+            if remove_thinking_blocks:
+                ai_message.content = self.lollmsClient.remove_thinking_blocks(ai_message.content)
+
+            if self._is_db_backed and self.autosave:
+                self.commit()
+
+            self.scratchpad = ""
+            object.__setattr__(self, '_active_callback', None)
+            return {
+                "user_message":     user_msg,
+                "ai_message":       ai_message,
+                "sources":          [],
+                "scratchpad":       None,
+                "self_corrections": None,
+                "artefacts":        [],
+                "memory_report":    {}
+            }
+
         # ── Source inference helper ───────────────────────────────────────────
         def _infer_sources_from_json(data: Any, tool_name: str) -> List[Dict]:
             found_sources = []
@@ -4361,7 +4573,17 @@ class ChatMixin:
                 auto_activate_artefacts = auto_activate_artefacts,
                 enable_artefacts      = enable_artefacts,
             )
- 
+
+            # Report reasoning loop status to the active processing tag and callback with filled types and details
+            if _round == 1:
+                ss.proc_type = "agent_reasoning"
+                ss.proc_title = "Agent Reasoning"
+                ss._emit_processing_status("Formulating thought process and planning action...")
+            else:
+                ss.proc_type = "agent_reasoning"
+                ss.proc_title = f"Agent Reasoning (Round {_round})"
+                ss._emit_processing_status(f"Executing follow-up reasoning (Round {_round}/{max_reasoning_steps}). Refining plan...")
+
             def _inline_relay(chunk, msg_type=None, meta=None):
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
@@ -4520,9 +4742,13 @@ class ChatMixin:
  
             _tool_trigger  = ss.tool_trigger
             _tool_json_str = ss.get_tool_call_json()
- 
+
             _artefacts_built = len(ss.affected_artefacts) > 0
-            _did_something   = _tool_trigger or _artefacts_built
+            _has_action_tags = any(
+                tag in _so_far.lower()
+                for tag in ["<generate_image", "<edit_image", "<lollms_inline", "<lollms_form", "<revert_artifact", "<revert_artefact"]
+            )
+            _did_something   = _tool_trigger or _artefacts_built or _has_action_tags
  
             # ── Round-1 correction: model produced prose instead of action ────
             if _round == 1 and not _did_something:
@@ -4570,6 +4796,11 @@ class ChatMixin:
                         f"[chat] Round 1 failed to act — injecting correction."
                     )
                     _warning(callback, "Action missing; forcing model to emit tags/calls.")
+
+                    # Notify user of intent correction and loop restart
+                    ss._emit_processing_status("⚠️ Diagnostic: Action/tag was missing in response. Injecting correction and retrying...")
+                    ss._emit_processing_close()
+
                     _clean_so_far_for_llm = re.sub(
                         r'<processing.*?>.*?</processing>',
                         _compact_repl, _so_far, flags=re.DOTALL

@@ -10,6 +10,107 @@
  */
 
 document.addEventListener("DOMContentLoaded", () => {
+    // ── 🔔 Modern Toast Notification System ──
+    function showNotification(message, type = "info", duration = 4500) {
+        // Dynamically inject CSS keyframes if missing
+        if (!document.getElementById("toast-animation-styles")) {
+            const style = document.createElement("style");
+            style.id = "toast-animation-styles";
+            style.textContent = `
+                @keyframes slideIn {
+                    from { transform: translateY(-30px); opacity: 0; }
+                    to { transform: translateY(0); opacity: 1; }
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        let container = document.getElementById("notification-container");
+        if (!container) {
+            container = document.createElement("div");
+            container.id = "notification-container";
+            container.style.position = "fixed";
+            container.style.top = "24px";
+            container.style.right = "24px";
+            container.style.zIndex = "200000";
+            container.style.display = "flex";
+            container.style.flexDirection = "column";
+            container.style.gap = "12px";
+            container.style.maxWidth = "380px";
+            container.style.width = "calc(100% - 48px)";
+            container.style.pointerEvents = "none";
+            document.body.appendChild(container);
+        }
+
+        const toast = document.createElement("div");
+        toast.className = `toast-notification ${type}`;
+        toast.style.padding = "14px 18px";
+        toast.style.borderRadius = "8px";
+        toast.style.color = "#ffffff";
+        toast.style.fontSize = "13px";
+        toast.style.fontWeight = "600";
+        toast.style.boxShadow = "0 10px 25px rgba(0, 0, 0, 0.4)";
+        toast.style.display = "flex";
+        toast.style.alignItems = "center";
+        toast.style.gap = "10px";
+        toast.style.pointerEvents = "auto";
+        toast.style.animation = "slideIn 0.25s ease-out";
+        toast.style.transition = "opacity 0.25s ease, transform 0.25s ease";
+
+        let bg = "var(--chat-user-bg, #4f46e5)";
+        let icon = "ℹ️";
+        if (type === "success") {
+            bg = "var(--success-color, #10b981)";
+            icon = "✅";
+        } else if (type === "error") {
+            bg = "#ef4444";
+            icon = "❌";
+        } else if (type === "warning") {
+            bg = "var(--accent-color, #f59e0b)";
+            icon = "⚠️";
+        }
+        toast.style.backgroundColor = bg;
+        toast.style.borderLeft = "4px solid rgba(0, 0, 0, 0.25)";
+
+        toast.innerHTML = `
+            <span style="font-size: 16px;">${icon}</span>
+            <span style="flex: 1; line-height: 1.4;">${message}</span>
+            <span class="toast-close" style="cursor: pointer; font-size: 18px; font-weight: bold; opacity: 0.6; transition: opacity 0.15s; user-select: none; margin-left: 8px;">×</span>
+        `;
+
+        container.appendChild(toast);
+
+        const closeBtn = toast.querySelector(".toast-close");
+        closeBtn.addEventListener("mouseover", () => closeBtn.style.opacity = "1");
+        closeBtn.addEventListener("mouseout", () => closeBtn.style.opacity = "0.6");
+        closeBtn.onclick = () => dismiss();
+
+        let dismissTimer = setTimeout(dismiss, duration);
+
+        function dismiss() {
+            clearTimeout(dismissTimer);
+            toast.style.opacity = "0";
+            toast.style.transform = "translateY(-12px)";
+            setTimeout(() => {
+                toast.remove();
+            }, 250);
+        }
+    }
+
+    // Overwrite the native alert dialog with our beautiful custom notifications
+    window.alert = function(message) {
+        let type = "info";
+        const msgLower = String(message).toLowerCase();
+        if (msgLower.includes("success") || msgLower.includes("complete") || msgLower.includes("ready") || msgLower.includes("imported") || msgLower.includes("restored") || msgLower.includes("saved") || msgLower.includes("active") || msgLower.includes("passed")) {
+            type = "success";
+        } else if (msgLower.includes("fail") || msgLower.includes("error") || msgLower.includes("exception") || msgLower.includes("rejected") || msgLower.includes("invalid") || msgLower.includes("missing")) {
+            type = "error";
+        } else if (msgLower.includes("please") || msgLower.includes("select") || msgLower.includes("enter") || msgLower.includes("specify") || msgLower.includes("choose") || msgLower.includes("warn")) {
+            type = "warning";
+        }
+        showNotification(message, type);
+    };
+
     // ── Global State variables ──
     let selectedFiles = [];
     let activeArtifactTitle = null;
@@ -25,11 +126,82 @@ document.addEventListener("DOMContentLoaded", () => {
     let currentTtiBindingConfig = {};
     let discoveredLlmModels = [];
     let discoveredTtiModels = [];
+    let isConfigLoading = false;
+
+    // ── 🌿 Custom Asynchronous Modal Prompt (Drop-in replacement for window.prompt) ──
+    function showCustomPrompt(title, placeholder = "", defaultValue = "") {
+        return new Promise((resolve) => {
+            const overlay = document.createElement("div");
+            overlay.className = "modal-overlay";
+            overlay.style.zIndex = "1000";
+
+            const container = document.createElement("div");
+            container.className = "modal-container";
+            container.style.width = "400px";
+
+            container.innerHTML = `
+                <div class="modal-header">
+                    <h2>⚙️ ${title}</h2>
+                    <button class="modal-close-btn" id="custom-prompt-close">×</button>
+                </div>
+                <div class="modal-body" style="padding: 20px;">
+                    <div class="input-group" style="margin-bottom: 0;">
+                        <input type="text" id="custom-prompt-input" value="${defaultValue}" placeholder="${placeholder}" autofocus style="width: 100%; padding: 10px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none;" />
+                    </div>
+                </div>
+                <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid var(--border-color); display: flex; gap: 10px; justify-content: flex-end; background-color: var(--bg-panel); border-bottom-left-radius: 12px; border-bottom-right-radius: 12px;">
+                    <button class="btn btn-secondary" id="custom-prompt-cancel" style="width: auto; padding: 6px 14px; font-size: 12.5px;">Cancel</button>
+                    <button class="btn btn-primary" id="custom-prompt-ok" style="width: auto; padding: 6px 14px; font-size: 12.5px;">OK</button>
+                </div>
+            `;
+
+            overlay.appendChild(container);
+            document.body.appendChild(overlay);
+
+            const input = container.querySelector("#custom-prompt-input");
+            input.focus();
+            if (input.value) {
+                input.setSelectionRange(input.value.length, input.value.length);
+            }
+
+            function cleanup() {
+                overlay.remove();
+            }
+
+            container.querySelector("#custom-prompt-close").addEventListener("click", () => {
+                cleanup();
+                resolve(null);
+            });
+
+            container.querySelector("#custom-prompt-cancel").addEventListener("click", () => {
+                cleanup();
+                resolve(null);
+            });
+
+            const okBtn = container.querySelector("#custom-prompt-ok");
+            okBtn.addEventListener("click", () => {
+                const val = input.value.trim();
+                cleanup();
+                resolve(val);
+            });
+
+            input.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    okBtn.click();
+                } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    container.querySelector("#custom-prompt-cancel").click();
+                }
+            });
+        });
+    }
 
     // ── Core DOM Elements ──
     const serverStatus = document.getElementById("server-status");
     const artifactsList = document.getElementById("artifacts-list");
     const memoriesList = document.getElementById("memories-list");
+    const branchSelect = document.getElementById("branch-select");
     
     // Chat & Workspace Center DOM Elements
     const workspaceTabs = document.getElementById("workspace-tabs");
@@ -42,10 +214,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnOpenImport = document.getElementById("btn-open-import");
     const btnCloseImport = document.getElementById("btn-close-import");
     const importModal = document.getElementById("import-modal");
-    
+
     // Modal Inner Navigation Elements
-    const modalTabs = document.querySelectorAll(".modal-tab");
-    const modalTabContents = document.querySelectorAll(".modal-tab-content-pane");
+    const modalTabs = document.querySelectorAll("#import-modal .modal-tab");
+    const modalTabContents = document.querySelectorAll("#import-modal .modal-tab-content-pane");
 
     // Local Ingestion Elements inside Modal
     const dropzone = document.getElementById("upload-dropzone");
@@ -140,21 +312,14 @@ document.addEventListener("DOMContentLoaded", () => {
     const settingsProfilesList = document.getElementById("settings-profiles-list");
 
     // ── Startup Initialization ──
-    fetchArtifacts();
-    fetchMemories();
-    fetchDiscoveredTools();
-    updateContextBudget();
-    loadSettingsIntoUI();
-    fetchMessageHistory();
-
     const btnAddMemory = document.getElementById("btn-add-memory-part");
     if (btnAddMemory) {
         btnAddMemory.addEventListener("click", async () => {
-            const content = prompt("Enter memory content:");
+            const content = await showCustomPrompt("Add Memory", "Enter memory content");
             if (!content) return;
-            const impStr = prompt("Importance (0.0 - 1.0):", "0.75");
+            const impStr = await showCustomPrompt("Memory Importance", "Importance (0.0 - 1.0)", "0.75");
             const importance = parseFloat(impStr || "0.75");
-            const lvlStr = prompt("Level (1=Working, 2=Deep, 3=Archived):", "1");
+            const lvlStr = await showCustomPrompt("Memory Level", "Level (1=Working, 2=Deep, 3=Archived)", "1");
             const level = parseInt(lvlStr || "1", 10);
             try {
                 const res = await fetch("/api/memories/import", {
@@ -169,20 +334,75 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // ── Check Server Status ──
-    fetch("/status")
-        .then(res => res.json())
-        .then(data => {
+    // Deactivate chat input by default until LLM server state is verified
+    chatInput.disabled = true;
+    btnChatSend.disabled = true;
+
+    async function verifyServerStatus() {
+        try {
+            const res = await fetch("/status");
+            const data = await res.json();
+            const overlay = document.getElementById("connection-overlay");
             if (data.status === "running") {
                 serverStatus.textContent = data.is_mock ? "Server Online (Mock Fallback)" : "Server Online";
                 serverStatus.style.backgroundColor = "rgba(16, 185, 129, 0.15)";
                 serverStatus.style.color = "#10b981";
+
+                if (data.needs_configuration) {
+                    if (overlay) overlay.style.display = "none";
+                    settingsModal.style.display = "flex";
+                    chatInput.disabled = true;
+                    btnChatSend.disabled = true;
+                    chatInput.placeholder = "⚠️ Please configure an LLM binding to start chatting...";
+                } else {
+                    if (overlay) overlay.style.display = "none";
+                    chatInput.disabled = false;
+                    btnChatSend.disabled = false;
+                    chatInput.placeholder = "Type your message or run a macro...";
+                }
             }
-        })
-        .catch(() => {
+        } catch (err) {
+            const overlay = document.getElementById("connection-overlay");
+            if (overlay) overlay.style.display = "none";
             serverStatus.textContent = "Offline";
             serverStatus.style.backgroundColor = "rgba(239, 68, 68, 0.15)";
             serverStatus.style.color = "#ef4444";
-        });
+        }
+    }
+
+    async function initializeApp() {
+        try {
+            // 1. Run core sidebar and budget fetches in parallel
+            await Promise.all([
+                fetchArtifacts(),
+                fetchMemories(),
+                fetchDiscoveredTools(),
+                updateContextBudget()
+            ]);
+
+            // 2. Load and resolve dropdown select listings
+            await loadSettingsIntoUI();
+
+            // 3. Retrieve chronological message history
+            await fetchMessageHistory();
+
+            // 4. Verify server configuration status and trigger settings redirect if needed
+            await verifyServerStatus();
+        } catch (err) {
+            console.error("Workspace initialization failed:", err);
+        } finally {
+            // 5. Smoothly fade out and remove the global loader once everything is ready
+            const globalLoader = document.getElementById("global-page-loader");
+            if (globalLoader) {
+                globalLoader.style.opacity = "0";
+                globalLoader.style.visibility = "hidden";
+                setTimeout(() => globalLoader.remove(), 400);
+            }
+        }
+    }
+
+    // Launch workspace bootstrapper
+    initializeApp();
 
     // ── Combined Ingestion Modal Display Toggle ──
     btnOpenImport.addEventListener("click", () => {
@@ -195,10 +415,16 @@ document.addEventListener("DOMContentLoaded", () => {
         importModal.style.display = "none";
     });
 
-    importModal.addEventListener("click", (e) => {
-        if (e.target === importModal) {
+    // Bulletproof click-outside closure tracking (prevents accidental close during text selection drags)
+    let isMouseDownOnImportOverlay = false;
+    importModal.addEventListener("mousedown", (e) => {
+        isMouseDownOnImportOverlay = (e.target === importModal);
+    });
+    importModal.addEventListener("mouseup", (e) => {
+        if (isMouseDownOnImportOverlay && e.target === importModal) {
             importModal.style.display = "none";
         }
+        isMouseDownOnImportOverlay = false;
     });
 
     modalTabs.forEach(tab => {
@@ -294,6 +520,17 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         if (targetContent) {
             targetContent.classList.add("active");
+
+            // Dispatch a window resize event to force any lazy-rendered elements or iframes to rescale instantly
+            window.dispatchEvent(new Event('resize'));
+
+            // If the content contains an iframe, trigger a resize on its window too
+            const iframe = targetContent.querySelector('iframe');
+            if (iframe && iframe.contentWindow) {
+                try {
+                    iframe.contentWindow.dispatchEvent(new Event('resize'));
+                } catch(e) {}
+            }
         }
     }
 
@@ -365,8 +602,23 @@ document.addEventListener("DOMContentLoaded", () => {
         });
 
         const vSelect = tabContent.querySelector(".version-select");
-        vSelect.addEventListener("change", (e) => {
-            loadArtifactVersion(title, parseInt(e.target.value, 10));
+        vSelect.addEventListener("change", async (e) => {
+            const selectedVer = parseInt(e.target.value, 10);
+            await loadArtifactVersion(title, selectedVer);
+
+            // Sync selected version back to the AI's active prompt context in real-time
+            try {
+                const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/select_version?version=${selectedVer}`, {
+                    method: "POST"
+                });
+                const data = await res.json();
+                if (data.success) {
+                    fetchArtifacts(); // Refreshes active/dormant icons in left sidebar
+                    updateContextBudget();
+                }
+            } catch(err) {
+                console.error("Failed to sync active version to AI:", err);
+            }
         });
 
         // Bind Context-Aware Download/Export Click
@@ -477,8 +729,8 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     // ── 🛠️ Create New Tool Action ──
     const btnCreateTool = document.getElementById("btn-create-tool");
-    btnCreateTool.addEventListener("click", () => {
-        const rawName = prompt("Enter a snake_case name for your new custom LCP tool (e.g. file_zipper):");
+    btnCreateTool.addEventListener("click", async () => {
+        const rawName = await showCustomPrompt("Create New Tool", "Enter a snake_case name (e.g. file_zipper)");
         if (!rawName) return;
 
         const cleanName = rawName.replace(/[^a-zA-Z0-9_]/g, "").trim().toLowerCase();
@@ -555,7 +807,18 @@ document.addEventListener("DOMContentLoaded", () => {
                 const art = await artRes.json();
                 rawView.value = art.content;
 
-                const blob = new Blob([art.content], { type: "text/html" });
+                // Resolve <artefact_image> custom tags into standard browser-supported <img> tags before creating the render Blob
+                let resolvedContent = art.content.replace(/<artefact_image\s+id=["']([^"']+)["']\s*(?:\/>|>)/gi, (match, imageId) => {
+                    if (imageId.includes("::")) {
+                        const parts = imageId.split("::");
+                        const imgIndex = parts[parts.length - 1];
+                        const imgTitle = parts.slice(0, -1).join("::");
+                        return `<img src="/api/images/${encodeURIComponent(imgTitle)}/${imgIndex}" style="width:100%; height:100%; object-fit:cover;" />`;
+                    }
+                    return match;
+                });
+
+                const blob = new Blob([resolvedContent], { type: "text/html" });
                 const iframeUrl = URL.createObjectURL(blob);
                 renderedView.innerHTML = `
                     <iframe src="${iframeUrl}" style="width: 100%; height: 100%; border: none; min-height: 520px; border-radius: 8px; background: #000;" id="presentation-frame-${safeId}"></iframe>
@@ -695,7 +958,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     }
                 } else {
                     const parsedMarkdown = marked.parse(art.content);
-                    const resolvedHTML = resolveImageAnchors(parsedMarkdown, title);
+                    const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, null, version);
                     renderedView.innerHTML = resolvedHTML;
                     renderMath(renderedView);
                 }
@@ -1342,6 +1605,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const macroReport = document.getElementById("macro-report");
     const macroInfographic = document.getElementById("macro-infographic");
     const macroPresentation = document.getElementById("macro-presentation");
+    const macroTestForm = document.getElementById("macro-test-form");
 
     macroReport.addEventListener("click", () => {
         triggerMacroPrompt("Generate a highly structured, professional, multi-section technical report synthesizing all currently active user-facing documents. Structure it with an executive summary, detailed analysis chapters, comparison tables, and conclusion sections. Save your response as a new document artifact by wrapping it in the exact XML tag: <artifact name=\"comprehensive_technical_report.md\" type=\"document\"> ... </artifact>");
@@ -1360,9 +1624,85 @@ document.addEventListener("DOMContentLoaded", () => {
             });
     });
 
-    macroPresentation.addEventListener("click", () => {
-        triggerMacroPrompt("Convert the active artifacts into a complete, beautiful slide deck presentation in semantic HTML5. Use custom inline CSS styles for layout, transitions, charts, and data figures, and add speakernotes (using 'data-notes'). Save your response as a new presentation artifact by wrapping it in the exact XML tag: <artifact name=\"slideshow_presentation.html\" type=\"presentation\"> ... </artifact>");
+    // 🎬 Presentation Builder Dashboard Modal & Trigger
+    const presModal = document.getElementById("presentation-dashboard-modal");
+    const btnClosePresModal = document.getElementById("btn-close-presentation-modal");
+    const btnCancelPres = document.getElementById("btn-cancel-presentation");
+    const btnBuildPres = document.getElementById("btn-build-presentation");
+
+    if (btnClosePresModal) {
+        btnClosePresModal.addEventListener("click", () => presModal.style.display = "none");
+    }
+    if (btnCancelPres) {
+        btnCancelPres.addEventListener("click", () => presModal.style.display = "none");
+    }
+
+    macroPresentation.addEventListener("click", async () => {
+        presModal.style.display = "flex";
+        const infoDiv = document.getElementById("pres-available-images-info");
+        infoDiv.style.display = "none";
+
+        // Query active workspace artifacts to identify if any image assets are available for embedding
+        try {
+            const res = await fetch("/api/artifacts");
+            const arts = await res.json();
+            const activeImages = arts.filter(a => a.active && a.type === "image");
+            if (activeImages.length > 0) {
+                infoDiv.style.display = "block";
+                infoDiv.innerHTML = `📸 Found <strong>${activeImages.length} active image(s)</strong> available for embedding:<br>${activeImages.map(a => `• <em>${a.title}</em>`).join("<br>")}`;
+            }
+        } catch (e) {
+            console.error("Failed to fetch active images for presentation builder:", e);
+        }
     });
+
+    macroTestForm.addEventListener("click", () => {
+        triggerMacroPrompt(
+            "Generate an interactive form using the <lollms_form> system to let the user configure a new cloud deployment.\n\n" +
+            "The form MUST include exactly these fields:\n" +
+            "1. A text field named 'project_name' with label 'Project Name'\n" +
+            "2. A select field named 'cloud_provider' with label 'Cloud Provider' and options: AWS, GCP, Azure, DigitalOcean\n" +
+            "3. A radio field named 'server_size' with label 'Server Size' and options: Micro, Medium, Large\n" +
+            "4. A checkbox field named 'enable_backups' with label 'Enable Backups'\n" +
+            "5. A range field named 'scaling_instances' with label 'Scaling Instances' (min 1, max 10, default 2)\n\n" +
+            "Include a polite greeting and let the user know they can submit the configuration. Do NOT wrap the tags in markdown fences."
+        );
+    });
+
+    if (btnBuildPres) {
+        btnBuildPres.addEventListener("click", () => {
+            const theme = document.getElementById("pres-style").value;
+            const slideCount = parseInt(document.getElementById("pres-slides-count").value, 10) || 5;
+            const hints = document.getElementById("pres-structure-hints").value.trim();
+            const embedImages = document.getElementById("pres-embed-images").checked;
+
+            let imageInstructions = "";
+            if (embedImages) {
+                imageInstructions = `
+                - IMAGE EMBEDDING IS AUTHORIZED: Yes. You can embed the active image artifacts using the following anchor tag format inside your slides:
+                  <figure class="slide-image"><artefact_image id="IMAGE_TITLE::0" /></figure>
+                  Make sure to match the image title exactly from the active artifacts list. Position these figures nicely inside a grid or two-column slide layout.`;
+            } else {
+                imageInstructions = `
+                - IMAGE EMBEDDING IS AUTHORIZED: No. Do not attempt to embed active images or reference any <artefact_image> tags. Use solid colors, styled text, and custom CSS layouts instead.`;
+            }
+
+            const promptText = `Convert the active artifacts into a complete, beautiful slide deck presentation in semantic HTML5.
+
+            DESIGN & STRUCTURE SPECIFICATIONS:
+            - Theme / Style: ${theme.toUpperCase()} style. Use customized CSS variables, backgrounds, fonts, and borders aligned with this style.
+            - Expected Slide Panels: Exactly ${slideCount} slides.
+            - Structure / Outline Hints: ${hints ? hints : "Synthesize the core themes of the active artifacts across the slides."}
+            ${imageInstructions}
+
+            Use custom inline CSS styles for layout, transitions, charts, and data figures, and add speakernotes (using 'data-notes' on each <section class="slide">). 
+            Save your response as a new presentation artifact by wrapping it in the exact XML tag: 
+            <artifact name="slideshow_presentation.html" type="presentation"> ... </artifact>`;
+
+            triggerMacroPrompt(promptText);
+            presModal.style.display = "none";
+        });
+    }
 
     // ── Local Ingestion Handlers (Relocated into Modal) ──
     dropzone.addEventListener("click", () => fileInput.click());
@@ -2206,6 +2546,7 @@ document.addEventListener("DOMContentLoaded", () => {
                             artFormat.innerHTML = `
                                 <option value="markdown" selected>Markdown (.md)</option>
                                 <option value="html">HTML Webpage (.html)</option>
+                                <option value="zip">Complete Zip Bundle (.zip)</option>
                                 <option value="pdf">PDF Document (.pdf)</option>
                                 <option value="docx">Microsoft Word (.docx)</option>
                                 <option value="pptx">Microsoft PowerPoint (.pptx)</option>
@@ -2289,7 +2630,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     btnOpenSettings.addEventListener("click", () => {
         settingsModal.style.display = "flex";
-        fetchBindings();
+        loadSettingsIntoUI();
     });
 
     const closeSettingsModal = () => {
@@ -2305,10 +2646,16 @@ document.addEventListener("DOMContentLoaded", () => {
         btnCancelSettings.addEventListener("click", closeSettingsModal);
     }
 
-    settingsModal.addEventListener("click", (e) => {
-        if (e.target === settingsModal) {
+    // Bulletproof click-outside closure tracking for settings
+    let isMouseDownOnSettingsOverlay = false;
+    settingsModal.addEventListener("mousedown", (e) => {
+        isMouseDownOnSettingsOverlay = (e.target === settingsModal);
+    });
+    settingsModal.addEventListener("mouseup", (e) => {
+        if (isMouseDownOnSettingsOverlay && e.target === settingsModal) {
             settingsModal.style.display = "none";
         }
+        isMouseDownOnSettingsOverlay = false;
     });
 
     settingsTabs.forEach(tab => {
@@ -2469,7 +2816,131 @@ document.addEventListener("DOMContentLoaded", () => {
         renderTtiModelDropdown(filtered);
     });
 
+    let discoveredTtiZoo = [];
+
+    async function populateTtiZoo(bindingName) {
+        const zooSelect = document.getElementById("settings-tti-zoo-select");
+        const downloadBtn = document.getElementById("btn-download-tti-zoo");
+        const statusDiv = document.getElementById("tti-zoo-status");
+
+        zooSelect.innerHTML = `<option value="">-- Select Zoo Model --</option>`;
+        downloadBtn.style.display = "none";
+        statusDiv.style.display = "none";
+
+        if (!bindingName) return;
+
+        downloadBtn.style.display = "inline-block";
+        statusDiv.className = "validation-status";
+        statusDiv.style.display = "flex";
+        statusDiv.textContent = "Fetching TTI Zoo list from binding...";
+
+        try {
+            const res = await fetch("/api/bindings/tti/zoo", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    binding_name: bindingName,
+                    config: collectTtiBindingConfig()
+                })
+            });
+            const data = await res.json();
+            if (data.success && Array.isArray(data.zoo)) {
+                discoveredTtiZoo = data.zoo;
+                if (discoveredTtiZoo.length === 0) {
+                    statusDiv.className = "validation-status error";
+                    statusDiv.textContent = "No models available in this binding's Zoo.";
+                    zooSelect.innerHTML = `<option value="">No models available</option>`;
+                    downloadBtn.style.display = "none";
+                } else {
+                    renderTtiZooDropdown(discoveredTtiZoo);
+                    statusDiv.style.display = "none";
+                }
+            } else {
+                statusDiv.className = "validation-status error";
+                statusDiv.textContent = "Could not fetch Zoo list: " + (data.error || "Unknown error.");
+            }
+        } catch (err) {
+            statusDiv.className = "validation-status error";
+            statusDiv.textContent = "Request failed: " + err;
+        }
+    }
+
+    function renderTtiZooDropdown(zooList) {
+        const zooSelect = document.getElementById("settings-tti-zoo-select");
+        zooSelect.innerHTML = `<option value="">-- Select Zoo Model --</option>` +
+            zooList.map(m => `<option value="${m.link}">${m.name} (${m.size || 'unknown size'})</option>`).join("");
+    }
+
+    const ttiZooSearch = document.getElementById("settings-tti-zoo-search");
+    if (ttiZooSearch) {
+        ttiZooSearch.addEventListener("input", (e) => {
+            const query = e.target.value.toLowerCase().trim();
+            if (!query) {
+                renderTtiZooDropdown(discoveredTtiZoo);
+                return;
+            }
+            const filtered = discoveredTtiZoo.filter(m => 
+                m.name.toLowerCase().includes(query) || 
+                (m.description && m.description.toLowerCase().includes(query)) ||
+                m.link.toLowerCase().includes(query)
+            );
+            renderTtiZooDropdown(filtered);
+        });
+    }
+
+    const btnDownloadTtiZoo = document.getElementById("btn-download-tti-zoo");
+    if (btnDownloadTtiZoo) {
+        btnDownloadTtiZoo.addEventListener("click", async () => {
+            const zooSelect = document.getElementById("settings-tti-zoo-select");
+            const statusDiv = document.getElementById("tti-zoo-status");
+            const modelLink = zooSelect.value;
+
+            if (!modelLink) {
+                alert("Please select a zoo model to download first.");
+                return;
+            }
+
+            btnDownloadTtiZoo.disabled = true;
+            btnDownloadTtiZoo.textContent = "Downloading...";
+            statusDiv.className = "validation-status";
+            statusDiv.style.display = "flex";
+            statusDiv.textContent = "Downloading model from Hub. This may take several minutes...";
+
+            try {
+                const res = await fetch("/api/bindings/execute_command", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        modality: "tti",
+                        binding_name: selTtiBinding.value,
+                        command_name: "pull_model",
+                        parameters: {
+                            model_name: modelLink
+                        }
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    statusDiv.className = "validation-status success";
+                    statusDiv.textContent = "✅ Model downloaded and installed successfully!";
+                    // Refresh available models list
+                    await fetchCurrentTtiModels();
+                } else {
+                    statusDiv.className = "validation-status error";
+                    statusDiv.textContent = "❌ Download failed: " + (data.error || "Unknown error.");
+                }
+            } catch (err) {
+                statusDiv.className = "validation-status error";
+                statusDiv.textContent = "❌ Request failed: " + err;
+            } finally {
+                btnDownloadTtiZoo.disabled = false;
+                btnDownloadTtiZoo.textContent = "📥 Download Selected Model";
+            }
+        });
+    }
+
     selTtiBinding.addEventListener("change", () => {
+        if (isConfigLoading) return;
         ttiModelGroup.style.display = "none";
         valTtiStatus.className = "validation-status";
         valTtiStatus.textContent = "";
@@ -2774,6 +3245,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     selBinding.addEventListener("change", () => {
+        if (isConfigLoading) return;
         modelGroup.style.display = "none";
         valStatus.className = "validation-status";
         valStatus.textContent = "";
@@ -2829,6 +3301,22 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
+    // Bind open settings folder button
+    const btnOpenSettingsFolder = document.getElementById("btn-open-settings-folder");
+    if (btnOpenSettingsFolder) {
+        btnOpenSettingsFolder.addEventListener("click", async () => {
+            try {
+                const res = await fetch("/api/settings/open_folder", { method: "POST" });
+                const data = await res.json();
+                if (!data.success) {
+                    alert("Failed to open settings folder: " + data.detail);
+                }
+            } catch (err) {
+                alert("Request failed: " + err);
+            }
+        });
+    }
+
     // Bind the LLM-specific apply button (if it exists separately in the future)
     // Currently, btnApply is bound to the LLM tab button, but we need the global one.
     const btnApplyGlobal = document.getElementById("btn-apply-global-settings");
@@ -2866,6 +3354,27 @@ document.addEventListener("DOMContentLoaded", () => {
                     valStatus.className = "validation-status success";
                     valStatus.textContent = "✅ Configuration applied successfully.";
                     await fetchCurrentModels();
+
+                    // Re-enable chat after successful configuration save
+                    chatInput.disabled = false;
+                    btnChatSend.disabled = false;
+                    chatInput.placeholder = "Type your message or run a macro...";
+
+                    setTimeout(() => {
+                        settingsModal.style.display = "none";
+                        valStatus.className = "validation-status";
+                        valStatus.textContent = "";
+                    }, 800);
+                }                if (data.success) {
+                    valStatus.className = "validation-status success";
+                    valStatus.textContent = "✅ Configuration applied successfully.";
+                    await fetchCurrentModels();
+
+                    // Re-enable chat after successful configuration save
+                    chatInput.disabled = false;
+                    btnChatSend.disabled = false;
+                    chatInput.placeholder = "Type your message or run a macro...";
+
                     setTimeout(() => {
                         settingsModal.style.display = "none";
                         valStatus.className = "validation-status";
@@ -3046,6 +3555,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function loadSettingsIntoUI() {
         try {
+            isConfigLoading = true;
             console.log("🔍 Loading settings into UI...");
             const res = await fetch("/api/settings");
             const data = await res.json();
@@ -3070,10 +3580,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (bindingExists) {
                     console.log("⚙️ Pre-selecting binding:", data.llm_binding_name);
 
-                    // Pre-select binding
+                    // Pre-select and render the form synchronously
                     selBinding.value = data.llm_binding_name;
-                    console.log("✅ selBinding.value set to:", selBinding.value);
-
+                    renderConfigForm(data.llm_binding_name);
                     // Wait for DOM to render the selection, then trigger change event
                     setTimeout(() => {
                         console.log("🔁 Verifying binding selection after DOM render...");
@@ -3093,9 +3602,9 @@ document.addEventListener("DOMContentLoaded", () => {
                                 console.log("✅ Re-applied binding selection:", selBinding.value);
                             }
                         }, 50);
-                    }, 100);
+                    }, 100);                    
 
-                    // Populate config inputs first
+                    // Populate config inputs directly
                     const config = data.llm_binding_config || {};
                     for (const [key, value] of Object.entries(config)) {
                         const input = document.getElementById(`cfg-${key}`);
@@ -3235,6 +3744,8 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         } catch (err) {
             console.error("Failed to load settings:", err);
+        } finally {
+            isConfigLoading = false;
         }
     }
     function closeExportModal() {
@@ -3246,6 +3757,7 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCancelExport.addEventListener("click", closeExportModal);
 
     // ── Settings Sub-Tabs Navigation (Parameters vs Custom Commands) ──
+    // Settings Sub-Tabs Navigation (Parameters vs Custom Commands)
     const llmSubTabButtons = document.querySelectorAll(".sub-tab-btn[data-llm-sub-tab]");
     const llmSubPanes = document.querySelectorAll(".llm-sub-pane");
     llmSubTabButtons.forEach(btn => {
@@ -3268,10 +3780,12 @@ document.addEventListener("DOMContentLoaded", () => {
             ttiSubTabButtons.forEach(b => b.classList.remove("active"));
             ttiSubPanes.forEach(p => p.style.display = "none");
             btn.classList.add("active");
-            document.getElementById(`tti-sub-pane-${btn.dataset.tti-sub-tab}`).style.display = "flex";
+            document.getElementById(`tti-sub-pane-${btn.dataset.ttiSubTab}`).style.display = "flex";
 
-            if (btn.dataset.tti-sub-tab === "commands") {
+            if (btn.dataset.ttiSubTab === "commands") {
                 populateBindingCommands("tti", selTtiBinding.value);
+            } else if (btn.dataset.ttiSubTab === "zoo") {
+                populateTtiZoo(selTtiBinding.value);
             }
         });
     });
@@ -3632,14 +4146,14 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch("/api/discussions/viewer_session/messages");
             const messages = await res.json();
 
+            // Check and preserve active thinking indicator state prior to innerHTML wipe
+            const indicator = document.getElementById("thinking-indicator");
+            const wasActive = indicator && indicator.classList.contains("active");
+            const activeText = indicator && indicator.querySelector(".thinking-text") ? indicator.querySelector(".thinking-text").textContent : "Lollms is thinking...";
+
             chatHistory.innerHTML = ""; // Clear
             if (messages.length === 0) {
-                chatHistory.innerHTML = `
-                    <div class="chat-welcome-msg">
-                        Ask Lollms questions. You can chat freely with or without loaded artifacts. 
-                        Click on the <strong>+</strong> button below to import local files or internet content!
-                    </div>
-                `;
+                // Keep chat completely empty per user requirements
                 return;
             }
 
@@ -3650,7 +4164,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     tokens: msg.tokens,
                     speed: msg.generation_speed,
                     ttft: msg.metadata ? msg.metadata.ttft : null
-                });
+                }, msg);
             });
             chatHistory.scrollTop = chatHistory.scrollHeight;
         } catch (err) {
@@ -3658,10 +4172,27 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    function renderMessageBubble(msgId, sender, text, metrics = {}) {
+    async function cycleSibling(messageId, direction) {
+        try {
+            const res = await fetch(`/api/discussions/viewer_session/messages/${messageId}/siblings/cycle?direction=${direction}`, {
+                method: "POST"
+            });
+            const data = await res.json();
+            if (data.success) {
+                await fetchMessageHistory();
+            }
+        } catch (err) {
+            console.error("Failed to cycle sibling:", err);
+        }
+    }
+
+    function renderMessageBubble(msgId, sender, text, metrics = {}, msgObj = null) {
         const bubble = document.createElement("div");
         bubble.className = `chat-bubble ${sender}`;
         bubble.dataset.msgId = msgId;
+        if (msgObj) {
+            bubble.dataset.msgObj = JSON.stringify(msgObj);
+        }
 
         const contentDiv = document.createElement("div");
         contentDiv.className = "chat-assistant-container";
@@ -3671,7 +4202,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Resolve inline anchors and compile markdown
         const parsedMarkdown = marked.parse(text);
-        const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle);
+        const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, msgId, null, msgObj);
         proseSpan.innerHTML = resolvedHTML;
         contentDiv.appendChild(proseSpan);
         bubble.appendChild(contentDiv);
@@ -3699,11 +4230,33 @@ document.addEventListener("DOMContentLoaded", () => {
         actionsRow.className = "msg-actions-row";
 
         const actionLabel = sender === "user" ? "🔄 Resend" : "🔄 Regenerate";
+
         actionsRow.innerHTML = `
             <button class="msg-action-btn edit" data-msg-id="${msgId}">✏️ Edit</button>
             <button class="msg-action-btn delete" data-msg-id="${msgId}">🗑️ Delete</button>
             <button class="msg-action-btn resend" data-msg-id="${msgId}">${actionLabel}</button>
         `;
+
+        if (msgObj && msgObj.siblings && msgObj.siblings.length > 1) {
+            const siblingPager = document.createElement("div");
+            siblingPager.className = "sibling-pager";
+            siblingPager.style = "display: inline-flex; align-items: center; gap: 8px; font-size: 11px; font-weight: bold; color: var(--text-secondary); margin-left: auto; user-select: none;";
+            siblingPager.innerHTML = `
+                <button class="sibling-page-btn prev-sib" style="background: none; border: none; color: var(--accent-color); cursor: pointer; font-size: 12px; padding: 2px 4px;">◀</button>
+                <span>${msgObj.active_sibling_index + 1} / ${msgObj.siblings.length}</span>
+                <button class="sibling-page-btn next-sib" style="background: none; border: none; color: var(--accent-color); cursor: pointer; font-size: 12px; padding: 2px 4px;">▶</button>
+            `;
+
+            siblingPager.querySelector(".prev-sib").addEventListener("click", () => {
+                cycleSibling(msgId, -1);
+            });
+            siblingPager.querySelector(".next-sib").addEventListener("click", () => {
+                cycleSibling(msgId, 1);
+            });
+
+            actionsRow.appendChild(siblingPager);
+        }
+
         contentDiv.appendChild(actionsRow);
         chatHistory.appendChild(bubble);
 
@@ -3782,29 +4335,68 @@ document.addEventListener("DOMContentLoaded", () => {
                 });
         });
 
-        // B. Delete Message
+        // B. Delete Message (Recursive Subtree Pruning Protocol)
         bubbleElement.querySelector(".msg-action-btn.delete").addEventListener("click", async () => {
-            if (!confirm("Are you sure you want to delete this message?")) return;
+            const isUser = bubbleElement.classList.contains("user");
+            const nodeLabel = isUser ? "User Message and subsequent replies" : "Assistant Message and subsequent conversation";
+            if (!confirm(`Are you sure you want to PRUNE this branch?\n(This permanently deletes this ${nodeLabel} on this path.)`)) {
+                return;
+            }
             try {
-                const res = await fetch(`/api/discussions/viewer_session/messages/${msgId}`, { method: "DELETE" });
+                const res = await fetch(`/api/discussions/viewer_session/messages/${msgId}?prune=true`, { method: "DELETE" });
                 const data = await res.json();
                 if (data.success) {
-                    bubbleElement.remove();
-                    fetchMessageHistory();
+                    await fetchMessageHistory();
                 }
-            } catch (err) { alert("Delete failed: " + err); }
+            } catch (err) { alert("Pruning failed: " + err); }
         });
 
-        // C. Resend / Regenerate
+        // C. Resend / Regenerate (Branching Resend/Regenerate protocol)
         bubbleElement.querySelector(".msg-action-btn.resend").addEventListener("click", async () => {
-            try {
-                const res = await fetch(`/api/discussions/viewer_session/messages/${msgId}/regenerate`, { method: "POST" });
-                const data = await res.json();
-                if (data.success) {
-                    // Trigger the duplicate-free assistant regeneration stream directly
-                    sendChatMessage(true);
+            const msgObj = bubbleElement.dataset.msgObj ? JSON.parse(bubbleElement.dataset.msgObj) : null;
+            const isUser = bubbleElement.classList.contains("user");
+
+            if (isUser) {
+                // User message: Resend forks a new branch instantly without prompting for text input
+                const originalText = proseSpan.textContent.trim();
+                const parentId = msgObj ? (msgObj.parent_id || "null") : "null";
+                try {
+                    const res = await fetch(`/api/discussions/viewer_session/messages/${parentId}/fork`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ initial_content: originalText })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await fetchMessageHistory();
+                        sendChatMessage(true); // run completion turn on new branch
+                    }
+                } catch (err) {
+                    alert("Resend failed: " + err);
                 }
-            } catch (err) { alert("Regeneration failed: " + err); }
+            } else {
+                // Assistant message: Regenerate switches back to parent user message and triggers a new sibling reply
+                const parentId = msgObj ? msgObj.parent_id : null;
+                if (!parentId) {
+                    alert("Cannot regenerate root assistant message.");
+                    return;
+                }
+                try {
+                    // Switch active branch pointer back to the parent user message
+                    const switchRes = await fetch("/api/discussions/viewer_session/branches/switch", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ leaf_id: parentId })
+                    });
+                    const switchData = await switchRes.json();
+                    if (switchData.success) {
+                        await fetchMessageHistory();
+                        sendChatMessage(true); // run completion turn to generate a new sibling assistant reply
+                    }
+                } catch (err) {
+                    alert("Regeneration failed: " + err);
+                }
+            }
         });
     }
 
@@ -3864,8 +4456,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const createCard = document.getElementById("btn-create-workspace-card");
         if (createCard) {
-            createCard.addEventListener("click", () => {
-                const name = prompt("Enter a name for the new isolated workspace:");
+            createCard.addEventListener("click", async () => {
+                const name = await showCustomPrompt("Create Workspace", "Enter workspace name", "Bazinga");
                 if (name) createWorkspace(name);
             });
         }
@@ -3938,6 +4530,77 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
+    // ── 🧠 Dynamic Thinking Indicator Helpers ──
+    function showThinkingIndicator(statusText = "Lollms is thinking...") {
+        let indicator = document.getElementById("thinking-indicator");
+        if (!indicator) {
+            indicator = document.createElement("div");
+            indicator.id = "thinking-indicator";
+            indicator.className = "typing-indicator";
+            indicator.innerHTML = `
+                <span class="typing-dot"></span>
+                <span class="typing-dot"></span>
+                <span class="typing-dot"></span>
+                <span class="thinking-text" style="font-size: 11.5px; font-weight: bold; color: var(--text-secondary); margin-left: 4px;">${statusText}</span>
+            `;
+        } else {
+            const textEl = indicator.querySelector(".thinking-text");
+            if (textEl) textEl.textContent = statusText;
+        }
+        chatHistory.appendChild(indicator);
+        indicator.classList.add("active");
+        chatHistory.scrollTop = chatHistory.scrollHeight;
+    }
+
+    function hideThinkingIndicator() {
+        const indicator = document.getElementById("thinking-indicator");
+        if (indicator) {
+            indicator.remove();
+        }
+    }
+
+    // ── 🌿 Fetch and Render Active Branches ──
+    async function fetchBranches() {
+        if (!branchSelect) return;
+        try {
+            const res = await fetch("/api/discussions/viewer_session/branches");
+            const branches = await res.json();
+
+            if (branches.length === 0) {
+                branchSelect.innerHTML = `<option value="">No branches found</option>`;
+                return;
+            }
+
+            branchSelect.innerHTML = branches.map(b => {
+                const isSelected = b.is_active ? "selected" : "";
+                return `<option value="${b.leaf_id}" ${isSelected}>${b.label}</option>`;
+            }).join("");
+        } catch (err) {
+            console.error("Failed to fetch branches:", err);
+        }
+    }
+
+    if (branchSelect) {
+        branchSelect.addEventListener("change", async () => {
+            const leafId = branchSelect.value;
+            if (!leafId) return;
+            try {
+                const res = await fetch("/api/discussions/viewer_session/branches/switch", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ leaf_id: leafId })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    await fetchMessageHistory();
+                    await fetchBranches();
+                }
+            } catch (err) {
+                alert("Failed to switch branch: " + err);
+            }
+        });
+    }
+
     // ── 🧠 Fetch and Render Persistent Memories ──
     async function fetchMemories() {
         try {
@@ -4008,8 +4671,9 @@ document.addEventListener("DOMContentLoaded", () => {
                             if (res.ok) fetchMemories();
                         } catch (err) { console.error(err); }
                     } else if (action === "imp") {
-                        const raw = prompt("New importance (0.0 - 1.0):");
-                        if (raw === null) return;
+                        const currentImp = card.querySelector(".importance-badge").textContent.match(/[\d.]+/)[0] / 100;
+                        const raw = await showCustomPrompt("Edit Importance", "New importance (0.0 - 1.0)", currentImp);
+                        if (raw === null || raw === "") return;
                         const importance = parseFloat(raw);
                         if (isNaN(importance)) return;
                         try {
@@ -4042,11 +4706,7 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch("/api/chat/clear", { method: "POST" });
             const data = await res.json();
             if (data.success) {
-                chatHistory.innerHTML = `
-                    <div class="chat-welcome-msg">
-                        Conversation cleared successfully. Ask Lollms any questions!
-                    </div>
-                `;
+                chatHistory.innerHTML = ""; // Complete wipe, removes everything
                 updateContextBudget();
             }
         } catch (err) {
@@ -4081,6 +4741,9 @@ document.addEventListener("DOMContentLoaded", () => {
         btnChatStop.disabled = false;
         btnChatStop.textContent = "🛑 Stop";
 
+        // Dynamically show the animated thinking indicator (prevents destruction on innerHTML wipes)
+        showThinkingIndicator("Lollms is thinking...");
+
         const startTime = Date.now();
         let ttft = null;
 
@@ -4088,10 +4751,6 @@ document.addEventListener("DOMContentLoaded", () => {
         await fetchMessageHistory();
 
         if (!regenerate) {
-            // Remove the welcome message if present
-            const welcome = chatHistory.querySelector(".chat-welcome-msg");
-            if (welcome) welcome.remove();
-
             // Append user bubble immediately
             renderMessageBubble(`temp-user-${Date.now()}`, "user", text);
             chatHistory.scrollTop = chatHistory.scrollHeight;
@@ -4168,111 +4827,26 @@ document.addEventListener("DOMContentLoaded", () => {
                             if (meta.artefact && meta.artefact.title) {
                                 chatAffectedArtifacts.add(meta.artefact.title);
                             }
+                            continue;
                         }
 
-                        if (evType === "processing_open") {
-                            chatActiveProc = { title: meta.title || "Task", statuses: [] };
-                            chatActiveProcDiv = document.createElement("div");
-                            chatActiveProcDiv.className = "inline-proc-box";
-                            chatActiveProcDiv.innerHTML = `
-                                <div class="proc-header">
-                                    <span>⚙️ ${chatActiveProc.title}</span>
-                                    <span class="spinner inline"></span>
-                                </div>
-                                <div class="proc-statuses"></div>
-                            `;
-                            if (bubbleContentDiv) {
-                                // Append before the actions row
-                                const actionsRow = bubbleContentDiv.querySelector(".msg-actions-row");
-                                if (actionsRow) {
-                                    bubbleContentDiv.insertBefore(chatActiveProcDiv, actionsRow);
-                                } else {
-                                    bubbleContentDiv.appendChild(chatActiveProcDiv);
-                                }
-                            } else {
-                                // No assistant bubble yet (e.g. during pre-flight or context scans)
-                                // Append directly to chatHistory as a temporary root-level block
-                                chatHistory.appendChild(chatActiveProcDiv);
-                                const welcome = chatHistory.querySelector(".chat-welcome-msg");
-                                if (welcome) welcome.remove();
-                            }
-                            chatHistory.scrollTop = chatHistory.scrollHeight;
-
-                        } else if (evType === "processing_status") {
-                            if (chatActiveProc && chatActiveProcDiv) {
-                                const statusText = meta.status || "";
-                                chatActiveProc.statuses.push(statusText);
-                                const statusesDiv = chatActiveProcDiv.querySelector(".proc-statuses");
-                                const item = document.createElement("div");
-                                item.className = "proc-item";
-                                item.textContent = `⤷ ⏳ ${statusText}`;
-                                statusesDiv.appendChild(item);
-                                chatHistory.scrollTop = chatHistory.scrollHeight;
-                            }
-
-                        } else if (evType === "processing_close") {
-                            if (chatActiveProc && chatActiveProcDiv) {
-                                chatActiveProcDiv.innerHTML = `
-                                    <div class="proc-header complete">
-                                        <span>✅ ${chatActiveProc.title} (Complete)</span>
-                                    </div>
-                                    <div class="proc-statuses">
-                                        ${chatActiveProc.statuses.map(s => `<div class="proc-item complete">✓ ${s}</div>`).join("")}
-                                    </div>
-                                `;
-                                
-                                // If this was a pre-flight/guard scan appended directly to chat history,
-                                // we can remove it after completion to keep the conversation clean.
-                                if (!bubbleContentDiv) {
-                                    const tempDiv = chatActiveProcDiv;
-                                    setTimeout(() => {
-                                        if (tempDiv && tempDiv.parentNode) {
-                                            tempDiv.remove();
-                                        }
-                                    }, 2000);
-                                }
-                                
-                                chatActiveProc = null;
-                                chatActiveProcDiv = null;
-                                chatHistory.scrollTop = chatHistory.scrollHeight;
-                            }
-
-                        } else if (evType === "processing_close") {
-                            if (chatActiveProc && chatActiveProcDiv) {
-                                chatActiveProcDiv.innerHTML = `
-                                    <div class="proc-header complete">
-                                        <span>✅ ${chatActiveProc.title} (Complete)</span>
-                                    </div>
-                                    <div class="proc-statuses">
-                                        ${chatActiveProc.statuses.map(s => `<div class="proc-item complete">✓ ${s}</div>`).join("")}
-                                    </div>
-                                `;
-                                chatActiveProc = null;
-                                chatActiveProcDiv = null;
-                                chatHistory.scrollTop = chatHistory.scrollHeight;
-                            }
-
-                        } else if (event.msg_type === "MSG_TYPE_CHUNK" && proseSpan) {
+                        if (event.msg_type === "MSG_TYPE_CHUNK" && proseSpan) {
                             if (event.chunk) {
-                                if (event.meta && event.meta.was_processed) {
-                                    // Intentionally drop status indicators
-                                } else if (!event.chunk.startsWith("<processing") && !event.chunk.startsWith("</processing>")) {
-                                    // ── ⏱️ Measure Time to First Token ──
-                                    if (ttft === null && currentProse === "") {
-                                        ttft = (Date.now() - startTime) / 1000;
-                                    }
-
-                                    if (currentProse === "") {
-                                        proseSpan.innerHTML = "";
-                                    }
-
-                                    currentProse += event.chunk;
-                                    const parsedMarkdown = marked.parse(currentProse);
-                                    const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle);
-                                    proseSpan.innerHTML = resolvedHTML;
-                                    renderMath(proseSpan);
-                                    chatHistory.scrollTop = chatHistory.scrollHeight;
+                                // ── ⏱️ Measure Time to First Token ──
+                                if (ttft === null && currentProse === "") {
+                                    ttft = (Date.now() - startTime) / 1000;
                                 }
+
+                                if (currentProse === "") {
+                                    proseSpan.innerHTML = "";
+                                }
+
+                                currentProse += event.chunk;
+                                const parsedMarkdown = marked.parse(currentProse);
+                                const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, activeMsgId);
+                                proseSpan.innerHTML = resolvedHTML;
+                                renderMath(proseSpan);
+                                chatHistory.scrollTop = chatHistory.scrollHeight;
                             }
                         }
                     }
@@ -4282,13 +4856,15 @@ document.addEventListener("DOMContentLoaded", () => {
             if (proseSpan) proseSpan.innerHTML = `<span style="color: #ef4444;">Connection failed: ${err}</span>`;
         } finally {
             chatInput.disabled = false;
-            
+
             // Restore Send button and hide Stop button
             btnChatStop.style.display = "none";
             btnChatSend.style.display = "inline-block";
             btnChatSend.disabled = false;
             chatInput.focus();
-            
+
+            hideThinkingIndicator();
+
             // Re-render and append full metrics & actions
             await fetchMessageHistory();
             await fetchArtifacts();
@@ -4302,29 +4878,16 @@ document.addEventListener("DOMContentLoaded", () => {
                     ttftDiv.title = "Time to First Token";
                     ttftDiv.innerHTML = `⏱️ TTFT: ${ttft.toFixed(2)}s`;
                     targetMetaBar.appendChild(ttftDiv);
-                    
-                    // We also save TTFT to the backend message metadata so it persists across reloads!
+
+                    // We also save TTFT and other metadata directly to the message's metadata so it persists across reloads!
                     fetch(`/api/discussions/viewer_session/messages/${activeMsgId}/edit`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ content: currentProse }) // sync prose
-                    }).then(() => {
-                        // Update metadata with ttft
-                        fetch(`/api/discussions/viewer_session/messages`)
-                            .then(res => res.json())
-                            .then(messages => {
-                                const m = messages.find(msg => msg.id === activeMsgId);
-                                if (m) {
-                                    const metadata = m.metadata || {};
-                                    metadata.ttft = ttft;
-                                    fetch(`/api/memories/${activeMsgId}/edit`, { // Helper to update metadata
-                                        method: "POST",
-                                        headers: { "Content-Type": "application/json" },
-                                        body: JSON.stringify({ metadata: metadata })
-                                    }).catch(() => {});
-                                }
-                            });
-                    });
+                        body: JSON.stringify({
+                            content: currentProse,
+                            metadata: { ttft: ttft }
+                        })
+                    }).catch(() => {});
                 }
             }
 
@@ -4450,23 +5013,383 @@ document.addEventListener("DOMContentLoaded", () => {
 /**
  * Parses raw text and resolves any <artefact_image> anchors into HTML <img> elements.
  */
-function resolveImageAnchors(content, title) {
+function resolveImageAnchors(content, title, msgId = null, version = null, msgObj = null) {
     if (!content) return "";
+
+    // Unified self-healing regex: matches both closed and unclosed <processing> tags anywhere in the string
+    const procPattern = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;
+    content = content.replace(procPattern, (match, attrsStr, bodyText) => {
+        const attrs = {};
+        attrsStr.replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => attrs[k] = v);
+
+        const procTitle = attrs.title || attrs.tool || attrs.type || "Task";
+        const titleText = procTitle.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
+
+        const isClosed = match.toLowerCase().endsWith("</processing>");
+        const lines = bodyText.trim().split("\n");
+
+        if (isClosed) {
+            const statusItems = lines.map(line => {
+                const clean = line.replace(/^\*\s*/, "").trim();
+                if (!clean) return "";
+                return `<div class="proc-item complete">✓ ${clean}</div>`;
+            }).join("");
+
+            return `
+                <details class="inline-proc-accordion">
+                    <summary class="proc-accordion-header complete">
+                        <span class="chevron">▶</span>
+                        <span>✅ ${titleText} (Complete)</span>
+                    </summary>
+                    <div class="proc-accordion-content">
+                        ${statusItems}
+                    </div>
+                </details>
+            `;
+        } else {
+            const statusItems = lines.map(line => {
+                const clean = line.replace(/^\*\s*/, "").trim();
+                if (!clean) return "";
+                return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
+            }).join("");
+
+            return `
+                <details class="inline-proc-accordion" open>
+                    <summary class="proc-accordion-header">
+                        <span class="chevron">▶</span>
+                        <span>⚙️ ${titleText}...</span>
+                        <span class="spinner inline"></span>
+                    </summary>
+                    <div class="proc-accordion-content">
+                        ${statusItems}
+                    </div>
+                </details>
+            `;
+        }
+    });
+
+    // 3. Parse and resolve <lollms_form> tags into a gorgeous, interactive, functional form card
+    const formPattern = /<lollms_form\s+([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
+    content = content.replace(formPattern, (match, attrsStr, bodyText) => {
+        const attrs = {};
+        attrsStr.replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => attrs[k] = v);
+
+        const formId = attrs.id || `form_${Math.random().toString(36).substr(2, 9)}`;
+        const fTitle = attrs.title || "User Survey Form";
+        const fDesc = attrs.description || "Please fill in the required fields.";
+        const fSubmitLabel = attrs.submit_label || "Submit Response";
+
+        // Parse fields
+        const fields = [];
+        const fieldPattern = /<field\s+([^>]+)\/?>/g;
+        let fm;
+        while ((fm = fieldPattern.exec(bodyText)) !== null) {
+            const f_attrs = {};
+            fm[1].replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => f_attrs[k] = v);
+            fields.push(f_attrs);
+        }
+
+        const fieldsHtml = fields.map(f => {
+            const name = f.name || "field";
+            const label = f.label || name;
+            const type = f.type || "text";
+            const req = f.required === "true" ? `<span style="color:#ef4444">*</span>` : "";
+            const placeholder = f.placeholder || "";
+            const defaultValue = f.default || "";
+
+            let inputHtml = "";
+            if (type === "textarea") {
+                inputHtml = `<textarea class="form-field-input" data-field-name="${name}" data-field-type="${type}" placeholder="${placeholder}" rows="${f.rows || 3}">${defaultValue}</textarea>`;
+            } else if (type === "select") {
+                const opts = (f.options || "").split(",").map(o => o.trim()).filter(o => o);
+                inputHtml = `
+                    <select class="form-field-input" data-field-name="${name}" data-field-type="${type}">
+                        ${opts.map(o => `<option value="${o}" ${o === defaultValue ? 'selected' : ''}>${o}</option>`).join("")}
+                    </select>
+                `;
+            } else if (type === "radio") {
+                const opts = (f.options || "").split(",").map(o => o.trim()).filter(o => o);
+                inputHtml = `
+                    <div class="form-field-radio-group">
+                        ${opts.map(o => `
+                            <label class="form-field-radio-label">
+                                <input type="radio" class="form-field-input" name="${formId}-${name}" data-field-name="${name}" data-field-type="${type}" value="${o}" ${o === defaultValue ? 'checked' : ''} />
+                                <span>${o}</span>
+                            </label>
+                        `).join("")}
+                    </div>
+                `;
+            } else if (type === "checkbox") {
+                inputHtml = `
+                    <label class="form-field-checkbox-label">
+                        <input type="checkbox" class="form-field-input" data-field-name="${name}" data-field-type="${type}" ${defaultValue === "true" ? "checked" : ""} />
+                        <span>Enable / Agree</span>
+                    </label>
+                `;
+            } else if (type === "range") {
+                const min = f.min || 0;
+                const max = f.max || 100;
+                const step = f.step || 1;
+                inputHtml = `
+                    <div style="display:flex; align-items:center; gap:10px; width:100%;">
+                        <input type="range" class="form-field-input" data-field-name="${name}" data-field-type="${type}" min="${min}" max="${max}" step="${step}" value="${defaultValue || min}" oninput="this.nextElementSibling.textContent = this.value" />
+                        <span style="font-weight:bold; min-width:30px; text-align:right;">${defaultValue || min}</span>
+                    </div>
+                `;
+            } else {
+                inputHtml = `<input type="text" class="form-field-input" data-field-name="${name}" data-field-type="${type}" value="${defaultValue}" placeholder="${placeholder}" />`;
+            }
+
+            return `
+                <div class="form-field-group">
+                    <label class="form-field-label">${label} ${req}</label>
+                    ${inputHtml}
+                </div>
+            `;
+        }).join("");
+
+        return `
+            <div class="interactive-form-card" data-form-id="${formId}">
+                <div class="form-card-header">
+                    <span>📋 ${fTitle}</span>
+                </div>
+                <p class="form-card-desc">${fDesc}</p>
+                <div class="form-card-fields">
+                    ${fieldsHtml}
+                </div>
+                <button class="btn btn-primary btn-submit-form" onclick="submitWorkspaceForm('${formId}')">${fSubmitLabel}</button>
+            </div>
+        `;
+    });
+
+    // ── 🎛️ Parse and resolve <lollms_inline> tags into an interactive iframe card ──
+    const inlinePattern = /<lollms_inline\s+([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
+    content = content.replace(inlinePattern, (match, attrsStr, bodyText) => {
+        const attrs = {};
+        attrsStr.replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => attrs[k] = v);
+
+        const title = attrs.title || "Interactive Widget";
+        const type = attrs.type || "html";
+
+        // Clean any leading/trailing markdown code block fences if present
+        let cleanedBody = bodyText.trim();
+        const codeBlockMatch = cleanedBody.match(/^```(?:html)?\s*\n([\s\S]+?)\n```\s*$/i);
+        if (codeBlockMatch) {
+            cleanedBody = codeBlockMatch[1].trim();
+        }
+
+        // Create a secure blob URL for the iframe
+        const blob = new Blob([cleanedBody], { type: "text/html" });
+        const iframeUrl = URL.createObjectURL(blob);
+        const widgetId = `inline-widget-${Math.random().toString(36).substr(2, 9)}`;
+
+        return `
+            <div class="interactive-widget-card" id="${widgetId}" style="background-color: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 8px; margin: 12px 0; overflow: hidden; display: flex; flex-direction: column; width: 100%; max-width: 500px; box-shadow: var(--shadow-md);">
+                <div class="form-card-header" style="background-color: #020617; padding: 10px 14px; font-weight: bold; color: var(--accent-color); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); font-size:13px; text-transform:uppercase;">
+                    <span>🎛️ ${title}</span>
+                    <button class="btn btn-secondary" onclick="window.open('${iframeUrl}', '_blank')" style="width: auto; padding: 4px 10px; font-size: 11px; border-radius: 12px; height:auto;">↗ Open in New Tab</button>
+                </div>
+                <iframe src="${iframeUrl}" style="width: 100%; height: 320px; border: none; background: #fff;" sandbox="allow-scripts"></iframe>
+            </div>
+        `;
+    });
+
+    // 4. Parse and resolve any failed generate_image / edit_image tags into an interactive retry card
+    const genPattern = /<(generate_image|edit_image)\s*([^>]*)>([\s\S]*?)<\/\1>/gi;
+    content = content.replace(genPattern, (match, tagName, attrsStr, promptText) => {
+        if (!msgId) {
+            return `
+                <div class="failed-image-card">
+                    <div class="failed-image-header">
+                        <span>🎨 Image Prompt (${tagName === 'edit_image' ? 'Edit' : 'Generation'})</span>
+                    </div>
+                    <textarea class="failed-image-prompt-input" readonly style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${promptText.trim()}</textarea>
+                </div>
+            `;
+        }
+        return `
+            <div class="failed-image-card" data-msg-id="${msgId}">
+                <div class="failed-image-header">
+                    <span>🎨 Image Prompt (${tagName === 'edit_image' ? 'Edit' : 'Generation'})</span>
+                </div>
+                <textarea class="failed-image-prompt-input" style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${promptText.trim()}</textarea>
+                <button class="btn btn-primary btn-retry-image" onclick="retryImageGeneration('${msgId}')" style="margin-top: 8px;">🎨 Generate Image</button>
+            </div>
+        `;
+    });
+
     const pattern = /<artefact_image\s+id=["']([^"']+)["']\s*(?:\/>|>)/gi;
     return content.replace(pattern, (match, imageId) => {
         if (imageId.includes("::")) {
             const parts = imageId.split("::");
             const imgIndex = parts[parts.length - 1];
             const imgTitle = parts.slice(0, -1).join("::");
-            return `<div class="rendered-image-container"><img src="/api/images/${encodeURIComponent(imgTitle)}/${imgIndex}" class="rendered-page-img" /><button class="img-delete-btn" onclick="deleteArtifactImage('${encodeURIComponent(imgTitle)}', ${imgIndex})">✕ Remove Image</button></div>`;
+            const versionParam = version ? `?version=${version}` : "";
+
+            let prompt = "";
+            if (msgObj && msgObj.metadata && msgObj.metadata.image_groups) {
+                const group = msgObj.metadata.image_groups.find(g => g.title === imgTitle);
+                if (group && group.prompt) {
+                    prompt = group.prompt;
+                }
+            }
+            if (!prompt) {
+                prompt = `Vibrant infographic design concept illustrating '${imgTitle.replace(/_/g, ' ')}'`;
+            }
+            const encodedPrompt = encodeURIComponent(prompt);
+
+            return `
+                <div class="rendered-image-container">
+                    <img src="/api/images/${encodeURIComponent(imgTitle)}/${imgIndex}${versionParam}" class="rendered-page-img" onerror="this.parentNode.innerHTML='<div class=&quot;failed-image-card&quot; style=&quot;margin:10px 0; width:460px; max-width:100%;&quot;><div class=&quot;failed-image-header&quot;><span>🎨 Image Prompt (Artifact Missing)</span></div><textarea class=&quot;failed-image-prompt-input&quot; style=&quot;width: 100%; min-height: 80px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 10px; border-radius: 6px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;&quot;>'+decodeURIComponent('${encodedPrompt}')+'</textarea><button class=&quot;btn btn-primary btn-retry-image&quot; onclick=&quot;retryImageGeneration(\\'${msgId}\\', \\'${encodeURIComponent(imgTitle)}\\')&quot; style=&quot;margin-top: 8px; width:auto !important; padding: 6px 14px !important;&quot;>🎨 Generate Image</button></div>';" />
+                    <div class="img-actions-overlay">
+                        <button class="img-action-overlay-btn edit" onclick="openImageEditor('${encodeURIComponent(imgTitle)}', ${imgIndex})">✏️ Edit Image</button>
+                        <button class="img-action-overlay-btn delete" onclick="deleteArtifactImage('${encodeURIComponent(imgTitle)}', ${imgIndex})">✕ Remove Image</button>
+                    </div>
+                </div>`;
         }
         return match;
     });
 }
 
-/**
- * Expose delete image function to window/global scope for onclick handler.
- */
+window.openImageEditor = function(title, index) {
+    const url = `/editor.html?title=${title}&index=${index}`;
+    window.open(url, "_blank");
+};
+
+window.submitWorkspaceForm = async function(formId) {
+    const card = document.querySelector(`.interactive-form-card[data-form-id="${formId}"]`);
+    if (!card) return;
+
+    const btn = card.querySelector(".btn-submit-form");
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Submitting...";
+    }
+
+    // Collect field answers
+    const answers = {};
+    const inputs = card.querySelectorAll(".form-field-input");
+    inputs.forEach(inp => {
+        const name = inp.getAttribute("data-field-name");
+        const type = inp.getAttribute("data-field-type");
+
+        if (type === "radio") {
+            if (inp.checked) {
+                answers[name] = inp.value;
+            }
+        } else if (type === "checkbox") {
+            answers[name] = inp.checked;
+        } else {
+            answers[name] = inp.value;
+        }
+    });
+
+    try {
+        const res = await fetch(`/api/discussions/viewer_session/forms/${formId}/submit`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ answers })
+        });
+        const data = await res.json();
+        if (data.success) {
+            // Dynamically re-render and trigger the LLM completion turn without reload!
+            await fetchMessageHistory();
+            await fetchBranches();
+            sendChatMessage(true);
+        } else {
+            alert("Submission failed: " + (data.detail || data.error));
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = "Submit Response";
+            }
+        }
+    } catch (err) {
+        alert(`Request failed: ${err}`);
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = "Submit Response";
+        }
+    }
+};
+
+window.retryImageGeneration = async function(msgId) {
+    const btn = document.querySelector(`.failed-image-card[data-msg-id="${msgId}"] .btn-retry-image`);
+    let loader = null;
+    let textElement = null;
+    let timerId = null;
+
+    const messages = [
+        { time: 0, text: "Generating your masterpiece... Please hold on, this can take up to 30 seconds depending on your TTI engine." },
+        { time: 10000, text: "Still rendering... Diffusion models are carefully arranging the pixels. Thank you for your patience." },
+        { time: 25000, text: "Adding fine details and textures... Almost there! This is going to look amazing." },
+        { time: 45000, text: "Polishing the artwork... Generating complex high-resolution details takes a bit of extra time." },
+        { time: 70000, text: "Taking longer than expected, but we are still actively refining and completing your image..." },
+        { time: 100000, text: "Almost done... Handcrafting high-fidelity AI art takes passion and a few extra seconds." }
+    ];
+
+    if (btn) {
+        btn.style.display = "none";
+        loader = document.createElement("div");
+        loader.className = "generation-loading-container";
+        loader.innerHTML = `
+            <span class="spinner"></span>
+            <span class="generation-loading-text">Generating your masterpiece... Please hold on, this can take up to 30 seconds depending on your TTI engine.</span>
+        `;
+        btn.parentNode.appendChild(loader);
+        textElement = loader.querySelector(".generation-loading-text");
+
+        const startTime = Date.now();
+        timerId = setInterval(() => {
+            const elapsed = Date.now() - startTime;
+            let activeMsg = messages[0].text;
+            for (const msg of messages) {
+                if (elapsed >= msg.time) {
+                    activeMsg = msg.text;
+                }
+            }
+            if (textElement) {
+                textElement.textContent = activeMsg;
+            }
+        }, 1000);
+    }
+
+    const card = document.querySelector(`.failed-image-card[data-msg-id="${msgId}"]`);
+    const promptInput = card ? card.querySelector(".failed-image-prompt-input") : null;
+    const editedPrompt = promptInput ? promptInput.value.trim() : null;
+
+    try {
+        const res = await fetch(`/api/discussions/viewer_session/messages/${msgId}/generate_image`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt: editedPrompt })
+        });
+        const data = await res.json();
+        if (data.success) {
+            location.reload();
+        } else {
+            alert(`Generation failed: ${data.detail || data.error}`);
+            if (btn) {
+                btn.style.display = "inline-block";
+            }
+            if (loader) {
+                loader.remove();
+            }
+        }
+    } catch (err) {
+        alert(`Request failed: ${err}`);
+        if (btn) {
+            btn.style.display = "inline-block";
+        }
+        if (loader) {
+            loader.remove();
+        }
+    } finally {
+        if (timerId) {
+            clearInterval(timerId);
+        }
+    }
+};
+
 window.deleteArtifactImage = async function(title, index) {
     const decodedTitle = decodeURIComponent(title);
     const baseTitle = decodedTitle.endsWith("::images") ? decodedTitle.replace("::images", "") : decodedTitle;
