@@ -1216,6 +1216,7 @@ class _StreamState:
         self.clean_prose: List[str] = []   # only actual MSG_TYPE_CHUNK prose, no processing XML
         self.suppress_buf: List[str] = []
         self._in_suppress: bool = False
+        self.reasoning_chunks_count = 0
 
     # ---------------------------------------------------------------- public entry point
 
