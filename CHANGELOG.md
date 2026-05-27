@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-27 19:31]
+
+- fix(diffusers): apply bitsandbytes compatibility patch and guard null device
+
 ## [2026-05-27 17:30]
 
 - fix(chat): initialize reasoning_chunks_count in _StreamState

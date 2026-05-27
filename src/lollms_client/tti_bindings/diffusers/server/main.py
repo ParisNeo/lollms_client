@@ -100,6 +100,22 @@ except Exception as ex:
 from PIL import Image
 DIFFUSERS_AVAILABLE = True
 
+# ── BitsAndBytes Compatibility Patch ─────────────────────────────────────────
+# Older bitsandbytes (<0.43) does not accept _is_hf_initialized in Params4bit.__new__.
+# Newer transformers/diffusers pass this kwarg when loading 4-bit quantized models.
+try:
+    from bitsandbytes.nn.modules import Params4bit
+    _orig_params4bit_new = Params4bit.__new__
+
+    def _patched_params4bit_new(cls, *args, **kwargs):
+        kwargs.pop("_is_hf_initialized", None)
+        return _orig_params4bit_new(cls, *args, **kwargs)
+
+    Params4bit.__new__ = _patched_params4bit_new
+    ASCIIColors.info("Applied BitsAndBytes Params4bit compatibility patch.")
+except Exception:
+    pass
+
 # ── New-generation pipelines (require git main of diffusers) ─────────────────
 # Each is imported individually with a graceful fallback so that older installs
 # still work – the model just won't be available at runtime.
@@ -930,7 +946,8 @@ class ModelManager:
         self._set_scheduler()
 
         if not use_device_map:
-            self.pipeline.to(self.config["device"])
+            if self.config["device"]:
+                self.pipeline.to(self.config["device"])
             if self.config["enable_xformers"]:
                 try:
                     self.pipeline.enable_xformers_memory_efficient_attention()
