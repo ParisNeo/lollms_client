@@ -105,7 +105,8 @@ class LollmsBinding(LollmsLLMBinding):
             host = host[:-3].rstrip("/")
 
         self.base_address = host
-        self.host_address = f"{self.base_address}/v1"
+        self.open_ai_host_address = f"{self.base_address}/v1"
+        self.lollms_host_address = f"{self.base_address}/lollms/v1"
         self.model_name=kwargs.get("model_name")
         self.service_key=kwargs.get("service_key")
         self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
@@ -118,7 +119,7 @@ class LollmsBinding(LollmsLLMBinding):
         # Determine verification strategy: specific file takes precedence, otherwise boolean flag
         self.verify = False if not self.verify_ssl_certificate else self.certificate_file_path if self.certificate_file_path else True
 
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=self.verify))
+        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.open_ai_host_address is None else self.open_ai_host_address if len(self.open_ai_host_address)>0 else None, http_client=httpx.Client(verify=self.verify))
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     def lollms_listMountedPersonalities(self, host_address:str|None=None):
@@ -522,7 +523,7 @@ class LollmsBinding(LollmsLLMBinding):
             return []
 
         try:
-            url = f"{self.host_address}/tokenize"
+            url = f"{self.lollms_host_address}/tokenize"
             headers = {}
             if self.service_key:
                 headers["Authorization"] = f"Bearer {self.service_key}"
@@ -568,7 +569,7 @@ class LollmsBinding(LollmsLLMBinding):
             return 0
 
         try:
-            url = f"{self.host_address}/tokenize"
+            url = f"{self.lollms_host_address}/tokenize"
             headers = {}
             if self.service_key:
                 headers["Authorization"] = f"Bearer {self.service_key}"
@@ -578,7 +579,7 @@ class LollmsBinding(LollmsLLMBinding):
                 "text": text
             }
 
-            response = requests.post(url, json=payload, headers=headers, timeout=5)
+            response = requests.post(url, json=payload, headers=headers, timeout=5, verify=self.verify)
             if response.status_code == 200:
                 data = response.json()
                 if "count" in data:
@@ -600,7 +601,7 @@ class LollmsBinding(LollmsLLMBinding):
 
         try:
             # Construct the lollms specific v1 endpoint URL
-            url = f"{self.base_address}/lollms/v1/context_size"
+            url = f"{self.lollms_host_address}/context_size"
 
             headers = {}
             if self.service_key:
@@ -668,7 +669,7 @@ class LollmsBinding(LollmsLLMBinding):
         return {
             "name": "OpenAI",
             "version": "2.0",
-            "host_address": self.host_address,
+            "host_address": self.open_ai_host_address,
             "model_name": self.model_name
         }
 
