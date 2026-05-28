@@ -19,6 +19,18 @@ global_input_parameters:
     is_secret: true
     default: ""
 
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify the SSL certificate of the server. Defaults to true."
+    mandatory: false
+    default: true
+    
+  - name: certificate_file_path
+    type: str
+    description: "Path to a specific SSL certificate file (.pem, .crt) for verifying the server identity. Useful for self-signed certificates."
+    mandatory: false
+    default: ""
+
 model_input_parameters:
   - name: "model_name"
     type: "str"
