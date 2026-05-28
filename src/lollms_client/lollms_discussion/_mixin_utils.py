@@ -65,6 +65,11 @@ class UtilsMixin:
         if not branch_tip_id and format_type in ["lollms_text","openai_chat","ollama_chat","markdown"]:
             return "" if format_type in ["lollms_text","markdown"] else []
         branch = self.get_branch(branch_tip_id)
+        # Exclude the last message from the branch if it's an assistant message
+        # This prevents empty assistant messages (e.g., from fast path) from being
+        # included in the export, which can cause issues with some systems
+        if branch and branch[-1].sender_type == 'assistant':
+            branch = branch[:-1]
         # Force a refresh of the artifacts zone before export
         system_prompt_part = (self._system_prompt or "").strip()
         data_zone_part     = self.get_full_data_zone()
