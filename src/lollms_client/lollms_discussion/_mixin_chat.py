@@ -2654,7 +2654,7 @@ class _StreamState:
                 prompt=final_payload,
                 system_prompt=surgical_prompt,
                 images=active_images if active_images else None,
-                temperature=0.1,
+                temperature=None,
                 n_predict=4096
             )
 
@@ -3620,7 +3620,7 @@ class ChatMixin:
             raw_text = self._stream_final_answer(
                 _fast_relay, images,
                 branch_tip_id or self.active_branch_id,
-                0.1,  # Low temperature for deterministic greetings
+                None,  # Use the default temperature
                 **kwargs,
             )
             ss_fast.flush_remaining_buffer()
@@ -4451,6 +4451,29 @@ class ChatMixin:
         def _compact_repl(m):
             """Replace <processing>…</processing> with an opaque non-prose marker."""
             return f"\n{_EXEC_MARKER}\n"
+
+        # ── Helper: build synthetic tool_result for history injection ──────────────
+        def _build_synthetic_result(action_type: str, title: str, details: str = ""):
+            """Create a synthetic tool_result marker that the LLM can learn from."""
+            if action_type == "artifact_created":
+                return (
+                    f'\n<tool_result name="create_artifact">'
+                    f'{{"success": true, "title": "{title}", "action": "created"}}'
+                    f'</tool_result>\n'
+                )
+            elif action_type == "artifact_updated":
+                return (
+                    f'\n<tool_result name="update_artifact">'
+                    f'{{"success": true, "title": "{title}", "action": "updated", "details": "{details}"}}'
+                    f'</tool_result>\n'
+                )
+            elif action_type == "tool_execution":
+                return (
+                    f'\n<tool_result name="{title}">'
+                    f'{{"success": true, "result": "executed"}}'
+                    f'</tool_result>\n'
+                )
+            return ""
  
         # ── Per-turn action scratchpad ─────────────────────────────────────────
         _turn_action_history: List[str] = []
@@ -4629,7 +4652,8 @@ class ChatMixin:
                     continue
                 role    = m.sender_type
                 content = m.content or ""
- 
+                metadata = getattr(m, 'metadata', {}) or {}
+
                 if role == "assistant":
                     # Replace all processing blocks with the opaque marker
                     content = re.sub(
@@ -4646,7 +4670,7 @@ class ChatMixin:
                     # Strip the marker itself — the model must never see it in
                     # an assistant turn it can learn to reproduce
                     content = _EXEC_MARKER_RE.sub('', content)
- 
+
                 msg_role = (
                     "assistant" if role == "assistant"
                     else ("user" if role == "user" else "system")
@@ -4654,6 +4678,60 @@ class ChatMixin:
                 content = content.strip()
                 if content:
                     _formatted_messages.append({"role": msg_role, "content": content})
+
+                # ── INJECT SYNTHETIC TOOL RESULTS FOR ACTION LEARNING ──────────────
+                # If this assistant message has action metadata, inject a synthetic
+                # tool_result that shows what happened after the action
+                if role == "assistant" and metadata:
+                    artifacts_modified = metadata.get("artefacts_modified", [])
+                    events = metadata.get("events", [])
+
+                    # Detect if this was an action-less reasoning turn
+                    has_action = bool(artifacts_modified or events)
+
+                    if has_action:
+                        # Inject artifact action results
+                        for art_title in artifacts_modified:
+                            # Check if it was a creation or update based on content presence
+                            art = self.artefacts.get(art_title)
+                            if art:
+                                action_type = "artifact_created" if art.get("version", 1) == 1 else "artifact_updated"
+                                synth_result = _build_synthetic_result(
+                                    action_type,
+                                    art_title,
+                                    f"version {art.get('version', 1)}"
+                                )
+                                if synth_result:
+                                    _formatted_messages.append({
+                                        "role": "system",
+                                        "content": synth_result
+                                    })
+
+                        # Inject tool execution results
+                        for evt in events:
+                            if evt.get("type") == "tool_call" and evt.get("tool"):
+                                tool_name = evt.get("tool")
+                                synth_result = _build_synthetic_result(
+                                    "tool_execution",
+                                    tool_name
+                                )
+                                if synth_result:
+                                    _formatted_messages.append({
+                                        "role": "system",
+                                        "content": synth_result
+                                    })
+                    else:
+                        # CRITICAL FIX: Inject synthetic FAILURE marker for action-less turns
+                        # This teaches the LLM that reasoning without action = failure
+                        synth_failure = (
+                            f'\n<tool_result name="action_failure">'
+                            f'{{"success": false, "error": "NO ACTION TAKEN: You produced reasoning but no tools were called and no artifacts were modified. The system requires you to call tools or emit <artifact> tags to make progress."}}'
+                            f'</tool_result>\n'
+                        )
+                        _formatted_messages.append({
+                            "role": "system",
+                            "content": synth_failure
+                        })
  
             # Images
             _binding = getattr(self.lollmsClient, 'llm', None)
@@ -5188,10 +5266,41 @@ class ChatMixin:
                 sender_type="assistant",
                 content=_clean_so_far_for_llm.strip()
             ))
+            # Keep the real tool result for tool calls
             _virtual_history.append(SimpleNamespace(
                 sender_type="user",
                 content=f'<tool_result name="{_tool_name}">{_result_str_for_llm}</tool_result>'
             ))
+
+            # ── INJECT SYNTHETIC ARTIFACT RESULTS OR FAILURE MARKERS ───────────
+            # If artifacts were created/updated, inject synthetic results so the
+            # model learns the pattern: emit tag → see result
+            if ss.affected_artefacts:
+                for art in ss.affected_artefacts:
+                    art_title = art.get("title", "unknown")
+                    action_type = "artifact_created" if art.get("version", 1) == 1 else "artifact_updated"
+                    synth_result = _build_synthetic_result(
+                        action_type,
+                        art_title,
+                        f"version {art.get('version', 1)}"
+                    )
+                    if synth_result:
+                        _virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=synth_result
+                        ))
+            else:
+                # CRITICAL FIX: Inject synthetic FAILURE marker when no action was taken
+                # This teaches the LLM that reasoning without action = failure
+                synth_failure = (
+                    f'\n<tool_result name="action_failure">'
+                    f'{{"success": false, "error": "NO ACTION TAKEN: You produced reasoning but no tools were called and no artifacts were modified. The system requires you to call tools or emit <artifact> tags to make progress."}}'
+                    f'</tool_result>\n'
+                )
+                _virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=synth_failure
+                ))
             # CRITICAL FIX: Preserve the full accumulated content in ai_message.content,
             # not just the clean prose. This ensures tool results and all text survive.
             ai_message.content = _accumulated_full
