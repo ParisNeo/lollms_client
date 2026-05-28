@@ -1,4 +1,4 @@
-# bindings/lollms/__init__.py
+# llm_bindings/lollms/__init__.py
 import requests
 import json
 from lollms_client.lollms_llm_binding import LollmsLLMBinding
@@ -114,11 +114,11 @@ class LollmsBinding(LollmsLLMBinding):
 
         if not self.service_key:
             self.service_key = os.getenv("LOLLMS_API_KEY", self.service_key)
-        
-        # Determine verification strategy: specific file takes precedence, otherwise boolean flag
-        verify = False if not self.verify_ssl_certificate else self.certificate_file_path if self.certificate_file_path else True
 
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=verify))
+        # Determine verification strategy: specific file takes precedence, otherwise boolean flag
+        self.verify = False if not self.verify_ssl_certificate else self.certificate_file_path if self.certificate_file_path else True
+
+        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=self.verify))
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     def lollms_listMountedPersonalities(self, host_address:str|None=None):
@@ -130,7 +130,7 @@ class LollmsBinding(LollmsLLMBinding):
             "Accept": "application/json",
         }
 
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, headers=headers, timeout=5, verify=self.verify)
 
         if response.status_code == 200:
             try:
@@ -142,7 +142,7 @@ class LollmsBinding(LollmsLLMBinding):
         # Fallback to personalities under alternative prefixes
         for fallback_url in (f"{base}/v1/personalities", f"{base}/lollms/v1/personalities"):
             try:
-                response = requests.get(fallback_url, headers=headers, timeout=5)
+                response = requests.get(fallback_url, headers=headers, timeout=5, verify=self.verify)
                 if response.status_code == 200:
                     text = json.loads(response.content.decode("utf-8"))
                     return text
@@ -532,7 +532,7 @@ class LollmsBinding(LollmsLLMBinding):
                 "text": text
             }
 
-            response = requests.post(url, json=payload, headers=headers, timeout=5)
+            response = requests.post(url, json=payload, headers=headers, timeout=5, verify=self.verify)
             if response.status_code == 200:
                 data = response.json()
                 if "tokens" in data:
@@ -608,7 +608,7 @@ class LollmsBinding(LollmsLLMBinding):
 
             payload = {"model": target_model}
 
-            response = requests.post(url, json=payload, headers=headers, timeout=5)
+            response = requests.post(url, json=payload, headers=headers, timeout=5, verify=self.verify)
             if response.status_code == 200:
                 data = response.json()
                 if "context_size" in data:
@@ -616,6 +616,7 @@ class LollmsBinding(LollmsLLMBinding):
                     ASCIIColors.warning(f"Using remote context size for model '{target_model}': {size}")
                     return size
         except Exception as e:
+            trace_exception(e)
             ASCIIColors.warning(f"Could not retrieve remote context size for '{target_model}': {e}. Falling back to default.")
 
         return super().get_ctx_size(model_name)
