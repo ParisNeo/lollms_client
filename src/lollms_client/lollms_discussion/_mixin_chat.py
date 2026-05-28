@@ -2609,10 +2609,77 @@ class _StreamState:
             "4. Provide exactly 2 lines of context in SEARCH blocks to ensure match uniqueness.\n"
             "5. For new artifacts, provide 100% of the content.\n"
             "6. Match indentation, punctuation, and blank lines character-for-character.\n"
+            "7. VISION CHECK: If images are provided, they have been pre-filtered by the main agent as relevant. \n"
+            "   However, you MUST still verify their relevance to the specific code task. \n"
+            "   If an image is clearly unrelated (e.g. a bunny when fixing code), IGNORE IT completely.\n"
+            "   Do not let irrelevant images distract you from the code architecture.\n"
         )
 
         # Ingest active conversation images (e.g. error screenshots) to forward to the specialist
         active_images = self.discussion.get_active_images()
+        filtered_images = []
+
+        # ── VISION FILTERING PROTOCOL ──
+        # Before forwarding images to the specialist, the main agent must evaluate
+        # their relevance to the current goal. This prevents "Vision Pollution" where
+        # irrelevant images (like a bunny rabbit) distract the specialist from code fixes.
+        if active_images:
+            self._emit_processing_status(f"👁️ Evaluating {len(active_images)} active image(s) for relevance...")
+
+            # Build a concise summary of the current task for the filter
+            filter_prompt = (
+                f"TASK CONTEXT: {goal}\n"
+                f"PLAN DETAILS: {details}\n"
+                f"TARGET ARTIFACTS: {', '.join(resolved_targets) if resolved_targets else 'None'}\n"
+                "\n"
+                "INSTRUCTION: \n"
+                "You have {n} image(s) attached to the current conversation context.\n"
+                "Determine if ANY of these images are CRITICALLY relevant to the task above.\n"
+                "- Relevant: Error screenshots, diagrams of the target architecture, UI bugs in the target file.\n"
+                "- Irrelevant: Decorative images, previous unrelated generations, generic assets.\n"
+                "\n"
+                "Output format: JSON object with key 'relevant_image_indices' (list of 0-based indices).\n"
+                "If no images are relevant, return an empty list.\n"
+                "Example: {\"relevant_image_indices\": [0, 2]}"
+            )
+
+            try:
+                # Ask the main client (which has vision) to filter
+                filter_result = self.discussion.lollmsClient.generate_structured_content(
+                    prompt=filter_prompt,
+                    schema={
+                        "relevant_image_indices": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "List of 0-based indices of images relevant to the current task."
+                        }
+                    },
+                    temperature=0.0, # Deterministic decision
+                    images=active_images # Pass all images for evaluation
+                )
+
+                if filter_result and isinstance(filter_result, dict):
+                    indices = filter_result.get("relevant_image_indices", [])
+                    if isinstance(indices, list):
+                        filtered_images = [active_images[i] for i in indices if 0 <= i < len(active_images)]
+                        if filtered_images:
+                            self._emit_processing_status(f"✅ {len(filtered_images)} image(s) selected as relevant.")
+                        else:
+                            self._emit_processing_status("🚫 No images deemed relevant to current task.")
+                    else:
+                        # Fallback: If schema parsing fails but images exist, keep them to be safe
+                        filtered_images = active_images
+                        self._emit_processing_status("⚠️ Filter parsing failed, keeping all images.")
+                else:
+                    # Fallback: Keep all images if no result
+                    filtered_images = active_images
+                    self._emit_processing_status("⚠️ Filter returned empty, keeping all images.")
+            except Exception as filter_err:
+                # Fallback on error: keep all images to avoid losing critical info
+                filtered_images = active_images
+                self._emit_processing_status(f"⚠️ Image filter failed: {str(filter_err)[:50]}. Keeping all images.")
+        else:
+            self._emit_processing_status("👁️ No active images to evaluate.")
 
         # Report the agent details and selective choices via the processing block if active or callback
         self._emit_processing_status(f"Spawning specialized spinoff agent: '{requested_persona}'")
@@ -2649,11 +2716,16 @@ class _StreamState:
         ASCIIColors.info("----------------------------------------------")
 
         # 6. Call LLM at low temperature for maximum reliability
+        # Use filtered_images instead of active_images
+        effective_images = filtered_images if filtered_images else None
+        if effective_images:
+            self._emit_processing_status(f"📤 Forwarding {len(effective_images)} relevant image(s) to specialist.")
+
         try:
             raw_output = self.discussion.lollmsClient.generate_text(
                 prompt=final_payload,
                 system_prompt=surgical_prompt,
-                images=active_images if active_images else None,
+                images=effective_images,
                 temperature=None,
                 n_predict=None
             )
