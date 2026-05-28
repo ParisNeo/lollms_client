@@ -13,6 +13,8 @@ import httpx
 import pipmaster as pm
 import mimetypes
 import base64
+from pathlib import Path
+import ssl
 
 pm.ensure_packages(["openai","tiktoken"])
 
@@ -79,26 +81,13 @@ def normalize_image_input(img, default_mime="image/jpeg"):
         return {"type": "input_image", "image_url": _to_data_url(s, default_mime)}
 
     raise ValueError("Unsupported image input type")
-class LollmsBinding(LollmsLLMBinding):
-    """Lollms-specific binding implementation (open ai compatible with some extra parameters)"""
-    
-    
-    def __init__(self,
-                 **kwargs):
-        """
-        Initialize the OpenAI binding.
 
-        Args:
-            host_address (str): Host address for the OpenAI service. Defaults to DEFAULT_HOST_ADDRESS.
-            model_name (str): Name of the model to use. Defaults to empty string.
-            service_key (str): Authentication key for the service. Defaults to None. This is a key generated 
-                               on the lollms interface (it is advised to use LOLLMS_API_KEY environment variable instead)
-            verify_ssl_certificate (bool): Whether to verify SSL certificates. Defaults to True.
-            certificate_file_path (str): Path to a specific certificate file for SSL verification.
-            personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
-        """
+class LollmsBinding(LollmsLLMBinding):
+    def __init__(self, **kwargs):
         super().__init__(BindingName, **kwargs)
+
         host = kwargs.get("host_address", "http://localhost:9642").rstrip("/")
+
         if host.endswith("/lollms/v1"):
             host = host[:-10].rstrip("/")
         elif host.endswith("/v1"):
@@ -107,19 +96,47 @@ class LollmsBinding(LollmsLLMBinding):
         self.base_address = host
         self.open_ai_host_address = f"{self.base_address}/v1"
         self.lollms_host_address = f"{self.base_address}/lollms/v1"
-        self.model_name=kwargs.get("model_name")
-        self.service_key=kwargs.get("service_key")
-        self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
-        self.certificate_file_path=kwargs.get("certificate_file_path")
-        self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
+
+        self.model_name = kwargs.get("model_name")
+        self.service_key = kwargs.get("service_key")
+        self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate", True)
+        self.certificate_file_path = kwargs.get("certificate_file_path")
+        self.default_completion_format = kwargs.get(
+            "default_completion_format",
+            ELF_COMPLETION_FORMAT.Chat
+        )
 
         if not self.service_key:
-            self.service_key = os.getenv("LOLLMS_API_KEY", self.service_key)
+            self.service_key = os.getenv("LOLLMS_API_KEY")
 
-        # Determine verification strategy: specific file takes precedence, otherwise boolean flag
-        self.verify = False if not self.verify_ssl_certificate else self.certificate_file_path if self.certificate_file_path else True
+        self.verify = True
 
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.open_ai_host_address is None else self.open_ai_host_address if len(self.open_ai_host_address)>0 else None, http_client=httpx.Client(verify=self.verify))
+        if not self.verify_ssl_certificate:
+            self.verify = False
+
+        elif self.certificate_file_path:
+            cert_path = Path(self.certificate_file_path)
+
+            if not cert_path.exists():
+                raise FileNotFoundError(
+                    f"Certificate file not found: {cert_path}"
+                )
+
+            ssl_context = ssl.create_default_context(
+                cafile=str(cert_path)
+            )
+
+            self.verify = ssl_context
+
+        self.client = openai.OpenAI(
+            api_key=self.service_key,
+            base_url=self.open_ai_host_address,
+            http_client=httpx.Client(
+                verify=self.verify,
+                timeout=300.0
+            )
+        )
+
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     def lollms_listMountedPersonalities(self, host_address:str|None=None):
@@ -734,6 +751,7 @@ class LollmsBinding(LollmsLLMBinding):
                     })
                     
         except Exception as e:
+            trace_exception(e)
             print(f"Failed to list models: {e}")
 
         return models_info
