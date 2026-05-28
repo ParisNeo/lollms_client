@@ -1,8 +1,11 @@
 import base64
 import requests
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 from lollms_client.lollms_tti_binding import LollmsTTIBinding
-
+import os
+import ssl
+from ascii_colors import trace_exception
 BindingName = "LollmsTTIBinding"
 
 class LollmsTTIBinding(LollmsTTIBinding):
@@ -10,40 +13,84 @@ class LollmsTTIBinding(LollmsTTIBinding):
         # Allow 'model' as an alias for 'model_name'
         if 'model' in kwargs and 'model_name' not in kwargs:
             kwargs['model_name'] = kwargs.pop('model')
-        super().__init__(binding_name="lollms", **kwargs)
-        self.config = kwargs
-        self.host_address = kwargs.get("host_address", "http://localhost:7860")
-        self.service_key = kwargs.get("service_key", "")
-        self.model_name = kwargs.get("model_name", "")
+        super().__init__(BindingName, **kwargs)
+
+        host = kwargs.get("host_address", "http://localhost:9642").rstrip("/")
+
+        if host.endswith("/lollms/v1"):
+            host = host[:-10].rstrip("/")
+        elif host.endswith("/v1"):
+            host = host[:-3].rstrip("/")
+
+        self.base_address = host
+        self.open_ai_host_address = f"{self.base_address}/v1"
+        self.lollms_host_address = f"{self.base_address}/lollms/v1"
+
+        self.model_name = kwargs.get("model_name")
+        self.service_key = kwargs.get("service_key")
+        self.verify_ssl_certificate = kwargs.get("verify_ssl_certificate", True)
+        self.certificate_file_path = kwargs.get("certificate_file_path")
+
+        if not self.service_key:
+            self.service_key = os.getenv("LOLLMS_API_KEY")
+
+        self.verify = True
+
+        if not self.verify_ssl_certificate:
+            self.verify = False
+
+        elif self.certificate_file_path:
+            cert_path = Path(self.certificate_file_path)
+
+            if not cert_path.exists():
+                raise FileNotFoundError(
+                    f"Certificate file not found: {cert_path}"
+                )
+
+            ssl_context = ssl.create_default_context(
+                cafile=str(cert_path)
+            )
+
+            self.verify = ssl_context
+
 
     def generate_image(self, prompt: str, negative_prompt: Optional[str] = "", width: int = 1024, height: int = 1024, **kwargs) -> bytes:
-        url = f"{self.host_address.rstrip('/')}/v1/images/generations"
+        url = f"{self.open_ai_host_address}/images/generations"
         headers = {}
         if self.service_key:
             headers["Authorization"] = f"Bearer {self.service_key}"
-        
+
+        # Convert width/height to size string format expected by server
+        size = f"{width}x{height}"
+
         payload = {
             "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "width": width,
-            "height": height,
-            "model": self.model_name or None,
+            "model": None,# self.model_name or None,
+            "size": size,
             "response_format": "b64_json"
         }
         for k, v in kwargs.items():
             if k not in payload and v is not None:
                 payload[k] = v
 
-        response = requests.post(url, json=payload, headers=headers, timeout=300)
+        import sys
+        print(f"[DEBUG] Sending payload to {url}: {payload}", file=sys.stderr)
+
+        response = requests.post(url, json=payload, headers=headers, timeout=300, verify=self.verify)
+        print(f"[DEBUG] Response status: {response.status_code}", file=sys.stderr)
+        if response.status_code != 200:
+            print(f"[DEBUG] Response body: {response.text}", file=sys.stderr)
         response.raise_for_status()
         res_data = response.json()
+
+        # Handle URL response format - download the image
         b64_data = res_data["data"][0]["b64_json"]
         image_bytes = base64.b64decode(b64_data)
         
         return self.process_image(image_bytes, **kwargs)
 
     def edit_image(self, images: Union[str, List[str]], prompt: str, negative_prompt: Optional[str] = "", mask: Optional[str] = None, width: Optional[int] = None, height: Optional[int] = None, **kwargs) -> bytes:
-        url = f"{self.host_address.rstrip('/')}/v1/images/edits"
+        url = f"{self.open_ai_host_address}/images/edits"
         headers = {}
         if self.service_key:
             headers["Authorization"] = f"Bearer {self.service_key}"
@@ -80,24 +127,24 @@ class LollmsTTIBinding(LollmsTTIBinding):
             "model": self.model_name or None
         }
 
-        response = requests.post(url, files=files, data=data, headers=headers, timeout=300)
+        response = requests.post(url, files=files, data=data, headers=headers, timeout=300, verify=self.verify)
         response.raise_for_status()
         res_data = response.json()
         b64_data = res_data["data"][0]["b64_json"]
         return base64.b64decode(b64_data)
 
     def list_models(self) -> list:
-        url = f"{self.host_address.rstrip('/')}/v1/models"
+        url = f"{self.open_ai_host_address}/models"
         headers = {}
         if self.service_key:
             headers["Authorization"] = f"Bearer {self.service_key}"
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers=headers, timeout=10, verify=self.verify)
             if response.status_code == 200:
                 models_data = response.json().get("data", [])
                 return [{"model_name": m["id"]} for m in models_data]
-        except Exception:
-            pass
+        except Exception as ex:
+            trace_exception(ex)
         return []
 
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
