@@ -1613,8 +1613,7 @@ async def refine_tool_endpoint(payload: RefineToolRequest):
     try:
         raw_res = client.generate_text(
             prompt=prompt,
-            temperature=0.2,
-            n_predict=2048
+            temperature=0.2
         ).strip()
 
         # Clean any leaked markdown wraps
