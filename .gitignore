@@ -166,3 +166,4 @@ cython_debug/
 # personal code examples (not shared)
 examples_perso
 data
+data_workspace
