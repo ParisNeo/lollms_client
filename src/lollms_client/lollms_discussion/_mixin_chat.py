@@ -2655,7 +2655,7 @@ class _StreamState:
                 system_prompt=surgical_prompt,
                 images=active_images if active_images else None,
                 temperature=None,
-                n_predict=4096
+                n_predict=None
             )
 
             # ── DEBUG LOG: Show Raw Specialist Response ──
