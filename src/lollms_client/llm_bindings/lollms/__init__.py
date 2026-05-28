@@ -110,9 +110,11 @@ class LollmsBinding(LollmsLLMBinding):
             self.service_key = os.getenv("LOLLMS_API_KEY")
 
         self.verify = True
+        verify = True
 
         if not self.verify_ssl_certificate:
             self.verify = False
+            verify = False
 
         elif self.certificate_file_path:
             cert_path = Path(self.certificate_file_path)
@@ -125,14 +127,14 @@ class LollmsBinding(LollmsLLMBinding):
             ssl_context = ssl.create_default_context(
                 cafile=str(cert_path)
             )
-
-            self.verify = ssl_context
+            self.verify = cert_path
+            verify = ssl_context
 
         self.client = openai.OpenAI(
             api_key=self.service_key,
             base_url=self.open_ai_host_address,
             http_client=httpx.Client(
-                verify=self.verify,
+                verify=verify,
                 timeout=300.0
             )
         )
