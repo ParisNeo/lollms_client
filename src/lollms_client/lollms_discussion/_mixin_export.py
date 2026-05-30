@@ -667,6 +667,23 @@ def _export_as_zip(self, art: Dict[str, Any]) -> bytes:
                 if r_content:
                     z.writestr(r_title, r_content.encode("utf-8"))
 
+        # 4. Find and bundle all active datasets (CSVs, Excel files) in the workspace
+        try:
+            from lollms_client.app.server import APP_WORKSPACE_DIR
+            if APP_WORKSPACE_DIR and APP_WORKSPACE_DIR.exists():
+                for active_art in self.artefacts.list(active_only=True):
+                    if active_art.get("type") == "data":
+                        d_title = active_art["title"]
+                        ext = active_art.get("file_ext", ".csv")
+                        version = active_art.get("version", 1)
+                        # We save both the versioned and unversioned names inside the zip so the code works under any reference style!
+                        for name in (f"{d_title}{ext}", f"{d_title}_v{version}{ext}"):
+                            file_path = APP_WORKSPACE_DIR / name
+                            if file_path.exists():
+                                z.write(str(file_path), name)
+        except Exception:
+            pass
+
     return buffer.getvalue()
 
 def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:

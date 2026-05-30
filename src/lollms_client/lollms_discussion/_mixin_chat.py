@@ -44,6 +44,7 @@ import json
 import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -1225,8 +1226,8 @@ class _StreamState:
             return True
 
         # ── STATUS MIMICRY TRAP ──
-        # If the LLM starts generating framework-only tags or status lines, we trigger an abort.
-        if "<processing" in chunk.lower() or chunk.strip().startswith("* "):
+        # If the LLM starts generating framework-only tags, we trigger an abort.
+        if "<processing" in chunk.lower():
             ASCIIColors.error(f"[Mimicry Trap] LLM attempted to generate internal status: {chunk!r}")
             self.patch_error_occurred = True # Trigger the execution failure logic
             self.proc_title = "Log Mimicry Detected"
@@ -2586,9 +2587,10 @@ class _StreamState:
         full_context = "\n\n".join(parts)
 
         # 5. Build the On-The-Fly Spinoff System Prompt
+        target_example = resolved_targets[0] if resolved_targets else "example.py"
         surgical_prompt = (
             f"You are the {requested_persona}.\n"
-            "You are a specialized spinoff persona spawned by the main system architect specifically to complete this implementation.\n"
+            "You are a specialized spinoff spinoff persona spawned by the main system architect specifically to complete this implementation.\n"
             "You operate in a hyper-focused sandbox environment isolated from the main conversation's noise.\n\n"
             "Your ONLY task is to implement the provided PLAN by outputting updated <artifact> tags.\n"
             "DO NOT create widgets, notes, or forms. DO NOT use conversational prose.\n\n"
@@ -2603,7 +2605,7 @@ class _StreamState:
             "- If the plan concerns Code: Ensure idiomatic accuracy and architectural consistency.\n"
             "- If the plan concerns Markdown/Text: Preserve tone, formatting, and structural depth.\n\n"
             "STRICT CONSTRAINTS:\n"
-            "1. Output ONLY <artifact> tags. You MUST specify the name attribute matching the target file exactly, e.g. <artifact name=\"math_ops.py\" type=\"code\">\n"
+            f"1. Output ONLY <artifact> tags. You MUST specify the name attribute matching the target file exactly, e.g. <artifact name=\"{target_example}\" type=\"code\">\n"
             "2. For modifying existing artifacts, you MUST use SEARCH/REPLACE blocks inside the tag.\n"
             "3. No conversation, no explanations, no markdown fences OUTSIDE the tags.\n"
             "4. Provide exactly 2 lines of context in SEARCH blocks to ensure match uniqueness.\n"
@@ -2683,7 +2685,6 @@ class _StreamState:
 
         # Report the agent details and selective choices via the processing block if active or callback
         self._emit_processing_status(f"Spawning specialized spinoff agent: '{requested_persona}'")
-        self._emit_processing_status(f"Spinoff Persona System Prompt:\n{surgical_prompt}")
         self._emit_processing_status(f"User Intent: {goal}")
         self._emit_processing_status(f"Target Artifacts to edit: {', '.join(resolved_targets) if resolved_targets else 'None'}")
         self._emit_processing_status(f"Supporting Context provided: {', '.join(resolved_supporting) if resolved_supporting else 'None'}")
@@ -2709,10 +2710,18 @@ class _StreamState:
 
         # ── DEBUG LOG: Show exactly what the implementation specialist sees ──
         ASCIIColors.info("--- [DEBUG] HYPER-FOCUSED SPECIALIST INPUT ---")
-        ASCIIColors.cyan(f"Persona: {requested_persona}")
-        ASCIIColors.yellow(f"Payload Size: {len(final_payload)} chars")
+        ASCIIColors.cyan(f"  • Persona             : {requested_persona}")
+        cond_preview = custom_traits[:120].replace('\n', ' ') + "..." if len(custom_traits) > 120 else custom_traits.replace('\n', ' ')
+        ASCIIColors.cyan(f"  • Conditioning Snippet: {cond_preview}")
+        ASCIIColors.cyan(f"  • Skills Selected     : {', '.join(resolved_skills) if resolved_skills else 'None'}")
+        ASCIIColors.cyan(f"  • Target Artefacts    : {', '.join(resolved_targets) if resolved_targets else 'None'}")
+        ASCIIColors.cyan(f"  • Support Artefacts   : {', '.join(resolved_supporting) if resolved_supporting else 'None'}")
+        ASCIIColors.cyan(f"  • Images Forwarded    : {len(filtered_images) if filtered_images else 0}")
+        ASCIIColors.yellow(f"  • Payload Size        : {len(final_payload):,} chars")
         if self.discussion.lollmsClient.debug:
+            ASCIIColors.white("\n--- FULL PAYLOAD ---")
             print(final_payload)
+            ASCIIColors.white("--------------------\n")
         ASCIIColors.info("----------------------------------------------")
 
         # 6. Call LLM at low temperature for maximum reliability
@@ -3815,8 +3824,28 @@ class ChatMixin:
                     call_args: Dict[str, Any] = {}
                     for p in params_spec:
                         pn = p.get("name")
+                        pt = str(p.get("type", "string")).lower()
                         if pn in kw:
-                            call_args[pn] = kw[pn]
+                            val = kw[pn]
+                            # ── 📄 Dynamic Artifact & Image Address Resolution ──
+                            # Instead of pasting massive code/images inside the JSON tool_call block,
+                            # the LLM can create an ephemeral artifact and simply pass its title/address!
+                            if pt == "artifact" and isinstance(val, str):
+                                art = self.artefacts.get(val)
+                                if art:
+                                    call_args[pn] = art
+                                else:
+                                    return {"error": f"Artifact address '{val}' not found in active session context.", "success": False}
+                            elif pt == "image" and isinstance(val, str):
+                                art = self.artefacts.get(val)
+                                if art and art.get("images"):
+                                    # Inject the last active base64 image from the resolved artifact
+                                    call_args[pn] = art["images"][-1]
+                                else:
+                                    # Fallback: treat as raw base64 or file path
+                                    call_args[pn] = val
+                            else:
+                                call_args[pn] = val
                         elif not p.get("optional", False):
                             return {"error": f"Missing required parameter: {pn}", "success": False}
                         elif "default" in p:
@@ -3900,16 +3929,78 @@ class ChatMixin:
         active_data = [a for a in self.artefacts.list(active_only=True) if a.get("type") == "data"]
         if active_data:
             def _execute_python_data_query_tool_impl(code: str) -> Dict[str, Any]:
-                title = active_data[0]["title"]
-                ext = active_data[0].get("file_ext", ".csv")
-                current_version = active_data[0].get("version", 1)
-                new_version = current_version + 1
+                # Dynamically retrieve the latest version of the data artifact to support multi-round updates
+                latest_data = [a for a in self.artefacts.list(active_only=True) if a.get("type") == "data"]
+                if not latest_data:
+                    err_msg = "No active data artifact found in this session."
+                    ASCIIColors.error(f"❌ {err_msg}")
+                    return {"success": False, "error": err_msg}
+
+                title = latest_data[0]["title"]
+                ext = latest_data[0].get("file_ext", ".csv")
+                current_version = latest_data[0].get("version", 1)
+                is_read_only = latest_data[0].get("read_only", False)
+                plot_b64 = None
+
                 workspace_dir = Path("./data_workspace")
-                source_file_path = workspace_dir / f"{title}_v{current_version}{ext}"
-                new_file_path = workspace_dir / f"{title}_v{new_version}{ext}"
+                try:
+                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                    if awd is not None:
+                        workspace_dir = awd
+                except ImportError:
+                    pass
+
+                # If read-only, we execute directly on the active alias without making a versioned copy
+                if is_read_only:
+                    new_version = current_version
+                    source_file_path = workspace_dir / f"{title}{ext}"
+                    new_file_path = source_file_path
+                else:
+                    new_version = current_version + 1
+                    source_file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+                    new_file_path = workspace_dir / f"{title}_v{new_version}{ext}"
+
+                ASCIIColors.info(f"--- [execute_python_data_query] Ingestion started for: '{title}' (v{current_version}{ext}) ---")
 
                 if not source_file_path.exists():
-                    return {"success": False, "error": f"Raw data file '{title}_v{current_version}{ext}' is missing from workspace."}
+                    # Fallback scan: check other workspaces and the global data_workspace
+                    found_path = None
+                    scan_dirs = [Path("./data_workspace")]
+                    try:
+                        from lollms_client.app.server import APP_DIR
+                        if APP_DIR and APP_DIR.exists():
+                            ws_dir = APP_DIR / "workspaces"
+                            if ws_dir.exists():
+                                for d in ws_dir.iterdir():
+                                    if d.is_dir():
+                                        scan_dirs.append(d / "data_workspace")
+                    except Exception:
+                        pass
+
+                    for sd in scan_dirs:
+                        cand = sd / f"{title}_v{current_version}{ext}"
+                        if cand.exists():
+                            found_path = cand
+                            break
+
+                    if found_path:
+                        try:
+                            workspace_dir.mkdir(parents=True, exist_ok=True)
+                            import shutil
+                            shutil.copy(str(found_path), str(source_file_path))
+                            unversioned_dest = workspace_dir / f"{title}{ext}"
+                            try:
+                                shutil.copy(str(found_path), str(unversioned_dest))
+                            except Exception:
+                                pass
+                            ASCIIColors.success(f"✓ Recovered missing data file from '{found_path.parent.parent.name or 'global'}' workspace!")
+                        except Exception as copy_err:
+                            ASCIIColors.error(f"Failed to copy recovered file: {copy_err}")
+
+                if not source_file_path.exists():
+                    err_msg = f"Raw data file '{title}_v{current_version}{ext}' is missing from workspace."
+                    ASCIIColors.error(f"❌ {err_msg}")
+                    return {"success": False, "error": err_msg}
 
                 import pandas as pd
                 import numpy as np
@@ -3924,9 +4015,11 @@ class ChatMixin:
                 local_vars = {
                     "pd": pd,
                     "plt": plt,
-                    "np": np
+                    "np": np,
+                    "Path": Path
                 }
 
+                # Pre-populate local vars with dataset for immediate accessibility
                 sep = ","
                 try:
                     if ext in (".db", ".sqlite", ".sqlite3"):
@@ -3944,52 +4037,87 @@ class ChatMixin:
                     else:
                         sep = ";" if ext == ".csv" and ";" in source_file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
                         local_vars["df"] = pd.read_csv(str(source_file_path), sep=sep)
+                    ASCIIColors.success(f"✓ Dataset loaded into memory successfully (Variables available: pd, plt, np, Path, and {'conn, cursor' if ext in ('.db', '.sqlite', '.sqlite3') else 'dfs' if ext in ('.xlsx', '.xls') else 'df'})")
                 except Exception as e:
+                    ASCIIColors.error(f"❌ Failed to load dataset: {e}")
+                    if self.lollmsClient.debug:
+                        trace_exception(e)
                     return {"success": False, "error": f"Failed to load dataset: {e}"}
 
                 old_stdout = sys.stdout
                 redirected_output = io.StringIO()
                 sys.stdout = redirected_output
 
-                plot_b64 = None
+                import os
+                old_cwd = os.getcwd()
+                
+                # --- 1. Execute Code Sandbox ---
                 try:
+                    if workspace_dir and workspace_dir.exists():
+                        os.chdir(str(workspace_dir))
+
                     plt.clf()
                     plt.close('all')
+                    ASCIIColors.info(f"⚡ Executing Sandboxed Python code:\n{code}")
                     exec(code, {}, local_vars)
+                except Exception as e:
+                    sys.stdout = old_stdout
+                    err_msg = f"Generated code execution error: {e}"
+                    ASCIIColors.error(f"❌ {err_msg}")
+                    if self.lollmsClient.debug:
+                        trace_exception(e)
+                    return {"success": False, "error": err_msg, "output": redirected_output.getvalue()}
+
+                # --- 2. Update and Commit Workspace State ---
+                try:
                     fig_nums = plt.get_fignums()
                     if fig_nums:
                         buf = io.BytesIO()
                         plt.savefig(buf, format="png", bbox_inches='tight')
                         buf.seek(0)
                         plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                        ASCIIColors.success("✓ Matplotlib visualization generated inside sandbox.")
 
-                    if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
-                        local_vars["conn"].commit()
-                        local_vars["conn"].close()
-                    elif ext in (".xlsx", ".xls") and "dfs" in local_vars:
-                        with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
-                            for sheet_name, sheet_df in local_vars["dfs"].items():
-                                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    elif "df" in local_vars:
-                        local_vars["df"].to_csv(new_file_path, index=False, sep=sep)
+                    if not is_read_only:
+                        if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
+                            local_vars["conn"].commit()
+                            local_vars["conn"].close()
+                        elif ext in (".xlsx", ".xls") and "dfs" in local_vars:
+                            with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
+                                for sheet_name, sheet_df in local_vars["dfs"].items():
+                                    sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        elif "df" in local_vars:
+                            local_vars["df"].to_csv(new_file_path, index=False, sep=sep)
 
-                    from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                    new_schema, _ = _parse_data_file(new_file_path, title, version=new_version, progress_cb=None)
-                    self.artefacts.update(
-                        title=title,
-                        new_content=new_schema,
-                        new_type="data",
-                        active=True,
-                        file_ext=ext,
-                        version=new_version
-                    )
+                        from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                        new_schema, _ = _parse_data_file(new_file_path, title, version=new_version, progress_cb=None)
+                        self.artefacts.update(
+                            title=title,
+                            new_content=new_schema,
+                            new_type="data",
+                            active=True,
+                            file_ext=ext
+                        )
+                        ASCIIColors.success(f"✓ Code executed and data version incremented to v{new_version} successfully.")
+                    else:
+                        if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
+                            local_vars["conn"].close()
+                        ASCIIColors.success("✓ Code executed successfully (Read-Only mode: no files written).")
                 except Exception as e:
                     sys.stdout = old_stdout
+                    err_msg = f"System Error in database updater: {e}"
+                    ASCIIColors.error(f"❌ {err_msg}")
+                    if self.lollmsClient.debug:
+                        trace_exception(e)
                     if new_file_path.exists() and ext not in (".db", ".sqlite", ".sqlite3"):
                         new_file_path.unlink()
-                    return {"success": False, "error": str(e), "output": redirected_output.getvalue()}
+                    return {"success": False, "error": err_msg, "output": redirected_output.getvalue()}
                 finally:
                     sys.stdout = old_stdout
+                    try:
+                        os.chdir(old_cwd)
+                    except Exception:
+                        pass
 
                 out_str = redirected_output.getvalue()
                 result = {
@@ -4004,8 +4132,8 @@ class ChatMixin:
             _register(
                 name="execute_python_data_query",
                 fn=_execute_python_data_query_tool_impl,
-                params=[{"name": "code", "type": "str", "description": "The Python code using pandas (via 'df' or 'dfs' dict) or sqlite3 (via 'conn' connection and 'cursor') to analyze or modify the loaded datasets."}],
-                description="MANDATORY FOR DATA MODIFICATION: Execute sandboxed Python code to analyze or modify/write to the active datasets (CSV, Excel, SQLite). Use this tool whenever the user asks to add columns, perform calculations, compute stats, or run SQL queries. Do NOT attempt to use <artifact> tags to modify 'data' type artifacts.",
+                params=[{"name": "code", "type": "str", "description": "The Python code to execute. To load active datasets, open them directly by their clean name (e.g., 'sales_database.xlsx' or 'sales_database.csv'). Do NOT use '/api/workspace_files/...' prefixes."}],
+                description="MANDATORY FOR DATA ANALYSIS/MODIFICATION: Execute sandboxed Python code using pandas or sqlite3 to analyze active datasets. To read active datasets (e.g., 'sales_database.xlsx'), simply open them directly by their clean filename (do NOT use '/api/workspace_files/...' prefixes, as those are strictly for client-side JavaScript).",
                 output=[{"name": "output", "type": "str"}]
             )
 
@@ -4290,10 +4418,14 @@ class ChatMixin:
                 _cb(callback, json.dumps(catalogue, indent=2),
                     MSG_TYPE.MSG_TYPE_TOOLS_LIST, {"tools": catalogue})
                 return {"success": True, "tool_count": len(catalogue), "tools": catalogue}
- 
-            tool_registry["show_tools"] = _show_tools_impl
-            tool_descriptions.append("- show_tools(): Display the full list of available tools")
- 
+
+            _register(
+                name="show_tools",
+                fn=_show_tools_impl,
+                params=[],
+                description="Display the full list of available tools"
+            )
+
         if enable_extract_artefact:
             def _extract_artefact_text_impl(
                 source_title: str, new_title: str,
@@ -4353,30 +4485,66 @@ class ChatMixin:
                     "total_lines": total, "lines_extracted": end_idx - start_idx + 1,
                     "artefact_id": new_art.get("id"),
                 }
- 
-            tool_registry["extract_artifact_text"] = _extract_artefact_text_impl
-            tool_descriptions.append(
-                "- extract_artifact_text(source_title: str, new_title: str, "
-                "start_line_hint: str, end_line_hint: str, occurrence: int = 1, "
-                "artefact_type: str = 'document', language: str = ''): "
-                "Extract a range from an artifact by line-prefix anchors"
+
+            _register(
+                name="extract_artifact_text",
+                fn=_extract_artefact_text_impl,
+                params=[
+                    {"name": "source_title", "type": "str", "description": "Title of the source artifact"},
+                    {"name": "new_title", "type": "str", "description": "Title of the new artifact to create"},
+                    {"name": "start_line_hint", "type": "str", "description": "Line content / prefix of the starting block (case insensitive)"},
+                    {"name": "end_line_hint", "type": "str", "description": "Line content / prefix of the ending block (case insensitive)"},
+                    {"name": "occurrence", "type": "int", "description": "Occurrence count if multiple matching lines exist", "optional": True, "default": 1},
+                    {"name": "artefact_type", "type": "str", "description": "The target artifact type to assign (e.g., 'code', 'document')", "optional": True, "default": "document"},
+                    {"name": "language", "type": "str", "description": "Optional programming language if type is code", "optional": True, "default": ""},
+                ],
+                description="Extract a range from an artifact by line-prefix anchors"
             )
- 
+
+        # ── 5. Promote Artifact Tool ──
+        def _promote_artifact_impl(title: str) -> Dict[str, Any]:
+            art = self.artefacts.get(title)
+            if not art:
+                return {"success": False, "error": f"Artifact '{title}' not found."}
+            # Remove ephemeral/hidden flag to make it persistent and visible in the sidebar list
+            self.artefacts.update(
+                title=title,
+                active=True,
+                ephemeral=False,
+                bump_version=False # update in place
+            )
+            self.commit()
+            return {
+                "success": True,
+                "message": f"Successfully promoted artifact '{title}' to persistent workspace sidebar list."
+            }
+        
+        _register(
+            name="promote_artifact",
+            fn=_promote_artifact_impl,
+            params=[{"name": "title", "type": "str", "description": "The exact title of the ephemeral artifact to promote to the visible workspace sidebar list."}],
+            description="Promote an ephemeral/temporary artifact to a permanent, visible workspace file."
+        )
+
         if enable_repl_tools:
             try:
                 from ._repl_tools import TextBuffer, register_repl_tools as _reg_repl
                 _reg_repl(tool_registry, tool_descriptions, TextBuffer(), self.artefacts)
             except ImportError as _e:
                 _warning(callback, f"REPL text tools unavailable: {_e}")
- 
+
         if enable_final_answer:
-            tool_registry["final_answer"] = lambda: {
-                "status":  "final",
-                "answer":  get_current_answer()["full_text"]
-                           if composable_answer["sections"] else None,
-                "success": True,
-            }
-            tool_descriptions.append("- final_answer(): Signal that the answer is ready")
+            _register(
+                name="final_answer",
+                fn=lambda: {
+                    "status":  "final",
+                    "answer":  get_current_answer()["full_text"]
+                               if composable_answer["sections"] else None,
+                    "success": True,
+                },
+                params=[],
+                description="Signal that the answer is ready"
+            )
   
         object.__setattr__(
             self, "_system_prompt",
@@ -5129,13 +5297,70 @@ class ChatMixin:
                 try:
                     ss._emit_tool_processing_status(f"Executing {_tool_name}...")
                     _result = active_tool_registry[_tool_name](**_tool_params)
- 
-                    inferred_srcs = _infer_sources_from_json(_result, _tool_name)
+
+                    # Normalize multi-structured tool output into a robust LCPResult instance
+                    from lollms_client.lollms_types import LCPResult
+                    if isinstance(_result, LCPResult):
+                        _result_obj = _result
+                    elif isinstance(_result, dict) and ("success" in _result or "prompt_injection" in _result):
+                        _result_obj = LCPResult.from_dict(_result)
+                    else:
+                        _success = True
+                        _err = None
+                        if isinstance(_result, dict):
+                            _success = _result.get("success", "error" not in _result)
+                            _err = _result.get("error")
+                            _out = _result.get("output", json.dumps(_result, indent=2))
+                        else:
+                            _out = str(_result)
+                        _result_obj = LCPResult(success=_success, output=_out, error=_err)
+
+                    # ── 📸 Multi-Modal Image Routing ──
+                    if _result_obj.images:
+                        # Append to the active turn's images list so subsequent reasoning rounds can "see" them
+                        if images is None:
+                            images = []
+                        for img_b64 in _result_obj.images:
+                            if img_b64 not in images:
+                                images.append(img_b64)
+                        # Append to the assistant's message image pack so they are fully rendered in the UI
+                        ai_message.add_image_pack(
+                            images=_result_obj.images,
+                            group_type="generated",
+                            active_by_default=True,
+                            title=f"{_tool_name}_img"
+                        )
+
+                    # ── 💻 Extra Structured Code Blocks Formatting ──
+                    if _result_obj.code_blocks:
+                        code_text_blocks = []
+                        for blk in _result_obj.code_blocks:
+                            lang = blk.get("language") or "python"
+                            code_text_blocks.append(f"\n```{lang}\n{blk.get('content')}\n```")
+                        _result_obj.output += "\n" + "\n".join(code_text_blocks)
+
+                    # ── 📂 Monospace Paths Ingestion ──
+                    if _result_obj.paths:
+                        path_texts = [f"  • `{p}`" for p in _result_obj.paths]
+                        _result_obj.output += "\n\nGenerated files:\n" + "\n".join(path_texts)
+
+                    # ── 🌐 Structured Sources Ingestion ──
+                    # If the tool returned structured sources (RAG, databases, search),
+                    # ingest them directly so they are beautifully cited and formatted
+                    if _result_obj.sources:
+                        for s in _result_obj.sources:
+                            s.setdefault("index", len(collected_sources) + 1)
+                            s.setdefault("tool", _tool_name)
+                            collected_sources.append(s)
+
+                    # ── 🧠 Context Ingestion ──
+                    inferred_srcs = _infer_sources_from_json(_result_obj.to_dict(), _tool_name)
                     res_label     = _tool_name.replace('_', ' ').title()
                     llm_block     = f"### [Source List: {res_label}]\n"
                     for s in inferred_srcs:
-                        s["index"] = len(collected_sources) + 1
-                        collected_sources.append(s)
+                        if s not in collected_sources:
+                            s["index"] = len(collected_sources) + 1
+                            collected_sources.append(s)
                         llm_block += f"[[{s['index']}]] {s['title']}\n"
                         if s['content']:
                             llm_block += f"Content: {s['content']}\n"
@@ -5143,55 +5368,69 @@ class ChatMixin:
                             llm_block += f"Metadata: {json.dumps(s['metadata'])}\n"
                         llm_block += "---\n"
                     if not inferred_srcs:
-                        llm_block += json.dumps(_result, indent=2)
- 
+                        llm_block += _result_obj.output
+
                     self.scratchpad = (self.scratchpad or "") + (
                         f"\n--- Tool: {res_label} (round {_round}) ---\n"
                         f"{llm_block}\n"
                         f"--- End {res_label} ---\n"
                     )
- 
+
                     _completed_tool_calls.append(_call_tag)
                     _created_title = (
-                        _result.get("title") or _result.get("name") or
-                        _result.get("note_title") or _result.get("artefact_title") or
-                        _tool_params.get("title") or _tool_params.get("name") or
-                        _tool_params.get("note_title")
+                        _result_obj.metadata.get("title") or _result_obj.metadata.get("name") or
+                        _tool_params.get("title") or _tool_params.get("name")
                     )
                     if _created_title and str(_created_title) not in _created_artefact_titles:
                         _created_artefact_titles.append(str(_created_title))
- 
-                    _raw_result_json = json.dumps(_result, indent=2, ensure_ascii=False)
- 
-                    _is_web_search = (
-                        ("search" in _tool_name.lower() or "query" in _tool_name.lower())
-                        and isinstance(_result, dict) and "sources" in _result
-                    )
-                    if _is_web_search:
-                        _formatted = _format_web_search_for_llm(_result, max_chars=2000)
-                        _result_str = (
-                            _formatted[:2500] + "\n... [additional results truncated]"
-                            if len(_formatted) > 2500 else _formatted
-                        )
+
+                    # ── 🧠 Custom Prompt Injection Override ──
+                    # If prompt_injection is provided, we completely bypass JSON serialization and inject the custom text directly!
+                    if _result_obj.prompt_injection:
+                        _result_str = _result_obj.prompt_injection
                     else:
-                        if len(_raw_result_json) <= 2000:
-                            _result_str = _raw_result_json
+                        _raw_result_json = json.dumps(_result_obj.to_dict(), indent=2, ensure_ascii=False)
+
+                        _is_web_search = (
+                            ("search" in _tool_name.lower() or "query" in _tool_name.lower())
+                            and isinstance(_result, dict) and "sources" in _result
+                        )
+                        if _is_web_search:
+                            _formatted = _format_web_search_for_llm(_result, max_chars=2000)
+                            _result_str = (
+                                _formatted[:2500] + "\n... [additional results truncated]"
+                                if len(_formatted) > 2500 else _formatted
+                            )
                         else:
-                            _truncated  = _smart_truncate_result(_result, max_total_chars=2000)
-                            _result_str = json.dumps(_truncated, indent=2, ensure_ascii=False)
- 
+                            if len(_raw_result_json) <= 2000:
+                                _result_str = _raw_result_json
+                            else:
+                                _truncated  = _smart_truncate_result(_result_obj.to_dict(), max_total_chars=2000)
+                                _result_str = json.dumps(_truncated, indent=2, ensure_ascii=False)
+
                     tool_calls_this_turn.append({
-                        "name": _tool_name, "params": _tool_params, "result": _result,
+                        "name": _tool_name, "params": _tool_params, "result": _result_obj.to_dict(),
                     })
  
                     _source_count = len(inferred_srcs)
                     _result_keys  = list(_result.keys()) if isinstance(_result, dict) else []
-                    result_summary = f"Success: {res_label}"
+                    _is_failed = isinstance(_result, dict) and _result.get("success") is False
+
+                    if _is_failed:
+                        result_summary = f"❌ Failed: {res_label}"
+                    else:
+                        result_summary = f"✓ Success: {res_label}"
+
                     if _source_count:
                         result_summary += f" — found {_source_count} source(s)"
                     if _result_keys:
                         result_summary += f" — result keys: {', '.join(_result_keys[:5])}"
                     ss._emit_tool_processing_status(result_summary)
+
+                    if _is_failed and _result.get("error"):
+                        # Render tool execution failure details as an elegant collapsible block inside the processing drawer
+                        error_details = f"<details><summary>⚠️ Error Details</summary><pre style='color:#ef4444; white-space:pre-wrap;'>{_result.get('error')}</pre></details>"
+                        ss._emit_tool_processing_status(error_details)
  
                     ss._emit_tool_processing_close(
                         f"Completed — output: {len(_raw_result_json):,} chars"
@@ -5262,7 +5501,8 @@ class ChatMixin:
                             })
  
                 except Exception as e:
-                    trace_exception(e)
+                    if self.lollmsClient.debug:
+                        trace_exception(e)
                     ss._emit_tool_processing_status(f"Error during execution: {str(e)[:100]}")
                     _warning(callback, f"Tool error ({_tool_name}): {e}")
                     ss._emit_tool_processing_close(f"Failed: {str(e)[:200]}")

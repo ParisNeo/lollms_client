@@ -249,6 +249,12 @@ class CoreMixin:
             metadata["discussion_images"] = self.images
             setattr(self._db_discussion, 'discussion_metadata', metadata)
         setattr(self._db_discussion, 'updated_at', datetime.utcnow())
+        if self._is_db_backed:
+            from sqlalchemy.orm.attributes import flag_modified
+            try:
+                flag_modified(self._db_discussion, 'discussion_metadata')
+            except Exception:
+                pass
         if self._is_db_backed and self.autosave:
             self.commit()
 

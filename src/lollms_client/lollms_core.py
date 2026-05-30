@@ -64,7 +64,7 @@ class LollmsClient():
         ai_name = "assistant",
         callback: Optional[Callable[[str, MSG_TYPE, Optional[Dict]], bool]] = None,
 
-        debug: Optional[bool] = False,
+        debug: Optional[bool] = True,
         cooperative_vram_management: Optional[bool] = False,
         **kwargs
         ):
@@ -470,6 +470,8 @@ class LollmsClient():
                     **gen_kwargs,
                 )
             except Exception as e:
+                if self.debug:
+                    trace_exception(e)
                 ASCIIColors.error(f"generate_with_tools: generation failed: {e}")
                 return {
                     "response": f"[Error during generation: {e}]",
@@ -597,7 +599,9 @@ class LollmsClient():
 
                     except Exception as e:
                         error_msg = f"Error executing {tool_name}: {e}"
-                        ASCIIColors.warning(error_msg)
+                        if self.debug:
+                            trace_exception(e)
+                            ASCIIColors.warning(error_msg)
                         result = {"error": error_msg, "success": False}
 
             result_record = {

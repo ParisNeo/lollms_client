@@ -109,10 +109,11 @@ class TestLollmsMemorySystem(unittest.TestCase):
         ASCIIColors.cyan("\n--- Test 3: Aging Decay & Archival ---")
         m = self.manager.add("An ancient memory that hasn't been accessed for weeks.", importance=0.5)
 
-        # Manipulate last_used_at to simulate aging (e.g. 3 days ago)
+        # Manipulate last_used_at and updated_at to simulate aging (e.g. 3 days ago)
         with self.manager._session() as s:
             rec = s.get(_MemoryRecord, m["id"])
             rec.last_used_at = datetime.utcnow() - timedelta(days=3)
+            rec.updated_at = datetime.utcnow() - timedelta(days=3)
 
         # Apply aging decay
         decay_count = self.manager.apply_decay()
@@ -150,7 +151,7 @@ class TestLollmsMemorySystem(unittest.TestCase):
 
         # 2. Test faded memory eligible for forgetting
         # Directly insert into the Level 3 Archive with a low importance to streamline state consistency,
-        # and back-date the last_used_at timestamp to avoid the 24h recently-used promotion filter in dream()
+        # and back-date the last_used_at and updated_at timestamps to avoid the 24h recently-used promotion filter in dream()
         two_days_ago = datetime.utcnow() - timedelta(days=2)
         m_faded_keep = self.manager.add("Important custom user instruction.", importance=0.01, level=3)
         m_faded_forget = self.manager.add("Trivial noise from scratchpad.", importance=0.01, level=3)
@@ -158,9 +159,11 @@ class TestLollmsMemorySystem(unittest.TestCase):
         with self.manager._session() as s:
             rec_keep = s.get(_MemoryRecord, m_faded_keep["id"])
             rec_keep.last_used_at = two_days_ago
-            
+            rec_keep.updated_at = two_days_ago
+
             rec_forget = s.get(_MemoryRecord, m_faded_forget["id"])
             rec_forget.last_used_at = two_days_ago
+            rec_forget.updated_at = two_days_ago
 
         # Build a mock dreamer that wants to keep the important instruction but discard the noise
         class DreamerClient:

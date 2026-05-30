@@ -197,6 +197,60 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    // ── 🗑️ Reusable Slick Confirmation Modal helper ──
+    function showSlickConfirm(title, message, confirmText = "Delete", isDanger = true) {
+        return new Promise((resolve) => {
+            const modal = document.getElementById("confirm-modal");
+            const titleEl = document.getElementById("confirm-modal-title");
+            const bodyEl = document.getElementById("confirm-modal-body-text");
+            const cancelBtn = document.getElementById("btn-cancel-confirm");
+            const okBtn = document.getElementById("btn-ok-confirm");
+            const closeBtn = document.getElementById("btn-close-confirm-modal");
+
+            titleEl.textContent = title;
+            bodyEl.textContent = message;
+            okBtn.textContent = confirmText;
+
+            if (isDanger) {
+                okBtn.style.backgroundColor = "#ef4444";
+                okBtn.style.borderColor = "#ef4444";
+                okBtn.style.color = "#ffffff";
+            } else {
+                okBtn.style.backgroundColor = "var(--accent-color)";
+                okBtn.style.borderColor = "var(--accent-color)";
+                okBtn.style.color = "#020617";
+            }
+
+            modal.style.display = "flex";
+
+            function cleanup() {
+                modal.style.display = "none";
+                // Remove event listeners by cloning
+                const newOk = okBtn.cloneNode(true);
+                okBtn.parentNode.replaceChild(newOk, okBtn);
+                const newCancel = cancelBtn.cloneNode(true);
+                cancelBtn.parentNode.replaceChild(newCancel, cancelBtn);
+                const newClose = closeBtn.cloneNode(true);
+                closeBtn.parentNode.replaceChild(newClose, closeBtn);
+            }
+
+            document.getElementById("btn-ok-confirm").onclick = () => {
+                cleanup();
+                resolve(true);
+            };
+
+            document.getElementById("btn-cancel-confirm").onclick = () => {
+                cleanup();
+                resolve(false);
+            };
+
+            document.getElementById("btn-close-confirm-modal").onclick = () => {
+                cleanup();
+                resolve(false);
+            };
+        });
+    }
+
     // ── Core DOM Elements ──
     const serverStatus = document.getElementById("server-status");
     const artifactsList = document.getElementById("artifacts-list");
@@ -332,6 +386,92 @@ document.addEventListener("DOMContentLoaded", () => {
             } catch (e) { alert("Failed to add memory: " + e); }
         });
     }
+
+    // ── 🎯 Chat Function Badges Handler ──
+    const funcBadges = document.querySelectorAll(".func-badge");
+    const funcStates = {};
+
+    funcBadges.forEach(badge => {
+        const funcKey = badge.dataset.func;
+        let defaultVal = "true";
+        if (funcKey === "enable_skills" || funcKey === "enable_books") {
+            defaultVal = "false";
+        }
+
+        const savedState = localStorage.getItem(`chat_func_${funcKey}`) || defaultVal;
+        const isActive = savedState === "true";
+        funcStates[funcKey] = isActive;
+
+        badge.classList.toggle("active", isActive);
+
+        badge.addEventListener("click", () => {
+            const current = funcStates[funcKey];
+            const nextState = !current;
+            funcStates[funcKey] = nextState;
+            localStorage.setItem(`chat_func_${funcKey}`, nextState ? "true" : "false");
+            badge.classList.toggle("active", nextState);
+            updateContextBudget();
+            showNotification(`${badge.textContent.trim()} function is now ${nextState ? 'enabled 🟢' : 'disabled 🔴'}`, "info", 2000);
+        });
+    });
+
+    // ── 📸 Clipboard Image Paste & Auto-expanding Textarea Handlers ──
+    const pastedImages = [];
+
+    chatInput.addEventListener("paste", (e) => {
+        const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+        let imagePasted = false;
+        for (const item of items) {
+            if (item.type.indexOf("image") !== -1) {
+                imagePasted = true;
+                const blob = item.getAsFile();
+                const reader = new FileReader();
+                reader.onload = function(event) {
+                    const base64Str = event.target.result.split(",")[1];
+                    pastedImages.push({
+                        data: base64Str,
+                        mimeType: item.type
+                    });
+                    renderPastedImagesPreview();
+                    showNotification("Image pasted successfully! 📸", "success", 2000);
+                };
+                reader.readAsDataURL(blob);
+            }
+        }
+        if (imagePasted) {
+            e.preventDefault();
+        }
+    });
+
+    function renderPastedImagesPreview() {
+        const container = document.getElementById("pasted-images-container");
+        if (pastedImages.length === 0) {
+            container.style.display = "none";
+            container.innerHTML = "";
+            return;
+        }
+        container.style.display = "flex";
+        container.innerHTML = pastedImages.map((img, idx) => `
+            <div class="pasted-image-thumb" style="position: relative; width: 64px; height: 64px; border: 1px solid var(--border-color); border-radius: 6px; overflow: hidden; background-color: var(--bg-app); flex-shrink: 0; box-shadow: var(--shadow-sm);">
+                <img src="data:${img.mimeType};base64,${img.data}" style="width: 100%; height: 100%; object-fit: cover;" />
+                <span class="pasted-image-remove" data-index="${idx}" style="position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; background-color: rgba(0,0,0,0.6); color: white; font-size: 11px; font-weight: bold; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; user-select: none;">×</span>
+            </div>
+        `).join("");
+
+        container.querySelectorAll(".pasted-image-remove").forEach(btn => {
+            btn.addEventListener("click", () => {
+                const idx = parseInt(btn.dataset.index, 10);
+                pastedImages.splice(idx, 1);
+                renderPastedImagesPreview();
+            });
+        });
+    }
+
+    // Auto-expanding text height event listener
+    chatInput.addEventListener("input", () => {
+        chatInput.style.height = "auto";
+        chatInput.style.height = Math.min(150, chatInput.scrollHeight) + "px";
+    });
 
     // ── Check Server Status ──
     // Deactivate chat input by default until LLM server state is verified
@@ -567,10 +707,13 @@ document.addEventListener("DOMContentLoaded", () => {
             <div class="artifact-sub-tabs">
                 <button class="sub-tab-btn active" data-sub-tab="rendered-${safeId}">👁️ Rendered View</button>
                 <button class="sub-tab-btn" data-sub-tab="raw-${safeId}">💻 Raw Source Code</button>
-                <div class="version-select-container">
+                <div class="version-select-container" style="display: flex; align-items: center; gap: 6px;">
                     <label>Version:</label>
                     <select class="version-select" data-art-title="${title}"></select>
-                    <button class="sub-tab-btn download-art-btn" data-art-title="${title}" title="Download / Export this artifact" style="margin-left: 8px; background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg);">💾 Download / Export</button>
+                    <button class="btn-version-action btn-set-active-version" data-art-title="${title}" title="⭐ Set this version as active/default in the session context" style="background: none; border: 1px solid var(--border-color); color: var(--text-secondary); padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; font-weight: bold; transition: all 0.15s; height: auto; width: auto; line-height: 1.4;">⭐ Set Active</button>
+                    <button class="btn-version-action btn-delete-version" data-art-title="${title}" title="🗑️ Delete this specific version permanently" style="background: none; border: 1px solid var(--border-color); color: #ef4444; border-color: rgba(239, 68, 68, 0.2); padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; font-weight: bold; transition: all 0.15s; height: auto; width: auto; line-height: 1.4;">🗑️ Delete</button>
+                    <button class="btn-version-action btn-squash-versions" data-art-title="${title}" title="🗜️ Compress/Squash version history" style="background: none; border: 1px solid var(--border-color); color: var(--accent-color); border-color: rgba(245, 158, 11, 0.2); padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; font-weight: bold; transition: all 0.15s; height: auto; width: auto; line-height: 1.4;">🗜️ Squash</button>
+                    <button class="sub-tab-btn download-art-btn" data-art-title="${title}" title="Download / Export this artifact" style="margin-left: 8px; background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg); padding: 6px 12px; height: auto;">💾 Download / Export</button>
                 </div>
             </div>
             <div class="sub-tab-content active" id="sub-tab-rendered-${safeId}">
@@ -602,22 +745,114 @@ document.addEventListener("DOMContentLoaded", () => {
         });
 
         const vSelect = tabContent.querySelector(".version-select");
+        const btnSetActive = tabContent.querySelector(".btn-set-active-version");
+        const btnDeleteVer = tabContent.querySelector(".btn-delete-version");
+        const btnSquash = tabContent.querySelector(".btn-squash-versions");
+
+        // 1. Browsing a version simply loads it visually (no auto-activation)
         vSelect.addEventListener("change", async (e) => {
             const selectedVer = parseInt(e.target.value, 10);
             await loadArtifactVersion(title, selectedVer);
+        });
 
-            // Sync selected version back to the AI's active prompt context in real-time
+        // 2. Set Active Button Click
+        btnSetActive.addEventListener("click", async () => {
+            const selectedVer = parseInt(vSelect.value, 10);
+            btnSetActive.disabled = true;
+            btnSetActive.textContent = "Setting...";
             try {
                 const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/select_version?version=${selectedVer}`, {
                     method: "POST"
                 });
                 const data = await res.json();
                 if (data.success) {
-                    fetchArtifacts(); // Refreshes active/dormant icons in left sidebar
-                    updateContextBudget();
+                    alert(`Version v${selectedVer} is now set as the active/default version in the session context!`);
+                    await fetchArtifacts(); // Refreshes active/dormant icons in left sidebar
+                    await selectArtifact(title); // Reload dropdown listing & state
                 }
-            } catch(err) {
-                console.error("Failed to sync active version to AI:", err);
+            } catch (err) {
+                alert(`Failed to set active version: ${err}`);
+            } finally {
+                btnSetActive.disabled = false;
+                btnSetActive.textContent = "⭐ Set Active";
+            }
+        });
+
+        // 3. Delete Version Button Click
+        btnDeleteVer.addEventListener("click", async () => {
+            const selectedVer = parseInt(vSelect.value, 10);
+            const confirmed = await showSlickConfirm(
+                "🗑️ Delete Artifact Version",
+                `Are you sure you want to permanently delete version v${selectedVer} of the artifact '${title}'? This cannot be undone.`
+            );
+            if (!confirmed) return;
+
+            btnDeleteVer.disabled = true;
+            btnDeleteVer.textContent = "Deleting...";
+            try {
+                const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/versions/${selectedVer}`, {
+                    method: "DELETE"
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert(`Version v${selectedVer} successfully deleted.`);
+                    await fetchArtifacts();
+                    // Reload artifact – this automatically switches the view to the new active version
+                    await selectArtifact(title);
+                } else {
+                    alert(`Deletion failed: ${data.detail}`);
+                }
+            } catch (err) {
+                alert(`Request failed: ${err}`);
+            } finally {
+                btnDeleteVer.disabled = false;
+                btnDeleteVer.textContent = "🗑️ Delete";
+            }
+        });
+
+        // 4. Squash Versions Button Click
+        btnSquash.addEventListener("click", async () => {
+            const numStr = await showCustomPrompt(
+                "🗜️ Squash Version History",
+                "Number of recent versions to keep (e.g., 3), or type 'active' to squash all other versions.",
+                "3"
+            );
+            if (!numStr) return;
+
+            const payload = {};
+            if (numStr.toLowerCase() === "active") {
+                const selectedVer = parseInt(vSelect.value, 10);
+                payload.target_version = selectedVer;
+            } else {
+                const keepVal = parseInt(numStr, 10);
+                if (isNaN(keepVal) || keepVal < 1) {
+                    alert("Please enter a valid positive number.");
+                    return;
+                }
+                payload.keep_last_n = keepVal;
+            }
+
+            btnSquash.disabled = true;
+            btnSquash.textContent = "Squashing...";
+            try {
+                const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/squash`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert(`Successfully squashed version history! Space reclaimed: ${data.report.space_reclaimed_estimate.toLocaleString()} characters.`);
+                    await fetchArtifacts();
+                    await selectArtifact(title);
+                } else {
+                    alert(`Squash failed: ${data.detail}`);
+                }
+            } catch (err) {
+                alert(`Request failed: ${err}`);
+            } finally {
+                btnSquash.disabled = false;
+                btnSquash.textContent = "🗜️ Squash";
             }
         });
 
@@ -779,6 +1014,18 @@ document.addEventListener("DOMContentLoaded", () => {
 
         if (!renderedView || !rawView) return;
 
+        // Reset inline styles before tab loading to prevent style contamination
+        renderedView.removeAttribute("style");
+        renderedView.className = "rendered-container";
+
+        // Show loading spinner immediately
+        renderedView.innerHTML = `
+            <div class="empty-viewer-msg" style="user-select: none;">
+                <span class="spinner" style="width: 32px; height: 32px; border-width: 3px; margin-right: 12px;"></span>
+                <span style="font-weight: bold; color: var(--text-secondary);">Loading artifact content...</span>
+            </div>
+        `;
+
         try {
             // Retrieve full artifacts structure to determine type
             const res = await fetch("/api/artifacts");
@@ -838,13 +1085,20 @@ document.addEventListener("DOMContentLoaded", () => {
                         try { codeEditors[title].toTextArea(); } catch(e) {}
                         delete codeEditors[title];
                     }
+                    renderedView.style.height = "100%";
+                    renderedView.style.overflow = "hidden";
+                    renderedView.style.display = "flex";
+                    renderedView.style.flexDirection = "column";
+
                     renderedView.innerHTML = `
-                        <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-shrink: 0;">
                             <span style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; font-weight: bold;">HTML Source</span>
                             <button class="btn btn-primary" id="btn-run-code-${safeId}" style="width:auto; padding: 6px 14px; font-size: 12px;">▶ Run HTML</button>
                         </div>
-                        <textarea id="cm-rendered-${safeId}"></textarea>
-                        <div id="code-run-output-${safeId}" style="display:none; margin-top: 12px; flex-direction: column; gap: 6px;"></div>
+                        <div class="code-editor-scroll-container" style="flex: 1; min-height: 150px; overflow: hidden; display: flex; flex-direction: column;">
+                            <textarea id="cm-rendered-${safeId}"></textarea>
+                        </div>
+                        <div id="code-run-output-${safeId}" class="console-locked-panel" style="display:none; margin-top: 12px; flex-shrink: 0; max-height: 220px; overflow-y: auto; background-color: #020617; border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; flex-direction: column; gap: 6px;"></div>
                     `;
                     const txtArea = renderedView.querySelector(`#cm-rendered-${safeId}`);
                     const cm = CodeMirror.fromTextArea(txtArea, {
@@ -868,6 +1122,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 } else if (matched.type === "code") {
                     const lang = matched.language || "";
                     if (lang === "graphviz" || art.content.includes("digraph") || art.content.includes("graph")) {
+                        renderedView.style.height = "100%";
+                        renderedView.style.overflow = "auto";
+                        renderedView.style.display = "block";
                         renderedView.innerHTML = `<div class="empty-viewer-msg"><span class="spinner inline" style="margin-right: 8px;"></span> Compiling Graphviz DOT logic...</div>`;
                         try {
                             const viz = new Viz();
@@ -890,13 +1147,20 @@ document.addEventListener("DOMContentLoaded", () => {
                             try { codeEditors[title].toTextArea(); } catch(e) {}
                             delete codeEditors[title];
                         }
+                        renderedView.style.height = "100%";
+                        renderedView.style.overflow = "hidden";
+                        renderedView.style.display = "flex";
+                        renderedView.style.flexDirection = "column";
+
                         renderedView.innerHTML = `
-                            <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-shrink: 0;">
                                 <span style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; font-weight: bold;">${lang} Source</span>
                                 <button class="btn btn-primary" id="btn-run-code-${safeId}" style="width:auto; padding: 6px 14px; font-size: 12px;">▶ Run ${lang.toUpperCase()}</button>
                             </div>
-                            <textarea id="cm-rendered-${safeId}"></textarea>
-                            <div id="code-run-output-${safeId}" style="display:none; margin-top: 12px; flex-direction: column; gap: 6px;"></div>
+                            <div class="code-editor-scroll-container" style="flex: 1; min-height: 150px; overflow: hidden; display: flex; flex-direction: column;">
+                                <textarea id="cm-rendered-${safeId}"></textarea>
+                            </div>
+                            <div id="code-run-output-${safeId}" class="console-locked-panel" style="display:none; margin-top: 12px; flex-shrink: 0; max-height: 220px; overflow-y: auto; background-color: #020617; border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; flex-direction: column; gap: 6px;"></div>
                         `;
                         const txtArea = renderedView.querySelector(`#cm-rendered-${safeId}`);
                         const cm = CodeMirror.fromTextArea(txtArea, {
@@ -923,7 +1187,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                 runBtn.disabled = true;
                                 runBtn.textContent = "Running...";
                                 outputBox.style.display = "flex";
-                                outputBox.innerHTML = `<div class="empty-viewer-msg" style="justify-content: flex-start; padding: 0;"><span class="spinner inline" style="margin-right: 8px;"></span> Executing Python sandbox...</div>`;
+                                outputBox.innerHTML = `<div class="empty-viewer-msg" style="user-select: none; justify-content: flex-start; padding: 0;"><span class="spinner inline" style="margin-right: 8px;"></span> Executing Python sandbox...</div>`;
                                 try {
                                     const res = await fetch("/api/execute_sandbox", {
                                         method: "POST",
@@ -933,18 +1197,18 @@ document.addEventListener("DOMContentLoaded", () => {
                                     const data = await res.json();
                                     if (data.success) {
                                         outputBox.innerHTML = `
-                                            <div class="query-title">💻 Sandbox Output</div>
+                                            <div class="query-title" style="user-select: none;">💻 Sandbox Output</div>
                                             <pre class="query-stdout">${data.output || "(No stdout output)"}</pre>
                                         `;
                                     } else {
                                         outputBox.innerHTML = `
-                                            <div class="query-title" style="color: #ef4444;">❌ Execution Error</div>
+                                            <div class="query-title" style="color: #ef4444; user-select: none;">❌ Execution Error</div>
                                             <pre class="query-stdout" style="color: #fca5a5;">${data.error}</pre>
-                                            ${data.output ? `<div class="query-title" style="margin-top: 6px;">Stdout prior to error:</div><pre class="query-stdout">${data.output}</pre>` : ""}
+                                            ${data.output ? `<div class="query-title" style="margin-top: 6px; user-select: none;">Stdout prior to error:</div><pre class="query-stdout">${data.output}</pre>` : ""}
                                         `;
                                     }
                                 } catch (err) {
-                                    outputBox.innerHTML = `<div class="query-title" style="color: #ef4444;">Request Failed</div><pre class="query-stdout">${err}</pre>`;
+                                    outputBox.innerHTML = `<div class="query-title" style="color: #ef4444; user-select: none;">Request Failed</div><pre class="query-stdout">${err}</pre>`;
                                 } finally {
                                     runBtn.disabled = false;
                                     runBtn.textContent = "▶ Run PYTHON";
@@ -952,11 +1216,17 @@ document.addEventListener("DOMContentLoaded", () => {
                             }
                         });
                     } else {
+                        renderedView.style.height = "100%";
+                        renderedView.style.overflow = "auto";
+                        renderedView.style.display = "block";
                         const renderContent = `\`\`\`${lang}\n${art.content}\n\`\`\``;
                         renderedView.innerHTML = marked.parse(renderContent);
                         renderMath(renderedView);
                     }
                 } else {
+                    renderedView.style.height = "100%";
+                    renderedView.style.overflow = "auto";
+                    renderedView.style.display = "block";
                     const parsedMarkdown = marked.parse(art.content);
                     const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, null, version);
                     renderedView.innerHTML = resolvedHTML;
@@ -964,6 +1234,13 @@ document.addEventListener("DOMContentLoaded", () => {
                 }
             }
             updateContextBudget();
+
+            // After loading, update button highlight states
+            const tabId = `tab-art-${safeId}`;
+            const tabContent = document.getElementById(tabId);
+            if (tabContent) {
+                updateVersionActionButtonsState(tabContent, title, version);
+            }
         } catch (err) {
             console.error("Failed to load artifact version:", err);
         }
@@ -1478,6 +1755,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 url += `?version=${version}`;
             }
             const res = await fetch(url);
+            if (!res.ok) {
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.detail || errData.error || `HTTP ${res.status}`);
+            }
             const data = await res.json();
 
             if (data.type === "excel" || data.type === "sqlite") {
@@ -1516,8 +1797,13 @@ document.addEventListener("DOMContentLoaded", () => {
         const gridTarget = document.getElementById(`spreadsheet-grid-target-${makeSafeId(docTitle)}`);
         if (!gridTarget) return;
 
-        const columns = sheetData.columns;
-        const rows = sheetData.rows;
+        const columns = sheetData?.columns;
+        const rows = sheetData?.rows;
+
+        if (!columns || !rows) {
+            gridTarget.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444; padding: 20px;">Failed to draw table: Invalid sheet data structure.</div>`;
+            return;
+        }
 
         const tableHtml = `
             <table class="data-table">
@@ -1570,6 +1856,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const activeVersionObj = history.find(h => h.is_active) || history[history.length - 1];
             selectedVersion = activeVersionObj ? activeVersionObj.version : 1;
+
+            if (vSelect) {
+                vSelect.dataset.activeVersion = activeVersionObj ? activeVersionObj.version : "";
+                vSelect.dataset.readOnly = matched.read_only ? "true" : "false";
+            }
 
             loadArtifactVersion(title, selectedVersion);
 
@@ -2453,7 +2744,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function openExportModal(type) {
         activeExportType = type;
-        exportModalBody.innerHTML = ""; // Clear
+        // Show loading spinner immediately
+        exportModalBody.innerHTML = `
+            <div class="empty-viewer-msg" style="user-select: none; padding: 40px 0;">
+                <span class="spinner" style="width: 28px; height: 28px; border-width: 2.5px; margin-right: 10px;"></span>
+                <span style="font-weight: bold; color: var(--text-secondary); font-size: 13px;">Retrieving available items...</span>
+            </div>
+        `;
         exportDetailsModal.style.display = "flex";
 
         if (type === "artifacts") {
@@ -3033,9 +3330,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function loadProfile(name) {
-        if (!confirm(`Are you sure you want to load the profile '${name.toUpperCase()}'? This will reinitialize active model servers.`)) {
-            return;
-        }
+        const confirmed = await showSlickConfirm(
+            "⚡ Load Profile",
+            `Are you sure you want to load the profile '${name.toUpperCase()}'? This will reinitialize active model servers.`,
+            "Load Profile",
+            false
+        );
+        if (!confirmed) return;
         try {
             const res = await fetch("/api/profiles/load", {
                 method: "POST",
@@ -3056,7 +3357,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function deleteProfile(name) {
-        if (!confirm(`Delete profile '${name.toUpperCase()}'?`)) return;
+        const confirmed = await showSlickConfirm(
+            "🗑️ Delete Profile",
+            `Are you sure you want to permanently delete the profile '${name.toUpperCase()}'?`
+        );
+        if (!confirmed) return;
         try {
             const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
             if (res.ok) fetchProfiles();
@@ -4069,10 +4374,22 @@ document.addEventListener("DOMContentLoaded", () => {
                     let typeIcon = "📄";
                     if (a.type === "data") typeIcon = "📊";
                     else if (a.type === "code") typeIcon = "💻";
+
+                    let ro_badge = "";
+                    let ro_action_icon = "🔓 Make Writable";
+                    if (a.read_only) {
+                        ro_badge = `<span class="level-tag archived" style="display:inline-block; font-size:9px; font-weight:bold; margin-left:6px; background-color:rgba(239, 68, 68, 0.1); color:#ef4444; border:1px solid rgba(239, 68, 68, 0.2);">🔒 READ-ONLY</span>`;
+                        ro_action_icon = "🔓 Make Writable";
+                    } else {
+                        ro_badge = `<span class="level-tag working" style="display:inline-block; font-size:9px; font-weight:bold; margin-left:6px; background-color:rgba(16, 185, 129, 0.1); color:#10b981; border:1px solid rgba(16, 185, 129, 0.2);">✏️ WRITABLE</span>`;
+                        ro_action_icon = "🔒 Make Read-Only";
+                    }
+
                     innerContent = `
                         <div class="artifact-card-header">
-                            <span class="title">${typeIcon} ${a.title}</span>
+                            <span class="title">${typeIcon} ${a.title} ${ro_badge}</span>
                             <div class="artifact-actions">
+                                <button class="artifact-action-btn toggle-ro" data-title="${a.title}" title="${ro_action_icon}">${a.read_only ? '🔒' : '✏️'}</button>
                                 <button class="artifact-action-btn toggle" data-title="${a.title}" title="${toggleTitle}">${toggleIcon}</button>
                                 <button class="artifact-action-btn delete" data-title="${a.title}" title="Delete completely">🗑️</button>
                             </div>
@@ -4098,6 +4415,27 @@ document.addEventListener("DOMContentLoaded", () => {
                 });
             });
 
+            document.querySelectorAll(".artifact-action-btn.toggle-ro").forEach(btn => {
+                btn.addEventListener("click", async (e) => {
+                    e.stopPropagation();
+                    const title = btn.dataset.title;
+                    try {
+                        const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/toggle_read_only`, { method: "POST" });
+                        const data = await res.json();
+                        if (data.success) {
+                            fetchArtifacts();
+                            const safeId = makeSafeId(title);
+                            const tabContent = document.getElementById(`tab-art-${safeId}`);
+                            if (tabContent) {
+                                await selectArtifact(title);
+                            }
+                        }
+                    } catch (err) {
+                        console.error("Failed to toggle read-only:", err);
+                    }
+                });
+            });
+
             document.querySelectorAll(".artifact-action-btn.toggle").forEach(btn => {
                 btn.addEventListener("click", async (e) => {
                     e.stopPropagation();
@@ -4119,9 +4457,11 @@ document.addEventListener("DOMContentLoaded", () => {
                 btn.addEventListener("click", async (e) => {
                     e.stopPropagation();
                     const title = btn.dataset.title;
-                    if (!confirm(`Are you sure you want to permanently delete the artifact '${title}'? This will also remove all its version history.`)) {
-                        return;
-                    }
+                    const confirmed = await showSlickConfirm(
+                        "🗑️ Delete Artifact",
+                        `Are you sure you want to permanently delete the artifact '${title}'? This will also remove all its version history.`
+                    );
+                    if (!confirmed) return;
                     try {
                         const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}`, { method: "DELETE" });
                         const data = await res.json();
@@ -4166,6 +4506,9 @@ document.addEventListener("DOMContentLoaded", () => {
                     ttft: msg.metadata ? msg.metadata.ttft : null
                 }, msg);
             });
+            if (wasActive) {
+                showThinkingIndicator(activeText);
+            }
             chatHistory.scrollTop = chatHistory.scrollHeight;
         } catch (err) {
             console.error("Failed to fetch message history:", err);
@@ -4186,6 +4529,36 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function runMarkdownCleanup(txt) {
+        if (!txt) return "";
+        return txt.replace(/\\`{1,3}/g, m => m.replace("\\", ""))
+                  .replace(/\\\*/g, "*")
+                  .replace(/\\_/g, "_");
+    }
+
+    function updateVersionActionButtonsState(tabContent, title, selectedVer) {
+        const vSelect = tabContent.querySelector(".version-select");
+        const btnSetActive = tabContent.querySelector(".btn-set-active-version");
+        const btnDeleteVer = tabContent.querySelector(".btn-delete-version");
+        const btnSquash = tabContent.querySelector(".btn-squash-versions");
+        if (!vSelect || !btnSetActive) return;
+        const activeVer = parseInt(vSelect.dataset.activeVersion, 10);
+
+        if (btnDeleteVer) btnDeleteVer.style.display = "inline-block";
+        if (btnSquash) btnSquash.style.display = "inline-block";
+        if (selectedVer === activeVer) {
+            btnSetActive.disabled = true;
+            btnSetActive.textContent = "⭐ Active";
+            btnSetActive.style.opacity = "0.5";
+            btnSetActive.style.cursor = "default";
+        } else {
+            btnSetActive.disabled = false;
+            btnSetActive.textContent = "⭐ Set Active";
+            btnSetActive.style.opacity = "1.0";
+            btnSetActive.style.cursor = "pointer";
+        }
+    }
+
     function renderMessageBubble(msgId, sender, text, metrics = {}, msgObj = null) {
         const bubble = document.createElement("div");
         bubble.className = `chat-bubble ${sender}`;
@@ -4200,8 +4573,10 @@ document.addEventListener("DOMContentLoaded", () => {
         const proseSpan = document.createElement("span");
         proseSpan.className = "prose-span";
 
-        // Resolve inline anchors and compile markdown
-        const parsedMarkdown = marked.parse(text);
+        // Un-escape any backticks/formatting, then resolve processing and markdown
+        const cleanedText = runMarkdownCleanup(text);
+        const processedText = resolveProcessingTags(cleanedText);
+        const parsedMarkdown = marked.parse(processedText);
         const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, msgId, null, msgObj);
         proseSpan.innerHTML = resolvedHTML;
         contentDiv.appendChild(proseSpan);
@@ -4339,9 +4714,11 @@ document.addEventListener("DOMContentLoaded", () => {
         bubbleElement.querySelector(".msg-action-btn.delete").addEventListener("click", async () => {
             const isUser = bubbleElement.classList.contains("user");
             const nodeLabel = isUser ? "User Message and subsequent replies" : "Assistant Message and subsequent conversation";
-            if (!confirm(`Are you sure you want to PRUNE this branch?\n(This permanently deletes this ${nodeLabel} on this path.)`)) {
-                return;
-            }
+            const confirmed = await showSlickConfirm(
+                "✂️ Prune Conversation Branch",
+                `Are you sure you want to PRUNE this branch? This permanently deletes this ${nodeLabel} on this path.`
+            );
+            if (!confirmed) return;
             try {
                 const res = await fetch(`/api/discussions/viewer_session/messages/${msgId}?prune=true`, { method: "DELETE" });
                 const data = await res.json();
@@ -4501,9 +4878,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function deleteWorkspace(name) {
-        if (!confirm(`Permanently delete workspace '${name.toUpperCase()}' and ALL of its associated discussions, memories, and artifacts?`)) {
-            return;
-        }
+        const confirmed = await showSlickConfirm(
+            "🗑️ Delete Workspace",
+            `Are you sure you want to permanently delete the workspace '${name.toUpperCase()}' and ALL of its associated discussions, memories, and artifacts?`
+        );
+        if (!confirmed) return;
         try {
             const res = await fetch(`/api/workspaces/${encodeURIComponent(name)}`, { method: "DELETE" });
             if (res.ok) fetchWorkspaces();
@@ -4695,13 +5074,18 @@ document.addEventListener("DOMContentLoaded", () => {
     // ── 💬 Interactive Conversational Chat Companion ──
     btnChatSend.addEventListener("click", sendChatMessage);
     chatInput.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") sendChatMessage();
+        if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            sendChatMessage();
+        }
     });
 
     btnChatClear.addEventListener("click", async () => {
-        if (!confirm("Are you sure you want to clear the conversation history? This cannot be undone.")) {
-            return;
-        }
+        const confirmed = await showSlickConfirm(
+            "🧹 Clear Conversation",
+            "Are you sure you want to clear the conversation history? This cannot be undone."
+        );
+        if (!confirmed) return;
         try {
             const res = await fetch("/api/chat/clear", { method: "POST" });
             const data = await res.json();
@@ -4766,10 +5150,28 @@ document.addEventListener("DOMContentLoaded", () => {
         let activeMsgId = null;
 
         try {
+            const imagesPayload = pastedImages.map(img => img.data);
+
+            const payload = {
+                message: text,
+                regenerate: regenerate,
+                images: imagesPayload.length > 0 ? imagesPayload : null,
+                enable_memory: funcStates["enable_memory"],
+                enable_artefacts: funcStates["enable_artefacts"],
+                enable_in_message_status: funcStates["enable_in_message_status"],
+                enable_presentations: funcStates["enable_presentations"],
+                enable_books: funcStates["enable_books"],
+                enable_skills: funcStates["enable_skills"],
+                enable_image_generation: funcStates["enable_image_generation"],
+                enable_image_editing: funcStates["enable_image_generation"],
+                enable_forms: funcStates["enable_forms"],
+                enable_inline_widgets: funcStates["enable_inline_widgets"]
+            };
+
             const res = await fetch("/api/chat", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ message: text, regenerate: regenerate })
+                body: JSON.stringify(payload)
             });
 
             if (!res.ok) {
@@ -4842,7 +5244,9 @@ document.addEventListener("DOMContentLoaded", () => {
                                 }
 
                                 currentProse += event.chunk;
-                                const parsedMarkdown = marked.parse(currentProse);
+                                const cleanedProse = runMarkdownCleanup(currentProse);
+                                const processedText = resolveProcessingTags(cleanedProse);
+                                const parsedMarkdown = marked.parse(processedText);
                                 const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, activeMsgId);
                                 proseSpan.innerHTML = resolvedHTML;
                                 renderMath(proseSpan);
@@ -4900,6 +5304,11 @@ document.addEventListener("DOMContentLoaded", () => {
             }
             updateContextBudget();
             fetchMemories();
+
+            // Clear pasted images list and previews upon successful completion
+            pastedImages.length = 0;
+            renderPastedImagesPreview();
+            chatInput.style.height = "36px"; // Reset height
         }
     }
 
@@ -5011,14 +5420,14 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 /**
- * Parses raw text and resolves any <artefact_image> anchors into HTML <img> elements.
+ * Resolves closed and unclosed <processing> tags into collapsible timeline panels.
+ * Run BEFORE marked.parse to prevent markdown list item corruption on nested lines.
  */
-function resolveImageAnchors(content, title, msgId = null, version = null, msgObj = null) {
+function resolveProcessingTags(content) {
     if (!content) return "";
 
-    // Unified self-healing regex: matches both closed and unclosed <processing> tags anywhere in the string
     const procPattern = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;
-    content = content.replace(procPattern, (match, attrsStr, bodyText) => {
+    return content.replace(procPattern, (match, attrsStr, bodyText) => {
         const attrs = {};
         attrsStr.replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => attrs[k] = v);
 
@@ -5032,41 +5441,50 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
             const statusItems = lines.map(line => {
                 const clean = line.replace(/^\*\s*/, "").trim();
                 if (!clean) return "";
+                if (clean.startsWith("<details>")) {
+                    return `<div class="proc-item-no-bullet">${clean}</div>`;
+                }
                 return `<div class="proc-item complete">✓ ${clean}</div>`;
-            }).join("");
+            }).filter(x => x !== "").join("");
 
-            return `
-                <details class="inline-proc-accordion">
-                    <summary class="proc-accordion-header complete">
-                        <span class="chevron">▶</span>
-                        <span>✅ ${titleText} (Complete)</span>
-                    </summary>
-                    <div class="proc-accordion-content">
-                        ${statusItems}
-                    </div>
-                </details>
-            `;
+            return `<details class="inline-proc-accordion">
+<summary class="proc-accordion-header complete">
+<span class="chevron">▶</span>
+<span>✅ ${titleText} (Complete)</span>
+</summary>
+<div class="proc-accordion-content">
+${statusItems}
+</div>
+</details>`;
         } else {
             const statusItems = lines.map(line => {
                 const clean = line.replace(/^\*\s*/, "").trim();
                 if (!clean) return "";
+                if (clean.startsWith("<details>")) {
+                    return `<div class="proc-item-no-bullet">${clean}</div>`;
+                }
                 return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
-            }).join("");
+            }).filter(x => x !== "").join("");
 
-            return `
-                <details class="inline-proc-accordion" open>
-                    <summary class="proc-accordion-header">
-                        <span class="chevron">▶</span>
-                        <span>⚙️ ${titleText}...</span>
-                        <span class="spinner inline"></span>
-                    </summary>
-                    <div class="proc-accordion-content">
-                        ${statusItems}
-                    </div>
-                </details>
-            `;
+            return `<details class="inline-proc-accordion" open>
+<summary class="proc-accordion-header">
+<span class="chevron">▶</span>
+<span>⚙️ ${titleText}...</span>
+<span class="spinner inline"></span>
+</summary>
+<div class="proc-accordion-content">
+${statusItems}
+</div>
+</details>`;
         }
     });
+}
+
+/**
+ * Parses raw text and resolves any <artefact_image> anchors into HTML <img> elements.
+ */
+function resolveImageAnchors(content, title, msgId = null, version = null, msgObj = null) {
+    if (!content) return "";
 
     // 3. Parse and resolve <lollms_form> tags into a gorgeous, interactive, functional form card
     const formPattern = /<lollms_form\s+([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
@@ -5394,9 +5812,11 @@ window.deleteArtifactImage = async function(title, index) {
     const decodedTitle = decodeURIComponent(title);
     const baseTitle = decodedTitle.endsWith("::images") ? decodedTitle.replace("::images", "") : decodedTitle;
 
-    if (!confirm(`Are you sure you want to remove this image from the artifact?`)) {
-        return;
-    }
+    const confirmed = await showSlickConfirm(
+        "🖼️ Remove Image",
+        "Are you sure you want to remove this image from the artifact?"
+    );
+    if (!confirmed) return;
 
     try {
         const res = await fetch(`/api/artifacts/${encodeURIComponent(baseTitle)}/images/${index}`, {

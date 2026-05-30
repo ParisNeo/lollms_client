@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-29 06:54]
+
+- refactor: remove src/app and add lollms-client-app entry point
+
 ## [2026-05-27 19:31]
 
 - fix(diffusers): apply bitsandbytes compatibility patch and guard null device

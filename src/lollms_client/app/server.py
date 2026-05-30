@@ -127,7 +127,7 @@ def initialize_workspace_state(workspace_name: str):
                 "tools_binding_config": {
                     "tools_folders": [
                         str(APP_WORKSPACE_DIR.resolve()),
-                        str(PROJECT_ROOT / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
+                        str(PROJECT_ROOT / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
                     ]
                 }
             }
@@ -497,6 +497,19 @@ async def get_binary_image(title: str, index: int, version: Optional[int] = None
     raise HTTPException(status_code=404, detail="Requested sub-image not found in bundle.")
 
 
+@app.get("/api/workspace_files/{filename}")
+async def get_workspace_file_endpoint(filename: str):
+    """Dynamically serve active workspace data files for HTML widget rendering."""
+    if not APP_WORKSPACE_DIR:
+        raise HTTPException(status_code=400, detail="No active workspace directory.")
+    
+    file_path = APP_WORKSPACE_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found in active workspace.")
+        
+    from fastapi.responses import FileResponse
+    return FileResponse(str(file_path))
+
 @app.get("/api/bundle/{title}")
 async def download_bundle(title: str):
     """Packages the artifact and all of its sub-images into a self-contained portable bundle."""
@@ -531,6 +544,9 @@ async def list_artifacts_endpoint():
             seen[t] = a
 
     latest_artifacts = list(seen.values())
+    # Exclude ephemeral (temporary) artifacts from the user-facing sidebar list
+    latest_artifacts = [a for a in latest_artifacts if not a.get("ephemeral")]
+
     return [
         {
             "title": a["title"],
@@ -542,7 +558,8 @@ async def list_artifacts_endpoint():
             "author": a.get("author"),
             "category": a.get("category"),
             "description": a.get("description"),
-            "created_at": a.get("created_at")
+            "created_at": a.get("created_at"),
+            "read_only": a.get("read_only", False)
         }
         for a in latest_artifacts
     ]
@@ -557,7 +574,83 @@ async def delete_artifact_endpoint(title: str):
         discussion.commit()
         return {"success": True, "removed_main": removed_main, "removed_comp": removed_comp}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/artifacts/{title}/toggle_read_only")
+async def toggle_artifact_read_only_endpoint(title: str):
+    """Toggles the read-only state of an artifact in place."""
+    try:
+        existing = discussion.artefacts.get(title)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Artifact not found.")
+
+        new_state = not existing.get("read_only", False)
+        discussion.artefacts.update(
+            title=title,
+            read_only=new_state,
+            bump_version=False # update in place
+        )
+        discussion.commit()
+        return {"success": True, "read_only": new_state}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/artifacts/{title}/versions/{version}")
+async def delete_artifact_version_endpoint(title: str, version: int):
+    """Deletes a specific version of an artifact from the database."""
+    try:
+        # Prevent deleting the last remaining version
+        history = discussion.artefacts.get_version_history(title)
+        if len(history) <= 1:
+            raise HTTPException(status_code=400, detail="Cannot delete the last remaining version of an artifact.")
+
+        removed = discussion.artefacts.remove(title, version=version)
+        discussion.commit()
+
+        # If we deleted the currently active version, automatically activate the latest remaining version
+        remaining = discussion.artefacts.get_version_history(title)
+        if remaining:
+            active_version_exists = any(h.get("is_active") for h in remaining)
+            if not active_version_exists:
+                latest_v = remaining[-1]["version"]
+                discussion.artefacts.activate(title, latest_v)
+                discussion.commit()
+
+        return {"success": True, "removed_count": removed}
+    except HTTPException:
+        raise
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SquashRequest(BaseModel):
+    keep_last_n: Optional[int] = None
+    target_version: Optional[int] = None
+
+@app.post("/api/artifacts/{title}/squash")
+async def squash_artifact_versions_endpoint(title: str, payload: SquashRequest):
+    """Squashes the version history of an artifact."""
+    try:
+        if payload.target_version is not None:
+            res = discussion.artefacts.squash_versions(title, target_version=payload.target_version)
+        elif payload.keep_last_n is not None:
+            res = discussion.artefacts.squash_versions(title, keep_last_n=payload.keep_last_n)
+        else:
+            raise HTTPException(status_code=400, detail="Provide either 'target_version' or 'keep_last_n'.")
+
+        discussion.commit()
+        return {"success": True, "report": res}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -569,7 +662,8 @@ async def toggle_artifact_endpoint(title: str):
         discussion.commit()
         return {"success": True, "active": new_state}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -620,7 +714,8 @@ async def delete_artifact_image_endpoint(title: str, index: int, version: Option
     except HTTPException:
         raise
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -641,7 +736,8 @@ async def delete_memory_endpoint(memory_id: str):
         ok = discussion.delete_memory(memory_id)
         return {"success": ok}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/memories/{memory_id}/edit")
@@ -662,7 +758,8 @@ async def edit_memory_endpoint(memory_id: str, payload: EditMemoryRequest):
     except HTTPException:
         raise
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/memories/import")
@@ -681,7 +778,8 @@ async def import_memory_endpoint(payload: ImportMemoryRequest):
             raise HTTPException(status_code=500, detail="Failed to create memory.")
         return {"success": True, "memory": res}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -737,7 +835,8 @@ async def test_tti_binding_endpoint(payload: BindingTestRequest):
             models = []
         return {"success": True, "models": models}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         return {"success": False, "error": str(e)}
 
 
@@ -791,6 +890,8 @@ async def save_profile_endpoint(payload: ProfileRequest):
             json.dump(cfg, f, indent=2)
         return {"success": True, "name": payload.name}
     except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=f"Failed to save profile: {e}")
 
 
@@ -818,7 +919,7 @@ async def load_profile_endpoint(payload: ProfileRequest):
             "tools_binding_config": {
                 "tools_folders": [
                     str(Path("./data_workspace").resolve()),
-                    str(PROJECT_ROOT / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
+                    str(PROJECT_ROOT / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
                 ]
             }
         }
@@ -849,9 +950,15 @@ async def load_profile_endpoint(payload: ProfileRequest):
             discussion.max_context_size = 4096
 
         needs_configuration = False
-        return {"success": True, "model_name": LLM_MODEL_NAME}
+        return {
+            "success": True,
+            "system_prompt": discussion.system_prompt,
+            "tools_imported": tools_imported,
+            "skills_imported": skills_imported
+        }
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -934,7 +1041,8 @@ async def execute_binding_command_endpoint(payload: ExecuteCommandRequest):
             return {"success": True, "result": result}
 
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1028,7 +1136,7 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
             "tools_binding_config": {
                 "tools_folders": [
                     str(Path("./data_workspace").resolve()),
-                    str(PROJECT_ROOT / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
+                    str(PROJECT_ROOT / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
                 ]
             }
         }
@@ -1063,7 +1171,8 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
         needs_configuration = False
         return {"success": True, "model_name": LLM_MODEL_NAME}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         return {"success": False, "error": str(e)}
 
 
@@ -1235,7 +1344,8 @@ async def import_personality_endpoint(file: UploadFile = File(...)):
 
         return {"success": True, "category": category, "persona": persona}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if tmp_path.exists():
@@ -1266,7 +1376,8 @@ async def export_personality_endpoint(category: str, persona: str):
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1315,7 +1426,8 @@ async def download_zoo_personality(payload: DownloadZooRequest):
 
         return {"success": True, "category": category, "persona": persona}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1341,6 +1453,8 @@ async def import_wikipedia_endpoint(payload: WikipediaImportSelectedRequest):
         discussion.commit()
         return {"success": True}
     except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1358,6 +1472,8 @@ async def import_arxiv_endpoint(payload: ArxivImportSelectedRequest):
         discussion.commit()
         return {"success": True}
     except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1420,7 +1536,8 @@ async def update_artifact_endpoint(title: str, payload: UpdateArtifactRequest):
     except HTTPException:
         raise
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1430,9 +1547,25 @@ async def select_artifact_version_endpoint(title: str, version: int):
     try:
         discussion.artefacts.activate(title, version)
         discussion.commit()
+
+        # Update active unversioned file on disk for data artifacts
+        active = discussion.artefacts.get(title, version)
+        if active and active.get("type") == "data":
+            ext = active.get("file_ext", ".csv")
+            workspace_dir = APP_WORKSPACE_DIR
+            versioned_path = workspace_dir / f"{title}_v{version}{ext}"
+            unversioned_path = workspace_dir / f"{title}{ext}"
+            if versioned_path.exists():
+                import shutil
+                try:
+                    shutil.copy(str(versioned_path), str(unversioned_path))
+                except Exception as e:
+                    ASCIIColors.warning(f"Failed to update active unversioned file on version select: {e}")
+
         return {"success": True, "active_version": version}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1457,7 +1590,8 @@ async def update_image_artifact_endpoint(title: str, payload: UpdateImageArtifac
         discussion.commit()
         return {"success": True, "version": res.get("version", 1)}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1490,6 +1624,35 @@ async def get_data_grid(title: str, version: Optional[int] = None):
     current_version = active.get("version", 1)
     workspace_dir = APP_WORKSPACE_DIR
     file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+    if not file_path.exists():
+        # Fallback scan: check other workspaces and the global data_workspace
+        found_path = None
+        scan_dirs = [Path("./data_workspace")]
+        if APP_DIR and APP_DIR.exists():
+            ws_dir = APP_DIR / "workspaces"
+            if ws_dir.exists():
+                for d in ws_dir.iterdir():
+                    if d.is_dir():
+                        scan_dirs.append(d / "data_workspace")
+        for sd in scan_dirs:
+            cand = sd / f"{title}_v{current_version}{ext}"
+            if cand.exists():
+                found_path = cand
+                break
+        if found_path:
+            import shutil
+            try:
+                workspace_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy(str(found_path), str(file_path))
+                unversioned_path = workspace_dir / f"{title}{ext}"
+                try:
+                    shutil.copy(str(found_path), str(unversioned_path))
+                except Exception:
+                    pass
+                ASCIIColors.success(f"✓ Recovered missing data file for grid: {file_path}")
+            except Exception:
+                pass
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Raw data file missing from workspace.")
 
@@ -1541,7 +1704,7 @@ async def save_tool_endpoint(payload: SaveToolRequest):
     """Saves a tool to the local LCP directory and versions its artifact in SQLite."""
     try:
         # 1. Always save user-created tools to the workspace data folder
-        tools_dir = Path("./data_workspace")
+        tools_dir = APP_WORKSPACE_DIR
         tools_dir.mkdir(parents=True, exist_ok=True)
 
         lcp_binding = getattr(client, "tools", None)
@@ -1700,6 +1863,8 @@ async def parse_tool_functions_endpoint(payload: ParseToolFunctionsRequest):
                 })
         return {"success": True, "functions": functions}
     except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1753,6 +1918,8 @@ async def execute_tool_function_endpoint(payload: ExecuteToolFunctionRequest):
             "result": result
         }
     except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
         return {
             "success": False,
             "error": str(e),
@@ -1773,16 +1940,44 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
     if payload.language == "python":
         import sys
         import io
+        import os
         old_stdout = sys.stdout
         redirected_output = io.StringIO()
         sys.stdout = redirected_output
+
+        # Ensure active unversioned copies exist for all data artifacts in the workspace
+        if discussion and APP_WORKSPACE_DIR:
+            try:
+                for art in discussion.artefacts.list(active_only=True):
+                    if art.get("type") == "data":
+                        title = art["title"]
+                        ext = art.get("file_ext", ".csv")
+                        version = art.get("version", 1)
+                        versioned_path = APP_WORKSPACE_DIR / f"{title}_v{version}{ext}"
+                        unversioned_path = APP_WORKSPACE_DIR / f"{title}{ext}"
+                        if versioned_path.exists() and not unversioned_path.exists():
+                            import shutil
+                            shutil.copy(str(versioned_path), str(unversioned_path))
+            except Exception as ex:
+                if client and client.debug:
+                    trace_exception(ex)
+
+        old_cwd = os.getcwd()
         try:
+            if APP_WORKSPACE_DIR and APP_WORKSPACE_DIR.exists():
+                os.chdir(str(APP_WORKSPACE_DIR))
             exec(payload.code, {}, {})
             return {"success": True, "output": redirected_output.getvalue()}
         except Exception as e:
+            if client and client.debug:
+                trace_exception(e)
             return {"success": False, "error": str(e), "output": redirected_output.getvalue()}
         finally:
             sys.stdout = old_stdout
+            try:
+                os.chdir(old_cwd)
+            except Exception:
+                pass
     else:
         return {"success": True, "output": ""}
 
@@ -1812,7 +2007,7 @@ async def list_discovered_tools_endpoint():
                 "name": t["name"],
                 "description": t.get("description", ""),
                 "input_schema": t.get("input_schema", {}),
-                "active": tool_states.get(t["name"], True)
+                "active": tool_states.get(t["name"], False)
             }
             for t in tools
         ]
@@ -1925,12 +2120,9 @@ async def query_data_endpoint(payload: DataQueryRequest):
 
     ext = active.get("file_ext", ".csv")
     current_version = active.get("version", 1)
-    new_version = current_version + 1
-    workspace_dir = Path("./data_workspace")
-    source_file_path = workspace_dir / f"{payload.title}_v{current_version}{ext}"
-    new_file_path = workspace_dir / f"{payload.title}_v{new_version}{ext}"
-
-    if not source_file_path.exists():
+    workspace_dir = APP_WORKSPACE_DIR
+    file_path = workspace_dir / f"{payload.title}_v{current_version}{ext}"
+    if not file_path.exists():
         raise HTTPException(status_code=404, detail="Current version data file missing.")
 
     import pandas as pd
@@ -1946,7 +2138,8 @@ async def query_data_endpoint(payload: DataQueryRequest):
     local_vars = {
         "pd": pd,
         "plt": plt,
-        "np": np
+        "np": np,
+        "Path": Path
     }
 
     sep = ","
@@ -1967,6 +2160,8 @@ async def query_data_endpoint(payload: DataQueryRequest):
             sep = ";" if ext == ".csv" and ";" in source_file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
             local_vars["df"] = pd.read_csv(str(source_file_path), sep=sep)
     except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=f"Failed to load dataset: {e}")
 
     # Redirect stdout to capture prints
@@ -2018,6 +2213,8 @@ async def query_data_endpoint(payload: DataQueryRequest):
         # Clean up any partial files if failed
         if new_file_path.exists() and ext not in (".db", ".sqlite", ".sqlite3"):
             new_file_path.unlink()
+        if client and client.debug:
+            trace_exception(e)
         return {"success": False, "error": str(e), "output": redirected_output.getvalue()}
     finally:
         sys.stdout = old_stdout
@@ -2034,6 +2231,26 @@ async def query_data_endpoint(payload: DataQueryRequest):
 class ChatRequest(BaseModel):
     message: str
     regenerate: Optional[bool] = False
+    images: Optional[List[str]] = None
+    enable_memory: Optional[bool] = True
+    enable_artefacts: Optional[bool] = True
+    enable_in_message_status: Optional[bool] = True
+    enable_presentations: Optional[bool] = True
+    enable_books: Optional[bool] = True
+    enable_skills: Optional[bool] = True
+    enable_image_generation: Optional[bool] = True
+    enable_image_editing: Optional[bool] = True
+    enable_forms: Optional[bool] = True
+    enable_inline_widgets: Optional[bool] = True
+    enable_memory: Optional[bool] = True
+    enable_artefacts: Optional[bool] = True
+    enable_in_message_status: Optional[bool] = True
+    enable_presentations: Optional[bool] = True
+    enable_books: Optional[bool] = True
+    enable_skills: Optional[bool] = True
+    enable_image_generation: Optional[bool] = True
+    enable_image_editing: Optional[bool] = True
+    enable_forms: Optional[bool] = True
 
 
 class ScanSkillsRequest(BaseModel):
@@ -2218,7 +2435,8 @@ async def chat_with_document(request: ChatRequest):
                 user_msg = discussion.add_message(
                     sender=discussion.lollmsClient.user_name if (discussion.lollmsClient and hasattr(discussion.lollmsClient, "user_name")) else "user",
                     sender_type="user",
-                    content=user_message
+                    content=user_message,
+                    images=request.images if request.images else []
                 )
             else:
                 user_msg = discussion.get_message(discussion.active_branch_id)
@@ -2279,12 +2497,16 @@ async def chat_with_document(request: ChatRequest):
                         streaming_callback=streaming_callback,
                         tools=active_tools if active_tools else None,
                         add_user_message=False,  # Already added cleanly above
-                        enable_memory=True,
-                        enable_artefacts=True,
-                        enable_in_message_status=True,
-                        enable_presentations=True,
-                        enable_books=True,
-                        enable_skills=True,
+                        enable_memory=request.enable_memory if request.enable_memory is not None else True,
+                        enable_artefacts=request.enable_artefacts if request.enable_artefacts is not None else True,
+                        enable_in_message_status=request.enable_in_message_status if request.enable_in_message_status is not None else True,
+                        enable_presentations=request.enable_presentations if request.enable_presentations is not None else True,
+                        enable_books=request.enable_books if request.enable_books is not None else True,
+                        enable_skills=request.enable_skills if request.enable_skills is not None else True,
+                        enable_image_generation=request.enable_image_generation if request.enable_image_generation is not None else True,
+                        enable_image_editing=request.enable_image_editing if request.enable_image_editing is not None else True,
+                        enable_forms=request.enable_forms if request.enable_forms is not None else True,
+                        enable_inline_widgets=request.enable_inline_widgets if request.enable_inline_widgets is not None else True,
                         debug=True
                     )
                 finally:
@@ -2294,6 +2516,8 @@ async def chat_with_document(request: ChatRequest):
                         discussion.commit()
             except Exception as e:
                 ASCIIColors.error(f"Chat execution failed: {e}")
+                if client and client.debug:
+                    trace_exception(e)
                 q.put({"error": str(e)})
             finally:
                 # We preserve deactivated_contents and sequential_summaries on the active discussion
@@ -2350,7 +2574,8 @@ async def export_artifact_endpoint(title: str, format: str, version: Optional[in
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=f"Export failed: {e}")
 
 
@@ -2376,7 +2601,8 @@ async def edit_session_message_endpoint(message_id: str, payload: EditMessageReq
         discussion.commit()
         return {"success": True, "content": msg.content}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2396,7 +2622,8 @@ async def delete_session_message_endpoint(message_id: str, prune: bool = False):
                 return {"success": True}
         raise HTTPException(status_code=404, detail="Message not found.")
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2450,7 +2677,8 @@ async def regenerate_session_message_endpoint(message_id: str):
         user_prompt = discussion.get_message(discussion.active_branch_id).content
         return {"success": True, "prompt": user_prompt}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2595,7 +2823,8 @@ async def generate_image_for_message_endpoint(message_id: str, payload: Optional
     except HTTPException:
         raise
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2691,7 +2920,8 @@ async def select_workspace_endpoint(payload: WorkspaceRequest):
         initialize_workspace_state(name_clean)
         return {"success": True, "active_workspace": name_clean}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2711,7 +2941,8 @@ async def submit_form_endpoint(discussion_id: str, form_id: str, payload: Submit
     except HTTPException:
         raise
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2751,7 +2982,8 @@ async def open_settings_folder_endpoint():
             subprocess.Popen(["xdg-open", path_str])
         return {"success": True}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2767,7 +2999,8 @@ async def clear_chat_endpoint():
         discussion.commit()
         return {"success": True}
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2794,7 +3027,7 @@ async def get_session_messages_endpoint():
             siblings = discussion.get_siblings(m.id)
             sibling_ids = [sib.id for sib in siblings]
             active_index = sibling_ids.index(m.id) if m.id in sibling_ids else 0
-            
+
             serialized.append({
                 "id": m.id,
                 "sender": m.sender,
@@ -2810,7 +3043,8 @@ async def get_session_messages_endpoint():
             })
         return serialized
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2821,7 +3055,8 @@ async def get_session_branches_endpoint():
         branches = discussion.list_branches()
         return [b.to_dict() for b in branches]
     except Exception as e:
-        trace_exception(e)
+        if client and client.debug:
+            trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 

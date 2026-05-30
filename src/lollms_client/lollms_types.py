@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Optional, List, Dict, Any
 
 class MSG_TYPE(Enum):
     # Messaging
@@ -125,6 +126,62 @@ class MSG_TYPE(Enum):
 
     MSG_TYPE_CODING_PLAN_CHUNK          = 48 # streaming chunk of a coding/update plan
     MSG_TYPE_CODING_PLAN_DONE           = 49 # complete coding plan ready for execution
+
+
+class LCPResult:
+    """
+    Highly typed, robust schema representing a multi-structured LCP Tool Execution Result.
+    Supports returning any combination of text output, prompt injections, base64 images,
+    extracted code blocks, file paths, structured sources, and execution status.
+    """
+    def __init__(
+        self,
+        success: bool = True,
+        output: str = "",
+        prompt_injection: Optional[str] = None,
+        images: Optional[List[str]] = None,
+        code_blocks: Optional[List[Dict[str, str]]] = None,
+        paths: Optional[List[str]] = None,
+        sources: Optional[List[Dict[str, Any]]] = None,
+        error: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ):
+        self.success = success
+        self.output = output
+        self.prompt_injection = prompt_injection
+        self.images = images or []
+        self.code_blocks = code_blocks or []
+        self.paths = paths or []
+        self.sources = sources or []
+        self.error = error
+        self.metadata = metadata or {}
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "output": self.output,
+            "prompt_injection": self.prompt_injection,
+            "images": self.images,
+            "code_blocks": self.code_blocks,
+            "paths": self.paths,
+            "sources": self.sources,
+            "error": self.error,
+            "metadata": self.metadata
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LCPResult":
+        return cls(
+            success=data.get("success", True),
+            output=data.get("output", ""),
+            prompt_injection=data.get("prompt_injection"),
+            images=data.get("images"),
+            code_blocks=data.get("code_blocks"),
+            paths=data.get("paths"),
+            sources=data.get("sources"),
+            error=data.get("error"),
+            metadata=data.get("metadata")
+        )
     # ── Form / Frame system ───────────────────────────────────────────────────
     # lollms_form allows the AI to solicit structured data from the user.
     # The UI renders a rich, interactive form. Submission pauses the AI until

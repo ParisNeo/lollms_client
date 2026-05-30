@@ -969,7 +969,7 @@ body {
     box-shadow: var(--shadow-sm);
 }
 
-.chat-input-wrapper input {
+.chat-input-wrapper textarea {
     flex: 1;
     background: none;
     border: none;
@@ -977,6 +977,11 @@ body {
     font-size: 13.5px;
     outline: none;
     padding: 8px 0;
+    resize: none;
+    font-family: inherit;
+    height: 36px;
+    max-height: 150px;
+    line-height: 1.4;
 }
 
 .chat-input-wrapper .btn {
@@ -1676,6 +1681,38 @@ html, body, select, textarea, div {
     animation: typingBounce 1.4s infinite ease-in-out both;
 }
 
+/* Active Chat Functions Badges */
+.func-badge {
+    background-color: var(--bg-app);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    outline: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.func-badge:hover {
+    border-color: var(--text-secondary);
+    color: var(--text-primary);
+}
+
+.func-badge.active {
+    background-color: rgba(16, 185, 129, 0.15); /* Emerald tint */
+    border-color: var(--success-color);
+    color: var(--success-color);
+}
+
+.func-badge.active:hover {
+    background-color: rgba(16, 185, 129, 0.25);
+}
+
 .typing-dot:nth-child(1) { animation-delay: -0.32s; }
 .typing-dot:nth-child(2) { animation-delay: -0.16s; }
 
@@ -2288,4 +2325,42 @@ html, body, select, textarea, div {
 .memory-actions button:hover {
     background-color: rgba(255, 255, 255, 0.08);
     color: var(--text-primary);
+}
+/* Force CodeMirror inside split layout containers to scroll internally */
+.code-editor-scroll-container .CodeMirror {
+    height: 100% !important;
+    flex: 1;
+}
+
+/* Elite styling for collapsible sub-accordions and bulletless items */
+.proc-item-no-bullet {
+    font-family: 'Fira Code', 'Courier New', Courier, monospace;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+    padding: 2px 0;
+}
+
+.proc-accordion-content details {
+    margin-top: 6px;
+    background-color: rgba(239, 68, 68, 0.03) !important;
+    border: 1px dashed rgba(239, 68, 68, 0.25) !important;
+    border-radius: 6px !important;
+    padding: 8px 12px !important;
+}
+
+.proc-accordion-content summary {
+    cursor: pointer;
+    font-weight: bold;
+    color: #fca5a5 !important;
+    outline: none;
+    user-select: none;
+}
+
+.proc-accordion-content pre {
+    margin-top: 6px;
+    font-size: 11px;
+    background: none !important;
+    border: none !important;
+    padding: 0 !important;
 }

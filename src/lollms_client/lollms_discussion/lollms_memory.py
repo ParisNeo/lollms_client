@@ -255,6 +255,7 @@ class LollmsMemoryManager:
             r.importance = min(1.0, r.importance + self.config.tag_boost)
             r.use_count += 1
             r.last_used_at = datetime.utcnow()
+            r.updated_at = datetime.utcnow()
             if r.level > 1: r.level = 1
             s.flush()
             return self._to_dict(r)
@@ -339,6 +340,7 @@ class LollmsMemoryManager:
             if r is None: return None
             r.level = 1
             r.last_used_at = datetime.utcnow()
+            r.updated_at = datetime.utcnow()
             r.importance = max(r.importance, self.config.demotion_threshold + 0.1)
             s.flush()
             return self._to_dict(r)
@@ -524,11 +526,11 @@ class LollmsMemoryManager:
         now, count = datetime.utcnow(), 0
         with self._session() as s:
             for r in self._q(s).all():
-                delta = (now - r.last_used_at).total_seconds() / 86400.0
+                delta = (now - r.updated_at).total_seconds() / 86400.0
                 new_imp = max(0.0, r.importance - (self.config.decay_rate_per_day * delta))
                 if abs(new_imp - r.importance) > 0.001:
                     r.importance = new_imp
-                    r.last_used_at = now
+                    r.updated_at = now
                     count += 1
                 if r.level == 1 and r.importance < self.config.demotion_threshold: r.level = 2
                 elif r.level <= 2 and r.importance < self.config.archive_threshold: r.level = 3

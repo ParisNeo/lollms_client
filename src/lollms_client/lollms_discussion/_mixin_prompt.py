@@ -516,6 +516,7 @@ RULES:
             "   </artifact>",
             "   ```",
             "",
+            "%s" % "",  # avoid literal match problems
             "✅ ALWAYS output the <artifact> tag **directly** as raw XML in your response.",
             "   Never wrap it inside any markdown code fence.",
             "",
@@ -531,8 +532,10 @@ RULES:
             "",
             "=== ARTEFACT PRIORITY & ANTI-STALLING POLICY ===",
             "1. **STRICT HIERARCHY**: You must ALWAYS prefer updating existing artifacts",
-            "   over creating new ones. Creating a widget or a new file to solve a",
-            "   problem that belongs in an active artifact is a CRITICAL FAILURE.",
+            "   over creating new ones. Creating a new file to solve a",
+            "   problem that belongs in an active artifact is a CRITICAL FAILURE. ",
+            "   However, if the user explicitly requests an inline 'widget', you MUST ",
+            "   prefer using <lollms_inline> directly over creating a new <artifact>.",
             "2. **ANTI-STALLING RULE**: Do NOT create a `<lollms_form>` to ask for ",
             "   choices if you have the technical knowledge to implement the feature.",
             "   If the user asks for a feature, use sensible engineering defaults and",
@@ -753,6 +756,30 @@ RULES:
             "  • Only HTML + CSS + JavaScript — no Python, SQL, etc.",
             "  • Never wrap the HTML inside ```html code fences",
             "  • Always add explanatory text before or after the widget",
+            "  • If the user explicitly requests a 'widget' (e.g., 'create a watch widget'),",
+            "    you MUST use the <lollms_inline> tag directly to render it inline in the chat.",
+            "    DO NOT create a new file or code <artifact> for it.",
+            "  • DATA ACCESS (CRITICAL): To prevent context window bloat and truncation, you MUST NEVER manually write or embed large JSON payloads or raw data blocks inside your HTML code.",
+            "    Instead, use your Python data query tool to aggregate and save your findings as clean, lightweight CSV files (e.g., 'category_performance.csv') in the workspace directory.",
+            "    Your HTML widget can then fetch these files dynamically during live preview and offline standalone exports using this standard template:",
+            "      <!-- Include PapaParse via CDN for robust CSV parsing -->",
+            "      <script src=\"https://cdn.jsdelivr.net/npm/papaparse@5/papaparse.min.js\"></script>",
+            "      <script>",
+            "        const isLivePreview = window.location.port === '9680' || window.location.hostname === 'localhost';",
+            "        const dataPath = isLivePreview ? '/api/workspace_files/category_performance.csv' : 'category_performance.csv';",
+            "        ",
+            "        fetch(dataPath)",
+            "          .then(res => {",
+            "            if (!res.ok) throw new Error('Data file not found');",
+            "            return res.text();",
+            "          })",
+            "          .then(csvText => {",
+            "            const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });",
+            "            const data = parsed.data;",
+            "            // Render your charts or interactive tables using the 'data' array...",
+            "          })",
+            "          .catch(err => console.error('Failed to load dataset:', err));",
+            "      </script>",
             "",
             "Supported types: html (default), react, svg",
             "",
@@ -889,6 +916,9 @@ EXAMPLE OF CORRECT FORM:
         NOTE: <artefact_image id="..."/> anchors are NOT processed here —
         they are preserved verbatim in the text so the UI can render them.
         """
+        # Un-escape any backticks or markdown characters accidentally escaped by the LLM
+        text = re.sub(r'\\(`{1,3})', r'\1', text)
+        text = text.replace(r'\*', '*').replace(r'\_', '_')
         # ── Mask code blocks so XML inside documentation isn't processed ─────
         code_blocks: Dict[str, str] = {}
 

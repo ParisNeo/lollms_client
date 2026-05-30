@@ -58,12 +58,13 @@ Homepage = "https://github.com/ParisNeo/lollms_client"
 
 # Exclude script launcher from the core library package
 [project.scripts]
+lollms-client-app = "lollms_client.app.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-exclude = ["app", "app.*", "lollms_client.egg-info*", "lollms_client.llm_bindings.llama_cpp_server.bin"]
+exclude = ["lollms_client.egg-info*", "lollms_client.llm_bindings.llama_cpp_server.bin"]
 
 [tool.setuptools.dynamic]
 version = {attr = "lollms_client.__version__"}
 [tool.setuptools.package-data]
-lollms_client = ["assets/*.json", "**/description.yaml"]
+lollms_client = ["assets/*.json", "**/description.yaml", "app/static/*"]

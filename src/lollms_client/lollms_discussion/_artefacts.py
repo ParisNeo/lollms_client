@@ -1108,18 +1108,30 @@ class ArtefactManager:
             lang     = item.get('language') or ''
             fence    = f"```{lang}" if lang else "```"
             url_line = f"\nSource: {item['url']}" if item.get('url') else ""
-            versions = [a.get('version', 1) for a in self._get_all_raw() if a.get('title') == item['title']]
-            total_versions = len(versions)
-            version_str = f"v{item['version']}"
-            if total_versions > 1:
-                version_str += f" | {total_versions} total versions exist"
+
+            # Formulate the display name and hide the version suffix for data and read-only artifacts
+            title_disp = item['title']
+            if atype == "data":
+                ext = item.get("file_ext", ".csv")
+                title_disp = f"{item['title']}{ext}"
+
+            if atype == "data" or item.get("read_only"):
+                version_str = "Read-Only" if item.get("read_only") else ""
+            else:
+                versions = [a.get('version', 1) for a in self._get_all_raw() if a.get('title') == item['title']]
+                total_versions = len(versions)
+                version_str = f"v{item['version']}"
+                if total_versions > 1:
+                    version_str += f" | {total_versions} total versions exist"
+
             meta_str = ""
             # Omit metadata fields from LLM-facing context zone for skills to conserve tokens
             if atype != ArtefactType.SKILL:
                 if item.get('author'):      meta_str += f" | Author: {item['author']}"
                 if item.get('description'): meta_str += f"\nDescription: {item['description']}"
             label  = ArtefactType.LABELS.get(atype, atype.capitalize())
-            header = f"###[{label}] {item['title']} ({version_str}){meta_str}{url_line}"
+            v_info = f" ({version_str})" if version_str else ""
+            header = f"###[{label}] {title_disp}{v_info}{meta_str}{url_line}"
 
             # Image count note (only when images present)
             img_note = ""
@@ -1238,9 +1250,9 @@ class ArtefactManager:
         ASCIIColors.panel(patch_block, "applying the patch")
 
         # ── Regex sentinels ──────────────────────────────────────────────────
-        SEARCH_RE  = _re.compile(r'^<{6,8}\s*SEARCH\s*$',  _re.IGNORECASE)
+        SEARCH_RE  = _re.compile(r'^<{6,8}(?:\s*\w+)?\s*$',  _re.IGNORECASE)
         SEP_RE     = _re.compile(r'^={5,}\s*$')
-        REPLACE_RE = _re.compile(r'^>{6,8}\s*REPLACE\s*$', _re.IGNORECASE)
+        REPLACE_RE = _re.compile(r'^>{6,8}(?:\s*\w+)?\s*$', _re.IGNORECASE)
 
         # ── Normalise line endings ───────────────────────────────────────────
         patch_block = patch_block.replace('\r\n', '\n').replace('\r', '\n')
