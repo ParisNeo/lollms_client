@@ -587,6 +587,43 @@ async def ai_data_query_endpoint(title: str, payload: AIDataQueryRequest):
     # 1. Fetch Schema Details
     schema_text = active.get("content", "")
 
+    # 1.5. Conversational Context Reformulator (Two-Level Agentic Context Preservation)
+    history_text = ""
+    if discussion:
+        try:
+            history_text = discussion.export("markdown", suppress_system_prompt=True, suppress_images=True)
+        except Exception:
+            pass
+
+    if history_text.strip():
+        reformulate_prompt = (
+            "You are a Conversational Context Reformulator.\n"
+            "Given the conversation history and the user's new follow-up question below, "
+            "rewrite the follow-up question so that it is fully self-contained and descriptive. "
+            "Resolve any pronouns (like 'he', 'it', 'they', 'this') to their specific names or IDs "
+            "mentioned in the history.\n\n"
+            "=== CONVERSATION HISTORY ===\n"
+            f"{history_text}\n"
+            "============================\n\n"
+            f"New Follow-Up Question: \"{payload.question}\"\n\n"
+            "Requirements:\n"
+            "1. Output ONLY the rewritten, self-contained question as raw text.\n"
+            "2. Keep the rewritten question focused, clear, and direct.\n"
+            "3. Do not add any preamble, conversational prose, or markdown code blocks."
+        )
+        try:
+            reformulated_question = client.generate_text(
+                prompt=reformulate_prompt,
+                temperature=0.1
+            ).strip()
+            # Strip any leaked markdown fences
+            reformulated_question = re.sub(r'^```[a-zA-Z0-9]*\s*\n|\s*```$', '', reformulated_question, flags=re.I).strip()
+            if reformulated_question:
+                ASCIIColors.info(f"🔄 Context Reformulator: '{payload.question}' -> '{reformulated_question}'")
+                payload.question = reformulated_question
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to reformulate question: {e}")
+
     # 2. Build high-precision prompt for the LLM to generate the SQL
     prompt = (
         "You are a Senior SQL Developer and Database Specialist.\n"

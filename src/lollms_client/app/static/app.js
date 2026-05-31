@@ -5154,23 +5154,17 @@ document.addEventListener("DOMContentLoaded", () => {
                     alert("Resend failed: " + err);
                 }
             } else {
-                // Assistant message: Regenerate switches back to parent user message and triggers a new sibling reply
-                const parentId = msgObj ? msgObj.parent_id : null;
-                if (!parentId) {
-                    alert("Cannot regenerate root assistant message.");
-                    return;
-                }
+                // Assistant message: Call the dedicated regenerate endpoint to cleanly delete the bad message and rewind the active branch
                 try {
-                    // Switch active branch pointer back to the parent user message
-                    const switchRes = await fetch("/api/discussions/viewer_session/branches/switch", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ leaf_id: parentId })
+                    const res = await fetch(`/api/discussions/viewer_session/messages/${msgId}/regenerate`, {
+                        method: "POST"
                     });
-                    const switchData = await switchRes.json();
-                    if (switchData.success) {
+                    const data = await res.json();
+                    if (data.success) {
                         await fetchMessageHistory();
                         sendChatMessage(true); // run completion turn to generate a new sibling assistant reply
+                    } else {
+                        alert(`Regeneration failed: ${data.detail || data.error}`);
                     }
                 } catch (err) {
                     alert("Regeneration failed: " + err);
@@ -5837,7 +5831,18 @@ function resolveProcessingTags(content) {
         const titleText = procTitle.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
 
         const isClosed = match.toLowerCase().endsWith("</processing>");
-        const lines = bodyText.trim().split("\n");
+
+        // Extract multiline <details> blocks to placeholders so we don't chop them up with split('\n')
+        const detailsMap = new Map();
+        let tempBody = bodyText;
+        const detailsRegex = /<details[\s\S]*?<\/details>/gi;
+        tempBody = tempBody.replace(detailsRegex, (detailsMatch) => {
+            const id = `__DETAILS_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+            detailsMap.set(id, detailsMatch);
+            return id;
+        });
+
+        const lines = tempBody.trim().split("\n");
 
         let paramsHtml = "";
         if (attrs.params) {
@@ -5850,7 +5855,7 @@ function resolveProcessingTags(content) {
                     }
                     return `<strong>⚙️ ${key}:</strong> <code style="font-family:monospace; background-color:#020617; padding:2px 4px; border-radius:4px; color:#cbd5e1;">${JSON.stringify(val)}</code>`;
                 }).join("<br/>");
-                
+
                 if (paramEntries) {
                     paramsHtml = `<div class="proc-item-no-bullet"><details class="proc-params-details" style="margin-top:6px; outline:none;"><summary style="cursor:pointer; font-weight:bold; outline:none; user-select:none;">🔧 Tool Parameters / Arguments</summary><div style="margin-top:8px; font-size:11.5px; line-height:1.5;">${paramEntries}</div></details></div>`;
                 }
@@ -5863,6 +5868,12 @@ function resolveProcessingTags(content) {
             let statusItems = lines.map(line => {
                 const clean = line.replace(/^\*\s*/, "").trim();
                 if (!clean) return "";
+
+                // Restore complete <details> block if this is a placeholder
+                if (detailsMap.has(clean)) {
+                    return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
+                }
+
                 if (clean.startsWith("<details>")) {
                     return `<div class="proc-item-no-bullet">${clean}</div>`;
                 }
@@ -5886,6 +5897,12 @@ ${statusItems}
             let statusItems = lines.map(line => {
                 const clean = line.replace(/^\*\s*/, "").trim();
                 if (!clean) return "";
+
+                // Restore complete <details> block if this is a placeholder
+                if (detailsMap.has(clean)) {
+                    return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
+                }
+
                 if (clean.startsWith("<details>")) {
                     return `<div class="proc-item-no-bullet">${clean}</div>`;
                 }

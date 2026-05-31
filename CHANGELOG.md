@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-31 00:35]
+
+- feat: add AI data query endpoint and update client bindings
+
 ## [2026-05-31 00:13]
 
 - feat(workspace,ui): add dynamic file serving and enhance tools panel

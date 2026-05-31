@@ -3851,7 +3851,10 @@ class ChatMixin:
                         elif "default" in p:
                             call_args[pn] = p["default"]
                     result = fn(**call_args)
-                    if not isinstance(result, dict):
+                    from lollms_client.lollms_types import LCPResult
+                    if isinstance(result, LCPResult):
+                        result = result.to_dict()
+                    elif not isinstance(result, dict):
                         result = {"output": result}
                     if "success" not in result:
                         result["success"] = "error" not in result or not result.get("error")
