@@ -4050,8 +4050,13 @@ class ChatMixin:
 
                 import os
                 old_cwd = os.getcwd()
-                
+                # List files before execution to detect changes
+                files_before = set(os.listdir(str(workspace_dir))) if workspace_dir.exists() else set()
+
                 # --- 1. Execute Code Sandbox ---
+                active_file = workspace_dir / f"{title}{ext}"
+                active_file_mtime_before = active_file.stat().st_mtime if active_file.exists() else 0
+
                 try:
                     if workspace_dir and workspace_dir.exists():
                         os.chdir(str(workspace_dir))
@@ -4059,7 +4064,7 @@ class ChatMixin:
                     plt.clf()
                     plt.close('all')
                     ASCIIColors.info(f"⚡ Executing Sandboxed Python code:\n{code}")
-                    exec(code, {}, local_vars)
+                    exec(code, local_vars)
                 except Exception as e:
                     sys.stdout = old_stdout
                     err_msg = f"Generated code execution error: {e}"
@@ -4070,6 +4075,23 @@ class ChatMixin:
 
                 # --- 2. Update and Commit Workspace State ---
                 try:
+                    # Detect new or modified CSV/Excel files in the workspace to register as UI Data Views
+                    files_after = set(os.listdir(str(workspace_dir))) if workspace_dir.exists() else set()
+                    new_or_modified_files = []
+                    for f in files_after:
+                        # Exclude versioned files, internal files, and target only unversioned output datasets
+                        if f.endswith((".csv", ".xlsx", ".xls")) and not "_v" in f:
+                            new_or_modified_files.append(f)
+
+                    if new_or_modified_files:
+                        current_meta = dict(ai_message.metadata or {})
+                        ui_views = current_meta.get("ui_data_views", [])
+                        for f in new_or_modified_files:
+                            if f not in ui_views:
+                                ui_views.append(f)
+                        current_meta["ui_data_views"] = ui_views
+                        ai_message.metadata = current_meta
+
                     fig_nums = plt.get_fignums()
                     if fig_nums:
                         buf = io.BytesIO()
@@ -4078,16 +4100,48 @@ class ChatMixin:
                         plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
                         ASCIIColors.success("✓ Matplotlib visualization generated inside sandbox.")
 
+                        # Automatically save/update as a persistent image artifact in the active workspace
+                        plot_title = f"{title}_plot"
+                        existing_plot = self.artefacts.get(plot_title)
+                        if existing_plot is None:
+                            self.artefacts.add(
+                                title=plot_title,
+                                artefact_type="image",
+                                content=f"### Matplotlib Visualization: {plot_title}\n\n<artefact_image id=\"{plot_title}::0\" />",
+                                images=[plot_b64],
+                                image_media_types=["image/png"],
+                                active=True
+                            )
+                        else:
+                            # Update in-place to append a new version of the generated plot
+                            self.artefacts.update(
+                                title=plot_title,
+                                new_content=f"### Matplotlib Visualization (Version {existing_plot.get('version', 1) + 1}): {plot_title}\n\n<artefact_image id=\"{plot_title}::{existing_plot.get('version', 1)}\" />",
+                                new_images=existing_plot.get("images", []) + [plot_b64],
+                                new_image_media_types=existing_plot.get("image_media_types", []) + ["image/png"],
+                                bump_version=True,
+                                active=True
+                            )
+                        self.commit()
+                        ASCIIColors.success(f"✓ Registered/updated Matplotlib plot as a persistent image artifact: '{plot_title}'")
+
                     if not is_read_only:
-                        if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
-                            local_vars["conn"].commit()
-                            local_vars["conn"].close()
-                        elif ext in (".xlsx", ".xls") and "dfs" in local_vars:
-                            with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
-                                for sheet_name, sheet_df in local_vars["dfs"].items():
-                                    sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                        elif "df" in local_vars:
-                            local_vars["df"].to_csv(new_file_path, index=False, sep=sep)
+                        active_file_mtime_after = active_file.stat().st_mtime if active_file.exists() else 0
+                        file_written_by_script = (active_file_mtime_after > active_file_mtime_before)
+
+                        if file_written_by_script:
+                            import shutil
+                            shutil.copy(str(active_file), str(new_file_path))
+                        else:
+                            if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
+                                local_vars["conn"].commit()
+                                local_vars["conn"].close()
+                            elif ext in (".xlsx", ".xls") and "dfs" in local_vars:
+                                with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
+                                    for sheet_name, sheet_df in local_vars["dfs"].items():
+                                        sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                            elif "df" in local_vars:
+                                local_vars["df"].to_csv(new_file_path, index=False, sep=sep)
 
                         from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
                         new_schema, _ = _parse_data_file(new_file_path, title, version=new_version, progress_cb=None)
@@ -4126,6 +4180,7 @@ class ChatMixin:
                 }
                 if plot_b64:
                     result["plot_b64"] = plot_b64
+                    result["images"] = [plot_b64]
                     result["output"] += "\n\n[SYSTEM: A matplotlib visualization was generated. The user can view it in their UI.]"
                 return result
 
@@ -4134,6 +4189,403 @@ class ChatMixin:
                 fn=_execute_python_data_query_tool_impl,
                 params=[{"name": "code", "type": "str", "description": "The Python code to execute. To load active datasets, open them directly by their clean name (e.g., 'sales_database.xlsx' or 'sales_database.csv'). Do NOT use '/api/workspace_files/...' prefixes."}],
                 description="MANDATORY FOR DATA ANALYSIS/MODIFICATION: Execute sandboxed Python code using pandas or sqlite3 to analyze active datasets. To read active datasets (e.g., 'sales_database.xlsx'), simply open them directly by their clean filename (do NOT use '/api/workspace_files/...' prefixes, as those are strictly for client-side JavaScript).",
+                output=[{"name": "output", "type": "str"}]
+            )
+
+            def _execute_sql_query_impl(sql_query: str) -> Dict[str, Any]:
+                """
+                Executes a standard SQLite SQL query on the active datasets.
+                If the dataset is an Excel spreadsheet or CSV, they are automatically
+                loaded as tables in an in-memory SQLite database.
+                """
+                import sqlite3
+                import pandas as pd
+                from pathlib import Path
+                from lollms_client.lollms_types import LCPResult
+                from ascii_colors import ASCIIColors, trace_exception
+
+                title = active_data[0]["title"]
+                ext = active_data[0].get("file_ext", ".csv")
+                current_version = active_data[0].get("version", 1)
+                is_read_only = active_data[0].get("read_only", False)
+
+                workspace_dir = Path("./data_workspace")
+                try:
+                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                    if awd is not None:
+                        workspace_dir = awd
+                except ImportError:
+                    pass
+
+                # Check for files
+                if is_read_only:
+                    file_path = workspace_dir / f"{title}{ext}"
+                else:
+                    file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+
+                if not file_path.exists():
+                    file_path = workspace_dir / f"{title}{ext}"
+                    if not file_path.exists():
+                        # Run self-healing scanner as fallback
+                        found_path = None
+                        scan_dirs = [Path("./data_workspace")]
+                        try:
+                            from lollms_client.app.server import APP_DIR
+                            if APP_DIR and APP_DIR.exists():
+                                ws_dir = APP_DIR / "workspaces"
+                                if ws_dir.exists():
+                                    for d in ws_dir.iterdir():
+                                        if d.is_dir():
+                                            scan_dirs.append(d / "data_workspace")
+                        except Exception:
+                            pass
+
+                        for sd in scan_dirs:
+                            cand = sd / f"{title}_v{current_version}{ext}"
+                            if cand.exists():
+                                found_path = cand
+                                break
+                            cand = sd / f"{title}{ext}"
+                            if cand.exists():
+                                found_path = cand
+                                break
+
+                        if found_path:
+                            try:
+                                workspace_dir.mkdir(parents=True, exist_ok=True)
+                                import shutil
+                                shutil.copy(str(found_path), str(file_path))
+                                unversioned_dest = workspace_dir / f"{title}{ext}"
+                                try:
+                                    shutil.copy(str(found_path), str(unversioned_dest))
+                                except Exception:
+                                    pass
+                                ASCIIColors.success(f"✓ Recovered missing data file from '{found_path.parent.parent.name or 'global'}' workspace!")
+                            except Exception as copy_err:
+                                ASCIIColors.error(f"Failed to copy recovered file: {copy_err}")
+
+                if not file_path.exists():
+                    return {"success": False, "error": f"Raw data file '{title}' is missing from workspace."}
+
+                ASCIIColors.info(f"--- [execute_sql_query] Compiling SQL query inside sandbox... ---")
+
+                # Setup in-memory SQLite database
+                try:
+                    conn = sqlite3.connect(":memory:")
+
+                    if ext in (".db", ".sqlite", ".sqlite3"):
+                        # If SQLite database on disk, backup/copy tables to our in-memory DB
+                        disk_conn = sqlite3.connect(str(file_path))
+                        disk_conn.backup(conn)
+                        disk_conn.close()
+                    elif ext in (".xlsx", ".xls"):
+                        # If Excel, load sheets as tables
+                        xl = pd.ExcelFile(str(file_path))
+                        for sheet_name in xl.sheet_names:
+                            # Standardize table name (no spaces)
+                            table_name = sheet_name.replace(" ", "_")
+                            df = pd.read_excel(str(file_path), sheet_name=sheet_name)
+                            df.to_sql(table_name, conn, index=False, if_exists="replace")
+                    else:
+                        # CSV
+                        sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+                        df = pd.read_csv(str(file_path), sep=sep)
+                        df.to_sql(title.replace(" ", "_"), conn, index=False, if_exists="replace")
+                    ASCIIColors.success("✓ Relational dataset compiled into in-memory SQLite successfully.")
+                except Exception as e:
+                    ASCIIColors.error(f"❌ Failed to load dataset tables into memory SQLite: {e}")
+                    if self.lollmsClient.debug:
+                        trace_exception(e)
+                    return {"success": False, "error": f"Failed to load dataset: {e}"}
+
+                # Execute SQL query on our in-memory DB
+                try:
+                    # Strip SQL comments and whitespace to reliably detect SELECT queries
+                    clean_query = sql_query.strip()
+                    clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
+                    clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
+
+                    is_select = clean_query.lower().startswith("select")
+
+                    if is_select:
+                        df_res = pd.read_sql_query(sql_query, conn)
+                        output_md = df_res.to_markdown(index=False)
+                        sources = [{
+                            "title": f"SQL Query Result: {sql_query}",
+                            "content": output_md,
+                            "source": f"sql_query"
+                        }]
+                        ASCIIColors.success(f"✓ SQL select query executed successfully: found {len(df_res)} rows.")
+                    else:
+                        if is_read_only:
+                            conn.close()
+                            err_msg = "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."
+                            ASCIIColors.error(f"❌ {err_msg}")
+                            return {"success": False, "error": err_msg}
+
+                        # Run write query
+                        cursor = conn.cursor()
+                        cursor.execute(sql_query)
+                        conn.commit()
+
+                        # Write back modified tables from memory DB back to Excel/CSV file on disk
+                        if ext in (".db", ".sqlite", ".sqlite3"):
+                            disk_conn = sqlite3.connect(str(file_path))
+                            conn.backup(disk_conn)
+                            disk_conn.close()
+                        elif ext in (".xlsx", ".xls"):
+                            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                            tables = [row[0] for row in cursor.fetchall()]
+
+                            new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                            with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
+                                for t in tables:
+                                    df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
+                                    df_write.to_excel(writer, sheet_name=t.replace("_", " "), index=False)
+
+                            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                            new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
+                            self.artefacts.update(
+                                title=title,
+                                new_content=new_schema,
+                                new_type="data",
+                                active=True,
+                                file_ext=ext
+                            )
+                        else:
+                            new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                            df_write = pd.read_sql_query(f"SELECT * FROM {title.replace(' ', '_')}", conn)
+                            df_write.to_csv(new_file_path, index=False, sep=sep)
+
+                            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                            new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
+                            self.artefacts.update(
+                                title=title,
+                                new_content=new_schema,
+                                new_type="data",
+                                active=True,
+                                file_ext=ext
+                            )
+
+                        output_md = f"Query executed successfully: `{sql_query}`. Affected rows: {cursor.rowcount}"
+                        sources = []
+                        ASCIIColors.success(f"✓ SQL write query executed successfully, workspace state updated.")
+
+                    conn.close()
+
+                    return LCPResult(
+                        success=True,
+                        output=output_md,
+                        sources=sources
+                    )
+                except Exception as e:
+                    conn.close()
+                    ASCIIColors.error(f"❌ SQL execution failed: {e}")
+                    if self.lollmsClient.debug:
+                        trace_exception(e)
+                    return {"success": False, "error": f"SQL execution error: {e}"}
+
+            _register(
+                name="execute_sql_query",
+                fn=_execute_sql_query_impl,
+                params=[{"name": "sql_query", "type": "str", "description": "The standard SQL query (SQLite syntax) to run on the database. Available tables match the Sheet names (e.g. 'Customers', 'Products', 'Orders', 'Order_Details' with spaces replaced by underscores, e.g., 'Order_Details')."}],
+                description="MANDATORY FOR SQL DATA ANALYSIS/QUERIES: Execute standard SQL queries on the active dataset tables. Available tables are the sheet names with spaces replaced by underscores. For write queries (INSERT/UPDATE/DELETE), ensure the dataset is in WRITABLE mode.",
+                output=[{"name": "output", "type": "str"}]
+            )
+
+            def _execute_sql_query_impl(sql_query: str) -> Dict[str, Any]:
+                """
+                Executes a standard SQLite SQL query on the active datasets.
+                If the dataset is an Excel spreadsheet or CSV, they are automatically
+                loaded as tables in an in-memory SQLite database.
+                """
+                import sqlite3
+                import pandas as pd
+                from pathlib import Path
+                from lollms_client.lollms_types import LCPResult
+                from ascii_colors import ASCIIColors, trace_exception
+
+                title = active_data[0]["title"]
+                ext = active_data[0].get("file_ext", ".csv")
+                current_version = active_data[0].get("version", 1)
+                is_read_only = active_data[0].get("read_only", False)
+
+                workspace_dir = Path("./data_workspace")
+                try:
+                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                    if awd is not None:
+                        workspace_dir = awd
+                except ImportError:
+                    pass
+
+                # Check for files
+                if is_read_only:
+                    file_path = workspace_dir / f"{title}{ext}"
+                else:
+                    file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+
+                if not file_path.exists():
+                    file_path = workspace_dir / f"{title}{ext}"
+                    if not file_path.exists():
+                        # Run self-healing scanner as fallback
+                        found_path = None
+                        scan_dirs = [Path("./data_workspace")]
+                        try:
+                            from lollms_client.app.server import APP_DIR
+                            if APP_DIR and APP_DIR.exists():
+                                ws_dir = APP_DIR / "workspaces"
+                                if ws_dir.exists():
+                                    for d in ws_dir.iterdir():
+                                        if d.is_dir():
+                                            scan_dirs.append(d / "data_workspace")
+                        except Exception:
+                            pass
+
+                        for sd in scan_dirs:
+                            cand = sd / f"{title}_v{current_version}{ext}"
+                            if cand.exists():
+                                found_path = cand
+                                break
+                            cand = sd / f"{title}{ext}"
+                            if cand.exists():
+                                found_path = cand
+                                break
+
+                        if found_path:
+                            try:
+                                workspace_dir.mkdir(parents=True, exist_ok=True)
+                                import shutil
+                                shutil.copy(str(found_path), str(file_path))
+                                unversioned_dest = workspace_dir / f"{title}{ext}"
+                                try:
+                                    shutil.copy(str(found_path), str(unversioned_dest))
+                                except Exception:
+                                    pass
+                                ASCIIColors.success(f"✓ Recovered missing data file from '{found_path.parent.parent.name or 'global'}' workspace!")
+                            except Exception as copy_err:
+                                ASCIIColors.error(f"Failed to copy recovered file: {copy_err}")
+
+                if not file_path.exists():
+                    return {"success": False, "error": f"Raw data file '{title}' is missing from workspace."}
+
+                ASCIIColors.info(f"--- [execute_sql_query] Compiling SQL query inside sandbox... ---")
+
+                # Setup in-memory SQLite database
+                try:
+                    conn = sqlite3.connect(":memory:")
+
+                    if ext in (".db", ".sqlite", ".sqlite3"):
+                        # If SQLite database on disk, backup/copy tables to our in-memory DB
+                        disk_conn = sqlite3.connect(str(file_path))
+                        disk_conn.backup(conn)
+                        disk_conn.close()
+                    elif ext in (".xlsx", ".xls"):
+                        # If Excel, load sheets as tables
+                        xl = pd.ExcelFile(str(file_path))
+                        for sheet_name in xl.sheet_names:
+                            # Standardize table name (no spaces)
+                            table_name = sheet_name.replace(" ", "_")
+                            df = pd.read_excel(str(file_path), sheet_name=sheet_name)
+                            df.to_sql(table_name, conn, index=False, if_exists="replace")
+                    else:
+                        # CSV
+                        sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+                        df = pd.read_csv(str(file_path), sep=sep)
+                        df.to_sql(title.replace(" ", "_"), conn, index=False, if_exists="replace")
+                    ASCIIColors.success("✓ Relational dataset compiled into in-memory SQLite successfully.")
+                except Exception as e:
+                    ASCIIColors.error(f"❌ Failed to load dataset tables into memory SQLite: {e}")
+                    if self.lollmsClient.debug:
+                        trace_exception(e)
+                    return {"success": False, "error": f"Failed to load dataset: {e}"}
+
+                # Execute SQL query on our in-memory DB
+                try:
+                    is_select = sql_query.strip().lower().startswith("select")
+
+                    if is_select:
+                        df_res = pd.read_sql_query(sql_query, conn)
+                        output_md = df_res.to_markdown(index=False)
+                        sources = [{
+                            "title": f"SQL Query Result: {sql_query}",
+                            "content": output_md,
+                            "source": f"sql_query"
+                        }]
+                        ASCIIColors.success(f"✓ SQL select query executed successfully: found {len(df_res)} rows.")
+                    else:
+                        if is_read_only:
+                            conn.close()
+                            err_msg = "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."
+                            ASCIIColors.error(f"❌ {err_msg}")
+                            return {"success": False, "error": err_msg}
+
+                        # Run write query
+                        cursor = conn.cursor()
+                        cursor.execute(sql_query)
+                        conn.commit()
+
+                        # Write back modified tables from memory DB back to Excel/CSV file on disk
+                        if ext in (".db", ".sqlite", ".sqlite3"):
+                            disk_conn = sqlite3.connect(str(file_path))
+                            conn.backup(disk_conn)
+                            disk_conn.close()
+                        elif ext in (".xlsx", ".xls"):
+                            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                            tables = [row[0] for row in cursor.fetchall()]
+
+                            new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                            with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
+                                for t in tables:
+                                    df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
+                                    df_write.to_excel(writer, sheet_name=t.replace("_", " "), index=False)
+
+                            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                            new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
+                            self.artefacts.update(
+                                title=title,
+                                new_content=new_schema,
+                                new_type="data",
+                                active=True,
+                                file_ext=ext
+                            )
+                        else:
+                            new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                            df_write = pd.read_sql_query(f"SELECT * FROM {title.replace(' ', '_')}", conn)
+                            df_write.to_csv(new_file_path, index=False, sep=sep)
+
+                            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                            new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
+                            self.artefacts.update(
+                                title=title,
+                                new_content=new_schema,
+                                new_type="data",
+                                active=True,
+                                file_ext=ext
+                            )
+
+                        output_md = f"Query executed successfully: `{sql_query}`. Affected rows: {cursor.rowcount}"
+                        sources = []
+                        ASCIIColors.success(f"✓ SQL write query executed successfully, workspace state updated.")
+
+                    conn.close()
+
+                    return LCPResult(
+                        success=True,
+                        output=output_md,
+                        sources=sources
+                    )
+                except Exception as e:
+                    conn.close()
+                    ASCIIColors.error(f"❌ SQL execution failed: {e}")
+                    if self.lollmsClient.debug:
+                        trace_exception(e)
+                    return {"success": False, "error": f"SQL execution error: {e}"}
+
+            _register(
+                name="execute_sql_query",
+                fn=_execute_sql_query_impl,
+                params=[{"name": "sql_query", "type": "str", "description": "The standard SQL query (SQLite syntax) to run on the database. Available tables match the Sheet names (e.g. 'Customers', 'Products', 'Orders', 'Order_Details' with spaces replaced by underscores, e.g., 'Order_Details')."}],
+                description="MANDATORY FOR SQL DATA ANALYSIS/QUERIES: Execute standard SQL queries on the active dataset tables. Available tables are the sheet names with spaces replaced by underscores. For write queries (INSERT/UPDATE/DELETE), ensure the dataset is in WRITABLE mode.",
                 output=[{"name": "output", "type": "str"}]
             )
 
@@ -5413,8 +5865,8 @@ class ChatMixin:
                     })
  
                     _source_count = len(inferred_srcs)
-                    _result_keys  = list(_result.keys()) if isinstance(_result, dict) else []
-                    _is_failed = isinstance(_result, dict) and _result.get("success") is False
+                    _result_keys  = list(_result_obj.to_dict().keys()) if isinstance(_result_obj.to_dict(), dict) else []
+                    _is_failed = not _result_obj.success
 
                     if _is_failed:
                         result_summary = f"❌ Failed: {res_label}"
@@ -5427,10 +5879,18 @@ class ChatMixin:
                         result_summary += f" — result keys: {', '.join(_result_keys[:5])}"
                     ss._emit_tool_processing_status(result_summary)
 
-                    if _is_failed and _result.get("error"):
+                    if _is_failed and _result_obj.error:
                         # Render tool execution failure details as an elegant collapsible block inside the processing drawer
-                        error_details = f"<details><summary>⚠️ Error Details</summary><pre style='color:#ef4444; white-space:pre-wrap;'>{_result.get('error')}</pre></details>"
+                        error_details = f"<details class='proc-error-details'><summary>⚠️ Error Details</summary><pre style='color:#ef4444; white-space:pre-wrap;'>{_result_obj.error}</pre></details>"
                         ss._emit_tool_processing_status(error_details)
+                    elif _result_obj.success and _result_obj.output.strip():
+                        # Render successful output / stdout as an elegant collapsible block inside the processing drawer
+                        clean_out = _result_obj.output.strip()
+                        escaped_out = clean_out.replace("<", "&lt;").replace(">", "&gt;")
+                        if len(escaped_out) > 3000:
+                            escaped_out = escaped_out[:3000] + "\n... [additional output truncated]"
+                        status_out = f"<details class='proc-success-details'><summary>💻 Execution Output / Return Value</summary><pre style='color:#10b981; white-space:pre-wrap;'>{escaped_out}</pre></details>"
+                        ss._emit_tool_processing_status(status_out)
  
                     ss._emit_tool_processing_close(
                         f"Completed — output: {len(_raw_result_json):,} chars"

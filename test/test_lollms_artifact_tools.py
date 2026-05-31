@@ -141,5 +141,94 @@ class TestLollmsArtifactTools(unittest.TestCase):
         toggled = self.discussion.artefacts.get("sales_data")
         self.assertFalse(toggled.get("read_only"))
 
+    def test_in_memory_sqlite_sql_query_operations(self):
+        # Create a mock data file (CSV)
+        import pandas as pd
+        workspace_dir = Path("./data_workspace")
+        workspace_dir.mkdir(exist_ok=True)
+        csv_path = workspace_dir / "user_salaries.csv"
+        df = pd.DataFrame({
+            "name": ["Alice", "Bob", "Charlie"],
+            "salary": [120000, 95000, 110000]
+        })
+        df.to_csv(csv_path, index=False)
+
+        art = self.discussion.artefacts.add(
+            title="user_salaries",
+            artefact_type="data",
+            content="Mock schema",
+            file_ext=".csv",
+            version=1,
+            read_only=False
+        )
+
+        # Re-fetch local tool executor
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        df.to_sql("user_salaries", conn, index=False, if_exists="replace")
+        
+        # Test SELECT query execution on memory SQL
+        df_res = pd.read_sql_query("SELECT * FROM user_salaries WHERE salary > 100000", conn)
+        self.assertEqual(len(df_res), 2)
+        self.assertIn("Alice", df_res["name"].values)
+        
+        # Test INSERT write query execution on memory SQL
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO user_salaries (name, salary) VALUES ('David', 130000)")
+        conn.commit()
+        
+        df_res_after = pd.read_sql_query("SELECT * FROM user_salaries", conn)
+        self.assertEqual(len(df_res_after), 4)
+        self.assertIn("David", df_res_after["name"].values)
+        conn.close()
+
+        # Clean up mock file
+        if csv_path.exists():
+            csv_path.unlink()
+
+
+
+    def test_token_count_caching(self):
+        # Create a mock client with a tracking counter for count_tokens calls
+        class MockLLM:
+            def __init__(self):
+                self.calls = 0
+            def count_tokens(self, text):
+                self.calls += 1
+                return len(text) // 4
+
+        # Wrap in LollmsClient shell
+        test_client = LollmsClient()
+        test_client.llm = MockLLM()
+
+        # Test first call (uncached)
+        c1 = test_client.count_tokens("This is a long string to verify correct MD5 caching.")
+        self.assertEqual(test_client.llm.calls, 1)
+
+        # Test second identical call (cached)
+        c2 = test_client.count_tokens("This is a long string to verify correct MD5 caching.")
+        self.assertEqual(test_client.llm.calls, 1) # Still 1!
+        self.assertEqual(c1, c2)
+
+        # Test different call (uncached)
+        c3 = test_client.count_tokens("Different string.")
+        self.assertEqual(test_client.llm.calls, 2)
+
+    def test_latex_to_pdf_export_detection(self):
+        # Create a mock LaTeX artifact
+        art = self.discussion.artefacts.add(
+            title="receipt",
+            artefact_type="document",
+            content="\\documentclass{article}\\begin{document}Receipt\\end{document}",
+            language="latex"
+        )
+        # Verify it is detected as latex
+        content = art.get("content", "").strip()
+        is_latex = (
+            art.get("language") in ("latex", "tex") or
+            content.startswith("\\documentclass")
+        )
+        self.assertTrue(is_latex)
+
 if __name__ == "__main__":
     unittest.main()

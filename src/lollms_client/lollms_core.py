@@ -266,7 +266,20 @@ class LollmsClient():
     def count_tokens(self, text: str) -> int:
         if text is None:
             text = ""
-        if self.llm: return self.llm.count_tokens(text)
+
+        # In-memory MD5 token-count caching to prevent redundant backend server floods
+        import hashlib
+        text_hash = hashlib.md5(text.encode('utf-8', errors='ignore')).hexdigest()
+        if not hasattr(self, "_token_count_cache"):
+            self._token_count_cache = {}
+
+        if text_hash in self._token_count_cache:
+            return self._token_count_cache[text_hash]
+
+        if self.llm: 
+            count = self.llm.count_tokens(text)
+            self._token_count_cache[text_hash] = count
+            return count
         raise RuntimeError("LLM binding not initialized.")
 
     def count_image_tokens(self, image: str) -> int:

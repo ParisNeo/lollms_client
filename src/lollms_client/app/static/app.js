@@ -544,6 +544,25 @@ document.addEventListener("DOMContentLoaded", () => {
     // Launch workspace bootstrapper
     initializeApp();
 
+    // ── 🧠 Startup Connection Guard & Safety Timer ──
+    // If the server is offline, broken, or hanging during startup, this guard ensures the user
+    // is never stuck on the splash loader. It forces the loader off and opens settings.
+    setTimeout(() => {
+        const globalLoader = document.getElementById("global-page-loader");
+        if (globalLoader) {
+            console.warn("Connection guard triggered: Forcing loader removal and opening settings.");
+            globalLoader.style.opacity = "0";
+            globalLoader.style.visibility = "hidden";
+            setTimeout(() => globalLoader.remove(), 400);
+
+            const settingsModal = document.getElementById("settings-modal");
+            if (settingsModal) {
+                settingsModal.style.display = "flex";
+                showNotification("⚠️ Connection to LLM Server failed. Please verify your binding settings.", "warning", 5000);
+            }
+        }
+    }, 15000); // 15 seconds generous safety limit to prevent premature triggers on slower environments
+
     // ── Combined Ingestion Modal Display Toggle ──
     btnOpenImport.addEventListener("click", () => {
         importModal.style.display = "flex";
@@ -752,7 +771,7 @@ document.addEventListener("DOMContentLoaded", () => {
         // 1. Browsing a version simply loads it visually (no auto-activation)
         vSelect.addEventListener("change", async (e) => {
             const selectedVer = parseInt(e.target.value, 10);
-            await loadArtifactVersion(title, selectedVer);
+            await loadArtifactVersion(title, selectedVer, type);
         });
 
         // 2. Set Active Button Click
@@ -861,10 +880,12 @@ document.addEventListener("DOMContentLoaded", () => {
         if (downloadBtn) {
             downloadBtn.addEventListener("click", () => {
                 if (type === "image") {
-                    // Direct binary download for images
+                    // Direct binary download for the currently selected version of the image
+                    const selectedVer = parseInt(vSelect.value, 10) || 1;
+                    const imgIndex = selectedVer - 1; // 0-based index
                     const a = document.createElement("a");
-                    a.href = `/api/images/${encodeURIComponent(title)}/0`;
-                    a.download = `${title}.png`;
+                    a.href = `/api/images/${encodeURIComponent(title)}/${imgIndex}`;
+                    a.download = `${title}_v${selectedVer}.png`;
                     document.body.appendChild(a);
                     a.click();
                     document.body.removeChild(a);
@@ -902,6 +923,13 @@ document.addEventListener("DOMContentLoaded", () => {
         saveRawBtn.addEventListener("click", async () => {
             saveRawBtn.disabled = true;
             saveRawBtn.textContent = "Saving...";
+
+            // Clear cache for this artifact to ensure fresh data is loaded
+            for (const key of datasetCache.keys()) {
+                if (key.startsWith(`${title}-`)) {
+                    datasetCache.delete(key);
+                }
+            }
 
             try {
                 const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/update`, {
@@ -1000,6 +1028,45 @@ document.addEventListener("DOMContentLoaded", () => {
         })
         .catch(err => alert(`Error creating tool: ${err}`));
     });
+
+    // ── 🛠️ Import LCP Tool Handler ──
+    const btnImportTool = document.getElementById("btn-import-tools-part");
+    const toolImportFileInput = document.getElementById("tool-import-file-input");
+
+    if (btnImportTool && toolImportFileInput) {
+        btnImportTool.addEventListener("click", () => toolImportFileInput.click());
+
+        toolImportFileInput.addEventListener("change", async (e) => {
+            if (e.target.files.length === 0) return;
+            const file = e.target.files[0];
+            const formData = new FormData();
+            formData.append("file", file);
+
+            btnImportTool.disabled = true;
+            btnImportTool.textContent = "Importing...";
+
+            try {
+                const res = await fetch("/api/tools/import", {
+                    method: "POST",
+                    body: formData
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showNotification(`Successfully imported tool: '${file.name}'! 🛠️`, "success", 3000);
+                    fetchDiscoveredTools();
+                    fetchArtifacts(); // refresh active artifacts list
+                } else {
+                    alert(`Import failed: ${data.detail}`);
+                }
+            } catch (err) {
+                alert(`Request failed: ${err}`);
+            } finally {
+                btnImportTool.disabled = false;
+                btnImportTool.textContent = "📥 Import";
+                toolImportFileInput.value = ""; // reset
+            }
+        });
+    }
     // Extract utility helper to capture python code blocks inside Markdown
     function extractCodeFromMarkdown(content) {
         const match = content.match(/```python\s*\n([\s\S]*?)\n```/i);
@@ -1007,7 +1074,8 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // ── 💾 Load Specific Version of an Artifact ──
-    async function loadArtifactVersion(title, version) {
+    // ── 💾 Load Specific Version of an Artifact ──
+    async function loadArtifactVersion(title, version, type = null) {
         const safeId = makeSafeId(title);
         const renderedView = document.getElementById(`rendered-view-${safeId}`);
         const rawView = document.getElementById(`raw-view-${safeId}`);
@@ -1027,28 +1095,31 @@ document.addEventListener("DOMContentLoaded", () => {
         `;
 
         try {
-            // Retrieve full artifacts structure to determine type
+            // Retrieve type-specific details locally to prevent global state contamination
+            let activeType = type;
+            let isReadOnly = false;
             const res = await fetch("/api/artifacts");
             const arts = await res.json();
             const matched = arts.find(a => a.title === title);
-            if (!matched) return;
+            if (matched) {
+                activeType = matched.type;
+                isReadOnly = matched.read_only;
+            }
 
-            activeArtifactType = matched.type;
-
-            if (activeArtifactType === "data") {
-                renderSpreadsheetGridInTab(title, version, renderedView);
+            if (activeType === "data") {
+                await renderSpreadsheetGridInTab(title, version, renderedView);
 
                 const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
                 const art = await artRes.json();
                 rawView.value = art.content;
-            } else if (activeArtifactType === "tool") {
+            } else if (activeType === "tool") {
                 // Renders the Full Interactive LCP Tool Builder Workspace inside Rendered View!
                 renderToolEditor(title, version, renderedView);
 
                 const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
                 const art = await artRes.json();
                 rawView.value = art.content;
-            } else if (activeArtifactType === "presentation") {
+            } else if (activeType === "presentation") {
                 // ── Render Presentation Slide Decks inside an Isolated Iframe ──
                 const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
                 const art = await artRes.json();
@@ -1071,12 +1142,12 @@ document.addEventListener("DOMContentLoaded", () => {
                     <iframe src="${iframeUrl}" style="width: 100%; height: 100%; border: none; min-height: 520px; border-radius: 8px; background: #000;" id="presentation-frame-${safeId}"></iframe>
                 `;
             } else {
-                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
+                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}${version !== undefined ? `?version=${version}` : ""}`);
                 const art = await artRes.json();
                 rawView.value = art.content;
 
                 const isHtml = title.endsWith(".html") || title.endsWith(".htm") || 
-                               (matched.language && matched.language === "html") || 
+                               (art.language && art.language === "html") || 
                                art.content.trim().toLowerCase().startsWith("<!doctype html>") || 
                                art.content.trim().toLowerCase().startsWith("<html>");
 
@@ -1119,8 +1190,8 @@ document.addEventListener("DOMContentLoaded", () => {
                         window.open(url, "_blank");
                         setTimeout(() => URL.revokeObjectURL(url), 60000);
                     });
-                } else if (matched.type === "code") {
-                    const lang = matched.language || "";
+                } else if (activeType === "code") {
+                    const lang = art.language || "";
                     if (lang === "graphviz" || art.content.includes("digraph") || art.content.includes("graph")) {
                         renderedView.style.height = "100%";
                         renderedView.style.overflow = "auto";
@@ -1748,6 +1819,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // ── 📊 Render Spreadsheet Table Grid (Multi-Sheet Excel Support) inside Center Tab ──
     async function renderSpreadsheetGridInTab(docTitle, version, containerElement) {
+        const cacheKey = `${docTitle}-${version}`;
+        if (datasetCache.has(cacheKey)) {
+            const cachedData = datasetCache.get(cacheKey);
+            if (cachedData.type === "excel" || cachedData.type === "sqlite") {
+                renderTabbedSheets(cachedData, docTitle, containerElement);
+            } else {
+                renderFlatTable(cachedData, docTitle, containerElement);
+            }
+            return;
+        }
+
         containerElement.innerHTML = `<div class="empty-viewer-msg"><span class="spinner inline" style="margin-right: 8px;"></span> Loading dataset spreadsheet...</div>`;
         try {
             let url = `/api/data/${encodeURIComponent(docTitle)}`;
@@ -1761,32 +1843,13 @@ document.addEventListener("DOMContentLoaded", () => {
             }
             const data = await res.json();
 
+            // Cache the loaded data
+            datasetCache.set(cacheKey, data);
+
             if (data.type === "excel" || data.type === "sqlite") {
-                const sheetNames = Object.keys(data.sheets);
-                
-                const tabsHtml = `
-                    <div class="sheet-tabs-container">
-                        ${sheetNames.map((s, idx) => `
-                            <button class="sheet-tab ${idx === 0 ? 'active' : ''}" data-sheet="${s}">${s}</button>
-                        `).join("")}
-                    </div>
-                    <div class="data-grid-wrapper" id="spreadsheet-grid-target-${makeSafeId(docTitle)}"></div>
-                `;
-                containerElement.innerHTML = tabsHtml;
-
-                containerElement.querySelectorAll(".sheet-tab").forEach(tab => {
-                    tab.addEventListener("click", () => {
-                        containerElement.querySelectorAll(".sheet-tab").forEach(t => t.classList.remove("active"));
-                        tab.classList.add("active");
-                        drawTableInTab(data.sheets[tab.dataset.sheet], docTitle);
-                    });
-                });
-
-                drawTableInTab(data.sheets[sheetNames[0]], docTitle);
-
+                renderTabbedSheets(data, docTitle, containerElement);
             } else {
-                containerElement.innerHTML = `<div class="data-grid-wrapper" id="spreadsheet-grid-target-${makeSafeId(docTitle)}"></div>`;
-                drawTableInTab(data, docTitle);
+                renderFlatTable(data, docTitle, containerElement);
             }
         } catch (err) {
             containerElement.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444;">Failed to render spreadsheet: ${err}</div>`;
@@ -1862,7 +1925,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 vSelect.dataset.readOnly = matched.read_only ? "true" : "false";
             }
 
-            loadArtifactVersion(title, selectedVersion);
+            loadArtifactVersion(title, selectedVersion, activeArtifactType);
 
             if (btnExportBundle) btnExportBundle.disabled = false;
             
@@ -4536,6 +4599,223 @@ document.addEventListener("DOMContentLoaded", () => {
                   .replace(/\\_/g, "_");
     }
 
+    // ── 📊 Frontend In-Memory Dataset Cache ──
+    const datasetCache = new Map(); // Cache key: "title-version" -> JSON data
+
+    function renderTabbedSheets(data, docTitle, containerElement) {
+        const sheetNames = Object.keys(data.sheets);
+        const safeTitle = makeSafeId(docTitle);
+
+        const tabsHtml = `
+            <!-- Data Intelligence Controls Panel -->
+            <div class="data-intelligence-panel" style="display: flex; flex-direction: column; gap: 10px; background-color: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 8px; padding: 14px; margin-bottom: 16px; flex-shrink: 0; box-shadow: var(--shadow-sm); user-select: none;">
+                <div style="display: flex; gap: 10px; align-items: center; width: 100%;">
+                    <!-- 1. Text Search Bar -->
+                    <div style="flex: 1; position: relative;">
+                        <input type="text" class="data-local-search" id="search-local-${safeTitle}" placeholder="🔍 Live filter visible rows..." style="width: 100%; padding: 8px 12px; font-size: 12px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none; transition: border-color 0.15s;" />
+                    </div>
+                    <!-- Toggle buttons -->
+                    <button class="btn btn-secondary toggle-sql-btn" id="btn-toggle-sql-${safeTitle}" style="width: auto; padding: 8px 14px; font-size: 11.5px; font-weight: bold; border-radius: 6px; background-color: var(--border-color); color: var(--text-primary);">💻 Raw SQL Sandbox</button>
+                    <button class="btn btn-primary toggle-ai-btn" id="btn-toggle-ai-${safeTitle}" style="width: auto; padding: 8px 14px; font-size: 11.5px; font-weight: bold; border-radius: 6px; background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg);">🤖 Ask AI Assistant</button>
+                </div>
+
+                <!-- 2. Hidden SQL Sandbox Panel -->
+                <div id="sql-panel-${safeTitle}" style="display: none; flex-direction: column; gap: 8px; border-top: 1px solid var(--border-color); padding-top: 10px; margin-top: 4px;">
+                    <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary); text-transform: uppercase;">SQLite SQL Query</label>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="text" id="sql-query-${safeTitle}" placeholder="SELECT * FROM Customers WHERE country = 'France' LIMIT 10" style="flex: 1; padding: 8px 12px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none; font-family: monospace; font-size: 12px;" />
+                        <button class="btn btn-primary" id="btn-run-sql-${safeTitle}" style="width: auto; padding: 8px 16px; font-size: 12px; font-weight: bold;">Run SQL</button>
+                    </div>
+                </div>
+
+                <!-- 3. Hidden AI Query Panel -->
+                <div id="ai-panel-${safeTitle}" style="display: none; flex-direction: column; gap: 8px; border-top: 1px solid var(--border-color); padding-top: 10px; margin-top: 4px;">
+                    <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary); text-transform: uppercase;">🤖 Ask AI Natural Language Question</label>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="text" id="ai-question-${safeTitle}" placeholder="e.g. How many Gold members signup in 2024?" style="flex: 1; padding: 8px 12px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none; font-size: 12.5px;" />
+                        <input type="submit" class="btn btn-primary" id="btn-run-ai-${safeTitle}" style="width: auto; padding: 8px 16px; font-size: 12px; font-weight: bold; background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg);" value="Ask AI" />
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sheets Tab bar -->
+            <div class="sheet-tabs-container" style="margin-bottom: 12px; user-select: none;">
+                ${sheetNames.map((s, idx) => `
+                    <button class="sheet-tab msg-sheet-tab-${safeTitle} ${idx === 0 ? 'active' : ''}" data-sheet="${s}">${s}</button>
+                `).join("")}
+            </div>
+            <div class="data-grid-wrapper" id="spreadsheet-grid-target-${safeTitle}" style="max-height: 500px; overflow-y: auto; overflow-x: auto; border: 1px solid var(--border-color); border-radius: 8px;"></div>
+        `;
+        containerElement.innerHTML = tabsHtml;
+
+        // Wire up Local Live Filter
+        const localSearch = containerElement.querySelector(`#search-local-${safeTitle}`);
+        localSearch.addEventListener("input", (e) => {
+            const query = e.target.value.toLowerCase().trim();
+            const rows = containerElement.querySelectorAll(`#spreadsheet-grid-target-${safeTitle} tbody tr`);
+            rows.forEach(tr => {
+                const text = tr.textContent.toLowerCase();
+                tr.style.display = text.includes(query) ? "" : "none";
+            });
+        });
+
+        // Wire up SQL Toggle
+        const sqlBtn = containerElement.querySelector(`#btn-toggle-sql-${safeTitle}`);
+        const sqlPanel = containerElement.querySelector(`#sql-panel-${safeTitle}`);
+        const aiBtn = containerElement.querySelector(`#btn-toggle-ai-${safeTitle}`);
+        const aiPanel = containerElement.querySelector(`#ai-panel-${safeTitle}`);
+
+        sqlBtn.addEventListener("click", () => {
+            const isHidden = sqlPanel.style.display === "none";
+            sqlPanel.style.display = isHidden ? "flex" : "none";
+            sqlBtn.classList.toggle("active", isHidden);
+            if (isHidden) {
+                // Close AI panel
+                aiPanel.style.display = "none";
+                aiBtn.classList.remove("active");
+            }
+        });
+
+        // Wire up AI Toggle
+        aiBtn.addEventListener("click", () => {
+            const isHidden = aiPanel.style.display === "none";
+            aiPanel.style.display = isHidden ? "flex" : "none";
+            aiBtn.classList.toggle("active", isHidden);
+            if (isHidden) {
+                // Close SQL panel
+                sqlPanel.style.display = "none";
+                sqlBtn.classList.remove("active");
+            }
+        });
+
+        // Wire up Run SQL click
+        const runSqlBtn = containerElement.querySelector(`#btn-run-sql-${safeTitle}`);
+        const sqlInput = containerElement.querySelector(`#sql-query-${safeTitle}`);
+        runSqlBtn.addEventListener("click", async () => {
+            const query = sqlInput.value.trim();
+            if (!query) return;
+
+            runSqlBtn.disabled = true;
+            runSqlBtn.textContent = "Querying...";
+            const gridTarget = containerElement.querySelector(`#spreadsheet-grid-target-${safeTitle}`);
+            gridTarget.innerHTML = `<div class="empty-viewer-msg" style="padding: 20px;"><span class="spinner inline" style="margin-right: 8px;"></span> Compiling SQL query inside SQLite sandbox...</div>`;
+
+            try {
+                const res = await fetch(`/api/data/${encodeURIComponent(docTitle)}/raw_query`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ sql_query: query })
+                });
+                const resData = await res.json();
+                if (resData.success) {
+                    drawQueryResultsInTable(resData, docTitle, gridTarget);
+                } else {
+                    gridTarget.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444; padding: 20px;">❌ SQL Query Error:<br/>${resData.error}</div>`;
+                }
+            } catch (err) {
+                gridTarget.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444; padding: 20px;">Request failed: ${err}</div>`;
+            } finally {
+                runSqlBtn.disabled = false;
+                runSqlBtn.textContent = "Run SQL";
+            }
+        });
+
+        // Wire up Run AI click
+        const runAiBtn = containerElement.querySelector(`#btn-run-ai-${safeTitle}`);
+        const aiInput = containerElement.querySelector(`#ai-question-${safeTitle}`);
+        runAiBtn.addEventListener("click", async () => {
+            const question = aiInput.value.trim();
+            if (!question) return;
+
+            runAiBtn.disabled = true;
+            runAiBtn.textContent = "AI Translating...";
+            const gridTarget = containerElement.querySelector(`#spreadsheet-grid-target-${safeTitle}`);
+            gridTarget.innerHTML = `<div class="empty-viewer-msg" style="padding: 20px;"><span class="spinner inline" style="margin-right: 8px;"></span> 🤖 AI Ingesting Schema & Formulating SQL...</div>`;
+
+            try {
+                const res = await fetch(`/api/data/${encodeURIComponent(docTitle)}/ai_query`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ question: question })
+                });
+                const resData = await res.json();
+                if (resData.success) {
+                    drawQueryResultsInTable(resData, docTitle, gridTarget, resData.sql_query, resData.explanation);
+                } else {
+                    gridTarget.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444; padding: 20px;">❌ AI Query Failed:<br/>${resData.error}</div>`;
+                }
+            } catch (err) {
+                gridTarget.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444; padding: 20px;">Request failed: ${err}</div>`;
+            } finally {
+                runAiBtn.disabled = false;
+                runAiBtn.value = "Ask AI";
+            }
+        });
+
+        // Wire up sheet tabs
+        containerElement.querySelectorAll(`.msg-sheet-tab-${safeTitle}`).forEach(tab => {
+            tab.addEventListener("click", () => {
+                containerElement.querySelectorAll(`.msg-sheet-tab-${safeTitle}`).forEach(t => t.classList.remove("active"));
+                tab.classList.add("active");
+                drawTableInTab(data.sheets[tab.dataset.sheet], docTitle);
+            });
+        });
+
+        drawTableInTab(data.sheets[sheetNames[0]], docTitle);
+    }
+
+    function drawQueryResultsInTable(resData, docTitle, gridTarget, generatedSql = null, explanation = null) {
+        const columns = resData.columns;
+        const rows = resData.rows;
+
+        if (columns.length === 0 || rows.length === 0) {
+            gridTarget.innerHTML = `<div class="empty-viewer-msg" style="padding: 20px;">Query returned 0 results.</div>`;
+            return;
+        }
+
+        let headerHtml = "";
+        if (generatedSql) {
+            headerHtml = `
+                <div style="background-color: #020617; border-bottom: 1px solid var(--border-color); padding: 12px 14px; font-family: monospace; font-size: 11.5px; color: var(--accent-color);">
+                    <strong>Generated SQLite Query:</strong><br/>
+                    <pre style="margin-top: 6px; color: #fde68a; font-family: inherit; white-space: pre-wrap;">${generatedSql}</pre>
+                    ${explanation ? `<div style="margin-top: 8px; color: var(--text-secondary); font-family: sans-serif; font-size: 11px;"><strong>Insight:</strong> ${explanation}</div>` : ""}
+                </div>
+            `;
+        }
+
+        gridTarget.innerHTML = `
+            ${headerHtml}
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        ${columns.map(c => `<th>${c}</th>`).join("")}
+                    </tr>
+                </thead>
+                <tbody>
+                    ${rows.map(r => `
+                        <tr>
+                            ${columns.map(c => `<td>${r[c] !== null ? r[c] : ''}</td>`).join("")}
+                        </tr>
+                    `).join("")}
+                </tbody>
+            </table>
+        `;
+    }
+
+    function renderFlatTable(data, docTitle, containerElement) {
+        // Flat CSV can be treated as a single table. To support SQL and AI querying, we can wrap its data
+        // inside the exact same tabbed sheets structure (with "Data" as the single sheet name) so the entire
+        // Data Intelligence Panel is fully functional for CSV files as well!
+        const parsedData = {
+            type: "excel",
+            sheets: {
+                "Data": data
+            }
+        };
+        renderTabbedSheets(parsedData, docTitle, containerElement);
+    }
+
     function updateVersionActionButtonsState(tabContent, title, selectedVer) {
         const vSelect = tabContent.querySelector(".version-select");
         const btnSetActive = tabContent.querySelector(".btn-set-active-version");
@@ -4580,6 +4860,128 @@ document.addEventListener("DOMContentLoaded", () => {
         const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, msgId, null, msgObj);
         proseSpan.innerHTML = resolvedHTML;
         contentDiv.appendChild(proseSpan);
+
+        // Render any active message images (such as sandboxed Matplotlib plots) at the bottom of the bubble
+        if (msgObj && msgObj.images && msgObj.images.length > 0) {
+            const imagesContainer = document.createElement("div");
+            imagesContainer.className = "msg-images-gallery";
+            imagesContainer.style = "display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px;";
+
+            // Collect all image IDs referenced in the text to avoid duplicate rendering
+            const imgPattern = /<artefact_image\s+id=["']([^"']+)["']/gi;
+            const referencedIds = [];
+            let match;
+            while ((match = imgPattern.exec(text)) !== null) {
+                referencedIds.push(match[1]);
+            }
+
+            const activeFlags = msgObj.active_images || [];
+            msgObj.images.forEach((imgB64, idx) => {
+                const isActive = idx < activeFlags.length ? activeFlags[idx] : true;
+                if (!isActive) return;
+
+                // Check if this image was already rendered inline via artefact_image tag
+                const isReferenced = referencedIds.some(refId => {
+                    if (refId.includes("::")) {
+                        const parts = refId.split("::");
+                        const refIdx = parseInt(parts[parts.length - 1], 10);
+                        return refIdx === idx;
+                    }
+                    return false;
+                });
+
+                if (isReferenced) return;
+
+                const imgContainer = document.createElement("div");
+                imgContainer.className = "rendered-image-container";
+                imgContainer.style = "position: relative; max-width: 100%; margin: 10px 0;";
+                imgContainer.innerHTML = `
+                    <img src="data:image/png;base64,${imgB64}" class="rendered-page-img" style="display: block; max-width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--border-color); box-shadow: var(--shadow-lg);" />
+                `;
+                imagesContainer.appendChild(imgContainer);
+            });
+
+            if (imagesContainer.children.length > 0) {
+                contentDiv.appendChild(imagesContainer);
+            }
+        }
+
+        // Render any dynamic workspace dataset views (ui_data_views) at the bottom of the chat bubble
+        if (msgObj && msgObj.metadata && msgObj.metadata.ui_data_views && msgObj.metadata.ui_data_views.length > 0) {
+            const views = msgObj.metadata.ui_data_views;
+            const viewsContainer = document.createElement("div");
+            viewsContainer.className = "msg-data-views-container";
+            viewsContainer.style = "margin-top: 14px; border: 1px solid var(--border-color); border-radius: 8px; overflow: hidden; background-color: var(--bg-panel); display: flex; flex-direction: column; width: 100%; box-shadow: var(--shadow-md);";
+
+            const safeMsgId = makeSafeId(msgId);
+
+            viewsContainer.innerHTML = `
+                <div class="sheet-tabs-container" style="background-color: #151f30; padding: 6px 10px; display: flex; gap: 6px; overflow-x: auto; border-bottom: 1px solid var(--border-color);">
+                    ${views.map((f, idx) => `
+                        <button class="sheet-tab msg-sheet-tab-${safeMsgId} ${idx === 0 ? 'active' : ''}" data-file="${f}" style="padding: 4px 10px; font-size: 11.5px; border-radius: 4px; font-weight: bold; background: none; border: 1px solid transparent; color: var(--text-secondary); cursor: pointer; transition: all 0.15s; white-space: nowrap;">📊 ${f}</button>
+                    `).join("")}
+                </div>
+                <div class="data-grid-wrapper" id="msg-grid-target-${safeMsgId}" style="max-height: 280px; overflow-y: auto; overflow-x: auto; background-color: var(--bg-panel);"></div>
+            `;
+
+            contentDiv.appendChild(viewsContainer);
+
+            async function renderMsgGrid(filename) {
+                const gridTarget = viewsContainer.querySelector(`#msg-grid-target-${safeMsgId}`);
+                if (!gridTarget) return;
+
+                gridTarget.innerHTML = `<div class="empty-viewer-msg" style="padding: 15px;"><span class="spinner inline" style="margin-right: 8px;"></span> Loading dataset preview...</div>`;
+                try {
+                    const res = await fetch(`/api/workspace_files/${encodeURIComponent(filename)}`);
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const csvText = await res.text();
+
+                    if (typeof Papa === "undefined") {
+                        gridTarget.innerHTML = `<div class="empty-viewer-msg" style="padding: 15px; color: #ef4444;">Failed to render: PapaParse library missing.</div>`;
+                        return;
+                    }
+
+                    const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
+                    const columns = parsed.meta.fields || [];
+                    const rows = parsed.data || [];
+
+                    if (columns.length === 0 || rows.length === 0) {
+                        gridTarget.innerHTML = `<div class="empty-viewer-msg" style="padding: 15px;">Dataset is empty.</div>`;
+                        return;
+                    }
+
+                    gridTarget.innerHTML = `
+                        <table class="data-table" style="font-size: 11.5px; width: 100%; border-collapse: collapse; text-align: left;">
+                            <thead>
+                                <tr style="background-color: #020617; color: var(--accent-color); position: sticky; top: 0; z-index: 10;">
+                                    ${columns.map(c => `<th style="padding: 8px 12px; border-bottom: 2px solid var(--border-color); font-weight: bold;">${c}</th>`).join("")}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${rows.map(r => `
+                                    <tr style="border-bottom: 1px solid var(--border-color);">
+                                        ${columns.map(c => `<td style="padding: 6px 12px;">${r[c] !== undefined ? r[c] : ''}</td>`).join("")}
+                                    </tr>
+                                `).join("")}
+                            </tbody>
+                        </table>
+                    `;
+                } catch(err) {
+                    gridTarget.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444; padding: 15px;">Failed to load dataset: ${err.message || err}</div>`;
+                }
+            }
+
+            viewsContainer.querySelectorAll(`.msg-sheet-tab-${safeMsgId}`).forEach(tab => {
+                tab.addEventListener("click", () => {
+                    viewsContainer.querySelectorAll(`.msg-sheet-tab-${safeMsgId}`).forEach(t => t.classList.remove("active"));
+                    tab.classList.add("active");
+                    renderMsgGrid(tab.dataset.file);
+                });
+            });
+
+            renderMsgGrid(views[0]);
+        }
+
         bubble.appendChild(contentDiv);
 
         // ── 1. Append Metrics Bar (Assistant only) ──
@@ -5125,20 +5527,20 @@ document.addEventListener("DOMContentLoaded", () => {
         btnChatStop.disabled = false;
         btnChatStop.textContent = "🛑 Stop";
 
-        // Dynamically show the animated thinking indicator (prevents destruction on innerHTML wipes)
-        showThinkingIndicator("Lollms is thinking...");
-
         const startTime = Date.now();
         let ttft = null;
 
-        // Clear and reload chronological history
+        // Clear and reload chronological history first
         await fetchMessageHistory();
 
         if (!regenerate) {
             // Append user bubble immediately
             renderMessageBubble(`temp-user-${Date.now()}`, "user", text);
-            chatHistory.scrollTop = chatHistory.scrollHeight;
         }
+
+        // Dynamically show the animated thinking indicator at the absolute bottom
+        showThinkingIndicator("Lollms is thinking...");
+        chatHistory.scrollTop = chatHistory.scrollHeight;
 
         let currentProse = "";
         let chatActiveProc = null;
@@ -5437,8 +5839,28 @@ function resolveProcessingTags(content) {
         const isClosed = match.toLowerCase().endsWith("</processing>");
         const lines = bodyText.trim().split("\n");
 
+        let paramsHtml = "";
+        if (attrs.params) {
+            try {
+                const unescapedParams = attrs.params.replace(/&quot;/g, '"');
+                const parsedParams = JSON.parse(unescapedParams);
+                const paramEntries = Object.entries(parsedParams).map(([key, val]) => {
+                    if (key === "code" && typeof val === "string") {
+                        return `<strong>💻 Python Code:</strong><pre style="background-color:#020617; border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-top:4px; font-family:monospace; white-space:pre-wrap; color:#cbd5e1;">${val}</pre>`;
+                    }
+                    return `<strong>⚙️ ${key}:</strong> <code style="font-family:monospace; background-color:#020617; padding:2px 4px; border-radius:4px; color:#cbd5e1;">${JSON.stringify(val)}</code>`;
+                }).join("<br/>");
+                
+                if (paramEntries) {
+                    paramsHtml = `<div class="proc-item-no-bullet"><details class="proc-params-details" style="margin-top:6px; outline:none;"><summary style="cursor:pointer; font-weight:bold; outline:none; user-select:none;">🔧 Tool Parameters / Arguments</summary><div style="margin-top:8px; font-size:11.5px; line-height:1.5;">${paramEntries}</div></details></div>`;
+                }
+            } catch(e) {
+                console.error("Failed to parse tool parameters for display:", e);
+            }
+        }
+
         if (isClosed) {
-            const statusItems = lines.map(line => {
+            let statusItems = lines.map(line => {
                 const clean = line.replace(/^\*\s*/, "").trim();
                 if (!clean) return "";
                 if (clean.startsWith("<details>")) {
@@ -5447,7 +5869,11 @@ function resolveProcessingTags(content) {
                 return `<div class="proc-item complete">✓ ${clean}</div>`;
             }).filter(x => x !== "").join("");
 
-            return `<details class="inline-proc-accordion">
+            if (paramsHtml) {
+                statusItems = paramsHtml + statusItems;
+            }
+
+            return `<details class="inline-proc-accordion" open>
 <summary class="proc-accordion-header complete">
 <span class="chevron">▶</span>
 <span>✅ ${titleText} (Complete)</span>
@@ -5457,7 +5883,7 @@ ${statusItems}
 </div>
 </details>`;
         } else {
-            const statusItems = lines.map(line => {
+            let statusItems = lines.map(line => {
                 const clean = line.replace(/^\*\s*/, "").trim();
                 if (!clean) return "";
                 if (clean.startsWith("<details>")) {
@@ -5465,6 +5891,10 @@ ${statusItems}
                 }
                 return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
             }).filter(x => x !== "").join("");
+
+            if (paramsHtml) {
+                statusItems = paramsHtml + statusItems;
+            }
 
             return `<details class="inline-proc-accordion" open>
 <summary class="proc-accordion-header">

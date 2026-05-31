@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-31 00:13]
+
+- feat(workspace,ui): add dynamic file serving and enhance tools panel
+
 ## [2026-05-29 06:54]
 
 - refactor: remove src/app and add lollms-client-app entry point

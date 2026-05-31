@@ -502,13 +502,251 @@ async def get_workspace_file_endpoint(filename: str):
     """Dynamically serve active workspace data files for HTML widget rendering."""
     if not APP_WORKSPACE_DIR:
         raise HTTPException(status_code=400, detail="No active workspace directory.")
-    
+
     file_path = APP_WORKSPACE_DIR / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found in active workspace.")
-        
+
     from fastapi.responses import FileResponse
     return FileResponse(str(file_path))
+
+
+class RawSQLQueryRequest(BaseModel):
+    sql_query: str
+
+@app.post("/api/data/{title}/raw_query")
+async def raw_sql_query_endpoint(title: str, payload: RawSQLQueryRequest):
+    """Executes a raw, user-written SQLite SQL query on the active dataset tables."""
+    active = discussion.artefacts.get(title)
+    if not active or active.get("type") != "data":
+        raise HTTPException(status_code=404, detail="Data artifact not found.")
+
+    try:
+        import sqlite3
+        import pandas as pd
+
+        ext = active.get("file_ext", ".csv")
+        current_version = active.get("version", 1)
+        is_read_only = active.get("read_only", False)
+
+        workspace_dir = APP_WORKSPACE_DIR
+        if is_read_only:
+            file_path = workspace_dir / f"{title}{ext}"
+        else:
+            file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+
+        if not file_path.exists():
+            file_path = workspace_dir / f"{title}{ext}"
+
+        if not file_path.exists():
+            raise FileNotFoundError(f"Raw data file is missing.")
+
+        conn = sqlite3.connect(":memory:")
+        if ext in (".db", ".sqlite", ".sqlite3"):
+            disk_conn = sqlite3.connect(str(file_path))
+            disk_conn.backup(conn)
+            disk_conn.close()
+        elif ext in (".xlsx", ".xls"):
+            xl = pd.ExcelFile(str(file_path))
+            for sheet_name in xl.sheet_names:
+                t_name = sheet_name.replace(" ", "_")
+                df = pd.read_excel(str(file_path), sheet_name=sheet_name)
+                df.to_sql(t_name, conn, index=False, if_exists="replace")
+        else:
+            sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+            df = pd.read_csv(str(file_path), sep=sep)
+            df.to_sql(title.replace(" ", "_"), conn, index=False, if_exists="replace")
+
+        # Execute
+        df_res = pd.read_sql_query(payload.sql_query, conn)
+        conn.close()
+
+        df_res = df_res.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
+
+        return {
+            "success": True,
+            "columns": list(df_res.columns),
+            "rows": df_res.to_dict(orient="records")
+        }
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        return {"success": False, "error": str(e)}
+
+
+class AIDataQueryRequest(BaseModel):
+    question: str
+
+@app.post("/api/data/{title}/ai_query")
+async def ai_data_query_endpoint(title: str, payload: AIDataQueryRequest):
+    """Asks the LLM to translate a natural language question into an SQL query, executes it, and returns the result."""
+    active = discussion.artefacts.get(title)
+    if not active or active.get("type") != "data":
+        raise HTTPException(status_code=404, detail="Data artifact not found.")
+
+    # 1. Fetch Schema Details
+    schema_text = active.get("content", "")
+
+    # 2. Build high-precision prompt for the LLM to generate the SQL
+    prompt = (
+        "You are a Senior SQL Developer and Database Specialist.\n"
+        f"Given the database schema for '{title}' below, translate the user's natural language question into a single, valid, optimized SQLite SQL query.\n\n"
+        "=== DATABASE SCHEMA ===\n"
+        f"{schema_text}\n"
+        "=======================\n\n"
+        f"User Question: \"{payload.question}\"\n\n"
+        "Requirements:\n"
+        "1. Output ONLY the raw SQLite SQL query inside a JSON object.\n"
+        "2. Ensure table names match the Sheet/Table names listed in the schema (spaces replaced by underscores, e.g., 'Order_Details').\n"
+        "3. Do NOT include markdown formatting, explanations, or code blocks outside the JSON."
+    )
+
+    try:
+        res_json = client.generate_structured_content(
+            prompt=prompt,
+            schema={
+                "sql_query": {
+                    "type": "string",
+                    "description": "The valid SQLite SQL query to execute."
+                },
+                "explanation": {
+                    "type": "string",
+                    "description": "A brief explanation of how this query computes the requested answer."
+                }
+            },
+            temperature=0.1
+        )
+
+        if not res_json or not isinstance(res_json, dict):
+            raise ValueError("The AI model failed to produce a structured JSON response.")
+
+        sql_query = res_json.get("sql_query", "").strip()
+        explanation = res_json.get("explanation", "").strip()
+
+        if not sql_query:
+            raise ValueError("LLM failed to generate a valid SQL query.")
+
+        # 3. Execute the SQL query inside the memory sandbox
+        import sqlite3
+        import pandas as pd
+
+        ext = active.get("file_ext", ".csv")
+        current_version = active.get("version", 1)
+        is_read_only = active.get("read_only", False)
+
+        workspace_dir = APP_WORKSPACE_DIR
+        if is_read_only:
+            file_path = workspace_dir / f"{title}{ext}"
+        else:
+            file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+
+        if not file_path.exists():
+            file_path = workspace_dir / f"{title}{ext}"
+
+        if not file_path.exists():
+            raise FileNotFoundError(f"Raw data file is missing.")
+
+        conn = sqlite3.connect(":memory:")
+        if ext in (".db", ".sqlite", ".sqlite3"):
+            disk_conn = sqlite3.connect(str(file_path))
+            disk_conn.backup(conn)
+            disk_conn.close()
+        elif ext in (".xlsx", ".xls"):
+            xl = pd.ExcelFile(str(file_path))
+            for sheet_name in xl.sheet_names:
+                t_name = sheet_name.replace(" ", "_")
+                df = pd.read_excel(str(file_path), sheet_name=sheet_name)
+                df.to_sql(t_name, conn, index=False, if_exists="replace")
+        else:
+            sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+            df = pd.read_csv(str(file_path), sep=sep)
+            df.to_sql(title.replace(" ", "_"), conn, index=False, if_exists="replace")
+
+        # Strip SQL comments and whitespace to reliably detect SELECT queries
+        clean_query = sql_query.strip()
+        clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
+        clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
+
+        is_select = clean_query.lower().startswith("select")
+
+        if is_select:
+            df_res = pd.read_sql_query(sql_query, conn)
+            conn.close()
+
+            # Replace NaNs with None for JSON serialization
+            df_res = df_res.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
+
+            return {
+                "success": True,
+                "sql_query": sql_query,
+                "explanation": explanation,
+                "columns": list(df_res.columns),
+                "rows": df_res.to_dict(orient="records")
+            }
+        else:
+            if is_read_only:
+                conn.close()
+                err_msg = "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."
+                ASCIIColors.error(f"❌ {err_msg}")
+                return {"success": False, "error": err_msg}
+
+            # Run write query
+            cursor = conn.cursor()
+            cursor.execute(sql_query)
+            conn.commit()
+
+            # Write back modified tables from memory DB back to Excel/CSV file on disk
+            if ext in (".db", ".sqlite", ".sqlite3"):
+                disk_conn = sqlite3.connect(str(file_path))
+                conn.backup(disk_conn)
+                disk_conn.close()
+            elif ext in (".xlsx", ".xls"):
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                tables = [row[0] for row in cursor.fetchall()]
+
+                new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
+                    for t in tables:
+                        df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
+                        df_write.to_excel(writer, sheet_name=t.replace("_", " "), index=False)
+
+                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
+                discussion.artefacts.update(
+                    title=title,
+                    new_content=new_schema,
+                    new_type="data",
+                    active=True,
+                    file_ext=ext
+                )
+            else:
+                new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                df_write = pd.read_sql_query(f"SELECT * FROM {title.replace(' ', '_')}", conn)
+                df_write.to_csv(new_file_path, index=False, sep=sep)
+
+                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
+                discussion.artefacts.update(
+                    title=title,
+                    new_content=new_schema,
+                    new_type="data",
+                    active=True,
+                    file_ext=ext
+                )
+
+            conn.close()
+
+            return {
+                "success": True,
+                "sql_query": sql_query,
+                "explanation": explanation,
+                "columns": ["status"],
+                "rows": [{"status": f"Query executed successfully: `{sql_query}`. Affected rows: {cursor.rowcount}"}]
+            }
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        return {"success": False, "error": str(e)}
 
 @app.get("/api/bundle/{title}")
 async def download_bundle(title: str):
@@ -537,10 +775,20 @@ async def list_artifacts_endpoint():
     artifacts = discussion.artefacts.list()
     # Group by title and keep only the latest version of each artifact for the list
     seen = {}
+
+    def get_int_version(val):
+        try:
+            if isinstance(val, str):
+                return int(float(val.split('.')[0]))
+            return int(val)
+        except Exception:
+            return 1
+
     for a in artifacts:
         t = a["title"]
-        v = a.get("version", 1)
-        if t not in seen or v > seen[t].get("version", 1):
+        v = get_int_version(a.get("version", 1))
+        seen_v = get_int_version(seen[t].get("version", 1)) if t in seen else 0
+        if t not in seen or v > seen_v:
             seen[t] = a
 
     latest_artifacts = list(seen.values())
@@ -1699,6 +1947,87 @@ async def get_data_grid(title: str, version: Optional[int] = None):
         raise HTTPException(status_code=500, detail=f"Failed to parse dataset: {e}")
 
 
+@app.post("/api/tools/import")
+async def import_tool_endpoint(file: UploadFile = File(...)):
+    """Imports a .py tool file or a .zip archive of tool files into the active workspace's tools directory."""
+    if not APP_WORKSPACE_DIR:
+        raise HTTPException(status_code=400, detail="No active workspace directory.")
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in (".py", ".zip"):
+        raise HTTPException(status_code=400, detail="Only standalone Python files (.py) or .zip tool archives are supported.")
+
+    try:
+        if suffix == ".py":
+            dest_path = APP_WORKSPACE_DIR / file.filename
+            with open(dest_path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+            ASCIIColors.success(f"✓ Standalone LCP tool imported: {file.filename}")
+
+            # Ingest as a tool-type artifact in SQLite
+            try:
+                tool_name = Path(file.filename).stem
+                code = dest_path.read_text(encoding="utf-8")
+                art_content = (
+                    f"# Smart Tool: {tool_name}\n"
+                    f"Imported on: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
+                    f"### Python Implementation (`{file.filename}`)\n"
+                    f"```python\n{code}\n```"
+                )
+                discussion.artefacts.add(
+                    title=f"{tool_name}_tool",
+                    artefact_type="tool",
+                    content=art_content,
+                    active=True
+                )
+                discussion.commit()
+            except Exception as art_err:
+                if client and client.debug:
+                    trace_exception(art_err)
+        else:
+            # Zip archive
+            import zipfile
+            with zipfile.ZipFile(file.file) as z:
+                for name in z.namelist():
+                    if name.endswith("/") or name.startswith("__MACOSX"):
+                        continue
+                    if name.endswith(".py"):
+                        member_dest = APP_WORKSPACE_DIR / Path(name).name
+                        with z.open(name) as source, open(member_dest, "wb") as target:
+                            shutil.copyfileobj(source, target)
+                        # Ingest as artifact
+                        try:
+                            tool_name = member_dest.stem
+                            code = member_dest.read_text(encoding="utf-8")
+                            art_content = (
+                                f"# Smart Tool: {tool_name}\n"
+                                f"Imported on: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
+                                f"### Python Implementation (`{member_dest.name}`)\n"
+                                f"```python\n{code}\n```"
+                            )
+                            discussion.artefacts.add(
+                                title=f"{tool_name}_tool",
+                                artefact_type="tool",
+                                content=art_content,
+                                active=True
+                            )
+                            discussion.commit()
+                        except Exception:
+                            pass
+            ASCIIColors.success(f"✓ Zip tool archive extracted successfully to workspace.")
+
+        # Trigger LCP reload
+        lcp_binding = getattr(client, "tools", None)
+        if lcp_binding and hasattr(lcp_binding, "_discover_local_tools"):
+            lcp_binding._discover_local_tools()
+
+        return {"success": True}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/save_tool")
 async def save_tool_endpoint(payload: SaveToolRequest):
     """Saves a tool to the local LCP directory and versions its artifact in SQLite."""
@@ -1966,7 +2295,7 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
         try:
             if APP_WORKSPACE_DIR and APP_WORKSPACE_DIR.exists():
                 os.chdir(str(APP_WORKSPACE_DIR))
-            exec(payload.code, {}, {})
+            exec(payload.code, {})
             return {"success": True, "output": redirected_output.getvalue()}
         except Exception as e:
             if client and client.debug:
@@ -2175,8 +2504,8 @@ async def query_data_endpoint(payload: DataQueryRequest):
         plt.close('all')
 
         # Execute code in local variables context
-        exec(payload.code, {}, local_vars)
-        
+        exec(payload.code, local_vars)
+
         # Check if any plot figure was generated
         fig_nums = plt.get_fignums()
         if fig_nums:
@@ -3037,6 +3366,8 @@ async def get_session_messages_endpoint():
                 "tokens": m.tokens or 0,
                 "generation_speed": m.generation_speed or 0,
                 "metadata": m.metadata or {},
+                "images": m.images or [],
+                "active_images": m.active_images or [],
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "siblings": sibling_ids,
                 "active_sibling_index": active_index

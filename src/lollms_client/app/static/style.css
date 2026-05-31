@@ -2341,7 +2341,17 @@ html, body, select, textarea, div {
     padding: 2px 0;
 }
 
-.proc-accordion-content details {
+/* Base pre formatting inside collapsible blocks */
+.proc-accordion-content pre {
+    margin-top: 6px;
+    font-size: 11px;
+    background: none !important;
+    border: none !important;
+    padding: 0 !important;
+}
+
+/* 1. Red Error details styling */
+.proc-accordion-content details.proc-error-details {
     margin-top: 6px;
     background-color: rgba(239, 68, 68, 0.03) !important;
     border: 1px dashed rgba(239, 68, 68, 0.25) !important;
@@ -2349,7 +2359,7 @@ html, body, select, textarea, div {
     padding: 8px 12px !important;
 }
 
-.proc-accordion-content summary {
+.proc-accordion-content details.proc-error-details summary {
     cursor: pointer;
     font-weight: bold;
     color: #fca5a5 !important;
@@ -2357,10 +2367,36 @@ html, body, select, textarea, div {
     user-select: none;
 }
 
-.proc-accordion-content pre {
+/* 2. Green Success Output details styling */
+.proc-accordion-content details.proc-success-details {
     margin-top: 6px;
-    font-size: 11px;
-    background: none !important;
-    border: none !important;
-    padding: 0 !important;
+    background-color: rgba(16, 185, 129, 0.03) !important;
+    border: 1px dashed rgba(16, 185, 129, 0.25) !important;
+    border-radius: 6px !important;
+    padding: 8px 12px !important;
+}
+
+.proc-accordion-content details.proc-success-details summary {
+    cursor: pointer;
+    font-weight: bold;
+    color: #a7f3d0 !important; /* Light green */
+    outline: none;
+    user-select: none;
+}
+
+/* 3. Amber Parameters/Arguments details styling */
+.proc-accordion-content details.proc-params-details {
+    margin-top: 6px;
+    background-color: rgba(245, 158, 11, 0.02) !important;
+    border: 1px dashed rgba(245, 158, 11, 0.15) !important;
+    border-radius: 6px !important;
+    padding: 8px 12px !important;
+}
+
+.proc-accordion-content details.proc-params-details summary {
+    cursor: pointer;
+    font-weight: bold;
+    color: #fde68a !important; /* Light amber */
+    outline: none;
+    user-select: none;
 }

@@ -131,6 +131,15 @@ class ExportMixin:
                     return art["content"].encode("utf-8"), "text/html"
                 return self._export_text_as_html(art), "text/html"
             elif fmt == "pdf":
+                content_stripped = art.get("content", "").strip()
+                is_latex = (
+                    art.get("language") in ("latex", "tex") or
+                    content_stripped.startswith("\\documentclass") or
+                    content_stripped.startswith("```latex") or
+                    content_stripped.startswith("```tex")
+                )
+                if is_latex:
+                    return self._export_latex_as_pdf(art), "application/pdf"
                 return self._export_text_as_pdf(art), "application/pdf"
             elif fmt == "docx":
                 return self._export_text_as_docx(art), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -178,6 +187,38 @@ class ExportMixin:
 </html>
 """
         return html.encode("utf-8")
+
+    def _export_latex_as_pdf(self, art: Dict[str, Any]) -> bytes:
+        import shutil
+        import re
+        if not shutil.which("pdflatex"):
+            raise RuntimeError(
+                "LaTeX compilation engine ('pdflatex') was not found on your system.\n"
+                "Please install a LaTeX distribution:\n"
+                "  • Windows: MiKTeX (https://miktex.org/)\n"
+                "  • macOS: MacTeX (https://www.tug.org/mactex/)\n"
+                "  • Linux: TeX Live (sudo apt install texlive-latex-extra latexmk)"
+            )
+
+        import pipmaster as pm
+        pm.ensure_packages("pdflatex")
+        from pdflatex import PDFLaTeX
+
+        content = art.get("content", "")
+
+        # Strip any leading/trailing markdown code fences that the LLM might have used
+        content_clean = content.strip()
+        content_clean = re.sub(r'^```latex\s*|\s*```$', '', content_clean, flags=re.IGNORECASE).strip()
+        content_clean = re.sub(r'^```tex\s*|\s*```$', '', content_clean, flags=re.IGNORECASE).strip()
+
+        try:
+            pdfl = PDFLaTeX.from_binarystring(content_clean.encode("utf-8"), "document")
+            pdf_bytes, log, status = pdfl.create_pdf()
+            if not pdf_bytes:
+                raise ValueError(f"pdflatex returned empty output. Log:\n{log}")
+            return pdf_bytes
+        except Exception as e:
+            raise RuntimeError(f"LaTeX Compilation Failed: {e}")
 
     def _export_text_as_pdf(self, art: Dict[str, Any]) -> bytes:
         import pipmaster as pm
@@ -506,13 +547,19 @@ class ExportMixin:
         import pipmaster as pm
         pm.ensure_packages("pandas")
         import pandas as pd
-        
+
         ext = art.get("file_ext", ".csv")
         title = art["title"]
         version = art.get("version", 1)
         workspace_dir = Path("./data_workspace")
+        try:
+            from lollms_client.app.server import APP_WORKSPACE_DIR
+            if APP_WORKSPACE_DIR is not None:
+                workspace_dir = APP_WORKSPACE_DIR
+        except ImportError:
+            pass
         file_path = workspace_dir / f"{title}_v{version}{ext}"
-        
+
         if not file_path.exists():
             raise FileNotFoundError(f"Original dataset file not found at {file_path}")
             
@@ -544,13 +591,19 @@ class ExportMixin:
         import pipmaster as pm
         pm.ensure_packages(["pandas", "openpyxl"])
         import pandas as pd
-        
+
         ext = art.get("file_ext", ".csv")
         title = art["title"]
         version = art.get("version", 1)
         workspace_dir = Path("./data_workspace")
+        try:
+            from lollms_client.app.server import APP_WORKSPACE_DIR
+            if APP_WORKSPACE_DIR is not None:
+                workspace_dir = APP_WORKSPACE_DIR
+        except ImportError:
+            pass
         file_path = workspace_dir / f"{title}_v{version}{ext}"
-        
+
         if not file_path.exists():
             raise FileNotFoundError(f"Original dataset file not found at {file_path}")
             
