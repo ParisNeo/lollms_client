@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-05-31 23:00]
+
+- feat(artefacts): add rename method and enhanced revert with version aliases
+
 ## [2026-05-31 00:35]
 
 - feat: add AI data query endpoint and update client bindings

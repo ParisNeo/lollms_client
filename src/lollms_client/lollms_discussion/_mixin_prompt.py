@@ -592,7 +592,7 @@ RULES:
             "</artifact>",
             "",
             "── Option D: REVERT",
-            '<artifact name="filename.ext" revert_to="v3" />',
+            '<revert_artifact name="filename.ext" version="3" />  (Use "previous" to go back one version)',
             "",
 "╔══════════════════════════════════════════════════════════════════╗",
             "║  SURGICAL UPDATE POLICY — READ BEFORE EVERY ARTEFACT EDIT       ║",

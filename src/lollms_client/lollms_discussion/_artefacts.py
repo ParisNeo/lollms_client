@@ -42,7 +42,7 @@
 import re
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from ascii_colors import ASCIIColors
 
@@ -493,12 +493,26 @@ class ArtefactManager:
         ASCIIColors.success(f"[ArtefactManager] Incremented '{target_title}' to v{new_version}")
         return result
 
-    def revert(self, title: str, target_version: int) -> Dict[str, Any]:
+    def revert(self, title: str, target_version: Union[int, str]) -> Dict[str, Any]:
+        latest = self.get(title)
+        if latest is None:
+            raise ValueError(f"Artefact '{title}' not found.")
+
+        if isinstance(target_version, str) and str(target_version).strip().lower() in ("last", "previous", "prev"):
+            curr_v = latest.get('version', 1)
+            if curr_v <= 1:
+                raise ValueError(f"Cannot revert '{title}': no previous version exists (current is v1).")
+            target_version = curr_v - 1
+        else:
+            try:
+                target_version = int(target_version)
+            except ValueError:
+                raise ValueError(f"Invalid target version: {target_version}")
+
         target = self.get(title, target_version)
         if target is None:
             raise ValueError(f"Version {target_version} of artefact '{title}' not found.")
-        latest = self.get(title)
-        new_version = (latest.get('version', 1) + 1) if latest else 1
+        new_version = (latest.get('version', 1) + 1)
         extra_keys = {k: v for k, v in target.items() if k not in [
             "id", "title", "type", "version", "content", "images", "image_media_types",
             "audios", "videos", "zip", "language", "url", "tags", "active",
@@ -521,6 +535,37 @@ class ArtefactManager:
             active            = True,
             **extra_keys,
         )
+
+    def rename(self, old_title: str, new_title: str, new_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Renames all versions of an artifact from old_title to new_title.
+        Optionally changes the type to new_type.
+        """
+        artefacts = self._get_all_raw()
+        found = False
+        for a in artefacts:
+            if a.get('title') == old_title:
+                a['title'] = new_title
+                a['updated_at'] = datetime.utcnow().isoformat()
+                if new_type is not None:
+                    a['type'] = new_type
+                # If there is content containing image-anchor IDs, rename them as well
+                content = a.get('content', '')
+                if content:
+                    a['content'] = content.replace(
+                        f'id="{old_title}{_IMAGE_ID_SEP}',
+                        f'id="{new_title}{_IMAGE_ID_SEP}'
+                    ).replace(
+                        f"id='{old_title}{_IMAGE_ID_SEP}",
+                        f"id='{new_title}{_IMAGE_ID_SEP}'"
+                    )
+                found = True
+
+        if found:
+            self._save_all(artefacts)
+            ASCIIColors.success(f"[ArtefactManager] Renamed all versions of '{old_title}' to '{new_title}'")
+            return self.get(new_title)
+        return None
 
     # --------------------------------------------------------- versioning
 
@@ -1762,12 +1807,12 @@ class ArtefactManager:
             attrs   = _parse_attrs(match.group(1))
             title   = attrs.get('name') or attrs.get('title')
             version = attrs.get('version')
-            if title and version and version.isdigit():
+            if title and version:
                 resolved = title if title in existing_titles else (
                     _find_best_title_match(title, existing_titles) or title
                 )
                 try:
-                    res_artefact = self.revert(resolved, int(version))
+                    res_artefact = self.revert(resolved, version)
                     affected.append(res_artefact)
                     if event_callback:
                         try:
