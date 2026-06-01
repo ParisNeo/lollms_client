@@ -3225,10 +3225,13 @@ class ChatMixin:
             if mem_cleaned != ai.content:
                 ai.content = mem_cleaned
 
+            if _mm:
+                self._save_episodic_memory_turn(user_message, ai.content, _mm)
+
             if affected and callback:
                 _cb(callback, json.dumps([a.get("title") for a in affected]),
                     MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {"artefacts": affected})
-            
+
             # Auto-dream pass
             dream_report = None
             if enable_auto_dream and _mm is not None:
@@ -4685,10 +4688,74 @@ class ChatMixin:
             _step_end(callback, "Pre-flight retrieval complete", preflight_id,
                       {"source_count": len(collected_sources)})
  
+        # Quick intent check to see if the user's message actually requires tools or agentic actions
+        _needs_tools = False
+        if tool_registry or enable_image_generation or enable_image_editing or enable_artefacts:
+            try:
+                intent_prompt = (
+                    f"User message: \"{user_message}\"\n\n"
+                    "Analyze if this message requires executing an external tool, modifying/creating files (artifacts), or generating/editing images.\n"
+                    "Return false if the user is just having a normal conversation, greeting you, asking a general question, or talking casually."
+                )
+                intent_res = self.lollmsClient.generate_structured_content(
+                    prompt=intent_prompt,
+                    schema={
+                        "requires_tools_or_actions": {
+                            "type": "boolean",
+                            "description": "True if the message requests a tool execution, file modification/creation, or image generation/edit. False for normal conversation."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Brief reasoning for the decision."
+                        }
+                    },
+                    temperature=0.0
+                )
+                if intent_res and isinstance(intent_res, dict):
+                    _needs_tools = intent_res.get("requires_tools_or_actions", False)
+                    ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
+            except Exception as e:
+                _needs_tools = True
+                ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to True.")
+        else:
+            _needs_tools = False
+
+        # Quick intent check to see if the user's message actually requires tools or agentic actions
+        _needs_tools = False
+        if tool_registry or enable_image_generation or enable_image_editing or enable_artefacts:
+            try:
+                intent_prompt = (
+                    f"User message: \"{user_message}\"\n\n"
+                    "Analyze if this message requires executing an external tool, modifying/creating files (artifacts), or generating/editing images.\n"
+                    "Return false if the user is just having a normal conversation, greeting you, asking a general question, or talking casually."
+                )
+                intent_res = self.lollmsClient.generate_structured_content(
+                    prompt=intent_prompt,
+                    schema={
+                        "requires_tools_or_actions": {
+                            "type": "boolean",
+                            "description": "True if the message requests a tool execution, file modification/creation, or image generation/edit. False for normal conversation."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Brief reasoning for the decision."
+                        }
+                    },
+                    temperature=0.0
+                )
+                if intent_res and isinstance(intent_res, dict):
+                    _needs_tools = intent_res.get("requires_tools_or_actions", False)
+                    ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
+            except Exception as e:
+                _needs_tools = True
+                ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to True.")
+        else:
+            _needs_tools = False
+
         # ====================================================================
         #  FAST PATH — no external tools registered
         # ====================================================================
-        _has_external_tools = bool(tool_registry)
+        _has_external_tools = bool(tool_registry) and _needs_tools
  
         if not _has_external_tools:
             ss = _StreamState(
@@ -4809,7 +4876,10 @@ class ChatMixin:
                 ai_message.content, _mm, callback)
             if _mem_cleaned != ai_message.content:
                 ai_message.content = _mem_cleaned
-            
+
+            if _mm:
+                self._save_episodic_memory_turn(user_message, ai_message.content, _mm)
+
             # Auto-dream pass
             dream_report = None
             if enable_auto_dream and _mm is not None:
@@ -6094,7 +6164,7 @@ class ChatMixin:
         _seems_stuck = _tool_call_count >= 3 and not _has_produced_text
 
         _needs_forced_answer = (
-            is_agentic_turn and (
+            is_agentic_turn and not _has_produced_text and (
                 not ai_message.content.strip()
                 or _round >= max_reasoning_steps
                 or _seems_stuck
@@ -6300,12 +6370,15 @@ class ChatMixin:
         )
         if _mem_cleaned != ai_message.content:
             ai_message.content = _mem_cleaned
- 
+
+        if _mm:
+            self._save_episodic_memory_turn(user_message, ai_message.content, _mm)
+
         if self._is_db_backed and self.autosave:
             self.commit()
- 
+
         object.__setattr__(self, '_active_callback', None)
- 
+
         return {
             "user_message":     user_msg,
             "ai_message":       ai_message,

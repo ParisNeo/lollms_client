@@ -414,11 +414,20 @@ class UtilsMixin:
             ("scratchpad", (getattr(self, "scratchpad", "") or "")),
             ("pruning_summary", (pruning_block or ""))
         ]
-        
+
         for key, text in zone_map:
             val = (text or "").strip()
             if val:
                 zone_breakdown[key] = {"tokens": tokenizer(val)}
+
+        _mm = getattr(self, "memory_manager", None)
+        if _mm:
+            working_txt = _mm.build_working_zone(token_counter=tokenizer)
+            deep_txt = _mm.build_handles_zone(token_counter=tokenizer)
+            episodic_txt = _mm.build_episodic_zone(token_counter=tokenizer)
+            if working_txt: zone_breakdown["working_memory"] = {"tokens": tokenizer(working_txt)}
+            if deep_txt: zone_breakdown["deep_memory"] = {"tokens": tokenizer(deep_txt)}
+            if episodic_txt: zone_breakdown["episodic_memory"] = {"tokens": tokenizer(episodic_txt)}
 
         # ── 2. Artefacts Grouped Breakdown ──────────────────────────────────
         active_artefacts = self.artefacts.list(active_only=True)

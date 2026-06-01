@@ -22,6 +22,9 @@
 #   Very old, near-zero importance memories. The `dream()` pass can either
 #   promote them back or mark them for permanent deletion.
 #
+# Level 4 — Episodic Memory  (SQLite, persistent records of past events/conversations)
+#   Historical context of past interactions and specific user-AI sessions.
+#
 # IMPORTANCE SCORING
 # ──────────────────
 # Each memory carries a float [0.0, 1.0] importance score.
@@ -456,6 +459,20 @@ class LollmsMemoryManager:
             body = "\n".join(lines)
         return "=== DEEP MEMORY HANDLES ===\n(Use <mem_load id=\"ID\"/> to bring into working memory)\n" + body + "\n=== END DEEP MEMORY HANDLES ===\n"
 
+    def build_episodic_zone(self, token_counter=None) -> str:
+        with self._session() as s:
+            recs = (self._q(s).filter(_MemoryRecord.level == 4).order_by(_MemoryRecord.importance.desc()).all())
+            if not recs: return ""
+            dicts = [self._to_dict(r) for r in recs]
+        budget = self.config.handles_token_budget
+        lines, used = [], 0
+        for r in dicts:
+            line = f"  [{r['id'][:8]}] (Episodic) {r['content'][:120]}"
+            tok = token_counter(line) if token_counter else len(line) // 4
+            if used + tok > budget: break
+            lines.append(line); used += tok
+        return "=== EPISODIC MEMORY ===\n(History of past events, interactions, or user-AI sessions)\n" + "\n".join(lines) + "\n=== END EPISODIC MEMORY ===\n" if lines else ""
+
     def build_system_instructions(self) -> str:
         return (
             "\n=== MEMORY SYSTEM ===\n\n"
@@ -464,6 +481,7 @@ class LollmsMemoryManager:
             "   👉 CRITICAL RULE: When you utilize or refer to an active memory [ID] to answer, you MUST prepend `<mem_tag id=\"ID\" />` to your response so the system can track its usage.\n"
             "── Deep Memory: Stored memories that are currently inactive. Only their compact handles appear. "
             "If you see a handle (e.g. [abc123de]) that contains information needed to answer the user's question, you MUST load it first by outputting `<mem_load id=\"ID\" />`.\n"
+            "── Episodic Memory: Memory of specific past events, experiences, or previous conversation sessions. They appear in the EPISODIC MEMORY zone below to provide historical context of past interactions.\n"
             "── Tags Available:\n"
             "   • `<mem_new importance=\"...\">content</mem_new>` — Save a new fact/preference (importance is a float, default 0.75).\n"
             "     🚨 CURATION PROTOCOL (ONLY SAVE HIGH-DENSITY, PERSISTENT KNOWLEDGE):\n"
@@ -525,7 +543,7 @@ class LollmsMemoryManager:
     def apply_decay(self) -> int:
         now, count = datetime.utcnow(), 0
         with self._session() as s:
-            for r in self._q(s).all():
+            for r in self._q(s).filter(_MemoryRecord.level <= 3).all():
                 delta = (now - r.updated_at).total_seconds() / 86400.0
                 new_imp = max(0.0, r.importance - (self.config.decay_rate_per_day * delta))
                 if abs(new_imp - r.importance) > 0.001:

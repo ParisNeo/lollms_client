@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
-
+import re
 from ascii_colors import ASCIIColors
-
+from datetime import datetime
 if TYPE_CHECKING:
     from .lollms_memory import LollmsMemoryManager
 
@@ -35,8 +35,22 @@ class MemoryMixin:
         if mm is None: return ""
         working = mm.build_working_zone(token_counter=token_counter)
         handles = mm.build_handles_zone(token_counter=token_counter)
-        parts = [p for p in (working, handles) if p]
+        episodic = mm.build_episodic_zone(token_counter=token_counter)
+        parts = [p for p in (working, handles, episodic) if p]
         return "\n".join(parts) if parts else ""
+
+    def _save_episodic_memory_turn(self, user_text: str, ai_text: str, mm: Optional['LollmsMemoryManager']):
+        if mm is None:
+            return
+        # Clean AI text of processing tags or HTML tags
+        clean_ai = re.sub(r'<processing.*?>.*?</processing>', '', ai_text, flags=re.DOTALL)
+        clean_ai = re.sub(r'<[^>]+>', '', clean_ai).strip()
+        clean_user = user_text.strip()
+        if not clean_user or not clean_ai:
+            return
+
+        episode_content = f"Event/Interaction on {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC:\nUser asked: \"{clean_user}\"\nAI responded: \"{clean_ai}\""
+        mm.add(content=episode_content, importance=0.8, tags=["episode", "interaction"], level=4)
 
     def _process_memory_tags(self, text: str, mm: Optional['LollmsMemoryManager'], callback=None) -> tuple:
         if mm is None: return text, {}

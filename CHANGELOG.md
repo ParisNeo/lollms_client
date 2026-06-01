@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-01 23:21]
+
+- feat: add Lollms Text Processor documentation and update dependencies
+
 ## [2026-05-31 23:00]
 
 - feat(artefacts): add rename method and enhanced revert with version aliases
