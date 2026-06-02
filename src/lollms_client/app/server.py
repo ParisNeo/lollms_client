@@ -34,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
+import sys
 
 from lollms_client import LollmsClient
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager
@@ -409,7 +410,7 @@ async def import_document(
     Uploads a file, writes it to a temporary path, and returns a StreamingResponse
     yielding real-time progress updates and the final output via SSE.
     """
-    if mode not in ("text", "text_images", "text_embedded_images", "images_only", "ocr", "data"):
+    if mode not in ("text", "text_images", "text_embedded_images", "images_only", "ocr", "data", "data_bundle"):
         raise HTTPException(status_code=400, detail="Invalid import mode selected.")
 
     suffix = Path(file.filename).suffix
@@ -509,6 +510,121 @@ async def get_workspace_file_endpoint(filename: str):
 
     from fastapi.responses import FileResponse
     return FileResponse(str(file_path))
+
+
+@app.post("/api/validate_folder")
+async def validate_folder_endpoint(payload: dict):
+    """
+    Validates that a folder path exists and is accessible.
+
+    Expects JSON body: {"folder_path": "path/to/folder"}
+    """
+    from pathlib import Path
+
+    folder_path = Path(payload.get("folder_path", "").strip())
+
+    if not folder_path.exists():
+        return {"success": False, "error": f"Path does not exist: {folder_path}"}
+
+    if not folder_path.is_dir():
+        return {"success": False, "error": f"Path is not a directory: {folder_path}"}
+
+    # Check if folder is accessible and contains files
+    try:
+        file_count = len(list(folder_path.glob("*")))
+        return {"success": True, "path": str(folder_path), "file_count": file_count}
+    except Exception as e:
+        return {"success": False, "error": f"Cannot access folder: {e}"}
+
+
+@app.post("/api/import_folder")
+async def import_folder_endpoint(payload: dict):
+    """
+    Imports an entire folder of data files (CSV, XLSX, SQLite) and consolidates them
+    into a single SQLite database for querying.
+
+    Expects JSON body: {"folder_path": "path/to/folder", "title": "optional_title"}
+    """
+    from pathlib import Path
+    import threading
+    import queue
+    import asyncio
+    from fastapi.responses import StreamingResponse
+    import json
+
+    folder_path = Path(payload.get("folder_path", "").strip())
+    title = payload.get("title")
+
+    if not folder_path.exists() or not folder_path.is_dir():
+        return {"success": False, "error": f"Invalid folder path: {folder_path}"}
+
+    if not title:
+        title = folder_path.stem
+
+    if not APP_WORKSPACE_DIR:
+        return {"success": False, "error": "No active workspace directory configured."}
+
+    def progress_callback(msg: str):
+        ASCIIColors.info(f"[Folder Import] {msg}")
+
+    def run_folder_import():
+        try:
+            # Ensure NumPy 2.x compatibility by trying to import pandas first
+            # If numexpr fails, we'll catch it and provide a helpful error message
+            try:
+                import pandas as pd
+            except Exception as import_err:
+                error_msg = str(import_err)
+                if "NumPy" in error_msg and "2.x" in error_msg:
+                    ASCIIColors.error("❌ NumPy 2.x compatibility issue detected!")
+                    ASCIIColors.error("   Please run: pip install --upgrade numexpr")
+                    ASCIIColors.error("   Or: pip uninstall numexpr && pip install 'numexpr>=3.0.0'")
+                    return {"success": False, "error": f"NumPy compatibility issue: {error_msg}"}
+                else:
+                    raise
+
+            result = discussion.import_file(
+                path=folder_path,
+                mode="data_bundle",
+                title=title,
+                activate=True,
+                progress_cb=progress_callback
+            )
+            return result
+        except Exception as e:
+            ASCIIColors.error(f"❌ Folder import failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+
+    # Run import in thread and return result
+    import_thread = threading.Thread(target=run_folder_import, daemon=True)
+    import_thread.start()
+    import_thread.join()  # Wait for completion
+
+    # Check if the consolidated DB file exists
+    db_file_path = APP_WORKSPACE_DIR / f"{title}_consolidated.db"
+    if not db_file_path.exists():
+        return {
+            "success": False,
+            "error": f"Consolidated database file not created. Check logs for errors. Path: {db_file_path}"
+        }
+
+    # Get file count for response
+    try:
+        file_count = len(list(folder_path.glob("*")))
+    except:
+        file_count = 0
+
+    return {
+        "success": True,
+        "title": title,
+        "mode": "data_bundle",
+        "file_count": file_count,
+        "groups": 1,
+        "message": f"Folder imported successfully: {folder_path}",
+        "db_path": str(db_file_path)
+    }
 
 
 class RawSQLQueryRequest(BaseModel):
@@ -885,6 +1001,8 @@ async def toggle_artifact_read_only_endpoint(title: str):
             trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
+class DeleteArtifactVersionEndpoint(BaseModel):
+    target_version: int
 
 @app.delete("/api/artifacts/{title}/versions/{version}")
 async def delete_artifact_version_endpoint(title: str, version: int):
@@ -916,6 +1034,119 @@ async def delete_artifact_version_endpoint(title: str, version: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class DeleteArtifactFullRequest(BaseModel):
+    delete_physical_data: bool = False  # Optionally drop the physical database table
+
+
+@app.delete("/api/artifacts/{title}")
+async def delete_artifact_endpoint(title: str, payload: DeleteArtifactFullRequest = None):
+    """Deletes an artifact and optionally its associated physical data tables."""
+    try:
+        if payload is None:
+            payload = DeleteArtifactFullRequest()
+
+        # If deleting physical data for data artifacts
+        if payload.delete_physical_data:
+            active = discussion.artefacts.get(title)
+            if active and active.get("type") == "data":
+                ext = active.get("file_ext", ".db")
+                workspace_dir = APP_WORKSPACE_DIR
+                db_path = workspace_dir / f"{title}_consolidated.db"
+
+                if db_path.exists():
+                    import sqlite3
+                    conn = sqlite3.connect(str(db_path))
+                    cursor = conn.cursor()
+
+                    # Get all table names in the DB
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                    tables = [row[0] for row in cursor.fetchall()]
+
+                    # Find matching tables (tables starting with artifact title)
+                    matching_tables = [t for t in tables if t.startswith(title.replace("-", "_").replace(" ", "_"))]
+
+                    if matching_tables:
+                        for tbl in matching_tables:
+                            try:
+                                cursor.execute(f'DROP TABLE "{tbl}";')
+                            except Exception as drop_err:
+                                ASCIIColors.warning(f"Failed to drop table '{tbl}': {drop_err}")
+
+                        conn.commit()
+                        conn.close()
+                        ASCIIColors.success(f"✓ Dropped {len(matching_tables)} physical tables for artifact '{title}'")
+
+        removed_main = discussion.artefacts.remove(title)
+        removed_comp = discussion.artefacts.remove(f"{title}::images")
+        discussion.commit()
+        return {"success": True, "removed_main": removed_main, "removed_comp": removed_comp, "tables_dropped": payload.delete_physical_data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/artifacts/{title}/cleanup_orphaned_tables")
+async def cleanup_orphaned_tables_endpoint(title: str):
+    """Scans the consolidated database for tables that no longer have corresponding artifacts and removes them."""
+    try:
+        active = discussion.artefacts.get(title)
+        if not active or active.get("type") != "data":
+            raise HTTPException(status_code=400, detail="Only data artifacts support table cleanup.")
+
+        ext = active.get("file_ext", ".db")
+        workspace_dir = APP_WORKSPACE_DIR
+        db_path = workspace_dir / f"{title}_consolidated.db"
+
+        if not db_path.exists():
+            raise HTTPException(status_code=404, detail="Consolidated database file not found.")
+
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+
+        # Get all table names in the DB
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
+
+        # Get active artifact titles from discussion
+        artifacts = discussion.artefacts.list(active_only=False)
+        active_titles = {a["title"] for a in artifacts if a.get("type") == "data"}
+
+        orphaned_tables = []
+        for tbl in tables:
+            # Check if any active artifact title matches this table name prefix
+            has_owner = False
+            for art_title in active_titles:
+                expected_prefix = art_title.replace("-", "_").replace(" ", "_")
+                if tbl.startswith(expected_prefix):
+                    has_owner = True
+                    break
+
+            if not has_owner and tbl != "sqlite_sequence":
+                orphaned_tables.append(tbl)
+
+        # Optionally delete orphaned tables
+        deleted_count = 0
+        for tbl in orphaned_tables:
+            try:
+                cursor.execute(f'DROP TABLE "{tbl}";')
+                deleted_count += 1
+            except Exception as drop_err:
+                ASCIIColors.warning(f"Failed to drop orphaned table '{tbl}': {drop_err}")
+
+        conn.commit()
+        conn.close()
+
+        return {"success": True, "orphaned_tables_found": len(orphaned_tables), "tables_deleted": deleted_count}
+    except HTTPException:
+        raise
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
 class SquashRequest(BaseModel):
     keep_last_n: Optional[int] = None
     target_version: Optional[int] = None
@@ -1908,8 +2139,21 @@ async def get_data_grid(title: str, version: Optional[int] = None):
     ext = active.get("file_ext", ".csv")
     current_version = active.get("version", 1)
     workspace_dir = APP_WORKSPACE_DIR
-    file_path = workspace_dir / f"{title}_v{current_version}{ext}"
-    if not file_path.exists():
+
+    # Check multiple possible file paths for data_bundle imports
+    possible_paths = [
+        workspace_dir / f"{title}_consolidated.db",  # Folder bundle consolidation
+        workspace_dir / f"{title}_v{current_version}{ext}",  # Standard versioned
+        workspace_dir / f"{title}{ext}",  # Unversioned fallback
+    ]
+
+    file_path = None
+    for path in possible_paths:
+        if path.exists():
+            file_path = path
+            break
+
+    if not file_path:
         # Fallback scan: check other workspaces and the global data_workspace
         found_path = None
         scan_dirs = [Path("./data_workspace")]
@@ -1920,10 +2164,14 @@ async def get_data_grid(title: str, version: Optional[int] = None):
                     if d.is_dir():
                         scan_dirs.append(d / "data_workspace")
         for sd in scan_dirs:
-            cand = sd / f"{title}_v{current_version}{ext}"
-            if cand.exists():
-                found_path = cand
+            for base_name in [f"{title}_consolidated.db", f"{title}_v{current_version}{ext}", f"{title}{ext}"]:
+                cand = sd / base_name
+                if cand.exists():
+                    found_path = cand
+                    break
+            if found_path:
                 break
+
         if found_path:
             import shutil
             try:
@@ -1938,8 +2186,8 @@ async def get_data_grid(title: str, version: Optional[int] = None):
             except Exception:
                 pass
 
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Raw data file missing from workspace.")
+    if not file_path or not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Raw data file missing from workspace. Searched: {possible_paths}")
 
     import pandas as pd
     try:
