@@ -298,6 +298,14 @@
                         <p>Drag & drop PDF, DOCX, PPTX, MD, CSV, XLSX, DB, or Image file here, or click to upload (supports multiple files)</p>
                         <input type="file" id="file-input" hidden multiple>
                     </div>
+                    <div class="input-group" id="folder-import-section" style="display: none; margin-top: 12px;">
+                        <label for="folder-path">📂 Import Folder Path (Consolidates all CSV/XLSX/SQLite files)</label>
+                        <p style="font-size: 11px; color: var(--text-secondary); margin-top: -6px; margin-bottom: 6px;">Note: Please paste the full folder path manually. Browser security restrictions prevent automatic folder path selection.</p>
+                        <div style="display: flex; gap: 8px;">
+                            <input type="text" id="folder-path" placeholder="e.g. ./cheminement_conta or C:\Users\name\folder" style="flex: 1; padding: 8px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none;" />
+                            <button class="btn btn-secondary" id="btn-validate-folder" style="width: auto; cursor: pointer;">✓ Validate Path</button>
+                        </div>
+                    </div>
                     <div class="input-group">
                         <label for="import-mode">Import Mode</label>
                         <select id="import-mode">
@@ -307,6 +315,7 @@
                             <option value="images_only">Images Only (Converts pages strictly to images)</option>
                             <option value="ocr">OCR Transcription (Extracts visual text via Vision LLM)</option>
                             <option value="data">Data Interface (Spreadsheet / SQLite DB Tables)</option>
+                            <option value="data_bundle">Folder Bundle (Consolidates all data files in folder)</option>
                         </select>
                     </div>
                     <div class="input-group">
