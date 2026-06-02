@@ -85,11 +85,11 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
 
             for idx, table in enumerate(tables):
                 if progress_cb: progress_cb(f"Analyzing table '{table}' ({idx+1}/{len(tables)})...")
-                # Get table schema (columns and types)
-                cursor.execute(f"PRAGMA table_info({table});")
+                # Get table schema (columns and types) - quote table name to handle special chars
+                cursor.execute(f'PRAGMA table_info("{table}");')
                 columns_info = cursor.fetchall()
-                # Get exact row count
-                cursor.execute(f"SELECT COUNT(*) FROM {table};")
+                # Get exact row count - quote table name
+                cursor.execute(f'SELECT COUNT(*) FROM "{table}";')
                 row_count = cursor.fetchone()[0]
 
                 schema_parts.append(f"## Table: {table}")
@@ -99,9 +99,9 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                     pk_marker = " — PRIMARY KEY" if col[5] else ""
                     schema_parts.append(f"  • {col[1]} ({col[2] or 'ANY'}){pk_marker}")
 
-                # Fetch a quick markdown preview using pandas
+                # Fetch a quick markdown preview using pandas - quote table name
                 try:
-                    df = pd.read_sql_query(f"SELECT * FROM {table} LIMIT 3;", conn)
+                    df = pd.read_sql_query(f'SELECT * FROM "{table}" LIMIT 3;', conn)
                     schema_parts.append("### Preview (First 3 Rows):")
                     schema_parts.append(df.to_markdown(index=False))
                 except Exception as ex:
