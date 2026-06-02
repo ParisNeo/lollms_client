@@ -109,6 +109,7 @@ IMPORT_MODE_TEXT_EMBEDDED_IMAGES = "text_embedded_images"
 IMPORT_MODE_IMAGES_ONLY = "images_only"
 IMPORT_MODE_OCR         = "ocr"
 IMPORT_MODE_DATA        = "data"
+IMPORT_MODE_DATA_BUNDLE = "data_bundle"
 
 ALL_IMPORT_MODES = {
     IMPORT_MODE_TEXT,
@@ -117,6 +118,7 @@ ALL_IMPORT_MODES = {
     IMPORT_MODE_IMAGES_ONLY,
     IMPORT_MODE_OCR,
     IMPORT_MODE_DATA,
+    IMPORT_MODE_DATA_BUNDLE,
 }
 
 # Extensions treated as source code → ArtefactType.CODE
@@ -682,6 +684,49 @@ def _extract_xlsx_text(path: Path) -> str:
 
 # ── Pure images ────────────────────────────────────────────────────────────
 
+import difflib
+
+def _normalize_column_name(col_name: str) -> str:
+    """
+    Normalize a column name for schema comparison.
+    - Convert to lowercase
+    - Strip whitespace
+    - Replace spaces and special chars with underscores
+    - Collapse multiple underscores
+    """
+    import re
+    normalized = str(col_name).lower().strip()
+    normalized = re.sub(r'[\s\-\.\']+', '_', normalized)  # Replace spaces/dots/hyphens with _
+    normalized = re.sub(r'_+', '_', normalized)  # Collapse multiple underscores
+    return normalized
+
+def _fuzzy_match_columns(source_cols: List[str], target_cols: List[str], threshold: float = 0.85) -> Dict[str, str]:
+    """
+    Match source columns to target columns using fuzzy string matching.
+    Returns a mapping: {source_col: matched_target_col} for matches above threshold.
+    Unmatched source columns are not included in the returned dict.
+    """
+    if not source_cols or not target_cols:
+        return {}
+
+    # Normalize target columns for comparison
+    normalized_targets = [_normalize_column_name(c) for c in target_cols]
+
+    mapping = {}
+    for src_col in source_cols:
+        src_norm = _normalize_column_name(src_col)
+
+        # Find best match using difflib (fuzzy matching)
+        matches = difflib.get_close_matches(
+            src_norm, normalized_targets, n=1, cutoff=threshold
+        )
+
+        if matches:
+            matched_target_raw = target_cols[normalized_targets.index(matches[0])]
+            mapping[src_col] = matched_target_raw
+
+    return mapping
+
 def _load_image_file(path: Path) -> Tuple[str, str]:
     """Load an image file, resize it, return (base64, media_type)."""
     _ensure_installed("Pillow", "PIL")
@@ -825,7 +870,269 @@ class FileImportMixin:
         is_xlsx       = ext == ".xlsx"
         is_image_file = ext in _IMAGE_EXTENSIONS
 
-        # ── data mode ────────────────────────────────────────────────────────
+        # ── data_bundle mode (Folder Ingestion) ──────────────────────────────
+        # ── data_bundle mode (Folder Ingestion) ──────────────────────────────
+        if mode == IMPORT_MODE_DATA_BUNDLE:
+            if not path.is_dir():
+                warnings.append(f"data_bundle mode requires a directory path, got: {path}")
+                mode = IMPORT_MODE_TEXT
+            else:
+                _progress(f"Scanning folder for data files: {path}")
+                supported_exts = {".csv", ".tsv", ".xlsx", ".xls"} # SQLite handled separately or skipped for now in fusion logic
+                csv_xlsx_files = []
+                
+                # 1. SCAN PHASE: Find all relevant files and extract schemas
+                for root, _, filenames in os.walk(path):
+                    for fname in filenames:
+                        f_path = Path(root) / fname
+                        if f_path.suffix.lower() in supported_exts:
+                            csv_xlsx_files.append(f_path)
+
+                if not csv_xlsx_files:
+                    warnings.append("No supported CSV/XLSX data files found in the folder.")
+                    mode = IMPORT_MODE_TEXT
+                else:
+                    _progress(f"Found {len(csv_xlsx_files)} data files. Analyzing schemas...")
+                    _ensure_installed("pandas")
+                    _ensure_installed("openpyxl")
+                    import pandas as pd
+                    import sqlite3
+                    from collections import defaultdict
+
+                    workspace_dir = Path("./data_workspace")
+                    try:
+                        from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                        if awd is not None:
+                            workspace_dir = awd
+                    except ImportError:
+                        pass
+                    workspace_dir.mkdir(exist_ok=True)
+
+                    # Schema fingerprinting with normalized column names for better grouping
+                    schema_groups = defaultdict(list)
+                    schema_info_map = {}  # signature -> (normalized_columns, raw_columns_sample)
+
+                    for f_path in csv_xlsx_files:
+                        try:
+                            ext = f_path.suffix.lower()
+                            if ext in (".csv", ".tsv"):
+                                sep = "\t" if ext == ".tsv" else ("," if ";" not in f_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ";")
+                                df = pd.read_csv(str(f_path), nrows=1)  # Read header only
+                            elif ext in (".xlsx", ".xls"):
+                                xl = pd.ExcelFile(str(f_path))
+                                if len(xl.sheet_names) == 1:
+                                    df = pd.read_excel(str(f_path), sheet_name=xl.sheet_names[0], nrows=1)
+                                else:
+                                    df = pd.read_excel(str(f_path), sheet_name=xl.sheet_names[0], nrows=1)
+                            else:
+                                continue
+
+                            # Create fingerprint using NORMALIZED column names for resilient grouping
+                            # We use .dtypes.str[0] to get simple type kind ('i', 'f', 'O', etc.) which is more stable than full dtype names
+                            normalized_signature = tuple(sorted(
+                                (_normalize_column_name(str(c)), str(d.kind)) 
+                                for c, d in zip(df.columns, df.dtypes)
+                            ))
+
+                            schema_groups[normalized_signature].append(f_path)
+                            # Store info once per group (using first file as representative)
+                            if normalized_signature not in schema_info_map:
+                                schema_info_map[normalized_signature] = list(df.columns)  # Keep raw names for reference
+
+                        except Exception as e:
+                            warnings.append(f"Skipped {f_path.name} during schema analysis: {e}")
+
+                    _progress(f"Found {len(schema_groups)} unique data structures. Fusing duplicates...")
+                    
+                    db_path = workspace_dir / f"{title}_consolidated.db"
+                    conn = sqlite3.connect(str(db_path))
+                    
+                    schema_summary = [f"# Data Bundle: {title}\n"]
+                    schema_summary.append(f"Format: Consolidated SQLite Database (Schema Fused)\n")
+                    schema_summary.append(f"Source Folder: {path}\n")
+                    schema_summary.append(f"Total Files Scanned: {len(csv_xlsx_files)}\n")
+                    schema_summary.append(f"Unique Structures Found: {len(schema_groups)}\n\n")
+
+                    tables_created = 0
+                    total_rows_ingested = 0
+                    
+                    for idx, (sig, file_list) in enumerate(schema_groups.items()):
+                        try:
+                            # Read ALL files in this group and concatenate them WITH source tracking
+                            dfs_to_concat = []
+                            sample_rows_info = []  # Store first few rows + filenames for LLM naming
+
+                            # First pass: read all files to establish master column set with fuzzy matching
+                            file_data_list = []
+                            reference_columns = None
+
+                            for f_path in file_list:
+                                ext = f_path.suffix.lower()
+                                if progress_cb: progress_cb(f"Reading {f_path.name} for schema group {idx}...")
+
+                                if ext in (".csv", ".tsv"):
+                                    sep = "\t" if ext == ".tsv" else ("," if ";" not in f_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ";")
+                                    df = pd.read_csv(str(f_path), sep=sep)
+                                elif ext in (".xlsx", ".xls"):
+                                    xl = pd.ExcelFile(str(f_path))
+                                    sheet_name = xl.sheet_names[0]
+                                    df = pd.read_excel(str(f_path), sheet_name=sheet_name)
+
+                                file_data_list.append((f_path, df))
+
+                            # Establish reference columns from first file
+                            if file_data_list:
+                                reference_columns = list(file_data_list[0][1].columns)
+
+                                # Second pass: align all files to reference schema using fuzzy matching
+                                for f_path, df in file_data_list:
+                                    if progress_cb: progress_cb(f"Aligning {f_path.name} columns...")
+
+                                    # Fuzzy match current file's columns to reference columns
+                                    column_mapping = _fuzzy_match_columns(df.columns.tolist(), reference_columns)
+
+                                    # Create a new dataframe with aligned columns
+                                    aligned_df = df.copy()
+
+                                    # Rename matched columns to reference names
+                                    for src_col, target_col in column_mapping.items():
+                                        if src_col != target_col:  # Only rename if different
+                                            aligned_df.rename(columns={src_col: target_col}, inplace=True)
+
+                                    # Add missing columns from reference that don't exist in this file
+                                    existing_cols = set(aligned_df.columns)
+                                    for ref_col in reference_columns:
+                                        if ref_col not in existing_cols:
+                                            aligned_df[ref_col] = None  # Fill missing with NaN
+
+                                    # Remove extra columns not in reference (they shouldn't be there if grouped correctly, but safety check)
+                                    aligned_df = aligned_df[[c for c in reference_columns if c in aligned_df.columns]]
+
+                                    # Add source_file column AFTER alignment
+                                    aligned_df['source_file'] = f_path.name
+                                    dfs_to_concat.append(aligned_df)
+
+                                    # Collect sample data for LLM naming (first 3 rows as representative samples)
+                                    if len(sample_rows_info) < 5:
+                                        sample_rows_info.append({
+                                            "filename": f_path.name,
+                                            "sample": aligned_df.head(3).to_dict('records')
+                                        })
+
+                            # Fuse into one massive dataframe per schema group
+                            if dfs_to_concat:
+                                fused_df = pd.concat(dfs_to_concat, ignore_index=True)
+
+                                # Clean column names to ensure SQL compatibility (replace spaces/special chars with underscore)
+                                fused_df.columns = [str(c).replace(" ", "_").replace("-", "_").replace(".", "_") for c in fused_df.columns]
+
+                                # Generate meaningful table name using LLM
+                                _ensure_installed("pipmaster")
+                                import pipmaster as pm
+
+                                # Prepare context for LLM naming
+                                columns_info = "\n".join([f"  • {col}" for col in fused_df.columns])
+                                sample_preview = f"\nSample data from {len(sample_rows_info)} source file(s):\n"
+                                for sample_info in sample_rows_info[:3]:
+                                    sample_preview += f"\n--- From: {sample_info['filename']} ---\n"
+                                    for row_idx, row_data in enumerate(sample_info['sample'][:2]):
+                                        preview = ", ".join([f"{k}: {v}" for k, v in list(row_data.items())[:5]])
+                                        sample_preview += f"  Row {row_idx+1}: {preview}...\n"
+
+                                naming_prompt = (
+                                    "You are a data architect. Based on the following database schema and sample data, "
+                                    "propose a meaningful table name that describes what this data represents.\n\n"
+                                    "COLUMNS:\n" + columns_info + "\n\n" + sample_preview + "\n\n"
+                                    "Return ONLY the table name (no explanations, no quotes). "
+                                    "Use snake_case format. Keep it under 50 characters."
+                                )
+
+                                try:
+                                    # Use LLM to generate table name if available
+                                    llm_available = False
+                                    llm_table_name = None
+
+                                    if hasattr(self, 'lollmsClient') and self.lollmsClient:
+                                        try:
+                                            response = self.lollmsClient.generate_text(
+                                                prompt=naming_prompt,
+                                                n_predict=50,
+                                                temperature=0.3
+                                            )
+                                            llm_table_name = response.strip().lower()[:50]
+                                            if llm_table_name and not any(c in llm_table_name for c in '!"#$%&()*+,:;<=>?@[]^`{|}'):
+                                                llm_available = True
+                                        except Exception:
+                                            pass
+
+                                    # Use LLM name or fallback to generated name
+                                    if llm_available and llm_table_name:
+                                        table_name = f"data_{llm_table_name}"
+                                    else:
+                                        # Fallback: use first 3 words from first filename + columns signature
+                                        base_name = '_'.join(file_list[0].stem.split('_')[:2])
+                                        key_cols = fused_df.columns[:3] if len(fused_df.columns) >= 3 else fused_df.columns
+                                        table_name = f"data_{base_name}_{'_'.join(key_cols)}"
+
+                                    # Ensure valid SQL identifier
+                                    table_name = re.sub(r'[^a-zA-Z0-9_]', '_', table_name.lower())
+                                    if len(table_name) > 60: 
+                                        table_name = table_name[:58] + "_"
+
+                                except Exception as naming_err:
+                                    # Fallback on error
+                                    base_name = '_'.join(file_list[0].stem.split('_')[:2])
+                                    key_cols = fused_df.columns[:3] if len(fused_df.columns) >= 3 else fused_df.columns
+                                    table_name = f"data_{base_name}_{'_'.join(key_cols)}"
+
+                                # Save to DB - sanitize table name for SQLite compatibility
+                                safe_table_name = re.sub(r'[^a-zA-Z0-9_]', '_', table_name)
+                                if len(safe_table_name) > 63: 
+                                    safe_table_name = safe_table_name[:61] + "_"
+
+                                # Save with sanitized name but keep original in metadata for display
+                                fused_df.to_sql(safe_table_name, conn, if_exists='replace', index=False)
+
+                                # Store mapping of safe_name -> original_display_name for later reference
+                                if not hasattr(conn, 'table_mappings'):
+                                    conn.table_mappings = {}
+                                conn.table_mappings[safe_table_name] = table_name
+
+                                tables_created += 1
+                                total_rows_ingested += len(fused_df)
+                                schema_summary.append(f"  • FUSED Table '{safe_table_name}' (display: {table_name}) ({len(file_list)} files merged | {len(fused_df):,} rows)")
+
+                        except Exception as e:
+                            warnings.append(f"Failed to fuse group {idx}: {e}")
+
+                    conn.close()
+
+                    schema_summary.append(f"\nTotal Tables Created: {tables_created}")
+                    schema_summary.append(f"Total Rows Ingested: {total_rows_ingested:,}")
+                    
+                    text = "\n".join(schema_summary)
+
+                    # Create the artifact
+                    art = self.artefacts.add(
+                        title=title,
+                        artefact_type=ArtefactType.DATA,
+                        content=text,
+                        active=activate,
+                        file_ext=".db",
+                        version=1,
+                        read_only=True
+                    )
+                    _progress(f"Data bundle consolidation complete. Reduced {len(csv_xlsx_files)} files to {tables_created} tables.")
+                    return {
+                        "text_artefact": art,
+                        "image_artefact": None,
+                        "mode": mode,
+                        "page_count": 0,
+                        "image_count": 0,
+                        "warnings": warnings,
+                    }
+
+        # ── data mode (Single File) ──────────────────────────────────────────
         if mode == IMPORT_MODE_DATA:
             is_data_file = ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3")
             if not is_data_file:
