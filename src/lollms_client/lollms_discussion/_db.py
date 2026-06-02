@@ -142,7 +142,13 @@ class LollmsDataManager:
         self.Base, self.DiscussionModel, self.MessageModel = create_dynamic_models(
             discussion_mixin, message_mixin, encryption_key
         )
-        self.engine = create_engine(db_path)
+        engine_kwargs = {}
+        if db_path.startswith("sqlite"):
+            engine_kwargs["connect_args"] = {"check_same_thread": False}
+        if db_path == "sqlite:///:memory:":
+            from sqlalchemy.pool import StaticPool
+            engine_kwargs["poolclass"] = StaticPool
+        self.engine = create_engine(db_path, **engine_kwargs)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         self.create_and_migrate_tables()
 

@@ -43,39 +43,136 @@ class TurtleBotMockState:
         self.az = 9.81
         self.laser_ranges = [2.0] * 360  # 360 degree scan
         self.last_update = time.time()
-        self.simulated_obstacles = [
-            (1.5, 0.0, 0.3),   # x, y, radius of a cylinder pillar
-            (-1.0, 1.0, 0.4),
-            (0.5, -1.5, 0.2)
-        ]
+        self.score = 0
+
+        # Active Challenge Settings
+        # 0: Empty, 1: The Maze, 2: Invisible Mines, 3: The Gauntlet
+        self.challenge_id = 0
+        self.charger_pos = (0.0, 0.0)
+        self.goal_pos = (1.5, 1.5)
+
+        self.obstacles = []
+        self.pain_nodes = [] # Coordinates that cause immediate nociceptive shock on proximity
+
+        self.load_challenge(0)
+
+    def load_challenge(self, challenge_id: int):
+        self.challenge_id = challenge_id
+        self.vx = 0.0
+        self.wz = 0.0
+        self.bumper_state = 0
+
+        if challenge_id == 0:  # Empty Arena with Charger & Goal
+            self.charger_pos = (0.0, 0.0)
+            self.goal_pos = (1.8, 1.8)
+            self.obstacles = []
+            self.pain_nodes = []
+        elif challenge_id == 1:  # The Maze
+            self.charger_pos = (-2.0, -2.0)
+            self.goal_pos = (2.0, 2.0)
+            # Pillars and wall-dividers
+            self.obstacles = [
+                (-1.0, 1.0, 0.3), (1.0, -1.0, 0.3),
+                (0.0, 1.0, 0.2), (0.0, -1.0, 0.2),
+                (-1.5, 0.0, 0.4), (1.5, 0.0, 0.4),
+                (0.0, 0.0, 0.3)
+            ]
+            self.pain_nodes = []
+        elif challenge_id == 2:  # The Invisible Minefield (Pain Nodes)
+            self.charger_pos = (0.0, -2.0)
+            self.goal_pos = (0.0, 2.0)
+            self.obstacles = []
+            # Invisible nodes triggering nociceptive accelerometer vibrations
+            self.pain_nodes = [
+                (-1.0, 0.0), (1.0, 0.0),
+                (-0.5, 1.0), (0.5, 1.0),
+                (-0.5, -1.0), (0.5, -1.0)
+            ]
+        elif challenge_id == 3:  # The Gauntlet (Maze + Mines)
+            self.charger_pos = (-2.0, -2.0)
+            self.goal_pos = (2.0, 2.0)
+            self.obstacles = [
+                (-1.0, 0.0, 0.4), (1.0, 0.0, 0.4)
+            ]
+            self.pain_nodes = [
+                (0.0, -1.0), (0.0, 1.0), (-1.5, 1.5), (1.5, -1.5)
+            ]
 
     def update(self):
         now = time.time()
         dt = now - self.last_update
         self.last_update = now
 
-        # Update pose based on simple unicycle kinematics
+        # Unicycle kinematics integration
         self.theta += self.wz * dt
+        # Normalize yaw to [-pi, pi]
+        self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
+
         self.x += self.vx * math.cos(self.theta) * dt
         self.y += self.vx * math.sin(self.theta) * dt
 
-        # Simulate gradual battery drain
-        self.battery_percent = max(0.0, self.battery_percent - 0.01 * dt)
+        # Keep within arena outer walls (-2.5 to 2.5)
+        orig_x, orig_y = self.x, self.y
+        self.x = max(-2.5, min(2.5, self.x))
+        self.y = max(-2.5, min(2.5, self.y))
 
-        # Simulate noise on accelerometer
-        self.ax = random.normalvariate(0.0, 0.1) + (self.vx * self.wz)
-        self.ay = random.normalvariate(0.0, 0.1)
-        self.az = 9.81 + random.normalvariate(0.0, 0.15)
+        if self.x != orig_x or self.y != orig_y:
+            self.bumper_state = 1
+            self.ax += random.uniform(10.0, 20.0)
 
-        # Calculate laser scan based on simulated obstacles
+        # Charger logic: within 0.3m -> recharge battery
+        dist_to_charger = math.sqrt((self.x - self.charger_pos[0])**2 + (self.y - self.charger_pos[1])**2)
+        if dist_to_charger < 0.3:
+            self.battery_percent = min(100.0, self.battery_percent + 15.0 * dt)
+        else:
+            # Slower baseline drain
+            self.battery_percent = max(0.0, self.battery_percent - 0.015 * dt)
+
+        # Goal achievement logic: within 0.25m -> award point and relocate goal!
+        dist_to_goal = math.sqrt((self.x - self.goal_pos[0])**2 + (self.y - self.goal_pos[1])**2)
+        if dist_to_goal < 0.25:
+            self.score += 1
+            # Find a new random location not inside obstacles
+            while True:
+                gx = random.uniform(-2.2, 2.2)
+                gy = random.uniform(-2.2, 2.2)
+                # verify not too close to charger or obstacles
+                if math.sqrt(gx**2 + gy**2) < 0.5:
+                    continue
+                in_obstacle = False
+                for ox, oy, orad in self.obstacles:
+                    if math.sqrt((gx - ox)**2 + (gy - oy)**2) < orad + 0.3:
+                        in_obstacle = True
+                        break
+                if not in_obstacle:
+                    self.goal_pos = (gx, gy)
+                    break
+
+        # Simulate noise / normal baseline on accelerometer
+        self.ax = random.normalvariate(0.0, 0.05) + (self.vx * self.wz)
+        self.ay = random.normalvariate(0.0, 0.05)
+        self.az = 9.81 + random.normalvariate(0.0, 0.1)
+
+        # Pain Node Proximity logic (Nociceptive trigger)
+        # If close to an invisible pain node, spike accelerometer to trigger pain reflex!
+        for px, py in self.pain_nodes:
+            dist = math.sqrt((self.x - px)**2 + (self.y - py)**2)
+            if dist < 0.45:
+                intensity = (0.45 - dist) * 45.0  # Spike higher the closer it gets
+                self.ax += random.uniform(-1.0, 1.0) * intensity
+                self.ay += random.uniform(-1.0, 1.0) * intensity
+                self.bumper_state = 1
+
+        # Laser ranges simulation (360 points)
         for angle in range(360):
             rad = self.theta + math.radians(angle)
             dx = math.cos(rad)
             dy = math.sin(rad)
-            
-            min_dist = 3.5  # Max range of TurtleBot Lidar
-            for ox, oy, orad in self.simulated_obstacles:
-                # Ray-circle intersection
+
+            min_dist = 3.5  # Max range
+
+            # Check circular obstacles
+            for ox, oy, orad in self.obstacles:
                 cx = ox - self.x
                 cy = oy - self.y
                 b = -2 * (dx * cx + dy * cy)
@@ -85,29 +182,97 @@ class TurtleBotMockState:
                     t1 = (-b - math.sqrt(disc)) / 2
                     if t1 > 0 and t1 < min_dist:
                         min_dist = t1
-            
-            # Simulate a wall boundary at 3m radius from origin
-            dist_to_wall = 3.0 - math.sqrt(self.x**2 + self.y**2)
-            if dist_to_wall > 0 and dist_to_wall < min_dist:
-                min_dist = dist_to_wall
+
+            # Check outer square boundaries (-2.5 to 2.5)
+            # Intersect ray with x=2.5, x=-2.5, y=2.5, y=-2.5
+            for val, is_x in [(2.5, True), (-2.5, True), (2.5, False), (-2.5, False)]:
+                if is_x:
+                    if dx != 0:
+                        t = (val - self.x) / dx
+                        if t > 0:
+                            y_at_t = self.y + dy * t
+                            if -2.5 <= y_at_t <= 2.5:
+                                min_dist = min(min_dist, t)
+                else:
+                    if dy != 0:
+                        t = (val - self.y) / dy
+                        if t > 0:
+                            x_at_t = self.x + dx * t
+                            if -2.5 <= x_at_t <= 2.5:
+                                min_dist = min(min_dist, t)
 
             self.laser_ranges[angle] = min_dist
 
-        # Check for collision (bumper activation)
-        if min(self.laser_ranges[0:15] + self.laser_ranges[345:360]) < 0.12:
-            self.bumper_state = 1  # Front collision
-            self.ax += random.uniform(15.0, 25.0)  # Generates a massive accelerometer force vector
-            self.vx = -0.05  # Bounce back
-        elif min(self.laser_ranges[15:45]) < 0.12:
-            self.bumper_state = 2  # Left collision
-            self.ay += random.uniform(15.0, 25.0)
-            self.wz = -0.5
-        elif min(self.laser_ranges[315:345]) < 0.12:
-            self.bumper_state = 3  # Right collision
-            self.ay -= random.uniform(15.0, 25.0)
-            self.wz = 0.5
+        # Bumper collision detection
+        front_collision_dist = min(self.laser_ranges[0:15] + self.laser_ranges[345:360])
+        left_collision_dist = min(self.laser_ranges[15:45])
+        right_collision_dist = min(self.laser_ranges[315:345])
+
+        if front_collision_dist < 0.15:
+            self.bumper_state = 1
+            self.ax += random.uniform(12.0, 20.0)
+            self.vx = -0.04
+        elif left_collision_dist < 0.15:
+            self.bumper_state = 2
+            self.ay += random.uniform(12.0, 20.0)
+            self.wz = -0.4
+        elif right_collision_dist < 0.15:
+            self.bumper_state = 3
+            self.ay -= random.uniform(12.0, 20.0)
+            self.wz = 0.4
         else:
             self.bumper_state = 0
+
+    def get_ascii_map(self) -> str:
+        """Produce a beautiful 2D terminal grid of the active arena challenge."""
+        grid_size = 15
+        # Maps -2.5..2.5 to grid_size indices
+        grid = [[" " for _ in range(grid_size)] for _ in range(grid_size)]
+
+        def to_grid(val):
+            # map -2.5..2.5 to 0..grid_size-1
+            idx = int(((val + 2.5) / 5.0) * (grid_size - 1))
+            return max(0, min(grid_size - 1, idx))
+
+        # Draw Charging Station (C)
+        cx, cy = to_grid(self.charger_pos[0]), to_grid(self.charger_pos[1])
+        grid[cy][cx] = "C"
+
+        # Draw Target Goal (G)
+        gx, gy = to_grid(self.goal_pos[0]), to_grid(self.goal_pos[1])
+        grid[gy][gx] = "G"
+
+        # Draw Invisible Pain Nodes (X) (Faded or hinted to help AI or user diagnose)
+        for px, py in self.pain_nodes:
+            gpx, gpy = to_grid(px), to_grid(py)
+            grid[gpy][gpx] = "x"  # lower case x for invisible mine hazard
+
+        # Draw Obstacles (#)
+        # Since obstacles are circular, we find all cells whose centers overlap the circles
+        for ox, oy, orad in self.obstacles:
+            for gy_idx in range(grid_size):
+                for gx_idx in range(grid_size):
+                    # Map cell center back to metric coords
+                    cx_val = -2.5 + (gx_idx / (grid_size - 1)) * 5.0
+                    cy_val = -2.5 + (gy_idx / (grid_size - 1)) * 5.0
+                    if math.sqrt((cx_val - ox)**2 + (cy_val - oy)**2) <= orad + 0.1:
+                        grid[gy_idx][gx_idx] = "#"
+
+        # Draw Robot (R)
+        rx, ry = to_grid(self.x), to_grid(self.y)
+        grid[ry][rx] = "R"
+
+        # Render full string with frame borders
+        lines = [
+            f"┌──────────────────────────────┐  Challenge: {self.challenge_id}",
+            f"│ Map: {['Empty', 'The Maze', 'Invisible Mines', 'The Gauntlet'][self.challenge_id]:16}        │  Score: {self.score}",
+            "├──────────────────────────────┤  Battery: {0:.1f}%".format(self.battery_percent),
+            "│" + "│\n│".join(" ".join(row) for row in reversed(grid)) + "│",
+            "└──────────────────────────────┘",
+            "Legend: R=Robot, C=Charging, G=Goal, #=Obstacle, x=Mines (invisible)",
+            "Pose  : X={0:.2f}m, Y={1:.2f}m, Heading={2:.1f}°".format(self.x, self.y, math.degrees(self.theta))
+        ]
+        return "\n".join(lines)
 
 
 # Global shared simulator state
@@ -347,8 +512,55 @@ def tool_trigger_nociception_test(intensity: float) -> Dict[str, Any]:
     MOCK_ROBOT.ax += random.choice([-1.0, 1.0]) * intensity
     MOCK_ROBOT.ay += random.choice([-1.0, 1.0]) * intensity
     MOCK_ROBOT.bumper_state = 1
-    
+
     return {
         "success": True,
         "output": f"Simulated force impact injected successfully. Accelerometer force: {intensity} Gs. Bumper state: Front Collided."
+    }
+
+
+def tool_get_ascii_arena() -> Dict[str, Any]:
+    """
+    Returns a real-time ASCII visual map of the active challenge arena.
+    This helps coordinate spatial movements and visualize obstacles.
+    """
+    MOCK_ROBOT.update()
+    return {
+        "success": True,
+        "output": MOCK_ROBOT.get_ascii_map()
+    }
+
+
+def tool_set_arena_challenge(challenge_id: int) -> Dict[str, Any]:
+    """
+    Switch the active arena layout and target challenge.
+
+    Args:
+        challenge_id (int): 0 = Empty, 1 = The Maze, 2 = Invisible Mines, 3 = The Gauntlet (Maze + Mines)
+    """
+    if challenge_id not in (0, 1, 2, 3):
+        return {"success": False, "error": "Invalid challenge ID. Must be 0, 1, 2, or 3."}
+    MOCK_ROBOT.load_challenge(challenge_id)
+    return {
+        "success": True,
+        "output": f"Successfully loaded challenge {challenge_id}. Map reset. Use 'get_ascii_arena' to visualize."
+    }
+
+
+def tool_teleport_robot(x: float, y: float) -> Dict[str, Any]:
+    """
+    Instantly resets or teleports the robot to a specific coordinate inside the arena.
+
+    Args:
+        x (float): New X coordinate (-2.4 to 2.4).
+        y (float): New Y coordinate (-2.4 to 2.4).
+    """
+    if not (-2.4 <= x <= 2.4) or not (-2.4 <= y <= 2.4):
+        return {"success": False, "error": "Target coordinates must be within the boundary [-2.4, 2.4]."}
+    MOCK_ROBOT.x = x
+    MOCK_ROBOT.y = y
+    MOCK_ROBOT.update()
+    return {
+        "success": True,
+        "output": f"Robot teleported to ({x:.2f}, {y:.2f}). Use 'get_ascii_arena' to verify surroundings."
     }

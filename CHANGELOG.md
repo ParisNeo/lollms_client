@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-02 07:10]
+
+- feat(agents): enhance agent examples and update core imports
+
 ## [2026-06-01 23:21]
 
 - feat: add Lollms Text Processor documentation and update dependencies

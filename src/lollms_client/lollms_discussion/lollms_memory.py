@@ -183,15 +183,15 @@ class LollmsMemoryManager:
         self.lollms_client = lollms_client
         self.config        = config or MemoryConfig()
         # Use StaticPool to ensure all connections share the same in-memory SQLite database instance
+        engine_kwargs = {}
+        if db_path.startswith("sqlite"):
+            engine_kwargs["connect_args"] = {"check_same_thread": False}
+
         if db_path == "sqlite:///:memory:":
             from sqlalchemy.pool import StaticPool
-            self._engine = create_engine(
-                db_path,
-                connect_args={"check_same_thread": False},
-                poolclass=StaticPool
-            )
-        else:
-            self._engine       = create_engine(db_path)
+            engine_kwargs["poolclass"] = StaticPool
+
+        self._engine = create_engine(db_path, **engine_kwargs)
         _Base.metadata.create_all(self._engine)
         self._Session      = sessionmaker(bind=self._engine, autoflush=False)
         self._last_dream   = datetime.utcnow() - timedelta(days=1)

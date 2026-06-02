@@ -31,7 +31,7 @@ from ascii_colors import ASCIIColors, trace_exception
 import lollms_client.tools_bindings.lcp.default_tools.ros_turtlebot.ros_turtlebot as tb
 
 
-def run_bootstrap_config_wizard() -> Dict[str, Any]:
+def run_bootstrap_config_wizard(force: bool = False) -> Dict[str, Any]:
     """
     Console wizard that automatically discovers and configures 
     available LLM and TTI bindings, saving results to the user's config file.
@@ -39,17 +39,14 @@ def run_bootstrap_config_wizard() -> Dict[str, Any]:
     app_dir = Path.home() / ".lollms_client_app"
     app_dir.mkdir(parents=True, exist_ok=True)
     config_path = app_dir / "config.json"
-    
-    # 1. Attempt to load existing config
-    if config_path.exists():
+
+    # 1. Attempt to load existing config silently if not forced
+    if not force and config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             if cfg.get("llm_binding_name") and cfg.get("llm_binding_config", {}).get("model_name"):
-                print(f"👁️ Found existing configuration: {cfg['llm_binding_name']} (Model: {cfg['llm_binding_config']['model_name']})")
-                use_existing = input("Use this configuration? (Y/n): ").strip().lower()
-                if use_existing != 'n':
-                    return cfg
+                return cfg
         except Exception as e:
             print(f"Warning: Failed to load existing config: {e}")
             
@@ -157,6 +154,95 @@ def run_bootstrap_config_wizard() -> Dict[str, Any]:
         cfg["tti_binding_name"] = selected_tti
         cfg["tti_binding_config"] = tti_config
 
+    # 4. Service / Gateway Ingress Configuration
+    setup_services = input("\nDo you want to configure external chat services (Telegram, Discord, Slack, WhatsApp)? (y/N): ").strip().lower()
+    gateways_cfg = {}
+    if setup_services == 'y':
+        # Discord Setup
+        setup_discord = input("\nConfigure Discord Bot? (y/N): ").strip().lower()
+        if setup_discord == 'y':
+            token = input("  Enter Discord Bot Token: ").strip()
+            chan_id = input("  Enter Discord Channel ID: ").strip()
+            if token and chan_id:
+                gateways_cfg["discord"] = {"token": token, "channel_id": int(chan_id)}
+
+        # Telegram Setup
+        setup_telegram = input("\nConfigure Telegram Bot? (y/N): ").strip().lower()
+        if setup_telegram == 'y':
+            token = input("  Enter Telegram Bot Token: ").strip()
+            chat_id = input("  Enter Telegram Chat ID: ").strip()
+            if token and chat_id:
+                gateways_cfg["telegram"] = {"token": token, "chat_id": chat_id}
+
+        # Slack Setup
+        setup_slack = input("\nConfigure Slack Bot? (y/N): ").strip().lower()
+        if setup_slack == 'y':
+            token = input("  Enter Slack Bot Token (xoxb-...): ").strip()
+            chan_id = input("  Enter Slack Channel ID: ").strip()
+            if token and chan_id:
+                gateways_cfg["slack"] = {"token": token, "channel_id": chan_id}
+
+        # WhatsApp Setup
+        setup_whatsapp = input("\nConfigure WhatsApp via Twilio? (y/N): ").strip().lower()
+        if setup_whatsapp == 'y':
+            sid = input("  Enter Twilio Account SID: ").strip()
+            tok = input("  Enter Twilio Auth Token: ").strip()
+            frm = input("  Enter Twilio WhatsApp From Number: ").strip()
+            to = input("  Enter WhatsApp User To Number: ").strip()
+            if sid and tok and frm and to:
+                gateways_cfg["whatsapp"] = {
+                    "account_sid": sid,
+                    "auth_token": tok,
+                    "from_number": frm,
+                    "to_number": to
+                }
+
+    cfg["gateways"] = gateways_cfg
+
+    # 5. Agent Internal Parameters & Persistence Setup
+    setup_agent_params = input("\nDo you want to configure database persistence and autonomous thresholds? (y/N): ").strip().lower()
+    db_path = "sqlite:///:memory:"
+    agent_cfg = {
+        "idle_timeout": 25.0,
+        "loneliness_threshold": 0.70,
+        "boredom_threshold": 0.80
+    }
+    if setup_agent_params == 'y':
+        # Database Persistence
+        print("\nDatabase Persistence:")
+        print("  [1] In-Memory (Temporary - Cleared on exit)")
+        print("  [2] File-Backed (Persistent - Saves history, memories, and artifacts)")
+        while True:
+            db_choice = input("  Enter selection [1 or 2]: ").strip()
+            if db_choice == "2":
+                db_name = input("  Enter SQLite database filename [lollmsbot_active.db]: ").strip() or "lollmsbot_active.db"
+                if not db_name.endswith(".db"):
+                    db_name += ".db"
+                # Store it in user's home app folder to keep things contained
+                db_path = f"sqlite:///{app_dir / db_name}"
+                break
+            elif db_choice == "1" or not db_choice:
+                db_path = "sqlite:///:memory:"
+                break
+            print("  Invalid choice. Please enter 1 or 2.")
+
+        # Thresholds
+        print("\nAutonomous Thresholds:")
+        try:
+            it = input("  Enter Idle/Dread Trigger Timeout in seconds [25.0]: ").strip()
+            if it: agent_cfg["idle_timeout"] = float(it)
+
+            lt = input("  Enter Loneliness threshold to trigger proactive pings (0.0 to 1.0) [0.70]: ").strip()
+            if lt: agent_cfg["loneliness_threshold"] = float(lt)
+
+            bt = input("  Enter Boredom threshold to trigger subconscious thoughts (0.0 to 1.0) [0.80]: ").strip()
+            if bt: agent_cfg["boredom_threshold"] = float(bt)
+        except ValueError:
+            print("  Warning: Invalid numeric input. Falling back to default thresholds.")
+
+    cfg["db_path"] = db_path
+    cfg["agent_config"] = agent_cfg
+
     # Save to user home app config folder
     try:
         with open(config_path, "w", encoding="utf-8") as f:
@@ -164,7 +250,7 @@ def run_bootstrap_config_wizard() -> Dict[str, Any]:
         print(f"\n✅ Configuration saved successfully to {config_path}!")
     except Exception as e:
         print(f"Error saving config file: {e}")
-        
+
     return cfg
 
 
@@ -205,8 +291,19 @@ class AffectiveState:
 
 class LollmsBot:
     """Stateful Embodied AI Agent combining Nociception, Emotion, Memory, and ROS Actions."""
-    def __init__(self, config: Dict[str, Any], db_path: str = "sqlite:///:memory:"):
+    def __init__(self, config: Dict[str, Any], db_path: Optional[str] = None):
         ASCIIColors.cyan("Initializing LollmsBot (Standard Embodied Agent)...")
+        
+        app_dir = Path.home() / ".lollms_client_app"
+        default_db_path = f"sqlite:///{app_dir / 'lollmsbot_active.db'}"
+        
+        # Override db_path if specified in config, otherwise default to persistent file
+        self.db_path = db_path or config.get("db_path") or default_db_path
+        
+        agent_cfg = config.get("agent_config", {})
+        self.idle_timeout = float(agent_cfg.get("idle_timeout", 25.0))
+        self.loneliness_threshold = float(agent_cfg.get("loneliness_threshold", 0.70))
+        self.boredom_threshold = float(agent_cfg.get("boredom_threshold", 0.80))
         
         # 1. Initialize Client using Configured Bindings
         client_kwargs = {
@@ -225,7 +322,7 @@ class LollmsBot:
             client_kwargs["tti_binding_config"] = config.get("tti_binding_config", {})
 
         self.client = LollmsClient(**client_kwargs)
-        self.db_manager = LollmsDataManager(db_path)
+        self.db_manager = LollmsDataManager(self.db_path)
         self.discussion = LollmsDiscussion.create_new(
             lollms_client=self.client,
             db_manager=self.db_manager,
@@ -234,9 +331,12 @@ class LollmsBot:
         )
         
         # 2. Attach memory system
-        self.memory_config = MemoryConfig(working_token_budget=1500)
+        self.memory_config = MemoryConfig(
+            working_token_budget=1500,
+            dream_min_interval_hours=12 # once or twice a day
+        )
         self.memory_manager = LollmsMemoryManager(
-            db_path=db_path,
+            db_path=self.db_path,
             owner_id="lollmsbot_core",
             config=self.memory_config
         )
@@ -259,7 +359,13 @@ class LollmsBot:
             "   - High Pain/Fear/Anxiety: Speak in short, defensive sentences. Express discomfort. Refuse dangerous paths.\n"
             "2. PAIN AVOIDANCE: You have an artificial nociception system. If you receive collision pain tokens, "
             "immediately analyze what caused the impact, back away from that coordinate, and update your memory to avoid it.\n"
-            "3. AUTONOMY: You do not simply answer prompts; you spin in a continuous cycle. Decide what to do next based on your sensor readings."
+            "3. AUTONOMY: You do not simply answer prompts; you spin in a continuous cycle. Decide what to do next based on your sensor readings.\n"
+            "4. ACTIVE MEMORY ENGAGEMENT (MANDATORY):\n"
+            "   - You MUST actively manage your memories to adapt and learn.\n"
+            "   - Creating: When you learn a new fact about the user, an obstacle, or a coordinate, immediately save it using `<mem_new importance=\"...\">content</mem_new>`.\n"
+            "   - Retrieving: If you refer to any active memory in the [WORKING MEMORY] zone, you MUST prepend `<mem_tag id=\"ID\" />` to your response.\n"
+            "   - Deep Recall: If you need to access a latent memory listed under [DEEP MEMORY HANDLES], you MUST call `<mem_load id=\"ID\" />` to bring it into your working context.\n"
+            "   - Updating/Deleting: If a memory is outdated, update it via `<mem_update id=\"ID\">new_content</mem_update>` or delete it via `<mem_delete id=\"ID\" />`."
         )
 
         # Pre-populate Long-Term "Deep" Memory with stable goals
@@ -315,6 +421,42 @@ class LollmsBot:
                 "callable": tb.tool_trigger_nociception_test
             }
         }
+
+    def reconfigure(self, config: Dict[str, Any]):
+        """Dynamically reinitializes the LollmsClient on-the-fly with new configurations."""
+        ASCIIColors.cyan("Reconfiguring LollmsBot with new settings...")
+        client_kwargs = {
+            "llm_binding_name": config["llm_binding_name"],
+            "llm_binding_config": config["llm_binding_config"],
+            "tools_binding_name": "lcp",
+            "tools_binding_config": {
+                "tools_folders": [
+                    str(Path("./data_workspace").resolve()),
+                    str(PROJECT_ROOT / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
+                ]
+            }
+        }
+        if config.get("tti_binding_name"):
+            client_kwargs["tti_binding_name"] = config["tti_binding_name"]
+            client_kwargs["tti_binding_config"] = config.get("tti_binding_config", {})
+
+        self.client = LollmsClient(**client_kwargs)
+        self.discussion.lollmsClient = self.client
+        
+        # Reload thresholds & path dynamically
+        self.db_path = config.get("db_path") or "sqlite:///:memory:"
+        agent_cfg = config.get("agent_config", {})
+        self.idle_timeout = float(agent_cfg.get("idle_timeout", 25.0))
+        self.loneliness_threshold = float(agent_cfg.get("loneliness_threshold", 0.70))
+        self.boredom_threshold = float(agent_cfg.get("boredom_threshold", 0.80))
+
+        # Sync context size
+        if hasattr(self.client, "get_ctx_size"):
+            try:
+                self.discussion.max_context_size = self.client.get_ctx_size()
+            except Exception:
+                self.discussion.max_context_size = 4096
+        ASCIIColors.success("✓ LollmsBot successfully reconfigured!")
 
         # Sync context budget limit
         if hasattr(self.client, "get_ctx_size"):
@@ -424,11 +566,16 @@ class LollmsBot:
         
         print()  # final newline
 
-        # 5. POST-PROCESS: Log as episodic memory turn to build autobiographical continuity
+        # 5. POST-PROCESS: Parse and apply memory tags from the LLM output
         ai_response = res.get("response", "").strip()
+        cleaned_response, memory_report = self.discussion._process_memory_tags(ai_response, self.memory_manager)
+        if not cleaned_response.strip() and any(memory_report.values()):
+            cleaned_response = "Memory database updated successfully."
+
+        # Log as episodic memory turn to build autobiographical continuity
         episode_content = (
             f"Telemetry: Pose=({pose.get('x')}, {pose.get('y')}), Battery={sensors.get('battery_percent')}%, Affect={current_affect}\n"
-            f"Exploration Log: \"{ai_response}\""
+            f"Exploration Log: \"{cleaned_response}\""
         )
         self.memory_manager.add(
             content=episode_content,
@@ -436,15 +583,23 @@ class LollmsBot:
             tags=["episode", "turn_log"],
             level=4
         )
-        
+
         # Sync the discussion message node
         self.discussion.add_message(
             sender="lollmsbot",
             sender_type="assistant",
-            content=ai_response,
+            content=cleaned_response,
             metadata={"affective_state": current_affect}
         )
         self.discussion.commit()
+
+        # Auto-dream pass (runs once or twice a day based on dream_min_interval_hours)
+        try:
+            dream_report = self.memory_manager.dream(self.client)
+            if dream_report and not dream_report.get("skipped"):
+                ASCIIColors.cyan(f"[Memory] Subconscious dream consolidation complete: {dream_report}")
+        except Exception as dream_err:
+            ASCIIColors.warning(f"Subconscious dream failed: {dream_err}")
 
         # Print some summary info
         ASCIIColors.green(f"✓ Agent Turn completed. Consolidated {len(res.get('tool_calls', []))} action(s).")
@@ -452,9 +607,11 @@ class LollmsBot:
 
 # ── 🎭 Interactive Agent Session Runner ──
 if __name__ == "__main__":
-    # Run the interactive bootstrapper wizard first before starting any processes!
-    config = run_bootstrap_config_wizard()
-    
+    # Run the interactive bootstrapper wizard (silently loads if existing is valid)
+    import sys
+    force_config = "--config" in sys.argv or "--wizard" in sys.argv or "--setup" in sys.argv
+    config = run_bootstrap_config_wizard(force=force_config)
+
     bot = LollmsBot(config)
     
     # Run some initial autonomous setup turns
