@@ -2061,6 +2061,18 @@ document.addEventListener("DOMContentLoaded", () => {
     // ── Local Ingestion Handlers (Relocated into Modal) ──
     dropzone.addEventListener("click", () => fileInput.click());
 
+    // Additional safety check for folder browse button
+    setTimeout(() => {
+        const btnBrowseFolder = document.getElementById("btn-browse-folder");
+        const folderInput = document.getElementById("folder-input");
+        if (btnBrowseFolder && folderInput) {
+            console.log("✅ Folder browse button initialized");
+            // Ensure the button has proper cursor and clickability
+            btnBrowseFolder.style.cursor = "pointer";
+            btnBrowseFolder.style.opacity = "1";
+        }
+    }, 100);
+
     dropzone.addEventListener("dragover", (e) => {
         e.preventDefault();
         dropzone.classList.add("dragover");
@@ -2084,6 +2096,87 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
+    // ── Folder Import Handlers ──
+    const folderPath = document.getElementById("folder-path");
+    const btnValidateFolder = document.getElementById("btn-validate-folder");
+    const folderImportSection = document.getElementById("folder-import-section");
+
+    // Toggle folder import section visibility based on mode selection
+    if (importMode && folderImportSection) {
+        function toggleFolderImportSection() {
+            const mode = importMode.value;
+            console.log("🔍 Toggle folder section - Current mode:", mode);
+            if (mode === "data_bundle") {
+                folderImportSection.style.display = "flex";
+                folderImportSection.style.flexDirection = "column";
+                folderImportSection.style.gap = "8px";
+                folderImportSection.style.marginTop = "12px";
+                console.log("✅ Folder section SHOWN");
+            } else {
+                folderImportSection.style.display = "none";
+                console.log("❌ Folder section HIDDEN");
+            }
+        }
+
+        // Initial state - check immediately
+        console.log("🚀 Initial mode value:", importMode.value);
+        toggleFolderImportSection();
+
+        // Listen for mode changes
+        importMode.addEventListener("change", () => {
+            console.log("🔄 Mode changed to:", importMode.value);
+            toggleFolderImportSection();
+        });
+    } else {
+        console.error("❌ Missing elements:");
+        console.log("  - importMode:", importMode);
+        console.log("  - folderImportSection:", folderImportSection);
+    }
+
+    // Validate folder path when user clicks validate button
+    if (btnValidateFolder && folderPath) {
+        btnValidateFolder.addEventListener("click", async () => {
+            const pathValue = folderPath.value.trim();
+            if (!pathValue) {
+                alert("Please enter a folder path first.");
+                return;
+            }
+
+            btnValidateFolder.disabled = true;
+            btnValidateFolder.textContent = "Validating...";
+
+            try {
+                // Send validation request to backend
+                const res = await fetch("/api/validate_folder", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ folder_path: pathValue })
+                });
+
+                const data = await res.json();
+
+                if (data.success) {
+                    folderPath.style.borderColor = "var(--success-color)";
+                    setTimeout(() => {
+                        folderPath.style.borderColor = "var(--border-color)";
+                    }, 2000);
+                    alert(`✅ Valid folder path: ${pathValue}`);
+                } else {
+                    folderPath.style.borderColor = "#ef4444";
+                    setTimeout(() => {
+                        folderPath.style.borderColor = "var(--border-color)";
+                    }, 2000);
+                    alert(`❌ Invalid folder path: ${data.error || "Path does not exist or is not accessible"}`);
+                }
+            } catch (err) {
+                alert(`Validation failed: ${err}`);
+            } finally {
+                btnValidateFolder.disabled = false;
+                btnValidateFolder.textContent = "✓ Validate Path";
+            }
+        });
+    }
+
     function handleFileSelect(files) {
         selectedFiles = Array.from(files);
         if (selectedFiles.length === 1) {
@@ -2098,6 +2191,59 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     btnSubmit.addEventListener("click", async () => {
+        const mode = importMode.value;
+
+        // Handle folder bundle import
+        if (mode === "data_bundle") {
+            if (!folderPath.value || folderPath.value.trim() === "") {
+                alert("Please specify a folder path. Use the Validate button first to verify the path exists.");
+                return;
+            }
+
+            const pathValue = folderPath.value.trim();
+            console.log("🚀 Starting folder bundle import for:", pathValue);
+
+            btnSubmit.disabled = true;
+            progressContainer.style.display = "flex";
+            progressBarFill.style.width = "0%";
+            progressStatusText.textContent = "Processing folder bundle ingestion...";
+
+            try {
+                const res = await fetch("/api/import_folder", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ 
+                        folder_path: pathValue,
+                        title: customTitle.value || "folder_bundle"
+                    })
+                });
+
+                const data = await res.json();
+                console.log("📊 Folder import response:", data);
+
+                if (data.success) {
+                    alert(`✅ Successfully imported ${data.file_count || 'multiple'} files into ${data.groups || 'data'} group(s)!`);
+                    importModal.style.display = "none";
+                    selectedFiles = [];
+                    folderPath.value = "";
+                    dropzone.innerHTML = `<p>Drag & drop PDF, DOCX, PPTX, MD, CSV, XLSX, DB, or Image file here, or click to upload (supports multiple files)</p>`;
+                    customTitle.value = "";
+                    fetchArtifacts();
+                } else {
+                    alert(`❌ Folder import failed: ${data.error || "Unknown error"}`);
+                }
+            } catch (err) {
+                console.error("❌ Folder import request failed:", err);
+                alert(`❌ Folder import request failed: ${err.message || err}`);
+            } finally {
+                btnSubmit.disabled = false;
+                btnSubmit.textContent = "Process Document";
+                progressContainer.style.display = "none";
+            }
+            return;
+        }
+
+        // Handle regular file import
         if (selectedFiles.length === 0) {
             alert("Please select one or more documents first.");
             return;
@@ -2117,7 +2263,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const formData = new FormData();
             formData.append("file", file);
-            formData.append("mode", importMode.value);
+            formData.append("mode", mode);
             if (selectedFiles.length === 1 && customTitle.value) {
                 formData.append("title", customTitle.value);
             }
@@ -4520,24 +4666,114 @@ document.addEventListener("DOMContentLoaded", () => {
                 btn.addEventListener("click", async (e) => {
                     e.stopPropagation();
                     const title = btn.dataset.title;
-                    const confirmed = await showSlickConfirm(
-                        "🗑️ Delete Artifact",
-                        `Are you sure you want to permanently delete the artifact '${title}'? This will also remove all its version history.`
-                    );
-                    if (!confirmed) return;
+
+                    // Check if this is a data artifact with physical tables
+                    let deletePhysical = false;
                     try {
-                        const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}`, { method: "DELETE" });
+                        const artRes = await fetch("/api/artifacts");
+                        const arts = await artRes.json();
+                        const matched = arts.find(a => a.title === title);
+                        if (matched && matched.type === "data") {
+                            // Prompt user for physical data deletion
+                            const wantPhysicalDelete = await showSlickConfirm(
+                                "🗑️ Delete Artifact Data",
+                                `This is a DATA artifact. Do you also want to delete the underlying database tables from the consolidated file?\n\n⚠️ This action cannot be undone!`,
+                                "Delete Physical Tables",
+                                true
+                            );
+                            deletePhysical = wantPhysicalDelete;
+                        }
+
+                        const confirmed = await showSlickConfirm(
+                            "🗑️ Delete Artifact",
+                            `Are you sure you want to permanently delete the artifact '${title}'? This will also remove all its version history.${deletePhysical ? '\n\n✓ Physical database tables will be dropped.' : ''}`
+                        );
+
+                        if (!confirmed) return;
+
+                        const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}`, { 
+                            method: "DELETE",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ delete_physical_data: deletePhysical })
+                        });
+
                         const data = await res.json();
                         if (data.success) {
                             closeArtifactTab(title);
                             fetchArtifacts();
                             updateContextBudget();
+
+                            if (deletePhysical && data.tables_dropped) {
+                                showNotification(`✓ Deleted artifact and dropped ${data.tables_dropped} physical database table(s)`, "success", 4000);
+                            }
                         }
                     } catch (err) {
                         console.error("Failed to delete artifact:", err);
+                        alert(`Delete failed: ${err}`);
                     }
                 });
             });
+
+
+            // ── Orphaned Table Cleanup Button (added to data artifacts tab) ──
+            const originalCreateArtifactTab = window.createArtifactTab;
+            if (!window._patchedCreateArtifactTab) {
+                window.createArtifactTab = function(title, type) {
+                    originalCreateArtifactTab(title, type);
+
+                    // Add cleanup button for data artifact tabs
+                    if (type === "data") {
+                        const safeId = makeSafeId(title);
+                        const tabContent = document.getElementById(`tab-art-${safeId}`);
+                        if (tabContent) {
+                            const vSelect = tabContent.querySelector(".version-select");
+                            if (vSelect) {
+                                const cleanupBtn = document.createElement("button");
+                                cleanupBtn.className = "btn-version-action btn-cleanup-orphaned";
+                                cleanupBtn.dataset.artTitle = title;
+                                cleanupBtn.title = "🧹 Remove orphaned database tables from consolidated file";
+                                cleanupBtn.textContent = "🧹 Cleanup Orphans";
+                                cleanupBtn.style.cssText = "background: none; border: 1px solid var(--border-color); color: #f59e0b; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; font-weight: bold; transition: all 0.15s; height: auto; width: auto; line-height: 1.4;";
+
+                                vSelect.parentNode.appendChild(cleanupBtn);
+
+                                cleanupBtn.addEventListener("click", async () => {
+                                    const confirmed = await showSlickConfirm(
+                                        "🧹 Cleanup Orphaned Tables",
+                                        `Scan the consolidated database for tables that no longer have corresponding artifacts and remove them?`,
+                                        "Cleanup Now"
+                                    );
+
+                                    if (!confirmed) return;
+
+                                    cleanupBtn.disabled = true;
+                                    cleanupBtn.textContent = "Scanning...";
+
+                                    try {
+                                        const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/cleanup_orphaned_tables`, {
+                                            method: "POST"
+                                        });
+                                        const data = await res.json();
+
+                                        if (data.success) {
+                                            alert(`✓ Cleanup complete!\n\nOrphaned tables found: ${data.orphaned_tables_found}\nTables deleted: ${data.tables_deleted}`);
+                                        } else {
+                                            alert(`Cleanup failed: ${data.detail || data.error}`);
+                                        }
+                                    } catch (err) {
+                                        alert(`Request failed: ${err}`);
+                                    } finally {
+                                        cleanupBtn.disabled = false;
+                                        cleanupBtn.textContent = "🧹 Cleanup Orphans";
+                                    }
+                                });
+                            }
+                        }
+                    }
+                };
+
+                window._patchedCreateArtifactTab = true;
+            }
         } catch (err) {
             console.error("Failed to load artifacts:", err);
         }
