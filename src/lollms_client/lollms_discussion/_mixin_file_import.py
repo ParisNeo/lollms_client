@@ -815,6 +815,7 @@ class FileImportMixin:
         title:       Optional[str] = None,
         activate:    bool = True,
         progress_cb: Optional[Callable[[str], None]] = None,
+        description: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Import a file into the artefact system.
@@ -947,15 +948,10 @@ class FileImportMixin:
                     db_path = workspace_dir / f"{title}_consolidated.db"
                     conn = sqlite3.connect(str(db_path))
                     
-                    schema_summary = [f"# Data Bundle: {title}\n"]
-                    schema_summary.append(f"Format: Consolidated SQLite Database (Schema Fused)\n")
-                    schema_summary.append(f"Source Folder: {path}\n")
-                    schema_summary.append(f"Total Files Scanned: {len(csv_xlsx_files)}\n")
-                    schema_summary.append(f"Unique Structures Found: {len(schema_groups)}\n\n")
-
                     tables_created = 0
                     total_rows_ingested = 0
-                    
+                    table_details = []
+
                     for idx, (sig, file_list) in enumerate(schema_groups.items()):
                         try:
                             # Read ALL files in this group and concatenate them WITH source tracking
@@ -1093,26 +1089,54 @@ class FileImportMixin:
                                 # Save with sanitized name but keep original in metadata for display
                                 fused_df.to_sql(safe_table_name, conn, if_exists='replace', index=False)
 
-                                # Store mapping of safe_name -> original_display_name for later reference
-                                if not hasattr(conn, 'table_mappings'):
-                                    conn.table_mappings = {}
-                                conn.table_mappings[safe_table_name] = table_name
+                                # Commit immediately to ensure data is persisted
+                                conn.commit()
 
                                 tables_created += 1
                                 total_rows_ingested += len(fused_df)
-                                schema_summary.append(f"  • FUSED Table '{safe_table_name}' (display: {table_name}) ({len(file_list)} files merged | {len(fused_df):,} rows)")
+                                table_details.append({
+                                    'safe_name': safe_table_name,
+                                    'display_name': table_name,
+                                    'files_merged': len(file_list),
+                                    'rows': len(fused_df)
+                                })
 
                         except Exception as e:
                             warnings.append(f"Failed to fuse group {idx}: {e}")
 
                     conn.close()
 
+                    # Build schema summary AFTER all tables are created with actual counts
+                    schema_summary = [f"# Data Bundle: {title}\n"]
+                    schema_summary.append(f"Format: Consolidated SQLite Database (Schema Fused)\n")
+                    schema_summary.append(f"Source Folder: {path}\n")
+                    schema_summary.append(f"Total Files Scanned: {len(csv_xlsx_files)}\n")
+                    schema_summary.append(f"Unique Structures Found: {len(schema_groups)}\n\n")
+
+                    if table_details:
+                        for td in table_details:
+                            schema_summary.append(
+                                f"  • Table '{td['safe_name']}' (display: {td['display_name']}) "
+                                f"({td['files_merged']} files merged | {td['rows']:,} rows)"
+                            )
+
                     schema_summary.append(f"\nTotal Tables Created: {tables_created}")
                     schema_summary.append(f"Total Rows Ingested: {total_rows_ingested:,}")
-                    
+
+                    # Append description if provided
+                    if description and description.strip():
+                        schema_summary.append("\n---\n")
+                        schema_summary.append("## Description\n")
+                        schema_summary.append(description.strip())
+
                     text = "\n".join(schema_summary)
 
                     # Create the artifact
+                    # Store description in metadata for future reference
+                    extra_meta = {}
+                    if description and description.strip():
+                        extra_meta["description"] = description.strip()
+
                     art = self.artefacts.add(
                         title=title,
                         artefact_type=ArtefactType.DATA,
@@ -1120,7 +1144,8 @@ class FileImportMixin:
                         active=activate,
                         file_ext=".db",
                         version=1,
-                        read_only=True
+                        read_only=True,
+                        **extra_meta
                     )
                     _progress(f"Data bundle consolidation complete. Reduced {len(csv_xlsx_files)} files to {tables_created} tables.")
                     return {
@@ -1141,10 +1166,20 @@ class FileImportMixin:
             else:
                 _progress("Analyzing structured data file...")
                 text, images_data = _parse_data_file(path, title, version=1, progress_cb=progress_cb)
+
+                # Append description if provided (before the schema content)
+                if description and description.strip():
+                    text = f"## Description\n{description.strip()}\n\n{text}"
+
                 atype = ArtefactType.DATA
 
                 existing = self.artefacts.get(title)
                 if existing is None:
+                    # Store description in metadata for future reference
+                    extra_meta = {}
+                    if description and description.strip():
+                        extra_meta["description"] = description.strip()
+
                     art = self.artefacts.add(
                         title=title,
                         artefact_type=atype,
@@ -1152,7 +1187,8 @@ class FileImportMixin:
                         active=activate,
                         file_ext=ext,
                         version=1,
-                        read_only=True # Default newly imported data files to read-only
+                        read_only=True, # Default newly imported data files to read-only
+                        **extra_meta
                     )
                 else:
                     art = self.artefacts.update(
