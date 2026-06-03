@@ -126,6 +126,8 @@ document.addEventListener("DOMContentLoaded", () => {
     let currentTtiBindingConfig = {};
     let discoveredLlmModels = [];
     let discoveredTtiModels = [];
+    let savedLlmConfigs = {};
+    let savedTtiConfigs = {};
     let isConfigLoading = false;
 
     // ── 🌿 Custom Asynchronous Modal Prompt (Drop-in replacement for window.prompt) ──
@@ -3217,12 +3219,16 @@ document.addEventListener("DOMContentLoaded", () => {
             return;
         }
 
+        const savedConfig = savedTtiConfigs[bindingName] || {};
+
         ttiConfigForm.innerHTML = binding.input_parameters.map(p => {
             if (p.name === "model_name") return "";
             const key = p.name;
             const label = p.name.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
             const type = p.type || "string";
-            const defaultVal = p.default !== undefined ? p.default : "";
+
+            // Use saved value if present, otherwise default
+            const defaultVal = savedConfig[key] !== undefined ? savedConfig[key] : (p.default !== undefined ? p.default : "");
             const desc = p.description || "";
 
             // Detect secret fields (API keys, tokens, etc.)
@@ -3447,6 +3453,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
     selTtiBinding.addEventListener("change", () => {
         if (isConfigLoading) return;
+
+        // UX Cache: Save current input values to local map before switching form
+        const prevTtiBinding = selTtiBinding.dataset.prevTtiBinding || "";
+        if (prevTtiBinding) {
+            savedTtiConfigs[prevTtiBinding] = collectTtiBindingConfig();
+        }
+        selTtiBinding.dataset.prevTtiBinding = selTtiBinding.value;
+
         ttiModelGroup.style.display = "none";
         valTtiStatus.className = "validation-status";
         valTtiStatus.textContent = "";
@@ -3633,9 +3647,11 @@ document.addEventListener("DOMContentLoaded", () => {
     function renderConfigForm(bindingName) {
         const binding = availableBindings.find(b => b.binding_name === bindingName);
         if (!binding || !binding.input_parameters) {
-            configForm.innerHTML = `<p class="empty-msg">No configurable parameters for this binding.</p>`;
+            configForm.innerHTML = `<p class="empty-msg">Select a binding to configure its parameters.</p>`;
             return;
         }
+
+        const savedConfig = savedLlmConfigs[bindingName] || {};
 
         configForm.innerHTML = binding.input_parameters.map(p => {
             if (p.name === "model_name") return ""; // model selection happens after validation
@@ -3643,7 +3659,9 @@ document.addEventListener("DOMContentLoaded", () => {
             const label = p.name.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
             const type = p.type || "string";
             const required = p.mandatory ? "required" : "";
-            const defaultVal = p.default !== undefined ? p.default : "";
+            
+            // Priority: Saved value in historical map -> Default value -> empty string
+            const defaultVal = savedConfig[key] !== undefined ? savedConfig[key] : (p.default !== undefined ? p.default : "");
             const desc = p.description || "";
 
             const isSecret = key.toLowerCase().includes("key") || key.toLowerCase().includes("token") || p.is_secret;
@@ -3760,6 +3778,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
     selBinding.addEventListener("change", () => {
         if (isConfigLoading) return;
+
+        // UX Cache: Save current input values to local map before switching form
+        const prevBinding = selBinding.dataset.prevBinding || "";
+        if (prevBinding) {
+            savedLlmConfigs[prevBinding] = collectBindingConfig();
+        }
+        selBinding.dataset.prevBinding = selBinding.value;
+
         modelGroup.style.display = "none";
         valStatus.className = "validation-status";
         valStatus.textContent = "";
@@ -4076,6 +4102,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
             console.log("📦 Settings data:", data);
 
+            savedLlmConfigs = data.llm_bindings_configs || {};
+            savedTtiConfigs = data.tti_bindings_configs || {};
+
             // First, load all binding options
             await fetchBindings();
             console.log("📋 Available bindings loaded:", availableBindings.map(b => b.binding_name));
@@ -4096,6 +4125,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
                     // Pre-select and render the form synchronously
                     selBinding.value = data.llm_binding_name;
+                    selBinding.dataset.prevBinding = data.llm_binding_name;
                     renderConfigForm(data.llm_binding_name);
                     // Wait for DOM to render the selection, then trigger change event
                     setTimeout(() => {
@@ -4162,6 +4192,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
                     if (ttiBindingExists) {
                         selTtiBinding.value = data.tti_binding_name;
+                        selTtiBinding.dataset.prevTtiBinding = data.tti_binding_name;
                         console.log("⚙️ TTI Pre-selecting binding:", data.tti_binding_name);
 
                         // Wait for DOM to render the selection, then trigger change event
@@ -4220,7 +4251,7 @@ document.addEventListener("DOMContentLoaded", () => {
                             console.warn("Saved TTI binding validation failed:", ttiValData.error);
                         }
                     } else {
-                        console.warn(`Saved TTI binding '${data.tti_binding_name}' not found in available bindings.`);
+                        console.warn("Saved TTI binding '" + data.tti_binding_name + "' not found in available bindings.");
                     }
                 }
 

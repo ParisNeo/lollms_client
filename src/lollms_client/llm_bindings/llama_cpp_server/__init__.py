@@ -174,6 +174,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         # ── Capacity / lifecycle ──────────────────────────────────────────────
         self.max_active_models: int = int(kwargs.get("max_active_models", 1))
         self.idle_timeout: float = float(kwargs.get("idle_timeout", -1))  # seconds; -1 = disabled
+        self.server_log_depth: int = int(kwargs.get("server_log_depth", 500))
 
         # ── Paths ─────────────────────────────────────────────────────────────
         self.binding_dir = Path(__file__).parent
@@ -1515,6 +1516,28 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             info["server_pid"] = reg["pid"]
             info["server_port"] = reg["port"]
         return info
+
+    def get_server_logs(self) -> str:
+        """
+        Returns the last N lines of the server log, where N is defined by server_log_depth.
+        """
+        if not self.model_name:
+            return "No model currently loaded."
+
+        safe_name = "".join(c for c in self.model_name if c.isalnum() or c in ("-", "_", "."))
+        log_file_path = self.servers_dir / f"{safe_name}_error.log"
+
+        if not log_file_path.exists():
+            return f"Log file for model '{self.model_name}' does not exist."
+
+        try:
+            with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+                depth = getattr(self, "server_log_depth", 500)
+                tail_lines = lines[-depth:] if len(lines) > depth else lines
+                return "\n".join(line.rstrip() for line in tail_lines)
+        except Exception as e:
+            return f"Failed to read server logs: {e}"
 
     def list_models(self) -> List[Dict[str, Any]]:
         """

@@ -79,3 +79,8 @@ class LollmsBaseBinding(ABC):
             "ref_count": 1,
             "status": "active (remote simulation)"
         }]
+    def get_server_logs(self) -> str:
+        """
+        This mmethos returns the logs for bindings that spin out a background server
+        """
+        return ""

@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-03 09:09]
+
+- feat(lollmsbot): Update agent examples, client setup, and LLM bindings
+
 ## [2026-06-02 07:10]
 
 - feat(agents): enhance agent examples and update core imports

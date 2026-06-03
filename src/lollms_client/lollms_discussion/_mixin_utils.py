@@ -706,7 +706,13 @@ class UtilsMixin:
 
     def remove_artefact(self, title, version=None):
         return self.artefacts.remove_artefact(title, version)
+    
+    def export_artefact(self, title: str) -> Optional[Dict[str, Any]]:
+        return self.artefacts.export_artefact(title)
 
+    def import_artefact(self, artefact_data: Dict[str, Any], activate: bool = True) -> Optional[Dict[str, Any]]:
+        return self.artefacts.import_artefact(artefact_data, activate=activate)
+    
     def load_artefact_into_data_zone(self, title, version=None):
         """Legacy shim: activates the artefact (new system) and also patches discussion_data_zone for compat."""
         a = self.artefacts.get(title, version)

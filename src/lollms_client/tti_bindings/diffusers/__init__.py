@@ -52,6 +52,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         self.models_path = Path(kwargs.get("models_path", "./data/tti_models/diffusers")).resolve()
         self.extra_models_path = kwargs.get("extra_models_path")
         self.hf_token = kwargs.get("hf_token", "")  # NEW
+        self.server_log_depth = int(kwargs.get("server_log_depth", 500))
         self.models_path.mkdir(exist_ok=True, parents=True)
         if self.auto_start_server:
             self.ensure_server_is_running(self.wait_for_server)
@@ -229,7 +230,15 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                             self.hf_token
                         ])
 
-                    self.server_process = subprocess.Popen(command)
+                    log_file_path = self.models_path / "diffusers_server.log"
+                    log_f = open(log_file_path, "w", encoding="utf-8")
+
+                    self.server_process = subprocess.Popen(
+                        command,
+                        stdout=log_f,
+                        stderr=subprocess.STDOUT
+                    )
+                    log_f.close()
 
                     ASCIIColors.info(
                         f"Diffusers server launched on "
@@ -647,6 +656,23 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                 progress_callback({"status": "error", "message": error_msg})
             return {"status": False, "message": error_msg}
 
+
+    def get_server_logs(self) -> str:
+        """
+        Returns the last N lines of the server log, where N is defined by server_log_depth.
+        """
+        log_file_path = self.models_path / "diffusers_server.log"
+        if not log_file_path.exists():
+            return "No diffusers server log file found."
+
+        try:
+            with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+                depth = getattr(self, "server_log_depth", 500)
+                tail_lines = lines[-depth:] if len(lines) > depth else lines
+                return "\n".join(line.rstrip() for line in tail_lines)
+        except Exception as e:
+            return f"Failed to read diffusers server logs: {e}"
 
     def reinstall_dependencies(self):
         """

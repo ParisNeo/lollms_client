@@ -1986,3 +1986,80 @@ class ArtefactManager:
             )
 
         return main_art
+
+    def export_artefact(self, title: str) -> Optional[Dict[str, Any]]:
+        """
+        Exports an entire artefact including all of its versions and history,
+        as well as all versions of any companion images/assets.
+        """
+        all_raw = self._get_all_raw()
+        versions = [a for a in all_raw if a.get('title') == title]
+        if not versions:
+            return None
+
+        def _safe_version_key(a):
+            try:
+                v = a.get('version', 1)
+                if isinstance(v, str):
+                    v = int(float(v.split('.')[0]))
+                return int(v)
+            except Exception:
+                return 1
+
+        sorted_versions = sorted(versions, key=_safe_version_key)
+        latest = sorted_versions[-1]
+
+        comp_versions = [a for a in all_raw if a.get('title') == f"{title}::images"]
+        sorted_comp_versions = sorted(comp_versions, key=_safe_version_key)
+
+        return {
+            "version": 1, # Export bundle format version
+            "title": title,
+            "type": latest.get("type", ArtefactType.DOCUMENT),
+            "versions": [{k: v for k, v in ver.items() if k != "id"} for ver in sorted_versions],
+            "companion_images_versions": [{k: v for k, v in ver.items() if k != "id"} for ver in sorted_comp_versions],
+            "exported_at": datetime.utcnow().isoformat()
+        }
+
+    def import_artefact(self, artefact_data: Dict[str, Any], activate: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Imports a previously exported multi-version artefact dataset into the discussion,
+        rebuilding its entire version history chronologically.
+        """
+        if not isinstance(artefact_data, dict) or "versions" not in artefact_data:
+            raise ValueError("Invalid multi-version exported artefact format")
+
+        title = artefact_data.get("title")
+        if not title:
+            raise ValueError("Missing title in imported artefact data")
+
+        # Strip any existing versions of this artifact (and its companion) from the discussion
+        # to ensure a clean overwrite/restore of its entire version history
+        all_raw = self._get_all_raw()
+        cleaned_raw = [a for a in all_raw if a.get('title') != title and a.get('title') != f"{title}::images"]
+
+        imported_versions = []
+        for ver_info in artefact_data["versions"]:
+            new_ver = ver_info.copy()
+            new_ver["id"] = str(uuid.uuid4())
+            new_ver["active"] = False # Default off during list insertion
+            cleaned_raw.append(new_ver)
+            imported_versions.append(new_ver)
+
+        for comp_info in artefact_data.get("companion_images_versions", []):
+            new_comp = comp_info.copy()
+            new_comp["id"] = str(uuid.uuid4())
+            new_comp["active"] = False
+            cleaned_raw.append(new_comp)
+
+        self._save_all(cleaned_raw)
+
+        # Set active status on the latest version if requested
+        if imported_versions:
+            latest_imported = imported_versions[-1]
+            if activate:
+                self.activate(title, latest_imported.get("version", 1))
+                if artefact_data.get("companion_images_versions"):
+                    self.activate(f"{title}::images")
+
+        return self.get(title)

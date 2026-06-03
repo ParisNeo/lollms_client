@@ -230,5 +230,64 @@ class TestLollmsArtifactTools(unittest.TestCase):
         )
         self.assertTrue(is_latex)
 
+    def test_multi_version_export_and_import(self):
+        # 1. Create multiple versions of an artifact
+        self.discussion.artefacts.add(
+            title="script.py",
+            artefact_type="code",
+            content="print('v1')",
+            language="python",
+            version=1,
+            commit_message="First release"
+        )
+        self.discussion.artefacts.update(
+            title="script.py",
+            new_content="print('v2')",
+            language="python",
+            bump_version=True,
+            commit_message="Second release"
+        )
+        self.discussion.artefacts.update(
+            title="script.py",
+            new_content="print('v3')",
+            language="python",
+            bump_version=True,
+            commit_message="Third release"
+        )
+
+        # 2. Export the artifact with all its versions
+        exported_data = self.discussion.export_artefact("script.py")
+        self.assertIsNotNone(exported_data)
+        self.assertEqual(exported_data["title"], "script.py")
+        self.assertEqual(len(exported_data["versions"]), 3)
+        self.assertEqual(exported_data["versions"][0]["content"], "print('v1')")
+        self.assertEqual(exported_data["versions"][1]["content"], "print('v2')")
+        self.assertEqual(exported_data["versions"][2]["content"], "print('v3')")
+
+        # 3. Create a second fresh discussion
+        another_discussion = LollmsDiscussion.create_new(
+            lollms_client=self.client,
+            db_manager=self.db_manager,
+            id="test_session_2",
+            autosave=True
+        )
+
+        # 4. Import the artifact object into the second discussion
+        imported_art = another_discussion.import_artefact(exported_data, activate=True)
+        self.assertIsNotNone(imported_art)
+        self.assertEqual(imported_art["title"], "script.py")
+        self.assertEqual(imported_art["version"], 3)
+        self.assertEqual(imported_art["content"], "print('v3')")
+
+        # Verify the entire version history is present in the second discussion
+        history = another_discussion.artefacts.get_version_history("script.py")
+        self.assertEqual(len(history), 3)
+        self.assertEqual(history[0]["version"], 1)
+        self.assertEqual(history[1]["version"], 2)
+        self.assertEqual(history[2]["version"], 3)
+        self.assertTrue(history[2]["is_active"])
+
+        another_discussion.close()
+
 if __name__ == "__main__":
     unittest.main()

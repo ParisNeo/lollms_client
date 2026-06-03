@@ -135,6 +135,11 @@ input_parameters:
     description: "Seconds of inactivity before a server is auto-stopped (-1 = disabled)."
     mandatory: false
     default: -1
+  - name: server_log_depth
+    type: int
+    description: "The maximum number of lines of server logs to return when querying get_server_logs."
+    mandatory: false
+    default: 500
   - name: models_path
     type: str
     description: "Directory containing GGUF model files."

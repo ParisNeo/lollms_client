@@ -323,12 +323,15 @@ class LollmsBot:
 
         self.client = LollmsClient(**client_kwargs)
         self.db_manager = LollmsDataManager(self.db_path)
-        self.discussion = LollmsDiscussion.create_new(
-            lollms_client=self.client,
-            db_manager=self.db_manager,
-            id="lollmsbot_core",
-            autosave=True
-        )
+        if self.db_manager.discussion_exists("lollmsbot_core"):
+            self.discussion = self.db_manager.get_discussion(self.client, "lollmsbot_core", autosave=True)
+        else:
+            self.discussion = LollmsDiscussion.create_new(
+                lollms_client=self.client,
+                db_manager=self.db_manager,
+                id="lollmsbot_core",
+                autosave=True
+            )
         
         # 2. Attach memory system
         self.memory_config = MemoryConfig(
@@ -347,7 +350,10 @@ class LollmsBot:
         self.affect = AffectiveState()
         self.last_update = time.time()
         self.cumulative_ticks = 0
-        
+
+        # Print active memory status on startup
+        self.print_memory_status()
+
         # Set core system prompt conditioning personality traits
         self.discussion.system_prompt = (
             "You are LollmsBot, a persistent, stateful, embodied AI agent connected to a mobile TurtleBot3.\n"
@@ -548,9 +554,9 @@ class LollmsBot:
 
         # 4. ACT: Run the decision through the LLM core using generate_with_tools
         ASCIIColors.yellow("🧠 Cognitive processing of state and goals...")
-        
+
         # Callback to echo streaming to stdout
-        def stdout_callback(chunk, msg_type, meta):
+        def stdout_callback(chunk, msg_type, meta=None):
             if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
                 print(chunk, end="", flush=True)
             elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
@@ -603,6 +609,35 @@ class LollmsBot:
 
         # Print some summary info
         ASCIIColors.green(f"✓ Agent Turn completed. Consolidated {len(res.get('tool_calls', []))} action(s).")
+
+    def print_memory_status(self):
+        """Queries and prints an aesthetic summary of the persistent cognitive database on startup."""
+        try:
+            res = self.memory_manager.list_all(page_size=100)
+            memories = res.get("memories", [])
+
+            working_count = sum(1 for m in memories if m["level"] == 1)
+            deep_count = sum(1 for m in memories if m["level"] == 2)
+            archived_count = sum(1 for m in memories if m["level"] == 3)
+            episodic_count = sum(1 for m in memories if m["level"] == 4)
+
+            ASCIIColors.cyan("\n🧠 ─── COGNITIVE MEMORY DATABASE STATUS ───")
+            ASCIIColors.cyan(f"  • Database Path  : {self.db_path}")
+            ASCIIColors.cyan(f"  • Total Memories : {len(memories)} (Working: {working_count}, Deep: {deep_count}, Archived: {archived_count}, Episodic: {episodic_count})")
+
+            if memories:
+                ASCIIColors.cyan("  • Recent Active Memories:")
+                # Show top 5 highest-importance memories
+                sorted_mems = sorted(memories, key=lambda m: m["importance"], reverse=True)
+                for m in sorted_mems[:5]:
+                    level_label = {1: "Working", 2: "Deep", 3: "Archived", 4: "Episodic"}.get(m["level"], "Unknown")
+                    summary = m["content"][:80].replace("\n", " ") + ("..." if len(m["content"]) > 80 else "")
+                    print(f"    - [{level_label}] [{m['id'][:8]}] (Imp: {m['importance']:.0%}) {summary}")
+            else:
+                ASCIIColors.warning("  • Database is currently empty.")
+            ASCIIColors.cyan("───────────────────────────────────────────\n")
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to load memory status: {e}")
 
 
 # ── 🎭 Interactive Agent Session Runner ──

@@ -49,6 +49,11 @@ global_input_parameters:
     description: "Optional Hugging Face access token used by the Diffusers server to download private or gated models."
     is_secret: true
 
+  - name: "server_log_depth"
+    type: "int"
+    default: 500
+    description: "The maximum number of lines of server logs to return when querying get_server_logs."
+
   - name: "device"
     type: "str"
     default: "cuda"

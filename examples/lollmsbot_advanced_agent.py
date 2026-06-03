@@ -99,6 +99,8 @@ def run_bootstrap_config_wizard(force: bool = False) -> Dict[str, Any]:
             cfg["llm_binding_config"] = loaded.get("llm_binding_config", {})
             cfg["tti_binding_name"] = loaded.get("tti_binding_name", "")
             cfg["tti_binding_config"] = loaded.get("tti_binding_config", {})
+            cfg["llm_bindings_configs"] = loaded.get("llm_bindings_configs", {})
+            cfg["tti_bindings_configs"] = loaded.get("tti_bindings_configs", {})
             cfg["gateways"] = loaded.get("gateways", {})
             cfg["db_path"] = loaded.get("db_path", f"sqlite:///{app_dir / 'lollmsbot_active.db'}")
 
@@ -363,6 +365,15 @@ def run_bootstrap_config_wizard(force: bool = False) -> Dict[str, Any]:
             if not cfg.get("llm_binding_name") or not cfg.get("llm_binding_config", {}).get("model_name"):
                 print("\n❌ Error: You must configure a valid LLM Binding before saving.")
                 continue
+
+            # Save current configs into the historical maps
+            llm_configs = cfg.setdefault("llm_bindings_configs", {})
+            llm_configs[cfg["llm_binding_name"]] = cfg["llm_binding_config"]
+
+            if cfg.get("tti_binding_name"):
+                tti_configs = cfg.setdefault("tti_bindings_configs", {})
+                tti_configs[cfg["tti_binding_name"]] = cfg["tti_binding_config"]
+
             try:
                 with open(config_path, "w", encoding="utf-8") as f:
                     json.dump(cfg, f, indent=2)
@@ -470,9 +481,11 @@ class CLIGateway(BaseGateway):
                     continue
 
                 if line in ("/config", "/wizard", "/setup"):
+                    self.bot.is_configuring = True
                     print("\nRe-running Configuration Wizard...")
                     new_cfg = run_bootstrap_config_wizard(force=True)
                     self.bot.reconfigure(new_cfg)
+                    self.bot.is_configuring = False
                     continue
 
                 incoming_files = []
@@ -746,12 +759,15 @@ class LollmsBot:
 
         self.client = LollmsClient(**client_kwargs)
         self.db_manager = LollmsDataManager(self.db_path)
-        self.discussion = LollmsDiscussion.create_new(
-            lollms_client=self.client,
-            db_manager=self.db_manager,
-            id="lollmsbot_advanced",
-            autosave=True
-        )
+        if self.db_manager.discussion_exists("lollmsbot_advanced"):
+            self.discussion = self.db_manager.get_discussion(self.client, "lollmsbot_advanced", autosave=True)
+        else:
+            self.discussion = LollmsDiscussion.create_new(
+                lollms_client=self.client,
+                db_manager=self.db_manager,
+                id="lollmsbot_advanced",
+                autosave=True
+            )
         
         # 2. Attach memory system
         self.memory_config = MemoryConfig(
@@ -796,6 +812,7 @@ class LollmsBot:
         self.last_update = time.time()
         self.last_interaction_time = time.time()
         self.idle_timeout = 25.0  # seconds before autonomous thought/ping triggers
+        self.is_configuring = False
         
         # 4. Initialize Multi-Channel Gateways
         self.gateways: List[BaseGateway] = []
@@ -808,7 +825,8 @@ class LollmsBot:
         # 5. Connect and register ROS TurtleBot3 Tools
         tb.init_tool_library()
         self._register_lcp_tools()
-
+        # Print active memory status on startup
+        self.print_memory_status()
         # Sync context size
         if hasattr(self.client, "get_ctx_size"):
             try:
@@ -927,6 +945,35 @@ class LollmsBot:
                 self.discussion.max_context_size = 4096
         ASCIIColors.success("✓ LollmsBot successfully reconfigured!")
 
+    def print_memory_status(self):
+        """Queries and prints an aesthetic summary of the persistent cognitive database on startup."""
+        try:
+            res = self.memory_manager.list_all(page_size=100)
+            memories = res.get("memories", [])
+
+            working_count = sum(1 for m in memories if m["level"] == 1)
+            deep_count = sum(1 for m in memories if m["level"] == 2)
+            archived_count = sum(1 for m in memories if m["level"] == 3)
+            episodic_count = sum(1 for m in memories if m["level"] == 4)
+
+            ASCIIColors.cyan("\n🧠 ─── COGNITIVE MEMORY DATABASE STATUS ───")
+            ASCIIColors.cyan(f"  • Database Path  : {self.db_path}")
+            ASCIIColors.cyan(f"  • Total Memories : {len(memories)} (Working: {working_count}, Deep: {deep_count}, Archived: {archived_count}, Episodic: {episodic_count})")
+
+            if memories:
+                ASCIIColors.cyan("  • Recent Active Memories:")
+                # Show top 5 highest-importance memories
+                sorted_mems = sorted(memories, key=lambda m: m["importance"], reverse=True)
+                for m in sorted_mems[:5]:
+                    level_label = {1: "Working", 2: "Deep", 3: "Archived", 4: "Episodic"}.get(m["level"], "Unknown")
+                    summary = m["content"][:80].replace("\n", " ") + ("..." if len(m["content"]) > 80 else "")
+                    print(f"    - [{level_label}] [{m['id'][:8]}] (Imp: {m['importance']:.0%}) {summary}")
+            else:
+                ASCIIColors.warning("  • Database is currently empty.")
+            ASCIIColors.cyan("───────────────────────────────────────────\n")
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to load memory status: {e}")
+
     # =====================================================================
     # In-Process Autonomous Tool Implementations
     # =====================================================================
@@ -1026,6 +1073,8 @@ class LollmsBot:
 
         while True:
             time.sleep(5.0)
+            if getattr(self, "is_configuring", False):
+                continue
             now = time.time()
             dt = now - self.last_update
             self.last_update = now
@@ -1265,7 +1314,7 @@ class LollmsBot:
         # Placeholder lists to track outgoing attachments
         outgoing_attachments: List[Path] = []
 
-        def client_relay_callback(chunk, msg_type, meta):
+        def client_relay_callback(chunk, msg_type, meta=None):
             if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
                 print(chunk, end="", flush=True)
             return True

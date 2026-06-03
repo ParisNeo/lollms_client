@@ -922,6 +922,29 @@ async def import_bundle(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Invalid bundle package: {e}")
 
 
+@app.get("/api/artifacts/{title}/export_multi_version")
+async def export_multi_version_artifact_endpoint(title: str):
+    """Exports an entire artifact including all of its versions and history."""
+    artifact_data = discussion.export_artefact(title)
+    if not artifact_data:
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+    return artifact_data
+
+
+@app.post("/api/artifacts/import_multi_version")
+async def import_multi_version_artifact_endpoint(file: UploadFile = File(...)):
+    """Imports a multi-version artifact object into the active discussion."""
+    try:
+        content = await file.read()
+        artifact_data = json.loads(content.decode("utf-8"))
+        result = discussion.import_artefact(artifact_data, activate=True)
+        if not result:
+            raise ValueError("Import returned no valid artifact.")
+        return {"success": True, "title": result["title"]}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to import multi-version artifact: {e}")
+
+
 @app.get("/api/artifacts")
 async def list_artifacts_endpoint():
     """Lists all artifacts in the discussion session with metadata, including active state."""
@@ -1635,6 +1658,8 @@ async def get_settings_endpoint():
         "llm_binding_config": cfg.get("llm_binding_config", {}),
         "tti_binding_name": cfg.get("tti_binding_name", ""),
         "tti_binding_config": cfg.get("tti_binding_config", {}),
+        "llm_bindings_configs": cfg.get("llm_bindings_configs", {}),
+        "tti_bindings_configs": cfg.get("tti_bindings_configs", {}),
         "personality_name": cfg.get("personality_name", "")
     }
 
@@ -1683,6 +1708,15 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
             "tti_binding_config": payload.tti_binding_config,
             "personality_name": payload.personality_name
         })
+
+        # Save to historical maps for all-bindings hot retention
+        llm_configs = current_config.setdefault("llm_bindings_configs", {})
+        llm_configs[payload.llm_binding_name] = payload.llm_binding_config
+
+        if payload.tti_binding_name:
+            tti_configs = current_config.setdefault("tti_bindings_configs", {})
+            tti_configs[payload.tti_binding_name] = payload.tti_binding_config
+
         save_app_config(current_config)
         needs_configuration = False
         return {"success": True, "model_name": LLM_MODEL_NAME}
@@ -3450,6 +3484,30 @@ def status_endpoint():
         "is_mock": not isinstance(client, LollmsClient),
         "needs_configuration": needs_configuration
     }
+
+
+@app.get("/api/llm/logs")
+async def get_llm_logs_endpoint():
+    """Retrieves the last N lines of the running LLM server logs."""
+    if not client or not getattr(client, "llm", None):
+        raise HTTPException(status_code=400, detail="LLM binding is not active.")
+    try:
+        logs = client.llm.get_server_logs()
+        return {"success": True, "logs": logs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tti/logs")
+async def get_tti_logs_endpoint():
+    """Retrieves the last N lines of the running TTI server logs."""
+    if not client or not getattr(client, "tti", None):
+        raise HTTPException(status_code=400, detail="TTI binding is not active.")
+    try:
+        logs = client.tti.get_server_logs()
+        return {"success": True, "logs": logs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/models")
