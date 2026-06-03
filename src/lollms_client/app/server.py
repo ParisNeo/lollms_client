@@ -241,6 +241,11 @@ class GenerateImageForMessageRequest(BaseModel):
     prompt: Optional[str] = None
 
 
+class ImportFolderRequest(BaseModel):
+    folder_path: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+
 class DataQueryRequest(BaseModel):
     title: str
     code: str
@@ -538,7 +543,7 @@ async def validate_folder_endpoint(payload: dict):
 
 
 @app.post("/api/import_folder")
-async def import_folder_endpoint(payload: dict):
+async def import_folder_endpoint(payload: ImportFolderRequest):
     """
     Imports an entire folder of data files (CSV, XLSX, SQLite) and consolidates them
     into a single SQLite database for querying.
@@ -588,7 +593,8 @@ async def import_folder_endpoint(payload: dict):
                 mode="data_bundle",
                 title=title,
                 activate=True,
-                progress_cb=progress_callback
+                progress_cb=progress_callback,
+                description=payload.description
             )
             return result
         except Exception as e:
