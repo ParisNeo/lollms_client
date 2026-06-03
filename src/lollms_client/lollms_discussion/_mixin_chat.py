@@ -2008,6 +2008,8 @@ class _StreamState:
 
                 if spec_result:
                     self._emit_processing_status("Specialist implemented the plan successfully.")
+
+                    # CRITICAL FIX: Store result AND emit it as final content
                     self.pending_final_content = spec_result
 
                     # LOG TO TURN SCRATCHPAD
@@ -2022,6 +2024,21 @@ class _StreamState:
                         self._turn_action_history.append("✗ FAILED to implement plan (No valid XML returned)")
             except Exception as e:
                 self._emit_processing_status(f"❌ Specialist Error: {str(e)}")
+
+            # CRITICAL FIX: Emit the specialist result as a tool output event so it's visible
+            if hasattr(self, "_turn_action_history"):
+                current_meta = dict(getattr(self.ai_message, 'metadata', {}) or {})
+                events = current_meta.get("events", [])
+                events.append({
+                    "type": "tool_output", 
+                    "content": spec_result if spec_result else "No result from specialist",
+                    "id": str(uuid.uuid4()), 
+                    "tool": "artifact_specialist",
+                    "result": {"success": bool(spec_result)},
+                    "offset": len(self.ai_message.content)
+                })
+                current_meta["events"] = events
+                self.ai_message.metadata = current_meta
 
             self._emit_processing_close()
             _cb(self.callback, full_content, self.sec_done_mt, {"plan": plan_text})
@@ -4690,39 +4707,82 @@ class ChatMixin:
  
         # Quick intent check to see if the user's message actually requires tools or agentic actions
         _needs_tools = False
-        if tool_registry or enable_image_generation or enable_image_editing or enable_artefacts:
+
+        # CRITICAL FIX: Check for active data artifacts first - ANY analytical question should trigger tool use
+        has_active_data_artifacts = any(
+            a.get("type") == "data" 
+            for a in self.artefacts.list(active_only=True)
+        )
+
+        if has_active_data_artifacts and tool_registry:
+            # Check if the question is analytical/factual (could relate to data)
+            # Keywords that suggest data analysis/querying even without explicit "database" mention
+            _data_intent_keywords = {
+                'question_words': ['what', 'which', 'how many', 'how much', 'where', 'when', 'why', 'who'],
+                'analytical_verbs': ['find', 'get', 'query', 'check', 'see', 'look', 'analyze', 'calculate', 'compute', 'count', 'list', 'show', 'retrieve', 'extract'],
+                'comparative_words': ['most', 'least', 'more', 'less', 'better', 'worse', 'highest', 'lowest', 'top', 'bottom', 'average', 'total', 'sum', 'frequency', 'often', 'rarely'],
+                'data_terms': ['metal', 'equipment', 'contamination', 'value', 'measure', 'record', 'entry', 'row', 'column', 'table', 'dataset']
+            }
+
+            user_msg_lower = user_message.lower()
+            data_intent_score = 0
+
+            # Count matching keywords
+            for word_list in _data_intent_keywords.values():
+                for keyword in word_list:
+                    if keyword in user_msg_lower:
+                        data_intent_score += 1
+
+            # If question has multiple analytical indicators AND there's a data artifact, force tool use
+        if has_active_data_artifacts and tool_registry:
             try:
                 intent_prompt = (
                     f"User message: \"{user_message}\"\n\n"
-                    "Analyze if this message requires executing an external tool, modifying/creating files (artifacts), or generating/editing images.\n"
-                    "Return false if the user is just having a normal conversation, greeting you, asking a general question, or talking casually."
+                    "IMPORTANT CONTEXT: There is an active DATA artifact in this session (a database or dataset file).\n\n"
+                    "Analyze if this message requires:\n"
+                    "1. Executing a tool to query/analyze the data artifact\n"
+                    "2. Modifying/creating files (artifacts)\n"
+                    "3. Generating/editing images\n\n"
+                    "CRITICAL: If the question is analytical, factual, or asks about specific values/frequencies/count/comparisons,\n"
+                    "it likely requires querying the data artifact even if it doesn't explicitly mention 'database' or 'query'.\n\n"
+                    "Return false ONLY if:\n"
+                    "- The user is greeting you (hello, hi, etc.)\n"
+                    "- The question has NO relation to data analysis (e.g., philosophical, abstract)\n"
+                    "- It's purely conversational chit-chat\n\n"
+                    f"When in doubt with analytical questions and an active data artifact, return TRUE.\n"
                 )
                 intent_res = self.lollmsClient.generate_structured_content(
                     prompt=intent_prompt,
                     schema={
                         "requires_tools_or_actions": {
                             "type": "boolean",
-                            "description": "True if the message requests a tool execution, file modification/creation, or image generation/edit. False for normal conversation."
+                            "description": "True if the message requires tool execution (especially data queries), file modification/creation, or image generation/edit. False only for pure conversation."
                         },
                         "reasoning": {
                             "type": "string",
-                            "description": "Brief reasoning for the decision."
+                            "description": "Brief reasoning explaining why tools are or aren't needed"
                         }
                     },
                     temperature=0.0
                 )
                 if intent_res and isinstance(intent_res, dict):
                     _needs_tools = intent_res.get("requires_tools_or_actions", False)
+
+                    # Additional safety: If data artifact exists AND question has analytical keywords, override to True
+                    if has_active_data_artifacts and data_intent_score >= 2:
+                        _needs_tools = True
+                        ASCIIColors.info(f"[Intent Classifier] Overrode to TRUE due to active data artifact + {data_intent_score} analytical keywords")
+
                     ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
             except Exception as e:
-                _needs_tools = True
-                ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to True.")
-        else:
-            _needs_tools = False
-
-        # Quick intent check to see if the user's message actually requires tools or agentic actions
-        _needs_tools = False
-        if tool_registry or enable_image_generation or enable_image_editing or enable_artefacts:
+                # If intent classification fails AND there's a data artifact, default to True (safer)
+                if has_active_data_artifacts:
+                    _needs_tools = True
+                    ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to TRUE due to active data artifact.")
+                else:
+                    _needs_tools = False
+        elif tool_registry or enable_image_generation or enable_image_editing or enable_artefacts:
+            # Standard path for non-data-artifact scenarios
             try:
                 intent_prompt = (
                     f"User message: \"{user_message}\"\n\n"
@@ -5592,8 +5652,11 @@ class ChatMixin:
                 tag in _so_far.lower()
                 for tag in ["<generate_image", "<edit_image", "<lollms_inline", "<lollms_form", "<revert_artifact", "<revert_artefact"]
             )
-            _did_something   = _tool_trigger or _artefacts_built or _has_action_tags
- 
+            # Check if specialist executed successfully (coding_plan with successful implementation)
+            _specialist_executed = hasattr(ss, 'pending_final_content') and bool(ss.pending_final_content)
+
+            _did_something   = _tool_trigger or _artefacts_built or _has_action_tags or _specialist_executed
+
             # ── Round-1 correction: model produced prose instead of action ────
             if _round == 1 and not _did_something:
                 _output_clean = _round_clean.strip()
@@ -5661,10 +5724,22 @@ class ChatMixin:
                     ai_message.content = ai_message.content[:round_content_start]
                     continue
  
-            if not _tool_trigger:
+            # CRITICAL FIX: Enhanced loop exit detection with rescue protocol
+            if not _tool_trigger and not _artefacts_built and not _has_action_tags and not _specialist_executed:
+                # Check if we're in Round 2+ and still no action - force final answer now!
+                if _round >= 2:
+                    ASCIIColors.warning(
+                        f"[chat] Round {_round} also failed to act after correction. "
+                        "Forcing final answer pass with all gathered context."
+                    )
+                    # Set flag to trigger immediate forced answer after loop
+                    is_agentic_turn = True
+                    _turn_action_history.append(
+                        "⚠️ CORRECTION: Model failed to call tools in Round 2. Forcing summary."
+                    )
                 break
- 
-            # ====================================================================
+
+        # ====================================================================
             #  Tool execution
             # ====================================================================
             def _parse_tool_call_lenient(raw: str) -> dict:
@@ -6149,6 +6224,12 @@ class ChatMixin:
             # CRITICAL FIX: Preserve the full accumulated content in ai_message.content,
             # not just the clean prose. This ensures tool results and all text survive.
             ai_message.content = _accumulated_full
+
+            # CRITICAL FIX: If there's pending_final_content from specialist/coding_plan, add it!
+            if hasattr(ss, 'pending_final_content') and ss.pending_final_content:
+                ai_message.content += "\n\n" + ss.pending_final_content
+                # Don't append to clean_prose here - that's for streaming chunks only
+
             ss.clean_prose.clear()
  
         # ====================================================================
@@ -6163,15 +6244,29 @@ class ChatMixin:
         )
         _seems_stuck = _tool_call_count >= 3 and not _has_produced_text
 
+        # Check if specialist successfully executed but no final answer was shown
+        _specialist_succeeded = hasattr(ss, 'pending_final_content') and bool(ss.pending_final_content)
+
+        # Detect if we exited the loop after multiple failed reasoning rounds
+        _loop_exit_after_correction_failure = (
+            _round >= 2 and 
+            not _tool_trigger and 
+            not _artefacts_built and
+            any("failed to act" in entry or "CORRECTION" in entry for entry in _turn_action_history)
+        )
+
+        # CRITICAL FIX: Force answer if multiple rounds failed to act OR specialist succeeded but no output
         _needs_forced_answer = (
-            is_agentic_turn and not _has_produced_text and (
-                not ai_message.content.strip()
-                or _round >= max_reasoning_steps
-                or _seems_stuck
-                or (tool_calls_this_turn and not any(
+            is_agentic_turn and (
+                not _has_produced_text or  # No text at all
+                _loop_exit_after_correction_failure or  # Failed to act in Round 2+ after correction
+                (_specialist_succeeded and not ai_message.content.strip()) or  # Specialist worked but no output shown
+                (_round >= max_reasoning_steps) or  # Max rounds reached
+                (_seems_stuck) or  # Too many tool calls with no text
+                (tool_calls_this_turn and not any(
                     c.get("name") == "final_answer"
                     for c in tool_calls_this_turn
-                ))
+                ))  # Tools called but no final answer signal
             )
         )
 
