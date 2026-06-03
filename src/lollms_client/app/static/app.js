@@ -2211,12 +2211,14 @@ document.addEventListener("DOMContentLoaded", () => {
             progressStatusText.textContent = "Processing folder bundle ingestion...";
 
             try {
+                const description = document.getElementById("custom-description").value.trim();
                 const res = await fetch("/api/import_folder", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ 
                         folder_path: pathValue,
-                        title: customTitle.value || "folder_bundle"
+                        title: customTitle.value || "folder_bundle",
+                        description: description || null
                     })
                 });
 
@@ -2230,6 +2232,8 @@ document.addEventListener("DOMContentLoaded", () => {
                     folderPath.value = "";
                     dropzone.innerHTML = `<p>Drag & drop PDF, DOCX, PPTX, MD, CSV, XLSX, DB, or Image file here, or click to upload (supports multiple files)</p>`;
                     customTitle.value = "";
+                    const descField = document.getElementById("custom-description");
+                    if (descField) descField.value = "";
                     fetchArtifacts();
                 } else {
                     alert(`❌ Folder import failed: ${data.error || "Unknown error"}`);
