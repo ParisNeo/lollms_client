@@ -921,6 +921,9 @@ class ArtefactManager:
         return self.squash_versions(title, keep_last_n=keep_count)
 
     def remove(self, title: str, version: Optional[int] = None) -> int:
+        # First, clean up any associated workspace files for DATA type artefacts
+        self._cleanup_data_artefact_files(title, version)
+
         artefacts = self._get_all_raw()
         initial = len(artefacts)
         if version is None:
@@ -933,6 +936,84 @@ class ArtefactManager:
             self._save_all(artefacts)
             ASCIIColors.info(f"Removed {removed} artefact(s) titled '{title}'.")
         return removed
+
+    def _cleanup_data_artefact_files(self, title: str, version: Optional[int] = None):
+        """
+        Deletes workspace files associated with a DATA type artefact when it is removed.
+
+        Handles both single data files and consolidated bundles from folder ingestion.
+        """
+        try:
+            # Get the artefact to determine file path details
+            art = self.get(title, version) if version else self.get(title)
+            if not art or art.get('type') != 'data':
+                return  # Not a data artefact, skip cleanup
+
+            # Determine workspace directory
+            workspace_dir = Path("./data_workspace")
+            try:
+                from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                if awd is not None:
+                    workspace_dir = awd
+            except ImportError:
+                pass
+
+            if not workspace_dir.exists():
+                return
+
+            file_ext = art.get('file_ext', '.csv')
+
+            # Build list of potential files to delete for this artefact title/version
+            files_to_delete = []
+
+            if version is None:
+                # Remove all versions - find all matching files
+                all_versions = [a for a in self._get_all_raw() if a.get('title') == title and a.get('type') == 'data']
+                for v_art in all_versions:
+                    v_num = v_art.get('version', 1)
+
+                    # Check for versioned file (e.g., "mydb_v2.db")
+                    versioned_file = workspace_dir / f"{title}_v{v_num}{file_ext}"
+                    if versioned_file.exists():
+                        files_to_delete.append(versioned_file)
+
+                    # Check for consolidated bundle DB (only exists on v1 creation)
+                    if v_num == 1:
+                        bundled_db = workspace_dir / f"{title}_consolidated.db"
+                        if bundled_db.exists():
+                            files_to_delete.append(bundled_db)
+            else:
+                # Remove specific version only
+                if art.get('type') == 'data':
+                    # Check for versioned file (e.g., "mydb_v2.db")
+                    versioned_file = workspace_dir / f"{title}_v{version}{file_ext}"
+                    if versioned_file.exists():
+                        files_to_delete.append(versioned_file)
+
+                    # Check for consolidated bundle DB (only exists on v1 creation)
+                    if version == 1:
+                        bundled_db = workspace_dir / f"{title}_consolidated.db"
+                        if bundled_db.exists():
+                            files_to_delete.append(bundled_db)
+
+            # Execute deletion with safety checks
+            for file_path in set(files_to_delete):  # Use set to avoid duplicates
+                try:
+                    # Safety check: ensure we're only deleting data workspace files
+                    resolved = file_path.resolve()
+                    ws_resolved = workspace_dir.resolve()
+
+                    if not str(resolved).startswith(str(ws_resolved)):
+                        ASCIIColors.warning(f"[ArtefactCleanup] Skipping deletion of {file_path} - outside workspace")
+                        continue
+
+                    file_path.unlink()
+                    ASCIIColors.success(f"✓ Deleted data file: {file_path.name}")
+                except Exception as e:
+                    ASCIIColors.error(f"Failed to delete file {file_path}: {e}")
+
+        except Exception as e:
+            ASCIIColors.warning(f"[ArtefactCleanup] Error during cleanup for '{title}': {e}")
 
     def remove_by_id(self, artefact_id: str) -> bool:
         artefacts = self._get_all_raw()
