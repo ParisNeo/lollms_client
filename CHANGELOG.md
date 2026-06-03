@@ -42,6 +42,14 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-03 22:30]
+
+- feat(lollms_discussion): Add critical constraints for <coding\_plan> and <artifact> tags
+
+## [2026-06-03 22:29]
+
+- feat(lollms_discussion): Add critical constraint on using <coding_plan> and <artifact> tags for data artifacts
+
 ## [2026-06-03 09:09]
 
 - feat(lollmsbot): Update agent examples, client setup, and LLM bindings

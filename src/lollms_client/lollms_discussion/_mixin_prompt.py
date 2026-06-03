@@ -564,6 +564,7 @@ RULES:
             "  - Relevant Skills: [List of exact skill titles containing reusable techniques or guidelines needed for this task. Evaluate which of the active skills are relevant to pass.]",
             "  - Relevant Memories: [List 8-char IDs of specific memories required for this task. Leave empty if none apply.]",
             "</coding_plan>",
+            "🚨 CRITICAL: Never write a <coding_plan> or <artifact> tag for read-only queries, data analysis, or calculations on 'data' type artifacts.",
             "",
             "Step 2: EXECUTION",
             "After the plan, you may emit the <artifact> tag. NOTE: The system will use a ",
@@ -594,7 +595,7 @@ RULES:
             "── Option D: REVERT",
             '<revert_artifact name="filename.ext" version="3" />  (Use "previous" to go back one version)',
             "",
-"╔══════════════════════════════════════════════════════════════════╗",
+            "╔══════════════════════════════════════════════════════════════════╗",
             "║  SURGICAL UPDATE POLICY — READ BEFORE EVERY ARTEFACT EDIT       ║",
             "╠══════════════════════════════════════════════════════════════════╣",
             "║                                                                  ║",
@@ -702,7 +703,7 @@ RULES:
             "",
             "=== END ARTIFACT SYSTEM ===",
             "",
-        ]
+        ] 
         return "\n".join(lines)
 
     def _build_image_generation_instructions(self) -> str:
