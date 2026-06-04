@@ -148,6 +148,8 @@ _SECONDARY_TAG_MAP = {
                        MSG_TYPE.MSG_TYPE_INFO,              "</mem_new>"),
     "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,
                        MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
+    "<think":         ("thought_update",      MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,
+                       MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT,   "</think>"),
 }
 
 
@@ -1228,8 +1230,7 @@ class _StreamState:
         # ── STATUS MIMICRY TRAP ──
         # If the LLM starts generating framework-only tags, we trigger an abort.
         if "<processing" in chunk.lower():
-            ASCIIColors.error(f"[Mimicry Trap] LLM attempted to generate internal status: {chunk!r}")
-            self.patch_error_occurred = True # Trigger the execution failure logic
+            ASCIIColors.error(f"\n[Mimicry Trap] LLM attempted to generate internal status: {chunk!r}")
             self.proc_title = "Log Mimicry Detected"
             return False
 
@@ -1333,7 +1334,8 @@ class _StreamState:
             b_str = "".join(self.bracket_buf)
             new_pos = gt_idx + 1
 
-            if "<tool_call>" in b_str:
+            b_str_normalized = b_str.lower().replace(" ", "").replace("\n", "").replace("\r", "")
+            if "<tool_call>" in b_str_normalized:
                 if self.proc_has_opened and self.proc_type == "agent_reasoning":
                     self._emit_processing_close()
                 self.state = self.STATE_TOOL_CALL
@@ -1604,6 +1606,7 @@ class _StreamState:
             "<lollms_form":   "form_building",
             "<mem_new":       "memory_update",
             "<mem_update":    "memory_update",
+            "<think":         "agent_reasoning",
         }
 
         # ── Determine Context: Building vs Editing ──
@@ -1834,8 +1837,8 @@ class _StreamState:
         attrs  = self.sec_open_attrs
         prefix = self.sec_prefix
 
-        # Widgets and forms: buffer silently
-        if prefix in ("<lollms_inline", "<lollms_form"):
+        # Widgets, forms, and thoughts: buffer silently
+        if prefix in ("<lollms_inline", "<lollms_form", "<think"):
             return
 
         # Lazy-init milestone tracker (also reset by _reset_secondary_state)
@@ -2011,6 +2014,14 @@ class _StreamState:
 
                     # CRITICAL FIX: Store result AND emit it as final content
                     self.pending_final_content = spec_result
+
+                    # Automatically parse and schedule any <tool_call> inside the specialist's result
+                    tool_match = re.search(r'<tool_call>(.*?)</tool_call>', spec_result, re.DOTALL | re.IGNORECASE)
+                    if tool_match:
+                        self.tool_trigger = True
+                        self.tool_buf = [f"<tool_call>{tool_match.group(1)}</tool_call>"]
+                        self.state = self.STATE_TOOL_CALL
+                        ASCIIColors.success(f"[StreamState] Specialist returned tool call. Intercepted and scheduled for execution.")
 
                     # LOG TO TURN SCRATCHPAD
                     if hasattr(self, "_turn_action_history"):
@@ -2333,6 +2344,21 @@ class _StreamState:
                 "is_patch": is_patch,
                 "attrs":    attrs,
             })
+
+        # ── Thought Process ───────────────────────────────────────────────────
+        elif prefix == "<think":
+            thought_text = full_content.strip()
+            escaped_thought = thought_text.replace("<", "&lt;").replace(">", "&gt;")
+
+            details_html = (
+                f"\n<details class='proc-params-details' style='margin-top: 6px; outline: none; border-color: rgba(245, 158, 11, 0.15);'>"
+                f"<summary style='cursor: pointer; font-weight: bold; color: var(--accent-color); outline: none; user-select: none;'>💭 Thought Process / Reasoning</summary>"
+                f"<pre style='color: var(--text-secondary); white-space: pre-wrap; font-family: inherit; font-size: 11.5px; margin-top: 6px;'>{escaped_thought}</pre>"
+                f"</details>\n"
+            )
+            self._emit_processing_status(details_html)
+            self._emit_processing_close()
+            _cb(self.callback, full_content, self.sec_done_mt, {"content": full_content})
 
         # ── Memory (Standard Tags with inner content) ─────────────────────────
         elif prefix == "<mem_new":
@@ -2756,6 +2782,10 @@ class _StreamState:
                 n_predict=None
             )
 
+            # Safeguard: If the LLM call returned an error dictionary, raise the error message
+            if isinstance(raw_output, dict):
+                raise RuntimeError(raw_output.get("error", "Unknown LLM service error"))
+
             # ── DEBUG LOG: Show Raw Specialist Response ──
             ASCIIColors.info("--- [DEBUG] SPECIALIST RAW OUTPUT ---")
             ASCIIColors.yellow(f"Output Length: {len(raw_output or '')} chars")
@@ -3145,6 +3175,8 @@ class ChatMixin:
             return m in ["ok", "merci", "thanks", "cool", "yes", "no", "oui", "non"]
 
         extra_instructions = ""
+        user_msg_lower = user_message.lower()
+
         if enable_artefacts:
             extra_instructions += self._build_artefact_instructions()
             if enable_inline_widgets:
@@ -3153,7 +3185,9 @@ class ChatMixin:
                 extra_instructions += self._build_note_instructions()
             if enable_skills:
                 extra_instructions += self._build_skill_instructions()
-            if enable_forms:
+
+            # Lazy-load heavy templates only when requested in user intent
+            if enable_forms and any(kw in user_msg_lower for kw in ("form", "formulaire", "survey", "questionnaire")):
                 extra_instructions += self._build_form_instructions()
 
             branch_msgs = self.get_branch(branch_tip_id or self.active_branch_id)
@@ -3566,8 +3600,20 @@ class ChatMixin:
             final_answer_temperature = kwargs.pop("temperature")
         else:
             final_answer_temperature = None
- 
+
         object.__setattr__(self, '_active_callback', None)
+
+        # Precompute has_data_arts to filter LCP tools contextually
+        has_data_arts = any(
+            a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+            for a in self.artefacts.list(active_only=True)
+        )
+
+        # Precompute has_data_arts so we can filter LCP tools contextually
+        has_data_arts = any(
+            a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+            for a in self.artefacts.list(active_only=True)
+        )
  
         # ====================================================================
         #  SWARM DISPATCH
@@ -3605,8 +3651,10 @@ class ChatMixin:
         _eff_img_gen   = enable_image_generation and _tti_available
         _eff_img_edit  = enable_image_editing     and _tti_available
  
-        # ── System-prompt instructions ────────────────────────────────────────
+        # ── System-prompt instructions (Lazy Loaded to prevent Context Bloat) ──
         extra_instructions = ""
+        user_msg_lower = user_message.lower()
+
         if enable_artefacts:
             extra_instructions += self._build_artefact_instructions()
             if enable_inline_widgets:
@@ -3615,11 +3663,13 @@ class ChatMixin:
                 extra_instructions += self._build_note_instructions()
             if enable_skills:
                 extra_instructions += self._build_skill_instructions()
-            if enable_forms:
+
+            # Lazy-load heavy templates only when requested in user intent
+            if enable_forms and any(kw in user_msg_lower for kw in ("form", "formulaire", "survey", "questionnaire")):
                 extra_instructions += self._build_form_instructions()
-            if enable_books:
+            if enable_books and any(kw in user_msg_lower for kw in ("book", "tome", "novel", "chapitre")):
                 extra_instructions += self._build_book_instructions()
-            if enable_presentations:
+            if enable_presentations and any(kw in user_msg_lower for kw in ("presentation", "slide", "slideshow", "deck", "diaporama")):
                 extra_instructions += self._build_presentation_instructions()
 
             branch_msgs_now = self.get_branch(branch_tip_id or self.active_branch_id)
@@ -3631,6 +3681,23 @@ class ChatMixin:
             extra_instructions += _mem_instructions
         if _eff_img_gen or _eff_img_edit:
             extra_instructions += self._build_image_generation_instructions()
+        if has_data_arts:
+            extra_instructions += """
+=== COGNITIVE DATA QUERY DIRECTIVE (MANDATORY) ===
+You have active data/spreadsheet artifacts loaded.
+
+Before answering the user's query, you MUST perform this internal self-reflection:
+"Does answering this question, or building the requested visualization/report, require or benefit from retrieving, calculating, or validating values from the active dataset?"
+
+If YES, you MUST:
+  1. Use the `execute_python_data_query` or `execute_sql_query` tool to inspect the data.
+  2. You are STRICTLY FORBIDDEN from guessing, assuming, fabricating statistics, or claiming you cannot perform the calculation.
+  3. First, state: "Let's inspect the active dataset to find the exact figures." (or similar), and immediately follow with your `<tool_call>` tag.
+  4. Never write conversational summaries of data before you have executed the query to retrieve it.
+
+If you fail to use the tools when data is available, your output will be rejected.
+=== END COGNITIVE DIRECTIVE ===
+"""
 
         if extra_instructions.strip():
             original_sp = self._system_prompt or ""
@@ -3948,12 +4015,9 @@ class ChatMixin:
                       {"tool_count": len(_pt_specs)})
  
         # ── Layer 2.5: Autonomous Python Data Query Tool ──────────────────────
-        # Automatically registered whenever an active data/database artifact is present in the discussion.
-        active_data = [
-            a for a in self.artefacts.list(active_only=True) 
-            if a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
-        ]
-        if active_data:
+        # Moved to external LCP tools: execute_python_data_query and execute_sql_query
+        active_data = []
+        if False:
             def _execute_python_data_query_tool_impl(code: str) -> Dict[str, Any]:
                 # Dynamically retrieve the latest version of the data artifact to support multi-round updates
                 latest_data = [
@@ -4728,7 +4792,7 @@ class ChatMixin:
 
         # CRITICAL FIX: Check for active data artifacts first - ANY analytical question should trigger tool use
         has_active_data_artifacts = any(
-            a.get("type") == "data" 
+            a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
             for a in self.artefacts.list(active_only=True)
         )
 
@@ -4955,9 +5019,6 @@ class ChatMixin:
             if _mem_cleaned != ai_message.content:
                 ai_message.content = _mem_cleaned
 
-            if _mm:
-                self._save_episodic_memory_turn(user_message, ai_message.content, _mm)
-
             # Auto-dream pass
             dream_report = None
             if enable_auto_dream and _mm is not None:
@@ -4969,8 +5030,9 @@ class ChatMixin:
                             try:
                                 callback(
                                     json.dumps(dream_report, default=str), 
-                                    MSG_TYPE.MSG_TYPE_INFO, 
-                                    {"type": "memory_dream", "report": dream_report}
+                                    text="subconscious dream consolidation", 
+                                    msg_type=MSG_TYPE.MSG_TYPE_INFO, 
+                                    meta={"type": "memory_dream", "report": dream_report}
                                 )
                             except Exception:
                                 pass
@@ -5384,15 +5446,31 @@ class ChatMixin:
                     "=== AGENT STATE (already completed this turn — DO NOT repeat) ==="
                 )
                 if _completed_tool_calls:
-                    state_lines.append("Tool calls already made:")
-                    state_lines.extend(f"  ✓ {c}" for c in _completed_tool_calls)
+                    state_lines.append("⚠️  IMPORTANT: ACTIONS ALREADY COMPLETED:")
+                    state_lines.append("You have already executed these tools and received their results. Do NOT run them again:")
+                    state_lines.extend(f"  ✓ {c} (Completed - Result is in the context history below)" for c in _completed_tool_calls)
+                    state_lines.append("Your goal now is to analyze the results and present the final answer to the user.")
                 if _created_artefact_titles:
                     state_lines.append("Artifacts / notes already created:")
                     state_lines.extend(f"  ✓ {t}" for t in _created_artefact_titles)
                 state_lines.append("=== END AGENT STATE ===")
- 
+
             state_lines.append(_TOOL_CALL_REMINDER)
- 
+
+            if has_data_arts:
+                state_lines.append(
+                    "⚠️  MANDATORY ACTION DIRECTIVE — TWO-STEP EPHEMERAL PARADIGM ONLY:\n"
+                    "You are STRICTLY FORBIDDEN from inlining your Python/SQL script inside the JSON parameters.\n"
+                    "You MUST use this exact two-step procedure:\n\n"
+                    "  Step 1: Write/save your raw, unescaped code/query inside an ephemeral artifact first:\n"
+                    '     <artifact name="query.py" type="code" language="python" ephemeral="true">\n'
+                    "     your complete clean python/sql code here\n"
+                    "     </artifact>\n\n"
+                    "  Step 2: Emit the tool call passing the artifact title as a reference:\n"
+                    '     <tool_call>{"name": "execute_python_data_query", "parameters": {"code": "query.py"}}</tool_call>\n\n'
+                    "Do NOT write plans without executing them. Do NOT say 'Since I cannot perform calculations...'. Run the two steps now."
+                )
+
             if _round == 1 and not _completed_tool_calls:
                 state_lines.append(
                     "AVAILABLE TOOLS (quick list): " + ", ".join(tool_registry.keys())
@@ -5986,7 +6064,7 @@ class ChatMixin:
                             llm_block += f"Metadata: {json.dumps(s['metadata'])}\n"
                         llm_block += "---\n"
                     if not inferred_srcs:
-                        llm_block += _result_obj.output
+                        llm_block += json.dumps(_result_obj.output, indent=2, ensure_ascii=False) if isinstance(_result_obj.output, dict) else str(_result_obj.output)
 
                     self.scratchpad = (self.scratchpad or "") + (
                         f"\n--- Tool: {res_label} (round {_round}) ---\n"
@@ -6204,10 +6282,10 @@ class ChatMixin:
                 sender_type="assistant",
                 content=_clean_so_far_for_llm.strip()
             ))
-            # Keep the real tool result for tool calls
+            # Keep the real tool result for tool calls in plain English for small models
             _virtual_history.append(SimpleNamespace(
                 sender_type="user",
-                content=f'<tool_result name="{_tool_name}">{_result_str_for_llm}</tool_result>'
+                content=f'[SYSTEM: Tool "{_tool_name}" executed successfully. Return Value:\n{_result_str_for_llm}]'
             ))
 
             # ── INJECT SYNTHETIC ARTIFACT RESULTS OR FAILURE MARKERS ───────────
@@ -6227,9 +6305,8 @@ class ChatMixin:
                             sender_type="user",
                             content=synth_result
                         ))
-            else:
-                # CRITICAL FIX: Inject synthetic FAILURE marker when no action was taken
-                # This teaches the LLM that reasoning without action = failure
+            elif not _did_something:
+                # Inject failure marker ONLY when absolutely no action was taken
                 synth_failure = (
                     f'\n<tool_result name="action_failure">'
                     f'{{"success": false, "error": "NO ACTION TAKEN: You produced reasoning but no tools were called and no artifacts were modified. The system requires you to call tools or emit <artifact> tags to make progress."}}'

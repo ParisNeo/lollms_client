@@ -5619,7 +5619,19 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    // ── 🌿 Fetch and Render Active Branches ──
+    // ── Local Memories Tabbed Viewport Variables ──
+    let activeMemoryLevel = 1;
+    let cachedMemories = [];
+
+    // Bind Memories Local Tabs Click Events
+    document.querySelectorAll(".mem-tab-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+            activeMemoryLevel = parseInt(btn.dataset.memLevel, 10);
+            renderMemories();
+        });
+    });
+
+    // ── Fetch and Render Active Branches ──
     async function fetchBranches() {
         if (!branchSelect) return;
         try {
@@ -5665,91 +5677,102 @@ document.addEventListener("DOMContentLoaded", () => {
     async function fetchMemories() {
         try {
             const res = await fetch("/api/memories");
-            const memories = await res.json();
-
-            if (memories.length === 0) {
-                memoriesList.innerHTML = `<li class="empty-msg">No memories stored yet.</li>`;
-                return;
-            }
-
-            const working = memories.filter(m => m.level === 1);
-            const deep = memories.filter(m => m.level === 2);
-            const archived = memories.filter(m => m.level === 3);
-
-            function renderZone(items, label, cls) {
-                if (items.length === 0) {
-                    return `<li class="empty-msg" style="padding:4px 12px;font-size:11px;">No ${label} memories.</li>`;
-                }
-                return items.map(m => `
-                    <li class="memory-card ${cls}" data-mem-id="${m.id}">
-                        <div class="memory-header">
-                            <span class="level-tag ${cls}">${label} (Level ${m.level})</span>
-                            <span class="importance-badge">Imp: ${(m.importance * 100).toFixed(0)}%</span>
-                        </div>
-                        <p class="desc-text" style="color: var(--text-primary); margin-top: 4px;">${m.content}</p>
-                        <div class="details" style="font-size: 10px;">Uses: ${m.use_count} · ID: ${m.id.substring(0, 8)}</div>
-                        <div class="memory-actions">
-                            <button class="mem-btn" data-action="up" title="Promote (decrease level)">⬆️</button>
-                            <button class="mem-btn" data-action="down" title="Demote (increase level)">⬇️</button>
-                            <button class="mem-btn" data-action="imp" title="Edit importance">⚡</button>
-                            <button class="mem-btn" data-action="del" title="Delete memory">🗑️</button>
-                        </div>
-                    </li>
-                `).join("");
-            }
-
-            memoriesList.innerHTML = `
-                <li class="memory-zone-header working-zone">⚡ Working Memory</li>
-                ${renderZone(working, "Working", "working")}
-                <li class="memory-zone-header deep-zone">🔒 Deep Memory</li>
-                ${renderZone(deep, "Deep", "deep")}
-                <li class="memory-zone-header archived-zone">📦 Archived Memory</li>
-                ${renderZone(archived, "Archived", "archived")}
-            `;
-
-            memoriesList.querySelectorAll(".memory-actions .mem-btn").forEach(btn => {
-                btn.addEventListener("click", async (e) => {
-                    e.stopPropagation();
-                    const card = btn.closest(".memory-card");
-                    const id = card.dataset.memId;
-                    const action = btn.dataset.action;
-                    if (action === "del") {
-                        if (!confirm("Delete this memory permanently?")) return;
-                        try {
-                            const res = await fetch(`/api/memories/${encodeURIComponent(id)}`, { method: "DELETE" });
-                            if (res.ok) fetchMemories();
-                        } catch (err) { console.error(err); }
-                    } else if (action === "up" || action === "down") {
-                        const currentLevel = parseInt(card.querySelector(".level-tag").textContent.match(/\d+/)[0], 10);
-                        const newLevel = action === "up" ? Math.max(1, currentLevel - 1) : Math.min(3, currentLevel + 1);
-                        try {
-                            const res = await fetch(`/api/memories/${encodeURIComponent(id)}/edit`, {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ level: newLevel })
-                            });
-                            if (res.ok) fetchMemories();
-                        } catch (err) { console.error(err); }
-                    } else if (action === "imp") {
-                        const currentImp = card.querySelector(".importance-badge").textContent.match(/[\d.]+/)[0] / 100;
-                        const raw = await showCustomPrompt("Edit Importance", "New importance (0.0 - 1.0)", currentImp);
-                        if (raw === null || raw === "") return;
-                        const importance = parseFloat(raw);
-                        if (isNaN(importance)) return;
-                        try {
-                            const res = await fetch(`/api/memories/${encodeURIComponent(id)}/edit`, {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ importance })
-                            });
-                            if (res.ok) fetchMemories();
-                        } catch (err) { console.error(err); }
-                    }
-                });
-            });
+            cachedMemories = await res.json();
+            renderMemories();
         } catch (err) {
-            console.error("Failed to load memories:", err);
+            console.error("Failed to fetch memories:", err);
         }
+    }
+
+    function renderMemories() {
+        // Synchronize active local tab button highlight
+        document.querySelectorAll(".mem-tab-btn").forEach(btn => {
+            const lvl = parseInt(btn.dataset.memLevel, 10);
+            btn.classList.toggle("active", lvl === activeMemoryLevel);
+        });
+
+        if (cachedMemories.length === 0) {
+            memoriesList.innerHTML = `<li class="empty-msg">No memories stored yet.</li>`;
+            return;
+        }
+
+        const filtered = cachedMemories.filter(m => m.level === activeMemoryLevel);
+
+        if (filtered.length === 0) {
+            const labels = { 1: "Working", 2: "Deep / Associative", 3: "Archived", 4: "Episodic" };
+            memoriesList.innerHTML = `<li class="empty-msg">No ${labels[activeMemoryLevel]} memories in session.</li>`;
+            return;
+        }
+
+        const labels = { 1: "Working", 2: "Deep", 3: "Archived", 4: "Episodic" };
+        const classes = { 1: "working", 2: "deep", 3: "archived", 4: "episodic" };
+
+        memoriesList.innerHTML = filtered.map(m => `
+            <li class="memory-card ${classes[m.level]}" data-mem-id="${m.id}">
+                <div class="memory-header">
+                    <span class="level-tag ${classes[m.level]}">${labels[m.level]} (Level ${m.level})</span>
+                    <span class="importance-badge">Imp: ${(m.importance * 100).toFixed(0)}%</span>
+                </div>
+                <p class="desc-text" style="color: var(--text-primary); margin-top: 6px; white-space: pre-wrap; line-height: 1.4;">${m.content}</p>
+                <div class="details" style="font-size: 10px; margin-top: 4px;">Uses: ${m.use_count} · ID: ${m.id.substring(0, 8)}</div>
+                <div class="memory-actions" style="margin-top: 8px;">
+                    <button class="mem-btn" data-action="up" title="Promote (decrease level)">⬆️</button>
+                    <button class="mem-btn" data-action="down" title="Demote (increase level)">⬇️</button>
+                    <button class="mem-btn" data-action="imp" title="Edit importance">⚡</button>
+                    <button class="mem-btn" data-action="del" title="Delete memory">🗑️</button>
+                </div>
+            </li>
+        `).join("");
+
+        // Bind click actions to the newly rendered cards
+        memoriesList.querySelectorAll(".memory-actions .mem-btn").forEach(btn => {
+            btn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                const card = btn.closest(".memory-card");
+                const id = card.dataset.memId;
+                const action = btn.dataset.action;
+
+                if (action === "del") {
+                    const confirmed = await showSlickConfirm(
+                        "🗑️ Delete Memory",
+                        "Are you sure you want to permanently delete this memory? This cannot be undone."
+                    );
+                    if (!confirmed) return;
+                    try {
+                        const res = await fetch(`/api/memories/${encodeURIComponent(id)}`, { method: "DELETE" });
+                        if (res.ok) fetchMemories();
+                    } catch (err) { console.error(err); }
+                } else if (action === "up" || action === "down") {
+                    const currentLevel = activeMemoryLevel;
+                    const newLevel = action === "up" ? Math.max(1, currentLevel - 1) : Math.min(4, currentLevel + 1);
+                    try {
+                        const res = await fetch(`/api/memories/${encodeURIComponent(id)}/edit`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ level: newLevel })
+                        });
+                        if (res.ok) {
+                            activeMemoryLevel = newLevel; // Follow the memory card's level swap for seamless UX!
+                            fetchMemories();
+                        }
+                    } catch (err) { console.error(err); }
+                } else if (action === "imp") {
+                    const currentImp = parseFloat(card.querySelector(".importance-badge").textContent.match(/[\d.]+/)[0]) / 100;
+                    const raw = await showCustomPrompt("Edit Importance", "New importance (0.0 - 1.0)", currentImp.toString());
+                    if (raw === null || raw === "") return;
+                    const importance = parseFloat(raw);
+                    if (isNaN(importance)) return;
+                    try {
+                        const res = await fetch(`/api/memories/${encodeURIComponent(id)}/edit`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ importance })
+                        });
+                        if (res.ok) fetchMemories();
+                    } catch (err) { console.error(err); }
+                }
+            });
+        });
     }
 
     // ── 💬 Interactive Conversational Chat Companion ──

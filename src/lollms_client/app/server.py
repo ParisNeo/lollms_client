@@ -3121,11 +3121,20 @@ async def chat_with_document(request: ChatRequest):
                 if synthesis and user_msg:
                     user_msg.content = f"{synthesis}\n\n---\n\nUser query: {original_content}"
 
+                # Precompute has_data_arts to filter LCP tools contextually
+                has_data_arts = any(
+                    a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+                    for a in discussion.artefacts.list(active_only=True)
+                )
+
                 active_tools = {}
                 if discussion.lollmsClient and getattr(discussion.lollmsClient, "tools", None):
                     # Gather discovered local LCP tools (respecting user activation toggle)
                     for t in discussion.lollmsClient.tools.list_tools():
                         if not tool_states.get(t["name"], True):
+                            continue
+                        # Skip data tools if no active data artifacts are present
+                        if t["name"] in ("execute_python_data_query", "execute_sql_query") and not has_data_arts:
                             continue
                         # Wrap callable to execute through the LCP binding
                         active_tools[t["name"]] = {

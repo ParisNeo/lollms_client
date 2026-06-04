@@ -461,6 +461,10 @@ body {
     border-left: 3px solid #64748b;
 }
 
+.memory-list .memory-card.episodic {
+    border-left: 3px solid var(--chat-user-bg);
+}
+
 .memory-list .memory-header {
     display: flex;
     justify-content: space-between;
@@ -494,29 +498,37 @@ body {
     color: #64748b;
 }
 
-.memory-zone-header {
+.memory-list .level-tag.episodic {
+    color: var(--text-primary);
+    background-color: var(--chat-user-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+/* Local Tabbed Memories Controls */
+.mem-tab-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    padding: 4px 8px;
     font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 8px 12px 4px;
-    border-top: 1px solid var(--border-color);
+    font-weight: bold;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.15s;
+    border: 1px solid transparent;
+    white-space: nowrap;
 }
 
-.memory-zone-header:first-child {
-    border-top: none;
+.mem-tab-btn:hover {
+    color: var(--text-primary);
+    background-color: rgba(255, 255, 255, 0.03);
 }
 
-.memory-zone-header.working-zone {
-    color: var(--success-color);
-}
-
-.memory-zone-header.deep-zone {
-    color: var(--accent-color);
-}
-
-.memory-zone-header.archived-zone {
-    color: #64748b;
+.mem-tab-btn.active {
+    background-color: var(--accent-color);
+    color: #020617;
+    border-color: var(--accent-color);
 }
 
 /* Sub-Tab Navigation System inside Artifact Workspace Tabs */

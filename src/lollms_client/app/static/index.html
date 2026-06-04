@@ -115,6 +115,13 @@
                     </div>
                 </div>
                 <p class="section-desc">Tiered persistent SQLite memory.</p>
+                <!-- Local Tabbed Memory Widget -->
+                <div class="memory-tabs" style="display: flex; gap: 4px; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 6px; overflow-x: auto; user-select: none;">
+                    <button class="mem-tab-btn active" data-mem-level="1">Working</button>
+                    <button class="mem-tab-btn" data-mem-level="2">Deep / Assoc</button>
+                    <button class="mem-tab-btn" data-mem-level="3">Archived</button>
+                    <button class="mem-tab-btn" data-mem-level="4">Episodic</button>
+                </div>
                 <ul class="memory-list" id="memories-list">
                     <li class="empty-msg">No memories stored yet.</li>
                 </ul>

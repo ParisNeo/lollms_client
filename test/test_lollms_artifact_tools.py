@@ -186,7 +186,122 @@ class TestLollmsArtifactTools(unittest.TestCase):
         if csv_path.exists():
             csv_path.unlink()
 
+    def test_lcp_sql_and_python_query_tools(self):
+        # 1. Create mock data file in the workspace
+        import pandas as pd
+        workspace_dir = Path("./data_workspace")
+        workspace_dir.mkdir(exist_ok=True)
+        csv_path = workspace_dir / "user_salaries_v1.csv"
+        df = pd.DataFrame({
+            "name": ["Alice", "Bob", "Charlie"],
+            "salary": [120000, 95000, 110000]
+        })
+        df.to_csv(csv_path, index=False)
 
+        # Create active unversioned fallback
+        df.to_csv(workspace_dir / "user_salaries.csv", index=False)
+
+        # 2. Register data artifact in active discussion
+        art = self.discussion.artefacts.add(
+            title="user_salaries",
+            artefact_type="data",
+            content="Mock schema",
+            file_ext=".csv",
+            version=1,
+            read_only=False
+        )
+
+        # Set up a temporary active branch message so discussion_instance.active_branch_id is valid
+        user_msg = self.discussion.add_message(sender="user", content="Query data")
+        ai_msg = self.discussion.add_message(sender="assistant", content="Analyzing")
+
+        # 3. Test LCP SQL Query Tool
+        from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.execute_sql_query import tool_execute_sql_query
+        
+        sql_res = tool_execute_sql_query(
+            sql_query="SELECT name FROM user_salaries WHERE salary > 100000",
+            discussion_instance=self.discussion
+        )
+        self.assertTrue(sql_res["success"])
+        self.assertIn("Alice", sql_res["output"])
+        self.assertIn("Charlie", sql_res["output"])
+
+        # 4. Test LCP Python Data Query Tool
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
+        
+        python_res = tool_execute_python_data_query(
+            code="df['salary'] = df['salary'] + 5000",
+            discussion_instance=self.discussion
+        )
+        self.assertTrue(python_res["success"])
+        
+        # Verify the file was updated and a new version is registered
+        updated_art = self.discussion.artefacts.get("user_salaries")
+        self.assertEqual(updated_art["version"], 2)
+
+        # Clean up files
+        for f in (workspace_dir / "user_salaries_v1.csv", workspace_dir / "user_salaries_v2.csv", workspace_dir / "user_salaries.csv"):
+            if f.exists():
+                f.unlink()
+
+
+    def test_lcp_sql_and_python_query_tools(self):
+        # 1. Create mock data file in the workspace
+        import pandas as pd
+        workspace_dir = Path("./data_workspace")
+        workspace_dir.mkdir(exist_ok=True)
+        csv_path = workspace_dir / "user_salaries_v1.csv"
+        df = pd.DataFrame({
+            "name": ["Alice", "Bob", "Charlie"],
+            "salary": [120000, 95000, 110000]
+        })
+        df.to_csv(csv_path, index=False)
+
+        # Create active unversioned fallback
+        df.to_csv(workspace_dir / "user_salaries.csv", index=False)
+
+        # 2. Register data artifact in active discussion
+        art = self.discussion.artefacts.add(
+            title="user_salaries",
+            artefact_type="data",
+            content="Mock schema",
+            file_ext=".csv",
+            version=1,
+            read_only=False
+        )
+
+        # Set up a temporary active branch message so discussion_instance.active_branch_id is valid
+        user_msg = self.discussion.add_message(sender="user", content="Query data")
+        ai_msg = self.discussion.add_message(sender="assistant", content="Analyzing")
+
+        # 3. Test LCP SQL Query Tool
+        from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.execute_sql_query import tool_execute_sql_query
+
+        sql_res = tool_execute_sql_query(
+            sql_query="SELECT name FROM user_salaries WHERE salary > 100000",
+            discussion_instance=self.discussion
+        )
+        self.assertTrue(sql_res["success"])
+        self.assertIn("Alice", sql_res["output"])
+        self.assertIn("Charlie", sql_res["output"])
+
+        # 4. Test LCP Python Data Query Tool
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
+
+        python_res = tool_execute_python_data_query(
+            code="df['salary'] = df['salary'] + 5000",
+            discussion_instance=self.discussion
+        )
+        self.assertTrue(python_res["success"])
+
+        # Verify the file was updated and a new version is registered
+        updated_art = self.discussion.artefacts.get("user_salaries")
+        self.assertEqual(updated_art["version"], 2)
+
+        # Clean up files
+        for f in (workspace_dir / "user_salaries_v1.csv", workspace_dir / "user_salaries_v2.csv", workspace_dir / "user_salaries.csv"):
+            if f.exists():
+                f.unlink()
 
     def test_token_count_caching(self):
         # Create a mock client with a tracking counter for count_tokens calls

@@ -91,27 +91,37 @@ class LCPBinding(LollmsToolBinding):
 
             if not entry_fn:
                 return None
-                
+
             # Extract Description from Docstring
             docstring = ast.get_docstring(entry_fn) or ""
             description = docstring.strip().split("\n\n")[0].strip() if docstring else "No description provided."
-            
+
+            # Parse parameter descriptions from docstring to enrich explicit arguments
+            doc_params = {}
+            if docstring:
+                for line in docstring.splitlines():
+                    m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line.strip())
+                    if m:
+                        p_name = m.group(1).strip()
+                        p_desc = m.group(3).strip()
+                        doc_params[p_name] = p_desc
+
             # Extract Parameters from Function Arguments
             properties = {}
             required = []
-            
+
             args_list = entry_fn.args.args
             defaults_list = entry_fn.args.defaults
-            
+
             # Align defaults with arguments
             defaults_offset = len(args_list) - len(defaults_list) if defaults_list else len(args_list)
-            
+
             for idx, arg in enumerate(args_list):
                 arg_name = arg.arg
                 # Exclude standard context parameters
                 if arg_name in ("lollms_client_instance", "client", "discussion_instance", "discussion", "args", "params"):
                     continue
-                    
+
                 # Extract Type from Annotation
                 arg_type = "string" # default
                 if arg.annotation:
@@ -126,7 +136,7 @@ class LCPBinding(LollmsToolBinding):
                         arg_type = "array"
                     elif "dict" in anno_str or "object" in anno_str:
                         arg_type = "object"
-                        
+
                 # Extract Default value if present
                 has_default = idx >= defaults_offset
                 default_val = None
@@ -136,17 +146,18 @@ class LCPBinding(LollmsToolBinding):
                         default_val = ast.literal_eval(default_node)
                     except:
                         default_val = ast.unparse(default_node).strip("'\"")
-                        
+
+                desc = doc_params.get(arg_name, f"Parameter '{arg_name}'")
                 properties[arg_name] = {
                     "type": arg_type,
-                    "description": f"Parameter '{arg_name}'"
+                    "description": desc
                 }
-                
+
                 if has_default:
                     properties[arg_name]["default"] = default_val
                 else:
                     required.append(arg_name)
-                    
+
             # Docstring Fallback: If the function takes a generic dict (args/params), parse parameters from the docstring
             if not properties and docstring:
                 lines = docstring.splitlines()
@@ -157,18 +168,18 @@ class LCPBinding(LollmsToolBinding):
                         p_name = m.group(1).strip()
                         p_type_raw = (m.group(2) or "string").lower().strip()
                         p_desc = m.group(3).strip()
-                        
+
                         # Skip keywords or headings
                         if p_name.lower() in ("args", "parameters", "returns", "example", "usage", "note", "class", "def", "raises"):
                             continue
-                            
+
                         p_type = "string"
                         if "int" in p_type_raw: p_type = "integer"
                         elif "float" in p_type_raw or "number" in p_type_raw: p_type = "number"
                         elif "bool" in p_type_raw: p_type = "boolean"
                         elif "list" in p_type_raw or "array" in p_type_raw: p_type = "array"
                         elif "dict" in p_type_raw or "object" in p_type_raw: p_type = "object"
-                        
+
                         properties[p_name] = {
                             "type": p_type,
                             "description": p_desc
@@ -251,16 +262,16 @@ class LCPBinding(LollmsToolBinding):
         Args:
             specific_tool_names (Optional[List[str]]): If provided, filter discovery
                                                        to only these tool names.
-            **kwargs: Ignored by this binding.
+            **kwargs: Can include 'force_refresh' to clear cache and re-scan.
 
         Returns:
             List[Dict[str, Any]]: A list of discovered tool definitions.
         """
         if not self.tools_folders and not self.tool_files:
             return []
-            
+
         # Re-scan if needed, or if discovery hasn't happened
-        if not self.discovered_tools:
+        if kwargs.get("force_refresh", False) or not self.discovered_tools:
              self._discover_local_tools()
 
         if specific_tool_names:
