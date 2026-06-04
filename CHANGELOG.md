@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-04 00:34]
+
+- feat(lollms): Introduce mixins for chat and memory functionality
+
 ## [2026-06-03 22:30]
 
 - feat(lollms_discussion): Add critical constraints for <coding\_plan> and <artifact> tags

@@ -251,6 +251,55 @@ class LollmsMemoryManager:
             s.flush()
             return self._to_dict(r)
 
+    def auto_pull_associative_memories(self, memory_id: str, top_k: int = 2) -> List[Dict]:
+        """
+        Locates other deep/archived memories associated with the given memory_id
+        (via shared tags, matching subject_group, or keyword similarity)
+        and promotes them to Level 2 (Deep Memory) to make their handles visible.
+        """
+        target = self.get(memory_id)
+        if not target:
+            return []
+
+        associated_ids = set()
+        pulled_memories = []
+
+        target_tags = set(t.strip().lower() for t in (target.get("tags") or "").split(",") if t.strip())
+        target_group = target.get("subject_group")
+
+        with self._session() as s:
+            candidates = self._q(s).filter(_MemoryRecord.id != memory_id)\
+                                   .filter(_MemoryRecord.level.in_([2, 3]))\
+                                   .all()
+
+            for c in candidates:
+                # Association A: Match by identical Subject Group
+                group_match = target_group and c.subject_group == target_group
+
+                # Association B: Match by shared tags
+                c_tags = set(t.strip().lower() for t in (c.tags or "").split(",") if t.strip())
+                tag_match = bool(target_tags & c_tags)
+
+                if group_match or tag_match:
+                    associated_ids.add(c.id)
+
+        for cid in list(associated_ids)[:top_k]:
+            with self._session() as s:
+                r = s.get(_MemoryRecord, cid)
+                if r:
+                    if r.level == 3:
+                        r.level = 2
+                    r.importance = min(1.0, r.importance + 0.05)  # slight associative boost
+                    s.flush()
+                    pulled_memories.append(self._to_dict(r))
+
+        if pulled_memories:
+            ASCIIColors.cyan(
+                f"[Memory] Associative Recall — Staged {len(pulled_memories)} related memory handle(s) "
+                f"associated with '{target['id'][:8]}' ('{target['content'][:30]}...')."
+            )
+        return pulled_memories
+
     def tag(self, memory_id: str) -> Optional[Dict]:
         with self._session() as s:
             r = self._q(s).filter(_MemoryRecord.id == memory_id).first()
@@ -261,6 +310,13 @@ class LollmsMemoryManager:
             r.updated_at = datetime.utcnow()
             if r.level > 1: r.level = 1
             s.flush()
+
+            # Cascade and pull associated memories into Level 2
+            try:
+                self.auto_pull_associative_memories(memory_id)
+            except Exception as e:
+                ASCIIColors.warning(f"Associative memory propagation failed: {e}")
+
             return self._to_dict(r)
 
     def delete(self, memory_id: str) -> bool:
@@ -346,6 +402,13 @@ class LollmsMemoryManager:
             r.updated_at = datetime.utcnow()
             r.importance = max(r.importance, self.config.demotion_threshold + 0.1)
             s.flush()
+
+            # Cascade and pull associated memories into Level 2
+            try:
+                self.auto_pull_associative_memories(memory_id)
+            except Exception as e:
+                ASCIIColors.warning(f"Associative memory propagation failed: {e}")
+
             return self._to_dict(r)
 
     def auto_pull_deep_memories(self, user_message: str, top_k: int = 3) -> List[Dict]:

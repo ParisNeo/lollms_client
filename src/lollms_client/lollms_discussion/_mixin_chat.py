@@ -3949,18 +3949,24 @@ class ChatMixin:
  
         # ── Layer 2.5: Autonomous Python Data Query Tool ──────────────────────
         # Automatically registered whenever an active data/database artifact is present in the discussion.
-        active_data = [a for a in self.artefacts.list(active_only=True) if a.get("type") == "data"]
+        active_data = [
+            a for a in self.artefacts.list(active_only=True) 
+            if a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+        ]
         if active_data:
             def _execute_python_data_query_tool_impl(code: str) -> Dict[str, Any]:
                 # Dynamically retrieve the latest version of the data artifact to support multi-round updates
-                latest_data = [a for a in self.artefacts.list(active_only=True) if a.get("type") == "data"]
+                latest_data = [
+                    a for a in self.artefacts.list(active_only=True) 
+                    if a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+                ]
                 if not latest_data:
                     err_msg = "No active data artifact found in this session."
                     ASCIIColors.error(f"❌ {err_msg}")
                     return {"success": False, "error": err_msg}
 
                 title = latest_data[0]["title"]
-                ext = latest_data[0].get("file_ext", ".csv")
+                ext = latest_data[0].get("file_ext") or Path(title).suffix or ".csv"
                 current_version = latest_data[0].get("version", 1)
                 is_read_only = latest_data[0].get("read_only", False)
                 plot_b64 = None
@@ -4227,10 +4233,16 @@ class ChatMixin:
                 from lollms_client.lollms_types import LCPResult
                 from ascii_colors import ASCIIColors, trace_exception
 
-                title = active_data[0]["title"]
-                ext = active_data[0].get("file_ext", ".csv")
-                current_version = active_data[0].get("version", 1)
-                is_read_only = active_data[0].get("read_only", False)
+                # Find first active data-matching artifact
+                matched_art = next((
+                    a for a in self.artefacts.list(active_only=True) 
+                    if a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+                ), active_data[0])
+
+                title = matched_art["title"]
+                ext = matched_art.get("file_ext") or Path(title).suffix or ".csv"
+                current_version = matched_art.get("version", 1)
+                is_read_only = matched_art.get("read_only", False)
 
                 workspace_dir = Path("./data_workspace")
                 try:
@@ -4428,10 +4440,16 @@ class ChatMixin:
                 from lollms_client.lollms_types import LCPResult
                 from ascii_colors import ASCIIColors, trace_exception
 
-                title = active_data[0]["title"]
-                ext = active_data[0].get("file_ext", ".csv")
-                current_version = active_data[0].get("version", 1)
-                is_read_only = active_data[0].get("read_only", False)
+                # Find first active data-matching artifact
+                matched_art = next((
+                    a for a in self.artefacts.list(active_only=True) 
+                    if a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+                ), active_data[0])
+
+                title = matched_art["title"]
+                ext = matched_art.get("file_ext") or Path(title).suffix or ".csv"
+                current_version = matched_art.get("version", 1)
+                is_read_only = matched_art.get("read_only", False)
 
                 workspace_dir = Path("./data_workspace")
                 try:
@@ -4719,9 +4737,9 @@ class ChatMixin:
             # Keywords that suggest data analysis/querying even without explicit "database" mention
             _data_intent_keywords = {
                 'question_words': ['what', 'which', 'how many', 'how much', 'where', 'when', 'why', 'who'],
-                'analytical_verbs': ['find', 'get', 'query', 'check', 'see', 'look', 'analyze', 'calculate', 'compute', 'count', 'list', 'show', 'retrieve', 'extract'],
-                'comparative_words': ['most', 'least', 'more', 'less', 'better', 'worse', 'highest', 'lowest', 'top', 'bottom', 'average', 'total', 'sum', 'frequency', 'often', 'rarely'],
-                'data_terms': ['metal', 'equipment', 'contamination', 'value', 'measure', 'record', 'entry', 'row', 'column', 'table', 'dataset']
+                'analytical_verbs': ['find', 'get', 'query', 'check', 'see', 'look', 'analyze', 'calculate', 'compute', 'count', 'list', 'show', 'retrieve', 'extract', 'plot', 'make', 'draw', 'graph', 'chart', 'visualize', 'display'],
+                'comparative_words': ['most', 'least', 'more', 'less', 'better', 'worse', 'highest', 'lowest', 'top', 'bottom', 'average', 'total', 'sum', 'frequency', 'often', 'rarely', 'distribution', 'trend', 'change', 'growth', 'over time'],
+                'data_terms': ['metal', 'equipment', 'contamination', 'value', 'measure', 'record', 'entry', 'row', 'column', 'table', 'dataset', 'order', 'orders', 'sale', 'sales', 'product', 'products', 'customer', 'customers', 'quantity', 'price']
             }
 
             user_msg_lower = user_message.lower()

@@ -39,6 +39,38 @@ class MemoryMixin:
         parts = [p for p in (working, handles, episodic) if p]
         return "\n".join(parts) if parts else ""
 
+    def _is_turn_worth_memorizing(self, user_text: str, ai_text: str) -> bool:
+        """Filters out conversational noise, small talk, errors, and status updates."""
+        u_clean = user_text.lower().strip()
+        a_clean = ai_text.lower().strip()
+
+        # 1. Skip empty or extremely short turns
+        if len(u_clean) < 10 or len(a_clean) < 15:
+            return False
+
+        # 2. Filter common greetings, pleasantries, and trivial social fluff
+        fluff_patterns = [
+            r"^(hello|hi|hey|bonjour|salut|good morning|good afternoon|good evening|howdy|yo)\b",
+            r"^(thanks|thank you|merci|cool|ok|okay|yes|no|oui|non|perfect|awesome|great|super|agreed)\b",
+            r"^(bye|goodbye|au revoir|see you)\b"
+        ]
+        for pattern in fluff_patterns:
+            if re.match(pattern, u_clean) and len(u_clean) < 30:
+                return False
+            if re.match(pattern, a_clean) and len(a_clean) < 40:
+                return False
+
+        # 3. Filter structural execution errors, rejections, and raw debugging/diff blocks
+        noise_terms = [
+            "rejected:", "failed to match", "search/replace", "error executing", 
+            "invalid token", "traceback", "syntaxerror", "connection refused",
+            "log mimicry", "processing_open", "processing_close"
+        ]
+        if any(term in u_clean or term in a_clean for term in noise_terms):
+            return False
+
+        return True
+
     def _save_episodic_memory_turn(self, user_text: str, ai_text: str, mm: Optional['LollmsMemoryManager']):
         if mm is None:
             return
@@ -47,6 +79,9 @@ class MemoryMixin:
         clean_ai = re.sub(r'<[^>]+>', '', clean_ai).strip()
         clean_user = user_text.strip()
         if not clean_user or not clean_ai:
+            return
+
+        if not self._is_turn_worth_memorizing(clean_user, clean_ai):
             return
 
         episode_content = f"Event/Interaction on {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC:\nUser asked: \"{clean_user}\"\nAI responded: \"{clean_ai}\""
