@@ -3130,7 +3130,7 @@ async def chat_with_document(request: ChatRequest):
                 active_tools = {}
                 if discussion.lollmsClient and getattr(discussion.lollmsClient, "tools", None):
                     # Gather discovered local LCP tools (respecting user activation toggle)
-                    for t in discussion.lollmsClient.tools.list_tools():
+                    for t in discussion.lollmsClient.tools.list_tools(force_refresh=True):
                         if not tool_states.get(t["name"], True):
                             continue
                         # Skip data tools if no active data artifacts are present
@@ -3149,8 +3149,8 @@ async def chat_with_document(request: ChatRequest):
                                 }
                                 for p_name, p_info in t["input_schema"].get("properties", {}).items()
                             ],
-                            "callable": lambda tname=t["name"], **kw: discussion.lollmsClient.tools.execute_tool(
-                                tname, kw, discussion.lollmsClient, discussion=discussion
+                            "callable": lambda tname=t["name"], **kw: self.lollmsClient.tools.execute_tool(
+                                tname, kw, self.lollmsClient, discussion=self
                             ).get("output", {})
                         }
 

@@ -2059,7 +2059,17 @@ class _StreamState:
             tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
             new_name  = attrs.pop('rename', None)
             atype     = attrs.pop('type', 'code')
-            lang      = attrs.pop('language', None)
+            
+            # Defensive Type Mapping Guard for LLM hallucinations
+            if atype not in ArtefactType.ALL:
+                if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite"):
+                    atype = ArtefactType.DATA
+                elif atype in ("text", "txt", "markdown", "md"):
+                    atype = ArtefactType.DOCUMENT
+                else:
+                    atype = ArtefactType.CODE
+
+            lang  = attrs.pop('language', None)
             attrs.pop('images', None)
             attrs.pop('image_media_types', None)
 
@@ -6127,14 +6137,16 @@ If you fail to use the tools when data is available, your output will be rejecte
                         # Render tool execution failure details as an elegant collapsible block inside the processing drawer
                         error_details = f"<details class='proc-error-details'><summary>⚠️ Error Details</summary><pre style='color:#ef4444; white-space:pre-wrap;'>{_result_obj.error}</pre></details>"
                         ss._emit_tool_processing_status(error_details)
-                    elif _result_obj.success and _result_obj.output.strip():
-                        # Render successful output / stdout as an elegant collapsible block inside the processing drawer
-                        clean_out = _result_obj.output.strip()
-                        escaped_out = clean_out.replace("<", "&lt;").replace(">", "&gt;")
-                        if len(escaped_out) > 3000:
-                            escaped_out = escaped_out[:3000] + "\n... [additional output truncated]"
-                        status_out = f"<details class='proc-success-details'><summary>💻 Execution Output / Return Value</summary><pre style='color:#10b981; white-space:pre-wrap;'>{escaped_out}</pre></details>"
-                        ss._emit_tool_processing_status(status_out)
+                    else:
+                        output_str = json.dumps(_result_obj.output, indent=2, ensure_ascii=False) if isinstance(_result_obj.output, dict) else str(_result_obj.output)
+                        if _result_obj.success and output_str.strip():
+                            # Render successful output / stdout as an elegant collapsible block inside the processing drawer
+                            clean_out = output_str.strip()
+                            escaped_out = clean_out.replace("<", "&lt;").replace(">", "&gt;")
+                            if len(escaped_out) > 3000:
+                                escaped_out = escaped_out[:3000] + "\n... [additional output truncated]"
+                            status_out = f"<details class='proc-success-details'><summary>💻 Execution Output / Return Value</summary><pre style='color:#10b981; white-space:pre-wrap;'>{escaped_out}</pre></details>"
+                            ss._emit_tool_processing_status(status_out)
  
                     ss._emit_tool_processing_close(
                         f"Completed — output: {len(_raw_result_json):,} chars"

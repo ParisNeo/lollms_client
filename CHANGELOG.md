@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-04 07:49]
+
+- Refactor: Improve tool execution flow, artifact type classification, and LLM output handling
+
 ## [2026-06-04 07:36]
 
 - feat(lollms_client): Integrate document chat functionality and update UI

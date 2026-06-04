@@ -1774,7 +1774,12 @@ class ArtefactManager:
             attrs.pop('image_media_types', None)
 
             if atype not in ArtefactType.ALL:
-                atype = default_type
+                if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite"):
+                    atype = ArtefactType.DATA
+                elif atype in ("text", "txt", "markdown", "md"):
+                    atype = ArtefactType.DOCUMENT
+                else:
+                    atype = default_type
 
             resolved_title: Optional[str] = None
             is_new = False
