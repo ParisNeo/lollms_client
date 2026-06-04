@@ -3457,9 +3457,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
     selTtiBinding.addEventListener("change", () => {
         if (isConfigLoading) return;
+        const prevTtiBinding = selTtiBinding.dataset.prevTtiBinding || "";
+        if (selTtiBinding.value === prevTtiBinding) return;
 
         // UX Cache: Save current input values to local map before switching form
-        const prevTtiBinding = selTtiBinding.dataset.prevTtiBinding || "";
         if (prevTtiBinding) {
             savedTtiConfigs[prevTtiBinding] = collectTtiBindingConfig();
         }
@@ -3782,9 +3783,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
     selBinding.addEventListener("change", () => {
         if (isConfigLoading) return;
+        const prevBinding = selBinding.dataset.prevBinding || "";
+        if (selBinding.value === prevBinding) return;
 
         // UX Cache: Save current input values to local map before switching form
-        const prevBinding = selBinding.dataset.prevBinding || "";
         if (prevBinding) {
             savedLlmConfigs[prevBinding] = collectBindingConfig();
         }
@@ -4023,9 +4025,9 @@ document.addEventListener("DOMContentLoaded", () => {
         document.body.removeChild(a);
     }
 
-    async function fetchCurrentTtiModels() {
+    async function fetchCurrentTtiModels(savedModelName = null) {
         try {
-            const currentSelection = headerTtiModel.value;
+            const currentSelection = savedModelName || headerTtiModel.value;
             // Scan for configured TTI local models
             const res = await fetch("/api/bindings/tti");
             const data = await res.json();
@@ -4043,7 +4045,16 @@ document.addEventListener("DOMContentLoaded", () => {
                     });
                     const testData = await testRes.json();
                     if (testData.success && Array.isArray(testData.models)) {
+                        const hasCurrent = testData.models.some(m => {
+                            const v = m.model_name || m.name || m.id || m;
+                            return v === currentSelection;
+                        });
+
                         let html = `<option value="">-- Active TTI Model --</option>`;
+                        if (currentSelection && !hasCurrent) {
+                            html += `<option value="${currentSelection}">${currentSelection}</option>`;
+                        }
+
                         html += testData.models.map(m => {
                             const value = m.model_name || m.name || m.id || m;
                             const label = m.display_name || value;
@@ -4062,9 +4073,9 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function fetchCurrentModels() {
+    async function fetchCurrentModels(savedModelName = null) {
         try {
-            const currentSelection = headerModel.value;
+            const currentSelection = savedModelName || headerModel.value;
             const res = await fetch("/api/models");
             const data = await res.json();
             if (data.success && Array.isArray(data.models) && data.models.length > 0) {
@@ -4280,16 +4291,19 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             // Populate models list first before setting values
-            await fetchCurrentModels();
-            await fetchCurrentTtiModels();
+            const savedLlmModelName = (data.success && data.llm_binding_config) ? data.llm_binding_config.model_name : null;
+            const savedTtiModelName = (data.success && data.tti_binding_config) ? data.tti_binding_config.model_name : null;
+
+            await fetchCurrentModels(savedLlmModelName);
+            await fetchCurrentTtiModels(savedTtiModelName);
             await fetchPersonalities();
 
             // Explicitly sync the top header dropdown value with the saved setting
-            if (data.success && data.llm_binding_config && data.llm_binding_config.model_name) {
-                headerModel.value = data.llm_binding_config.model_name;
+            if (savedLlmModelName) {
+                headerModel.value = savedLlmModelName;
             }
-            if (data.success && data.tti_binding_config && data.tti_binding_config.model_name) {
-                headerTtiModel.value = data.tti_binding_config.model_name;
+            if (savedTtiModelName) {
+                headerTtiModel.value = savedTtiModelName;
             }
         } catch (err) {
             console.error("Failed to load settings:", err);

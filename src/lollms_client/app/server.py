@@ -128,7 +128,7 @@ def initialize_workspace_state(workspace_name: str):
                 "tools_binding_config": {
                     "tools_folders": [
                         str(APP_WORKSPACE_DIR.resolve()),
-                        str(PROJECT_ROOT / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
+                        str(Path(__file__).resolve().parent.parent / "tools_bindings" / "lcp" / "default_tools")
                     ]
                 }
             }
@@ -1332,7 +1332,7 @@ async def import_memory_endpoint(payload: ImportMemoryRequest):
 async def list_tti_bindings():
     """Discovers all TTI bindings by scanning the tti_bindings directory."""
     bindings = []
-    bindings_root = PROJECT_ROOT / "src" / "lollms_client" / "tti_bindings"
+    bindings_root = Path(__file__).resolve().parent.parent / "tti_bindings"
     if bindings_root.exists():
         for d in sorted(bindings_root.iterdir()):
             if d.is_dir() and not d.name.startswith("_"):
@@ -1464,7 +1464,7 @@ async def load_profile_endpoint(payload: ProfileRequest):
             "tools_binding_config": {
                 "tools_folders": [
                     str(Path("./data_workspace").resolve()),
-                    str(PROJECT_ROOT / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
+                    str(Path(__file__).resolve().parent.parent / "tools_bindings" / "lcp" / "default_tools")
                 ]
             }
         }
@@ -1595,7 +1595,7 @@ async def execute_binding_command_endpoint(payload: ExecuteCommandRequest):
 async def list_llm_bindings():
     """Discovers all LLM bindings by scanning the bindings directory."""
     bindings = []
-    bindings_root = PROJECT_ROOT / "src" / "lollms_client" / "llm_bindings"
+    bindings_root = Path(__file__).resolve().parent.parent / "llm_bindings"
     if bindings_root.exists():
         for d in sorted(bindings_root.iterdir()):
             if d.is_dir() and not d.name.startswith("_"):
@@ -1683,7 +1683,7 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
             "tools_binding_config": {
                 "tools_folders": [
                     str(Path("./data_workspace").resolve()),
-                    str(PROJECT_ROOT / "lollms_client" / "tools_bindings" / "lcp" / "default_tools")
+                    str(Path(__file__).resolve().parent.parent / "tools_bindings" / "lcp" / "default_tools")
                 ]
             }
         }

@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-04 06:11]
+
+- Refactor path handling in server and improve model loading UX in client
+
 ## [2026-06-04 00:34]
 
 - feat(lollms): Introduce mixins for chat and memory functionality
