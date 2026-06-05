@@ -587,7 +587,7 @@ class LollmsBot:
             content=episode_content,
             importance=0.75,
             tags=["episode", "turn_log"],
-            level=4
+            level=1
         )
 
         # Sync the discussion message node

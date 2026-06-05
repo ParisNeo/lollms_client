@@ -1352,7 +1352,7 @@ class LollmsBot:
             f"Response: \"{cleaned_response}\" (Sent: {len(outgoing_attachments)} attachment(s))\n"
             f"Affect: {current_affect}"
         )
-        self.memory_manager.add(content=episode_content, importance=0.75, tags=["episode", "interaction"], level=4)
+        self.memory_manager.add(content=episode_content, importance=0.75, tags=["episode", "interaction"], level=1)
 
         # 7. Save assistant message and dispatch to active gateway
         self.discussion.add_message(

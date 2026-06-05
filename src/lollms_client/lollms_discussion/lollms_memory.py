@@ -484,12 +484,16 @@ class LollmsMemoryManager:
         return [d for _, d in scored[:top_k]]
 
     # ──────────────────────────────────────────────── context assembly
+    # ──────────────────────────────────────────────── context assembly
     def build_working_zone(self, token_counter=None) -> str:
         records = self.list_working()
         if not records: return ""
+        # Sort chronologically by created_at (oldest first, newest last)
+        records.sort(key=lambda x: x["created_at"])
         budget, lines, used_tok = self.config.working_token_budget, [], 0
         for r in records:
-            entry = f"[{r['id'][:8]}] ({r['importance']:.0%}) {r['content']}"
+            ts = r['created_at'][:19].replace('T', ' ')
+            entry = f"[{ts}] [{r['id'][:8]}] ({r['importance']:.0%}) {r['content']}"
             if r.get('tags'): entry += f"  #{r['tags'].replace(',', ' #')}"
             tok = token_counter(entry) if token_counter else len(entry) // 4
             if used_tok + tok > budget: break
@@ -522,31 +526,16 @@ class LollmsMemoryManager:
             body = "\n".join(lines)
         return "=== DEEP MEMORY HANDLES ===\n(Use <mem_load id=\"ID\"/> to bring into working memory)\n" + body + "\n=== END DEEP MEMORY HANDLES ===\n"
 
-    def build_episodic_zone(self, token_counter=None) -> str:
-        with self._session() as s:
-            recs = (self._q(s).filter(_MemoryRecord.level == 4).order_by(_MemoryRecord.importance.desc()).all())
-            if not recs: return ""
-            dicts = [self._to_dict(r) for r in recs]
-        budget = self.config.handles_token_budget
-        lines, used = [], 0
-        for r in dicts:
-            line = f"  [{r['id'][:8]}] (Episodic) {r['content'][:120]}"
-            tok = token_counter(line) if token_counter else len(line) // 4
-            if used + tok > budget: break
-            lines.append(line); used += tok
-        return "=== EPISODIC MEMORY ===\n(History of past events, interactions, or user-AI sessions)\n" + "\n".join(lines) + "\n=== END EPISODIC MEMORY ===\n" if lines else ""
-
     def build_system_instructions(self) -> str:
         return (
             "\n=== MEMORY SYSTEM ===\n\n"
-            "You are equipped with a multi-level persistent memory system to recall facts and user preferences across turns.\n\n"
-            "── Working Memory: Active memories appear in the WORKING MEMORY zone below (injected into your context). They are shown verbatim with their [ID] and importance.\n"
+            "You are equipped with a multi-level persistent memory system to recall facts, user preferences, and past events/conversations across turns.\n\n"
+            "── Working Memory: Active memories and past conversation episodes appear in the WORKING MEMORY zone below (injected into your context). They are shown in chronological order with their timestamp, [ID], and importance.\n"
             "   👉 CRITICAL RULE: When you utilize or refer to an active memory [ID] to answer, you MUST prepend `<mem_tag id=\"ID\" />` to your response so the system can track its usage.\n"
-            "── Deep Memory: Stored memories that are currently inactive. Only their compact handles appear. "
+            "── Deep Memory: Stored memories and past episodes that are currently inactive. Only their compact handles appear. "
             "If you see a handle (e.g. [abc123de]) that contains information needed to answer the user's question, you MUST load it first by outputting `<mem_load id=\"ID\" />`.\n"
-            "── Episodic Memory: Memory of specific past events, experiences, or previous conversation sessions. They appear in the EPISODIC MEMORY zone below to provide historical context of past interactions.\n"
             "── Tags Available:\n"
-            "   • `<mem_new importance=\"...\">content</mem_new>` — Save a new fact/preference (importance is a float, default 0.75).\n"
+            "   • `<mem_new importance=\"...\">content</mem_new>` — Save a new fact, preference, or event (importance is a float, default 0.75).\n"
             "     🚨 CURATION PROTOCOL (ONLY SAVE HIGH-DENSITY, PERSISTENT KNOWLEDGE):\n"
             "     ✅ ALWAYS SAVE: Core user preferences (e.g., language choice, custom guidelines), persistent architectural decisions, structural rules, and primary project goals.\n"
             "     ❌ NEVER SAVE: Casual pleasantries, greetings, small talk, weather, conversational fluff, temporary feelings, or large raw code blocks.\n"
@@ -614,7 +603,7 @@ class LollmsMemoryManager:
                     r.updated_at = now
                     count += 1
                 if r.level == 1 and r.importance < self.config.demotion_threshold: r.level = 2
-                elif r.level <= 2 and r.importance < self.config.archive_threshold: r.level = 3
+                elif r.level == 2 and r.importance < self.config.archive_threshold: r.level = 3
         return count
 
     def enforce_budget(self, token_counter=None) -> int:

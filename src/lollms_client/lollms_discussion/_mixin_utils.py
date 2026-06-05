@@ -424,10 +424,8 @@ class UtilsMixin:
         if _mm:
             working_txt = _mm.build_working_zone(token_counter=tokenizer)
             deep_txt = _mm.build_handles_zone(token_counter=tokenizer)
-            episodic_txt = _mm.build_episodic_zone(token_counter=tokenizer)
             if working_txt: zone_breakdown["working_memory"] = {"tokens": tokenizer(working_txt)}
             if deep_txt: zone_breakdown["deep_memory"] = {"tokens": tokenizer(deep_txt)}
-            if episodic_txt: zone_breakdown["episodic_memory"] = {"tokens": tokenizer(episodic_txt)}
 
         # ── 2. Artefacts Grouped Breakdown ──────────────────────────────────
         active_artefacts = self.artefacts.list(active_only=True)

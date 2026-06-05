@@ -35,8 +35,7 @@ class MemoryMixin:
         if mm is None: return ""
         working = mm.build_working_zone(token_counter=token_counter)
         handles = mm.build_handles_zone(token_counter=token_counter)
-        episodic = mm.build_episodic_zone(token_counter=token_counter)
-        parts = [p for p in (working, handles, episodic) if p]
+        parts = [p for p in (working, handles) if p]
         return "\n".join(parts) if parts else ""
 
     def _is_turn_worth_memorizing(self, user_text: str, ai_text: str) -> bool:
@@ -85,7 +84,7 @@ class MemoryMixin:
             return
 
         episode_content = f"Event/Interaction on {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC:\nUser asked: \"{clean_user}\"\nAI responded: \"{clean_ai}\""
-        mm.add(content=episode_content, importance=0.8, tags=["episode", "interaction"], level=4)
+        mm.add(content=episode_content, importance=0.8, tags=["episode", "interaction"], level=1)
 
     def _process_memory_tags(self, text: str, mm: Optional['LollmsMemoryManager'], callback=None) -> tuple:
         if mm is None: return text, {}

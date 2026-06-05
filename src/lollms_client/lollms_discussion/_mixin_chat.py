@@ -5523,11 +5523,14 @@ If you fail to use the tools when data is available, your output will be rejecte
                 ai_message            = ai_message,
                 enable_notes          = enable_notes,
                 enable_skills         = enable_skills,
-                enable_inline_widgets = inline_widgets if 'inline_widgets' in locals() else enable_inline_widgets,
+                enable_inline_widgets = enable_inline_widgets,
                 enable_forms          = enable_forms,
                 auto_activate_artefacts = auto_activate_artefacts,
                 enable_artefacts      = enable_artefacts,
             )
+            ss._turn_action_history = _turn_action_history
+            if self._is_db_backed:
+                self.commit()
 
             # Report reasoning loop status to the active processing tag and callback with filled types and details
             if _round == 1:
@@ -6083,6 +6086,10 @@ If you fail to use the tools when data is available, your output will be rejecte
                     )
 
                     _completed_tool_calls.append(_call_tag)
+
+                    if not _is_failed and _tool_name in ("execute_python_data_query", "execute_sql_query"):
+                        _turn_action_history.append(f"✓ SUCCESSFULLY executed data query: {_tool_name}")
+
                     _created_title = (
                         _result_obj.metadata.get("title") or _result_obj.metadata.get("name") or
                         _tool_params.get("title") or _tool_params.get("name")

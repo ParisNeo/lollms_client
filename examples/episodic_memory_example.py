@@ -61,8 +61,8 @@ def main():
         level=1
     )
 
-    # 5. Simulate conversational turns with automatic Episodic Memory (Level 4) generation
-    # When a conversation turn finishes, the system automatically logs the exchange as an episodic record!
+    # 5. Simulate conversational turns with automatic Working Memory (Level 1) generation with episodic status!
+    # When a conversation turn finishes, the system automatically logs the exchange as an active working memory record!
     ASCIIColors.info("\nSimulating conversation exchange turns...")
     
     turn_1_user = "Can we use Bootstrap instead of Tailwind?"
@@ -70,14 +70,14 @@ def main():
     
     # Log turn 1
     discussion._save_episodic_memory_turn(turn_1_user, turn_1_ai, memory_manager)
-    ASCIIColors.success("✓ Turn 1 logged as an episodic memory.")
+    ASCIIColors.success("✓ Turn 1 logged as a timestamped working memory.")
 
     turn_2_user = "What database are we using?"
     turn_2_ai = "We are using SQLite for local development and PostgreSQL for production environments."
     
     # Log turn 2
     discussion._save_episodic_memory_turn(turn_2_user, turn_2_ai, memory_manager)
-    ASCIIColors.success("✓ Turn 2 logged as an episodic memory.")
+    ASCIIColors.success("✓ Turn 2 logged as a timestamped working memory.")
 
     # 6. Retrieve and Print the fully formatted context memory block
     # This represents exactly what is injected into the LLM system prompt context!
@@ -94,9 +94,8 @@ def main():
     
     ASCIIColors.cyan("=== Persistent Memories Breakdown ===")
     for m in memories:
-        level_label = {1: "Working", 2: "Deep", 3: "Archived", 4: "Episodic"}.get(m["level"], "Unknown")
+        level_label = {1: "Working", 2: "Deep", 3: "Archived"}.get(m["level"], "Unknown")
         print(f"• [{level_label}] ID: {m['id'][:8]} (Imp: {m['importance']:.0%}): {m['content'][:90]}...")
     print("=====================================\n")
-
 if __name__ == "__main__":
     main()

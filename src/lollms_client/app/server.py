@@ -557,8 +557,8 @@ async def import_folder_endpoint(payload: ImportFolderRequest):
     from fastapi.responses import StreamingResponse
     import json
 
-    folder_path = Path(payload.get("folder_path", "").strip())
-    title = payload.get("title")
+    folder_path = Path(payload.folder_path.strip())
+    title = payload.title
 
     if not folder_path.exists() or not folder_path.is_dir():
         return {"success": False, "error": f"Invalid folder path: {folder_path}"}
