@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-05 12:04]
+
+- feat: Add new cognitive decisions test file
+
 ## [2026-06-05 09:11]
 
 - feat(memory): Implement Episodic Memory examples and agent framework updates

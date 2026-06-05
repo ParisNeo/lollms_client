@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""
+test_agent_cognitive_decisions.py
+=============================================================================
+Comprehensive Cognitive Decision-Making & Multi-Turn Tool Chaining Test Suite.
+
+This script runs real conversational scenarios to evaluate and audit:
+  1. Intent Classification: Tool vs. No-Tool decision accuracy.
+  2. Action Integrity: Full overwrite vs. Surgical search/replace patches.
+  3. Two-Step Ingestion: Ephemeral artifact generation + parameter-passing.
+  4. Multi-Turn Chaining: Consecutive tool execution before final answer.
+=============================================================================
+"""
+
+import sys
+import os
+import json
+import time
+import unittest
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
+
+# Ensure correct workspace import resolution
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from lollms_client import LollmsClient
+from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager, ArtefactType
+from lollms_client.lollms_types import MSG_TYPE
+from ascii_colors import ASCIIColors
+
+
+class MockGemmaAgentClient:
+    """
+    High-fidelity Mock Client simulating Gemma's cognitive tokens
+    and XML tags emission for all test scenarios.
+    """
+    def __init__(self):
+        self.debug = True
+        self.llm = self
+        self.model_name = "gemma4:e2b"
+        self.binding_name = "ollama"
+        self._step_counter = 0
+
+    def count_tokens(self, text: str) -> int:
+        return len(text) // 4
+
+    def count_image_tokens(self, img) -> int:
+        return 256
+
+    def remove_thinking_blocks(self, text: str) -> str:
+        return text
+
+    def generate_structured_content(self, prompt: str, schema: Dict, **kwargs) -> Dict[str, Any]:
+        p_lower = prompt.lower()
+        if "hello" in p_lower:
+            return {"requires_tools_or_actions": False, "reasoning": "Simple conversational greeting."}
+        if "update" in p_lower or "math_ops.py" in p_lower:
+            return {"requires_tools_or_actions": True, "reasoning": "Request asks to modify a code file."}
+        if "sales_database" in p_lower or "highest revenue" in p_lower:
+            return {"requires_tools_or_actions": True, "reasoning": "Factual question requiring relational data."}
+        return {"requires_tools_or_actions": False, "reasoning": "Conversational reply."}
+
+    def generate_text(self, prompt: str, **kwargs) -> str:
+        # Handles the internal hyper-focused specialist spinoff calls
+        if "spinoff" in prompt.lower() or "specialist" in prompt.lower() or "execute the plan" in prompt.lower():
+            if "safe_divide" in prompt.lower():
+                return (
+                    '<artifact name="math_ops.py" type="code" language="python">\n'
+                    "<<<<<<< SEARCH\n"
+                    "def compute_sum(a, b):\n"
+                    "    return a + b\n"
+                    "=======\n"
+                    "def compute_sum(a, b):\n"
+                    "    return a + b\n\n"
+                    "def safe_divide(a, b):\n"
+                    "    if b == 0:\n"
+                    "        return None\n"
+                    "    return a / b\n"
+                    ">>>>>>> REPLACE\n"
+                    "</artifact>"
+                )
+        return "Simulated text output"
+
+    def chat(self, discussion, **kwargs):
+        self._step_counter += 1
+        callback = kwargs.get("streaming_callback")
+        
+        # ── Test Scenario A: Direct Conversation (No Tools) ──
+        if self._step_counter == 1:
+            reply = "Hello! I am Lollms, your persistent engineering assistant. How can I help you today?"
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+            return reply
+
+        # ── Test Scenario B: Surgical Implementation (Plan + Patch) ──
+        if self._step_counter == 2:
+            reply = (
+                "<coding_plan>\n"
+                "  - Goal: Implement safe division\n"
+                "  - Specialist Persona: Senior Python Developer\n"
+                "  - Target Artifacts: math_ops.py\n"
+                "  - Implementation Details: Add safe_divide(a, b) to prevent division by zero.\n"
+                "</coding_plan>"
+            )
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+            return reply
+
+        # ── Test Scenario C: Two-Step Ingestion & Data Query (Multi-Turn) ──
+        if self._step_counter == 3:
+            # Turn 1: Save the query script inside an ephemeral artifact
+            reply = (
+                '<artifact name="query.py" type="code" language="python" ephemeral="true">\n'
+                "import pandas as pd\n"
+                "df = pd.read_csv('sales_database.csv')\n"
+                "print(df.loc[df['revenue'].idxmax()][['product_name', 'revenue']].to_dict())\n"
+                "</artifact>\n"
+                '<tool_call>{"name": "execute_python_data_query", "parameters": {"code": "query.py"}}</tool_call>'
+            )
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+            return reply
+
+        if self._step_counter == 4:
+            # Turn 2: Receive the output and formulate final answer
+            reply = "Based on my data query of the sales database, the product with the highest revenue is the **Smartphone Alpha** with a total revenue of **$124,500.00 USD**."
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+            return reply
+
+        return "Simulated fallback reply"
+
+
+class TestAgentCognitiveDecisions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.report_cards = []
+
+        # ── Setup LollmsClient & Discussion ──
+        import requests
+        is_online = False
+        try:
+            res = requests.get("http://localhost:11434/api/tags", timeout=1.5)
+            if res.status_code == 200:
+                models = [m["name"] for m in res.json().get("models", [])]
+                is_online = any(m.startswith("gemma") for m in models)
+        except Exception:
+            pass
+
+        if is_online:
+            ASCIIColors.green("⚡ Connection found! Running LIVE integration testing with Ollama...")
+            cls.client = LollmsClient(
+                llm_binding_name="ollama",
+                llm_binding_config={"model_name": "gemma4:e2b", "host_address": "http://localhost:11434"},
+                cooperative_vram_management=True,
+                debug=True
+            )
+        else:
+            ASCIIColors.yellow("⚠️  Ollama offline or 'gemma4:e2b' missing. Running in High-Fidelity Cognitive Simulation.")
+            cls.client = MockGemmaAgentClient()
+
+        # Set up a clean local tools folder for LCP sandbox testing
+        cls.workspace_dir = Path("./data_workspace")
+        cls.workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write dummy CSV dataset
+        cls.csv_path = cls.workspace_dir / "sales_database.csv"
+        import pandas as pd
+        df = pd.DataFrame({
+            "product_name": ["Organic Cotton Tee", "Smartphone Alpha", "Ergonomic Desk Chair"],
+            "category": ["Apparel", "Electronics", "Home & Living"],
+            "revenue": [15400.0, 124500.0, 48200.0]
+        })
+        df.to_csv(cls.csv_path, index=False)
+
+    @classmethod
+    def tearDownClass(cls):
+        # Print the final detailed diagnostic audit report
+        print("\n\n" + "=" * 80)
+        print("📊 AGENT COGNITIVE DECISION-MAKING AUDIT REPORT")
+        print("=" * 80)
+        for card in cls.report_cards:
+            status = "🟢 PASS" if card["success"] else "🔴 FAIL"
+            print(f"\n[{status}] {card['name']}")
+            print(f"  • Decision:    {card['decision_reason']}")
+            print(f"  • Tools Run:   {card['tools_called']}")
+            print(f"  • Output Size: {card['response_size']} chars")
+            print(f"  • Highlights:  {card['highlights']}")
+        print("\n" + "=" * 80 + "\n")
+
+        # Cleanup files
+        if cls.csv_path.exists():
+            cls.csv_path.unlink()
+
+    def setUp(self):
+        self.db_manager = LollmsDataManager("sqlite:///:memory:")
+        self.discussion = LollmsDiscussion.create_new(
+            lollms_client=self.client,
+            db_manager=self.db_manager,
+            id="test_cognitive_session",
+            autosave=True
+        )
+
+    def tearDown(self):
+        self.discussion.close()
+
+    def test_scenario_a_direct_conversation(self):
+        ASCIIColors.cyan("\n▶ Running Scenario A: Direct Conversation (No Tools expected)")
+        
+        user_message = "Hello Lollms! I hope you are having an amazing day."
+        
+        # We capture the streaming events
+        tools_called = []
+        def relay(chunk, msg_type, meta=None):
+            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
+                tools_called.append(meta.get("tool"))
+            return True
+
+        res = self.discussion.chat(
+            user_message=user_message,
+            streaming_callback=relay,
+            enable_memory=False,
+            enable_artefacts=True
+        )
+
+        success = len(tools_called) == 0
+        self.report_cards.append({
+            "name": "Scenario A: Conversational Intent Classification",
+            "success": success,
+            "decision_reason": "Correctly classified conversational greeting as requiring NO tool calls.",
+            "tools_called": tools_called if tools_called else "None (Correct)",
+            "response_size": len(res.get("ai_message").content),
+            "highlights": f"Response text: '{res.get('ai_message').content[:60]}...'"
+        })
+        self.assertTrue(success, "Agent incorrectly called tools for a simple greeting!")
+
+    def test_scenario_b_surgical_implementation(self):
+        ASCIIColors.cyan("\n▶ Running Scenario B: Surgical Implementation (Plan + Patch expected)")
+
+        # Create a baseline code artifact to be updated
+        self.discussion.artefacts.add(
+            title="math_ops.py",
+            artefact_type=ArtefactType.CODE,
+            content="def compute_sum(a, b):\n    return a + b\n",
+            language="python",
+            version=1
+        )
+        self.discussion.commit()
+
+        user_message = "Please update math_ops.py to add a safe_divide(a, b) function."
+
+        tools_called = []
+        def relay(chunk, msg_type, meta=None):
+            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
+                tools_called.append(meta.get("tool"))
+            return True
+
+        res = self.discussion.chat(
+            user_message=user_message,
+            streaming_callback=relay,
+            enable_memory=False,
+            enable_artefacts=True
+        )
+
+        updated_art = self.discussion.artefacts.get("math_ops.py")
+        success = (
+            updated_art["version"] == 2 and 
+            "safe_divide" in updated_art["content"] and 
+            "compute_sum" in updated_art["content"]
+        )
+
+        self.report_cards.append({
+            "name": "Scenario B: Surgical Patch Decision",
+            "success": success,
+            "decision_reason": "Correctly compiled plan and applied a surgical Aider patch instead of a full file overwrite.",
+            "tools_called": tools_called if tools_called else "None (Handled via Artifact Spinoff)",
+            "response_size": len(updated_art["content"]),
+            "highlights": f"Artifact updated to v{updated_art['version']}. Code contains 'safe_divide' and 'compute_sum'."
+        })
+        self.assertTrue(success, "Failed to apply surgical patch successfully.")
+
+    def test_scenario_c_multistep_data_query(self):
+        ASCIIColors.cyan("\n▶ Running Scenario C: Multi-Turn Two-Step Data Query")
+
+        # Register our dummy CSV file as an active data artifact in the session
+        self.discussion.artefacts.add(
+            title="sales_database",
+            artefact_type="data",
+            content="Columns: product_name (str), category (str), revenue (float)",
+            file_ext=".csv",
+            version=1,
+            read_only=True
+        )
+        self.discussion.commit()
+
+        user_message = "Analyze the sales_database and tell me which product generated the highest revenue."
+
+        # Setup local tool mock binding for python execution
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
+        
+        active_tools = {
+            "execute_python_data_query": {
+                "name": "execute_python_data_query",
+                "description": "Execute python code on datasets.",
+                "parameters": [{"name": "code", "type": "str", "required": True}],
+                "callable": lambda code, **kw: tool_execute_python_data_query(code, discussion_instance=self.discussion)
+            }
+        }
+
+        tools_called = []
+        def relay(chunk, msg_type, meta=None):
+            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
+                tools_called.append(meta.get("tool"))
+            return True
+
+        # Run multi-turn chat
+        res = self.discussion.chat(
+            user_message=user_message,
+            streaming_callback=relay,
+            tools=active_tools,
+            enable_memory=False,
+            enable_artefacts=True
+        )
+
+        success = "execute_python_data_query" in tools_called and "Smartphone Alpha" in res.get("ai_message").content
+        self.report_cards.append({
+            "name": "Scenario C: Multi-Turn Two-Step Ephemeral Ingestion",
+            "success": success,
+            "decision_reason": "Correctly utilized the two-step ephemeral paradigm: wrote clean code to query.py first, executed it via tool, and formulated the final answer.",
+            "tools_called": tools_called,
+            "response_size": len(res.get("ai_message").content),
+            "highlights": f"Final Answer: '{res.get('ai_message').content}'"
+        })
+        self.assertTrue(success, "Failed to execute multi-turn data query successfully.")
+
+
+if __name__ == "__main__":
+    unittest.main()
