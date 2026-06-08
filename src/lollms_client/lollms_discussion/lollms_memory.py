@@ -178,6 +178,16 @@ class LollmsMemoryManager:
         lollms_client: Optional[Any]   = None,
         config:        Optional[MemoryConfig] = None,
     ):
+        # Normalize Windows backslashes to forward slashes for SQLAlchemy compatibility
+        if db_path.startswith("sqlite:///"):
+            path_part = db_path[10:]
+            clean_path = path_part.replace("\\", "/")
+            db_path = f"sqlite:///{clean_path}"
+        elif db_path.startswith("sqlite://"):
+            path_part = db_path[9:]
+            clean_path = path_part.replace("\\", "/")
+            db_path = f"sqlite://{clean_path}"
+
         self.db_path       = db_path
         self.owner_id      = owner_id
         self.lollms_client = lollms_client
@@ -221,14 +231,20 @@ class LollmsMemoryManager:
 
     def add(self, content: str, importance: Optional[float] = None, tags: Optional[List[str]] = None, subject_group: Optional[str] = None, level: int = 1) -> Dict:
         now = datetime.utcnow()
-        rec = _MemoryRecord(
-            id=str(uuid.uuid4()), owner_id=self.owner_id, content=content.strip(),
-            summary=self._auto_summary(content), level=level,
-            importance=max(0.0, min(1.0, importance if importance is not None else self.config.default_importance)),
-            use_count=0, tags=",".join(tags) if tags else None, subject_group=subject_group,
-            created_at=now, updated_at=now, last_used_at=now,
-        )
         with self._session() as s:
+            # Query maximum created_at in database to enforce monotonicity
+            max_created = s.query(_MemoryRecord.created_at).filter(_MemoryRecord.owner_id == self.owner_id).order_by(_MemoryRecord.created_at.desc()).first()
+            if max_created and max_created[0]:
+                if now <= max_created[0]:
+                    now = max_created[0] + timedelta(microseconds=1)
+
+            rec = _MemoryRecord(
+                id=str(uuid.uuid4()), owner_id=self.owner_id, content=content.strip(),
+                summary=self._auto_summary(content), level=level,
+                importance=max(0.0, min(1.0, importance if importance is not None else self.config.default_importance)),
+                use_count=0, tags=",".join(tags) if tags else None, subject_group=subject_group,
+                created_at=now, updated_at=now, last_used_at=now,
+            )
             s.add(rec)
             s.flush()
             return self._to_dict(rec)
@@ -325,6 +341,13 @@ class LollmsMemoryManager:
             if r is None: return False
             s.delete(r)
             return True
+
+    def clear_level(self, level: int) -> int:
+        with self._session() as s:
+            q = self._q(s).filter(_MemoryRecord.level == level)
+            count = q.count()
+            q.delete(synchronize_session=False)
+            return count
 
     def edit_memory(
         self,

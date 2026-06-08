@@ -101,6 +101,7 @@ class LollmsClient():
             config = llm_binding_config or {}
             config['user_name'] = self.user_name
             config['ai_name'] = self.ai_name
+            config['debug'] = self.debug
             self.llm = self.llm_binding_manager.create_binding(
                 binding_name=llm_binding_name,
                 **{k: v for k, v in config.items() if k != "binding_name"}
@@ -130,7 +131,9 @@ class LollmsClient():
         if tti_binding_name:
             if callback: callback(f"🎨 Initializing **TTI** binding: `{tti_binding_name}`...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
             try:
-                self.tti = self.tti_binding_manager.create_binding(binding_name=tti_binding_name, **(tti_binding_config or {}))
+                tti_config = (tti_binding_config or {}).copy()
+                tti_config['debug'] = self.debug
+                self.tti = self.tti_binding_manager.create_binding(binding_name=tti_binding_name, **tti_config)
                 if self.tti is None: 
                     msg = f"Failed to create TTI binding: {tti_binding_name}"
                     if callback: callback(f"❌ {msg}", MSG_TYPE.MSG_TYPE_ERROR, {})

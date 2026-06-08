@@ -159,41 +159,27 @@ class OllamaBinding(LollmsLLMBinding):
     @contextmanager
     def _client(self):
         """
-        Context manager that yields a fresh ollama.Client instance.
-        Ensures the underlying httpx client is closed after use.
+        Context manager that yields a shared ollama.Client instance
+        to leverage connection pooling and prevent Windows socket exhaustion (WinError 10053).
         """
-        client = ollama.Client(
-            host=self.host_address,
-            headers=self.ollama_client_headers if self.ollama_client_headers else None,
-            verify=self.verify_ssl_certificate
-        )
+        if not hasattr(self, "_shared_client") or self._shared_client is None:
+            self._shared_client = ollama.Client(
+                host=self.host_address,
+                headers=self.ollama_client_headers if self.ollama_client_headers else None,
+                verify=self.verify_ssl_certificate
+            )
         with self._client_lock:
-            self._active_client = client
+            self._active_client = self._shared_client
         try:
-            yield client
+            yield self._shared_client
         finally:
             with self._client_lock:
                 self._active_client = None
-            try:
-                if hasattr(client, '_client') and client._client is not None:
-                    client._client.close()
-            except Exception as e:
-                ASCIIColors.warning(f"[{self.binding_name}] Error while closing ollama client: {e}")
 
     def cancel(self) -> None:
         """
         Signal the binding to stop the current generation as soon as possible.
-        Closes the active ollama client to abort in-flight HTTP requests,
-        then sets the base-class cancellation event.
         """
-        with self._client_lock:
-            active = self._active_client
-            if active is not None:
-                try:
-                    if hasattr(active, '_client') and active._client is not None:
-                        active._client.close()
-                except Exception as e:
-                    ASCIIColors.warning(f"[{self.binding_name}] Error while closing active ollama client in cancel(): {e}")
         super().cancel()
 
     def unload_model(self, model_name: Optional[str] = None) -> bool:
@@ -219,11 +205,11 @@ class OllamaBinding(LollmsLLMBinding):
                     system_prompt: str = "",
                     n_predict: Optional[int] = None,
                     stream: Optional[bool] = None,
-                    temperature: float = 0.7, # Ollama default is 0.8, common default 0.7
-                    top_k: int = 40,          # Ollama default is 40
-                    top_p: float = 0.9,       # Ollama default is 0.9
-                    repeat_penalty: float = 1.1, # Ollama default is 1.1
-                    repeat_last_n: int = 64,  # Ollama default is 64
+                    temperature: Optional[float] = None,
+                    top_k: Optional[int] = None,
+                    top_p: Optional[float] = None,
+                    repeat_penalty: Optional[float] = None,
+                    repeat_last_n: Optional[int] = None,
                     seed: Optional[int] = None,
                     n_threads: Optional[int] = None,
                     ctx_size: int | None = None,
@@ -265,16 +251,18 @@ class OllamaBinding(LollmsLLMBinding):
         if streaming_callback:
             stream = True
 
-        options = {}
-        if n_predict is not None: options['num_predict'] = n_predict
-        if temperature is not None: options['temperature'] = float(temperature)
-        if top_k is not None: options['top_k'] = top_k
-        if top_p is not None: options['top_p'] = top_p
-        if repeat_penalty is not None: options['repeat_penalty'] = repeat_penalty
-        if repeat_last_n is not None: options['repeat_last_n'] = repeat_last_n
-        if seed is not None: options['seed'] = seed
-        if n_threads is not None: options['num_thread'] = n_threads
-        if ctx_size is not None: options['num_ctx'] = ctx_size
+        options = {
+            'num_predict': n_predict,
+            'temperature': float(temperature) if temperature is not None else None,
+            'top_k': top_k,
+            'top_p': top_p,
+            'repeat_penalty': repeat_penalty,
+            'repeat_last_n': repeat_last_n,
+            'seed': seed,
+            'num_thread': n_threads,
+            'num_ctx': ctx_size if ctx_size is not None else self.default_ctx_size,
+        }
+        options = {k: v for k, v in options.items() if v is not None}
         
         full_response_text = ""
         think = think if "gpt-oss" not in self.model_name else reasoning_effort
@@ -300,9 +288,10 @@ class OllamaBinding(LollmsLLMBinding):
                             messages[-1]["images"]=processed_images
                     else:
                         messages.append({'role': 'user', 'content': prompt, 'images': processed_images if processed_images else None})
+                    alternated_messages = self.clean_and_alternate_messages(messages)
                     chat_kwargs = {
                         "model": self.model_name,
-                        "messages": messages,
+                        "messages": alternated_messages,
                         "stream": True,
                         "options": options if options else None
                     }
@@ -318,7 +307,7 @@ class OllamaBinding(LollmsLLMBinding):
                             if chunk.message.thinking and not in_thinking:
                                 full_response_text += "<think>\n"
                                 in_thinking = True
-                                
+
                             if chunk.message.content:# Ensure there is content to process
                                 chunk_content = chunk.message.content
                                 if in_thinking:
@@ -332,14 +321,21 @@ class OllamaBinding(LollmsLLMBinding):
                     else: # Not streaming
                         chat_kwargs = {
                             "model": self.model_name,
-                            "messages": messages,
+                            "messages": alternated_messages,
                             "stream": False,
                             "options": options if options else None
                         }
                         if think:
                             chat_kwargs["think"] = think
+
+                        if self.debug:
+                            ASCIIColors.cyan(f"[{self.binding_name}] Sending non-streaming chat request to Ollama...")
+
                         response = client.chat(**chat_kwargs)
                         full_response_text = response.message.content
+
+                        if self.debug:
+                            ASCIIColors.cyan(f"[{self.binding_name}] Received response: {full_response_text[:200]}...")
                         if think:
                             full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
                         return full_response_text
@@ -352,24 +348,53 @@ class OllamaBinding(LollmsLLMBinding):
                     else:
                         messages.append({'role': 'user', 'content': prompt})
 
+                    alternated_messages = self.clean_and_alternate_messages(messages)
+                    chat_kwargs = {
+                        "model": self.model_name,
+                        "messages": alternated_messages,
+                        "stream": stream,
+                        "options": options if options else None
+                    }
+                    if think:
+                        chat_kwargs["think"] = think
+
+                    if self.debug:
+                        ASCIIColors.cyan(f"[{self.binding_name}] Sending chat request to Ollama:")
+                        ASCIIColors.cyan(f"  • Model: {self.model_name}")
+                        ASCIIColors.cyan(f"  • Messages: {json.dumps(chat_kwargs['messages'], indent=2)}")
+                        if chat_kwargs.get("options"):
+                            ASCIIColors.cyan(f"  • Options: {json.dumps(chat_kwargs['options'], indent=2)}")
+
                     if stream:
-                        response_stream = client.chat(
-                            model=self.model_name,
-                            messages=messages,
-                            stream=True,
-                            think=think,
-                            options=options if options else None
-                        )
+                        response_stream = client.chat(**chat_kwargs)
                         in_thinking = False
                         for chunk in response_stream:
                             if self.is_cancelled():
                                 break
-                            if chunk.message.thinking and not in_thinking:
-                                full_response_text += "<think>\n"
-                                in_thinking = True
-                                
-                            if chunk.message.content:# Ensure there is content to process
-                                chunk_content = chunk.message.content
+
+                            # Handle both object and dict chunk representations
+                            if hasattr(chunk, 'message'):
+                                msg_obj = chunk.message
+                                chunk_thinking = getattr(msg_obj, 'thinking', None)
+                                chunk_content = getattr(msg_obj, 'content', None)
+                            elif isinstance(chunk, dict):
+                                msg_dict = chunk.get('message', {})
+                                chunk_thinking = msg_dict.get('thinking')
+                                chunk_content = msg_dict.get('content')
+                            else:
+                                chunk_thinking = None
+                                chunk_content = None
+
+                            if chunk_thinking:
+                                if self.debug:
+                                    ASCIIColors.rich_print(f"[purple]{chunk_thinking}[/purple]", end="", flush=True)
+                                if not in_thinking:
+                                    full_response_text += "<think>\n"
+                                    in_thinking = True
+
+                            if chunk_content:
+                                if self.debug:
+                                    ASCIIColors.rich_print(f"[cyan]{chunk_content}[/cyan]", end="", flush=True)
                                 if in_thinking:
                                     full_response_text += "\n<think>\n"                            
                                     in_thinking = False
@@ -381,7 +406,7 @@ class OllamaBinding(LollmsLLMBinding):
                     else: # Not streaming
                         response = client.chat(
                             model=self.model_name,
-                            messages=messages,
+                            messages=alternated_messages,
                             stream=False,
                             think=think,
                             options=options if options else None
@@ -433,7 +458,9 @@ class OllamaBinding(LollmsLLMBinding):
         if n_threads is not None: options['num_thread'] = n_threads
         if ctx_size is not None: options['num_ctx'] = ctx_size
 
-        ollama_messages = self.clean_message_images(messages)
+        # Ensure strict role alternation and single system prompt
+        alternated_messages = self.clean_and_alternate_messages(messages)
+        ollama_messages = self.clean_message_images(alternated_messages)
         full_response_text = ""
 
         try:
@@ -528,19 +555,20 @@ class OllamaBinding(LollmsLLMBinding):
         # 1. Export the discussion to the Ollama chat format
         # This handles system prompts, user/assistant roles, and base64-encoded images.
         messages = discussion.export("ollama_chat", branch_tip_id)
-        ollama_messages = self.clean_message_images(messages)
+        alternated_messages = self.clean_and_alternate_messages(messages)
+        ollama_messages = self.clean_message_images(alternated_messages)
 
         # 2. Build the generation options dictionary
         options = {
             'num_predict': n_predict,
-            'temperature': float(temperature) if temperature else None,
+            'temperature': float(temperature) if temperature is not None else None,
             'top_k': top_k,
             'top_p': top_p,
             'repeat_penalty': repeat_penalty,
             'repeat_last_n': repeat_last_n,
             'seed': seed,
             'num_thread': n_threads,
-            'num_ctx': ctx_size,
+            'num_ctx': ctx_size if ctx_size is not None else self.default_ctx_size,
         }
         # Remove None values, as ollama-python expects them to be absent
         options = {k: v for k, v in options.items() if v is not None}
@@ -562,21 +590,42 @@ class OllamaBinding(LollmsLLMBinding):
                     chat_kwargs["stream"] = True
                     if think:
                         chat_kwargs["think"] = think
+
+                    if self.debug:
+                        ASCIIColors.cyan(f"[{self.binding_name}] Sending chat request to Ollama:")
+                        ASCIIColors.cyan(f"  • Model: {self.model_name}")
+                        ASCIIColors.cyan(f"  • Messages: {json.dumps(ollama_messages, indent=2)}")
+
                     response_stream = client.chat(**chat_kwargs)
                     in_thinking = False
                     for chunk in response_stream:
                         if self.is_cancelled():
                             break
 
+                        # Handle both object and dict chunk representations
+                        if hasattr(chunk, 'message'):
+                            msg_obj = chunk.message
+                            chunk_thinking = getattr(msg_obj, 'thinking', None)
+                            chunk_content = getattr(msg_obj, 'content', None)
+                        elif isinstance(chunk, dict):
+                            msg_dict = chunk.get('message', {})
+                            chunk_thinking = msg_dict.get('thinking')
+                            chunk_content = msg_dict.get('content')
+                        else:
+                            chunk_thinking = None
+                            chunk_content = None
+
                         # Process and stream thinking tokens dynamically to prevent idle silences
-                        if chunk.message.thinking:
+                        if chunk_thinking:
+                            if self.debug:
+                                ASCIIColors.rich_print(f"[purple]{chunk_thinking}[/purple]", end="", flush=True)
                             if not in_thinking:
                                 in_thinking = True
                                 if streaming_callback:
                                     streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
                             if streaming_callback:
-                                streaming_callback(chunk.message.thinking, MSG_TYPE.MSG_TYPE_CHUNK)
-                            full_response_text += chunk.message.thinking
+                                streaming_callback(chunk_thinking, MSG_TYPE.MSG_TYPE_CHUNK)
+                            full_response_text += chunk_thinking
                             continue
 
                         # When transitioning from thinking to content, close the reasoning tag
@@ -585,8 +634,9 @@ class OllamaBinding(LollmsLLMBinding):
                             if streaming_callback:
                                 streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
 
-                        if chunk.message.content: # Ensure there is content to process
-                            chunk_content = chunk.message.content
+                        if chunk_content: # Ensure there is content to process
+                            if self.debug:
+                                ASCIIColors.rich_print(f"[cyan]{chunk_content}[cyan]", end="", flush=True)
                             full_response_text += chunk_content
                             if streaming_callback:
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
@@ -1113,7 +1163,7 @@ if __name__ == '__main__':
         full_streamed_text = ""
         def stream_callback(chunk: str, msg_type: int):
             global full_streamed_text
-            print(f"{ASCIIColors.GREEN}Stream chunk: {chunk}{ASCIIColors.RESET}", end="", flush=True)
+            print(f"{ASCIIColors.GREEN}Stream chunk: {chunk}[/green]", end="", flush=True)
             full_streamed_text += chunk
             if len(full_streamed_text) > 100: # Example: stop after 100 chars for test
                 # print("\nStopping stream early for test.")

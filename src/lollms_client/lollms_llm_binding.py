@@ -318,6 +318,129 @@ class LollmsLLMBinding(LollmsBaseBinding):
         return self._chat(**chat_kwargs)
 
 
+    def clean_and_alternate_messages(self, messages: List[Dict]) -> List[Dict]:
+        """
+        Ensures that:
+          1. An optional system prompt only appears at the very beginning (index 0).
+             All initial consecutive system prompts are merged into a single system prompt.
+          2. Any system prompts appearing later in the conversation are converted to user messages.
+          3. Consecutive messages of the same role (e.g., user/user or assistant/assistant) are merged
+             into a single message of that role with a double newline separator.
+          4. The conversation must strictly alternate: system (optional), user, assistant, user, assistant...
+        """
+        if not messages:
+            return []
+
+        # 1. Extract and merge all initial system messages
+        system_contents = []
+        first_non_system_index = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    if content.strip():
+                        system_contents.append(content.strip())
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text = part.get("text", "").strip()
+                            if text:
+                                system_contents.append(text)
+                first_non_system_index = i + 1
+            else:
+                break
+
+        # 2. Build the normalized list starting with the merged system prompt if present
+        normalized = []
+        if system_contents:
+            normalized.append({
+                "role": "system",
+                "content": "\n\n".join(system_contents)
+            })
+
+        # 3. Process the remaining messages
+        for msg in messages[first_non_system_index:]:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            # Convert any system message in the middle of the chat to user role
+            if role == "system":
+                role = "user"
+
+            normalized.append({
+                "role": role,
+                "content": content
+            })
+
+        # 4. Merge consecutive messages with the same role
+        merged = []
+        if normalized and normalized[0]["role"] == "system":
+            merged.append(normalized[0])
+            remaining = normalized[1:]
+        else:
+            remaining = normalized
+
+        for msg in remaining:
+            if not merged:
+                merged.append(msg)
+                continue
+
+            prev = merged[-1]
+            if prev["role"] == msg["role"]:
+                prev_content = prev["content"]
+                curr_content = msg["content"]
+
+                def _to_list_of_blocks(content_val):
+                    if isinstance(content_val, str):
+                        return [{"type": "text", "text": content_val}] if content_val else []
+                    elif isinstance(content_val, list):
+                        return content_val
+                    return []
+
+                p1 = _to_list_of_blocks(prev_content)
+                p2 = _to_list_of_blocks(curr_content)
+
+                combined_parts = []
+                for part in p1 + p2:
+                    if part.get("type") == "text":
+                        text_val = part.get("text", "").strip()
+                        if text_val:
+                            if combined_parts and combined_parts[-1].get("type") == "text":
+                                combined_parts[-1]["text"] += "\n\n" + text_val
+                            else:
+                                combined_parts.append({"type": "text", "text": text_val})
+                    else:
+                        combined_parts.append(part)
+
+                if len(combined_parts) == 1 and combined_parts[0]["type"] == "text":
+                    prev["content"] = combined_parts[0]["text"]
+                else:
+                    prev["content"] = combined_parts
+            else:
+                merged.append(msg)
+
+        # 5. Ensure strict alternation
+        alternating = []
+        if merged and merged[0]["role"] == "system":
+            alternating.append(merged[0])
+            remaining_merged = merged[1:]
+        else:
+            remaining_merged = merged
+
+        for msg in remaining_merged:
+            if not alternating or alternating[-1]["role"] == "system":
+                if msg["role"] == "assistant":
+                    alternating.append({"role": "user", "content": "Proceed."})
+                alternating.append(msg)
+            else:
+                prev_role = alternating[-1]["role"]
+                if prev_role == msg["role"]:
+                    pass
+                else:
+                    alternating.append(msg)
+
+        return alternating
+
     def normalize_model_name(self, model_name: str) -> str:
         return model_name.strip().lower()
 

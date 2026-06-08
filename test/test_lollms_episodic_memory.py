@@ -64,14 +64,22 @@ class TestLollmsEpisodicMemory(unittest.TestCase):
             level=1
         )
 
+        # Space them out explicitly in the SQLite database to guarantee order
+        with self.memory_manager._session() as s:
+            from lollms_client.lollms_discussion.lollms_memory import _MemoryRecord
+            rec1 = s.query(_MemoryRecord).filter_by(id=m1["id"]).one()
+            rec2 = s.query(_MemoryRecord).filter_by(id=m2["id"]).one()
+            rec1.created_at = datetime.utcnow() - timedelta(seconds=5)
+            rec2.created_at = datetime.utcnow()
+
         # 3. Zone should be ordered chronologically (Memory A first, then Memory B)
         zone_populated = self.memory_manager.build_working_zone()
         self.assertIn("=== WORKING MEMORY ===", zone_populated)
-        
+
         # Verify the timestamps are prepended
         self.assertIn("Memory A", zone_populated)
         self.assertIn("Memory B", zone_populated)
-        
+
         # Verify correct chronological order (m1 was added before m2)
         idx1 = zone_populated.index("Memory A")
         idx2 = zone_populated.index("Memory B")

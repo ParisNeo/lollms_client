@@ -531,11 +531,11 @@ RULES:
             "• Ignore older conversational history if it conflicts with the Active Artefacts.",
             "",
             "=== ARTEFACT PRIORITY & ANTI-STALLING POLICY ===",
-            "1. **STRICT HIERARCHY**: You must ALWAYS prefer updating existing artifacts",
-            "   over creating new ones. Creating a new file to solve a",
-            "   problem that belongs in an active artifact is a CRITICAL FAILURE. ",
-            "   However, if the user explicitly requests an inline 'widget', you MUST ",
-            "   prefer using <lollms_inline> directly over creating a new <artifact>.",
+            "1. **STRICT HIERARCHY**: You must ALWAYS prefer creating a persistent <artifact> over an inline <lollms_inline> widget.",
+            "   Creating a new file to solve a problem that belongs in an active artifact is a CRITICAL FAILURE. ",
+            "   You MUST implement all runnable games, interactive applications, utilities, and software tools as persistent <artifact> files.",
+            "   You are STRICTLY FORBIDDEN from using <lollms_inline> for games, apps, or full tools — widgets are exclusively for brief, isolated visual demonstrations.",
+            "   Conversely, if the user explicitly asks for an 'inline widget', you may use <lollms_inline>.",
             "2. **ANTI-STALLING RULE**: Do NOT create a `<lollms_form>` to ask for ",
             "   choices if you have the technical knowledge to implement the feature.",
             "   If the user asks for a feature, use sensible engineering defaults and",
@@ -752,10 +752,10 @@ RULES:
             "",
             "You can embed live, interactive HTML widgets directly in your replies.",
             "",
-            "✅ WHEN TO USE A WIDGET:",
-            "  • When an interactive visualization would make the concept much clearer",
-            "  • To let the user experiment with parameters and see results immediately",
-            "  • For teaching algorithms, math, physics, UI behavior, games, etc.",
+            "🚨 CRITICAL PRIORITY DIRECTIVE — FAVOR ARTIFACTS OVER WIDGETS:",
+            "  • You MUST always favor creating persistent <artifact> files over inline <lollms_inline> widgets.",
+            "  • Widgets are strictly reserved for short, isolated, inline visual demonstrations (e.g. demonstrating a math formula, an algorithm tree, or a single color picker).",
+            "  • You are STRICTLY FORBIDDEN from using <lollms_inline> to build games, tools, or functional software applications. All runnable games (like Pong, Snake) and software apps MUST be implemented as <artifact> files.",
             "",
             "❌ DO NOT use widgets for:",
             "  • Simple static explanations or text content",
@@ -935,7 +935,7 @@ EXAMPLE OF CORRECT FORM:
         # Un-escape any backticks or markdown characters accidentally escaped by the LLM
         text = re.sub(r'\\(`{1,3})', r'\1', text)
         text = text.replace(r'\*', '*').replace(r'\_', '_')
-        # ── Mask code blocks so XML inside documentation isn't processed ─────
+        # ── Mask code blocks and think blocks so XML inside them isn't processed ─────
         code_blocks: Dict[str, str] = {}
 
         def mask_code_block(match):
@@ -943,7 +943,11 @@ EXAMPLE OF CORRECT FORM:
             code_blocks[placeholder] = match.group(0)
             return placeholder
 
-        masked_text = re.sub(r'(`{3,})[\s\S]*?\1', mask_code_block, text)
+        # Mask think blocks first to prevent processing any XML tags generated inside the thoughts
+        masked_text = re.sub(r'<think>[\s\S]*?(?:</think>|$)', mask_code_block, text, flags=re.IGNORECASE)
+
+        # Mask code blocks
+        masked_text = re.sub(r'(`{3,})[\s\S]*?\1', mask_code_block, masked_text)
         masked_text = re.sub(r'`[^`]+`',           mask_code_block, masked_text)
 
         has_artefact = bool(re.search(r'<(?:revert_)?art[ei]fact[\s>]', masked_text, re.IGNORECASE))

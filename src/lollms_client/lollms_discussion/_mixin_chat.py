@@ -1227,6 +1227,12 @@ class _StreamState:
         if not isinstance(chunk, str):
             return True
 
+        if getattr(self, "_mission_complete", False):
+            self.ai_message.content += chunk
+            self.clean_prose.append(chunk)
+            _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+            return True
+
         # ── STATUS MIMICRY TRAP ──
         # If the LLM starts generating framework-only tags, we trigger an abort.
         if "<processing" in chunk.lower():
@@ -1255,22 +1261,60 @@ class _StreamState:
 
         pos = 0
         while pos < len(chunk):
+            # Track code block fence state (ONLY in normal or buffering states)
+            if self.state in (self.STATE_NORMAL, self.STATE_BUFFERING):
+                if chunk[pos:].startswith("```"):
+                    self.in_code_block = not getattr(self, "in_code_block", False)
+                    if self.state == self.STATE_BUFFERING:
+                        self._flush_bracket_buf_as_text()
+                        self.state = self.STATE_NORMAL
+                    text = "```"
+                    self.ai_message.content += text
+                    self.clean_prose.append(text)
+                    _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
+                    pos += 3
+                    continue
+
+                if chunk[pos] == "`":
+                    if not getattr(self, "in_code_block", False):
+                        self.in_inline_code = not getattr(self, "in_inline_code", False)
+                    if self.state == self.STATE_BUFFERING:
+                        self._flush_bracket_buf_as_text()
+                        self.state = self.STATE_NORMAL
+                    text = "`"
+                    self.ai_message.content += text
+                    self.clean_prose.append(text)
+                    _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
+                    pos += 1
+                    continue
+
+            # If inside code blocks, treat as normal text and bypass any tag interception
+            if getattr(self, "in_code_block", False) or getattr(self, "in_inline_code", False):
+                char = chunk[pos]
+                if self.state == self.STATE_NORMAL:
+                    if self.proc_has_opened and self.proc_type == "agent_reasoning":
+                        self._emit_processing_close()
+                    self.ai_message.content += char
+                    self.clean_prose.append(char)
+                    _cb(self.callback, char, MSG_TYPE.MSG_TYPE_CHUNK)
+                else:
+                    self.sec_close_scan += char
+                pos += 1
+                continue
+
+            # Normal state machine logic (outside code blocks)
             if self.state == self.STATE_NORMAL:
                 pos = self._feed_normal(chunk, pos)
-
             elif self.state == self.STATE_BUFFERING:
                 pos = self._feed_buffering(chunk, pos)
                 if self.tool_trigger:
                     return False
-
             elif self.state == self.STATE_TOOL_CALL:
                 pos = self._feed_tool_call(chunk, pos)
                 if self.tool_trigger:
                     return False
-
             elif self.state == self.STATE_SECONDARY:
                 pos = self._feed_secondary(chunk, pos)
-
             else:
                 pos += 1
 
@@ -1946,6 +1990,12 @@ class _StreamState:
                 "category":    attrs.get('category', ''),
                 "description": attrs.get('description', ''),
             })
+        elif prefix == "<lollms_inline":
+            _cb(self.callback, content, self.sec_chunk_mt, {
+                "title":       attrs.get('title') or attrs.get('name', 'Widget'),
+                "chunk":       content,
+                "widget_type": attrs.get('type', 'html'),
+            })
 
     def _fire_secondary_done(self):
         """
@@ -2317,8 +2367,8 @@ class _StreamState:
                     ASCIIColors.red("  [Integrity] FAILED: Content is binary-identical to previous version.")
 
             # Process success if we have a new artifact or confirmed changes
-            # Process success if we have a new artifact, confirmed changes, or it is a full overwrite (not a patch)
-            if result_art and (is_new or has_real_changes or not is_patch):
+            # Process success if we have a new artifact or confirmed changes (for both patches and full overwrites)
+            if result_art and (is_new or has_real_changes):
                 self.affected_artefacts.append(result_art)
                 current_meta = dict(self.ai_message.metadata or {})
                 mod_list = current_meta.get("artefacts_modified", [])
@@ -2669,7 +2719,8 @@ class _StreamState:
             "   If an image is clearly unrelated (e.g. a bunny when fixing code), IGNORE IT completely.\n"
             "   Do not let irrelevant images distract you from the code architecture.\n"
         )
-
+        self._emit_processing_status(f"Parent Scratchpad size: {len(getattr(self, 'scratchpad', '') or '')} characters")
+        self._emit_processing_status("⚡ Specialized agent is reading the contextual payload & compiling the initial stream...")
         # Ingest active conversation images (e.g. error screenshots) to forward to the specialist
         active_images = self.discussion.get_active_images()
         filtered_images = []
@@ -2784,13 +2835,100 @@ class _StreamState:
             self._emit_processing_status(f"📤 Forwarding {len(effective_images)} relevant image(s) to specialist.")
 
         try:
+            import time
+
+            collected_chunks = []
+            fired_features = set()
+            line_buffer = ""
+            last_status_time = time.time()
+            total_lines_written = 0
+
+            def specialist_stream_callback(chunk, msg_type, meta=None):
+                if isinstance(chunk, str) and chunk:
+                    collected_chunks.append(chunk)
+                    nonlocal line_buffer, last_status_time, total_lines_written
+
+                    # Print dot to server console for active low-overhead feedback
+                    print(".", end="", flush=True)
+
+                    # Relay the raw chunk to the frontend under MSG_TYPE_ARTEFACT_CHUNK
+                    # so the user can see the code being written in real-time!
+                    _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, {
+                        "title":    target_example,
+                        "chunk":    chunk,
+                        "art_type": "code",
+                        "language": target_example.split(".")[-1] if "." in target_example else "python"
+                    })
+
+                    line_buffer += chunk
+                    lines_to_scan = []
+                    while "\n" in line_buffer:
+                        line, line_buffer = line_buffer.split("\n", 1)
+                        lines_to_scan.append(line)
+                        total_lines_written += 1
+
+                    if lines_to_scan:
+                        scan_block = "\n".join(lines_to_scan)
+                        now = time.time()
+
+                        # 1. Detect Markdown Headings
+                        hdr_match = re.search(r'^(#{1,4})\s+(.+)$', scan_block, re.MULTILINE)
+                        if hdr_match:
+                            hdr_title = hdr_match.group(2).strip()
+                            key = f"hdr:{hdr_title}"
+                            if key not in fired_features:
+                                fired_features.add(key)
+                                self._emit_processing_status(f"📖 Section: {hdr_title}")
+                                last_status_time = now
+                                return True
+
+                        # 2. Detect Classes
+                        cls_match = re.search(r'class\s+([a-zA-Z0-9_]+)', scan_block)
+                        if cls_match:
+                            cls_name = cls_match.group(1).strip()
+                            key = f"cls:{cls_name}"
+                            if key not in fired_features:
+                                fired_features.add(key)
+                                self._emit_processing_status(f"🏗️ Class: {cls_name}")
+                                last_status_time = now
+                                return True
+
+                        # 3. Detect Functions/Methods
+                        fn_match = re.search(r'(?:def|function)\s+([a-zA-Z0-9_]+)\s*\(', scan_block)
+                        if fn_match:
+                            fn_name = fn_match.group(1).strip()
+                            key = f"fn:{fn_name}"
+                            if key not in fired_features:
+                                fired_features.add(key)
+                                self._emit_processing_status(f"⚙️ Implementing: {fn_name}()")
+                                last_status_time = now
+                                return True
+
+                        # 4. Heartbeat Fallback (frequent progressive compiler updates)
+                        total_chars = len("".join(collected_chunks))
+                        if (total_lines_written > 0 and total_lines_written % 10 == 0) or (now - last_status_time > 3.0):
+                            key = f"hb:{total_lines_written}:{total_chars // 100}"
+                            if key not in fired_features:
+                                fired_features.add(key)
+                                self._emit_processing_status(
+                                    f"⚡ Compiling: {total_lines_written:,} lines / {total_chars:,} characters written..."
+                                )
+                                last_status_time = now
+
+                return True
+
             raw_output = self.discussion.lollmsClient.generate_text(
                 prompt=final_payload,
                 system_prompt=surgical_prompt,
                 images=effective_images,
                 temperature=None,
-                n_predict=None
+                n_predict=None,
+                stream=True,
+                streaming_callback=specialist_stream_callback
             )
+
+            # Ensure we print a newline after console dot streams
+            print()
 
             # Safeguard: If the LLM call returned an error dictionary, raise the error message
             if isinstance(raw_output, dict):
@@ -2807,8 +2945,9 @@ class _StreamState:
             # Extract expected targets from the plan
             targets_match = re.search(r"Target Artifacts:\s*([^\n\r]+)", plan, re.I)
             if targets_match:
-                # Get list of valid names
+                # Get list of valid names, adding ephemeral targets to the whitelist by default
                 allowed_names = [t.strip().lower() for t in targets_match.group(1).split(",")]
+                allowed_names.extend(["query.py", "query.sql"])
 
                 # Regex to find all artifact tags in output
                 tag_pattern = re.compile(r'(<art[ei]fact\s+[^>]*>.*?</art[ei]fact>)', re.DOTALL | re.IGNORECASE)
@@ -3593,7 +3732,7 @@ class ChatMixin:
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
 
-        # ── Memory ────────────────────────────────────────────────────────────
+        # ── 🧠 Memory ────────────────────────────────────────────────────────────
         _mm      = self._get_memory_manager(memory_manager) if enable_memory else None
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
         if _mm:
@@ -3743,157 +3882,6 @@ If you fail to use the tools when data is available, your output will be rejecte
                 "</RLM_STUB>",
             ])
  
-        # ── Add user message ──────────────────────────────────────────────────
-        if add_user_message:
-            user_msg = self.add_message(
-                sender=kwargs.get("user_name", "user"),
-                sender_type="user",
-                content=actual_user_content,
-                images=images,
-                **kwargs,
-            )
-            if rlm_enabled and len(user_message) > 10000:
-                user_msg.metadata["rlm_full_content"] = user_message
-                user_msg.metadata["rlm_var_name"]     = rlm_context_var_name
-        else:
-            if self.active_branch_id not in self._message_index:
-                raise ValueError("Regeneration failed: active branch tip not found.")
-            user_msg = LollmsMessage(self, self._message_index[self.active_branch_id])
-            images   = user_msg.get_active_images()
-            user_message = user_msg.content
-
-        # ── Fast Path Bypass ──────────────────────────────────────────────────
-        if _is_fast_message(user_message):
-            ai_message = self.add_message(
-                sender=personality.name,
-                sender_type="assistant",
-                content="",
-                parent_id=user_msg.id if user_msg else None,
-                model_name=self.lollmsClient.llm.model_name,
-                binding_name=self.lollmsClient.llm.binding_name,
-                metadata={"mode": "direct_fast_path"},
-            )
-
-            ss_fast = _StreamState(
-                discussion            = self,
-                callback              = callback,
-                ai_message            = ai_message,
-                enable_notes          = False,
-                enable_skills         = False,
-                enable_inline_widgets = False,
-                enable_forms          = False,
-                auto_activate_artefacts = False,
-                enable_artefacts      = False,
-            )
-
-            def _fast_relay(chunk, msg_type=None, meta=None):
-                if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
-                    return ss_fast.passthrough(chunk, msg_type, meta)
-                if isinstance(chunk, str):
-                    return ss_fast.feed(chunk)
-                return True
-
-            _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"message_id": ai_message.id})
-
-            raw_text = self._stream_final_answer(
-                _fast_relay, images,
-                branch_tip_id or self.active_branch_id,
-                None,  # Use the default temperature
-                **kwargs,
-            )
-            ss_fast.flush_remaining_buffer()
-
-            if remove_thinking_blocks:
-                ai_message.content = self.lollmsClient.remove_thinking_blocks(ai_message.content)
-
-            if self._is_db_backed and self.autosave:
-                self.commit()
-
-            self.scratchpad = ""
-            object.__setattr__(self, '_active_callback', None)
-            return {
-                "user_message":     user_msg,
-                "ai_message":       ai_message,
-                "sources":          [],
-                "scratchpad":       None,
-                "self_corrections": None,
-                "artefacts":        [],
-                "memory_report":    {}
-            }
-
-        # ── Source inference helper ───────────────────────────────────────────
-        def _infer_sources_from_json(data: Any, tool_name: str) -> List[Dict]:
-            found_sources = []
-            def looks_like_source(d: dict) -> bool:
-                title_keys = {'title', 'name', 'label', 'header', 'id', 'filename'}
-                return any(k in d for k in title_keys)
-            def scan(obj: Any):
-                if isinstance(obj, list):
-                    for item in obj:
-                        if isinstance(item, dict) and looks_like_source(item):
-                            found_sources.append(item)
-                        else:
-                            scan(item)
-                elif isinstance(obj, dict):
-                    for k, v in obj.items():
-                        if k.lower() in ['results', 'sources', 'data', 'items', 'content'] \
-                                and isinstance(v, list):
-                            scan(v)
-                        else:
-                            scan(v)
-            scan(data)
-            if not found_sources and isinstance(data, dict) and looks_like_source(data):
-                found_sources.append(data)
-            normalized = []
-            for item in found_sources:
-                title = (item.get('title') or item.get('name') or item.get('label') or
-                         item.get('id') or item.get('filename') or f"{tool_name} Result")
-                content = (item.get('content') or item.get('summary') or item.get('snippet') or
-                           item.get('text') or item.get('description') or "")
-                link = (item.get('url') or item.get('link') or item.get('href') or
-                        item.get('source') or item.get('pdf_url') or "")
-                raw_score = item.get('score') or item.get('relevance', 100 if content else 0)
-                try:
-                    score = float(raw_score) * 100 if 0 < float(raw_score) <= 1 \
-                        else float(raw_score)
-                except (TypeError, ValueError):
-                    score = 0.0
-                metadata = {k: v for k, v in item.items()
-                            if k not in ['title', 'content', 'url', 'link', 'score']}
-                normalized.append({
-                    "title": str(title), "content": str(content), "source": str(link),
-                    "relevance_score": score, "metadata": metadata, "tool": tool_name
-                })
-            return normalized
- 
-        # ── Document zone extraction helper ───────────────────────────────────
-        def _extract_docs(zone_content):
-            if not zone_content:
-                return []
-            return [
-                {
-                    "name":        m[0].strip(),
-                    "content":     m[1].strip(),
-                    "size":        len(m[1].strip()),
-                    "token_count": self.lollmsClient.count_tokens(m[1].strip()),
-                }
-                for m in re.findall(
-                    r"--- Document: (.+?) ---\n(.*?)\n--- End Document: \1 ---",
-                    zone_content, re.DOTALL,
-                )
-            ]
- 
-        all_documents: List[Dict] = []
-        for zone_content, zone_label in [
-            (self.discussion_data_zone,  "discussion"),
-            (self.user_data_zone,        "user"),
-            (None if personality.has_data else self.personality_data_zone, "personality"),
-        ]:
-            if zone_content:
-                for d in _extract_docs(zone_content):
-                    d["zone"] = zone_label
-                    all_documents.append(d)
- 
         # ====================================================================
         #  Tool registry
         # ====================================================================
@@ -4024,686 +4012,6 @@ If you fail to use the tools when data is available, your output will be rejecte
             _step_end(callback, f"{len(_pt_specs)} personality tool(s) ready", _pt_step_id,
                       {"tool_count": len(_pt_specs)})
  
-        # ── Layer 2.5: Autonomous Python Data Query Tool ──────────────────────
-        # Moved to external LCP tools: execute_python_data_query and execute_sql_query
-        active_data = []
-        if False:
-            def _execute_python_data_query_tool_impl(code: str) -> Dict[str, Any]:
-                # Dynamically retrieve the latest version of the data artifact to support multi-round updates
-                latest_data = [
-                    a for a in self.artefacts.list(active_only=True) 
-                    if a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
-                ]
-                if not latest_data:
-                    err_msg = "No active data artifact found in this session."
-                    ASCIIColors.error(f"❌ {err_msg}")
-                    return {"success": False, "error": err_msg}
-
-                title = latest_data[0]["title"]
-                ext = latest_data[0].get("file_ext") or Path(title).suffix or ".csv"
-                current_version = latest_data[0].get("version", 1)
-                is_read_only = latest_data[0].get("read_only", False)
-                plot_b64 = None
-
-                workspace_dir = Path("./data_workspace")
-                try:
-                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-                    if awd is not None:
-                        workspace_dir = awd
-                except ImportError:
-                    pass
-
-                # If read-only, we execute directly on the active alias without making a versioned copy
-                if is_read_only:
-                    new_version = current_version
-                    source_file_path = workspace_dir / f"{title}{ext}"
-                    new_file_path = source_file_path
-                else:
-                    new_version = current_version + 1
-                    source_file_path = workspace_dir / f"{title}_v{current_version}{ext}"
-                    new_file_path = workspace_dir / f"{title}_v{new_version}{ext}"
-
-                ASCIIColors.info(f"--- [execute_python_data_query] Ingestion started for: '{title}' (v{current_version}{ext}) ---")
-
-                if not source_file_path.exists():
-                    # Fallback scan: check other workspaces and the global data_workspace
-                    found_path = None
-                    scan_dirs = [Path("./data_workspace")]
-                    try:
-                        from lollms_client.app.server import APP_DIR
-                        if APP_DIR and APP_DIR.exists():
-                            ws_dir = APP_DIR / "workspaces"
-                            if ws_dir.exists():
-                                for d in ws_dir.iterdir():
-                                    if d.is_dir():
-                                        scan_dirs.append(d / "data_workspace")
-                    except Exception:
-                        pass
-
-                    for sd in scan_dirs:
-                        cand = sd / f"{title}_v{current_version}{ext}"
-                        if cand.exists():
-                            found_path = cand
-                            break
-
-                    if found_path:
-                        try:
-                            workspace_dir.mkdir(parents=True, exist_ok=True)
-                            import shutil
-                            shutil.copy(str(found_path), str(source_file_path))
-                            unversioned_dest = workspace_dir / f"{title}{ext}"
-                            try:
-                                shutil.copy(str(found_path), str(unversioned_dest))
-                            except Exception:
-                                pass
-                            ASCIIColors.success(f"✓ Recovered missing data file from '{found_path.parent.parent.name or 'global'}' workspace!")
-                        except Exception as copy_err:
-                            ASCIIColors.error(f"Failed to copy recovered file: {copy_err}")
-
-                if not source_file_path.exists():
-                    err_msg = f"Raw data file '{title}_v{current_version}{ext}' is missing from workspace."
-                    ASCIIColors.error(f"❌ {err_msg}")
-                    return {"success": False, "error": err_msg}
-
-                import pandas as pd
-                import numpy as np
-                import base64
-                import io
-                import sys
-                import shutil
-                import matplotlib
-                matplotlib.use('Agg')
-                import matplotlib.pyplot as plt
-
-                local_vars = {
-                    "pd": pd,
-                    "plt": plt,
-                    "np": np,
-                    "Path": Path
-                }
-
-                # Pre-populate local vars with dataset for immediate accessibility
-                sep = ","
-                try:
-                    if ext in (".db", ".sqlite", ".sqlite3"):
-                        shutil.copy(str(source_file_path), str(new_file_path))
-                        import sqlite3
-                        conn = sqlite3.connect(str(new_file_path))
-                        local_vars["conn"] = conn
-                        local_vars["cursor"] = conn.cursor()
-                    elif ext in (".xlsx", ".xls"):
-                        xl = pd.ExcelFile(str(source_file_path))
-                        dfs = {sheet: pd.read_excel(str(source_file_path), sheet_name=sheet) for sheet in xl.sheet_names}
-                        local_vars["dfs"] = dfs
-                        if len(dfs) == 1:
-                            local_vars["df"] = list(dfs.values())[0]
-                    else:
-                        sep = ";" if ext == ".csv" and ";" in source_file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
-                        local_vars["df"] = pd.read_csv(str(source_file_path), sep=sep)
-                    ASCIIColors.success(f"✓ Dataset loaded into memory successfully (Variables available: pd, plt, np, Path, and {'conn, cursor' if ext in ('.db', '.sqlite', '.sqlite3') else 'dfs' if ext in ('.xlsx', '.xls') else 'df'})")
-                except Exception as e:
-                    ASCIIColors.error(f"❌ Failed to load dataset: {e}")
-                    if self.lollmsClient.debug:
-                        trace_exception(e)
-                    return {"success": False, "error": f"Failed to load dataset: {e}"}
-
-                old_stdout = sys.stdout
-                redirected_output = io.StringIO()
-                sys.stdout = redirected_output
-
-                import os
-                old_cwd = os.getcwd()
-                # List files before execution to detect changes
-                files_before = set(os.listdir(str(workspace_dir))) if workspace_dir.exists() else set()
-
-                # --- 1. Execute Code Sandbox ---
-                active_file = workspace_dir / f"{title}{ext}"
-                active_file_mtime_before = active_file.stat().st_mtime if active_file.exists() else 0
-
-                try:
-                    if workspace_dir and workspace_dir.exists():
-                        os.chdir(str(workspace_dir))
-
-                    plt.clf()
-                    plt.close('all')
-                    ASCIIColors.info(f"⚡ Executing Sandboxed Python code:\n{code}")
-                    exec(code, local_vars)
-                except Exception as e:
-                    sys.stdout = old_stdout
-                    err_msg = f"Generated code execution error: {e}"
-                    ASCIIColors.error(f"❌ {err_msg}")
-                    if self.lollmsClient.debug:
-                        trace_exception(e)
-                    return {"success": False, "error": err_msg, "output": redirected_output.getvalue()}
-
-                # --- 2. Update and Commit Workspace State ---
-                try:
-                    # Detect new or modified CSV/Excel files in the workspace to register as UI Data Views
-                    files_after = set(os.listdir(str(workspace_dir))) if workspace_dir.exists() else set()
-                    new_or_modified_files = []
-                    for f in files_after:
-                        # Exclude versioned files, internal files, and target only unversioned output datasets
-                        if f.endswith((".csv", ".xlsx", ".xls")) and not "_v" in f:
-                            new_or_modified_files.append(f)
-
-                    if new_or_modified_files:
-                        current_meta = dict(ai_message.metadata or {})
-                        ui_views = current_meta.get("ui_data_views", [])
-                        for f in new_or_modified_files:
-                            if f not in ui_views:
-                                ui_views.append(f)
-                        current_meta["ui_data_views"] = ui_views
-                        ai_message.metadata = current_meta
-
-                    fig_nums = plt.get_fignums()
-                    if fig_nums:
-                        buf = io.BytesIO()
-                        plt.savefig(buf, format="png", bbox_inches='tight')
-                        buf.seek(0)
-                        plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-                        ASCIIColors.success("✓ Matplotlib visualization generated inside sandbox.")
-
-                        # Automatically save/update as a persistent image artifact in the active workspace
-                        plot_title = f"{title}_plot"
-                        existing_plot = self.artefacts.get(plot_title)
-                        if existing_plot is None:
-                            self.artefacts.add(
-                                title=plot_title,
-                                artefact_type="image",
-                                content=f"### Matplotlib Visualization: {plot_title}\n\n<artefact_image id=\"{plot_title}::0\" />",
-                                images=[plot_b64],
-                                image_media_types=["image/png"],
-                                active=True
-                            )
-                        else:
-                            # Update in-place to append a new version of the generated plot
-                            self.artefacts.update(
-                                title=plot_title,
-                                new_content=f"### Matplotlib Visualization (Version {existing_plot.get('version', 1) + 1}): {plot_title}\n\n<artefact_image id=\"{plot_title}::{existing_plot.get('version', 1)}\" />",
-                                new_images=existing_plot.get("images", []) + [plot_b64],
-                                new_image_media_types=existing_plot.get("image_media_types", []) + ["image/png"],
-                                bump_version=True,
-                                active=True
-                            )
-                        self.commit()
-                        ASCIIColors.success(f"✓ Registered/updated Matplotlib plot as a persistent image artifact: '{plot_title}'")
-
-                    if not is_read_only:
-                        active_file_mtime_after = active_file.stat().st_mtime if active_file.exists() else 0
-                        file_written_by_script = (active_file_mtime_after > active_file_mtime_before)
-
-                        if file_written_by_script:
-                            import shutil
-                            shutil.copy(str(active_file), str(new_file_path))
-                        else:
-                            if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
-                                local_vars["conn"].commit()
-                                local_vars["conn"].close()
-                            elif ext in (".xlsx", ".xls") and "dfs" in local_vars:
-                                with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
-                                    for sheet_name, sheet_df in local_vars["dfs"].items():
-                                        sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                            elif "df" in local_vars:
-                                local_vars["df"].to_csv(new_file_path, index=False, sep=sep)
-
-                        from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                        new_schema, _ = _parse_data_file(new_file_path, title, version=new_version, progress_cb=None)
-                        self.artefacts.update(
-                            title=title,
-                            new_content=new_schema,
-                            new_type="data",
-                            active=True,
-                            file_ext=ext
-                        )
-                        ASCIIColors.success(f"✓ Code executed and data version incremented to v{new_version} successfully.")
-                    else:
-                        if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
-                            local_vars["conn"].close()
-                        ASCIIColors.success("✓ Code executed successfully (Read-Only mode: no files written).")
-                except Exception as e:
-                    sys.stdout = old_stdout
-                    err_msg = f"System Error in database updater: {e}"
-                    ASCIIColors.error(f"❌ {err_msg}")
-                    if self.lollmsClient.debug:
-                        trace_exception(e)
-                    if new_file_path.exists() and ext not in (".db", ".sqlite", ".sqlite3"):
-                        new_file_path.unlink()
-                    return {"success": False, "error": err_msg, "output": redirected_output.getvalue()}
-                finally:
-                    sys.stdout = old_stdout
-                    try:
-                        os.chdir(old_cwd)
-                    except Exception:
-                        pass
-
-                out_str = redirected_output.getvalue()
-                result = {
-                    "success": True,
-                    "output": out_str or "Code executed successfully (no stdout prints)."
-                }
-                if plot_b64:
-                    result["plot_b64"] = plot_b64
-                    result["images"] = [plot_b64]
-                    result["output"] += "\n\n[SYSTEM: A matplotlib visualization was generated. The user can view it in their UI.]"
-                return result
-
-            _register(
-                name="execute_python_data_query",
-                fn=_execute_python_data_query_tool_impl,
-                params=[{"name": "code", "type": "str", "description": "The Python code to execute. To load active datasets, open them directly by their clean name (e.g., 'sales_database.xlsx' or 'sales_database.csv'). Do NOT use '/api/workspace_files/...' prefixes."}],
-                description="MANDATORY FOR DATA ANALYSIS/MODIFICATION: Execute sandboxed Python code using pandas or sqlite3 to analyze active datasets. To read active datasets (e.g., 'sales_database.xlsx'), simply open them directly by their clean filename (do NOT use '/api/workspace_files/...' prefixes, as those are strictly for client-side JavaScript).",
-                output=[{"name": "output", "type": "str"}]
-            )
-
-            def _execute_sql_query_impl(sql_query: str) -> Dict[str, Any]:
-                """
-                Executes a standard SQLite SQL query on the active datasets.
-                If the dataset is an Excel spreadsheet or CSV, they are automatically
-                loaded as tables in an in-memory SQLite database.
-                """
-                import sqlite3
-                import pandas as pd
-                from pathlib import Path
-                from lollms_client.lollms_types import LCPResult
-                from ascii_colors import ASCIIColors, trace_exception
-
-                # Find first active data-matching artifact
-                matched_art = next((
-                    a for a in self.artefacts.list(active_only=True) 
-                    if a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
-                ), active_data[0])
-
-                title = matched_art["title"]
-                ext = matched_art.get("file_ext") or Path(title).suffix or ".csv"
-                current_version = matched_art.get("version", 1)
-                is_read_only = matched_art.get("read_only", False)
-
-                workspace_dir = Path("./data_workspace")
-                try:
-                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-                    if awd is not None:
-                        workspace_dir = awd
-                except ImportError:
-                    pass
-
-                # Check for files
-                if is_read_only:
-                    file_path = workspace_dir / f"{title}{ext}"
-                else:
-                    file_path = workspace_dir / f"{title}_v{current_version}{ext}"
-
-                if not file_path.exists():
-                    file_path = workspace_dir / f"{title}{ext}"
-                    if not file_path.exists():
-                        # Run self-healing scanner as fallback
-                        found_path = None
-                        scan_dirs = [Path("./data_workspace")]
-                        try:
-                            from lollms_client.app.server import APP_DIR
-                            if APP_DIR and APP_DIR.exists():
-                                ws_dir = APP_DIR / "workspaces"
-                                if ws_dir.exists():
-                                    for d in ws_dir.iterdir():
-                                        if d.is_dir():
-                                            scan_dirs.append(d / "data_workspace")
-                        except Exception:
-                            pass
-
-                        for sd in scan_dirs:
-                            cand = sd / f"{title}_v{current_version}{ext}"
-                            if cand.exists():
-                                found_path = cand
-                                break
-                            cand = sd / f"{title}{ext}"
-                            if cand.exists():
-                                found_path = cand
-                                break
-
-                        if found_path:
-                            try:
-                                workspace_dir.mkdir(parents=True, exist_ok=True)
-                                import shutil
-                                shutil.copy(str(found_path), str(file_path))
-                                unversioned_dest = workspace_dir / f"{title}{ext}"
-                                try:
-                                    shutil.copy(str(found_path), str(unversioned_dest))
-                                except Exception:
-                                    pass
-                                ASCIIColors.success(f"✓ Recovered missing data file from '{found_path.parent.parent.name or 'global'}' workspace!")
-                            except Exception as copy_err:
-                                ASCIIColors.error(f"Failed to copy recovered file: {copy_err}")
-
-                if not file_path.exists():
-                    return {"success": False, "error": f"Raw data file '{title}' is missing from workspace."}
-
-                ASCIIColors.info(f"--- [execute_sql_query] Compiling SQL query inside sandbox... ---")
-
-                # Setup in-memory SQLite database
-                try:
-                    conn = sqlite3.connect(":memory:")
-
-                    if ext in (".db", ".sqlite", ".sqlite3"):
-                        # If SQLite database on disk, backup/copy tables to our in-memory DB
-                        disk_conn = sqlite3.connect(str(file_path))
-                        disk_conn.backup(conn)
-                        disk_conn.close()
-                    elif ext in (".xlsx", ".xls"):
-                        # If Excel, load sheets as tables
-                        xl = pd.ExcelFile(str(file_path))
-                        for sheet_name in xl.sheet_names:
-                            # Standardize table name (no spaces)
-                            table_name = sheet_name.replace(" ", "_")
-                            df = pd.read_excel(str(file_path), sheet_name=sheet_name)
-                            df.to_sql(table_name, conn, index=False, if_exists="replace")
-                    else:
-                        # CSV
-                        sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
-                        df = pd.read_csv(str(file_path), sep=sep)
-                        df.to_sql(title.replace(" ", "_"), conn, index=False, if_exists="replace")
-                    ASCIIColors.success("✓ Relational dataset compiled into in-memory SQLite successfully.")
-                except Exception as e:
-                    ASCIIColors.error(f"❌ Failed to load dataset tables into memory SQLite: {e}")
-                    if self.lollmsClient.debug:
-                        trace_exception(e)
-                    return {"success": False, "error": f"Failed to load dataset: {e}"}
-
-                # Execute SQL query on our in-memory DB
-                try:
-                    # Strip SQL comments and whitespace to reliably detect SELECT queries
-                    clean_query = sql_query.strip()
-                    clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
-                    clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
-
-                    is_select = clean_query.lower().startswith("select")
-
-                    if is_select:
-                        df_res = pd.read_sql_query(sql_query, conn)
-                        output_md = df_res.to_markdown(index=False)
-                        sources = [{
-                            "title": f"SQL Query Result: {sql_query}",
-                            "content": output_md,
-                            "source": f"sql_query"
-                        }]
-                        ASCIIColors.success(f"✓ SQL select query executed successfully: found {len(df_res)} rows.")
-                    else:
-                        if is_read_only:
-                            conn.close()
-                            err_msg = "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."
-                            ASCIIColors.error(f"❌ {err_msg}")
-                            return {"success": False, "error": err_msg}
-
-                        # Run write query
-                        cursor = conn.cursor()
-                        cursor.execute(sql_query)
-                        conn.commit()
-
-                        # Write back modified tables from memory DB back to Excel/CSV file on disk
-                        if ext in (".db", ".sqlite", ".sqlite3"):
-                            disk_conn = sqlite3.connect(str(file_path))
-                            conn.backup(disk_conn)
-                            disk_conn.close()
-                        elif ext in (".xlsx", ".xls"):
-                            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                            tables = [row[0] for row in cursor.fetchall()]
-
-                            new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
-                            with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
-                                for t in tables:
-                                    df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
-                                    df_write.to_excel(writer, sheet_name=t.replace("_", " "), index=False)
-
-                            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                            new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
-                            self.artefacts.update(
-                                title=title,
-                                new_content=new_schema,
-                                new_type="data",
-                                active=True,
-                                file_ext=ext
-                            )
-                        else:
-                            new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
-                            df_write = pd.read_sql_query(f"SELECT * FROM {title.replace(' ', '_')}", conn)
-                            df_write.to_csv(new_file_path, index=False, sep=sep)
-
-                            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                            new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
-                            self.artefacts.update(
-                                title=title,
-                                new_content=new_schema,
-                                new_type="data",
-                                active=True,
-                                file_ext=ext
-                            )
-
-                        output_md = f"Query executed successfully: `{sql_query}`. Affected rows: {cursor.rowcount}"
-                        sources = []
-                        ASCIIColors.success(f"✓ SQL write query executed successfully, workspace state updated.")
-
-                    conn.close()
-
-                    return LCPResult(
-                        success=True,
-                        output=output_md,
-                        sources=sources
-                    )
-                except Exception as e:
-                    conn.close()
-                    ASCIIColors.error(f"❌ SQL execution failed: {e}")
-                    if self.lollmsClient.debug:
-                        trace_exception(e)
-                    return {"success": False, "error": f"SQL execution error: {e}"}
-
-            _register(
-                name="execute_sql_query",
-                fn=_execute_sql_query_impl,
-                params=[{"name": "sql_query", "type": "str", "description": "The standard SQL query (SQLite syntax) to run on the database. Available tables match the Sheet names (e.g. 'Customers', 'Products', 'Orders', 'Order_Details' with spaces replaced by underscores, e.g., 'Order_Details')."}],
-                description="MANDATORY FOR SQL DATA ANALYSIS/QUERIES: Execute standard SQL queries on the active dataset tables. Available tables are the sheet names with spaces replaced by underscores. For write queries (INSERT/UPDATE/DELETE), ensure the dataset is in WRITABLE mode.",
-                output=[{"name": "output", "type": "str"}]
-            )
-
-            def _execute_sql_query_impl(sql_query: str) -> Dict[str, Any]:
-                """
-                Executes a standard SQLite SQL query on the active datasets.
-                If the dataset is an Excel spreadsheet or CSV, they are automatically
-                loaded as tables in an in-memory SQLite database.
-                """
-                import sqlite3
-                import pandas as pd
-                from pathlib import Path
-                from lollms_client.lollms_types import LCPResult
-                from ascii_colors import ASCIIColors, trace_exception
-
-                # Find first active data-matching artifact
-                matched_art = next((
-                    a for a in self.artefacts.list(active_only=True) 
-                    if a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
-                ), active_data[0])
-
-                title = matched_art["title"]
-                ext = matched_art.get("file_ext") or Path(title).suffix or ".csv"
-                current_version = matched_art.get("version", 1)
-                is_read_only = matched_art.get("read_only", False)
-
-                workspace_dir = Path("./data_workspace")
-                try:
-                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-                    if awd is not None:
-                        workspace_dir = awd
-                except ImportError:
-                    pass
-
-                # Check for files
-                if is_read_only:
-                    file_path = workspace_dir / f"{title}{ext}"
-                else:
-                    file_path = workspace_dir / f"{title}_v{current_version}{ext}"
-
-                if not file_path.exists():
-                    file_path = workspace_dir / f"{title}{ext}"
-                    if not file_path.exists():
-                        # Run self-healing scanner as fallback
-                        found_path = None
-                        scan_dirs = [Path("./data_workspace")]
-                        try:
-                            from lollms_client.app.server import APP_DIR
-                            if APP_DIR and APP_DIR.exists():
-                                ws_dir = APP_DIR / "workspaces"
-                                if ws_dir.exists():
-                                    for d in ws_dir.iterdir():
-                                        if d.is_dir():
-                                            scan_dirs.append(d / "data_workspace")
-                        except Exception:
-                            pass
-
-                        for sd in scan_dirs:
-                            cand = sd / f"{title}_v{current_version}{ext}"
-                            if cand.exists():
-                                found_path = cand
-                                break
-                            cand = sd / f"{title}{ext}"
-                            if cand.exists():
-                                found_path = cand
-                                break
-
-                        if found_path:
-                            try:
-                                workspace_dir.mkdir(parents=True, exist_ok=True)
-                                import shutil
-                                shutil.copy(str(found_path), str(file_path))
-                                unversioned_dest = workspace_dir / f"{title}{ext}"
-                                try:
-                                    shutil.copy(str(found_path), str(unversioned_dest))
-                                except Exception:
-                                    pass
-                                ASCIIColors.success(f"✓ Recovered missing data file from '{found_path.parent.parent.name or 'global'}' workspace!")
-                            except Exception as copy_err:
-                                ASCIIColors.error(f"Failed to copy recovered file: {copy_err}")
-
-                if not file_path.exists():
-                    return {"success": False, "error": f"Raw data file '{title}' is missing from workspace."}
-
-                ASCIIColors.info(f"--- [execute_sql_query] Compiling SQL query inside sandbox... ---")
-
-                # Setup in-memory SQLite database
-                try:
-                    conn = sqlite3.connect(":memory:")
-
-                    if ext in (".db", ".sqlite", ".sqlite3"):
-                        # If SQLite database on disk, backup/copy tables to our in-memory DB
-                        disk_conn = sqlite3.connect(str(file_path))
-                        disk_conn.backup(conn)
-                        disk_conn.close()
-                    elif ext in (".xlsx", ".xls"):
-                        # If Excel, load sheets as tables
-                        xl = pd.ExcelFile(str(file_path))
-                        for sheet_name in xl.sheet_names:
-                            # Standardize table name (no spaces)
-                            table_name = sheet_name.replace(" ", "_")
-                            df = pd.read_excel(str(file_path), sheet_name=sheet_name)
-                            df.to_sql(table_name, conn, index=False, if_exists="replace")
-                    else:
-                        # CSV
-                        sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
-                        df = pd.read_csv(str(file_path), sep=sep)
-                        df.to_sql(title.replace(" ", "_"), conn, index=False, if_exists="replace")
-                    ASCIIColors.success("✓ Relational dataset compiled into in-memory SQLite successfully.")
-                except Exception as e:
-                    ASCIIColors.error(f"❌ Failed to load dataset tables into memory SQLite: {e}")
-                    if self.lollmsClient.debug:
-                        trace_exception(e)
-                    return {"success": False, "error": f"Failed to load dataset: {e}"}
-
-                # Execute SQL query on our in-memory DB
-                try:
-                    is_select = sql_query.strip().lower().startswith("select")
-
-                    if is_select:
-                        df_res = pd.read_sql_query(sql_query, conn)
-                        output_md = df_res.to_markdown(index=False)
-                        sources = [{
-                            "title": f"SQL Query Result: {sql_query}",
-                            "content": output_md,
-                            "source": f"sql_query"
-                        }]
-                        ASCIIColors.success(f"✓ SQL select query executed successfully: found {len(df_res)} rows.")
-                    else:
-                        if is_read_only:
-                            conn.close()
-                            err_msg = "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."
-                            ASCIIColors.error(f"❌ {err_msg}")
-                            return {"success": False, "error": err_msg}
-
-                        # Run write query
-                        cursor = conn.cursor()
-                        cursor.execute(sql_query)
-                        conn.commit()
-
-                        # Write back modified tables from memory DB back to Excel/CSV file on disk
-                        if ext in (".db", ".sqlite", ".sqlite3"):
-                            disk_conn = sqlite3.connect(str(file_path))
-                            conn.backup(disk_conn)
-                            disk_conn.close()
-                        elif ext in (".xlsx", ".xls"):
-                            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                            tables = [row[0] for row in cursor.fetchall()]
-
-                            new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
-                            with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
-                                for t in tables:
-                                    df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
-                                    df_write.to_excel(writer, sheet_name=t.replace("_", " "), index=False)
-
-                            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                            new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
-                            self.artefacts.update(
-                                title=title,
-                                new_content=new_schema,
-                                new_type="data",
-                                active=True,
-                                file_ext=ext
-                            )
-                        else:
-                            new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
-                            df_write = pd.read_sql_query(f"SELECT * FROM {title.replace(' ', '_')}", conn)
-                            df_write.to_csv(new_file_path, index=False, sep=sep)
-
-                            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                            new_schema, _ = _parse_data_file(new_file_path, title, version=current_version + 1, progress_cb=None)
-                            self.artefacts.update(
-                                title=title,
-                                new_content=new_schema,
-                                new_type="data",
-                                active=True,
-                                file_ext=ext
-                            )
-
-                        output_md = f"Query executed successfully: `{sql_query}`. Affected rows: {cursor.rowcount}"
-                        sources = []
-                        ASCIIColors.success(f"✓ SQL write query executed successfully, workspace state updated.")
-
-                    conn.close()
-
-                    return LCPResult(
-                        success=True,
-                        output=output_md,
-                        sources=sources
-                    )
-                except Exception as e:
-                    conn.close()
-                    ASCIIColors.error(f"❌ SQL execution failed: {e}")
-                    if self.lollmsClient.debug:
-                        trace_exception(e)
-                    return {"success": False, "error": f"SQL execution error: {e}"}
-
-            _register(
-                name="execute_sql_query",
-                fn=_execute_sql_query_impl,
-                params=[{"name": "sql_query", "type": "str", "description": "The standard SQL query (SQLite syntax) to run on the database. Available tables match the Sheet names (e.g. 'Customers', 'Products', 'Orders', 'Order_Details' with spaces replaced by underscores, e.g., 'Order_Details')."}],
-                description="MANDATORY FOR SQL DATA ANALYSIS/QUERIES: Execute standard SQL queries on the active dataset tables. Available tables are the sheet names with spaces replaced by underscores. For write queries (INSERT/UPDATE/DELETE), ensure the dataset is in WRITABLE mode.",
-                output=[{"name": "output", "type": "str"}]
-            )
-
         # ── Layer 3: personality RAG tool ─────────────────────────────────────
         if personality.has_data:
             def _personality_rag(query: str) -> Dict[str, Any]:
@@ -4724,14 +4032,337 @@ If you fail to use the tools when data is available, your output will be rejecte
                 result["sources"] = sources_filtered
                 result["count"]   = len(sources_filtered)
                 return result
- 
+
             _register(
                 name        = "search_personality_knowledge",
                 fn          = _personality_rag,
                 params      = [{"name": "query", "type": "str", "description": "Search query"}],
-                description = "Search the personality's knowledge base",
+                description = "RAG search tool to retrieve information from the personality's knowledge base",
                 output      = [{"name": "sources", "type": "list"}],
             )
+
+        # ── Layer 4: Global Memory RAG tool ──
+        if _mm:
+            def _query_memories_tool_impl(query: str) -> Dict[str, Any]:
+                res = _mm.query(query, top_k=5)
+                # Format memories nicely
+                formatted = []
+                for m in res:
+                    formatted.append(f"[{m['id'][:8]}] (Imp: {m['importance']:.0%}) {m['content']}")
+                return {
+                    "success": True,
+                    "query": query,
+                    "memories": res,
+                    "output": "\n".join(formatted) if formatted else "No matching memories found."
+                }
+
+            _register(
+                name="query_memories",
+                fn=_query_memories_tool_impl,
+                params=[{"name": "query", "type": "str", "description": "Search query keywords to retrieve memories."}],
+                description="RAG search tool to query your persistent long-term memory database for past events, user preferences, or project guidelines.",
+                output=[{"name": "output", "type": "str"}]
+            )
+
+        # Quick intent check to see if the user's message actually requires tools or agentic actions
+        _needs_tools = False
+
+        # Check for active data artifacts
+        has_active_data_artifacts = any(
+            a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+            for a in self.artefacts.list(active_only=True)
+        )
+
+        # Check if there are active RAG or Search tools in the registry
+        has_search_or_rag_tools = any(
+            "search" in tname.lower() or "rag" in tname.lower() or "query" in tname.lower() or "internet" in tname.lower()
+            for tname in tool_registry
+        )
+
+        if has_active_data_artifacts and tool_registry:
+            # Check if the question is analytical/factual (could relate to data)
+            _data_intent_keywords = {
+                'question_words': ['what', 'which', 'how many', 'how much', 'where', 'when', 'why', 'who'],
+                'analytical_verbs': ['find', 'get', 'query', 'check', 'see', 'look', 'analyze', 'calculate', 'compute', 'count', 'list', 'show', 'retrieve', 'extract', 'plot', 'make', 'draw', 'graph', 'chart', 'visualize', 'display'],
+                'comparative_words': ['most', 'least', 'more', 'less', 'better', 'worse', 'highest', 'lowest', 'top', 'bottom', 'average', 'total', 'sum', 'frequency', 'often', 'rarely', 'distribution', 'trend', 'change', 'growth', 'over time'],
+                'data_terms': ['metal', 'equipment', 'contamination', 'value', 'measure', 'record', 'entry', 'row', 'column', 'table', 'dataset', 'order', 'orders', 'sale', 'sales', 'product', 'products', 'customer', 'customers', 'quantity', 'price']
+            }
+
+            user_msg_lower = user_message.lower()
+            data_intent_score = 0
+
+            # Count matching keywords
+            for word_list in _data_intent_keywords.values():
+                for keyword in word_list:
+                    if keyword in user_msg_lower:
+                        data_intent_score += 1
+
+            try:
+                intent_prompt = (
+                    f"User message: \"{user_message}\"\n\n"
+                    "IMPORTANT CONTEXT: There is an active DATA artifact in this session (a database or dataset file).\n\n"
+                    "Analyze if this message requires:\n"
+                    "1. Executing a tool to query/analyze the data artifact\n"
+                    "2. Modifying/creating files (artifacts)\n"
+                    "3. Generating/editing images\n\n"
+                    "CRITICAL: If the question is analytical, factual, or asks about specific values/frequencies/count/comparisons,\n"
+                    "it likely requires querying the data artifact even if it doesn't explicitly mention 'database' or 'query'.\n\n"
+                    "Return false ONLY if:\n"
+                    "- The user is greeting you (hello, hi, etc.)\n"
+                    "- The question has NO relation to data analysis (e.g., philosophical, abstract)\n"
+                    "- It's purely conversational chit-chat\n\n"
+                    f"When in doubt with analytical questions and an active data artifact, return TRUE.\n"
+                )
+                intent_res = self.lollmsClient.generate_structured_content(
+                    prompt=intent_prompt,
+                    schema={
+                        "requires_tools_or_actions": {
+                            "type": "boolean",
+                            "description": "True if the message requires tool execution (especially data queries), file modification/creation, or image generation/edit. False only for pure conversation."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Brief reasoning explaining why tools are or aren't needed"
+                        }
+                    },
+                    temperature=0.0
+                )
+                if intent_res and isinstance(intent_res, dict):
+                    _needs_tools = intent_res.get("requires_tools_or_actions", False)
+
+                    # Additional safety: If data artifact exists AND question has analytical keywords, override to True
+                    if data_intent_score >= 2:
+                        _needs_tools = True
+                        ASCIIColors.info(f"[Intent Classifier] Overrode to TRUE due to active data artifact + {data_intent_score} analytical keywords")
+
+                    ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
+            except Exception as e:
+                _needs_tools = True
+                ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to TRUE due to active data artifact.")
+
+        elif tool_registry or enable_image_generation or enable_image_editing or enable_artefacts:
+            # Standard path for non-data-artifact scenarios
+            try:
+                if has_search_or_rag_tools:
+                    intent_prompt = (
+                        f"User message: \"{user_message}\"\n\n"
+                        "Analyze if this message requires executing an external tool, searching a database/RAG/knowledge base, modifying/creating files (artifacts), or generating/editing images.\n"
+                        "Return true if the user is asking a factual question or seeking information that could be retrieved from available search/RAG tools.\n"
+                        "Return false ONLY if the user is just having a casual greeting, chit-chat, or talking casually without asking for any information or task execution."
+                    )
+                else:
+                    intent_prompt = (
+                        f"User message: \"{user_message}\"\n\n"
+                        "Analyze if this message requires executing an external tool, modifying/creating files (artifacts), or generating/editing images.\n"
+                        "Return false if the user is just having a normal conversation, greeting you, asking a general question, or talking casually."
+                    )
+                intent_res = self.lollmsClient.generate_structured_content(
+                    prompt=intent_prompt,
+                    schema={
+                        "requires_tools_or_actions": {
+                            "type": "boolean",
+                            "description": "True if the message requests a tool execution, file modification/creation, or image generation/edit. False for normal conversation."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Brief reasoning for the decision."
+                        }
+                    },
+                    temperature=0.0
+                )
+                if intent_res and isinstance(intent_res, dict):
+                    _needs_tools = intent_res.get("requires_tools_or_actions", False)
+                    ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
+            except Exception as e:
+                _needs_tools = True
+                ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to True.")
+        else:
+            _needs_tools = False
+
+        # ── Add user message ──────────────────────────────────────────────────
+        if add_user_message:
+            user_msg = self.add_message(
+                sender=kwargs.get("user_name", "user"),
+                sender_type="user",
+                content=actual_user_content,
+                images=images,
+                **kwargs,
+            )
+            if rlm_enabled and len(user_message) > 10000:
+                user_msg.metadata["rlm_full_content"] = user_message
+                user_msg.metadata["rlm_var_name"]     = rlm_context_var_name
+        else:
+            if self.active_branch_id not in self._message_index:
+                raise ValueError("Regeneration failed: active branch tip not found.")
+            user_msg = LollmsMessage(self, self._message_index[self.active_branch_id])
+            images   = user_msg.get_active_images()
+            user_message = user_msg.content
+
+        # ====================================================================
+        #  FAST PATH — no external tools registered
+        # ====================================================================
+        _has_external_tools = bool(tools) and _needs_tools
+ 
+        if not _has_external_tools:
+            ss = _StreamState(
+                discussion            = self,
+                callback              = callback,
+                ai_message            = None,
+                enable_notes          = enable_notes,
+                enable_skills         = enable_skills,
+                enable_inline_widgets = enable_inline_widgets,
+                enable_forms          = enable_forms,
+                auto_activate_artefacts = auto_activate_artefacts,
+                enable_artefacts      = enable_artefacts,
+            )
+ 
+            ai_message = self.add_message(
+                sender=personality.name,
+                sender_type="assistant",
+                content="",
+                parent_id=user_msg.id,
+                model_name=self.lollmsClient.llm.model_name,
+                binding_name=self.lollmsClient.llm.binding_name,
+                metadata={"mode": "direct"},
+            )
+            ss.ai_message = ai_message
+ 
+            def _fast_relay(chunk, msg_type=None, meta=None):
+                if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
+                    return ss.passthrough(chunk, msg_type, meta)
+                if isinstance(chunk, str):
+                    if meta and meta.get("was_processed"):
+                        return True
+                    return ss.feed(chunk)
+                return True
+ 
+            raw_text = self._stream_final_answer(
+                _fast_relay, images,
+                branch_tip_id or self.active_branch_id,
+                final_answer_temperature, **kwargs,
+            )
+ 
+            ss.flush_remaining_buffer()
+ 
+            if raw_text and not ai_message.content:
+                for ch in raw_text:
+                    ss.feed(ch)
+                ss.flush_remaining_buffer()
+ 
+            raw_text = ai_message.content
+ 
+            # Scrub any leaked internal markers
+            if _EXEC_MARKER_RE.search(raw_text or ""):
+                raw_text = _EXEC_MARKER_RE.sub('', raw_text).strip()
+                ai_message.content = raw_text
+ 
+            if not raw_text or not raw_text.strip():
+                ASCIIColors.warning("[chat] Fast path produced no output — forcing retry")
+                _retry_prompt = (
+                    "[SYSTEM INSTRUCTION] Please provide a direct answer to the user's question. "
+                    "Be concise and helpful."
+                )
+                self.scratchpad = (self.scratchpad or "") + "\n" + _retry_prompt
+                raw_text = self._stream_final_answer(
+                    _fast_relay, images,
+                    branch_tip_id or self.active_branch_id,
+                    final_answer_temperature, **kwargs,
+                )
+                ss.flush_remaining_buffer()
+                raw_text = ai_message.content
+                self.scratchpad = ""
+
+            # ADD: detect "described but didn't act" on fast path
+            _intent_keywords = ["update", "add", "change", "fix", "create", "build", "write", "make"]
+            _user_intends_to_act = any(kw in user_message.lower() for kw in _intent_keywords)
+            _has_action_in_content = any(
+                tag in ai_message.content.lower()
+                for tag in ["<artifact", "<note", "<skill", "<lollms_inline", "<lollms_form", "<generate_image", "<edit_image"]
+            )
+            if (_user_intends_to_act
+                    and not ss.affected_artefacts
+                    and not _has_action_in_content
+                    and len(ai_message.content.strip()) > 30
+                    and bool(self.artefacts.list(active_only=True))):
+                # Model wrote prose about what it would do but didn't emit an <artifact> tag
+                # while active artifacts exist. Re-run with correction injected.
+                self.scratchpad = (
+                    "\n⚠️ CORRECTION: You wrote a description but did not emit any <artifact> tag. "
+                    "Active artifacts exist. You MUST emit the <artifact> tag with your changes NOW. "
+                    "Do not write prose — emit the XML directly.\n"
+                    + (self.scratchpad or "")
+                )
+                # clear and re-run (similar to existing retry_prompt pattern)
+                ai_message.content = ""
+                raw_text = self._stream_final_answer(
+                    _fast_relay, images,
+                    branch_tip_id or self.active_branch_id,
+                    final_answer_temperature, **kwargs,
+                )
+                ss.flush_remaining_buffer()                
+ 
+            if remove_thinking_blocks:
+                raw_text = self.lollmsClient.remove_thinking_blocks(raw_text)
+ 
+            branch_for_handles = self.get_branch(ai_message.id)
+            raw_after_handles, handle_arts = _apply_handles(
+                raw_text, branch_for_handles, self.artefacts
+            )
+            ai_message.content = raw_after_handles
+ 
+            cleaned, affected_pp = self._post_process_llm_response(
+                raw_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
+                auto_activate_artefacts,
+                enable_inline_widgets=enable_inline_widgets if enable_artefacts else False,
+                enable_notes=enable_notes if enable_artefacts else False,
+                enable_skills=enable_skills if enable_artefacts else False,
+                enable_forms=enable_forms if enable_artefacts else False,
+                enable_silent_artefact_explanation=enable_silent_artefact_explanation if enable_artefacts else False,
+            )
+            affected = handle_arts + ss.affected_artefacts + affected_pp
+            if cleaned != raw_after_handles:
+                ai_message.content = cleaned
+ 
+            _mem_cleaned, _mem_report = self._process_memory_tags(
+                ai_message.content, _mm, callback)
+            if _mem_cleaned != ai_message.content:
+                ai_message.content = _mem_cleaned
+
+            # Auto-dream pass
+            dream_report = None
+            if enable_auto_dream and _mm is not None:
+                try:
+                    dream_report = _mm.dream(self.lollmsClient)
+                    if dream_report and not dream_report.get("skipped"):
+                        ASCIIColors.cyan(f"[Memory] Auto-Dream complete: {dream_report}")
+                        if callback:
+                            try:
+                                callback(
+                                    json.dumps(dream_report, default=str), 
+                                    text="subconscious dream consolidation", 
+                                    msg_type=MSG_TYPE.MSG_TYPE_INFO, 
+                                    meta={"type": "memory_dream", "report": dream_report}
+                                )
+                            except Exception:
+                                pass
+                except Exception as dream_err:
+                    ASCIIColors.warning(f"[Memory] Auto-dream execution failed: {dream_err}")
+
+            if self._is_db_backed and self.autosave:
+                self.commit()
+            self.scratchpad = ""
+            object.__setattr__(self, '_active_callback', None)
+            return {
+                "user_message":     user_msg,
+                "ai_message":       ai_message,
+                "sources":          collected_sources,
+                "scratchpad":       None,
+                "self_corrections": None,
+                "artefacts":        affected,
+                "memory_report":    _mem_report,
+                "dream_report":     dream_report,
+            }
+ 
  
         # ── Personality system prompt ──────────────────────────────────────────
         if personality.system_prompt:
@@ -4907,7 +4538,7 @@ If you fail to use the tools when data is available, your output will be rejecte
         # ====================================================================
         #  FAST PATH — no external tools registered
         # ====================================================================
-        _has_external_tools = bool(tool_registry) and _needs_tools
+        _has_external_tools = bool(tool_registry)
  
         if not _has_external_tools:
             ss = _StreamState(
@@ -4981,8 +4612,13 @@ If you fail to use the tools when data is available, your output will be rejecte
             # ADD: detect "described but didn't act" on fast path
             _intent_keywords = ["update", "add", "change", "fix", "create", "build", "write", "make"]
             _user_intends_to_act = any(kw in user_message.lower() for kw in _intent_keywords)
+            _has_action_in_content = any(
+                tag in ai_message.content.lower()
+                for tag in ["<artifact", "<note", "<skill", "<lollms_inline", "<lollms_form", "<generate_image", "<edit_image"]
+            )
             if (_user_intends_to_act
                     and not ss.affected_artefacts
+                    and not _has_action_in_content
                     and len(ai_message.content.strip()) > 30
                     and bool(self.artefacts.list(active_only=True))):
                 # Model wrote prose about what it would do but didn't emit an <artifact> tag
@@ -5406,21 +5042,9 @@ If you fail to use the tools when data is available, your output will be rejecte
  
             if _mission_complete:
                 ASCIIColors.success(
-                    "[Master] Success detected. Revoking tool access and forcing summary."
+                    "[Master] Success detected. Exiting reasoning loop to formulate final answer."
                 )
-                _round = max_reasoning_steps
-                active_tool_registry = {
-                    "final_answer": tool_registry.get("final_answer"),
-                }
-                self.scratchpad = (
-                    "╔══════════════════════════════════════════════════════════════════╗\n"
-                    "║ 🛑 STOP: MISSION ACCOMPLISHED                                    ║\n"
-                    "╠══════════════════════════════════════════════════════════════════╣\n"
-                    "║ The artifacts are already updated. Tool access has been REVOKED. ║\n"
-                    "║ 1. DO NOT call any more tools.                                   ║\n"
-                    "║ 2. Summarize your work to the user now.                          ║\n"
-                    "╚══════════════════════════════════════════════════════════════════╝"
-                )
+                break
             else:
                 active_tool_registry = tool_registry
  
@@ -5517,6 +5141,9 @@ If you fail to use the tools when data is available, your output will be rejecte
 
             round_content_start = len(ai_message.content)
  
+            _mission_complete = any(
+                "✓ SUCCESSFULLY" in entry for entry in _turn_action_history
+            )
             ss = _StreamState(
                 discussion            = self,
                 callback              = callback,
@@ -5529,6 +5156,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                 enable_artefacts      = enable_artefacts,
             )
             ss._turn_action_history = _turn_action_history
+            ss._mission_complete = _mission_complete
             if self._is_db_backed:
                 self.commit()
 
@@ -6004,6 +5632,7 @@ If you fail to use the tools when data is available, your output will be rejecte
  
             else:
                 try:
+                    _is_failed = False
                     ss._emit_tool_processing_status(f"Executing {_tool_name}...")
                     _result = active_tool_registry[_tool_name](**_tool_params)
 
@@ -6087,6 +5716,7 @@ If you fail to use the tools when data is available, your output will be rejecte
 
                     _completed_tool_calls.append(_call_tag)
 
+                    _is_failed = not _result_obj.success
                     if not _is_failed and _tool_name in ("execute_python_data_query", "execute_sql_query"):
                         _turn_action_history.append(f"✓ SUCCESSFULLY executed data query: {_tool_name}")
 
@@ -6399,6 +6029,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                 enable_forms          = enable_forms,
                 discussion            = self,
             )
+            ss_final._mission_complete = True
             # Do NOT clear ai_message.content — the final answer should append
  
             def _final_relay(chunk, msg_type=None, meta=None):
@@ -6483,7 +6114,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                 self.delete_message(mid)
             else:
                 self.db_manager.delete_message(mid)
- 
+
         # ── Final content cleanup ─────────────────────────────────────────────
         import re as _re
         # Use ai_message.content as the primary source — it contains the
@@ -6497,12 +6128,12 @@ If you fail to use the tools when data is available, your output will be rejecte
         _clean = _EXEC_MARKER_RE.sub('', _clean).strip()
         if remove_thinking_blocks:
             _clean = self.lollmsClient.remove_thinking_blocks(_clean)
- 
+
         end_time    = datetime.now()
         duration    = (end_time - start_time).total_seconds()
         token_count = self.lollmsClient.count_tokens(_clean)
         tok_per_sec = (token_count / duration) if duration > 0 else 0
- 
+
         message_meta: Dict[str, Any] = {
             "mode": (
                 "rlm_agentic" if rlm_enabled
@@ -6535,9 +6166,9 @@ If you fail to use the tools when data is available, your output will be rejecte
             ]
         if _round1_no_tool_call:
             message_meta["round1_correction_applied"] = True
- 
+
         self.scratchpad = ""
- 
+
         # CRITICAL: Ensure we save the complete content, not just the cleaned version.
         # The raw_content preserves everything; content is the user-visible version.
         ai_message.content          = _clean
@@ -6545,14 +6176,15 @@ If you fail to use the tools when data is available, your output will be rejecte
         ai_message.tokens           = token_count
         ai_message.generation_speed = tok_per_sec
         ai_message.metadata         = message_meta
- 
+
         branch_for_final_handles = self.get_branch(ai_message.id)
         _clean_after_handles, handle_arts = _apply_handles(
             _clean, branch_for_final_handles, self.artefacts
         )
         if _clean_after_handles != _clean:
             ai_message.content = _clean_after_handles
- 
+
+        # Run post-processing to parse tags, lock versions, and execute the silent-artifact explanation if needed
         cleaned_content, affected_pp = self._post_process_llm_response(
             _clean_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
             auto_activate_artefacts,

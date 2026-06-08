@@ -119,6 +119,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let activeSearchResults = [];
     let openTabs = new Set(); // Stores titles of currently open tabs
     let codeEditors = {}; // Keeps track of active CodeMirror instances key-mapped by artifact title
+    let activeChatAbortController = null;
     let toolRefDocs = {}; // Reference doc contents mapped to tool titles: { title: [{name, content}] }
     let availableBindings = [];
     let currentBindingConfig = {};
@@ -389,6 +390,43 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    const btnClearMemories = document.getElementById("btn-clear-memories-part");
+    if (btnClearMemories) {
+        btnClearMemories.addEventListener("click", async () => {
+            const labels = { 1: "Working", 2: "Deep / Associative", 3: "Archived", 4: "Episodic" };
+            const categoryName = labels[activeMemoryLevel] || "selected";
+
+            const confirmed = await showSlickConfirm(
+                "🧹 Clear Category Memories",
+                `Are you sure you want to permanently delete ALL ${categoryName} memories? This cannot be undone.`
+            );
+            if (!confirmed) return;
+
+            btnClearMemories.disabled = true;
+            btnClearMemories.textContent = "Clearing...";
+
+            try {
+                const res = await fetch("/api/memories/clear", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ level: activeMemoryLevel })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showNotification(`✓ Successfully cleared all ${categoryName} memories!`, "success", 3000);
+                    await fetchMemories();
+                } else {
+                    alert(`Clear failed: ${data.detail || data.error}`);
+                }
+            } catch (err) {
+                alert(`Request failed: ${err}`);
+            } finally {
+                btnClearMemories.disabled = false;
+                btnClearMemories.textContent = "🧹 Clear";
+            }
+        });
+    }
+
     // ── 🎯 Chat Function Badges Handler ──
     const funcBadges = document.querySelectorAll(".func-badge");
     const funcStates = {};
@@ -416,6 +454,33 @@ document.addEventListener("DOMContentLoaded", () => {
             showNotification(`${badge.textContent.trim()} function is now ${nextState ? 'enabled 🟢' : 'disabled 🔴'}`, "info", 2000);
         });
     });
+
+    // ── 🌡️ Temperature Override Handler ──
+    const tempOverrideEnable = document.getElementById("temp-override-enable");
+    const tempOverrideValue = document.getElementById("temp-override-value");
+
+    if (tempOverrideEnable && tempOverrideValue) {
+        const savedOverride = localStorage.getItem("chat_temp_override_enable") === "true";
+        const savedValue = localStorage.getItem("chat_temp_override_value") || "0.7";
+
+        tempOverrideEnable.checked = savedOverride;
+        tempOverrideValue.value = savedValue;
+        tempOverrideValue.style.display = savedOverride ? "inline-block" : "none";
+
+        tempOverrideEnable.addEventListener("change", () => {
+            const isChecked = tempOverrideEnable.checked;
+            localStorage.setItem("chat_temp_override_enable", isChecked ? "true" : "false");
+            tempOverrideValue.style.display = isChecked ? "inline-block" : "none";
+            showNotification(`Temperature override is now ${isChecked ? 'enabled 🌡️' : 'disabled ❄️'}`, "info", 2000);
+        });
+
+        tempOverrideValue.addEventListener("input", () => {
+            let val = parseFloat(tempOverrideValue.value);
+            if (isNaN(val)) val = 0.7;
+            val = Math.max(0.0, Math.min(2.0, val));
+            localStorage.setItem("chat_temp_override_value", val.toString());
+        });
+    }
 
     // ── 📸 Clipboard Image Paste & Auto-expanding Textarea Handlers ──
     const pastedImages = [];
@@ -1300,9 +1365,35 @@ document.addEventListener("DOMContentLoaded", () => {
                     renderedView.style.height = "100%";
                     renderedView.style.overflow = "auto";
                     renderedView.style.display = "block";
-                    const parsedMarkdown = marked.parse(art.content);
-                    const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, null, version);
-                    renderedView.innerHTML = resolvedHTML;
+
+                    const placeholders = {};
+                    let maskedText = art.content;
+
+                    // Mask <lollms_inline>
+                    const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
+                    maskedText = maskedText.replace(inlinePattern, (match) => {
+                        const id = `__WIDGET_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+                        placeholders[id] = match;
+                        return id;
+                    });
+
+                    // Mask <lollms_form>
+                    const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
+                    maskedText = maskedText.replace(formPattern, (match) => {
+                        const id = `__FORM_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+                        placeholders[id] = match;
+                        return id;
+                    });
+
+                    const parsedMarkdown = marked.parse(maskedText);
+
+                    let restoredHTML = parsedMarkdown;
+                    for (const [id, original] of Object.entries(placeholders)) {
+                        restoredHTML = restoredHTML.replace(id, original);
+                    }
+
+                    const resolvedHTML = resolveImageAnchors(restoredHTML, activeArtifactTitle, null, version);
+                    renderedView.innerHTML = restoredHTML;
                     renderMath(renderedView);
                 }
             }
@@ -5806,6 +5897,13 @@ document.addEventListener("DOMContentLoaded", () => {
     btnChatStop.addEventListener("click", async () => {
         btnChatStop.disabled = true;
         btnChatStop.textContent = "Stopping...";
+        if (activeChatAbortController) {
+            try {
+                activeChatAbortController.abort(); // Instantly abort the stream reader
+            } catch (err) {
+                console.error("Abort failed:", err);
+            }
+        }
         try {
             await fetch("/api/chat/cancel", { method: "POST" });
         } catch (err) {
@@ -5872,10 +5970,17 @@ document.addEventListener("DOMContentLoaded", () => {
                 enable_inline_widgets: funcStates["enable_inline_widgets"]
             };
 
+            if (tempOverrideEnable && tempOverrideEnable.checked) {
+                const tVal = parseFloat(tempOverrideValue.value);
+                payload.temperature = isNaN(tVal) ? 0.7 : tVal;
+            }
+
+            activeChatAbortController = new AbortController();
             const res = await fetch("/api/chat", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
+                body: JSON.stringify(payload),
+                signal: activeChatAbortController.signal
             });
 
             if (!res.ok) {
@@ -5936,6 +6041,31 @@ document.addEventListener("DOMContentLoaded", () => {
                             continue;
                         }
 
+                        if (event.msg_type === "MSG_TYPE_ARTEFACT_CHUNK") {
+                            const title = meta.title;
+                            const chunk = event.chunk;
+                            const safeId = makeSafeId(title);
+
+                            // Automatically open and switch to the artifact tab on the first streaming chunk
+                            if (!openTabs.has(title)) {
+                                createArtifactTab(title, meta.art_type || "code");
+                                switchCenterTab(`tab-art-${safeId}`);
+                            }
+
+                            const rawView = document.getElementById(`raw-view-${safeId}`);
+                            if (rawView) {
+                                rawView.value += chunk;
+
+                                // Dynamically append to CodeMirror editor if active
+                                if (codeEditors[title]) {
+                                    const editor = codeEditors[title];
+                                    const doc = editor.getDoc();
+                                    editor.replaceRange(chunk, { line: doc.lineCount() });
+                                }
+                            }
+                            continue;
+                        }
+
                         if (event.msg_type === "MSG_TYPE_CHUNK" && proseSpan) {
                             if (event.chunk) {
                                 // ── ⏱️ Measure Time to First Token ──
@@ -5950,8 +6080,36 @@ document.addEventListener("DOMContentLoaded", () => {
                                 currentProse += event.chunk;
                                 const cleanedProse = runMarkdownCleanup(currentProse);
                                 const processedText = resolveProcessingTags(cleanedProse);
-                                const parsedMarkdown = marked.parse(processedText);
-                                const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, activeMsgId);
+
+                                // ── MASK SYSTEM (Prevents marked.parse from corrupting nested XML tags) ──
+                                const placeholders = {};
+                                let maskedText = processedText;
+
+                                // Mask <lollms_inline> blocks
+                                const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
+                                maskedText = maskedText.replace(inlinePattern, (match) => {
+                                    const id = `__WIDGET_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+                                    placeholders[id] = match;
+                                    return id;
+                                });
+
+                                // Mask <lollms_form> blocks
+                                const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
+                                maskedText = maskedText.replace(formPattern, (match) => {
+                                    const id = `__FORM_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+                                    placeholders[id] = match;
+                                    return id;
+                                });
+
+                                const parsedMarkdown = marked.parse(maskedText);
+
+                                // Restore masked placeholders
+                                let restoredHTML = parsedMarkdown;
+                                for (const [id, original] of Object.entries(placeholders)) {
+                                    restoredHTML = restoredHTML.replace(id, original);
+                                }
+
+                                const resolvedHTML = resolveImageAnchors(restoredHTML, activeArtifactTitle, activeMsgId);
                                 proseSpan.innerHTML = resolvedHTML;
                                 renderMath(proseSpan);
                                 chatHistory.scrollTop = chatHistory.scrollHeight;
@@ -6129,6 +6287,23 @@ document.addEventListener("DOMContentLoaded", () => {
  */
 function resolveProcessingTags(content) {
     if (!content) return "";
+
+    // ── Render <think> tags as a beautiful, styled collapsible details block ──
+    const thinkPattern = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
+    content = content.replace(thinkPattern, (match, bodyText) => {
+        const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
+        return `
+            <details class="inline-proc-accordion" open style="border-color: rgba(147, 51, 234, 0.15);">
+                <summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05);">
+                    <span class="chevron">▶</span>
+                    <span>💭 Thought Process / Reasoning</span>
+                </summary>
+                <div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15);">
+                    <pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre>
+                </div>
+            </details>
+        `;
+    });
 
     const procPattern = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;
     return content.replace(procPattern, (match, attrsStr, bodyText) => {

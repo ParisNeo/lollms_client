@@ -68,6 +68,10 @@ class MemoryMixin:
         if any(term in u_clean or term in a_clean for term in noise_terms):
             return False
 
+        # 4. Filter code-heavy responses (e.g. containing markdown code blocks, script blocks, or CSS)
+        if "```" in a_clean or "<script" in a_clean or "canvas" in a_clean or "const " in a_clean:
+            return False
+
         return True
 
     def _save_episodic_memory_turn(self, user_text: str, ai_text: str, mm: Optional['LollmsMemoryManager']):
@@ -153,6 +157,13 @@ class MemoryMixin:
         """Permanently delete/forget a memory."""
         if self.memory_manager:
             return self.memory_manager.delete(memory_id)
+        return False
+
+    def clear_memories_of_level(self, level: int) -> bool:
+        """Delete all memories of the specified level."""
+        if self.memory_manager:
+            self.memory_manager.clear_level(level)
+            return True
         return False
 
     def load_memory_to_working(self, memory_id: str) -> Optional[Dict]:

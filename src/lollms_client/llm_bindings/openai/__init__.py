@@ -229,17 +229,50 @@ class OpenAIBinding(LollmsLLMBinding):
                     chat_completion = self.client.chat.completions.create(**params)                
 
                 if stream:
+                    in_thinking = False
                     for resp in chat_completion:
                         if count >= (n_predict or float('inf')):
                             break
-                        word = getattr(resp.choices[0].delta, "content", "") or ""
-                        if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                            break
-                        if word:
-                            output += word
+                        delta = resp.choices[0].delta
+                        reasoning_content = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                        content = getattr(delta, "content", None)
+
+                        if reasoning_content:
+                            if not in_thinking:
+                                in_thinking = True
+                                if streaming_callback:
+                                    streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                                output += "<think>\n"
+                            if streaming_callback:
+                                streaming_callback(reasoning_content, MSG_TYPE.MSG_TYPE_CHUNK)
+                            output += reasoning_content
                             count += 1
+                            continue
+
+                        if content:
+                            if in_thinking:
+                                in_thinking = False
+                                if streaming_callback:
+                                    streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                                output += "\n</think>\n"
+                            if streaming_callback:
+                                if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                    break
+                            output += content
+                            count += 1
+
+                    if in_thinking:
+                        if streaming_callback:
+                            streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                        output += "\n</think>\n"
                 else:
-                    output = chat_completion.choices[0].message.content
+                    message_obj = chat_completion.choices[0].message
+                    reasoning_content = getattr(message_obj, "reasoning_content", None) or getattr(message_obj, "reasoning", None)
+                    content = message_obj.content or ""
+                    if reasoning_content:
+                        output = f"<think>\n{reasoning_content}\n</think>\n{content}"
+                    else:
+                        output = content
 
             else:
                 params = self._build_openai_params(prompt=prompt,
@@ -403,16 +436,46 @@ class OpenAIBinding(LollmsLLMBinding):
                 completion = self.client.chat.completions.create(**params)
 
             if stream:
+                in_thinking = False
                 for chunk in completion:
                     delta = chunk.choices[0].delta
-                    if delta.content:
-                        word = delta.content
-                        if streaming_callback is not None:
-                            if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
+                    reasoning_content = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    content = getattr(delta, "content", None)
+
+                    if reasoning_content:
+                        if not in_thinking:
+                            in_thinking = True
+                            if streaming_callback:
+                                streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            output += "<think>\n"
+                        if streaming_callback:
+                            streaming_callback(reasoning_content, MSG_TYPE.MSG_TYPE_CHUNK)
+                        output += reasoning_content
+                        continue
+
+                    if content:
+                        if in_thinking:
+                            in_thinking = False
+                            if streaming_callback:
+                                streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            output += "\n</think>\n"
+                        if streaming_callback:
+                            if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
                                 break
-                        output += word
+                        output += content
+
+                if in_thinking:
+                    if streaming_callback:
+                        streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                    output += "\n</think>\n"
             else:
-                output = completion.choices[0].message.content
+                message_obj = completion.choices[0].message
+                reasoning_content = getattr(message_obj, "reasoning_content", None) or getattr(message_obj, "reasoning", None)
+                content = message_obj.content or ""
+                if reasoning_content:
+                    output = f"<think>\n{reasoning_content}\n</think>\n{content}"
+                else:
+                    output = content
         
         except Exception as e:
             error_message = f"An error occurred with the OpenAI API: {e}"

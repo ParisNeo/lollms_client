@@ -338,6 +338,9 @@ class ImportMemoryRequest(BaseModel):
     level: Optional[int] = 1
     tags: Optional[List[str]] = None
 
+class ClearMemoriesRequest(BaseModel):
+    level: int
+
 class BindingTestRequest(BaseModel):
     binding_name: str
     config: Dict[str, Any]
@@ -1322,6 +1325,20 @@ async def import_memory_endpoint(payload: ImportMemoryRequest):
         if res is None:
             raise HTTPException(status_code=500, detail="Failed to create memory.")
         return {"success": True, "memory": res}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/memories/clear")
+async def clear_memories_endpoint(payload: ClearMemoriesRequest):
+    """Deletes all memories of the specified level from the database."""
+    if not discussion.memory_manager:
+        raise HTTPException(status_code=400, detail="Memory manager not active.")
+    try:
+        discussion.clear_memories_of_level(payload.level)
+        discussion.commit()
+        return {"success": True}
     except Exception as e:
         if client and client.debug:
             trace_exception(e)
@@ -2896,6 +2913,7 @@ class ChatRequest(BaseModel):
     enable_image_editing: Optional[bool] = True
     enable_forms: Optional[bool] = True
     enable_inline_widgets: Optional[bool] = True
+    temperature: Optional[float] = None
     enable_memory: Optional[bool] = True
     enable_artefacts: Optional[bool] = True
     enable_in_message_status: Optional[bool] = True
@@ -3170,6 +3188,7 @@ async def chat_with_document(request: ChatRequest):
                         enable_image_editing=request.enable_image_editing if request.enable_image_editing is not None else True,
                         enable_forms=request.enable_forms if request.enable_forms is not None else True,
                         enable_inline_widgets=request.enable_inline_widgets if request.enable_inline_widgets is not None else True,
+                        temperature=request.temperature,
                         debug=True
                     )
                 finally:
@@ -3835,8 +3854,17 @@ async def cycle_message_sibling_endpoint(message_id: str, direction: int = 1):
         trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
-# Mount static folder
-app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+class NoCacheStaticFiles(StaticFiles):
+    """Subclass of StaticFiles to enforce no-cache headers during local development."""
+    async def get_response(self, path: str, scope):
+        res = await super().get_response(path, scope)
+        res.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+        res.headers["Pragma"] = "no-cache"
+        res.headers["Expires"] = "0"
+        return res
+
+# Mount static folder with no-cache subclass to prevent browser cache retention
+app.mount("/", NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 
 def main():

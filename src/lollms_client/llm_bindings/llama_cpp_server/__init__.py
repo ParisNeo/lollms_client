@@ -1345,6 +1345,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         when targeting /v1/chat/completions.
         """
         client = self._get_client()
+        alternated_messages = self.clean_and_alternate_messages(messages)
         extra_body = self._build_extra_body(
             top_k=top_k, repeat_penalty=repeat_penalty,
             repeat_last_n=repeat_last_n,
@@ -1358,7 +1359,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         def _do():
             return client.chat.completions.create(
                 model=self.model_name,
-                messages=messages,
+                messages=alternated_messages,
                 max_tokens=n_predict,
                 temperature=temperature,
                 top_p=top_p,

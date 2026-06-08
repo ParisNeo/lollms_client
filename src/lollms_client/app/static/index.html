@@ -109,10 +109,6 @@
             <div class="panel-section">
                 <div class="sidebar-section-header">
                     <h2>🧠 Stored Memories</h2>
-                    <div style="display:flex;gap:6px;">
-                        <button class="part-export-btn" id="btn-add-memory-part" title="Import a new memory">➕ Add</button>
-                        <button class="part-export-btn" id="btn-export-memories-part" title="Export memories...">📤 Export</button>
-                    </div>
                 </div>
                 <p class="section-desc">Tiered persistent SQLite memory.</p>
                 <!-- Local Tabbed Memory Widget -->
@@ -121,6 +117,11 @@
                     <button class="mem-tab-btn" data-mem-level="2">Deep / Assoc</button>
                     <button class="mem-tab-btn" data-mem-level="3">Archived</button>
                     <button class="mem-tab-btn" data-mem-level="4">Episodic</button>
+                </div>
+                <div class="memory-tab-actions" style="display: flex; gap: 6px; margin-bottom: 10px; justify-content: flex-end; user-select: none;">
+                    <button class="part-export-btn" id="btn-add-memory-part" title="Import a new memory" style="padding: 4px 10px; font-size: 11.5px;">➕ Add</button>
+                    <button class="part-export-btn" id="btn-clear-memories-part" title="Clear/delete all memories of the selected category" style="padding: 4px 10px; font-size: 11.5px; color: #ef4444; border-color: rgba(239, 68, 68, 0.25);">🧹 Clear</button>
+                    <button class="part-export-btn" id="btn-export-memories-part" title="Export memories..." style="padding: 4px 10px; font-size: 11.5px;">📤 Export</button>
                 </div>
                 <ul class="memory-list" id="memories-list">
                     <li class="empty-msg">No memories stored yet.</li>
@@ -190,6 +191,15 @@
                         <button class="func-badge active" id="badge-images" data-func="enable_image_generation" title="Toggle Text-to-Image generation">🖼️ Image Gen</button>
                         <button class="func-badge active" id="badge-forms" data-func="enable_forms" title="Toggle interactive form generation">📋 Forms</button>
                         <button class="func-badge active" id="badge-widgets" data-func="enable_inline_widgets" title="Toggle interactive HTML inline widgets">🎛️ Widgets</button>
+
+                        <!-- Temperature Override Control -->
+                        <div style="display: flex; align-items: center; gap: 6px; margin-left: auto; border-left: 1px solid var(--border-color); padding-left: 12px;">
+                            <label style="font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; display: flex; align-items: center; gap: 4px; user-select: none;">
+                                <input type="checkbox" id="temp-override-enable" style="width: auto; height: auto; accent-color: var(--accent-color); cursor: pointer;" />
+                                <span>🌡️ Temp Override</span>
+                            </label>
+                            <input type="number" id="temp-override-value" value="0.7" min="0.0" max="2.0" step="0.1" style="width: 54px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 4px; padding: 2px 6px; font-size: 11px; outline: none; font-weight: bold; text-align: center; display: none;" />
+                        </div>
                     </div>
 
                     <!-- Chat Message Area -->
@@ -696,6 +706,15 @@
                         <h3 style="color: var(--accent-color); font-size: 13px;">📂 Persistent App Configuration</h3>
                         <p class="section-desc">Open your local configuration directory in the OS file explorer to inspect, backup, or manually edit settings files, saved profiles, and logs.</p>
                         <button class="btn btn-secondary" id="btn-open-settings-folder" style="width: auto; font-size: 12.5px; padding: 8px 16px;">📂 Open Settings Folder</button>
+                    </div>
+
+                    <div class="panel-section" style="margin-top: 10px;">
+                        <h3 style="color: var(--accent-color); font-size: 13px;">⚙️ Developer Debugging</h3>
+                        <p class="section-desc">Toggle verbose server-side terminal logging, LLM payloads, and real-time streaming traces.</p>
+                        <div class="input-group" style="display: flex; flex-direction: row; gap: 8px; align-items: center; margin-top: 10px;">
+                            <input type="checkbox" id="settings-global-debug" style="width: auto; cursor: pointer; accent-color: var(--accent-color);">
+                            <label for="settings-global-debug" style="cursor: pointer; text-transform: none;">Enable Verbose Debug Logs</label>
+                        </div>
                     </div>
                 </div>
 
