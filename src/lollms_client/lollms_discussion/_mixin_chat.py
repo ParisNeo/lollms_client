@@ -1263,7 +1263,10 @@ class _StreamState:
         while pos < len(chunk):
             # Track code block fence state (ONLY in normal or buffering states)
             if self.state in (self.STATE_NORMAL, self.STATE_BUFFERING):
-                if chunk[pos:].startswith("```"):
+                # Check if the backtick is escaped (preceded by a backslash)
+                is_escaped = (pos > 0 and chunk[pos-1] == "\\") or (not pos and self.ai_message.content and self.ai_message.content[-1] == "\\")
+
+                if chunk[pos:].startswith("```") and not is_escaped:
                     self.in_code_block = not getattr(self, "in_code_block", False)
                     if self.state == self.STATE_BUFFERING:
                         self._flush_bracket_buf_as_text()
@@ -1275,7 +1278,7 @@ class _StreamState:
                     pos += 3
                     continue
 
-                if chunk[pos] == "`":
+                if chunk[pos] == "`" and not is_escaped:
                     if not getattr(self, "in_code_block", False):
                         self.in_inline_code = not getattr(self, "in_inline_code", False)
                     if self.state == self.STATE_BUFFERING:
