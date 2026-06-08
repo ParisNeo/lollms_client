@@ -72,9 +72,9 @@ def count_tokens_ollama(
     return res.prompt_eval_count-5
 class OllamaBinding(LollmsLLMBinding):
     """Ollama-specific binding implementation using the ollama-python library."""
-    
+
     DEFAULT_HOST_ADDRESS = "http://localhost:11434"
-    
+
     def __init__(self,
                  **kwargs
                  ):
@@ -91,6 +91,7 @@ class OllamaBinding(LollmsLLMBinding):
         host_address = kwargs.get("host_address")
         _host_address = host_address if host_address is not None else self.DEFAULT_HOST_ADDRESS
         super().__init__(BindingName, **kwargs)
+        self.debug = kwargs.get("debug", False)
         self.host_address=_host_address
         self.model_name=kwargs.get("model_name")
         self.service_key=kwargs.get("service_key")
@@ -304,15 +305,37 @@ class OllamaBinding(LollmsLLMBinding):
                         for chunk in response_stream:
                             if self.is_cancelled():
                                 break
-                            if chunk.message.thinking and not in_thinking:
-                                full_response_text += "<think>\n"
-                                in_thinking = True
 
-                            if chunk.message.content:# Ensure there is content to process
-                                chunk_content = chunk.message.content
+                            # Handle both object and dict chunk representations safely
+                            if hasattr(chunk, 'message'):
+                                msg_obj = chunk.message
+                                chunk_thinking = getattr(msg_obj, 'thinking', None)
+                                chunk_content = getattr(msg_obj, 'content', None)
+                            elif isinstance(chunk, dict):
+                                msg_dict = chunk.get('message', {})
+                                chunk_thinking = msg_dict.get('thinking')
+                                chunk_content = msg_dict.get('content')
+                            else:
+                                chunk_thinking = None
+                                chunk_content = None
+
+                            if chunk_thinking:
+                                if not in_thinking:
+                                    full_response_text += "<think>\n"
+                                    in_thinking = True
+                                    if streaming_callback:
+                                        streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                                if streaming_callback:
+                                    streaming_callback(chunk_thinking, MSG_TYPE.MSG_TYPE_CHUNK)
+                                full_response_text += chunk_thinking
+                                continue
+
+                            if chunk_content: # Ensure there is content to process
                                 if in_thinking:
-                                    full_response_text += "\n<think>\n"                            
+                                    full_response_text += "\n</think>\n"                            
                                     in_thinking = False
+                                    if streaming_callback:
+                                        streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
                                 full_response_text += chunk_content
                                 if streaming_callback:
                                     if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
@@ -476,25 +499,51 @@ class OllamaBinding(LollmsLLMBinding):
                     if think:
                         chat_kwargs["think"] = think
                     response_stream = client.chat(**chat_kwargs)
-                    for chunk_dict in response_stream:
+                    in_thinking = False
+                    for chunk in response_stream:
                         if self.is_cancelled():
                             break
-                        chunk_content = chunk_dict.get('message', {}).get('content', '')
-                        if chunk_content:
+
+                        # Handle both object and dict chunk representations
+                        if hasattr(chunk, 'message'):
+                            msg_obj = chunk.message
+                            chunk_thinking = getattr(msg_obj, 'thinking', None)
+                            chunk_content = getattr(msg_obj, 'content', None)
+                        elif isinstance(chunk, dict):
+                            msg_dict = chunk.get('message', {})
+                            chunk_thinking = msg_dict.get('thinking')
+                            chunk_content = msg_dict.get('content')
+                        else:
+                            chunk_thinking = None
+                            chunk_content = None
+
+                        # Process and stream thinking tokens dynamically to prevent idle silences
+                        if chunk_thinking:
+                            if self.debug:
+                                ASCIIColors.rich_print(f"[purple]{chunk_thinking}[/purple]", end="", flush=True)
+                            if not in_thinking:
+                                in_thinking = True
+                                if streaming_callback:
+                                    streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            if streaming_callback:
+                                streaming_callback(chunk_thinking, MSG_TYPE.MSG_TYPE_CHUNK)
+                            full_response_text += chunk_thinking
+                            continue
+
+                        # When transitioning from thinking to content, close the reasoning tag
+                        if in_thinking:
+                            in_thinking = False
+                            if streaming_callback:
+                                streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+                        if chunk_content: # Ensure there is content to process
+                            if self.debug:
+                                ASCIIColors.rich_print(f"[cyan]{chunk_content}[/cyan]", end="", flush=True)
                             full_response_text += chunk_content
                             if streaming_callback:
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                    break
-                    return full_response_text
-                else:
-                    chat_kwargs["stream"] = False
-                    eff_think = think if "gpt-oss" not in self.model_name else reasoning_effort
-                    if eff_think:
-                        chat_kwargs["think"] = eff_think
-                    response = client.chat(**chat_kwargs)
-                    full_response_text = response.message.content
-                    if think:
-                        full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
+                                    break # Callback requested stop
+
                     return full_response_text
 
         except ollama.ResponseError as e:
@@ -636,7 +685,7 @@ class OllamaBinding(LollmsLLMBinding):
 
                         if chunk_content: # Ensure there is content to process
                             if self.debug:
-                                ASCIIColors.rich_print(f"[cyan]{chunk_content}[cyan]", end="", flush=True)
+                                ASCIIColors.rich_print(f"[cyan]{chunk_content}[/cyan]", end="", flush=True)
                             full_response_text += chunk_content
                             if streaming_callback:
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):

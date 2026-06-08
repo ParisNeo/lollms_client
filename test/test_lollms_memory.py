@@ -194,6 +194,38 @@ class TestLollmsMemorySystem(unittest.TestCase):
 
         ASCIIColors.success("✨ All memory operations and dream cycles validated successfully.")
 
+    def test_ontological_triples_and_spreading_activation(self):
+        ASCIIColors.cyan("\n--- Test 6: Ontological Triples & Spreading Activation ---")
+        # 1. Add memories with explicit Subject-Predicate-Object relations
+        m1 = self.manager.add(
+            content="ParisNeo prefers Rust for system-level programming.",
+            subject="ParisNeo",
+            predicate="PREFERS",
+            obj="Rust",
+            importance=0.9
+        )
+        m2 = self.manager.add(
+            content="Rust uses a borrow checker to guarantee memory safety.",
+            subject="Rust",
+            predicate="USES",
+            obj="borrow_checker",
+            importance=0.8,
+            level=2  # Deep Memory
+        )
+
+        self.assertEqual(m1["subject"], "parisneo")
+        self.assertEqual(m1["predicate"], "PREFERS")
+        self.assertEqual(m1["object"], "rust")
+
+        # 2. Tag/retrieve m1, which should trigger Spreading Activation to m2 (linked via 'Rust')
+        tagged = self.manager.tag(m1["id"])
+        self.assertIsNotNone(tagged)
+
+        # 3. Verify m2 has been pre-warmed/promoted due to spreading activation
+        m2_updated = self.manager.get(m2["id"])
+        self.assertGreater(m2_updated["activation"], 0.0)
+        self.assertGreater(m2_updated["importance"], 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

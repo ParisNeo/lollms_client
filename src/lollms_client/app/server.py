@@ -135,6 +135,9 @@ def initialize_workspace_state(workspace_name: str):
             if cfg.get("tti_binding_name"):
                 client_kwargs["tti_binding_name"] = cfg["tti_binding_name"]
                 client_kwargs["tti_binding_config"] = cfg.get("tti_binding_config", {})
+            if cfg.get("stt_binding_name"):
+                client_kwargs["stt_binding_name"] = cfg["stt_binding_name"]
+                client_kwargs["stt_binding_config"] = cfg.get("stt_binding_config", {})
 
             client = LollmsClient(**client_kwargs)
             ASCIIColors.green(f"⚡ [Workspace '{workspace_name_clean}'] Loaded saved configuration: {LLM_MODEL_NAME} via {cfg['llm_binding_name']}")
@@ -157,14 +160,16 @@ def initialize_workspace_state(workspace_name: str):
         client = DummyClient()
 
     # Load or create persistent discussion session
+    internet_cfg = cfg.get("internet_config") or {}
     if db_mgr.discussion_exists("viewer_session"):
-        discussion = db_mgr.get_discussion(client, "viewer_session", autosave=True)
+        discussion = db_mgr.get_discussion(client, "viewer_session", autosave=True, internet_config=internet_cfg)
     else:
         discussion = LollmsDiscussion.create_new(
             lollms_client=client,
             db_manager=db_mgr,
             id="viewer_session",
-            autosave=True
+            autosave=True,
+            internet_config=internet_cfg
         )
 
     if active_personality_prompt:
@@ -323,6 +328,18 @@ class UpdateImageArtifactRequest(BaseModel):
     commit_message: Optional[str] = "Edit image via Photoshop UI"
 
 
+class SQLConnectionImportRequest(BaseModel):
+    title: str
+    dialect: str
+    host: str
+    port: Optional[int] = None
+    username: Optional[str] = ""
+    password: Optional[str] = ""
+    database: str
+    url: Optional[str] = ""
+    read_only: bool = True
+    description: Optional[str] = ""
+
 class WorkspaceRequest(BaseModel):
     name: str
 
@@ -350,7 +367,10 @@ class ApplySettingsRequest(BaseModel):
     llm_binding_config: Dict[str, Any]
     tti_binding_name: Optional[str] = None
     tti_binding_config: Optional[Dict[str, Any]] = None
+    stt_binding_name: Optional[str] = None
+    stt_binding_config: Optional[Dict[str, Any]] = None
     personality_name: Optional[str] = None
+    internet_config: Optional[Dict[str, Any]] = None
 
 
 def check_ollama(host: str, model: str) -> bool:
@@ -398,14 +418,100 @@ LLM_MODEL_NAME = "unknown"
 tool_states = {}
 
 # Dynamic Startup: Load active workspace from central config, defaulting to "default"
-_cfg = load_app_config()
-_active_ws = _cfg.get("active_workspace", "default")
-initialize_workspace_state(_active_ws)
+# Skip initialization if running under a testing framework to prevent loading heavy bindings (e.g. Whisper STT)
+_is_testing = "pytest" in sys.modules or "unittest" in sys.modules or any("pytest" in arg or "unittest" in arg for r in [sys.argv] for arg in r)
+if not _is_testing:
+    _cfg = load_app_config()
+    _active_ws = _cfg.get("active_workspace", "default")
+    initialize_workspace_state(_active_ws)
 
-# Attach persistent multi-level memory manager so <mem_new> tags survive across turns
-mem_db_path = APP_DATA_DIR / "memories.db"
-mem_db_path.parent.mkdir(parents=True, exist_ok=True)
-discussion._init_memory(LollmsMemoryManager(f"sqlite:///{mem_db_path}"))
+    # Attach persistent multi-level memory manager so <mem_new> tags survive across turns
+    mem_db_path = APP_DATA_DIR / "memories.db"
+    mem_db_path.parent.mkdir(parents=True, exist_ok=True)
+    discussion._init_memory(LollmsMemoryManager(f"sqlite:///{mem_db_path}"))
+else:
+    # Set default safe fallback paths for test imports
+    CURRENT_WORKSPACE_DIR = APP_DIR / "workspaces" / "default"
+    APP_DATA_DIR = CURRENT_WORKSPACE_DIR / "data"
+    APP_WORKSPACE_DIR = CURRENT_WORKSPACE_DIR / "data_workspace"
+
+
+@app.post("/api/data/import_sql_connection")
+async def import_sql_connection_endpoint(payload: SQLConnectionImportRequest):
+    """
+    Validates and registers an external SQL database connection as a session data artifact.
+    Generates a '.sqlconn' metadata file on disk and extracts its schema.
+    """
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Connection title cannot be empty.")
+
+    title_clean = "".join(c for c in title if c.isalnum() or c in ("-", "_")).strip().lower()
+
+    # 1. Prepare Connection Details Dictionary
+    conn_info = {
+        "type": "sql_connection",
+        "dialect": payload.dialect.strip().lower(),
+        "host": payload.host.strip(),
+        "port": payload.port,
+        "username": payload.username.strip(),
+        "password": payload.password.strip(),
+        "database": payload.database.strip(),
+        "url": payload.url.strip()
+    }
+
+    # 2. Write Temporary '.sqlconn' File
+    workspace_dir = APP_WORKSPACE_DIR
+    if not workspace_dir:
+         raise HTTPException(status_code=400, detail="No active workspace directory.")
+
+    file_path = workspace_dir / f"{title_clean}.sqlconn"
+
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(conn_info, f, indent=2)
+
+        # 3. Test Connection and Extract Schema
+        from lollms_client.lollms_discussion._data_files import _parse_data_file
+        schema, _ = _parse_data_file(file_path, title_clean, version=1)
+
+        # Append description if provided
+        if payload.description and payload.description.strip():
+            schema = f"## Description\n{payload.description.strip()}\n\n{schema}"
+
+        # 4. Register/Update the session artifact
+        existing = discussion.artefacts.get(title_clean)
+        if existing is None:
+            art = discussion.artefacts.add(
+                title=title_clean,
+                artefact_type="data",
+                content=schema,
+                active=True,
+                file_ext=".sqlconn",
+                version=1,
+                read_only=payload.read_only,
+                description=payload.description
+            )
+        else:
+            art = discussion.artefacts.update(
+                title=title_clean,
+                new_content=schema,
+                new_type="data",
+                active=True,
+                file_ext=".sqlconn",
+                version=1,
+                read_only=payload.read_only,
+                description=payload.description
+            )
+
+        discussion.commit()
+        return {"success": True, "title": title_clean, "artifact": art}
+    except Exception as e:
+        if file_path.exists():
+            file_path.unlink()
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=f"Database Connection Failed: {e}")
 
 
 @app.post("/api/import")
@@ -418,7 +524,7 @@ async def import_document(
     Uploads a file, writes it to a temporary path, and returns a StreamingResponse
     yielding real-time progress updates and the final output via SSE.
     """
-    if mode not in ("text", "text_images", "text_embedded_images", "images_only", "ocr", "data", "data_bundle"):
+    if mode not in ("text", "text_images", "text_embedded_images", "images_only", "ocr", "data", "data_bundle", "audio_stt"):
         raise HTTPException(status_code=400, detail="Invalid import mode selected.")
 
     suffix = Path(file.filename).suffix
@@ -476,12 +582,15 @@ async def import_document(
         thread.start()
 
         while True:
-            while q.empty():
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
                 await asyncio.sleep(0.05)
-            item = q.get()
+                continue
             if item is None:
                 break
             yield f"data: {json.dumps(item)}\n\n"
+            await asyncio.sleep(0.001)
 
         # Clean up temporary file
         if tmp_path.exists():
@@ -647,7 +756,6 @@ async def raw_sql_query_endpoint(title: str, payload: RawSQLQueryRequest):
         raise HTTPException(status_code=404, detail="Data artifact not found.")
 
     try:
-        import sqlite3
         import pandas as pd
 
         ext = active.get("file_ext", ".csv")
@@ -666,6 +774,45 @@ async def raw_sql_query_endpoint(title: str, payload: RawSQLQueryRequest):
         if not file_path.exists():
             raise FileNotFoundError(f"Raw data file is missing.")
 
+        if ext == ".sqlconn":
+            from lollms_client.lollms_discussion._data_files import _get_sqlalchemy_engine_from_file
+            from sqlalchemy import text
+            engine, dialect = _get_sqlalchemy_engine_from_file(file_path)
+
+            clean_query = payload.sql_query.strip()
+            clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
+            clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
+            is_select = clean_query.lower().startswith("select")
+
+            if is_select:
+                raw_conn = engine.raw_connection()
+                try:
+                    df_res = pd.read_sql_query(payload.sql_query, raw_conn)
+                finally:
+                    raw_conn.close()
+                engine.dispose()
+                df_res = df_res.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
+                return {
+                    "success": True,
+                    "columns": list(df_res.columns),
+                    "rows": df_res.to_dict(orient="records")
+                }
+            else:
+                if is_read_only:
+                    engine.dispose()
+                    return {"success": False, "error": "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."}
+
+                with engine.begin() as connection:
+                    res = connection.execute(text(payload.sql_query))
+                    rowcount = res.rowcount
+                engine.dispose()
+                return {
+                    "success": True,
+                    "columns": ["status"],
+                    "rows": [{"status": f"Query executed successfully. Affected rows: {rowcount}"}]
+                }
+
+        import sqlite3
         conn = sqlite3.connect(":memory:")
         if ext in (".db", ".sqlite", ".sqlite3"):
             disk_conn = sqlite3.connect(str(file_path))
@@ -808,6 +955,62 @@ async def ai_data_query_endpoint(title: str, payload: AIDataQueryRequest):
         if not file_path.exists():
             raise FileNotFoundError(f"Raw data file is missing.")
 
+        if ext == ".sqlconn":
+            from lollms_client.lollms_discussion._data_files import _get_sqlalchemy_engine_from_file
+            from sqlalchemy import text
+            engine, dialect = _get_sqlalchemy_engine_from_file(file_path)
+
+            clean_query = sql_query.strip()
+            clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
+            clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
+            is_select = clean_query.lower().startswith("select")
+
+            if is_select:
+                raw_conn = engine.raw_connection()
+                try:
+                    df_res = pd.read_sql_query(sql_query, raw_conn)
+                finally:
+                    raw_conn.close()
+                engine.dispose()
+                df_res = df_res.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
+                return {
+                    "success": True,
+                    "sql_query": sql_query,
+                    "explanation": explanation,
+                    "columns": list(df_res.columns),
+                    "rows": df_res.to_dict(orient="records")
+                }
+            else:
+                if is_read_only:
+                    engine.dispose()
+                    return {"success": False, "error": "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."}
+
+                with engine.begin() as connection:
+                    res = connection.execute(text(sql_query))
+                    rowcount = res.rowcount
+
+                # Re-parse connection in place to reflect any new tables or schema changes
+                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                new_schema, _ = _parse_data_file(file_path, title, version=current_version, progress_cb=None)
+                discussion.artefacts.update(
+                    title=title,
+                    new_content=new_schema,
+                    new_type="data",
+                    active=True,
+                    file_ext=ext,
+                    version=current_version
+                )
+
+                engine.dispose()
+                return {
+                    "success": True,
+                    "sql_query": sql_query,
+                    "explanation": explanation,
+                    "columns": ["status"],
+                    "rows": [{"status": f"Query executed successfully: `{sql_query}`. Affected rows: {rowcount}"}]
+                }
+
+        import sqlite3
         conn = sqlite3.connect(":memory:")
         if ext in (".db", ".sqlite", ".sqlite3"):
             disk_conn = sqlite3.connect(str(file_path))
@@ -1345,6 +1548,64 @@ async def clear_memories_endpoint(payload: ClearMemoriesRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/bindings/stt")
+async def list_stt_bindings():
+    """Discovers all STT bindings by scanning the stt_bindings directory."""
+    bindings = []
+    bindings_root = Path(__file__).resolve().parent.parent / "stt_bindings"
+    if bindings_root.exists():
+        for d in sorted(bindings_root.iterdir()):
+            if d.is_dir() and not d.name.startswith("_"):
+                desc_file = d / "description.yaml"
+                data = {}
+                if desc_file.exists():
+                    try:
+                        with open(desc_file, "r", encoding="utf-8") as f:
+                            data = yaml.safe_load(f) or {}
+                    except Exception:
+                        pass
+
+                # Flatten global / model-specific / legacy parameter lists into one UI-facing list
+                unified_params = []
+                for key in ("global_input_parameters", "model_input_parameters", "input_parameters", "server_parameters", "binding_parameters"):
+                    if isinstance(data.get(key), list):
+                        unified_params.extend(data[key])
+
+                data["input_parameters"] = unified_params if unified_params else []
+                data["binding_name"] = d.name
+                data.setdefault("title", d.name.replace("_", " ").title())
+                data.setdefault("description", f"A binding for {d.name}.")
+                bindings.append(data)
+    return {"success": True, "bindings": bindings}
+
+
+@app.post("/api/bindings/stt/test")
+async def test_stt_binding_endpoint(payload: BindingTestRequest):
+    """Instantiates an STT binding with user config and retrieves available models."""
+    try:
+        import importlib
+        module_path = f"lollms_client.stt_bindings.{payload.binding_name}"
+        module = importlib.import_module(module_path)
+        binding_class = getattr(module, getattr(module, "BindingName", None), None)
+        if not binding_class or not isinstance(binding_class, type) or inspect.isabstract(binding_class):
+            return {"success": False, "error": f"Could not find a concrete Binding class in {payload.binding_name}"}
+
+        instance = binding_class(**payload.config)
+        models = []
+        if hasattr(instance, "list_models") and callable(getattr(instance, "list_models")):
+            models = instance.list_models()
+        elif hasattr(instance, "get_zoo") and callable(getattr(instance, "get_zoo")):
+            models = instance.get_zoo()
+
+        if not isinstance(models, list):
+            models = []
+        return {"success": True, "models": models}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/api/bindings/tti")
 async def list_tti_bindings():
     """Discovers all TTI bindings by scanning the tti_bindings directory."""
@@ -1681,9 +1942,13 @@ async def get_settings_endpoint():
         "llm_binding_config": cfg.get("llm_binding_config", {}),
         "tti_binding_name": cfg.get("tti_binding_name", ""),
         "tti_binding_config": cfg.get("tti_binding_config", {}),
+        "stt_binding_name": cfg.get("stt_binding_name", ""),
+        "stt_binding_config": cfg.get("stt_binding_config", {}),
         "llm_bindings_configs": cfg.get("llm_bindings_configs", {}),
         "tti_bindings_configs": cfg.get("tti_bindings_configs", {}),
-        "personality_name": cfg.get("personality_name", "")
+        "stt_bindings_configs": cfg.get("stt_bindings_configs", {}),
+        "personality_name": cfg.get("personality_name", ""),
+        "internet_config": cfg.get("internet_config", {})
     }
 
 
@@ -1707,6 +1972,9 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
         if payload.tti_binding_name:
             kwargs["tti_binding_name"] = payload.tti_binding_name
             kwargs["tti_binding_config"] = payload.tti_binding_config or {}
+        if payload.stt_binding_name:
+            kwargs["stt_binding_name"] = payload.stt_binding_name
+            kwargs["stt_binding_config"] = payload.stt_binding_config or {}
 
         client = LollmsClient(**kwargs)
         discussion.lollmsClient = client
@@ -1729,8 +1997,15 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
             "llm_binding_config": payload.llm_binding_config,
             "tti_binding_name": payload.tti_binding_name,
             "tti_binding_config": payload.tti_binding_config,
-            "personality_name": payload.personality_name
+            "stt_binding_name": payload.stt_binding_name,
+            "stt_binding_config": payload.stt_binding_config,
+            "personality_name": payload.personality_name,
+            "internet_config": payload.internet_config or {}
         })
+
+        # Update active discussion's internet_config
+        if discussion:
+            object.__setattr__(discussion, 'internet_config', payload.internet_config or {})
 
         # Save to historical maps for all-bindings hot retention
         llm_configs = current_config.setdefault("llm_bindings_configs", {})
@@ -1739,6 +2014,10 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
         if payload.tti_binding_name:
             tti_configs = current_config.setdefault("tti_bindings_configs", {})
             tti_configs[payload.tti_binding_name] = payload.tti_binding_config
+
+        if payload.stt_binding_name:
+            stt_configs = current_config.setdefault("stt_bindings_configs", {})
+            stt_configs[payload.stt_binding_name] = payload.stt_binding_config
 
         save_app_config(current_config)
         needs_configuration = False
@@ -2248,7 +2527,22 @@ async def get_data_grid(title: str, version: Optional[int] = None):
 
     import pandas as pd
     try:
-        if ext in (".xlsx", ".xls"):
+        if ext == ".sqlconn":
+            from lollms_client.lollms_discussion._data_files import _get_sqlalchemy_engine_from_file
+            from sqlalchemy import inspect
+            engine, dialect = _get_sqlalchemy_engine_from_file(file_path)
+            inspector = inspect(engine)
+            tables = inspector.get_table_names()
+            result = {"type": "sql_connection", "sheets": {}}
+            for table in tables:
+                df = pd.read_sql_query(f'SELECT * FROM "{table}" LIMIT 100' if dialect != "mysql" else f'SELECT * FROM `{table}` LIMIT 100', engine)
+                df = df.replace({float('nan'): None, float('inf'): None, float('-inf'): None})
+                result["sheets"][table] = {
+                    "columns": list(df.columns),
+                    "rows": df.to_dict(orient="records")
+                }
+            engine.dispose()
+        elif ext in (".xlsx", ".xls"):
             xl = pd.ExcelFile(str(file_path))
             result = {"type": "excel", "sheets": {}}
             for sheet in xl.sheet_names:
@@ -2882,8 +3176,14 @@ async def query_data_endpoint(payload: DataQueryRequest):
     except Exception as e:
         sys.stdout = old_stdout
         # Clean up any partial files if failed
-        if new_file_path.exists() and ext not in (".db", ".sqlite", ".sqlite3"):
+        if new_file_path.exists() and ext not in (".db", ".sqlite", ".sqlite3", ".sqlconn"):
             new_file_path.unlink()
+        if "conn" in local_vars and ext == ".sqlconn":
+            try:
+                local_vars["conn"].close()
+                local_vars["engine"].dispose()
+            except Exception:
+                pass
         if client and client.debug:
             trace_exception(e)
         return {"success": False, "error": str(e), "output": redirected_output.getvalue()}
@@ -2894,7 +3194,7 @@ async def query_data_endpoint(payload: DataQueryRequest):
         "success": True,
         "output": redirected_output.getvalue(),
         "plot_b64": plot_b64,
-        "new_version": new_version
+        "new_version": current_version if ext == ".sqlconn" else new_version
     }
 
 
@@ -3086,12 +3386,25 @@ async def chat_with_document(request: ChatRequest):
     async def chat_event_generator():
         q = queue.Queue()
 
-        def streaming_callback(chunk: str, msg_type: MSG_TYPE, meta: dict = None):
-            q.put({
-                "chunk": chunk,
-                "msg_type": msg_type.name,
-                "meta": meta or {}
-            })
+        def streaming_callback(chunk: str, msg_type: Any, meta: dict = None):
+            try:
+                if hasattr(msg_type, "name"):
+                    msg_type_name = msg_type.name
+                elif isinstance(msg_type, int):
+                    try:
+                        msg_type_name = MSG_TYPE(msg_type).name
+                    except Exception:
+                        msg_type_name = "MSG_TYPE_CHUNK"
+                else:
+                    msg_type_name = "MSG_TYPE_CHUNK"
+
+                q.put({
+                    "chunk": chunk,
+                    "msg_type": msg_type_name,
+                    "meta": meta or {}
+                })
+            except Exception as e:
+                ASCIIColors.warning(f"Error in streaming_callback: {e}")
             return True
 
         def run_chat_thread():
@@ -3211,14 +3524,25 @@ async def chat_with_document(request: ChatRequest):
         thread.start()
 
         while True:
-            while q.empty():
-                await asyncio.sleep(0.02)
-            item = q.get()
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
             if item is None:
                 break
             yield f"data: {json.dumps(item)}\n\n"
+            await asyncio.sleep(0.001)
 
-    return StreamingResponse(chat_event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        chat_event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @app.get("/api/context_status")

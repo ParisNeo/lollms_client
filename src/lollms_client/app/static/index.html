@@ -109,6 +109,7 @@
             <div class="panel-section">
                 <div class="sidebar-section-header">
                     <h2>🧠 Stored Memories</h2>
+                    <button class="part-export-btn" id="btn-view-memory-graph" title="View Semantic Memory Network Graph">🧠 Graph</button>
                 </div>
                 <p class="section-desc">Tiered persistent SQLite memory.</p>
                 <!-- Local Tabbed Memory Widget -->
@@ -303,16 +304,79 @@
             <div class="modal-tabs">
                 <button class="modal-tab active" data-modal-tab="modal-tab-local">Local File</button>
                 <button class="modal-tab" data-modal-tab="modal-tab-internet">Internet Source</button>
+                <button class="modal-tab" data-modal-tab="modal-tab-sql">SQL Connection</button>
                 <button class="modal-tab" data-modal-tab="modal-tab-skills">Skills Scanner</button>
                 <button class="modal-tab" data-modal-tab="modal-tab-bundle">Portable Bundle</button>
                 <button class="modal-tab" data-modal-tab="modal-tab-personalities">🎭 Personalities</button>
             </div>
 
             <div class="modal-body">
+                <!-- SQL Connection Ingestion Pane -->
+                <div class="modal-tab-content-pane" id="modal-tab-sql">
+                    <p class="section-desc">Connect directly to an external relational database (MySQL, PostgreSQL, Oracle, SQL Server, etc.).</p>
+                    <div class="input-group">
+                        <label for="sql-conn-title">Connection Title / Alias <span style="color:#ef4444">*</span></label>
+                        <input type="text" id="sql-conn-title" placeholder="e.g. sales_prod_db">
+                    </div>
+                    <div class="input-group">
+                        <label for="sql-conn-dialect">Database Engine Dialect</label>
+                        <select id="sql-conn-dialect">
+                            <option value="mysql" selected>MySQL / MariaDB</option>
+                            <option value="postgresql">PostgreSQL</option>
+                            <option value="oracle">Oracle Database</option>
+                            <option value="mssql">Microsoft SQL Server</option>
+                            <option value="sqlite">Local SQLite Connection</option>
+                        </select>
+                    </div>
+                    <div class="input-group" id="group-sql-conn-host">
+                        <label for="sql-conn-host">Host Address / Endpoint <span style="color:#ef4444">*</span></label>
+                        <input type="text" id="sql-conn-host" value="localhost">
+                    </div>
+                    <div class="input-group" id="group-sql-conn-port">
+                        <label for="sql-conn-port">Port Number</label>
+                        <input type="number" id="sql-conn-port" placeholder="Default for selected engine (e.g. 3306)">
+                    </div>
+                    <div class="input-group" id="group-sql-conn-user">
+                        <label for="sql-conn-user">Username</label>
+                        <input type="text" id="sql-conn-user" value="root">
+                    </div>
+                    <div class="input-group" id="group-sql-conn-pass">
+                        <label for="sql-conn-pass">Password</label>
+                        <input type="password" id="sql-conn-pass" placeholder="Enter password (stored securely in local .sqlconn file)">
+                    </div>
+                    <div class="input-group" id="group-sql-conn-db">
+                        <label for="sql-conn-db">Database / Schema Name <span style="color:#ef4444">*</span></label>
+                        <input type="text" id="sql-conn-db" placeholder="e.g. production_sales">
+                    </div>
+                    <div class="input-group">
+                        <label for="sql-conn-url">Direct Connection String URL (Optional - overrides individual fields)</label>
+                        <input type="text" id="sql-conn-url" placeholder="e.g. postgresql+psycopg2://user:pass@host:port/dbname">
+                    </div>
+                    <div class="input-group" style="display: flex; flex-direction: row; gap: 8px; align-items: center; margin-top: 10px;">
+                        <input type="checkbox" id="sql-conn-read-only" style="width: auto; cursor: pointer; accent-color: var(--accent-color);" checked>
+                        <label for="sql-conn-read-only" style="cursor: pointer; text-transform: none; font-weight: bold;">Force Read-Only (INSERT/UPDATE/DELETE queries blocked)</label>
+                    </div>
+                    <div class="input-group">
+                        <label for="sql-conn-desc">Description (Optional)</label>
+                        <textarea id="sql-conn-desc" placeholder="Describe the tables and data inside this database..." rows="2" style="width: 100%; padding: 8px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none; resize: vertical;"></textarea>
+                    </div>
+                    <button class="btn btn-primary" id="btn-submit-sql-conn">💾 Connect & Save Artifact</button>
+
+                    <div id="sql-conn-progress" class="progress-container" style="display: none; margin-top: 14px;">
+                        <div class="progress-header">
+                            <span id="sql-conn-progress-text">Connecting to database...</span>
+                            <span class="spinner"></span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="sql-conn-progress-bar-fill" style="width: 50%;"></div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Local File Ingestion Pane -->
                 <div class="modal-tab-content-pane active" id="modal-tab-local">
                     <div class="drop-zone" id="upload-dropzone">
-                        <p>Drag & drop PDF, DOCX, PPTX, MD, CSV, XLSX, DB, or Image file here, or click to upload (supports multiple files)</p>
+                        <p>Drag & drop PDF, DOCX, PPTX, MD, CSV, XLSX, DB, Image, or Audio file here, or click to upload (supports multiple files)</p>
                         <input type="file" id="file-input" hidden multiple>
                     </div>
                     <div class="input-group" id="folder-import-section" style="display: none; margin-top: 12px;">
@@ -329,6 +393,7 @@
                             <option value="text_images" selected>Text + Images (Renders entire pages)</option>
                             <option value="text_embedded_images">Text + Embedded Images (Extracts diagrams/pics)</option>
                             <option value="text">Text Only (Extracts text without rendering)</option>
+                            <option value="audio_stt">Audio Transcription (STT)</option>
                             <option value="images_only">Images Only (Converts pages strictly to images)</option>
                             <option value="ocr">OCR Transcription (Extracts visual text via Vision LLM)</option>
                             <option value="data">Data Interface (Spreadsheet / SQLite DB Tables)</option>
@@ -559,6 +624,19 @@
         </div>
     </div>
 
+    <!-- 🧠 Memory Network Graph Modal -->
+    <div class="modal-overlay" id="memory-graph-modal" style="display: none; z-index: 100000;">
+        <div class="modal-container" style="width: 800px; max-width: 95vw; height: 80vh;">
+            <div class="modal-header">
+                <h2>🧠 Semantic Memory Network</h2>
+                <button class="modal-close-btn" id="btn-close-memory-graph">×</button>
+            </div>
+            <div class="modal-body" id="memory-graph-viewport" style="display: flex; align-items: center; justify-content: center; overflow: auto; background-color: #0b0f19; padding: 20px;">
+                <!-- SVG Graph is dynamically injected here -->
+            </div>
+        </div>
+    </div>
+
     <!-- ⚙️ Settings Modal -->
     <div class="modal-overlay" id="settings-modal" style="display: none;">
         <div class="modal-container" style="width: 720px; max-height: 90vh;">
@@ -569,9 +647,10 @@
             <div class="modal-tabs">
                 <button class="modal-tab active" data-settings-tab="tab-settings-llm">🤖 LLM Binding</button>
                 <button class="modal-tab" data-settings-tab="tab-settings-tti">🎨 TTI (Image Gen)</button>
+                <button class="modal-tab" data-settings-tab="tab-settings-internet">🌐 Internet Search</button>
                 <button class="modal-tab" data-settings-tab="tab-settings-profiles">📂 Profiles</button>
                 <button class="modal-tab" data-settings-tab="tab-settings-advanced">🛠️ Advanced</button>
-                <button class="modal-tab" data-settings-tab="tab-settings-stt" disabled>🎙️ STT (Soon)</button>
+                <button class="modal-tab" data-settings-tab="tab-settings-stt" id="btn-stt-settings-tab">🎙️ STT</button>
                 <button class="modal-tab" data-settings-tab="tab-settings-tts" disabled>🔊 TTS (Soon)</button>
             </div>
             <div class="modal-body">
@@ -620,6 +699,27 @@
                     </div>
                     <div id="settings-validation-status" class="validation-status"></div>
                 </div>
+                <!-- Internet Search Configuration Pane -->
+                <div class="settings-tab-pane" id="tab-settings-internet">
+                    <p class="section-desc">Configure API credentials and keys for external search providers and connections. These enable specialized, high-accuracy tools like Google Search and Scopus Search for the LLM.</p>
+                    <div class="input-group">
+                        <label for="settings-google-api-key">Google Search API Key</label>
+                        <input type="password" id="settings-google-api-key" placeholder="Enter Google Custom Search API Key">
+                    </div>
+                    <div class="input-group">
+                        <label for="settings-google-cse-id">Google Custom Search Engine (CSE) ID</label>
+                        <input type="text" id="settings-google-cse-id" placeholder="Enter Google Custom Search Engine CX ID">
+                    </div>
+                    <div class="input-group">
+                        <label for="settings-scopus-api-key">Scopus API Key</label>
+                        <input type="password" id="settings-scopus-api-key" placeholder="Enter Elsevier Scopus API Key">
+                    </div>
+                    <div class="input-group">
+                        <label for="settings-scopus-inst-token">Scopus Institutional Token (Optional)</label>
+                        <input type="password" id="settings-scopus-inst-token" placeholder="Enter Scopus Institutional Token if applicable">
+                    </div>
+                </div>
+
                 <!-- TTI Ingestion Pane -->
                 <div class="settings-tab-pane" id="tab-settings-tti">
                     <div class="artifact-sub-tabs" style="padding: 0 0 10px 0; margin-bottom: 12px; background: none;">
@@ -719,7 +819,28 @@
                 </div>
 
                 <div class="settings-tab-pane" id="tab-settings-stt">
-                    <p class="empty-msg">STT configuration coming soon.</p>
+                    <div class="stt-sub-pane active" id="stt-sub-pane-params">
+                        <p class="section-desc">Configure Speech-to-Text (STT) transcription. Use a local Whisper or remote cloud binding to transcribe voice files.</p>
+                        <div class="input-group">
+                            <label for="settings-stt-binding">STT Binding Provider</label>
+                            <select id="settings-stt-binding">
+                                <option value="">-- Select STT Binding --</option>
+                            </select>
+                        </div>
+                        <div id="settings-stt-config-form" class="settings-config-form">
+                            <p class="empty-msg">Select an STT binding provider to configure its parameters.</p>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary" id="btn-validate-stt-binding" style="width:auto; display:inline-block;">🔌 Validate & Load Models</button>
+                        </div>
+                        <div class="input-group" id="settings-stt-model-group" style="display:none;">
+                            <label for="settings-stt-model-search">Search & Filter STT Models</label>
+                            <input type="text" id="settings-stt-model-search" placeholder="🔍 Type keyword to filter..." style="margin-bottom: 8px; padding: 8px 12px; font-size: 12.5px;" />
+                            <label for="settings-stt-model">Available STT Models</label>
+                            <select id="settings-stt-model"></select>
+                        </div>
+                        <div id="settings-stt-validation-status" class="validation-status"></div>
+                    </div>
                 </div>
                 <div class="settings-tab-pane" id="tab-settings-tts">
                     <p class="empty-msg">TTS configuration coming soon.</p>

@@ -422,6 +422,7 @@ class ArtefactManager:
         active:            Optional[bool] = None,
         commit_message:    Optional[str] = None,
         version_tags:      Optional[List[str]] = None,
+        version:           Optional[int] = None,
         **extra_data
     ) -> Optional[Dict[str, Any]]:
         latest = self.get(title)
@@ -433,7 +434,10 @@ class ArtefactManager:
         else:
             extra_data.pop("artefact_type", None)
 
-        new_version  = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
+        if version is not None:
+            new_version = version
+        else:
+            new_version  = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
         new_active   = active if active is not None else latest.get('active', True)
         target_title = new_title if new_title else title
 
@@ -1722,6 +1726,7 @@ class ArtefactManager:
         auto_activate: bool = True,
         replacements:  Optional[Dict[str, str]] = None,
         event_callback: Optional[Any] = None,
+        already_processed_artifacts: Optional[List[str]] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Scans *text* for ``<artifact …>…</artifact>`` blocks (American spelling)
@@ -1781,7 +1786,18 @@ class ArtefactManager:
                 else:
                     atype = default_type
 
-            resolved_title: Optional[str] = None
+            resolved_title = tag_title if tag_title in existing_titles else (
+                _find_best_title_match(tag_title, existing_titles) or tag_title
+            )
+
+            # Skip if already processed during streaming
+            if already_processed_artifacts and resolved_title in already_processed_artifacts:
+                ASCIIColors.info(f"Skipping post-processing for already applied artifact: '{resolved_title}'")
+                art = self.get(resolved_title)
+                if art:
+                    affected.append(art)
+                return ''
+            
             is_new = False
 
             if tag_title in existing_titles:

@@ -39,6 +39,7 @@ class CoreMixin:
         autosave: bool = False,
         max_context_size: Optional[int] = None,
         memory_manager=None,
+        internet_config: Optional[Dict[str, Any]] = None,
     ):
         object.__setattr__(self, 'lollmsClient', lollmsClient)
         object.__setattr__(self, 'db_manager', db_manager)
@@ -50,6 +51,7 @@ class CoreMixin:
         object.__setattr__(self, '_message_index', None)
         object.__setattr__(self, '_messages_to_delete_from_db', set())
         object.__setattr__(self, '_is_db_backed', db_manager is not None)
+        object.__setattr__(self, 'internet_config', internet_config or {})
 
         if self._is_db_backed:
             if not db_discussion_obj and not discussion_id:
@@ -105,7 +107,8 @@ class CoreMixin:
     def create_new(cls, lollms_client, db_manager=None, **kwargs):
         init_args = {
             'autosave': kwargs.pop('autosave', False),
-            'max_context_size': kwargs.pop('max_context_size', None)
+            'max_context_size': kwargs.pop('max_context_size', None),
+            'internet_config': kwargs.pop('internet_config', None)
         }
         if db_manager:
             with db_manager.get_session() as session:

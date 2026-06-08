@@ -40,7 +40,6 @@ class MockGemmaAgentClient:
         self.llm = self
         self.model_name = "gemma4:e2b"
         self.binding_name = "ollama"
-        self._step_counter = 0
 
     def count_tokens(self, text: str) -> int:
         return len(text) // 4
@@ -83,18 +82,38 @@ class MockGemmaAgentClient:
         return "Simulated text output"
 
     def chat(self, discussion, **kwargs):
-        self._step_counter += 1
         callback = kwargs.get("streaming_callback")
+        messages = discussion.export("openai_chat") if discussion else None
+        return self._generate_response(messages, callback, **kwargs)
+
+    def generate_from_messages(self, messages: List[Dict], **kwargs) -> str:
+        callback = kwargs.get("streaming_callback")
+        return self._generate_response(messages, callback, **kwargs)
+
+    def _generate_response(self, messages: Optional[List[Dict]], callback, **kwargs) -> str:
+        # Extract last user prompt text
+        prompt_text = ""
+        if messages:
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        prompt_text = "\n".join(part.get("text", "") for part in content if part.get("type") == "text")
+                    else:
+                        prompt_text = str(content)
+                    break
         
+        prompt_text_lower = prompt_text.lower()
+
         # ── Test Scenario A: Direct Conversation (No Tools) ──
-        if self._step_counter == 1:
+        if "hello" in prompt_text_lower or "amazing day" in prompt_text_lower:
             reply = "Hello! I am Lollms, your persistent engineering assistant. How can I help you today?"
             if callback:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
 
         # ── Test Scenario B: Surgical Implementation (Plan + Patch) ──
-        if self._step_counter == 2:
+        if "math_ops.py" in prompt_text_lower or "safe_divide" in prompt_text_lower:
             reply = (
                 "<coding_plan>\n"
                 "  - Goal: Implement safe division\n"
@@ -108,7 +127,14 @@ class MockGemmaAgentClient:
             return reply
 
         # ── Test Scenario C: Two-Step Ingestion & Data Query (Multi-Turn) ──
-        if self._step_counter == 3:
+        if "execute_python_data_query" in prompt_text_lower or "tool_result" in prompt_text_lower:
+            # Turn 2: Receive the output and formulate final answer
+            reply = "Based on my data query of the sales database, the product with the highest revenue is the **Smartphone Alpha** with a total revenue of **$124,500.00 USD**."
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+            return reply
+
+        if "sales_database" in prompt_text_lower or "highest revenue" in prompt_text_lower:
             # Turn 1: Save the query script inside an ephemeral artifact
             reply = (
                 '<artifact name="query.py" type="code" language="python" ephemeral="true">\n'
@@ -122,34 +148,25 @@ class MockGemmaAgentClient:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
 
-        if self._step_counter == 4:
-            # Turn 2: Receive the output and formulate final answer
-            reply = "Based on my data query of the sales database, the product with the highest revenue is the **Smartphone Alpha** with a total revenue of **$124,500.00 USD**."
-            if callback:
-                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
-            return reply
-
-        return "Simulated fallback reply"
+        # Fallback
+        reply = "Simulated response"
+        if callback:
+            callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+        return reply
 
 
 class TestAgentCognitiveDecisions(unittest.TestCase):
+    @classmethod
     @classmethod
     def setUpClass(cls):
         cls.report_cards = []
 
         # ── Setup LollmsClient & Discussion ──
-        import requests
+        # Force offline/simulation mode for deterministic unit testing
         is_online = False
-        try:
-            res = requests.get("http://localhost:11434/api/tags", timeout=1.5)
-            if res.status_code == 200:
-                models = [m["name"] for m in res.json().get("models", [])]
-                is_online = any(m.startswith("gemma") for m in models)
-        except Exception:
-            pass
 
         if is_online:
-            ASCIIColors.green("⚡ Connection found! Running LIVE integration testing with Ollama...")
+            ASCIIColors.green(f"⚡ Connection found! Running LIVE integration testing with Ollama...")
             cls.client = LollmsClient(
                 llm_binding_name="ollama",
                 llm_binding_config={"model_name": "gemma4:e2b", "host_address": "http://localhost:11434"},

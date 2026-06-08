@@ -34,6 +34,59 @@ def _ensure_installed(
         __import__(import_name or package_name)
 
 
+def _get_sqlalchemy_engine_from_file(file_path: Path) -> Tuple[Any, str]:
+    """
+    Parses a '.sqlconn' connection metadata file and creates a SQLAlchemy engine.
+    Installs required driver packages dynamically on demand via pipmaster.
+    """
+    import json
+    _ensure_installed("sqlalchemy")
+    from sqlalchemy import create_engine
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        conn_info = json.load(f)
+
+    dialect = conn_info.get("dialect", "mysql").lower().strip()
+    host = conn_info.get("host", "localhost").strip()
+    port = conn_info.get("port")
+    username = conn_info.get("username", "").strip()
+    password = conn_info.get("password", "").strip()
+    database = conn_info.get("database", "").strip()
+    connection_url = conn_info.get("url", "").strip()
+
+    if dialect == "mysql":
+        _ensure_installed("pymysql")
+        if not connection_url:
+            port_str = f":{port}" if port else ""
+            connection_url = f"mysql+pymysql://{username}:{password}@{host}{port_str}/{database}"
+    elif dialect == "postgresql":
+        _ensure_installed("psycopg2-binary", "psycopg2")
+        if not connection_url:
+            port_str = f":{port}" if port else ""
+            connection_url = f"postgresql+psycopg2://{username}:{password}@{host}{port_str}/{database}"
+    elif dialect == "oracle":
+        _ensure_installed("oracledb")
+        if not connection_url:
+            port_str = f":{port}" if port else ""
+            connection_url = f"oracle+oracledb://{username}:{password}@{host}{port_str}/{database}"
+    elif dialect in ("mssql", "sqlserver"):
+        _ensure_installed("pyodbc")
+        if not connection_url:
+            port_str = f":{port}" if port else ""
+            connection_url = f"mssql+pyodbc://{username}:{password}@{host}{port_str}/{database}"
+    elif dialect == "sqlite":
+        if not connection_url:
+            connection_url = f"sqlite:///{database}"
+
+    # Handle connection timeouts to avoid hanging the main thread
+    connect_args = {}
+    if dialect not in ("oracle", "sqlite"):
+        connect_args["connect_timeout"] = 5
+
+    engine = create_engine(connection_url, connect_args=connect_args)
+    return engine, dialect
+
+
 def _dataframe_to_markdown(df: Any) -> str:
     """Convert a pandas DataFrame to a Markdown table."""
     try:
@@ -58,12 +111,7 @@ def _dataframe_to_markdown(df: Any) -> str:
 
 
 def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, List[Tuple[str, str]]]:
-    """
-    Ingests a CSV, XLSX/XLS, or SQLite Database file, extracts its structural schema 
-    (columns, types, row counts, and descriptive statistics), and writes the original 
-    file to a local data workspace under a versioned suffix. Returns a compact Markdown 
-    schema for LLM context.
-    """
+    _ensure_installed("sqlalchemy")
     _ensure_installed("pandas")
     _ensure_installed("openpyxl")
     import pandas as pd
@@ -72,7 +120,54 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
     schema_parts = [f"# Data Interface: {art_title}\n"]
 
     try:
-        if ext in (".db", ".sqlite", ".sqlite3"):
+        if ext == ".sqlconn":
+            if progress_cb: progress_cb("Reading SQL connection details...")
+            engine, dialect = _get_sqlalchemy_engine_from_file(path)
+            
+            from sqlalchemy import inspect, text
+            inspector = inspect(engine)
+            tables = inspector.get_table_names()
+            schema_parts.append(f"Format: Remote Relational Database ({dialect}) | Total Tables: {len(tables)}\n")
+            
+            for idx, table in enumerate(tables):
+                if progress_cb: progress_cb(f"Inspecting table '{table}' ({idx+1}/{len(tables)})...")
+                columns = inspector.get_columns(table)
+                pk_cols = inspector.get_pk_constraint(table).get("constrained_columns", [])
+                
+                # Fetch row count
+                row_count = 0
+                try:
+                    with engine.connect() as connection:
+                        res = connection.execute(text(f'SELECT COUNT(*) FROM "{table}"' if dialect != "mysql" else f'SELECT COUNT(*) FROM `{table}`'))
+                        row_count = res.scalar()
+                except Exception:
+                    pass
+
+                schema_parts.append(f"## Table: {table}")
+                schema_parts.append(f"- Total Rows: {row_count:,} | Columns: {len(columns)}")
+                schema_parts.append("### Columns & Schema:")
+                for col in columns:
+                    pk_marker = " — PRIMARY KEY" if col["name"] in pk_cols else ""
+                    nullable_marker = " (NULLABLE)" if col.get("nullable", True) else ""
+                    schema_parts.append(f"  • {col['name']} ({col['type']}){pk_marker}{nullable_marker}")
+
+                # Fetch a preview
+                try:
+                    query_str = f'SELECT * FROM "{table}" LIMIT 3' if dialect != "mysql" else f'SELECT * FROM `{table}` LIMIT 3'
+                    raw_conn = engine.raw_connection()
+                    try:
+                        df = pd.read_sql_query(query_str, raw_conn)
+                    finally:
+                        raw_conn.close()
+                    schema_parts.append("### Preview (First 3 Rows):")
+                    schema_parts.append(df.to_markdown(index=False))
+                except Exception as ex:
+                    schema_parts.append(f"  (Failed to read table preview: {ex})")
+
+                schema_parts.append("\n---\n")
+            
+            engine.dispose()
+        elif ext in (".db", ".sqlite", ".sqlite3"):
             if progress_cb: progress_cb("Connecting to SQLite database...")
             import sqlite3
             conn = sqlite3.connect(str(path))

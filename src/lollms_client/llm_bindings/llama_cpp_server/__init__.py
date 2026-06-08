@@ -1087,12 +1087,35 @@ class LlamaCppServerBinding(LollmsLLMBinding):
     def _stream_completion(self, completion, callback: Optional[Callable]) -> str:
         """Drains a streaming completion and feeds chunks to *callback*."""
         full = []
+        in_thinking = False
         for chunk in completion:
-            content = chunk.choices[0].delta.content or ""
-            full.append(content)
-            if callback:
-                if not callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
-                    break
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            content = getattr(delta, "content", "") or ""
+
+            if reasoning:
+                if not in_thinking:
+                    in_thinking = True
+                    if callback:
+                        callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                    full.append("<think>\n")
+                if callback:
+                    callback(reasoning, MSG_TYPE.MSG_TYPE_CHUNK)
+                full.append(reasoning)
+                continue
+
+            if content:
+                if in_thinking:
+                    in_thinking = False
+                    if callback:
+                        callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                    full.append("\n</think>\n")
+                full.append(content)
+                if callback:
+                    if not callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
+                        break
         return "".join(full)
 
     def _stream_raw_completion(self, completion, callback: Optional[Callable]) -> str:

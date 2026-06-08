@@ -110,6 +110,7 @@ IMPORT_MODE_IMAGES_ONLY = "images_only"
 IMPORT_MODE_OCR         = "ocr"
 IMPORT_MODE_DATA        = "data"
 IMPORT_MODE_DATA_BUNDLE = "data_bundle"
+IMPORT_MODE_AUDIO_STT   = "audio_stt"
 
 ALL_IMPORT_MODES = {
     IMPORT_MODE_TEXT,
@@ -119,6 +120,7 @@ ALL_IMPORT_MODES = {
     IMPORT_MODE_OCR,
     IMPORT_MODE_DATA,
     IMPORT_MODE_DATA_BUNDLE,
+    IMPORT_MODE_AUDIO_STT,
 }
 
 # Extensions treated as source code → ArtefactType.CODE
@@ -870,6 +872,7 @@ class FileImportMixin:
         is_pptx       = ext == ".pptx"
         is_xlsx       = ext == ".xlsx"
         is_image_file = ext in _IMAGE_EXTENSIONS
+        is_audio_file = ext in (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".wma", ".aac")
 
         # ── data_bundle mode (Folder Ingestion) ──────────────────────────────
         # ── data_bundle mode (Folder Ingestion) ──────────────────────────────
@@ -1345,6 +1348,18 @@ class FileImportMixin:
             _progress("Reading text file…")
             text = _extract_text_file(path)
             # No image extraction for plain text
+
+        elif is_audio_file or mode == IMPORT_MODE_AUDIO_STT:
+            _progress("Transcribing audio file via STT...")
+            lc = getattr(self, "lollmsClient", None)
+            if lc is None or not getattr(lc, "stt", None):
+                raise RuntimeError("Audio file import requires a Speech-to-Text (STT) model to be configured and active in your settings.")
+            try:
+                raw_transcript = lc.transcribe_audio(path)
+                text = f"# Audio Transcript: {title}\n*File source: {path.name}*\n\n{raw_transcript}"
+                _progress("Audio transcription complete!")
+            except Exception as e:
+                raise RuntimeError(f"Audio transcription failed: {e}")
 
         elif is_pdf:
             if extract_embedded:

@@ -2089,7 +2089,22 @@ html, body, select, textarea, div {
     border-color: var(--accent-color);
 }
 
-/* Search Results UI Elements */
+/* Memory Network Graph & Activation Styles */
+.activation-bar {
+    border-radius: 2px;
+}
+.activation-bar.glowing {
+    background-color: var(--accent-color);
+    box-shadow: 0 0 8px var(--accent-color);
+}
+.activation-bar.neutral {
+    background-color: var(--chat-user-bg);
+}
+.activation-bar.faded {
+    background-color: #475569;
+}
+
+/* Web Search Results UI Elements */
 .search-results-container {
     margin-top: 16px;
     background-color: #020617;

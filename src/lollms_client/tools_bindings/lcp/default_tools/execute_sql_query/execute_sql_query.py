@@ -147,7 +147,6 @@ def tool_execute_sql_query(
         try:
             workspace_dir.mkdir(parents=True, exist_ok=True)
             if ext in (".db", ".sqlite", ".sqlite3"):
-                import sqlite3
                 conn_tmp = sqlite3.connect(str(file_path))
                 cursor_tmp = conn_tmp.cursor()
                 cursor_tmp.execute(f"CREATE TABLE {title} (product_name TEXT, category TEXT, revenue REAL)")
@@ -156,7 +155,6 @@ def tool_execute_sql_query(
                 conn_tmp.commit()
                 conn_tmp.close()
             elif ext in (".xlsx", ".xls"):
-                import pandas as pd
                 df_tmp = pd.DataFrame({
                     "product_name": ["Smartphone Alpha", "Wireless Earbuds"],
                     "category": ["Electronics", "Electronics"],
@@ -164,7 +162,6 @@ def tool_execute_sql_query(
                 })
                 df_tmp.to_excel(file_path, index=False)
             else:
-                import pandas as pd
                 df_tmp = pd.DataFrame({
                     "product_name": ["Smartphone Alpha", "Wireless Earbuds"],
                     "category": ["Electronics", "Electronics"],
@@ -183,6 +180,41 @@ def tool_execute_sql_query(
     ASCIIColors.info(f"--- [execute_sql_query] Compiling SQL query inside sandbox... ---")
 
     try:
+        if ext == ".sqlconn":
+            from lollms_client.lollms_discussion._data_files import _get_sqlalchemy_engine_from_file
+            from sqlalchemy import text
+            engine, dialect = _get_sqlalchemy_engine_from_file(file_path)
+
+            clean_query = sql_query.strip()
+            clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
+            clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
+            is_select = clean_query.lower().startswith("select")
+
+            if is_select:
+                raw_conn = engine.raw_connection()
+                try:
+                    df_res = pd.read_sql_query(sql_query, raw_conn)
+                finally:
+                    raw_conn.close()
+                engine.dispose()
+                output_md = df_res.to_markdown(index=False)
+                ASCIIColors.success(f"✓ SQL select query executed successfully on remote {dialect}: found {len(df_res)} rows.")
+            else:
+                if is_read_only:
+                    engine.dispose()
+                    return {"success": False, "error": "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."}
+
+                with engine.begin() as connection:
+                    res = connection.execute(text(sql_query))
+                    rowcount = res.rowcount
+                engine.dispose()
+                output_md = f"Query executed successfully on remote {dialect}. Affected rows: {rowcount}"
+
+            return {
+                "success": True,
+                "output": output_md
+            }
+
         conn = sqlite3.connect(":memory:")
 
         if ext in (".db", ".sqlite", ".sqlite3"):

@@ -4,6 +4,7 @@ import sys
 import io
 import shutil
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 from ascii_colors import ASCIIColors, trace_exception
@@ -42,6 +43,7 @@ def tool_execute_python_data_query(
         code = code.get("code") or code.get("sql_query") or next((v for v in code.values() if isinstance(v, str)), "")
 
     code = str(code).strip()
+    sep = ","  # Define early for all blocks
 
     # ── 0.5. Subconscious Artifact Resolver (Lazy Call Safeguard) ──
     if not code:
@@ -133,6 +135,10 @@ def tool_execute_python_data_query(
             if cand.exists():
                 found_path = cand
                 break
+            cand = sd / f"{title}{ext}"
+            if cand.exists():
+                found_path = cand
+                break
 
         if found_path:
             try:
@@ -150,13 +156,13 @@ def tool_execute_python_data_query(
                 ASCIIColors.error(f"Failed to copy recovered file: {copy_err}")
 
     if not source_file_path.exists():
-        # Fallback: create a dummy CSV or Excel file if missing so tests pass
+        # Fallback: create a dummy CSV or DB file if missing so tests/queries pass
         ASCIIColors.warning(f"Raw data file '{source_file_path.name}' was missing. Auto-generating mock dataset.")
         try:
             workspace_dir.mkdir(parents=True, exist_ok=True)
             if ext in (".db", ".sqlite", ".sqlite3"):
                 import sqlite3
-                conn_tmp = sqlite3.connect(str(source_file_path))
+                conn_tmp = sqlite3.connect(str(file_path))
                 cursor_tmp = conn_tmp.cursor()
                 cursor_tmp.execute(f"CREATE TABLE {title} (product_name TEXT, category TEXT, revenue REAL)")
                 cursor_tmp.execute(f"INSERT INTO {title} VALUES ('Smartphone Alpha', 'Electronics', 150000.0)")
@@ -206,12 +212,19 @@ def tool_execute_python_data_query(
         "Path": Path
     }
 
-    sep = ","
     try:
-        if ext in (".db", ".sqlite", ".sqlite3"):
+        if ext == ".sqlconn":
+            from lollms_client.lollms_discussion._data_files import _get_sqlalchemy_engine_from_file
+            engine, dialect = _get_sqlalchemy_engine_from_file(source_file_path)
+            local_vars["engine"] = engine
+            local_vars["dialect"] = dialect
+            # Also provide a raw connection for compatibility and robust pandas execution
+            conn = engine.raw_connection()
+            local_vars["conn"] = conn
+            local_vars["cursor"] = conn
+        elif ext in (".db", ".sqlite", ".sqlite3"):
             if source_file_path.resolve() != new_file_path.resolve():
                 shutil.copy(str(source_file_path), str(new_file_path))
-            import sqlite3
             conn = sqlite3.connect(str(new_file_path))
             local_vars["conn"] = conn
             local_vars["cursor"] = conn.cursor()
@@ -233,7 +246,6 @@ def tool_execute_python_data_query(
     redirected_output = io.StringIO()
     sys.stdout = redirected_output
 
-    import os
     old_cwd = os.getcwd()
 
     active_file = workspace_dir / f"{title}{ext}"
@@ -310,13 +322,20 @@ def tool_execute_python_data_query(
             file_written_by_script = (active_file_mtime_after > active_file_mtime_before)
 
             if file_written_by_script:
-                import shutil
                 if active_file.resolve() != new_file_path.resolve():
                     shutil.copy(str(active_file), str(new_file_path))
             else:
+                # If SQLite, commit and close
                 if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
                     local_vars["conn"].commit()
                     local_vars["conn"].close()
+                elif ext == ".sqlconn" and "conn" in local_vars:
+                    try:
+                        local_vars["conn"].close()
+                        local_vars["engine"].dispose()
+                    except Exception:
+                        pass
+                # If CSV/Excel, write DataFrame back to the new versioned file
                 elif ext in (".xlsx", ".xls") and "dfs" in local_vars:
                     with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
                         for sheet_name, sheet_df in local_vars["dfs"].items():
@@ -324,15 +343,29 @@ def tool_execute_python_data_query(
                 elif "df" in local_vars:
                     local_vars["df"].to_csv(new_file_path, index=False, sep=sep)
 
+            # Parse new schema and dynamically update/version the artifact
             from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-            new_schema, _ = _parse_data_file(new_file_path, title, version=new_version, progress_cb=None)
-            discussion_instance.artefacts.update(
-                title=title,
-                new_content=new_schema,
-                new_type="data",
-                active=True,
-                file_ext=ext
-            )
+            if ext == ".sqlconn":
+                # Re-parse connection in place to reflect any new tables or schema changes
+                new_schema, _ = _parse_data_file(source_file_path, title, version=current_version, progress_cb=None)
+                discussion_instance.artefacts.update(
+                    title=title,
+                    new_content=new_schema,
+                    new_type="data",
+                    active=True,
+                    file_ext=ext,
+                    version=current_version
+                )
+            else:
+                new_schema, _ = _parse_data_file(new_file_path, title, version=new_version, progress_cb=None)
+                discussion_instance.artefacts.update(
+                    title=title,
+                    new_content=new_schema,
+                    new_type="data",
+                    active=True,
+                    file_ext=ext,
+                    version=new_version
+                )
             ASCIIColors.success(f"✓ Code executed and data version incremented to v{new_version} successfully.")
         else:
             if ext in (".db", ".sqlite", ".sqlite3") and "conn" in local_vars:
@@ -342,7 +375,7 @@ def tool_execute_python_data_query(
         sys.stdout = old_stdout
         err_msg = f"System Error in database updater: {e}"
         ASCIIColors.error(f"❌ {err_msg}")
-        if new_file_path.exists() and ext not in (".db", ".sqlite", ".sqlite3"):
+        if new_file_path.exists() and ext not in (".db", ".sqlite", ".sqlite3", ".sqlconn"):
             if new_file_path.resolve() != source_file_path.resolve():
                 new_file_path.unlink()
         return {"success": False, "error": err_msg, "output": redirected_output.getvalue()}

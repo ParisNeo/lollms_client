@@ -61,7 +61,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from sqlalchemy import (Column, DateTime, Float, Index, Integer, String,
-                        Text, create_engine)
+                        Text, ForeignKey, create_engine)
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from ascii_colors import ASCIIColors
 
@@ -81,10 +81,23 @@ class _MemoryRecord(_Base):
     created_at      = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at      = Column(DateTime, nullable=False, default=datetime.utcnow)
     last_used_at    = Column(DateTime, nullable=False, default=datetime.utcnow)
+    subject         = Column(Text,     nullable=True)
+    predicate       = Column(Text,     nullable=True)
+    object          = Column(Text,     nullable=True)
+    activation      = Column(Float,    nullable=True, default=0.0)
 
     __table_args__ = (
         Index("ix_mem_owner_level_importance", "owner_id", "level", "importance"),
     )
+
+
+class _RetrievalLog(_Base):
+    __tablename__ = "retrieval_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(String, ForeignKey("memories.id", ondelete="CASCADE"), nullable=False, index=True)
+    retrieved_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MemoryConfig
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,7 +146,8 @@ class MemoryConfig:
         default_importance:     float = 0.75,
         tag_boost:              float = 0.10,
         update_boost:           float = 0.25,
-        decay_rate_per_day:     float = 0.02,
+        decay_rate_per_day:     float = 0.5,   # Petroff's power law decay rate parameter d
+        spread_probability:     float = 0.9,   # Attenuation multiplier for Spreading Activation
         demotion_threshold:     float = 0.25,
         archive_threshold:      float = 0.05,
         dream_min_interval_hours: int = 1,
@@ -147,6 +161,7 @@ class MemoryConfig:
         self.tag_boost                 = tag_boost
         self.update_boost              = update_boost
         self.decay_rate_per_day        = decay_rate_per_day
+        self.spread_probability        = spread_probability
         self.demotion_threshold        = demotion_threshold
         self.archive_threshold         = archive_threshold
         self.dream_min_interval_hours  = dream_min_interval_hours
@@ -203,6 +218,27 @@ class LollmsMemoryManager:
 
         self._engine = create_engine(db_path, **engine_kwargs)
         _Base.metadata.create_all(self._engine)
+
+        # Safe in-place column migrations for existing SQLite databases
+        try:
+            with self._engine.connect() as connection:
+                from sqlalchemy import text
+                cursor = connection.execute(text("PRAGMA table_info(memories)"))
+                columns = {row[1] for row in cursor.fetchall()}
+                migrations = [
+                    ('subject', "ALTER TABLE memories ADD COLUMN subject TEXT"),
+                    ('predicate', "ALTER TABLE memories ADD COLUMN predicate TEXT"),
+                    ('object', "ALTER TABLE memories ADD COLUMN object TEXT"),
+                    ('activation', "ALTER TABLE memories ADD COLUMN activation REAL"),
+                ]
+                for col, sql in migrations:
+                    if col not in columns:
+                        ASCIIColors.info(f"  -> Upgrading 'memories' table: Adding '{col}' column.")
+                        connection.execute(text(sql))
+                connection.commit()
+        except Exception as e:
+            ASCIIColors.warning(f"Memory migration warning: {e}")
+
         self._Session      = sessionmaker(bind=self._engine, autoflush=False)
         self._last_dream   = datetime.utcnow() - timedelta(days=1)
         ASCIIColors.info(f"[MemoryManager] Initialised — db={db_path}, owner={owner_id}")
@@ -229,7 +265,17 @@ class LollmsMemoryManager:
 
     # ──────────────────────────────────────────────── CRUD
 
-    def add(self, content: str, importance: Optional[float] = None, tags: Optional[List[str]] = None, subject_group: Optional[str] = None, level: int = 1) -> Dict:
+    def add(
+        self,
+        content: str,
+        importance: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        subject_group: Optional[str] = None,
+        level: int = 1,
+        subject: Optional[str] = None,
+        predicate: Optional[str] = None,
+        obj: Optional[str] = None
+    ) -> Dict:
         now = datetime.utcnow()
         with self._session() as s:
             # Query maximum created_at in database to enforce monotonicity
@@ -238,15 +284,30 @@ class LollmsMemoryManager:
                 if now <= max_created[0]:
                     now = max_created[0] + timedelta(microseconds=1)
 
+            # Standardise Ontological Triples fallback if omitted by caller
+            sub_val = subject or (tags[0] if tags and len(tags) > 0 else "unknown")
+            pred_val = predicate or "RELATED_TO"
+            obj_val = obj or (tags[1] if tags and len(tags) > 1 else "unknown")
+
             rec = _MemoryRecord(
                 id=str(uuid.uuid4()), owner_id=self.owner_id, content=content.strip(),
                 summary=self._auto_summary(content), level=level,
                 importance=max(0.0, min(1.0, importance if importance is not None else self.config.default_importance)),
                 use_count=0, tags=",".join(tags) if tags else None, subject_group=subject_group,
                 created_at=now, updated_at=now, last_used_at=now,
+                subject=sub_val.strip().lower(),
+                predicate=pred_val.strip().upper(),
+                object=obj_val.strip().lower(),
+                activation=0.0
             )
             s.add(rec)
             s.flush()
+
+            # Record initial retrieval log
+            log = _RetrievalLog(node_id=rec.id, retrieved_at=now)
+            s.add(log)
+            s.flush()
+
             return self._to_dict(rec)
 
     def get(self, memory_id: str) -> Optional[Dict]:
@@ -316,22 +377,84 @@ class LollmsMemoryManager:
             )
         return pulled_memories
 
+    def compute_petroff_activation(self, session: Session, node_id: str, t: datetime) -> float:
+        """
+        Computes the base-level activation using Petroff's power-law decay approximation.
+        Bi = ln( Sum( (t - t_j)^(-d) ) )
+        """
+        import math
+        logs = session.query(_RetrievalLog).filter_by(node_id=node_id).all()
+        if not logs:
+            return -99.0
+        
+        total = 0.0
+        d = self.config.decay_rate_per_day
+        for log in logs:
+            delta = (t - log.retrieved_at).total_seconds()
+            if delta < 0.001:
+                delta = 0.001
+            total += math.pow(delta, -d)
+            
+        return math.log(total) if total > 0.0 else -99.0
+
+    def spread_activation(self, session: Session, source_id: str, t: datetime):
+        """
+        Spreads energy multiplicatively from source_id to linked semantic neighbors.
+        Pre-warms associated nodes in deep memory without loading full contents.
+        """
+        r = session.query(_MemoryRecord).filter_by(id=source_id).first()
+        if not r or not r.subject or not r.object:
+            return
+
+        src_activation = r.activation if r.activation is not None else -99.0
+        if src_activation == -99.0:
+            src_activation = self.compute_petroff_activation(session, source_id, t)
+
+        # Find linked nodes sharing Subject, Predicate, or Object
+        neighbors = session.query(_MemoryRecord).filter(
+            _MemoryRecord.id != source_id,
+            (
+                (_MemoryRecord.subject == r.subject) | 
+                (_MemoryRecord.object == r.subject) | 
+                (_MemoryRecord.subject == r.object) | 
+                (_MemoryRecord.object == r.object)
+            )
+        ).all()
+
+        for n in neighbors:
+            boost = src_activation * self.config.spread_probability
+            n.activation = (n.activation or 0.0) + boost
+            if n.level == 3:
+                n.level = 2
+            n.importance = max(0.0, min(1.0, n.importance + 0.05))  # slight associative boost
+            ASCIIColors.info(f"[Spreading Activation] Pre-warmed associated memory '{n.content[:40]}...' (New activation: {n.activation:.2f})")
+        session.flush()
+
     def tag(self, memory_id: str) -> Optional[Dict]:
         with self._session() as s:
             r = self._q(s).filter(_MemoryRecord.id == memory_id).first()
             if r is None: return None
-            r.importance = min(1.0, r.importance + self.config.tag_boost)
-            r.use_count += 1
-            r.last_used_at = datetime.utcnow()
-            r.updated_at = datetime.utcnow()
-            if r.level > 1: r.level = 1
+
+            now = datetime.utcnow()
+            log = _RetrievalLog(node_id=memory_id, retrieved_at=now)
+            s.add(log)
             s.flush()
 
-            # Cascade and pull associated memories into Level 2
+            r.importance = min(1.0, r.importance + self.config.tag_boost)
+            r.use_count += 1
+            r.last_used_at = now
+            r.updated_at = now
+            if r.level > 1: r.level = 1
+            
+            # Recalculate Petroff's activation value
+            r.activation = self.compute_petroff_activation(s, r.id, now)
+            s.flush()
+
+            # Cascade: Spreading Activation to linked semantic neighbors
             try:
-                self.auto_pull_associative_memories(memory_id)
+                self.spread_activation(s, r.id, now)
             except Exception as e:
-                ASCIIColors.warning(f"Associative memory propagation failed: {e}")
+                ASCIIColors.warning(f"Spreading activation failed: {e}")
 
             return self._to_dict(r)
 
@@ -753,4 +876,6 @@ class LollmsMemoryManager:
             "level": r.level, "importance": round(r.importance, 4), "use_count": r.use_count,
             "tags": r.tags, "subject_group": r.subject_group, "created_at": r.created_at.isoformat(),
             "updated_at": r.updated_at.isoformat(), "last_used_at": r.last_used_at.isoformat(),
+            "subject": r.subject, "predicate": r.predicate, "object": r.object,
+            "activation": round(r.activation, 4) if r.activation is not None else 0.0
         }

@@ -916,6 +916,7 @@ EXAMPLE OF CORRECT FORM:
         enable_skills:           bool = False,
         enable_forms:            bool = True,
         enable_silent_artefact_explanation: bool = True,
+        already_processed_artifacts: Optional[List[str]] = None,
     ) -> Tuple[str, List[Dict]]:
         """
         Scans the raw LLM response for XML action tags and applies them.
@@ -999,6 +1000,7 @@ EXAMPLE OF CORRECT FORM:
                 cleaned, auto_activate=auto_activate_artefacts,
                 replacements=code_blocks,
                 event_callback=_artefact_event,
+                already_processed_artifacts=already_processed_artifacts,
             )
 
         # ── 2. Image generation → message.images & Workspace Artifacts ──
@@ -1135,13 +1137,18 @@ EXAMPLE OF CORRECT FORM:
         # ── 5. Notes ──────────────────────────────────────────────────────────
         if has_note:
             note_pattern = re.compile(
-                r'<note\s*([^>]*)>(.*?)</note>',
+                r'<note\s*([^>]*?)>(.*?)</note>|<note\s*([^>]*?)/?>',
                 re.DOTALL | re.IGNORECASE,
             )
 
             def handle_note(match: re.Match) -> str:
-                attrs   = _parse_attrs(match.group(1))
-                content = match.group(2)
+                # Handle both standard tags and self-closing/attribute-based tags
+                if match.group(2) is not None:
+                    attrs   = _parse_attrs(match.group(1))
+                    content = match.group(2)
+                else:
+                    attrs   = _parse_attrs(match.group(3))
+                    content = attrs.get('content', attrs.get('Content', ''))
 
                 for placeholder, original in code_blocks.items():
                     content = content.replace(placeholder, original)

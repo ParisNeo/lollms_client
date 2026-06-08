@@ -125,10 +125,14 @@ document.addEventListener("DOMContentLoaded", () => {
     let currentBindingConfig = {};
     let availableTtiBindings = [];
     let currentTtiBindingConfig = {};
+    let availableSttBindings = [];
+    let currentSttBindingConfig = {};
     let discoveredLlmModels = [];
     let discoveredTtiModels = [];
+    let discoveredSttModels = [];
     let savedLlmConfigs = {};
     let savedTtiConfigs = {};
+    let savedSttConfigs = {};
     let isConfigLoading = false;
 
     // ── 🌿 Custom Asynchronous Modal Prompt (Drop-in replacement for window.prompt) ──
@@ -359,6 +363,15 @@ document.addEventListener("DOMContentLoaded", () => {
     const ttiModelSearch = document.getElementById("settings-tti-model-search");
     const ttiModelGroup = document.getElementById("settings-tti-model-group");
     const valTtiStatus = document.getElementById("settings-tti-validation-status");
+
+    // STT Configuration Selectors
+    const selSttBinding = document.getElementById("settings-stt-binding");
+    const sttConfigForm = document.getElementById("settings-stt-config-form");
+    const btnValidateStt = document.getElementById("btn-validate-stt-binding");
+    const selSttModel = document.getElementById("settings-stt-model");
+    const sttModelSearch = document.getElementById("settings-stt-model-search");
+    const sttModelGroup = document.getElementById("settings-stt-model-group");
+    const valSttStatus = document.getElementById("settings-stt-validation-status");
 
     // LLM Model Search Selector
     const llmModelSearch = document.getElementById("settings-llm-model-search");
@@ -641,6 +654,8 @@ document.addEventListener("DOMContentLoaded", () => {
         importModal.style.display = "none";
     });
 
+
+    
     // Bulletproof click-outside closure tracking (prevents accidental close during text selection drags)
     let isMouseDownOnImportOverlay = false;
     importModal.addEventListener("mousedown", (e) => {
@@ -1939,7 +1954,7 @@ document.addEventListener("DOMContentLoaded", () => {
             // Cache the loaded data
             datasetCache.set(cacheKey, data);
 
-            if (data.type === "excel" || data.type === "sqlite") {
+            if (data.type === "excel" || data.type === "sqlite" || data.type === "sql_connection") {
                 renderTabbedSheets(data, docTitle, containerElement);
             } else {
                 renderFlatTable(data, docTitle, containerElement);
@@ -2379,20 +2394,34 @@ document.addEventListener("DOMContentLoaded", () => {
                 const decoder = new TextDecoder();
                 let buffer = "";
 
+                function processImportLine(line) {
+                    const trimmed = line.trim();
+                    if (trimmed.startsWith("data: ")) {
+                        try {
+                            const rawJson = trimmed.slice(6);
+                            const event = JSON.parse(rawJson);
+                            handleStreamEvent(event, currentNum, totalNum);
+                        } catch (e) {
+                            console.error("Failed to parse import event:", e);
+                        }
+                    }
+                }
+
                 while (true) {
                     const { value, done } = await reader.read();
-                    if (done) break;
+                    if (done) {
+                        if (buffer.trim()) {
+                            processImportLine(buffer);
+                        }
+                        break;
+                    }
 
                     buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split("\n\n");
+                    let lines = buffer.split(/\r?\n/);
                     buffer = lines.pop();
 
                     for (const line of lines) {
-                        if (line.trim().startsWith("data: ")) {
-                            const rawJson = line.trim().slice(6);
-                            const event = JSON.parse(rawJson);
-                            handleStreamEvent(event, currentNum, totalNum);
-                        }
+                        processImportLine(line);
                     }
                 }
             } catch (err) {
@@ -2701,17 +2730,11 @@ document.addEventListener("DOMContentLoaded", () => {
             const decoder = new TextDecoder();
             let buffer = "";
 
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split("\n\n");
-                buffer = lines.pop();
-
-                for (const line of lines) {
-                    if (line.trim().startsWith("data: ")) {
-                        const rawJson = line.trim().slice(6);
+            function processSkillLine(line) {
+                const trimmed = line.trim();
+                if (trimmed.startsWith("data: ")) {
+                    try {
+                        const rawJson = trimmed.slice(6);
                         const event = JSON.parse(rawJson);
                         if (event.type === "result") {
                             alert("Successfully loaded skill: '" + event.title + "'!");
@@ -2720,7 +2743,27 @@ document.addEventListener("DOMContentLoaded", () => {
                         } else if (event.type === "error") {
                             alert("Error: " + event.message);
                         }
+                    } catch (e) {
+                        console.error("Failed to parse skill import event:", e);
                     }
+                }
+            }
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) {
+                    if (buffer.trim()) {
+                        processSkillLine(buffer);
+                    }
+                    break;
+                }
+
+                buffer += decoder.decode(value, { stream: true });
+                let lines = buffer.split(/\r?\n/);
+                buffer = lines.pop();
+
+                for (const line of lines) {
+                    processSkillLine(line);
                 }
             }
         } catch (err) {
@@ -3289,6 +3332,24 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
+    async function fetchSttBindings() {
+        try {
+            const res = await fetch("/api/bindings/stt");
+            const data = await res.json();
+            if (data.success) {
+                const currentValue = selSttBinding.value;
+                availableSttBindings = data.bindings;
+                selSttBinding.innerHTML = `<option value="">-- Select STT Binding --</option>` +
+                    availableSttBindings.map(b => `<option value="${b.binding_name}">${b.title || b.binding_name}</option>`).join("");
+                if (currentValue) {
+                    selSttBinding.value = currentValue;
+                }
+            }
+        } catch (err) {
+            console.error("Failed to fetch STT bindings:", err);
+        }
+    }
+
     async function fetchTtiBindings() {
         try {
             const res = await fetch("/api/bindings/tti");
@@ -3305,6 +3366,74 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (err) {
             console.error("Failed to fetch TTI bindings:", err);
         }
+    }
+
+    function renderSttConfigForm(bindingName) {
+        const binding = availableSttBindings.find(b => b.binding_name === bindingName);
+        if (!binding || !binding.input_parameters) {
+            sttConfigForm.innerHTML = `<p class="empty-msg">No configurable parameters for this STT binding.</p>`;
+            return;
+        }
+
+        const savedConfig = savedSttConfigs[bindingName] || {};
+
+        sttConfigForm.innerHTML = binding.input_parameters.map(p => {
+            if (p.name === "model_name") return "";
+            const key = p.name;
+            const label = p.name.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
+            const type = p.type || "string";
+
+            const defaultVal = savedConfig[key] !== undefined ? savedConfig[key] : (p.default !== undefined ? p.default : "");
+            const desc = p.description || "";
+
+            const isSecret = key.toLowerCase().includes("key") || key.toLowerCase().includes("token") || p.is_secret;
+
+            if (type === "bool" || type === "boolean") {
+                return `
+                    <div class="input-group">
+                        <label style="flex-direction:row; align-items:center; gap:8px; text-transform:none;">
+                            <input type="checkbox" id="stt-cfg-${key}" data-stt-key="${key}" ${defaultVal ? "checked" : ""} />
+                            <span>${label}</span>
+                        </label>
+                        <span style="font-size:10px; color:var(--text-secondary); margin-top:2px;">${desc}</span>
+                    </div>`;
+            } else if (type === "int" || type === "integer" || type === "float" || type === "number") {
+                return `
+                    <div class="input-group">
+                        <label for="stt-cfg-${key}">${label}</label>
+                        <input type="number" id="stt-cfg-${key}" data-stt-key="${key}" data-type="${type}" value="${defaultVal}" step="${type === 'float' || type === 'number' ? '0.01' : '1'}" />
+                        <span style="font-size:10px; color:var(--text-secondary); margin-top:2px;">${desc}</span>
+                    </div>`;
+            } else if (isSecret) {
+                return `
+                    <div class="input-group">
+                        <label for="stt-cfg-${key}">${label}</label>
+                        <div style="position: relative; display: flex; align-items: center; width: 100%;">
+                            <input type="password" id="stt-cfg-${key}" data-stt-key="${key}" value="${defaultVal}" placeholder="${desc}" style="padding-right: 40px;" />
+                            <button type="button" class="btn-toggle-secret" data-target="stt-cfg-${key}" style="position: absolute; right: 8px; background: none; border: none; color: var(--accent-color); cursor: pointer; font-size: 16px; outline: none; padding: 4px;" title="Toggle Visibility">👁️</button>
+                        </div>
+                        <span style="font-size:10px; color:var(--text-secondary); margin-top:2px;">${desc}</span>
+                    </div>`;
+            } else {
+                return `
+                    <div class="input-group">
+                        <label for="stt-cfg-${key}">${label}</label>
+                        <input type="text" id="stt-cfg-${key}" data-stt-key="${key}" value="${defaultVal}" placeholder="${desc}" />
+                        <span style="font-size:10px; color:var(--text-secondary); margin-top:2px;">${desc}</span>
+                    </div>`;
+            }
+        }).join("");
+
+        sttConfigForm.querySelectorAll(".btn-toggle-secret").forEach(btn => {
+            btn.addEventListener("click", () => {
+                const targetInput = document.getElementById(btn.dataset.target);
+                if (targetInput) {
+                    const isPassword = targetInput.type === "password";
+                    targetInput.type = isPassword ? "text" : "password";
+                    btn.textContent = isPassword ? "🔒" : "👁️";
+                }
+            });
+        });
     }
 
     function renderTtiConfigForm(bindingName) {
@@ -3378,6 +3507,25 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    function collectSttBindingConfig() {
+        const inputs = sttConfigForm.querySelectorAll("[data-stt-key]");
+        const cfg = {};
+        inputs.forEach(inp => {
+            const key = inp.dataset.sttKey || inp.getAttribute("data-stt-key");
+            const type = inp.dataset.type || "string";
+            if (inp.type === "checkbox") {
+                cfg[key] = inp.checked;
+            } else if (type === "int" || type === "integer") {
+                cfg[key] = parseInt(inp.value, 10);
+            } else if (type === "float" || type === "number") {
+                cfg[key] = parseFloat(inp.value);
+            } else {
+                cfg[key] = inp.value;
+            }
+        });
+        return cfg;
+    }
+
     function collectTtiBindingConfig() {
         const inputs = ttiConfigForm.querySelectorAll("[data-tti-key]");
         const cfg = {};
@@ -3395,6 +3543,15 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         });
         return cfg;
+    }
+
+    function renderSttModelDropdown(modelsList) {
+        selSttModel.innerHTML = modelsList.map(m => {
+            const value = m.model_name || m.name || m.id || m;
+            const label = m.display_name || value;
+            return `<option value="${value}">${label}</option>`;
+        }).join("");
+        selSttModel.dispatchEvent(new Event("change"));
     }
 
     function renderTtiModelDropdown(modelsList) {
@@ -3545,6 +3702,84 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         });
     }
+
+    sttModelSearch.addEventListener("input", (e) => {
+        const query = e.target.value.toLowerCase().trim();
+        if (!query) {
+            renderSttModelDropdown(discoveredSttModels);
+            return;
+        }
+        const filtered = discoveredSttModels.filter(m => {
+            const value = m.model_name || m.name || m.id || m;
+            const label = m.display_name || value;
+            return value.toLowerCase().includes(query) || label.toLowerCase().includes(query);
+        });
+        renderSttModelDropdown(filtered);
+    });
+
+    selSttBinding.addEventListener("change", () => {
+        if (isConfigLoading) return;
+        const prevSttBinding = selSttBinding.dataset.prevSttBinding || "";
+        if (selSttBinding.value === prevSttBinding) return;
+
+        if (prevSttBinding) {
+            savedSttConfigs[prevSttBinding] = collectSttBindingConfig();
+        }
+        selSttBinding.dataset.prevSttBinding = selSttBinding.value;
+
+        sttModelGroup.style.display = "none";
+        valSttStatus.className = "validation-status";
+        valSttStatus.textContent = "";
+        renderSttConfigForm(selSttBinding.value);
+    });
+
+    btnValidateStt.addEventListener("click", async () => {
+        if (!selSttBinding.value) {
+            valSttStatus.className = "validation-status error";
+            valSttStatus.textContent = "Please select an STT binding first.";
+            return;
+        }
+        btnValidateStt.disabled = true;
+        btnValidateStt.textContent = "Validating...";
+        valSttStatus.className = "validation-status";
+        valSttStatus.textContent = "Connecting to STT service...";
+
+        const payload = {
+            binding_name: selSttBinding.value,
+            config: collectSttBindingConfig()
+        };
+
+        try {
+            const res = await fetch("/api/bindings/stt/test", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+
+            if (data.success && Array.isArray(data.models)) {
+                valSttStatus.className = "validation-status success";
+                valSttStatus.textContent = `✅ Connection successful. Found ${data.models.length} model(s).`;
+
+                discoveredSttModels = data.models;
+                sttModelSearch.value = "";
+
+                renderSttModelDropdown(discoveredSttModels);
+                sttModelGroup.style.display = "flex";
+                currentSttBindingConfig = payload.config;
+            } else {
+                valSttStatus.className = "validation-status error";
+                valSttStatus.textContent = `❌ Validation failed: ${data.error || "Could not reach STT process."}`;
+                sttModelGroup.style.display = "none";
+            }
+        } catch (err) {
+            valSttStatus.className = "validation-status error";
+            valSttStatus.textContent = `❌ Request failed: ${err}`;
+        } finally {
+            btnValidateStt.disabled = false;
+            btnValidateStt.textContent = "🔌 Validate & Load Models";
+        }
+    });
 
     selTtiBinding.addEventListener("change", () => {
         if (isConfigLoading) return;
@@ -3979,6 +4214,21 @@ document.addEventListener("DOMContentLoaded", () => {
                 payload["tti_binding_config"] = { ...collectTtiBindingConfig(), model_name: selTtiModel.value };
             }
 
+            // Collect optional STT configuration directly from the form inputs
+            if (selSttBinding.value && selSttModel.value) {
+                payload["stt_binding_name"] = selSttBinding.value;
+                payload["stt_binding_config"] = { ...collectSttBindingConfig(), model_name: selSttModel.value };
+            }
+
+            // Collect optional Internet Search configuration directly from the form inputs
+            const internetConfig = {
+                google_api_key: document.getElementById("settings-google-api-key").value.trim(),
+                google_cse_id: document.getElementById("settings-google-cse-id").value.trim(),
+                scopus_api_key: document.getElementById("settings-scopus-api-key").value.trim(),
+                scopus_inst_token: document.getElementById("settings-scopus-inst-token").value.trim()
+            };
+            payload["internet_config"] = internetConfig;
+
             try {
                 const res = await fetch("/api/settings", {
                     method: "POST",
@@ -4210,6 +4460,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
             savedLlmConfigs = data.llm_bindings_configs || {};
             savedTtiConfigs = data.tti_bindings_configs || {};
+            savedSttConfigs = data.stt_bindings_configs || {};
+
+            // Populate Internet config inputs
+            const internetConfig = data.internet_config || {};
+            document.getElementById("settings-google-api-key").value = internetConfig.google_api_key || "";
+            document.getElementById("settings-google-cse-id").value = internetConfig.google_cse_id || "";
+            document.getElementById("settings-scopus-api-key").value = internetConfig.scopus_api_key || "";
+            document.getElementById("settings-scopus-inst-token").value = internetConfig.scopus_inst_token || "";
 
             // First, load all binding options
             await fetchBindings();
@@ -4217,6 +4475,7 @@ document.addEventListener("DOMContentLoaded", () => {
             console.log("📋 SelBinding options:", Array.from(selBinding.options).map(o => o.value));
 
             await fetchTtiBindings();
+            await fetchSttBindings();
             await fetchProfiles();
 
             if (data.success && data.llm_binding_name) {
@@ -4361,6 +4620,54 @@ document.addEventListener("DOMContentLoaded", () => {
                     }
                 }
 
+                if (data.stt_binding_name) {
+                    const sttBindingExists = availableSttBindings.some(b => b.binding_name === data.stt_binding_name);
+
+                    if (sttBindingExists) {
+                        selSttBinding.value = data.stt_binding_name;
+                        selSttBinding.dataset.prevSttBinding = data.stt_binding_name;
+                        console.log("⚙️ STT Pre-selecting binding:", data.stt_binding_name);
+
+                        setTimeout(() => {
+                            const sttChangeEvent = new Event('change', { bubbles: true });
+                            selSttBinding.dispatchEvent(sttChangeEvent);
+                        }, 100);
+
+                        renderSttConfigForm(data.stt_binding_name);
+
+                        const sttConfig = data.stt_binding_config || {};
+                        for (const [key, value] of Object.entries(sttConfig)) {
+                            const input = document.getElementById(`stt-cfg-${key}`);
+                            if (input) {
+                                if (input.type === "checkbox") {
+                                    input.checked = !!value;
+                                } else {
+                                    input.value = Array.isArray(value) ? JSON.stringify(value) : value;
+                                }
+                            }
+                        }
+
+                        // Trigger validation with STT config directly
+                        const sttValRes = await fetch("/api/bindings/stt/test", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ binding_name: data.stt_binding_name, config: sttConfig })
+                        });
+                        const sttValData = await sttValRes.json();
+                        if (sttValData.success && Array.isArray(sttValData.models)) {
+                            discoveredSttModels = sttValData.models;
+                            renderSttModelDropdown(discoveredSttModels);
+                            sttModelGroup.style.display = "flex";
+                            currentSttBindingConfig = sttConfig;
+
+                            if (sttConfig.model_name) {
+                                selSttModel.value = sttConfig.model_name;
+                                selSttModel.dispatchEvent(new Event("change"));
+                            }
+                        }
+                    }
+                }
+
                 if (data.personality_name) {
                     setTimeout(() => {
                         headerPersonality.value = data.personality_name;
@@ -4409,6 +4716,124 @@ document.addEventListener("DOMContentLoaded", () => {
 
     btnCloseExportModal.addEventListener("click", closeExportModal);
     btnCancelExport.addEventListener("click", closeExportModal);
+
+    // ── Memory Network Graph Modal Handlers ──
+    const btnViewGraph = document.getElementById("btn-view-memory-graph");
+    const memoryGraphModal = document.getElementById("memory-graph-modal");
+    const btnCloseGraph = document.getElementById("btn-close-memory-graph");
+    const graphViewport = document.getElementById("memory-graph-viewport");
+
+    if (btnViewGraph) {
+        btnViewGraph.addEventListener("click", () => {
+            memoryGraphModal.style.display = "flex";
+            renderMemoryNetworkGraph();
+        });
+    }
+
+    if (btnCloseGraph) {
+        btnCloseGraph.addEventListener("click", () => {
+            memoryGraphModal.style.display = "none";
+        });
+    }
+
+    // Bulletproof click-outside closure tracking for memory graph modal
+    let isMouseDownOnGraphOverlay = false;
+    if (memoryGraphModal) {
+        memoryGraphModal.addEventListener("mousedown", (e) => {
+            isMouseDownOnGraphOverlay = (e.target === memoryGraphModal);
+        });
+        memoryGraphModal.addEventListener("mouseup", (e) => {
+            if (isMouseDownOnGraphOverlay && e.target === memoryGraphModal) {
+                memoryGraphModal.style.display = "none";
+            }
+            isMouseDownOnGraphOverlay = false;
+        });
+    }
+
+    function renderMemoryNetworkGraph() {
+        if (!cachedMemories || cachedMemories.length === 0) {
+            graphViewport.innerHTML = `<div class="empty-viewer-msg">No memories available to graph.</div>`;
+            return;
+        }
+
+        // Filter memories that have semantic triples
+        const tripleMems = cachedMemories.filter(m => m.subject && m.object);
+        if (tripleMems.length === 0) {
+            graphViewport.innerHTML = `<div class="empty-viewer-msg">No semantic triple connections (Subject/Object) found to build a graph. Add some relational memories first!</div>`;
+            return;
+        }
+
+        graphViewport.innerHTML = `<div class="empty-viewer-msg"><span class="spinner inline" style="margin-right: 8px;"></span> Rendering Semantic Memory Network...</div>`;
+
+        try {
+            const dot = generateMemoryGraphDot(tripleMems);
+            const viz = new Viz();
+            viz.renderSVGElement(dot)
+                .then(element => {
+                    element.style.width = "100%";
+                    element.style.height = "100%";
+                    graphViewport.innerHTML = "";
+                    graphViewport.appendChild(element);
+                })
+                .catch(err => {
+                    console.error(err);
+                    graphViewport.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444;">Graph rendering failed: ${err.message || err}</div>`;
+                });
+        } catch (err) {
+            graphViewport.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444;">Viz.js initialization failed: ${err.message || err}</div>`;
+        }
+    }
+
+    function generateMemoryGraphDot(memories) {
+        let dot = 'digraph G {\n';
+        dot += '  background="transparent";\n';
+        dot += '  node [fontname="Helvetica", fontsize=10, style="filled", shape="box", penwidth=1.5];\n';
+        dot += '  edge [fontname="Helvetica", fontsize=8, color="#818cf8", fontcolor="#cbd5e1", arrowsize=0.6];\n';
+
+        const declaredNodes = new Set();
+
+        memories.forEach(m => {
+            const sub = m.subject || "unknown";
+            const obj = m.object || "unknown";
+            const pred = m.predicate || "RELATED_TO";
+
+            const subId = makeSafeId(sub);
+            const objId = makeSafeId(obj);
+
+            // Color based on activation
+            let fillColor = "#1e293b"; // dark slate
+            let fontColor = "#cbd5e1";
+            let borderColor = "#334155";
+
+            const activation = m.activation || 0.0;
+            if (activation > 2.0) {
+                fillColor = "#78350f"; // glowing amber
+                borderColor = "#f59e0b";
+                fontColor = "#fef3c7";
+            } else if (activation > 0.0) {
+                fillColor = "rgba(245, 158, 11, 0.15)";
+                borderColor = "#d97706";
+            } else if (m.level === 3) {
+                fillColor = "#0f172a"; // faded
+                borderColor = "rgba(51, 65, 85, 0.3)";
+                fontColor = "#64748b";
+            }
+
+            if (!declaredNodes.has(subId)) {
+                dot += `  ${subId} [label="${sub.toUpperCase()}", fillcolor="${fillColor}", color="${borderColor}", fontcolor="${fontColor}"];\n`;
+                declaredNodes.add(subId);
+            }
+            if (!declaredNodes.has(objId)) {
+                dot += `  ${objId} [label="${obj.toUpperCase()}", fillcolor="${fillColor}", color="${borderColor}", fontcolor="${fontColor}"];\n`;
+                declaredNodes.add(objId);
+            }
+
+            dot += `  ${subId} -> ${objId} [label="${pred}"];\n`;
+        });
+
+        dot += '}\n';
+        return dot;
+    }
 
     // ── Settings Sub-Tabs Navigation (Parameters vs Custom Commands) ──
     // Settings Sub-Tabs Navigation (Parameters vs Custom Commands)
@@ -5798,22 +6223,55 @@ document.addEventListener("DOMContentLoaded", () => {
         const labels = { 1: "Working", 2: "Deep", 3: "Archived", 4: "Episodic" };
         const classes = { 1: "working", 2: "deep", 3: "archived", 4: "episodic" };
 
-        memoriesList.innerHTML = filtered.map(m => `
-            <li class="memory-card ${classes[m.level]}" data-mem-id="${m.id}">
-                <div class="memory-header">
-                    <span class="level-tag ${classes[m.level]}">${labels[m.level]} (Level ${m.level})</span>
-                    <span class="importance-badge">Imp: ${(m.importance * 100).toFixed(0)}%</span>
-                </div>
-                <p class="desc-text" style="color: var(--text-primary); margin-top: 6px; white-space: pre-wrap; line-height: 1.4;">${m.content}</p>
-                <div class="details" style="font-size: 10px; margin-top: 4px;">Uses: ${m.use_count} · ID: ${m.id.substring(0, 8)}</div>
-                <div class="memory-actions" style="margin-top: 8px;">
-                    <button class="mem-btn" data-action="up" title="Promote (decrease level)">⬆️</button>
-                    <button class="mem-btn" data-action="down" title="Demote (increase level)">⬇️</button>
-                    <button class="mem-btn" data-action="imp" title="Edit importance">⚡</button>
-                    <button class="mem-btn" data-action="del" title="Delete memory">🗑️</button>
-                </div>
-            </li>
-        `).join("");
+        memoriesList.innerHTML = filtered.map(m => {
+            let tripleHtml = "";
+            if (m.subject && m.object) {
+                tripleHtml = `
+                    <div class="memory-triple-badge" style="display: inline-flex; align-items: center; gap: 4px; font-family: monospace; font-size: 9px; background-color: rgba(79, 70, 229, 0.1); color: #818cf8; border: 1px solid rgba(79, 70, 229, 0.2); padding: 2px 6px; border-radius: 4px; margin-top: 6px; user-select: none;">
+                        <strong>${m.subject}</strong> --[${m.predicate || 'RELATED_TO'}]--> <strong>${m.object}</strong>
+                    </div>
+                `;
+            }
+
+            let activationHtml = "";
+            if (m.activation !== undefined && m.activation !== null) {
+                const actVal = parseFloat(m.activation);
+                const actPct = Math.min(100, Math.max(0, (actVal + 5) * 10)); // Map -5..5 range to 0..100%
+                let actClass = "neutral";
+                if (actVal > 2.0) {
+                    actClass = "glowing";
+                } else if (actVal < -1.0) {
+                    actClass = "faded";
+                }
+                activationHtml = `
+                    <div class="memory-activation-container" style="display: flex; align-items: center; gap: 8px; margin-top: 6px; user-select: none;">
+                        <span style="font-size: 9px; font-weight: bold; color: var(--text-secondary); text-transform: uppercase;">Activation (${actVal.toFixed(1)})</span>
+                        <div style="flex: 1; height: 4px; background-color: #020617; border-radius: 2px; overflow: hidden; border: 1px solid var(--border-color); display: flex;">
+                            <div class="activation-bar ${actClass}" style="width: ${actPct}%; height: 100%; transition: width 0.3s;"></div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            return `
+                <li class="memory-card ${classes[m.level]}" data-mem-id="${m.id}">
+                    <div class="memory-header">
+                        <span class="level-tag ${classes[m.level]}">${labels[m.level]} (Level ${m.level})</span>
+                        <span class="importance-badge">Imp: ${(m.importance * 100).toFixed(0)}%</span>
+                    </div>
+                    <p class="desc-text" style="color: var(--text-primary); margin-top: 6px; white-space: pre-wrap; line-height: 1.4;">${m.content}</p>
+                    ${tripleHtml}
+                    ${activationHtml}
+                    <div class="details" style="font-size: 10px; margin-top: 6px;">Uses: ${m.use_count} · ID: ${m.id.substring(0, 8)}</div>
+                    <div class="memory-actions" style="margin-top: 8px;">
+                        <button class="mem-btn" data-action="up" title="Promote (decrease level)">⬆️</button>
+                        <button class="mem-btn" data-action="down" title="Demote (increase level)">⬇️</button>
+                        <button class="mem-btn" data-action="imp" title="Edit importance">⚡</button>
+                        <button class="mem-btn" data-action="del" title="Delete memory">🗑️</button>
+                    </div>
+                </li>
+            `;
+        }).join("");
 
         // Bind click actions to the newly rendered cards
         memoriesList.querySelectorAll(".memory-actions .mem-btn").forEach(btn => {
@@ -5991,131 +6449,132 @@ document.addEventListener("DOMContentLoaded", () => {
             const decoder = new TextDecoder();
             let buffer = "";
 
+            function processStreamLine(line) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith("data: ")) return;
+
+                try {
+                    const rawJson = trimmed.slice(6);
+                    const event = JSON.parse(rawJson);
+
+                    if (event.error) {
+                        if (proseSpan) proseSpan.innerHTML = `<span style="color: #ef4444;">Error: ${event.error}</span>`;
+                        return;
+                    }
+
+                    const meta = event.meta || {};
+                    const evType = meta.type;
+
+                    if (event.msg_type === "MSG_TYPE_NEW_MESSAGE") {
+                        activeMsgId = event.chunk;
+                        renderMessageBubble(activeMsgId, "assistant", "Lollms is thinking...", {
+                            model_name: headerModel.value || "unknown",
+                            tokens: 0,
+                            speed: 0,
+                            ttft: null
+                        });
+
+                        const assistantBubble = chatHistory.querySelector(`.chat-bubble.assistant[data-msg-id="${activeMsgId}"]`);
+                        if (assistantBubble) {
+                            bubbleContentDiv = assistantBubble.querySelector(".chat-assistant-container");
+                            proseSpan = assistantBubble.querySelector(".prose-span");
+                        }
+                        return;
+                    }
+
+                    if (event.msg_type === "MSG_TYPE_ARTEFACTS_STATE_CHANGED") {
+                        if (meta.artefact && meta.artefact.title) {
+                            chatAffectedArtifacts.add(meta.artefact.title);
+                        }
+                        return;
+                    }
+
+                    if (event.msg_type === "MSG_TYPE_ARTEFACT_CHUNK") {
+                        const title = meta.title;
+                        const chunk = event.chunk;
+                        const safeId = makeSafeId(title);
+
+                        if (!openTabs.has(title)) {
+                            createArtifactTab(title, meta.art_type || "code");
+                            switchCenterTab(`tab-art-${safeId}`);
+                        }
+
+                        const rawView = document.getElementById(`raw-view-${safeId}`);
+                        if (rawView) {
+                            rawView.value += chunk;
+                            if (codeEditors[title]) {
+                                const editor = codeEditors[title];
+                                const doc = editor.getDoc();
+                                editor.replaceRange(chunk, { line: doc.lineCount() });
+                            }
+                        }
+                        return;
+                    }
+
+                    if ((event.msg_type === "MSG_TYPE_CHUNK" || event.msg_type === "MSG_TYPE_CODING_PLAN_CHUNK") && proseSpan) {
+                        if (event.chunk) {
+                            if (ttft === null && currentProse === "") {
+                                ttft = (Date.now() - startTime) / 1000;
+                            }
+
+                            if (currentProse === "") {
+                                proseSpan.innerHTML = "";
+                            }
+
+                            currentProse += event.chunk;
+                            const cleanedProse = runMarkdownCleanup(currentProse);
+                            const processedText = resolveProcessingTags(cleanedProse);
+
+                            const placeholders = {};
+                            let maskedText = processedText;
+
+                            const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
+                            maskedText = maskedText.replace(inlinePattern, (match) => {
+                                const id = `__WIDGET_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+                                placeholders[id] = match;
+                                return id;
+                            });
+
+                            const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
+                            maskedText = maskedText.replace(formPattern, (match) => {
+                                const id = `__FORM_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+                                placeholders[id] = match;
+                                return id;
+                            });
+
+                            const parsedMarkdown = marked.parse(maskedText);
+
+                            let restoredHTML = parsedMarkdown;
+                            for (const [id, original] of Object.entries(placeholders)) {
+                                restoredHTML = restoredHTML.replace(id, original);
+                            }
+
+                            const resolvedHTML = resolveImageAnchors(restoredHTML, activeArtifactTitle, activeMsgId);
+                            proseSpan.innerHTML = resolvedHTML;
+                            renderMath(proseSpan);
+                            chatHistory.scrollTop = chatHistory.scrollHeight;
+                        }
+                    }
+                } catch (e) {
+                    console.error("Failed to parse stream JSON:", e, trimmed);
+                }
+            }
+
             while (true) {
                 const { value, done } = await reader.read();
-                if (done) break;
+                if (done) {
+                    if (buffer.trim()) {
+                        processStreamLine(buffer);
+                    }
+                    break;
+                }
 
                 buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split("\n\n");
+                let lines = buffer.split(/\r?\n/);
                 buffer = lines.pop();
 
                 for (const line of lines) {
-                    if (line.trim().startsWith("data: ")) {
-                        const rawJson = line.trim().slice(6);
-                        const event = JSON.parse(rawJson);
-
-                        if (event.error) {
-                            if (proseSpan) proseSpan.innerHTML = `<span style="color: #ef4444;">Error: ${event.error}</span>`;
-                            break;
-                        }
-
-                        const meta = event.meta || {};
-                        const evType = meta.type;
-
-                        if (event.msg_type === "MSG_TYPE_NEW_MESSAGE") {
-                            // Backend initialized a new message node. 
-                            activeMsgId = event.chunk; // returns message_id
-
-                            // Surgically append the new assistant bubble directly to the DOM
-                            // This completely prevents duplicate bubble rendering and race conditions!
-                            renderMessageBubble(activeMsgId, "assistant", "Lollms is thinking...", {
-                                model_name: headerModel.value || "unknown",
-                                tokens: 0,
-                                speed: 0,
-                                ttft: null
-                            });
-
-                            // Bind stream target variables to the newly appended bubble
-                            const assistantBubble = chatHistory.querySelector(`.chat-bubble.assistant[data-msg-id="${activeMsgId}"]`);
-                            if (assistantBubble) {
-                                bubbleContentDiv = assistantBubble.querySelector(".chat-assistant-container");
-                                proseSpan = assistantBubble.querySelector(".prose-span");
-                            }
-                            continue;
-                        }
-
-                        if (event.msg_type === "MSG_TYPE_ARTEFACTS_STATE_CHANGED") {
-                            if (meta.artefact && meta.artefact.title) {
-                                chatAffectedArtifacts.add(meta.artefact.title);
-                            }
-                            continue;
-                        }
-
-                        if (event.msg_type === "MSG_TYPE_ARTEFACT_CHUNK") {
-                            const title = meta.title;
-                            const chunk = event.chunk;
-                            const safeId = makeSafeId(title);
-
-                            // Automatically open and switch to the artifact tab on the first streaming chunk
-                            if (!openTabs.has(title)) {
-                                createArtifactTab(title, meta.art_type || "code");
-                                switchCenterTab(`tab-art-${safeId}`);
-                            }
-
-                            const rawView = document.getElementById(`raw-view-${safeId}`);
-                            if (rawView) {
-                                rawView.value += chunk;
-
-                                // Dynamically append to CodeMirror editor if active
-                                if (codeEditors[title]) {
-                                    const editor = codeEditors[title];
-                                    const doc = editor.getDoc();
-                                    editor.replaceRange(chunk, { line: doc.lineCount() });
-                                }
-                            }
-                            continue;
-                        }
-
-                        if (event.msg_type === "MSG_TYPE_CHUNK" && proseSpan) {
-                            if (event.chunk) {
-                                // ── ⏱️ Measure Time to First Token ──
-                                if (ttft === null && currentProse === "") {
-                                    ttft = (Date.now() - startTime) / 1000;
-                                }
-
-                                if (currentProse === "") {
-                                    proseSpan.innerHTML = "";
-                                }
-
-                                currentProse += event.chunk;
-                                const cleanedProse = runMarkdownCleanup(currentProse);
-                                const processedText = resolveProcessingTags(cleanedProse);
-
-                                // ── MASK SYSTEM (Prevents marked.parse from corrupting nested XML tags) ──
-                                const placeholders = {};
-                                let maskedText = processedText;
-
-                                // Mask <lollms_inline> blocks
-                                const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
-                                maskedText = maskedText.replace(inlinePattern, (match) => {
-                                    const id = `__WIDGET_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
-                                    placeholders[id] = match;
-                                    return id;
-                                });
-
-                                // Mask <lollms_form> blocks
-                                const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
-                                maskedText = maskedText.replace(formPattern, (match) => {
-                                    const id = `__FORM_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
-                                    placeholders[id] = match;
-                                    return id;
-                                });
-
-                                const parsedMarkdown = marked.parse(maskedText);
-
-                                // Restore masked placeholders
-                                let restoredHTML = parsedMarkdown;
-                                for (const [id, original] of Object.entries(placeholders)) {
-                                    restoredHTML = restoredHTML.replace(id, original);
-                                }
-
-                                const resolvedHTML = resolveImageAnchors(restoredHTML, activeArtifactTitle, activeMsgId);
-                                proseSpan.innerHTML = resolvedHTML;
-                                renderMath(proseSpan);
-                                chatHistory.scrollTop = chatHistory.scrollHeight;
-                            }
-                        }
-                    }
+                    processStreamLine(line);
                 }
             }
         } catch (err) {
@@ -6292,17 +6751,7 @@ function resolveProcessingTags(content) {
     const thinkPattern = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
     content = content.replace(thinkPattern, (match, bodyText) => {
         const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
-        return `
-            <details class="inline-proc-accordion" open style="border-color: rgba(147, 51, 234, 0.15);">
-                <summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05);">
-                    <span class="chevron">▶</span>
-                    <span>💭 Thought Process / Reasoning</span>
-                </summary>
-                <div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15);">
-                    <pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre>
-                </div>
-            </details>
-        `;
+        return `<details class="inline-proc-accordion" open style="border-color: rgba(147, 51, 234, 0.15);"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05);"><span class="chevron">▶</span><span>💭 Thought Process / Reasoning</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15);"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
     });
 
     const procPattern = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;

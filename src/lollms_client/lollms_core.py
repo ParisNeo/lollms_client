@@ -73,6 +73,14 @@ class LollmsClient():
         """
 
         self.debug = debug
+        if not self.debug:
+            import logging
+            logging.getLogger("ASCIIColors").setLevel(logging.WARNING)
+            from ascii_colors import ASCIIColors
+            for method_name in ["info", "success", "cyan", "blue", "green", "panel"]:
+                if hasattr(ASCIIColors, method_name):
+                    setattr(ASCIIColors, method_name, lambda *args, **kwargs: None)
+
         self.cooperative_vram_management = cooperative_vram_management
         if callback: callback("🚀 Initializing **Lollms Client**...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
         

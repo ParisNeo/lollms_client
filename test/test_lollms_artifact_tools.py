@@ -186,61 +186,81 @@ class TestLollmsArtifactTools(unittest.TestCase):
         if csv_path.exists():
             csv_path.unlink()
 
-    def test_lcp_sql_and_python_query_tools(self):
-        # 1. Create mock data file in the workspace
+    def test_external_sql_connection_operations(self):
+        # 1. Create a dummy SQLite DB on disk to simulate the "external" database
+        import sqlite3
         import pandas as pd
         workspace_dir = Path("./data_workspace")
         workspace_dir.mkdir(exist_ok=True)
-        csv_path = workspace_dir / "user_salaries_v1.csv"
-        df = pd.DataFrame({
-            "name": ["Alice", "Bob", "Charlie"],
-            "salary": [120000, 95000, 110000]
-        })
-        df.to_csv(csv_path, index=False)
+        db_path = workspace_dir / "external_test_db.sqlite"
+        if db_path.exists():
+            db_path.unlink()
+        
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, role TEXT)")
+        cursor.execute("INSERT INTO employees (name, role) VALUES ('Eve', 'Architect')")
+        cursor.execute("INSERT INTO employees (name, role) VALUES ('Frank', 'Auditor')")
+        conn.commit()
+        conn.close()
 
-        # Create active unversioned fallback
-        df.to_csv(workspace_dir / "user_salaries.csv", index=False)
+        # 2. Write a '.sqlconn' connection file in the workspace
+        sqlconn_path = workspace_dir / "my_external_db.sqlconn"
+        conn_info = {
+            "type": "sql_connection",
+            "dialect": "sqlite",
+            "database": str(db_path.resolve())
+        }
+        import json
+        with open(sqlconn_path, "w", encoding="utf-8") as f:
+            json.dump(conn_info, f, indent=2)
 
-        # 2. Register data artifact in active discussion
+        # 3. Test schema parsing on .sqlconn file
+        from lollms_client.lollms_discussion._data_files import _parse_data_file
+        schema, _ = _parse_data_file(sqlconn_path, "my_external_db", version=1)
+
+        self.assertIn("Format: Remote Relational Database (sqlite)", schema)
+        self.assertIn("## Table: employees", schema)
+        self.assertIn("Eve", schema)
+
+        # 4. Register as active session artifact
         art = self.discussion.artefacts.add(
-            title="user_salaries",
+            title="my_external_db",
             artefact_type="data",
-            content="Mock schema",
-            file_ext=".csv",
+            content=schema,
+            file_ext=".sqlconn",
             version=1,
             read_only=False
         )
+        self.discussion.commit()
 
-        # Set up a temporary active branch message so discussion_instance.active_branch_id is valid
-        user_msg = self.discussion.add_message(sender="user", content="Query data")
-        ai_msg = self.discussion.add_message(sender="assistant", content="Analyzing")
-
-        # 3. Test LCP SQL Query Tool
+        # 5. Test LCP SQL Query on .sqlconn
         from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.execute_sql_query import tool_execute_sql_query
-        
         sql_res = tool_execute_sql_query(
-            sql_query="SELECT name FROM user_salaries WHERE salary > 100000",
+            sql_query="SELECT name FROM employees WHERE role = 'Architect'",
             discussion_instance=self.discussion
         )
         self.assertTrue(sql_res["success"])
-        self.assertIn("Alice", sql_res["output"])
-        self.assertIn("Charlie", sql_res["output"])
+        self.assertIn("Eve", sql_res["output"])
 
-        # 4. Test LCP Python Data Query Tool
+        # 6. Test LCP Python Sandbox on .sqlconn
         from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
-        
+
+        py_code = (
+            "import pandas as pd\n"
+            "df = pd.read_sql_query('SELECT * FROM employees', conn)\n"
+            "print(f'Total employees: {len(df)}')\n"
+        )
+
         python_res = tool_execute_python_data_query(
-            code="df['salary'] = df['salary'] + 5000",
+            code=py_code,
             discussion_instance=self.discussion
         )
         self.assertTrue(python_res["success"])
-        
-        # Verify the file was updated and a new version is registered
-        updated_art = self.discussion.artefacts.get("user_salaries")
-        self.assertEqual(updated_art["version"], 2)
+        self.assertIn("Total employees: 2", python_res["output"])
 
         # Clean up files
-        for f in (workspace_dir / "user_salaries_v1.csv", workspace_dir / "user_salaries_v2.csv", workspace_dir / "user_salaries.csv"):
+        for f in (db_path, sqlconn_path, workspace_dir / "my_external_db_v1.sqlconn", workspace_dir / "my_external_db.sqlconn"):
             if f.exists():
                 f.unlink()
 

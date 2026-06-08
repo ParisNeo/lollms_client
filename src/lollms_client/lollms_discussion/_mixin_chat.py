@@ -60,9 +60,9 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Hard cap on bracket buffer size
+# Hard cap on bracket buffer size (Sized down for near-instant unclosed tag recovery)
 # ---------------------------------------------------------------------------
-_MAX_BRACKET_BUF = 4096
+_MAX_BRACKET_BUF = 256
 # Marker injected into virtual history to replace processed <processing> blocks.
 # Uses Unicode chars unlikely to appear in any LLM output naturally.
 # The streaming scrubber strips this if the model reproduces it anyway.
@@ -148,8 +148,6 @@ _SECONDARY_TAG_MAP = {
                        MSG_TYPE.MSG_TYPE_INFO,              "</mem_new>"),
     "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,
                        MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
-    "<think":         ("thought_update",      MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,
-                       MSG_TYPE.MSG_TYPE_THOUGHT_CONTENT,   "</think>"),
 }
 
 
@@ -532,6 +530,88 @@ def _extract_main_content(html_text: str, query_words: set) -> List[Dict[str, An
     # Sort by composite score descending
     scored_passages.sort(key=lambda x: x["score"], reverse=True)
     return scored_passages
+
+
+def _infer_sources_from_json(result_dict: Dict[str, Any], tool_name: str) -> List[Dict[str, Any]]:
+    """Infers and extracts structured sources from a tool result dictionary."""
+    sources = []
+    if not isinstance(result_dict, dict):
+        return sources
+
+    raw_sources = result_dict.get("sources", [])
+    if isinstance(raw_sources, list):
+        for s in raw_sources:
+            if isinstance(s, dict):
+                s.setdefault("title", s.get("name") or s.get("title") or f"{tool_name} Source")
+                s.setdefault("content", s.get("content") or s.get("snippet") or "")
+                s.setdefault("source", s.get("source") or s.get("url") or "")
+                s.setdefault("metadata", s.get("metadata") or {})
+                sources.append(s)
+
+    output = result_dict.get("output")
+    if isinstance(output, dict):
+        for key in ["results", "sources", "items"]:
+            val = output.get(key)
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        sources.append({
+                            "title": item.get("title") or item.get("name") or f"{tool_name} Result",
+                            "content": item.get("content") or item.get("snippet") or item.get("text") or "",
+                            "source": item.get("source") or item.get("url") or item.get("link") or "",
+                            "metadata": item.get("metadata") or {}
+                        })
+    elif isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict):
+                sources.append({
+                    "title": item.get("title") or item.get("name") or f"{tool_name} Result",
+                    "content": item.get("content") or item.get("snippet") or item.get("text") or "",
+                    "source": item.get("source") or item.get("url") or item.get("link") or "",
+                    "metadata": item.get("metadata") or {}
+                })
+    return sources
+
+
+def _infer_sources_from_json(result_dict: Dict[str, Any], tool_name: str) -> List[Dict[str, Any]]:
+    """Infers and extracts structured sources from a tool result dictionary."""
+    sources = []
+    if not isinstance(result_dict, dict):
+        return sources
+
+    raw_sources = result_dict.get("sources", [])
+    if isinstance(raw_sources, list):
+        for s in raw_sources:
+            if isinstance(s, dict):
+                s.setdefault("title", s.get("name") or s.get("title") or f"{tool_name} Source")
+                s.setdefault("content", s.get("content") or s.get("snippet") or "")
+                s.setdefault("source", s.get("source") or s.get("url") or "")
+                s.setdefault("metadata", s.get("metadata") or {})
+                sources.append(s)
+
+    output = result_dict.get("output")
+    if isinstance(output, dict):
+        for key in ["results", "sources", "items"]:
+            val = output.get(key)
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        sources.append({
+                            "title": item.get("title") or item.get("name") or f"{tool_name} Result",
+                            "content": item.get("content") or item.get("snippet") or item.get("text") or "",
+                            "source": item.get("source") or item.get("url") or item.get("link") or "",
+                            "metadata": item.get("metadata") or {}
+                        })
+    elif isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict):
+                sources.append({
+                    "title": item.get("title") or item.get("name") or f"{tool_name} Result",
+                    "content": item.get("content") or item.get("snippet") or item.get("text") or "",
+                    "source": item.get("source") or item.get("url") or item.get("link") or "",
+                    "metadata": item.get("metadata") or {}
+                })
+    return sources
 
 
 def _format_web_search_for_llm(processed: Dict[str, Any], max_chars: int = 2000) -> str:
@@ -1335,9 +1415,9 @@ class _StreamState:
     # ---------------------------------------------------------------- STATE_NORMAL
 
     def _feed_normal(self, chunk: str, pos: int) -> int:
-        # Check for both '<' (XML tags) and '[' (suppress tokens)
+        # Check for '<' (XML tags), '[' (suppress tokens), and '`' (code blocks/inlines)
         next_special = -1
-        for c in ('<', '['):
+        for c in ('<', '[', '`'):
             idx = chunk.find(c, pos)
             if idx != -1 and (next_special == -1 or idx < next_special):
                 next_special = idx
@@ -1365,11 +1445,15 @@ class _StreamState:
         if next_char == '<':
             self.state = self.STATE_BUFFERING
             self.bracket_buf = ["<"]
-        else:  # '['
+            return next_special + 1
+        elif next_char == '[':
             self.state = self.STATE_BUFFERING
             self.bracket_buf = ["["]
-            self._suppress_mode = True  # flag that we're in a [...] buffer
-        return next_special + 1
+            self._suppress_mode = True
+            return next_special + 1
+        
+        # For '`', return the index directly so the main loop can process the code block/inline state transition
+        return next_special
 
     # ---------------------------------------------------------------- STATE_BUFFERING
 
@@ -1403,10 +1487,22 @@ class _StreamState:
 
             matched_prefix = self._match_secondary_prefix(b_str)
             if matched_prefix:
-                self.bracket_buf.clear()
-                self.state = self.STATE_SECONDARY
-                self._enter_secondary(b_str, matched_prefix)
-                return new_pos
+                # Precise XML opening tag regex validation to prevent capturing conversational references (allows optional / for self-closing)
+                tag_name = matched_prefix[1:]
+                is_valid_tag = bool(re.match(rf"^<{tag_name}(?:\s+[a-zA-Z0-9_-]+=(?:\"[^\"]*\"|'[^']*'))*\s*/?>$", b_str, re.IGNORECASE))
+
+                if is_valid_tag:
+                    if b_str.strip().endswith("/>"):
+                        # Process self-closing tag instantly
+                        self.bracket_buf.clear()
+                        self._enter_secondary(b_str, matched_prefix)
+                        self._fire_secondary_done()
+                        self.state = self.STATE_NORMAL
+                    else:
+                        self.bracket_buf.clear()
+                        self.state = self.STATE_SECONDARY
+                        self._enter_secondary(b_str, matched_prefix)
+                    return new_pos
 
             self._flush_bracket_buf_as_text()
             self.state = self.STATE_NORMAL
@@ -1784,6 +1880,10 @@ class _StreamState:
                 pos = self._feed_normal(text, pos)
             elif self.state == self.STATE_BUFFERING:
                 pos = self._feed_buffering(text, pos)
+                if self.tool_trigger:
+                    break
+            elif self.state == self.STATE_TOOL_CALL:
+                pos = self._feed_tool_call(text, pos)
                 if self.tool_trigger:
                     break
             elif self.state == self.STATE_SECONDARY:
@@ -2285,6 +2385,7 @@ class _StreamState:
                             f"All {_MAX_PATCH_RETRIES} patch attempts failed. "
                             "Falling back to full content overwrite."
                         )
+                        self.patch_error_occurred = True
                         has_search     = bool(re.search(r'<{6,8}\s*SEARCH', patch_content, re.I))
                         fallback_content = original_text if has_search else patch_content
 
@@ -2369,9 +2470,8 @@ class _StreamState:
                     # If we had a patch accepted but content is same, it was a null-op
                     ASCIIColors.red("  [Integrity] FAILED: Content is binary-identical to previous version.")
 
-            # Process success if we have a new artifact or confirmed changes
-            # Process success if we have a new artifact or confirmed changes (for both patches and full overwrites)
-            if result_art and (is_new or has_real_changes):
+            # Process success if we have a valid result_art (new or updated, even if binary-identical / no-op)
+            if result_art:
                 self.affected_artefacts.append(result_art)
                 current_meta = dict(self.ai_message.metadata or {})
                 mod_list = current_meta.get("artefacts_modified", [])
@@ -2385,10 +2485,11 @@ class _StreamState:
                     f"Artefact saved as version {result_art.get('version', '?')}"
                 )
                 if hasattr(self, "_turn_action_history"):
-                    self._turn_action_history.append(f"✓ SUCCESSFULLY updated '{resolved_title}' to v{result_art.get('version')}")
+                    if not result_art.get("ephemeral"):
+                        self._turn_action_history.append(f"✓ SUCCESSFULLY updated '{resolved_title}' to v{result_art.get('version')}")
+                    else:
+                        self._turn_action_history.append(f"Staged ephemeral artifact '{resolved_title}' to v{result_art.get('version')}")
             else:
-                # Fallback path: No real changes detected on a patch
-                self.patch_error_occurred = True
                 self._emit_processing_status(
                     "❌ No changes detected: Content remains identical to original."
                 )
@@ -2454,17 +2555,17 @@ class _StreamState:
         elif prefix == "<note":
             title = attrs.get('title') or attrs.get('name', f'note_{uuid.uuid4().hex[:8]}')
             self._emit_processing_status(f"Creating note '{title}'")
+            note_content = full_content.strip() or attrs.get('content', attrs.get('Content', ''))
             art = self.discussion.artefacts.add(
                 title=title, artefact_type=ArtefactType.NOTE,
-                content=full_content.strip(), active=self.auto_activate,
+                content=note_content, active=self.auto_activate,
             )
             self.affected_artefacts.append(art)
             _fire_state_change(art, True)
             self._emit_processing_status("Note saved successfully")
             self._emit_processing_close()
-            _cb(self.callback, full_content, self.sec_done_mt,
-                {"title": title, "content": full_content})
-
+            _cb(self.callback, note_content, self.sec_done_mt,
+                {"title": title, "content": note_content})
         # ── Skills ────────────────────────────────────────────────────────────
         elif prefix == "<skill":
             title = attrs.get('title') or attrs.get('name', f'skill_{uuid.uuid4().hex[:8]}')
@@ -2952,8 +3053,8 @@ class _StreamState:
                 allowed_names = [t.strip().lower() for t in targets_match.group(1).split(",")]
                 allowed_names.extend(["query.py", "query.sql"])
 
-                # Regex to find all artifact tags in output
-                tag_pattern = re.compile(r'(<art[ei]fact\s+[^>]*>.*?</art[ei]fact>)', re.DOTALL | re.IGNORECASE)
+                # Regex to find all artifact, note, and skill tags in output
+                tag_pattern = re.compile(r'(<(art[ei]fact|note|skill)\s+[^>]*>.*?</\2>)', re.DOTALL | re.IGNORECASE)
                 valid_tags = []
 
                 for tag_match in tag_pattern.finditer(raw_output):
@@ -2961,8 +3062,12 @@ class _StreamState:
                     name_attr = re.search(r'(?:name|title)=["\']([^"\']+)["\']', full_tag, re.I)
                     if name_attr:
                         tag_name = name_attr.group(1).strip().lower()
-                        # STRICT MATCH: Only allow if explicitly in targets
-                        is_allowed = any((a in tag_name or tag_name in a) for a in allowed_names if a)
+                        # STRICT MATCH: Only allow if explicitly in targets or if target is "none"/"prose"/empty
+                        is_allowed = (
+                            any((a in tag_name or tag_name in a) for a in allowed_names if a) or
+                            any("none" in a or "prose" in a for a in allowed_names) or
+                            not any(allowed_names)
+                        )
 
                         if is_allowed:
                             valid_tags.append(full_tag)
@@ -4067,6 +4172,86 @@ If you fail to use the tools when data is available, your output will be rejecte
                 output=[{"name": "output", "type": "str"}]
             )
 
+        # ── Layer 5: Global Internet Search & Import tools ──
+        import os
+        internet_cfg = getattr(self, "internet_config", {}) or {}
+
+        # We always register standard/free search tools
+        _register(
+            name="search_web_duckduckgo",
+            fn=lambda query, max_results=5: self.search_web(query, provider="duckduckgo", max_results=max_results) if hasattr(self, "search_web") else [],
+            params=[
+                {"name": "query", "type": "str", "description": "The search query for DuckDuckGo."},
+                {"name": "max_results", "type": "int", "description": "Maximum number of results to return.", "optional": True, "default": 5}
+            ],
+            description="Search the web using DuckDuckGo."
+        )
+
+        _register(
+            name="search_wikipedia",
+            fn=lambda query: self.search_wikipedia(query) if hasattr(self, "search_wikipedia") else [],
+            params=[{"name": "query", "type": "str", "description": "Wikipedia search term or article title."}],
+            description="Search Wikipedia for background concepts."
+        )
+
+        _register(
+            name="search_arxiv",
+            fn=lambda query, max_results=5: self.search_arxiv(query, max_results=max_results) if hasattr(self, "search_arxiv") else [],
+            params=[
+                {"name": "query", "type": "str", "description": "Arxiv query keywords."},
+                {"name": "max_results", "type": "int", "description": "Maximum results to return.", "optional": True, "default": 5}
+            ],
+            description="Search Arxiv database for scientific papers."
+        )
+
+        # Paid or connection-based APIs are conditionally registered ONLY if their keys are configured
+        google_key = internet_cfg.get("google_api_key") or os.environ.get("GOOGLE_API_KEY")
+        google_cse = internet_cfg.get("google_cse_id") or os.environ.get("GOOGLE_CSE_ID")
+        if google_key and google_cse:
+            _register(
+                name="search_web_google",
+                fn=lambda query, max_results=5: self.search_web(query, provider="google", google_api_key=google_key, google_cse_id=google_cse, max_results=max_results) if hasattr(self, "search_web") else [],
+                params=[
+                    {"name": "query", "type": "str", "description": "The search query for Google."},
+                    {"name": "max_results", "type": "int", "description": "Maximum number of results to return.", "optional": True, "default": 5}
+                ],
+                description="Search the web using Google Search API."
+            )
+
+        scopus_key = internet_cfg.get("scopus_api_key") or os.environ.get("SCOPUS_API_KEY")
+        scopus_inst = internet_cfg.get("scopus_inst_token") or os.environ.get("SCOPUS_INST_TOKEN")
+        if scopus_key:
+            _register(
+                name="search_scopus",
+                fn=lambda query, max_results=5: self.search_scopus(query, api_key=scopus_key, inst_token=scopus_inst, max_results=max_results) if hasattr(self, "search_scopus") else [],
+                params=[
+                    {"name": "query", "type": "str", "description": "The search query for Scopus database."},
+                    {"name": "max_results", "type": "int", "description": "Maximum number of results to return.", "optional": True, "default": 5}
+                ],
+                description="Search Scopus database for high-quality scientific papers, abstracts, and citations."
+            )
+
+        # Import/Ingestion tools
+        _register(
+            name="import_wikipedia",
+            fn=lambda title, url: self.import_wikipedia(title, url, auto_load=True) if hasattr(self, "import_wikipedia") else None,
+            params=[
+                {"name": "title", "type": "str", "description": "Wikipedia article title."},
+                {"name": "url", "type": "str", "description": "Wikipedia article URL."}
+            ],
+            description="Import a Wikipedia article's full content as a session artifact."
+        )
+
+        _register(
+            name="import_arxiv",
+            fn=lambda arxiv_id, mode="abstract": self.import_arxiv(arxiv_id, mode=mode, auto_load=True) if hasattr(self, "import_arxiv") else None,
+            params=[
+                {"name": "arxiv_id", "type": "str", "description": "The Arxiv paper ID (e.g. '1706.03762')."},
+                {"name": "mode", "type": "str", "description": "Whether to import 'abstract' or 'full' PDF content.", "optional": True, "default": "abstract"}
+            ],
+            description="Import an Arxiv paper's abstract or full PDF text as a session artifact."
+        )
+
         # Quick intent check to see if the user's message actually requires tools or agentic actions
         _needs_tools = False
 
@@ -4234,8 +4419,6 @@ If you fail to use the tools when data is available, your output will be rejecte
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
-                    if meta and meta.get("was_processed"):
-                        return True
                     return ss.feed(chunk)
                 return True
  
@@ -4312,7 +4495,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                 raw_text, branch_for_handles, self.artefacts
             )
             ai_message.content = raw_after_handles
- 
+
             cleaned, affected_pp = self._post_process_llm_response(
                 raw_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
                 auto_activate_artefacts,
@@ -4321,6 +4504,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                 enable_skills=enable_skills if enable_artefacts else False,
                 enable_forms=enable_forms if enable_artefacts else False,
                 enable_silent_artefact_explanation=enable_silent_artefact_explanation if enable_artefacts else False,
+                already_processed_artifacts=[a.get("title") for a in ss.affected_artefacts]
             )
             affected = handle_arts + ss.affected_artefacts + affected_pp
             if cleaned != raw_after_handles:
@@ -4908,12 +5092,13 @@ If you fail to use the tools when data is available, your output will be rejecte
         is_agentic_turn       = False
         tool_calls_this_turn: List[Dict] = []
         all_events:           List[Dict] = []
+        all_affected_artefacts: List[Dict] = []
         _accumulated_full     = ""
         _clean_text_so_far    = ""
         _round                = 0
         _temp_msg_ids:        List[str] = []
         _current_branch_tip   = branch_tip_id or self.active_branch_id
- 
+
         _completed_tool_calls:    List[str] = []
         _created_artefact_titles: List[str] = []
  
@@ -5177,8 +5362,6 @@ If you fail to use the tools when data is available, your output will be rejecte
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
-                    if meta and meta.get("was_processed"):
-                        return True
                     result = ss.feed(chunk)
                     if ss.tool_trigger:
                         return False
@@ -5329,6 +5512,8 @@ If you fail to use the tools when data is available, your output will be rejecte
             )
  
             ss.flush_remaining_buffer()
+            if ss.affected_artefacts:
+                all_affected_artefacts.extend(ss.affected_artefacts)
             self.scratchpad = _saved_scratchpad
  
             # ── Post-round scrub: remove any leaked internal markers ───────────
@@ -5598,8 +5783,11 @@ If you fail to use the tools when data is available, your output will be rejecte
                 "✓ SUCCESSFULLY implemented" in entry
                 for entry in _turn_action_history
             )
- 
+
+            _is_failed = False
+
             if _already_done and _tool_name not in ["final_answer"]:
+                _is_failed = True
                 ss._emit_tool_processing_status(
                     "Tool Access Revoked: Mission already complete."
                 )
@@ -5607,8 +5795,9 @@ If you fail to use the tools when data is available, your output will be rejecte
                                "error": "MISSION COMPLETE. Do not call more tools. Summarize now."}
                 _result_str = json.dumps(_result)
                 ss._emit_tool_processing_close("Blocked")
- 
+
             elif _tool_name not in active_tool_registry:
+                _is_failed = True
                 _err_msg = (
                     f"Tool '{_tool_name}' is currently DISABLED (Mission Complete)."
                     if _mission_complete else
@@ -5632,7 +5821,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                      "id": _step_id, "offset": _current_offset, "status": "failed"},
                 ])
                 ss._emit_tool_processing_close("Failed: tool not found")
- 
+
             else:
                 try:
                     _is_failed = False
@@ -5857,6 +6046,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                             })
  
                 except Exception as e:
+                    _is_failed = True
                     if self.lollmsClient.debug:
                         trace_exception(e)
                     ss._emit_tool_processing_status(f"Error during execution: {str(e)[:100]}")
@@ -5935,9 +6125,10 @@ If you fail to use the tools when data is available, your output will be rejecte
                 content=_clean_so_far_for_llm.strip()
             ))
             # Keep the real tool result for tool calls in plain English for small models
+            _status_lbl = "FAILED to execute. Error details" if _is_failed else "executed successfully. Return Value"
             _virtual_history.append(SimpleNamespace(
                 sender_type="user",
-                content=f'[SYSTEM: Tool "{_tool_name}" executed successfully. Return Value:\n{_result_str_for_llm}]'
+                content=f'[SYSTEM: Tool "{_tool_name}" {_status_lbl}:\n{_result_str_for_llm}]'
             ))
 
             # ── INJECT SYNTHETIC ARTIFACT RESULTS OR FAILURE MARKERS ───────────
@@ -6085,9 +6276,21 @@ If you fail to use the tools when data is available, your output will be rejecte
             ])
  
             self.scratchpad = "\n".join(_forced_prompt_parts)
- 
+
             merged_images = self._merge_artefact_images(images)
             kwargs['streaming_callback'] = _final_relay
+
+            # Temporarily override system prompt to force direct final answer and prevent loops
+            _original_system_prompt = self.system_prompt
+            _final_system_prompt = (
+                "You are Lollms, a direct, concise Technical Explainer.\n"
+                "Your ONLY task is to write a clear, natural language final answer to the user's "
+                "question using the gathered tool outputs below.\n"
+                "DO NOT write any <coding_plan>, <artifact>, or <tool_call> tags. "
+                "Do NOT describe your internal planning or tool steps. Just answer the user directly."
+            )
+            object.__setattr__(self, "_system_prompt", _final_system_prompt)
+
             self.lollmsClient.chat(
                 self,
                 images             = merged_images,
@@ -6096,9 +6299,10 @@ If you fail to use the tools when data is available, your output will be rejecte
                 temperature        = final_answer_temperature,
                 **kwargs,
             )
- 
+
             ss_final.flush_remaining_buffer()
             self.scratchpad = _scratch_before_final
+            object.__setattr__(self, "_system_prompt", _original_system_prompt)
 
             # The final answer has been streaming into ai_message.content;
             # ensure we capture the complete result including any prior content.
@@ -6196,6 +6400,7 @@ If you fail to use the tools when data is available, your output will be rejecte
             enable_skills=enable_skills,
             enable_forms=enable_forms,
             enable_silent_artefact_explanation=enable_silent_artefact_explanation,
+            already_processed_artifacts=[a.get("title") for a in all_affected_artefacts]
         )
         affected_artefacts = handle_arts + affected_pp
         if cleaned_content != _clean_after_handles:

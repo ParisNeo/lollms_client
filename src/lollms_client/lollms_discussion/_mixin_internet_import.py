@@ -30,7 +30,8 @@ class InternetImportMixin:
         query: str,
         provider: str = "duckduckgo",
         google_api_key: Optional[str] = None,
-        google_cse_id: Optional[str] = None
+        google_cse_id: Optional[str] = None,
+        max_results: int = 5
     ) -> List[Dict[str, Any]]:
         """Perform a web search using DuckDuckGo or Google CSE and return structured results."""
         results = []
@@ -43,7 +44,7 @@ class InternetImportMixin:
                 except ImportError:
                     from ddgs import DDGS
                 with DDGS() as ddgs:
-                    raw_results = [r for r in ddgs.text(query, max_results=10)]
+                    raw_results = [r for r in ddgs.text(query, max_results=max_results)]
                     results = [{'title': r.get('title'), 'url': r.get('href'), 'snippet': r.get('body')} for r in raw_results]
             elif provider == "google":
                 if not google_api_key or not google_cse_id:
@@ -51,9 +52,9 @@ class InternetImportMixin:
                 import pipmaster as pm
                 pm.ensure_packages("google-api-python-client")
                 from googleapiclient.discovery import build as google_build
-                
+
                 service = google_build("customsearch", "v1", developerKey=google_api_key)
-                res = service.cse().list(q=query, cx=google_cse_id, num=10).execute()
+                res = service.cse().list(q=query, cx=google_cse_id, num=max_results).execute()
                 items = res.get('items', [])
                 results = [{'title': item.get('title'), 'url': item.get('link'), 'snippet': item.get('snippet')} for item in items]
         except Exception as e:
@@ -85,7 +86,7 @@ class InternetImportMixin:
             resp = requests.get(api_url, params=params, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-            
+
             results = []
             for item in data.get("query", {}).get("search", []):
                 results.append({
@@ -96,6 +97,70 @@ class InternetImportMixin:
             return results
         except Exception as e:
             trace_exception(e)
+            return []
+
+    def search_scopus(
+        self,
+        query: str,
+        api_key: Optional[str] = None,
+        inst_token: Optional[str] = None,
+        max_results: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Search Scopus database for scholarly papers, abstracts, and citations."""
+        config = getattr(self, "internet_config", {}) or {}
+        api_key = api_key or config.get("scopus_api_key") or os.environ.get("SCOPUS_API_KEY")
+        inst_token = inst_token or config.get("scopus_inst_token") or os.environ.get("SCOPUS_INST_TOKEN")
+
+        if not api_key:
+            ASCIIColors.warning("Scopus API key is missing. Skipping Scopus search.")
+            return []
+
+        url = "https://api.elsevier.com/content/search/scopus"
+        headers = {
+            "X-ELS-APIKey": api_key,
+            "Accept": "application/json"
+        }
+        if inst_token:
+            headers["X-ELS-Insttoken"] = inst_token
+
+        params = {
+            "query": query,
+            "count": max_results
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            results = []
+            entries = data.get("search-results", {}).get("entry", [])
+            for entry in entries:
+                title = entry.get("dc:title", "Untitled")
+                creator = entry.get("dc:creator", "Unknown")
+                publication = entry.get("prj:publicationName", entry.get("pubName", "Unknown Publication"))
+                cover_date = entry.get("prism:coverDate", "Unknown Date")
+                scopus_id = entry.get("dc:identifier", "").replace("SCOPUS_ID:", "")
+
+                links = entry.get("link", [])
+                scopus_url = ""
+                for link in links:
+                    if link.get("@ref") == "scopus":
+                        scopus_url = link.get("@href")
+                        break
+                if not scopus_url and scopus_id:
+                    scopus_url = f"https://www.scopus.com/record/display.uri?eid=2-s2.0-{scopus_id}&origin=resultslist"
+
+                snippet = f"Creator: {creator} | Publication: {publication} | Date: {cover_date}"
+                results.append({
+                    "title": title,
+                    "url": scopus_url,
+                    "snippet": snippet
+                })
+            return results
+        except Exception as e:
+            trace_exception(e)
+            ASCIIColors.warning(f"[InternetImport] Scopus search failed: {e}")
             return []
 
     def import_wikipedia(self, title: str, url: str, auto_load: bool = True) -> Optional[Dict[str, Any]]:
@@ -154,17 +219,18 @@ class InternetImportMixin:
             query_parts = []
             if query: query_parts.append(query)
             if author: query_parts.append(f"au:{author}")
-            
+
             query_str = " AND ".join(query_parts) if query_parts else "all:*"
-            
+
             search = arxiv.Search(
                 query=query_str,
                 max_results=max_results,
                 sort_by=arxiv.SortCriterion.Relevance
             )
-            
+
+            client = arxiv.Client()
             results = []
-            for r in search.results():
+            for r in client.results(search):
                 if year and r.published.year != year:
                     continue
                 results.append({
@@ -187,8 +253,9 @@ class InternetImportMixin:
         import arxiv
         import fitz
         try:
+            client = arxiv.Client()
             search = arxiv.Search(id_list=[arxiv_id])
-            paper = next(search.results())
+            paper = next(client.results(search))
             
             if mode == "full":
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
