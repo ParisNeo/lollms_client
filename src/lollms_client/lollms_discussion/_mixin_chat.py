@@ -111,7 +111,8 @@ _TAG_STARTS = [
     "<lollms_event",
     "<use_handle",
     "<processing",     # Unified processing indicator
-    "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete"
+    "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete",
+    "<agent_mode",     # Agent mode activation tag
 ]
 _SUPPRESS_TOKENS = [
     "[BLIND_ACTION_EXECUTED]",
@@ -126,6 +127,17 @@ def _is_fast_message(msg: str) -> bool:
     if len(m) < 20 and any(x in m for x in ["bonjour", "salut", "hello", "hi", "hey", "test"]):
         return True
     return m in ["ok", "merci", "thanks", "cool", "yes", "no", "oui", "non"]
+
+
+def _requests_tool_list(msg: str) -> bool:
+    """Detect if user is asking for available tools."""
+    m = msg.lower()
+    tool_keywords = [
+        "what tools", "available tools", "list tools", "show tools",
+        "what can you do", "what are your capabilities", "tool list",
+        "what tools do you have", "quels outils", "liste des outils"
+    ]
+    return any(kw in m for kw in tool_keywords)
 
 
 _SECONDARY_TAG_MAP = {
@@ -151,6 +163,8 @@ _SECONDARY_TAG_MAP = {
                        MSG_TYPE.MSG_TYPE_INFO,              "</<think>>"),
     "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,
                        MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
+    "<agent_mode":    ("agent_mode_start",    MSG_TYPE.MSG_TYPE_INFO,
+                       MSG_TYPE.MSG_TYPE_INFO,              "</agent_mode>"),
 }
 
 
@@ -3939,9 +3953,15 @@ class ChatMixin:
         _eff_img_edit  = enable_image_editing     and _tti_available
  
         # ── System-prompt instructions (Lazy Loaded to prevent Context Bloat) ──
+        # FAST PATH: Do NOT include tool calling instructions by default.
+        # Tool instructions are only added when agent mode is activated.
         extra_instructions = ""
         user_msg_lower = user_message.lower()
 
+        # CRITICAL FIX #1: Define _user_requests_tools at function scope start
+        _user_requests_tools = _requests_tool_list(user_message)
+
+        # Always include these (lightweight)
         if enable_artefacts:
             extra_instructions += self._build_artefact_instructions()
             if enable_inline_widgets:
@@ -3968,21 +3988,80 @@ class ChatMixin:
             extra_instructions += _mem_instructions
         if _eff_img_gen or _eff_img_edit:
             extra_instructions += self._build_image_generation_instructions()
+
+        # FAST PATH NOTE: Mention agent mode availability without bloating context with tool details
+        if enable_artefacts and _has_external_tools:
+            extra_instructions += """
+=== AGENT MODE ACTIVATION TRIGGERS ===
+You are currently in FAST RESPONSE mode. For simple questions, answer directly.
+
+EMIT <agent_mode/> tag IMMEDIATELY when the user request involves ANY of these:
+
+1. 📡 INTERNET / EXTERNAL DATA
+   - "Search for...", "Look up...", "Find information about..."
+   - Current events, news, weather, stock prices
+   - Academic papers (arxiv), Wikipedia articles
+   - Any factual query requiring up-to-date information
+
+2. 📁 FILE / ARTIFACT OPERATIONS
+   - "Create a file...", "Write code...", "Build an artifact..."
+   - "Update...", "Modify...", "Edit..." existing files
+   - "Save this as...", "Export to..."
+   - Any request involving <artifact> tags
+
+3. 📊 DATA QUERIES & ANALYSIS
+   - "Query the database...", "Analyze this dataset..."
+   - "Calculate...", "Count...", "Find statistics..."
+   - Questions about active CSV/Excel/SQL artifacts
+   - "Generate a chart/graph from..."
+
+4. 🛠️ TOOL EXECUTION
+   - "Run this command...", "Execute..."
+   - "Use the [tool_name] tool..."
+   - Any explicit tool invocation request
+
+5. 🔄 MULTI-STEP WORKFLOWS
+   - Tasks requiring multiple actions in sequence
+   - "First search, then summarize..."
+   - "Create files and then test them..."
+
+ACTIVATION SYNTAX: <agent_mode/>
+Place this tag at the START of your response when any trigger above applies.
+
+EXAMPLE:
+User: "Search for Python tutorials and create a summary file"
+Assistant: <agent_mode/>
+<tool_call>{"name": "search_web_duckduckgo", "parameters": {"query": "Python tutorials beginners"}}</tool_call>
+<artifact name="python_tutorials_summary.md" type="document">
+# Summary of Python Tutorials
+...
+</artifact>
+
+⚠️ DO NOT describe what you will do in prose. EMIT THE TAG AND ACT.
+=== END AGENT MODE TRIGGERS ===
+"""
+
         if has_data_arts:
             extra_instructions += """
 === COGNITIVE DATA QUERY DIRECTIVE (MANDATORY) ===
 You have active data/spreadsheet artifacts loaded.
 
-Before answering the user's query, you MUST perform this internal self-reflection:
-"Does answering this question, or building the requested visualization/report, require or benefit from retrieving, calculating, or validating values from the active dataset?"
+BEFORE answering ANY question, ask yourself:
+"Does this require retrieving, calculating, or validating values from the active dataset?"
 
-If YES, you MUST:
-  1. Use the `execute_python_data_query` or `execute_sql_query` tool to inspect the data.
-  2. You are STRICTLY FORBIDDEN from guessing, assuming, fabricating statistics, or claiming you cannot perform the calculation.
-  3. First, state: "Let's inspect the active dataset to find the exact figures." (or similar), and immediately follow with your `<tool_call>` tag.
-  4. Never write conversational summaries of data before you have executed the query to retrieve it.
+If YES → EMIT <agent_mode/> IMMEDIATELY, then:
+  1. Call `execute_python_data_query` or `execute_sql_query`
+  2. Wait for tool result
+  3. Answer based on ACTUAL data (NEVER guess)
 
-If you fail to use the tools when data is available, your output will be rejected.
+TRIGGER EXAMPLES:
+- "How many rows..." → REQUIRES QUERY
+- "What's the average..." → REQUIRES QUERY
+- "Show me sales by..." → REQUIRES QUERY
+- "Find duplicates..." → REQUIRES QUERY
+- "What's the total..." → REQUIRES QUERY
+
+⚠️ FABRICATION = REJECTION. Always query first.
 === END COGNITIVE DIRECTIVE ===
 """
 
@@ -4284,126 +4363,58 @@ If you fail to use the tools when data is available, your output will be rejecte
             description="Import an Arxiv paper's abstract or full PDF text as a session artifact."
         )
 
-        # Quick intent check to see if the user's message actually requires tools or agentic actions
-        _needs_tools = False
+        # ╔══════════════════════════════════════════════════════════════════╗
+        # ║  FAST PATH DEFAULT — Agent mode on-demand via tags              ║
+        # ╚══════════════════════════════════════════════════════════════════╝
+        # Initialize mission state at function scope (fixes UnboundLocalError)
+        _mission_state: Dict[str, Any] = {
+            "phase": "THINK",
+            "success": False,
+            "artifacts_modified": 0,
+            "tools_executed": 0,
+            "declared_objectives": [],
+            "completed_objectives": [],
+        }
 
-        # Check for active data artifacts
-        has_active_data_artifacts = any(
-            a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
-            for a in self.artefacts.list(active_only=True)
-        )
+        # CRITICAL FIX: Initialize _needs_tools before any references
+        _needs_tools: bool = False
 
-        # Check if there are active RAG or Search tools in the registry
-        has_search_or_rag_tools = any(
-            "search" in tname.lower() or "rag" in tname.lower() or "query" in tname.lower() or "internet" in tname.lower()
-            for tname in tool_registry
-        )
+        if debug or self.lollmsClient.debug:
+            # Calculate context token size
+            _ctx_text = self.export("lollms_text", branch_tip_id or self.active_branch_id, 999999)
+            _ctx_tokens = self.lollmsClient.count_tokens(_ctx_text) if self.lollmsClient else 0
 
-        # CRITICAL FIX: Aggressive tool requirement detection for data artifacts
-        # Any analytical question with active data MUST trigger tool use
-        if has_active_data_artifacts and tool_registry:
-            # Check if the question is analytical/factual (could relate to data)
-            _data_intent_keywords = {
-                'question_words': ['what', 'which', 'how many', 'how much', 'where', 'when', 'why', 'who'],
-                'analytical_verbs': ['find', 'get', 'query', 'check', 'see', 'look', 'analyze', 'calculate', 'compute', 'count', 'list', 'show', 'retrieve', 'extract', 'plot', 'make', 'draw', 'graph', 'chart', 'visualize', 'display'],
-                'comparative_words': ['most', 'least', 'more', 'less', 'better', 'worse', 'highest', 'lowest', 'top', 'bottom', 'average', 'total', 'sum', 'frequency', 'often', 'rarely', 'distribution', 'trend', 'change', 'growth', 'over time'],
-                'data_terms': ['metal', 'equipment', 'contamination', 'value', 'measure', 'record', 'entry', 'row', 'column', 'table', 'dataset', 'order', 'orders', 'sale', 'sales', 'product', 'products', 'customer', 'customers', 'quantity', 'price']
-            }
-
-            user_msg_lower = user_message.lower()
-            data_intent_score = 0
-
-            # Count matching keywords
-            for word_list in _data_intent_keywords.values():
-                for keyword in word_list:
-                    if keyword in user_msg_lower:
-                        data_intent_score += 1
-
-            try:
-                intent_prompt = (
-                    f"User message: \"{user_message}\"\n\n"
-                    "IMPORTANT CONTEXT: There is an active DATA artifact in this session (a database or dataset file).\n\n"
-                    "Analyze if this message requires:\n"
-                    "1. Executing a tool to query/analyze the data artifact\n"
-                    "2. Modifying/creating files (artifacts)\n"
-                    "3. Generating/editing images\n\n"
-                    "CRITICAL: If the question is analytical, factual, or asks about specific values/frequencies/count/comparisons,\n"
-                    "it likely requires querying the data artifact even if it doesn't explicitly mention 'database' or 'query'.\n\n"
-                    "Return false ONLY if:\n"
-                    "- The user is greeting you (hello, hi, etc.)\n"
-                    "- The question has NO relation to data analysis (e.g., philosophical, abstract)\n"
-                    "- It's purely conversational chit-chat\n\n"
-                    f"When in doubt with analytical questions and an active data artifact, return TRUE.\n"
-                )
-                intent_res = self.lollmsClient.generate_structured_content(
-                    prompt=intent_prompt,
-                    schema={
-                        "requires_tools_or_actions": {
-                            "type": "boolean",
-                            "description": "True if the message requires tool execution (especially data queries), file modification/creation, or image generation/edit. False only for pure conversation."
-                        },
-                        "reasoning": {
-                            "type": "string",
-                            "description": "Brief reasoning explaining why tools are or aren't needed"
-                        }
-                    },
-                    temperature=0.0
-                )
-                if intent_res and isinstance(intent_res, dict):
-                    _needs_tools = intent_res.get("requires_tools_or_actions", False)
-
-                    # Additional safety: If data artifact exists AND question has analytical keywords, override to True
-                    if data_intent_score >= 2:
-                        _needs_tools = True
-                        ASCIIColors.info(f"[Intent Classifier] Overrode to TRUE due to active data artifact + {data_intent_score} analytical keywords")
-
-                    ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
-            except Exception as e:
-                _needs_tools = True
-                ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to TRUE due to active data artifact.")
-
-        elif tool_registry or enable_image_generation or enable_image_editing or enable_artefacts:
-            # Standard path for non-data-artifact scenarios
-            try:
-                # ENHANCED INTENT PROMPT - More aggressive tool detection
-                if has_search_or_rag_tools:
-                    intent_prompt = (
-                        f"User message: \"{user_message}\"\n\n"
-                        "CRITICAL: You are analyzing whether this message requires ACTION (tool execution, file modification, image generation).\n"
-                        "Return TRUE if the user is:\n"
-                        "- Asking a factual question that could use search/RAG tools\n"
-                        "- Requesting any file creation/modification (artifacts)\n"
-                        "- Asking for images, calculations, data queries, or external information\n"
-                        "Return FALSE ONLY for: greetings, pure chit-chat, philosophical discussions without action items."
-                    )
+            # Categorize tools by type
+            _tool_categories = {"search": [], "artifact": [], "memory": [], "data": [], "other": []}
+            for _tname in tool_registry:
+                _tname_lower = _tname.lower()
+                if any(k in _tname_lower for k in ["search", "query", "web", "wikipedia", "arxiv", "scopus"]):
+                    _tool_categories["search"].append(_tname)
+                elif any(k in _tname_lower for k in ["artifact", "artefact", "file", "create", "update", "promote", "extract"]):
+                    _tool_categories["artifact"].append(_tname)
+                elif any(k in _tname_lower for k in ["memory", "mem_", "recall"]):
+                    _tool_categories["memory"].append(_tname)
+                elif any(k in _tname_lower for k in ["data", "sql", "python", "execute", "csv", "excel"]):
+                    _tool_categories["data"].append(_tname)
                 else:
-                    intent_prompt = (
-                        f"User message: \"{user_message}\"\n\n"
-                        "CRITICAL: Return TRUE if this requires ANY action: tool execution, artifact creation/editing, image generation.\n"
-                        "Return FALSE ONLY for: greetings, casual conversation without action items."
-                    )
-                intent_res = self.lollmsClient.generate_structured_content(
-                    prompt=intent_prompt,
-                    schema={
-                        "requires_tools_or_actions": {
-                            "type": "boolean",
-                            "description": "TRUE if action required (tools/files/images). FALSE only for pure conversation."
-                        },
-                        "reasoning": {
-                            "type": "string",
-                            "description": "Brief reasoning for the decision."
-                        }
-                    }
-                )
-                if intent_res and isinstance(intent_res, dict):
-                    _needs_tools = intent_res.get("requires_tools_or_actions", False)
-                    ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
-            except Exception as e:
-                _needs_tools = True
-                ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to True.")
-        else:
-            # Default to tools needed when uncertain
-            _needs_tools = bool(tool_registry)
+                    _tool_categories["other"].append(_tname)
+
+            ASCIIColors.cyan("╔══════════════════════════════════════════════════════════════════╗")
+            ASCIIColors.cyan("║  [FAST-PATH DEFAULT] Agent mode on-demand via tags              ║")
+            ASCIIColors.cyan(f"║  • Context size: {_ctx_tokens:,} tokens                                ║")
+            ASCIIColors.cyan(f"║  • Tools registered: {len(tool_registry)}                                  ║")
+            if _tool_categories["search"]:
+                ASCIIColors.cyan(f"║    └─ Search: {', '.join(_tool_categories['search'])}")
+            if _tool_categories["artifact"]:
+                ASCIIColors.cyan(f"║    └─ Artifact: {', '.join(_tool_categories['artifact'])}")
+            if _tool_categories["memory"]:
+                ASCIIColors.cyan(f"║    └─ Memory: {', '.join(_tool_categories['memory'])}")
+            if _tool_categories["data"]:
+                ASCIIColors.cyan(f"║    └─ Data: {', '.join(_tool_categories['data'])}")
+            if _tool_categories["other"]:
+                ASCIIColors.cyan(f"║    └─ Other: {', '.join(_tool_categories['other'])}")
+            ASCIIColors.cyan(f"║  • Active artifacts: {len(self.artefacts.list(active_only=True))}                        ║")
+            ASCIIColors.cyan("╚══════════════════════════════════════════════════════════════════╝")
 
         # ── Add user message ──────────────────────────────────────────────────
         if add_user_message:
@@ -4427,8 +4438,13 @@ If you fail to use the tools when data is available, your output will be rejecte
         # ====================================================================
         #  FAST PATH — no external tools registered
         # ====================================================================
-        _has_external_tools = bool(tools) and _needs_tools
- 
+        _has_external_tools = bool(tool_registry)
+
+        # CRITICAL FIX #3: Remove duplicate _user_requests_tools definition
+        # (already defined at function scope start)
+        if debug or self.lollmsClient.debug:
+            ASCIIColors.cyan(f"[FAST PATH] _user_requests_tools={_user_requests_tools}, _has_external_tools={_has_external_tools}")
+
         if not _has_external_tools:
             ss = _StreamState(
                 discussion            = self,
@@ -4452,14 +4468,24 @@ If you fail to use the tools when data is available, your output will be rejecte
                 metadata={"mode": "direct"},
             )
             ss.ai_message = ai_message
- 
+
+            # CRITICAL FIX: Define _fast_relay BEFORE conditional branching (fixes undefined name error)
+            _agent_mode_triggered = False
+
             def _fast_relay(chunk, msg_type=None, meta=None):
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
+                    # Check for <agent_mode/> tag in streaming chunk
+                    if "<agent_mode" in chunk.lower() and not _agent_mode_triggered:
+                        _agent_mode_triggered = True
+                        ASCIIColors.info("[FAST PATH] <agent_mode/> tag detected — switching to agentic loop.")
+                    # Forward chunk to user callback FIRST for streaming
+                    _cb(callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, meta)
+                    # Then feed to state machine for tag detection
                     return ss.feed(chunk)
                 return True
- 
+
             raw_text = self._stream_final_answer(
                 _fast_relay, images,
                 branch_tip_id or self.active_branch_id,
@@ -4527,7 +4553,88 @@ If you fail to use the tools when data is available, your output will be rejecte
  
             if remove_thinking_blocks:
                 raw_text = self.lollmsClient.remove_thinking_blocks(raw_text)
- 
+
+            # Detect <agent_mode> tag in fast path response — re-enter agent loop
+            # CRITICAL FIX: Also check the _agent_mode_triggered flag from streaming relay
+            _agent_mode_requested = (
+                "<agent_mode" in raw_text.lower() or
+                _user_requests_tools or
+                _agent_mode_triggered
+            )
+
+            if _agent_mode_requested and _has_external_tools:
+                ASCIIColors.info("[chat] Agent mode requested in fast path — re-entering agent loop.")
+                # Clear fast path content and fall through to agent loop
+                ai_message.content = ""
+                _entered_agentic_mode = True
+            else:
+                # Continue with fast path finalization
+                branch_for_handles = self.get_branch(ai_message.id)
+                raw_after_handles, handle_arts = _apply_handles(
+                    raw_text, branch_for_handles, self.artefacts
+                )
+                ai_message.content = raw_after_handles
+
+                cleaned, affected_pp = self._post_process_llm_response(
+                    raw_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
+                    auto_activate_artefacts,
+                    enable_inline_widgets=enable_inline_widgets if enable_artefacts else False,
+                    enable_notes=enable_notes if enable_artefacts else False,
+                    enable_skills=enable_skills if enable_artefacts else False,
+                    enable_forms=enable_forms if enable_artefacts else False,
+                    enable_silent_artefact_explanation=enable_silent_artefact_explanation if enable_artefacts else False,
+                )
+                affected = handle_arts + ss.affected_artefacts + affected_pp
+                if cleaned != raw_after_handles:
+                    ai_message.content = cleaned
+
+                _mem_cleaned, _mem_report = self._process_memory_tags(
+                    ai_message.content, _mm, callback)
+                if _mem_cleaned != ai_message.content:
+                    ai_message.content = _mem_cleaned
+
+                # Auto-dream pass
+                dream_report = None
+                if enable_auto_dream and _mm is not None:
+                    try:
+                        dream_report = _mm.dream(self.lollmsClient)
+                        if dream_report and not dream_report.get("skipped"):
+                            ASCIIColors.cyan(f"[Memory] Auto-Dream complete: {dream_report}")
+                            if callback:
+                                try:
+                                    callback(
+                                        json.dumps(dream_report, default=str), 
+                                        text="subconscious dream consolidation", 
+                                        msg_type=MSG_TYPE.MSG_TYPE_INFO, 
+                                        meta={"type": "memory_dream", "report": dream_report}
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception as dream_err:
+                        ASCIIColors.warning(f"[Memory] Auto-dream execution failed: {dream_err}")
+
+                if self._is_db_backed and self.autosave:
+                    self.commit()
+                self.scratchpad = ""
+                object.__setattr__(self, '_active_callback', None)
+                return {
+                    "user_message":     user_msg,
+                    "ai_message":       ai_message,
+                    "sources":          collected_sources,
+                    "scratchpad":       None,
+                    "self_corrections": None,
+                    "artefacts":        affected,
+                    "memory_report":    _mem_report,
+                    "dream_report":     dream_report,
+                }
+
+            # If we reach here, agent mode was requested — fall through to agent loop setup
+            # Build full tool system prompt now that we're entering agent mode
+            object.__setattr__(
+                self, "_system_prompt",
+                _build_tool_system_prompt(self._system_prompt or "", tool_descriptions)
+            )
+
             branch_for_handles = self.get_branch(ai_message.id)
             raw_after_handles, handle_arts = _apply_handles(
                 raw_text, branch_for_handles, self.artefacts
@@ -4734,8 +4841,11 @@ If you fail to use the tools when data is available, your output will be rejecte
         # ====================================================================
         #  FAST PATH — no external tools registered
         # ====================================================================
+        # CRITICAL FIX: _user_requests_tools already defined at function scope above
+        # This duplicate definition was causing the UnboundLocalError
+
         _has_external_tools = bool(tool_registry)
- 
+
         if not _has_external_tools:
             ss = _StreamState(
                 discussion            = self,
@@ -5281,41 +5391,41 @@ If you fail to use the tools when data is available, your output will be rejecte
             })
             # State transition logged internally (debug output removed for cleaner logs)
 
-        # ====================================================================
-        #  Main agentic loop
-        # ====================================================================
+        # ╔══════════════════════════════════════════════════════════════════╗
+        # ║  SIMPLIFIED AGENTIC LOOP — Triggered by model tags              ║
+        # ╚══════════════════════════════════════════════════════════════════╝
+        # The model answers directly by default. If it needs tools/artifacts,
+        # it emits <artifact>, <tool_call>, or <agent_mode> tags which trigger the loop.
+
+        _entered_agentic_mode = False  # Track if we actually entered agent loop
+
         while _round < max_reasoning_steps:
             _round += 1
 
-            # ── MINIMAL STATE MACHINE: MISSION-COMPLETE CHECK ────────────────
-            _declared = _mission_state.get("declared_objectives", [])
-            _completed = _mission_state.get("completed_objectives", [])
+            # ── CHECK IF MODEL SIGNALLED AGENT MODE ─────────────────────────
+            # Already in agent mode if we reached here (fast path detected <agent_mode> or user requested tools)
+            _entered_agentic_mode = True
+
+            # Auto-call show_tools if user explicitly requested tool list
+            if _round == 1 and _user_requests_tools and "show_tools" in active_tool_registry:
+                ASCIIColors.info("[chat] User requested tool list — auto-calling show_tools.")
+                _tool_result = active_tool_registry["show_tools"]()
+                _virtual_history.append(SimpleNamespace(
+                    sender_type="system",
+                    content=f'<tool_result name="show_tools">{{"success": true, "tool_count": {_tool_result.get("tool_count", 0)}}}</tool_result>'
+                ))
+                _mission_state["tools_executed"] += 1
+                ss._emit_processing_status(f"Retrieved {_tool_result.get('tool_count', 0)} available tools.")
+
+            # ── MISSION COMPLETE CHECK ──────────────────────────────────────
             _artifacts = _mission_state.get("artifacts_modified", 0)
             _tools = _mission_state.get("tools_executed", 0)
+            _mission_complete = (_artifacts > 0 or _tools > 0) and _round > 1
 
-            # Check completion — CRITICAL FIX: Use OR logic to prevent loops
-            _mission_complete = False
-            _goal_tracking_complete = False
-            _legacy_complete = (_artifacts > 0 or _tools > 0)
-
-            if _declared:
-                # Goal-tracking mode
-                _goal_tracking_complete = set(_declared) <= set(_completed)
-
-            # Mission complete if EITHER mode says so (prevents deadlocks)
-            _mission_complete = _goal_tracking_complete or _legacy_complete
-
-            if _mission_complete and _mission_state["phase"] != "COMPLETE":
-                _log_state_transition("COMPLETE", "Objectives satisfied OR tools executed")
-
-            # Log state at each round (minimal)
-            # Round state tracked (debug logging removed for cleaner output)
-
-            # CRITICAL FIX: Hard exit when mission complete — prevent reasoning loops
             if _mission_complete:
                 ASCIIColors.success(
-                    f"[chat] Round {_round}: Mission complete (artifacts={_artifacts}, tools={_tools}). "
-                    f"Breaking loop to write final answer."
+                    f"[chat] Round {_round}: Work done (artifacts={_artifacts}, tools={_tools}). "
+                    f"Breaking to final answer."
                 )
                 break
 
@@ -5386,6 +5496,12 @@ If you fail to use the tools when data is available, your output will be rejecte
 
             # DETERMINISTIC: Mission complete flag from state machine, NOT text heuristics
             _mission_complete = _mission_state.get("phase") == "COMPLETE"
+
+            # CRITICAL FIX: Hard exit if mission already complete - prevent runaway rounds
+            if _mission_complete and _round > 1:
+                ASCIIColors.success(f"[chat] Round {_round}: Mission already complete. Breaking loop.")
+                break
+
             ss = _StreamState(
                 discussion            = self,
                 callback              = callback,
@@ -5682,10 +5798,76 @@ If you fail to use the tools when data is available, your output will be rejecte
             _tool_trigger  = ss.tool_trigger
             _tool_json_str = ss.get_tool_call_json()
 
+            # ╔══════════════════════════════════════════════════════════════════╗
+            # ║  ACT PHASE: Execute the action plan                               ║
+            # ╚══════════════════════════════════════════════════════════════════╝
+            if debug or self.lollmsClient.debug:
+                ASCIIColors.yellow(f"[ACT] Round {_round}: Executing action_type={_action_plan.get('action_type')}")
+
+            if _action_plan and _action_plan.get("action_type") == "tool_call":
+                _tool_name = _action_plan.get("tool_name")
+                _tool_params = _action_plan.get("tool_parameters", {})
+
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.yellow(f"[ACT] Tool call: {_tool_name}({json.dumps(_tool_params)[:150]}...)")
+
+                if _tool_name and _tool_name in active_tool_registry:
+                    try:
+                        if debug or self.lollmsClient.debug:
+                            ASCIIColors.green(f"[ACT] ✓ Executing {_tool_name}...")
+                        _result = active_tool_registry[_tool_name](**_tool_params)
+
+                        _virtual_history.append(SimpleNamespace(
+                            sender_type="system",
+                            content=f'<tool_result name="{_tool_name}">{{"success": true, "output": {json.dumps(_result)[:500]}...}}</tool_result>'
+                        ))
+                        _mission_state["tools_executed"] += 1
+                        _mission_state["phase"] = "VERIFY"
+
+                        if debug or self.lollmsClient.debug:
+                            ASCIIColors.green(f"[ACT] ✓ Tool execution complete → phase=VERIFY")
+                    except Exception as e:
+                        if debug or self.lollmsClient.debug:
+                            ASCIIColors.red(f"[ACT] ✗ Tool execution failed: {e}")
+                        _virtual_history.append(SimpleNamespace(
+                            sender_type="system",
+                            content=f'<tool_result name="{_tool_name}">{{"success": false, "error": "{str(e)}"}}</tool_result>'
+                        ))
+                else:
+                    if debug or self.lollmsClient.debug:
+                        ASCIIColors.red(f"[ACT] ✗ Unknown tool: {_tool_name}")
+                    ASCIIColors.warning(f"[ACT] Unknown tool: {_tool_name}")
+
+            elif _action_plan and _action_plan.get("action_type") == "artifact_action":
+                # Artifact actions are handled by the streaming parser (<artifact> tags)
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.yellow(f"[ACT] Artifact action: {_action_plan.get('artifact_name')} (type={_action_plan.get('artifact_type')})")
+                # Model will emit <artifact> tag in generation — no pre-execution needed
+                _mission_state["phase"] = "VERIFY"
+
+            elif _action_plan and _action_plan.get("action_type") == "complete":
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.success(f"[ACT] ✓ Model signaled completion: {_action_plan.get('reasoning')}")
+                _mission_state["phase"] = "COMPLETE"
+                break
+
+            else:
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.warning(f"[ACT] ⚠ No valid action plan received: {_action_plan}")
+
             # DETERMINISTIC: Use explicit state flags from StreamState, NOT text search
             _artefacts_built = len(ss.affected_artefacts) > 0
             _has_action_tags = ss._has_action_tags if hasattr(ss, '_has_action_tags') else False
             _specialist_executed = hasattr(ss, 'pending_final_content') and bool(ss.pending_final_content)
+
+            # DEBUG: Log artifact detection state
+            ASCIIColors.yellow(f"[Round {_round} Action Check] artefacts_built={_artefacts_built}, has_action_tags={_has_action_tags}, tool_trigger={_tool_trigger}, specialist={_specialist_executed}")
+            if not _artefacts_built and not _has_action_tags and not _tool_trigger:
+                # Check raw content for artifact tags that may have been missed
+                _raw_content = ai_message.content or ""
+                _artifact_tag_found = '<artifact' in _raw_content.lower() or '<artefact' in _raw_content.lower()
+                if _artifact_tag_found:
+                    ASCIIColors.red(f"[DEBUG] Artifact tag found in raw content but NOT captured in ss.affected_artefacts! Content preview: {_raw_content[-500:]}")
 
             _did_something   = _tool_trigger or _artefacts_built or _has_action_tags or _specialist_executed
 
@@ -5746,62 +5928,23 @@ If you fail to use the tools when data is available, your output will be rejecte
                     ai_message.content = ai_message.content[:round_content_start]
                     continue
  
-            # ── LOOP EXIT DETECTION (deterministic, state-based) ─────────────────
-            # CRITICAL FIX: Use explicit state flags, NOT text pattern matching
-            _declared = _mission_state.get("declared_objectives", [])
-            _completed = _mission_state.get("completed_objectives", [])
-            _artifacts = _mission_state.get("artifacts_modified", 0)
-            _tools = _mission_state.get("tools_executed", 0)
-
-            # Determine if mission is already complete using deterministic state
-            _mission_already_complete = _mission_state.get("phase") == "COMPLETE"
-            if not _mission_already_complete:
-                if _declared:
-                    _mission_already_complete = set(_declared) <= set(_completed)
-                else:
-                    # Legacy mode: require real work (artifacts or meaningful tools)
-                    _mission_already_complete = _artifacts > 0 or _tools > 0
-
-            if _mission_already_complete:
-                ASCIIColors.success(
-                    f"[chat] Round {_round}: Mission already completed (artifacts={_artifacts}, tools={_tools}). Exiting."
-                )
-                break
-
-            # Only check for "failed to act" if mission is NOT already complete
-            if not _tool_trigger and not _artefacts_built and not _has_action_tags and not _specialist_executed:
-                # Check if we're in Round 2+ and still no action - inject STRONGER correction before forcing answer
+            # ── EXIT IF NO ACTION DETECTED (Round 2+) ───────────────────────
+            # If model didn't emit tags in Round 1, we already broke out above.
+            # This handles Round 2+ where model emitted tags but then went silent.
+            if _round >= 2 and not (_tool_trigger or _artefacts_built or _has_action_tags or _specialist_executed):
                 if _round >= 3:
-                    # After 3 failed rounds, force final answer immediately
-                    ASCIIColors.error(
-                        f"[chat] Round {_round} failed after final warning. Forcing final answer."
-                    )
-                    is_agentic_turn = True
-                    _turn_action_history.append(
-                        "🚨 FAILED: Model could not emit tool calls after 3 rounds + final warning."
-                    )
+                    ASCIIColors.error(f"[chat] Round {_round}: No action after warnings. Forcing answer.")
                     break
-                elif _round >= 2:
-                    ASCIIColors.error(f"[chat] Round {_round} failed to act after correction. Injecting final warning.")
+                elif _round == 2:
+                    ASCIIColors.warning(f"[chat] Round 2: No action detected. One more chance.")
                     _virtual_history.append(SimpleNamespace(
                         sender_type="system",
                         content=(
-                            "⚠️ FINAL WARNING — LAST CHANCE TO ACT\n"
-                            "You failed to emit tool calls or artifact tags for 2 rounds.\n"
-                            "This is your FINAL opportunity to produce valid XML tags.\n"
-                            "\n"
-                            "If you do not emit <artifact> or <tool_call> tags this turn:\n"
-                            "1. System will FORCE final answer without your changes\n"
-                            "2. User request will remain UNFULFILLED\n"
-                            "3. Response marked as FAILED\n"
-                            "\n"
-                            "EMIT TAGS NOW OR FAIL COMPLETELY."
+                            "⚠️ You emitted tags in Round 1 but took no action.\n"
+                            "Round 3 will FORCE final answer if you don't act NOW.\n"
+                            "Emit <artifact> or <tool_call> tags immediately."
                         )
                     ))
-                    _turn_action_history.append(
-                        f"⚠️ CRITICAL: Round {_round} failed. Final warning injected."
-                    )
-                    # Continue to ONE more round (round 3) with the strong warning, then force answer
                     continue
 
         # ====================================================================
@@ -6333,16 +6476,112 @@ If you fail to use the tools when data is available, your output will be rejecte
             else:
                 _result_str_for_llm = _result_str
  
-            # ── GOAL DECLARATION PHASE (Round 1 only) ─────────────────────────
+            # ╔══════════════════════════════════════════════════════════════════╗
+            # ║  THINK PHASE: Generate explicit action plan                      ║
+            # ╚══════════════════════════════════════════════════════════════════╝
+            _action_plan = None
+
+            if debug or self.lollmsClient.debug:
+                ASCIIColors.magenta(f"[THINK] Round {_round}: Generating action plan (phase={_mission_state.get('phase')})")
+
+            try:
+                _action_plan = self.lollmsClient.generate_structured_content(
+                    prompt=(
+                        f"=== CURRENT STATE ===\n"
+                        f"Mission Phase: {_mission_state.get('phase', 'THINK')}\n"
+                        f"Declared Objectives: {_mission_state.get('declared_objectives', [])}\n"
+                        f"Completed Objectives: {_mission_state.get('completed_objectives', [])}\n"
+                        f"Active Artifacts: {[a['title'] for a in self.artefacts.list(active_only=True)]}\n"
+                        f"Tools Executed This Turn: {[tc['name'] for tc in tool_calls_this_turn]}\n\n"
+                        "=== DECISION REQUIRED ===\n"
+                        "Choose EXACTLY ONE action:\n"
+                        "1. tool_call — Execute a tool (must specify tool_name + tool_parameters)\n"
+                        "2. artifact_action — Create/modify artifact (must specify artifact_name + artifact_type)\n"
+                        "3. complete — All objectives satisfied, ready for final answer\n\n"
+                        "CRITICAL: Do NOT output prose. Output ONLY the JSON action plan."
+                    ),
+                    schema={
+                        "type": "object",
+                        "properties": {
+                            "action_type": {
+                                "type": "string",
+                                "enum": ["tool_call", "artifact_action", "complete"],
+                                "description": "The type of action to take"
+                            },
+                            "tool_name": {
+                                "type": "string",
+                                "description": "Tool name (required if action_type=tool_call)"
+                            },
+                            "tool_parameters": {
+                                "type": "object",
+                                "description": "Tool parameters as key-value pairs (required if action_type=tool_call)"
+                            },
+                            "artifact_name": {
+                                "type": "string",
+                                "description": "Artifact filename/title (required if action_type=artifact_action)"
+                            },
+                            "artifact_type": {
+                                "type": "string",
+                                "enum": ["code", "document", "data", "note", "skill"],
+                                "description": "Artifact type (required if action_type=artifact_action)"
+                            },
+                            "reasoning": {
+                                "type": "string",
+                                "description": "Brief justification for this action (1-2 sentences)"
+                            }
+                        },
+                        "required": ["action_type", "reasoning"]
+                    },
+                    temperature=0.1,
+                    debug=debug
+                )
+
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.green(f"[THINK] ✓ Action plan generated: action_type={_action_plan.get('action_type')}, reasoning={_action_plan.get('reasoning', '')[:80]}")
+            except Exception as e:
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.red(f"[THINK] ✗ Structured planning failed: {e}")
+                _action_plan = {"action_type": "complete", "reasoning": f"Planning failed: {str(e)[:100]}"}
+
+            # ╔══════════════════════════════════════════════════════════════════╗
+            # ║  VERIFY PHASE: Acknowledge results, decide next action            ║
+            # ╚══════════════════════════════════════════════════════════════════╝
+            if _action_plan and _mission_state.get("phase") == "VERIFY":
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.cyan(f"[VERIFY] Round {_round}: Acknowledging tool result for {_action_plan.get('tool_name', 'unknown')}")
+
+                # Inject synthetic tool result into history for model to learn from
+                _result_preview = _virtual_history[-1].content[:300] if _virtual_history else "No result"
+
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.cyan(f"[VERIFY] Result preview: {_result_preview}...")
+
+                # Phase transitions back to THINK for next decision
+                _mission_state["phase"] = "THINK"
+
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.cyan(f"[VERIFY] → phase=THINK (next iteration)")
+
+            # ╔══════════════════════════════════════════════════════════════════╗
+            # ║  GOAL DECLARATION (Round 1 only)                                  ║
+            # ╚══════════════════════════════════════════════════════════════════╝
             if _round == 1 and not _mission_state.get("declared_objectives"):
+                if debug or self.lollmsClient.debug:
+                    ASCIIColors.cyan("[GOALS] Round 1: Extracting objectives from user request")
+
                 _objectives_extracted = False
 
                 try:
                     _obj_result = self.lollmsClient.generate_structured_content(
-                        prompt="List planned objectives as JSON array. Example: [\"research\", \"write_artifact\"]. Output ONLY array.",
+                        prompt=(
+                            f"User request: \"{user_message}\"\n\n"
+                            "Extract 1-3 concrete objectives as a JSON array.\n"
+                            "Examples: [\"research_topic\", \"create_artifact\"], [\"query_database\", \"generate_report\"]\n"
+                            "Output ONLY the array."
+                        ),
                         schema={"type": "array", "items": {"type": "string"}},
                         temperature=0.0,
-                        debug=True
+                        debug=debug
                     )
                     if _obj_result and isinstance(_obj_result, list) and len(_obj_result) > 0:
                         _filtered = [
@@ -6352,11 +6591,13 @@ If you fail to use the tools when data is available, your output will be rejecte
                         if _filtered:
                             _mission_state["declared_objectives"] = _filtered
                             _objectives_extracted = True
-                            ASCIIColors.cyan(f"[Goals] Declared: {_filtered}")
+                            if debug or self.lollmsClient.debug:
+                                ASCIIColors.green(f"[GOALS] ✓ Declared: {_filtered}")
                 except Exception as e:
-                    ASCIIColors.warning(f"[Goals] Structured extraction failed: {e}")
+                    if debug or self.lollmsClient.debug:
+                        ASCIIColors.red(f"[GOALS] ✗ Structured extraction failed: {e}")
 
-                # Try 2: Default objectives based on context (always succeeds)
+                # Fallback: Default objectives based on context
                 if not _objectives_extracted:
                     _default_objectives = []
                     if _has_external_tools:
@@ -6367,7 +6608,8 @@ If you fail to use the tools when data is available, your output will be rejecte
                         _default_objectives.append("create_artifact")
 
                     _mission_state["declared_objectives"] = _default_objectives
-                    ASCIIColors.yellow(f"[Goals] Using defaults: {_default_objectives}")
+                    if debug or self.lollmsClient.debug:
+                        ASCIIColors.yellow(f"[GOALS] Using defaults: {_default_objectives}")
 
                     _record_episode(
                         episode_type="goal_declaration",
@@ -6376,7 +6618,13 @@ If you fail to use the tools when data is available, your output will be rejecte
                     )
 
                     _mission_state["goal_declaration_round"] = 1
-                    _log_state_transition("ACT", f"Goals declared ({len(_mission_state['declared_objectives'])} objectives)")
+                    _log_state_transition("THINK", f"Goals declared ({len(_mission_state['declared_objectives'])} objectives)")
+
+                # Initialize state machine
+                if _round == 1:
+                    _mission_state["phase"] = "THINK"
+                    if debug or self.lollmsClient.debug:
+                        ASCIIColors.cyan("[TAV] ✓ State machine initialized: phase=THINK")
 
                 # ── OBJECTIVE PROGRESS CHECK (deterministic, explicit matching) ───────────
                 _declared = _mission_state.get("declared_objectives", [])
@@ -6466,9 +6714,27 @@ If you fail to use the tools when data is available, your output will be rejecte
                             content=synth_result
                         ))
             elif not _did_something:
+                # Escalating failure markers based on round number
+                _intent_locked = getattr(self, '_intent_lock', None)
+                _intent_context = f"INTENT LOCK: {_intent_locked}" if _intent_locked is not None else "INTENT: UNKNOWN"
+
+                if _round == 1:
+                    _failure_detail = "NO ACTION: You produced reasoning but no tools called and no artifacts modified."
+                elif _round == 2:
+                    _failure_detail = (
+                        f"CRITICAL FAILURE (Round 2): You ignored Round 1 failure marker. "
+                        f"{_intent_context}. You MUST emit <artifact> or <tool_call> tags. Prose alone is REJECTED."
+                    )
+                else:
+                    _failure_detail = (
+                        f"CATASTROPHIC FAILURE (Round 3): You have failed to act for 3 consecutive rounds. "
+                        f"{_intent_context}. System will FORCE final answer without your changes. "
+                        "This is your ABSOLUTE LAST CHANCE to emit valid XML tags."
+                    )
+
                 synth_failure = (
                     f'\n<tool_result name="action_failure">'
-                    f'{{"success": false, "error": "NO ACTION: You produced reasoning but no tools called and no artifacts modified. Call tools or emit <artifact> tags to progress."}}'
+                    f'{{"success": false, "error": "{_failure_detail}", "round": {_round}, "consecutive_failures": {_round}}}'
                     f'</tool_result>\n'
                 )
                 _virtual_history.append(SimpleNamespace(
@@ -6487,40 +6753,27 @@ If you fail to use the tools when data is available, your output will be rejecte
             ss.clean_prose.clear()
  
         # ====================================================================
-        #  Forced final-answer pass
+        #  FINAL ANSWER PASS
         # ====================================================================
-        # DETERMINISTIC: Use explicit state flags, NOT text length heuristics
-        _tool_call_count = len(tool_calls_this_turn)
+        # If model never entered agentic mode (no tags), just use accumulated content
+        # If model did enter agentic mode, ensure we have a proper summary
+
         _has_produced_text = bool(ai_message.content.strip())
-        _specialist_succeeded = hasattr(ss, 'pending_final_content') and bool(ss.pending_final_content)
+        _entered_agent_mode = _entered_agentic_mode  # From loop above
 
-        # DETERMINISTIC: Check mission state flags, NOT text pattern matching
-        _declared = _mission_state.get("declared_objectives", [])
-        _completed = _mission_state.get("completed_objectives", [])
-        _artifacts = _mission_state.get("artifacts_modified", 0)
-        _tools = _mission_state.get("tools_executed", 0)
-
-        _mission_success = False
-        if _declared:
-            _mission_success = set(_declared) <= set(_completed)
-        else:
-            _mission_success = _artifacts > 0 or _tools > 0
-
-        # DETERMINISTIC: Forced answer conditions based on explicit state
+        # Only force answer if we entered agent mode but got no output
         _needs_forced_answer = (
-            is_agentic_turn and not _mission_success and (
-                not _has_produced_text or
-                _round >= max_reasoning_steps or
-                (_specialist_succeeded and not _has_produced_text) or
-                (tool_calls_this_turn and not any(c.get("name") == "final_answer" for c in tool_calls_this_turn))
-            )
+            _entered_agent_mode and not _has_produced_text
         )
 
         if _needs_forced_answer:
             _final_id = _step_start(callback, "Generating final answer...")
 
-            # Preserve all content generated so far; final answer appends to it
-            _content_before_final = ai_message.content
+            # If we never entered agent mode, just return what we have
+            if not _entered_agentic_mode:
+                ASCIIColors.info("[chat] Fast path: Model answered directly without agent mode.")
+            else:
+                ASCIIColors.info("[chat] Agent mode completed. Writing final answer.")
 
             ss_final = _StreamState(
                 callback              = callback,
