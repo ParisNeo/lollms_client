@@ -1104,28 +1104,28 @@ Continue the code exactly from where it left off. Do not repeat any part of the 
                 flags=re.DOTALL | re.IGNORECASE
             )
         
-        # Now search for <json> tags in the cleaned response
+        # Use ONLY <json> tags for simplicity and consistency
         pattern = r'<json>(.*?)</json>'
         matches = list(re.finditer(pattern, cleaned_response, re.DOTALL | re.IGNORECASE))
-        
+
         if matches:
             # Return the last complete match (most likely to be the actual output)
             return matches[-1].group(1).strip()
-        
+
         # Fallback: try original response for closed tags if cleaning removed everything
         matches = list(re.finditer(pattern, response, re.DOTALL | re.IGNORECASE))
         if matches:
             # Return the last match from original response
             return matches[-1].group(1).strip()
-        
+
         # Last resort: try to find unclosed json tag (for truncated responses)
-        pattern = r'<json>(.*?)$'
-        match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
-        
+        unclosed_pattern = r'<json>(.*?)$'
+        match = re.search(unclosed_pattern, response, re.DOTALL | re.IGNORECASE)
+
         if match:
             self._log_warning("Found unclosed <json> tag - response may be truncated")
             return match.group(1).strip()
-        
+
         return None
     
     def _create_schema_example(self, schema: dict) -> any:
@@ -1175,6 +1175,15 @@ Continue the code exactly from where it left off. Do not repeat any part of the 
             parsed = json.loads(json_string)
             return {"success": True, "truncated": False, "data": parsed}
         except json.JSONDecodeError as e:
+            # DEBUG: Log the exact JSON that failed to parse
+            if getattr(self, 'llm', None) and (self.llm.debug or getattr(self, '_debug', False)):
+                ASCIIColors.red(f"[DEBUG] JSON Parse Failed at position {e.pos}:")
+                ASCIIColors.red(f"  Error: {e.msg}")
+                # Show context around the error position
+                start = max(0, (e.pos or 0) - 50)
+                end = min(len(json_string), (e.pos or 0) + 100)
+                ASCIIColors.yellow(f"  Context: {json_string[start:end]!r}")
+
             # Analyze the error to detect truncation
             error_msg = str(e)
             
@@ -1332,12 +1341,29 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
             )
             if isinstance(response, dict) and not response.get("status", True):
                 continue
-                
+
+            # DEBUG: Log raw LLM response to understand parsing failures
+            if self.llm.debug or kwargs.get("debug", False):
+                ASCIIColors.magenta(f"[DEBUG] Raw LLM Response ({len(response)} chars):")
+                ASCIIColors.white(response[:2000] + ("..." if len(response) > 2000 else ""))
+
             response = self.remove_thinking_blocks(response)
-            
-            
+
+            # DEBUG: Log response after thinking block removal
+            if self.llm.debug or kwargs.get("debug", False):
+                ASCIIColors.cyan(f"[DEBUG] After thinking removal ({len(response)} chars):")
+                ASCIIColors.white(response[:1500] + ("..." if len(response) > 1500 else ""))
+
             # Multi-strategy extraction
             json_string = self._extract_json_multi_strategy(response)
+
+            # DEBUG: Log extracted JSON string
+            if self.llm.debug or kwargs.get("debug", False):
+                if json_string:
+                    ASCIIColors.green(f"[DEBUG] Extracted JSON ({len(json_string)} chars):")
+                    ASCIIColors.white(json_string[:1000] + ("..." if len(json_string) > 1000 else ""))
+                else:
+                    ASCIIColors.red("[DEBUG] Failed to extract any JSON from response")
             
             if not json_string:
                 self._log_warning(f"Attempt {attempt + 1}: No JSON found in response")
@@ -1437,7 +1463,7 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
 {field_requirements if field_requirements else "  (Check schema for required fields)"}
 
 # OUTPUT FORMAT RULES
-1. Wrap your JSON in <json_output> tags
+1. Wrap your JSON in <json> tags
 2. Use ONLY valid JSON syntax (double quotes, proper escaping)
 3. Include ALL required fields from the schema
 4. Match the exact data types specified (string, number, boolean, array, object)
@@ -1446,12 +1472,12 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
 7. Do NOT truncate - complete the entire structure
 
 # OUTPUT TEMPLATE
-<json_output>
+<json>
 {{
 "field1": "value1",
 "field2": value2
 }}
-</json_output>
+</json>
 
 Generate ONLY the JSON within the tags. No explanations before or after."""
 
@@ -1632,7 +1658,7 @@ Generate ONLY the JSON within the tags. No explanations before or after."""
 
     {partial_json}
 
-    Complete this JSON object according to the schema. Output ONLY the completion needed, starting from where it left off. Wrap in <json_output> tags."""
+    Complete this JSON object according to the schema. Output ONLY the completion needed, starting from where it left off. Wrap in <json> tags."""
         
         response = self.llm.generate_text(
             continuation_prompt,
@@ -1871,8 +1897,24 @@ Generate ONLY the JSON within the tags. No explanations before or after."""
     
     def remove_thinking_blocks(self, text: str) -> str:
         """Remove thinking blocks from text."""
-        pattern = r'<(thinking|think)>.*?</\1>\s*'
+        # Match <thinking>, <think>, AND <think> tags (case insensitive)
+        pattern = r'<(thinking|think|think)>\s*.*?\s*</\1>\s*'
         cleaned = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
+
+        # Also match <think>...</think> (no angle brackets, common in OpenAI models)
+        pattern_no_brackets = r'<think>\s*.*?\s*</think>\s*'
+        cleaned = re.sub(pattern_no_brackets, '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+        # CRITICAL FIX: Handle orphan </think> tags (when <think> was stripped by streaming)
+        # If </think> exists without matching <think>, treat everything before it as thought
+        if '</think>' in cleaned and '<think>' not in cleaned:
+            # Find the last </think> and remove everything before it
+            end_pos = cleaned.rfind('</think>')
+            if end_pos != -1:
+                # Keep everything after </think>, discard everything before
+                cleaned = cleaned[end_pos + len('</think>'):].lstrip()
+
+        # Clean up excessive newlines from the removal
         return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
     
     def extract_code_blocks(self, text: str, format: str = "markdown") -> List[dict]:
