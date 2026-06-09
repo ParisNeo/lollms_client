@@ -43,7 +43,7 @@ from lollms_client.lollms_types import MSG_TYPE
 from ascii_colors import ASCIIColors, trace_exception
 from datetime import datetime
 
-app = FastAPI(title="Lollms Multimodal Document Viewer")
+app = FastAPI(title="Lollms Client Demonstration App")
 
 # Define paths
 STATIC_DIR = Path(__file__).parent / "static"
@@ -205,6 +205,44 @@ class WikipediaImportItem(BaseModel):
 
 class WikipediaImportSelectedRequest(BaseModel):
     items: List[WikipediaImportItem]
+    auto_load: bool = True
+
+class GoogleScholarSearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+class GoogleScholarImportItem(BaseModel):
+    title: str
+    author: str
+    abstract: str
+    url: str
+
+class GoogleScholarImportSelectedRequest(BaseModel):
+    items: List[GoogleScholarImportItem]
+    auto_load: bool = True
+
+class ScopusSearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+class ScopusImportItem(BaseModel):
+    scopus_id: str
+    title: str
+
+class ScopusImportSelectedRequest(BaseModel):
+    items: List[ScopusImportItem]
+    auto_load: bool = True
+
+class OrbitSearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+class OrbitImportItem(BaseModel):
+    patent_id: str
+    title: str
+
+class OrbitImportSelectedRequest(BaseModel):
+    items: List[OrbitImportItem]
     auto_load: bool = True
 
 class ArxivSearchRequest(BaseModel):
@@ -2310,6 +2348,63 @@ async def import_wikipedia_endpoint(payload: WikipediaImportSelectedRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/google_scholar/search")
+async def search_google_scholar_endpoint(payload: GoogleScholarSearchRequest):
+    results = discussion.search_google_scholar(payload.query, max_results=payload.max_results)
+    return {"success": True, "results": results}
+
+
+@app.post("/api/google_scholar/import")
+async def import_google_scholar_endpoint(payload: GoogleScholarImportSelectedRequest):
+    try:
+        for item in payload.items:
+            discussion.import_google_scholar(item.title, item.author, item.abstract, item.url, payload.auto_load)
+        discussion.commit()
+        return {"success": True}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/scopus/search")
+async def search_scopus_endpoint(payload: ScopusSearchRequest):
+    results = discussion.search_scopus(payload.query, max_results=payload.max_results)
+    return {"success": True, "results": results}
+
+
+@app.post("/api/scopus/import")
+async def import_scopus_endpoint(payload: ScopusImportSelectedRequest):
+    try:
+        for item in payload.items:
+            discussion.import_scopus(item.scopus_id, auto_load=payload.auto_load)
+        discussion.commit()
+        return {"success": True}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/orbit/search")
+async def search_orbit_endpoint(payload: OrbitSearchRequest):
+    results = discussion.search_orbit(payload.query, max_results=payload.max_results)
+    return {"success": True, "results": results}
+
+
+@app.post("/api/orbit/import")
+async def import_orbit_endpoint(payload: OrbitImportSelectedRequest):
+    try:
+        for item in payload.items:
+            discussion.import_orbit(item.patent_id, auto_load=payload.auto_load)
+        discussion.commit()
+        return {"success": True}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/arxiv/search")
 async def search_arxiv_endpoint(payload: ArxivSearchRequest):
     results = discussion.search_arxiv(payload.query, payload.author, payload.year, payload.max_results)
@@ -4194,7 +4289,7 @@ app.mount("/", NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="static
 def main():
     """Entry point for the application."""
     ASCIIColors.cyan("==================================================================")
-    ASCIIColors.green("🎬 Starting Lollms Multimodal Document Viewer on http://localhost:9680")
+    ASCIIColors.green("🎬 Starting Lollms Client Demonstration App on http://localhost:9680")
     ASCIIColors.cyan("==================================================================")
     uvicorn.run(app, host="localhost", port=9680)
 

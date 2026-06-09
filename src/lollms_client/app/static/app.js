@@ -2486,13 +2486,13 @@ document.addEventListener("DOMContentLoaded", () => {
     internetSourceType.addEventListener("change", (e) => {
         const type = e.target.value;
         document.querySelectorAll(".internet-fields").forEach(f => f.style.display = "none");
-        
+
         const fieldBlock = document.getElementById(`fields-${type}`);
         if (fieldBlock) {
             fieldBlock.style.display = "block";
         }
 
-        if (type === "youtube" || type === "github" || type === "stackoverflow") {
+        if (type === "youtube" || type === "github" || type === "stackoverflow" || (type === "scopus" && document.getElementById("scopus-query").value.trim().startsWith("http"))) {
             btnInternetSearch.textContent = "Import URL directly";
         } else {
             btnInternetSearch.textContent = "Search / Ingest";
@@ -2522,6 +2522,13 @@ document.addEventListener("DOMContentLoaded", () => {
                 const url = document.getElementById("stackoverflow-url").value.trim();
                 await importDirectURL("/api/stackoverflow/import", { url: url });
             } 
+            else if (type === "scopus" && document.getElementById("scopus-query").value.trim().startsWith("http")) {
+                const url = document.getElementById("scopus-query").value.trim();
+                // Extract scopus ID from URL if possible
+                const idMatch = url.match(/eid=2-s2.0-(\d+)/) || url.match(/record\/display\.uri\?eid=([^&]+)/);
+                const scopusId = idMatch ? idMatch[1] : url.split("/").pop();
+                await importDirectURL("/api/scopus/import", { items: [{ scopus_id: scopusId, title: "Scopus Article" }], auto_load: true });
+            }
             else {
                 await executeSearch(type);
             }
@@ -2529,7 +2536,7 @@ document.addEventListener("DOMContentLoaded", () => {
             alert(`Search/Ingestion failed: ${err}`);
         } finally {
             btnInternetSearch.disabled = false;
-            btnInternetSearch.textContent = (type === "youtube" || type === "github" || type === "stackoverflow") ? "Import URL directly" : "Search / Ingest";
+            btnInternetSearch.textContent = (type === "youtube" || type === "github" || type === "stackoverflow" || (type === "scopus" && document.getElementById("scopus-query").value.trim().startsWith("http"))) ? "Import URL directly" : "Search / Ingest";
         }
     });
 
@@ -2573,6 +2580,21 @@ document.addEventListener("DOMContentLoaded", () => {
             if (!q && !author) { alert("Please specify either keywords or author."); return; }
             endpoint = "/api/arxiv/search";
             payload = { query: q || null, author: author || null, max_results: 5 };
+        } else if (type === "google_scholar") {
+            const q = document.getElementById("scholar-query").value.trim();
+            if (!q) { alert("Please specify search keywords."); return; }
+            endpoint = "/api/google_scholar/search";
+            payload = { query: q, max_results: 5 };
+        } else if (type === "scopus") {
+            const q = document.getElementById("scopus-query").value.trim();
+            if (!q) { alert("Please specify Scopus search keywords."); return; }
+            endpoint = "/api/scopus/search";
+            payload = { query: q, max_results: 5 };
+        } else if (type === "orbit") {
+            const q = document.getElementById("orbit-query").value.trim();
+            if (!q) { alert("Please specify Orbit search keywords."); return; }
+            endpoint = "/api/orbit/search";
+            payload = { query: q, max_results: 5 };
         } else if (type === "github") {
             const q = document.getElementById("github-url").value.trim();
             if (!q) { alert("Please specify GitHub search keywords."); return; }
@@ -2607,17 +2629,21 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function renderSearchResults(type, results) {
         searchResultsList.innerHTML = results.map((r, idx) => {
-            const url = r.url || r.pdf_url || (r.id ? `https://arxiv.org/abs/${r.id}` : "#");
+            let url = r.url || r.pdf_url || (r.id ? `https://arxiv.org/abs/${r.id}` : "#");
+            // Extract Scopus / Patent IDs safely
+            let id_str = r.scopus_id || r.patent_id || r.id || "";
+            let id_badge = id_str ? `<span class="level-tag deep" style="margin-left:6px; font-size:9px; padding:1px 4px; display:inline-block;">ID: ${id_str}</span>` : "";
+
             const titleHtml = url !== "#" 
-                ? `<a href="${url}" target="_blank" class="search-result-link" title="Open source link in new tab">${r.title} 🔗</a>` 
-                : `<span class="search-result-title">${r.title}</span>`;
+                ? `<a href="${url}" target="_blank" class="search-result-link" title="Open source link in new tab">${r.title} 🔗</a>${id_badge}` 
+                : `<span class="search-result-title">${r.title}</span>${id_badge}`;
 
             return `
                 <li class="search-result-card">
                     <input type="checkbox" class="result-check" data-index="${idx}">
                     <div class="search-result-content">
                         ${titleHtml}
-                        <span class="search-result-snippet">${r.snippet || r.abstract || r.url || ""}</span>
+                        <span class="search-result-snippet" style="white-space: pre-wrap; margin-top:4px;">${r.snippet || r.abstract || r.url || ""}</span>
                     </div>
                 </li>
             `;
@@ -2658,6 +2684,39 @@ document.addEventListener("DOMContentLoaded", () => {
             const mode = document.getElementById("arxiv-mode").value;
             payload = {
                 items: selectedItems.map(item => ({ id: item.id, title: item.title, mode: mode })),
+                auto_load: true
+            };
+        } else if (type === "google_scholar") {
+            endpoint = "/api/google_scholar/import";
+            payload = {
+                items: selectedItems.map(item => {
+                    const snippetParts = (item.snippet || "").split("\n");
+                    const author = snippetParts[0] || "Unknown";
+                    const abstract = snippetParts.slice(1).join("\n") || "No abstract available.";
+                    return { title: item.title, author: author, abstract: abstract, url: item.url };
+                }),
+                auto_load: true
+            };
+        } else if (type === "scopus") {
+            endpoint = "/api/scopus/import";
+            payload = {
+                items: selectedItems.map(item => {
+                    const url = item.url || "";
+                    const idMatch = url.match(/eid=2-s2.0-(\d+)/) || url.match(/record\/display\.uri\?eid=([^&]+)/);
+                    const scopusId = idMatch ? idMatch[1] : url.split("/").pop();
+                    return { scopus_id: scopusId, title: item.title };
+                }),
+                auto_load: true
+            };
+        } else if (type === "orbit") {
+            endpoint = "/api/orbit/import";
+            payload = {
+                items: selectedItems.map(item => {
+                    const snippet = item.snippet || "";
+                    const idMatch = snippet.match(/Patent ID:\s*([A-Za-z0-9]+)/i);
+                    const patentId = idMatch ? idMatch[1] : item.title.split(" ").pop();
+                    return { patent_id: patentId, title: item.title };
+                }),
                 auto_load: true
             };
         } else {
@@ -4225,7 +4284,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 google_api_key: document.getElementById("settings-google-api-key").value.trim(),
                 google_cse_id: document.getElementById("settings-google-cse-id").value.trim(),
                 scopus_api_key: document.getElementById("settings-scopus-api-key").value.trim(),
-                scopus_inst_token: document.getElementById("settings-scopus-inst-token").value.trim()
+                scopus_inst_token: document.getElementById("settings-scopus-inst-token").value.trim(),
+                orbit_api_key: document.getElementById("settings-orbit-api-key").value.trim(),
+                scholar_api_key: document.getElementById("settings-scholar-api-key").value.trim()
             };
             payload["internet_config"] = internetConfig;
 
@@ -4468,6 +4529,8 @@ document.addEventListener("DOMContentLoaded", () => {
             document.getElementById("settings-google-cse-id").value = internetConfig.google_cse_id || "";
             document.getElementById("settings-scopus-api-key").value = internetConfig.scopus_api_key || "";
             document.getElementById("settings-scopus-inst-token").value = internetConfig.scopus_inst_token || "";
+            document.getElementById("settings-orbit-api-key").value = internetConfig.orbit_api_key || "";
+            document.getElementById("settings-scholar-api-key").value = internetConfig.scholar_api_key || "";
 
             // First, load all binding options
             await fetchBindings();

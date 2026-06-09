@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Lollms Multimodal Document & Artifact Workspace</title>
+    <title>Lollms Client Demonstration App</title>
     <link rel="stylesheet" href="/style.css">
     <!-- Load Markdown Parser -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -67,7 +67,7 @@
     </div>
 
     <header class="app-header">
-        <div class="logo">🧠 LoLLMS Artifact & Chat Workspace</div>
+        <div class="logo">🧠 Lollms Client Demonstration App</div>
         <div class="header-controls">
             <div style="position: relative; display: inline-block;">
                 <select id="header-model-select" class="header-select" title="Active Model">
@@ -419,6 +419,9 @@
                             <option value="web" selected>Web Search (DuckDuckGo)</option>
                             <option value="wikipedia">Wikipedia Article</option>
                             <option value="arxiv">Arxiv Academic Paper</option>
+                            <option value="google_scholar">Google Scholar</option>
+                            <option value="scopus">Scopus Article</option>
+                            <option value="orbit">Orbit Patent Search</option>
                             <option value="github">GitHub File / Issue</option>
                             <option value="stackoverflow">StackOverflow Question</option>
                             <option value="youtube">YouTube Video Transcript</option>
@@ -430,6 +433,27 @@
                         <div class="input-group">
                             <label for="web-query">Search Query</label>
                             <input type="text" id="web-query" placeholder="e.g. latest Rust releases">
+                        </div>
+                    </div>
+
+                    <div class="internet-fields" id="fields-google_scholar" style="display:none;">
+                        <div class="input-group">
+                            <label for="scholar-query">Scholar Keywords / Authors</label>
+                            <input type="text" id="scholar-query" placeholder="e.g. attention is all you need">
+                        </div>
+                    </div>
+
+                    <div class="internet-fields" id="fields-scopus" style="display:none;">
+                        <div class="input-group">
+                            <label for="scopus-query">Scopus Search Keywords / ID</label>
+                            <input type="text" id="scopus-query" placeholder="e.g. TITLE-ABS-KEY(quantum computing)">
+                        </div>
+                    </div>
+
+                    <div class="internet-fields" id="fields-orbit" style="display:none;">
+                        <div class="input-group">
+                            <label for="orbit-query">Orbit Patent Search Query</label>
+                            <input type="text" id="orbit-query" placeholder="e.g. autonomous flight control">
                         </div>
                     </div>
 
@@ -717,6 +741,14 @@
                     <div class="input-group">
                         <label for="settings-scopus-inst-token">Scopus Institutional Token (Optional)</label>
                         <input type="password" id="settings-scopus-inst-token" placeholder="Enter Scopus Institutional Token if applicable">
+                    </div>
+                    <div class="input-group">
+                        <label for="settings-orbit-api-key">Questel Orbit API Key</label>
+                        <input type="password" id="settings-orbit-api-key" placeholder="Enter Questel Orbit API Key">
+                    </div>
+                    <div class="input-group">
+                        <label for="settings-scholar-api-key">Google Scholar API Key (SerpApi)</label>
+                        <input type="password" id="settings-scholar-api-key" placeholder="Enter SerpApi Key for Google Scholar">
                     </div>
                 </div>
 
