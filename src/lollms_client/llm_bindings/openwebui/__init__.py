@@ -88,6 +88,60 @@ def normalize_image_input(
     return {"type": "image_url", "image_url": {"url": url}}
 
 
+def normalize_message(msg: Dict, cap_size: bool = False, max_dim: int = 2048, default_mime: str = "image/jpeg") -> Dict:
+    role = msg.get("role", "user")
+    content = msg.get("content", "")
+    text_parts = []
+    images = []
+
+    # 1. Extract Text and Images from input
+    if isinstance(content, str):
+        text_parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            elif item.get("type") in ["input_image", "image_url"]:
+                val = item.get("image_url")
+                if isinstance(val, dict):
+                    val = val.get("url") or val.get("base64")
+
+                if isinstance(val, str) and val:
+                    images.append(val)
+
+    if msg.get("images"):
+        # Handle Ollama-style images attribute
+        for img in msg.get("images", []):
+            if isinstance(img, str):
+                images.append(img)
+
+    text_content = "\n".join([p for p in text_parts if p.strip()])
+
+    # 2. Format for OpenAI API
+    if not images:
+        return {"role": role, "content": text_content}
+    else:
+        openai_content = []
+        if text_content:
+            openai_content.append({"type": "text", "text": text_content})
+
+        for img in images:
+            img_url = img
+            if not img.startswith("http") and not img.startswith("data:"):
+                try:
+                    normalized = normalize_image_input(img, cap_size=cap_size, max_dim=max_dim, default_mime=default_mime)
+                    img_url = normalized["image_url"]["url"]
+                except Exception:
+                    img_url = f"data:{default_mime};base64,{img}"
+
+            openai_content.append({
+                "type": "image_url",
+                "image_url": {"url": img_url}
+            })
+
+        return {"role": role, "content": openai_content}
+
+
 class OpenWebUIBinding(LollmsLLMBinding):
     def __init__(self, **kwargs):
         super().__init__(BindingName, **kwargs)
@@ -114,9 +168,17 @@ class OpenWebUIBinding(LollmsLLMBinding):
         )
 
     def _build_request_params(self, messages: list, **kwargs) -> dict:
+        normalized_messages = [
+            normalize_message(
+                msg,
+                cap_size=self.cap_image_size,
+                max_dim=self.image_downsizing_max_dimension
+            )
+            for msg in messages
+        ]
         params = {
             "model": kwargs.get("model", self.model_name),
-            "messages": messages,
+            "messages": normalized_messages,
             "stream": kwargs.get("stream", True),
         }
 
@@ -226,19 +288,8 @@ class OpenWebUIBinding(LollmsLLMBinding):
 
         user_message = {"role": "user", "content": prompt}
         if images:
-            b64_images = []
-            for img_path in images:
-                normalized = normalize_image_input(
-                    img_path,
-                    cap_size=self.cap_image_size,
-                    max_dim=self.image_downsizing_max_dimension
-                )
-                data_url = normalized["image_url"]["url"]
-                if "base64," in data_url:
-                    b64_images.append(data_url.split("base64,")[1])
-            if b64_images:
-                user_message["images"] = b64_images
-        
+            user_message["images"] = images
+
         messages.append(user_message)
 
         params = self._build_request_params(
@@ -261,7 +312,7 @@ class OpenWebUIBinding(LollmsLLMBinding):
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         **kwargs,
     ) -> Union[str, dict]:
-        messages = discussion.export("ollama_chat", branch_tip_id)
+        messages = discussion.export("openai_chat", branch_tip_id)
         params = self._build_request_params(
             messages=messages, n_predict=n_predict, stream=stream,
             temperature=temperature, top_k=top_k, top_p=top_p,
@@ -281,32 +332,8 @@ class OpenWebUIBinding(LollmsLLMBinding):
         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
         **kwargs,
     ) -> Union[str, dict]:
-        # Convert from OpenAI vision format to Ollama vision format
-        ollama_messages = []
-        for msg in messages:
-            content = msg.get("content")
-            role = msg.get("role")
-            
-            if isinstance(content, list):
-                text_parts = []
-                image_parts = []
-                for part in content:
-                    if part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                    elif part.get("type") == "image_url":
-                        url = part.get("image_url", {}).get("url", "")
-                        if "base64," in url:
-                            image_parts.append(url.split("base64,")[1])
-                
-                new_msg = {"role": role, "content": "\n".join(text_parts)}
-                if image_parts:
-                    new_msg["images"] = image_parts
-                ollama_messages.append(new_msg)
-            else:
-                ollama_messages.append(msg)
-
         params = self._build_request_params(
-            messages=ollama_messages, n_predict=n_predict, stream=stream,
+            messages=messages, n_predict=n_predict, stream=stream,
             temperature=temperature, top_k=top_k, top_p=top_p,
             repeat_penalty=repeat_penalty, **kwargs,
         )
