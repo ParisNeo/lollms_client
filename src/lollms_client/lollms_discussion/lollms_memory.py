@@ -75,6 +75,7 @@ class _MemoryRecord(_Base):
     summary         = Column(Text,     nullable=True)
     level           = Column(Integer,  nullable=False, default=1)
     importance      = Column(Float,    nullable=False, default=0.75)
+    centrality      = Column(Float,    nullable=True, default=0.0)  # Graph centrality score
     use_count       = Column(Integer,  nullable=False, default=0)
     tags            = Column(Text,     nullable=True)
     subject_group   = Column(String,   nullable=True)
@@ -88,6 +89,22 @@ class _MemoryRecord(_Base):
 
     __table_args__ = (
         Index("ix_mem_owner_level_importance", "owner_id", "level", "importance"),
+    )
+
+
+class _MemoryRelationship(_Base):
+    """Explicit graph edges between memory nodes."""
+    __tablename__ = "memory_relationships"
+    id              = Column(String,   primary_key=True, default=lambda: str(uuid.uuid4()))
+    source_id       = Column(String,   ForeignKey("memories.id", ondelete="CASCADE"), nullable=False, index=True)
+    target_id       = Column(String,   ForeignKey("memories.id", ondelete="CASCADE"), nullable=False, index=True)
+    relationship_type = Column(String, nullable=False, default="RELATED_TO")  # RELATED_TO, DERIVED_FROM, CONTRADICTS, SUPPORTS, TEMPORAL_AFTER
+    weight          = Column(Float,    nullable=False, default=1.0)  # Edge weight for traversal
+    created_at      = Column(DateTime, nullable=False, default=datetime.utcnow)
+    relationship_metadata = Column(Text, nullable=True)  # JSON metadata
+
+    __table_args__ = (
+        Index("ix_rel_source_target", "source_id", "target_id", unique=True),
     )
 
 
@@ -230,6 +247,7 @@ class LollmsMemoryManager:
                     ('predicate', "ALTER TABLE memories ADD COLUMN predicate TEXT"),
                     ('object', "ALTER TABLE memories ADD COLUMN object TEXT"),
                     ('activation', "ALTER TABLE memories ADD COLUMN activation REAL"),
+                    ('centrality', "ALTER TABLE memories ADD COLUMN centrality REAL"),
                 ]
                 for col, sql in migrations:
                     if col not in columns:
@@ -675,11 +693,12 @@ class LollmsMemoryManager:
     def build_system_instructions(self) -> str:
         return (
             "\n=== MEMORY SYSTEM ===\n\n"
-            "You are equipped with a multi-level persistent memory system to recall facts, user preferences, and past events/conversations across turns.\n\n"
-            "── Working Memory: Active memories and past conversation episodes appear in the WORKING MEMORY zone below (injected into your context). They are shown in chronological order with their timestamp, [ID], and importance.\n"
+            "You are equipped with a multi-level persistent memory system with GRAPH-BASED relationships to recall facts, user preferences, and past events/conversations across turns.\n\n"
+            "── Working Memory: Active memories and past conversation episodes appear in the WORKING MEMORY zone below (injected into your context). They are shown in chronological order with their timestamp, [ID], importance, and centrality (graph connectivity).\n"
             "   👉 CRITICAL RULE: When you utilize or refer to an active memory [ID] to answer, you MUST prepend `<mem_tag id=\"ID\" />` to your response so the system can track its usage.\n"
             "── Deep Memory: Stored memories and past episodes that are currently inactive. Only their compact handles appear. "
             "If you see a handle (e.g. [abc123de]) that contains information needed to answer the user's question, you MUST load it first by outputting `<mem_load id=\"ID\" />`.\n"
+            "── Memory Graph: Memories are connected via explicit relationships. High-centrality memories are more connected and important.\n"
             "── Tags Available:\n"
             "   • `<mem_new importance=\"...\">content</mem_new>` — Save a new fact, preference, or event (importance is a float, default 0.75).\n"
             "     🚨 CURATION PROTOCOL (ONLY SAVE HIGH-DENSITY, PERSISTENT KNOWLEDGE):\n"
@@ -688,14 +707,18 @@ class LollmsMemoryManager:
             "   • `<mem_update id=\"ID\">content</mem_update>` — Update an existing memory's verbatim content.\n"
             "   • `<mem_tag id=\"ID\" />` — Tag/acknowledge that a memory was retrieved and used to answer the user.\n"
             "   • `<mem_load id=\"ID\" />` — Load an inactive Deep Memory into active Working Memory.\n"
-            "   • `<mem_delete id=\"ID\" />` — Delete a memory that is no longer correct or relevant.\n\n"
+            "   • `<mem_delete id=\"ID\" />` — Delete a memory that is no longer correct or relevant.\n"
+            "   • `<mem_rel source=\"ID\" target=\"ID\" type=\"TYPE\" weight=\"1.0\" />` — Create a graph relationship between memories.\n"
+            "     Relationship types: RELATED_TO, DERIVED_FROM, CONTRADICTS, SUPPORTS, TEMPORAL_AFTER\n\n"
             "── Rules: Use exact 8-character ID prefixes. All tags are automatically stripped from your reply before display.\n"
             "── CRITICAL: Memory tags are processed silently by the system. After using any memory tag, you MUST continue with a natural, helpful conversational response to the user. Do not stop after only emitting a memory tag.\n"
             "=== END MEMORY SYSTEM ===\n"
         )
 
+    _PAT_REL = re.compile(r'<mem_rel\s+source=["\']([^"\']+)["\']\s+target=["\']([^"\']+)["\'](?:\s+type=["\']([^"\']+)["\'])?(?:\s+weight=["\']([^"\']+)["\'])?(?:\s*/)?>', re.I)
+
     def process_llm_output(self, text: str) -> Tuple[str, Dict[str, Any]]:
-        cleaned, report = text, {"created": [], "updated": [], "tagged": [], "deleted": [], "loaded":  []}
+        cleaned, report = text, {"created": [], "updated": [], "tagged": [], "deleted": [], "loaded": [], "relationships": []}
         for m in self._PAT_UPDATE.finditer(text):
             full_id = self._resolve_id(m.group(1))
             if full_id:
@@ -729,6 +752,19 @@ class LollmsMemoryManager:
         for m in self._PAT_DELETE.finditer(text):
             full_id = self._resolve_id(m.group(1))
             if full_id and self.delete(full_id): report["deleted"].append(m.group(1))
+            cleaned = cleaned.replace(m.group(0), "", 1)
+        # Process relationship tags
+        for m in self._PAT_REL.finditer(text):
+            source_id = self._resolve_id(m.group(1))
+            target_id = self._resolve_id(m.group(2))
+            rel_type = m.group(3) or "RELATED_TO"
+            try:
+                weight = float(m.group(4)) if m.group(4) else 1.0
+            except ValueError:
+                weight = 1.0
+            if source_id and target_id:
+                res = self.add_relationship(source_id, target_id, rel_type, weight)
+                if res: report["relationships"].append(res)
             cleaned = cleaned.replace(m.group(0), "", 1)
         return cleaned.strip(), report
 
@@ -873,9 +909,150 @@ class LollmsMemoryManager:
     def _to_dict(self, r: _MemoryRecord) -> Dict:
         return {
             "id": r.id, "owner_id": r.owner_id, "content": r.content, "summary": r.summary,
-            "level": r.level, "importance": round(r.importance, 4), "use_count": r.use_count,
-            "tags": r.tags, "subject_group": r.subject_group, "created_at": r.created_at.isoformat(),
-            "updated_at": r.updated_at.isoformat(), "last_used_at": r.last_used_at.isoformat(),
-            "subject": r.subject, "predicate": r.predicate, "object": r.object,
-            "activation": round(r.activation, 4) if r.activation is not None else 0.0
+            "level": r.level, "importance": round(r.importance, 4), "centrality": round(r.centrality, 4) if r.centrality else 0.0,
+            "use_count": r.use_count, "tags": r.tags, "subject_group": r.subject_group,
+            "created_at": r.created_at.isoformat(), "updated_at": r.updated_at.isoformat(),
+            "last_used_at": r.last_used_at.isoformat(), "subject": r.subject, "predicate": r.predicate,
+            "object": r.object, "activation": round(r.activation, 4) if r.activation is not None else 0.0
+        }
+
+    # ──────────────────────────────────────────────── GRAPH OPERATIONS
+
+    def add_relationship(self, source_id: str, target_id: str, relationship_type: str = "RELATED_TO", weight: float = 1.0, metadata: Optional[Dict] = None) -> Optional[Dict]:
+        """Create an explicit graph edge between two memories."""
+        now = datetime.utcnow()
+        with self._session() as s:
+            # Verify both nodes exist
+            source = s.get(_MemoryRecord, source_id)
+            target = s.get(_MemoryRecord, target_id)
+            if not source or not target:
+                return None
+
+            # Check for existing relationship
+            existing = s.query(_MemoryRelationship).filter(
+                _MemoryRelationship.source_id == source_id,
+                _MemoryRelationship.target_id == target_id
+            ).first()
+            if existing:
+                existing.relationship_type = relationship_type
+                existing.weight = weight
+                existing.relationship_metadata = json.dumps(metadata) if metadata else None
+                existing.created_at = now
+                s.flush()
+                return self._rel_to_dict(existing)
+
+            rel = _MemoryRelationship(
+                id=str(uuid.uuid4()), source_id=source_id, target_id=target_id,
+                relationship_type=relationship_type.upper(), weight=max(0.0, min(10.0, weight)),
+                relationship_metadata=json.dumps(metadata) if metadata else None, created_at=now
+            )
+            s.add(rel)
+            s.flush()
+
+            # Recalculate centrality for affected nodes
+            self._recalculate_centrality(s, source_id)
+            self._recalculate_centrality(s, target_id)
+
+            return self._rel_to_dict(rel)
+
+    def remove_relationship(self, source_id: str, target_id: str) -> bool:
+        """Remove a graph edge between two memories."""
+        with self._session() as s:
+            rel = s.query(_MemoryRelationship).filter(
+                _MemoryRelationship.source_id == source_id,
+                _MemoryRelationship.target_id == target_id
+            ).first()
+            if rel:
+                s.delete(rel)
+                self._recalculate_centrality(s, source_id)
+                self._recalculate_centrality(s, target_id)
+                return True
+            return False
+
+    def get_relationships(self, memory_id: str, relationship_type: Optional[str] = None) -> List[Dict]:
+        """Get all relationships for a memory node."""
+        with self._session() as s:
+            q = s.query(_MemoryRelationship).filter(
+                (_MemoryRelationship.source_id == memory_id) | (_MemoryRelationship.target_id == memory_id)
+            )
+            if relationship_type:
+                q = q.filter(_MemoryRelationship.relationship_type == relationship_type.upper())
+            return [self._rel_to_dict(r) for r in q.all()]
+
+    def traverse_graph(self, start_id: str, max_depth: int = 3, relationship_types: Optional[List[str]] = None) -> List[Dict]:
+        """BFS traversal of memory graph from a starting node."""
+        visited = set()
+        queue = [(start_id, 0)]  # (node_id, depth)
+        results = []
+
+        with self._session() as s:
+            while queue:
+                node_id, depth = queue.pop(0)
+                if node_id in visited or depth > max_depth:
+                    continue
+                visited.add(node_id)
+
+                # Get node
+                node = s.get(_MemoryRecord, node_id)
+                if node:
+                    node_dict = self._to_dict(node)
+                    node_dict['_depth'] = depth
+                    results.append(node_dict)
+
+                # Get neighbors
+                rels = s.query(_MemoryRelationship).filter(
+                    (_MemoryRelationship.source_id == node_id) | (_MemoryRelationship.target_id == node_id)
+                )
+                if relationship_types:
+                    rels = rels.filter(_MemoryRelationship.relationship_type.in_([t.upper() for t in relationship_types]))
+
+                for rel in rels:
+                    neighbor_id = rel.target_id if rel.source_id == node_id else rel.source_id
+                    if neighbor_id not in visited:
+                        queue.append((neighbor_id, depth + 1))
+
+        return results
+
+    def _recalculate_centrality(self, session: Session, memory_id: str):
+        """Calculate PageRank-like centrality score for a memory node."""
+        # Get all relationships for this node
+        rels = session.query(_MemoryRelationship).filter(
+            (_MemoryRelationship.source_id == memory_id) | (_MemoryRelationship.target_id == memory_id)
+        ).all()
+
+        if not rels:
+            # No connections = low centrality
+            node = session.get(_MemoryRecord, memory_id)
+            if node:
+                node.centrality = 0.1
+            return
+
+        # Simple centrality: weighted degree / max possible degree
+        total_weight = sum(r.weight for r in rels)
+        node = session.get(_MemoryRecord, memory_id)
+        if node:
+            # Normalize: centrality = min(1.0, total_weight / 10.0)
+            node.centrality = min(1.0, total_weight / 10.0)
+
+    def recalculate_all_centrality(self):
+        """Recalculate centrality for all memories (expensive operation)."""
+        with self._session() as s:
+            for r in self._q(s).all():
+                self._recalculate_centrality(s, r.id)
+
+    def get_high_centrality_memories(self, top_k: int = 10, level: Optional[int] = None) -> List[Dict]:
+        """Get memories with highest graph centrality (most connected/important)."""
+        with self._session() as s:
+            q = self._q(s).filter(_MemoryRecord.centrality > 0.0)
+            if level is not None:
+                q = q.filter(_MemoryRecord.level == level)
+            recs = q.order_by(_MemoryRecord.centrality.desc()).limit(top_k).all()
+            return [self._to_dict(r) for r in recs]
+
+    def _rel_to_dict(self, r: _MemoryRelationship) -> Dict:
+        return {
+            "id": r.id, "source_id": r.source_id, "target_id": r.target_id,
+            "relationship_type": r.relationship_type, "weight": r.weight,
+            "metadata": json.loads(r.relationship_metadata) if r.relationship_metadata else {},
+            "created_at": r.created_at.isoformat()
         }
