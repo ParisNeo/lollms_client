@@ -4379,6 +4379,12 @@ TRIGGER EXAMPLES:
         # CRITICAL FIX: Initialize _needs_tools before any references
         _needs_tools: bool = False
 
+        # CRITICAL FIX: Define has_active_data_artifacts before use
+        has_active_data_artifacts = any(
+            a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+            for a in self.artefacts.list(active_only=True)
+        )
+
         if debug or self.lollmsClient.debug:
             # Calculate context token size
             _ctx_text = self.export("lollms_text", branch_tip_id or self.active_branch_id, 999999)
