@@ -79,21 +79,20 @@ _PATCH_RETRY_PROMPT_TEMPLATE = """\
 [CRITICAL: PATCH REJECTED]
 Your SEARCH/REPLACE block for '{title}' failed to match.
 
-DIAGNOSTIC:
-- You expected to find: '{expected_first_line}'
-- The closest match in the file is: '{closest_line}'
-- Reason: Your search block does not match the actual file content character-for-character.
+Expected: '{expected_first_line}'
+Found: '{closest_line}'
+Reason: SEARCH block does not match file content character-for-character.
 
-ACTUAL CURRENT CONTENT OF '{title}' (Use this as your source of truth):
+ACTUAL CONTENT OF '{title}' (source of truth):
 ---
 {current_content}
 ---
 
 INSTRUCTIONS:
-1. Compare your previous SEARCH block against the ACTUAL content above.
-2. Notice the differences in casing, punctuation, or spacing.
-3. Your SEARCH block must match the ACTUAL content CHARACTER-FOR-CHARACTER.
-4. If you cannot find a stable context anchor, provide the FULL file content in your tag.
+1. Compare your SEARCH block against ACTUAL content above.
+2. Note differences in casing, punctuation, spacing.
+3. SEARCH must match CHARACTER-FOR-CHARACTER.
+4. If no stable anchor, provide FULL file content.
 
 Reissue your artifact tag now.
 """
@@ -577,47 +576,6 @@ def _infer_sources_from_json(result_dict: Dict[str, Any], tool_name: str) -> Lis
     return sources
 
 
-def _infer_sources_from_json(result_dict: Dict[str, Any], tool_name: str) -> List[Dict[str, Any]]:
-    """Infers and extracts structured sources from a tool result dictionary."""
-    sources = []
-    if not isinstance(result_dict, dict):
-        return sources
-
-    raw_sources = result_dict.get("sources", [])
-    if isinstance(raw_sources, list):
-        for s in raw_sources:
-            if isinstance(s, dict):
-                s.setdefault("title", s.get("name") or s.get("title") or f"{tool_name} Source")
-                s.setdefault("content", s.get("content") or s.get("snippet") or "")
-                s.setdefault("source", s.get("source") or s.get("url") or "")
-                s.setdefault("metadata", s.get("metadata") or {})
-                sources.append(s)
-
-    output = result_dict.get("output")
-    if isinstance(output, dict):
-        for key in ["results", "sources", "items"]:
-            val = output.get(key)
-            if isinstance(val, list):
-                for item in val:
-                    if isinstance(item, dict):
-                        sources.append({
-                            "title": item.get("title") or item.get("name") or f"{tool_name} Result",
-                            "content": item.get("content") or item.get("snippet") or item.get("text") or "",
-                            "source": item.get("source") or item.get("url") or item.get("link") or "",
-                            "metadata": item.get("metadata") or {}
-                        })
-    elif isinstance(output, list):
-        for item in output:
-            if isinstance(item, dict):
-                sources.append({
-                    "title": item.get("title") or item.get("name") or f"{tool_name} Result",
-                    "content": item.get("content") or item.get("snippet") or item.get("text") or "",
-                    "source": item.get("source") or item.get("url") or item.get("link") or "",
-                    "metadata": item.get("metadata") or {}
-                })
-    return sources
-
-
 def _format_web_search_for_llm(processed: Dict[str, Any], max_chars: int = 2000) -> str:
     """
     Format processed web search results into clean, readable text for the LLM.
@@ -941,71 +899,64 @@ _LARGE_OUTPUT_THRESHOLD_CHARS = 2000
 
 _TOOL_CALL_HEADER = """\
 
-╔══════════════════════════════════════════════════════════════════╗
-║  TOOL USE — READ CAREFULLY BEFORE GENERATING                     ║
-╠══════════════════════════════════════════════════════════════════╣
-║  You have external tools. To use one you MUST emit a tool_call   ║
-║  tag containing a JSON object — NO markdown, NO prose calls.     ║
-║                                                                  ║
-║  EXACT FORMAT (copy this pattern):                               ║
-║    <tool_call>{"name": "tool_name",                              ║
-║                "parameters": {"key": "value"}}</tool_call>       ║
-║                                                                  ║
-║  Rules:                                                          ║
-║    • One tool call per response turn.                            ║
-║    • Do NOT call a tool you already called this turn (see STATE) ║
-║    • After calling ALL needed tools, write your final answer.    ║
-║    • If the user explicitly asks you to use a tool, USE IT.      ║
-╚══════════════════════════════════════════════════════════════════╝
+=== TOOL USE (MANDATORY) ===
+You have external tools. To use one, emit a tool_call tag with JSON — NO markdown, NO prose.
+
+EXACT FORMAT:
+<tool_call>{"name": "tool_name", "parameters": {"key": "value"}}</tool_call>
+
+Rules:
+• One tool call per turn.
+• Do NOT repeat tools from AGENT STATE above.
+• After tools, write your final answer.
+• If user requests a tool, USE IT.
 
 TOOLS AVAILABLE:
 """
 
 _TOOL_CALL_REMINDER = """\
-[AGENT REMINDER — YOU HAVE TOOLS]
-Call syntax:  <tool_call>{"name": "NAME", "parameters": {…}}</tool_call>
-One call per turn. Check AGENT STATE above before calling.
-If the user asked you to use a specific tool, call it NOW.
+[AGENT REMINDER]
+Call syntax: <tool_call>{"name": "NAME", "parameters": {...}}</tool_call>
+One call per turn. Check AGENT STATE. If user requested a tool, call it NOW.
 """
 
-_TOOL_CALL_CORRECTION = """\
-You were expected to call a tool but did not emit a <tool_call> tag.
-Please re-read the available tools and call the most appropriate one now.
-Do not explain why you didn't call it — just call it.
+_TOOL_CALL_CORRECTION = """
+[CRITICAL] You did not emit a <tool_call> tag. Call the appropriate tool NOW. Do not explain — just call it.
 """
 
-_SURGICAL_UPDATE_GUIDANCE = """\
+_SURGICAL_UPDATE_GUIDANCE = """
 
-╔══════════════════════════════════════════════════════════════════╗
-║  ARTEFACT UPDATE POLICY — SURGICAL EDITS PREFERRED               ║
-╠══════════════════════════════════════════════════════════════════╣
-║  When modifying an EXISTING artefact, you MUST use SEARCH/REPLACE║
-║  patch blocks unless the change affects >60% of the content.     ║
-║                                                                  ║
-║  PATCH FORMAT (Aider-style — copy exactly):                      ║
-║    <artifact name="filename.ext" type="code" language="python">  ║
-║    <<<<<<< SEARCH                                                 ║
-║    exact lines to find (verbatim, incl. indentation)             ║
-║    =======                                                        ║
-║    replacement lines                                             ║
-║    >>>>>>> REPLACE                                                ║
-║    </artifact>                                                   ║
-║                                                                  ║
-║  Rules:                                                          ║
-║    • SEARCH block must match the current artefact EXACTLY.       ║
-║    • Multiple SEARCH/REPLACE blocks allowed in one tag.          ║
-║    • Only rewrite the full content when creating NEW artefacts   ║
-║      or when >60% of lines change.                               ║
-║    • Never add commentary inside SEARCH/REPLACE blocks.          ║
-║    • If a previous patch was REJECTED, widen the SEARCH context  ║
-║      by ±3 lines and try again.                                  ║
-╚══════════════════════════════════════════════════════════════════╝
+=== ARTEFACT UPDATE POLICY ===
+When modifying EXISTING artefacts, use SEARCH/REPLACE patches unless >60% changes.
+
+PATCH FORMAT:
+<artifact name="filename.ext" type="code">
+<<<<<<< SEARCH
+exact lines (verbatim, incl. indentation)
+=======
+replacement lines
+>>>>>>> REPLACE
+</artifact>
+Rules:
+- SEARCH block must match the current artefact EXACTLY.
+- Multiple SEARCH/REPLACE blocks allowed in one tag.
+- Never add commentary inside SEARCH/REPLACE blocks.
+- If a previous patch was REJECTED, widen the SEARCH context by ±3 lines and try again.
 """
-
 def _build_tool_system_prompt(
     base_system_prompt: str,
     tool_descriptions: List[str],
 ) -> str:
+    """
+    Build system prompt with tool conditioning AFTER personality conditioning.
+
+    Structure:
+    1. Personality system prompt (if any)
+    2. Tool calling protocol & instructions
+    3. Available tools list
+    4. Artifact/update policies
+    """
+    # Strip any previous tool blocks to avoid duplication
     cleaned = re.split(
         r'\n*╔══+╗.*?╚══+╝.*?\nTOOLS AVAILABLE:',
         base_system_prompt,
@@ -1021,16 +972,45 @@ def _build_tool_system_prompt(
         cleaned,
         flags=re.DOTALL,
     )[0].rstrip()
-
-    # Strip any previous surgical-update guidance so we don't duplicate it
     cleaned = re.split(
         r'\n*╔══+╗.*?ARTEFACT UPDATE POLICY.*?╚══+╝',
         cleaned,
         flags=re.DOTALL,
     )[0].rstrip()
 
-    tool_block = _TOOL_CALL_HEADER + "\n".join(tool_descriptions)
-    return cleaned + _SURGICAL_UPDATE_GUIDANCE + "\n\n" + tool_block
+    # Build comprehensive tool conditioning block
+    tool_conditioning = """
+
+=== TOOL CALLING PROTOCOL ===
+You have external tools available. To execute an action, you MUST emit a tool call tag.
+
+**EXACT SYNTAX:**
+<tool_call>{"name": "tool_name", "parameters": {"key": "value"}}</tool_call>
+
+**MANDATORY RULES:**
+1. One tool call per turn maximum
+2. Do NOT repeat tools already executed (see EPISODIC MEMORY below)
+3. After tool execution, write a final answer summarizing results
+4. If user explicitly requests a tool, USE IT immediately
+5. NEVER describe what you will do — emit the tag and DO IT
+
+**AVAILABLE TOOLS:**
+""" + "\n".join(tool_descriptions) + """
+
+=== ARTEFACT UPDATE POLICY ===
+When modifying EXISTING artefacts:
+• Use SEARCH/REPLACE patches if changes ≤60% of file
+• Use full rewrite ONLY if changes >60%
+
+**PATCH FORMAT:**
+<artifact name="filename.ext" type="code">
+<<<<<<< SEARCH
+exact verbatim lines (including indentation)
+=======
+replacement lines
+>>>>>>> REPLACE
+</artifact>
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -1214,6 +1194,10 @@ class _StreamState:
     """
     Encapsulates all mutable state for the streaming interceptor.
 
+    DETERMINISTIC ACTION TRACKING:
+    All action detection uses explicit boolean flags set during streaming,
+    NOT text pattern matching on content buffers.
+
     UNIFIED STREAMING PROTOCOL:
     All secondary content (artefacts, widgets, forms, notes, skills) streams
     through <processing> tags. Status messages stream inside these tags; final
@@ -1305,8 +1289,10 @@ class _StreamState:
         self._in_suppress: bool = False
         self.reasoning_chunks_count = 0
 
-        # ── DETERMINISTIC MISSION STATE (replaces text-based detection) ──
-        # Track success through explicit boolean flags, not text pattern matching
+        # ── DETERMINISTIC ACTION FLAGS (set during streaming) ──
+        self._has_action_tags: bool = False
+
+        # ── DETERMINISTIC MISSION STATE ──
         self._mission_state: Dict[str, Any] = {
             "success": False,
             "artifacts_modified": 0,
@@ -2226,7 +2212,7 @@ class _StreamState:
             tag_title = attrs.pop('name', attrs.pop('title', 'untitled'))
             new_name  = attrs.pop('rename', None)
             atype     = attrs.pop('type', 'code')
-            
+
             # Defensive Type Mapping Guard for LLM hallucinations
             if atype not in ArtefactType.ALL:
                 if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite"):
@@ -2264,6 +2250,9 @@ class _StreamState:
             self._emit_processing_status(
                 f"{'Creating new' if is_new else 'Updating'} artefact '{resolved_title}'"
             )
+
+            # DETERMINISTIC: Set action flag when artifact tag detected
+            self._has_action_tags = True
 
             # ── CAPTURE STATE BEFORE UPDATE ──
             original_content_snapshot = existing_before_update.get('content', '') if existing_before_update else None
@@ -2531,12 +2520,9 @@ class _StreamState:
                 f"<pre style='color: var(--text-secondary); white-space: pre-wrap; font-family: inherit; font-size: 11.5px; margin-top: 6px;'>{escaped_thought}</pre>"
                 f"</details>\n"
             )
-            # Emit status for the processing drawer
             self._emit_processing_status("Thought process captured")
             self._emit_processing_close()
-            # CRITICAL FIX: Emit the HTML directly as MSG_TYPE_CHUNK so frontend renders it
             _cb(self.callback, details_html, MSG_TYPE.MSG_TYPE_CHUNK, {"type": "thought_rendered", "was_processed": True})
-            # Also emit the raw thought content for artifact done event
             _cb(self.callback, full_content, self.sec_done_mt, {"content": full_content})
 
         # ── Memory (Standard Tags with inner content) ─────────────────────────
@@ -2551,6 +2537,7 @@ class _StreamState:
             if res:
                 self.affected_artefacts.append(res)
                 self._emit_processing_status(f"Created new memory (Imp: {imp:.1%}): '{full_content[:40]}...'")
+                self._has_action_tags = True
             self._emit_processing_close()
             _cb(self.callback, full_content, self.sec_done_mt, {"importance": imp, "content": full_content})
 
@@ -2563,6 +2550,7 @@ class _StreamState:
                     if res:
                         self.affected_artefacts.append(res)
                         self._emit_processing_status(f"Updated memory [{tag_id[:8]}]: '{full_content[:40]}...'")
+                        self._has_action_tags = True
             self._emit_processing_close()
             _cb(self.callback, full_content, self.sec_done_mt, {"id": tag_id, "content": full_content})
 
@@ -2579,6 +2567,7 @@ class _StreamState:
             _fire_state_change(art, True)
             self._emit_processing_status("Note saved successfully")
             self._emit_processing_close()
+            self._has_action_tags = True
             _cb(self.callback, note_content, self.sec_done_mt,
                 {"title": title, "content": note_content})
         # ── Skills ────────────────────────────────────────────────────────────
@@ -2598,6 +2587,7 @@ class _StreamState:
             _fire_state_change(art, True)
             self._emit_processing_status("Skill saved successfully")
             self._emit_processing_close()
+            self._has_action_tags = True
             _cb(self.callback, full_content, self.sec_done_mt,
                 {"title": title, "content": full_content, "category": cat, "description": desc})
 
@@ -2682,8 +2672,11 @@ class _StreamState:
             else:
                 self._emit_processing_status("Form parsing failed")
                 self._emit_processing_close()
+
                 _cb(self.callback, "", self.sec_done_mt,
-                    {"title": title, "content": "", "error": "Form parsing failed"})   # ---------------------------------------------------------------- accessors
+                    {"title": title, "content": "", "error": "Form parsing failed"})
+
+    # ---------------------------------------------------------------- accessors
 
     def get_accumulated_stream(self) -> str:
         return "".join(self.stream_buf)
@@ -2931,21 +2924,7 @@ class _StreamState:
 
         final_payload = "\n\n".join(user_payload)
 
-        # ── DEBUG LOG: Show exactly what the implementation specialist sees ──
-        ASCIIColors.info("--- [DEBUG] HYPER-FOCUSED SPECIALIST INPUT ---")
-        ASCIIColors.cyan(f"  • Persona             : {requested_persona}")
-        cond_preview = custom_traits[:120].replace('\n', ' ') + "..." if len(custom_traits) > 120 else custom_traits.replace('\n', ' ')
-        ASCIIColors.cyan(f"  • Conditioning Snippet: {cond_preview}")
-        ASCIIColors.cyan(f"  • Skills Selected     : {', '.join(resolved_skills) if resolved_skills else 'None'}")
-        ASCIIColors.cyan(f"  • Target Artefacts    : {', '.join(resolved_targets) if resolved_targets else 'None'}")
-        ASCIIColors.cyan(f"  • Support Artefacts   : {', '.join(resolved_supporting) if resolved_supporting else 'None'}")
-        ASCIIColors.cyan(f"  • Images Forwarded    : {len(filtered_images) if filtered_images else 0}")
-        ASCIIColors.yellow(f"  • Payload Size        : {len(final_payload):,} chars")
-        if self.discussion.lollmsClient.debug:
-            ASCIIColors.white("\n--- FULL PAYLOAD ---")
-            print(final_payload)
-            ASCIIColors.white("--------------------\n")
-        ASCIIColors.info("----------------------------------------------")
+        # Specialist input prepared (debug logging removed for cleaner output)
 
         # 6. Call LLM at low temperature for maximum reliability
         # Use filtered_images instead of active_images
@@ -3053,12 +3032,7 @@ class _StreamState:
             if isinstance(raw_output, dict):
                 raise RuntimeError(raw_output.get("error", "Unknown LLM service error"))
 
-            # ── DEBUG LOG: Show Raw Specialist Response ──
-            ASCIIColors.info("--- [DEBUG] SPECIALIST RAW OUTPUT ---")
-            ASCIIColors.yellow(f"Output Length: {len(raw_output or '')} chars")
-            if self.discussion.lollmsClient.debug:
-                ASCIIColors.white(raw_output)
-            ASCIIColors.info("-------------------------------------")
+            # Specialist output received (debug logging removed for cleaner output)
 
             # 7. ANTI-HALLUCINATION FILTER
             # Extract expected targets from the plan
@@ -3428,8 +3402,9 @@ class ChatMixin:
         # ── Memory ────────────────────────────────────────────────────────
         _mm = self._get_memory_manager(memory_manager) if enable_memory else None
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
+        _memory_pull_report = None
         if _mm:
-            self._memory_pre_turn(_mm, user_message=user_message, enable_deep_memory_pulling=enable_deep_memory_pulling, token_counter=_counter)
+            _memory_pull_report = self._memory_pre_turn(_mm, user_message=user_message, enable_deep_memory_pulling=enable_deep_memory_pulling, token_counter=_counter)
             _mem_instructions = self._build_memory_system_instructions(_mm)
         else:
             _mem_instructions = ""
@@ -3469,6 +3444,16 @@ class ChatMixin:
 
         if _mem_instructions:
             extra_instructions += _mem_instructions
+        if _memory_pull_report and _memory_pull_report.get("pulled_memories"):
+            # Record pulled memories in episodic memory for continuity
+            for mem in _memory_pull_report["pulled_memories"]:
+                _record_episode(
+                    episode_type="memory_auto_pull",
+                    round_num=0,
+                    action=f"Auto-pulled deep memory [{mem['id'][:8]}]",
+                    details={"importance": mem.get("importance", 0), "level": mem.get("level", 2)},
+                    output_ref=mem.get("content", "")[:200],
+                )
         if enable_image_generation or enable_image_editing:
             extra_instructions += self._build_image_generation_instructions()
 
@@ -3639,6 +3624,16 @@ class ChatMixin:
         # Inject active working/deep memory into the scratchpad so the LLM sees it
         if _mm:
             mem_block = self._build_memory_context_block(_mm, token_counter=_counter)
+            # Also inject memory zone summary for full tiered context
+            zone_summary = []
+            if self.user_data_zone:
+                zone_summary.append(f"User Data Zone: {len(self.user_data_zone)} chars")
+            if self.discussion_data_zone:
+                zone_summary.append(f"Discussion Data Zone: {len(self.discussion_data_zone)} chars")
+            if self.personality_data_zone:
+                zone_summary.append(f"Personality Data Zone: {len(self.personality_data_zone)} chars")
+            if zone_summary:
+                mem_block += "\n\n=== MEMORY ZONES ===\n" + "\n".join(zone_summary) + "\n=== END ZONES ==="
             if mem_block:
                 self.scratchpad = (self.scratchpad or "") + "\n\n" + mem_block
 
@@ -3859,12 +3854,32 @@ class ChatMixin:
         _mm      = self._get_memory_manager(memory_manager) if enable_memory else None
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
         if _mm:
-            self._memory_pre_turn(_mm, user_message=user_message, enable_deep_memory_pulling=enable_deep_memory_pulling, token_counter=_counter)
+            _memory_pull_report = self._memory_pre_turn(_mm, user_message=user_message, enable_deep_memory_pulling=enable_deep_memory_pulling, token_counter=_counter)
             _mem_instructions = self._build_memory_system_instructions(_mm)
             # Inject active working/deep memory content so the LLM actually sees it
             mem_block = self._build_memory_context_block(_mm, token_counter=_counter)
+            # Add memory zone summary for full tiered context
+            zone_summary = []
+            if self.user_data_zone:
+                zone_summary.append(f"User Data Zone: {len(self.user_data_zone)} chars")
+            if self.discussion_data_zone:
+                zone_summary.append(f"Discussion Data Zone: {len(self.discussion_data_zone)} chars")
+            if self.personality_data_zone:
+                zone_summary.append(f"Personality Data Zone: {len(self.personality_data_zone)} chars")
+            if zone_summary:
+                mem_block += "\n\n=== MEMORY ZONES ===\n" + "\n".join(zone_summary) + "\n=== END ZONES ==="
             if mem_block:
                 self.scratchpad = (self.scratchpad or "") + "\n\n" + mem_block
+            # Record auto-pulled memories in episodic memory
+            if _memory_pull_report and _memory_pull_report.get("pulled_memories"):
+                for mem in _memory_pull_report["pulled_memories"]:
+                    _record_episode(
+                        episode_type="memory_auto_pull",
+                        round_num=0,
+                        action=f"Auto-pulled [{mem['id'][:8]}] (Tier: {'Deep' if mem.get('level', 1) == 2 else 'Working'})",
+                        details={"importance": mem.get("importance", 0), "level": mem.get("level", 1)},
+                        output_ref=mem.get("content", "")[:150],
+                    )
         else:
             _mem_instructions = ""
 
@@ -4168,22 +4183,24 @@ If you fail to use the tools when data is available, your output will be rejecte
         if _mm:
             def _query_memories_tool_impl(query: str) -> Dict[str, Any]:
                 res = _mm.query(query, top_k=5)
-                # Format memories nicely
+                # Format memories nicely with tier info
                 formatted = []
                 for m in res:
-                    formatted.append(f"[{m['id'][:8]}] (Imp: {m['importance']:.0%}) {m['content']}")
+                    tier_label = "Deep" if m.get("level", 1) == 2 else "Working"
+                    formatted.append(f"[{m['id'][:8]}] (Tier: {tier_label}, Imp: {m['importance']:.0%}) {m['content']}")
                 return {
                     "success": True,
                     "query": query,
                     "memories": res,
-                    "output": "\n".join(formatted) if formatted else "No matching memories found."
+                    "output": "\n".join(formatted) if formatted else "No matching memories found.",
+                    "memory_count": len(res),
                 }
 
             _register(
                 name="query_memories",
                 fn=_query_memories_tool_impl,
                 params=[{"name": "query", "type": "str", "description": "Search query keywords to retrieve memories."}],
-                description="RAG search tool to query your persistent long-term memory database for past events, user preferences, or project guidelines.",
+                description="RAG search tool to query your persistent long-term memory database (Working + Deep tiers) for past events, user preferences, or project guidelines.",
                 output=[{"name": "output", "type": "str"}]
             )
 
@@ -4376,8 +4393,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                             "type": "string",
                             "description": "Brief reasoning for the decision."
                         }
-                    },
-                    temperature=0.0
+                    }
                 )
                 if intent_res and isinstance(intent_res, dict):
                     _needs_tools = intent_res.get("requires_tools_or_actions", False)
@@ -5094,11 +5110,12 @@ If you fail to use the tools when data is available, your output will be rejecte
 
         _completed_tool_calls:    List[str] = []
         _created_artefact_titles: List[str] = []
- 
+        _turn_action_history:     List[str] = []
+
         _MAX_IDENTICAL_REPEATS              = 1
         _identical_call_counts: Dict[str, int] = {}
         _recent_queries: Dict[str, set]        = {}
- 
+
         _round1_no_tool_call = False
  
         ai_message = self.add_message(
@@ -5207,22 +5224,44 @@ If you fail to use the tools when data is available, your output will be rejecte
                 )
             return ""
  
-        # ── Per-turn action scratchpad ─────────────────────────────────────────
-        _turn_action_history: List[str] = []
+        # ── EPISODIC MEMORY: Pure record of what was done ───────────────────
+        # This becomes the scratchpad content — NOT instructions, just facts
+        _episodic_memory: List[Dict[str, Any]] = []
+
+        def _record_episode(
+            episode_type: str,
+            round_num: int,
+            action: str,
+            details: Optional[Dict[str, Any]] = None,
+            output_ref: Optional[str] = None,
+            artifact_ref: Optional[str] = None,
+        ):
+            """Record an episode in episodic memory."""
+            episode = {
+                "type": episode_type,
+                "round": round_num,
+                "action": action,
+                "timestamp": datetime.now().isoformat(),
+            }
+            if details:
+                episode["details"] = details
+            if output_ref:
+                episode["output_ref"] = output_ref
+            if artifact_ref:
+                episode["artifact_ref"] = artifact_ref
+            _episodic_memory.append(episode)
 
         # ── MINIMAL STATE MACHINE (explicit phases + transition logging) ─────
         # Phases: DECLARE → ACT → VERIFY → COMPLETE
         _mission_state: Dict[str, Any] = {
-            "phase": "DECLARE",              # Current phase
+            "phase": "DECLARE",
             "success": False,
             "artifacts_modified": 0,
             "tools_executed": 0,
             "last_action_round": 0,
-            # Goal tracking
             "declared_objectives": [],
             "completed_objectives": [],
             "goal_declaration_round": 0,
-            # State evolution log (for debug)
             "state_log": [],
         }
 
@@ -5240,10 +5279,7 @@ If you fail to use the tools when data is available, your output will be rejecte
                 "artifacts": _mission_state["artifacts_modified"],
                 "tools": _mission_state["tools_executed"],
             })
-            if debug or self.lollmsClient.debug:
-                ASCIIColors.cyan(
-                    f"[State Transition] Round {_round}: {old_phase} → {phase} | {reason}"
-                )
+            # State transition logged internally (debug output removed for cleaner logs)
 
         # ====================================================================
         #  Main agentic loop
@@ -5257,27 +5293,30 @@ If you fail to use the tools when data is available, your output will be rejecte
             _artifacts = _mission_state.get("artifacts_modified", 0)
             _tools = _mission_state.get("tools_executed", 0)
 
-            # Check completion
+            # Check completion — CRITICAL FIX: Use OR logic to prevent loops
             _mission_complete = False
+            _goal_tracking_complete = False
+            _legacy_complete = (_artifacts > 0 or _tools > 0)
+
             if _declared:
                 # Goal-tracking mode
-                _mission_complete = set(_declared) <= set(_completed)
-            else:
-                # Legacy mode: require real work (artifacts or meaningful tools)
-                _mission_complete = _artifacts > 0 or _tools > 0
+                _goal_tracking_complete = set(_declared) <= set(_completed)
+
+            # Mission complete if EITHER mode says so (prevents deadlocks)
+            _mission_complete = _goal_tracking_complete or _legacy_complete
 
             if _mission_complete and _mission_state["phase"] != "COMPLETE":
-                _log_state_transition("COMPLETE", "All objectives satisfied")
+                _log_state_transition("COMPLETE", "Objectives satisfied OR tools executed")
 
             # Log state at each round (minimal)
-            if debug or self.lollmsClient.debug:
-                ASCIIColors.magenta(
-                    f"[State R{_round}] phase={_mission_state['phase']} | "
-                    f"complete={_mission_complete} | art={_artifacts} | tools={_tools} | "
-                    f"obj={_declared}/{_completed}"
-                )
+            # Round state tracked (debug logging removed for cleaner output)
 
+            # CRITICAL FIX: Hard exit when mission complete — prevent reasoning loops
             if _mission_complete:
+                ASCIIColors.success(
+                    f"[chat] Round {_round}: Mission complete (artifacts={_artifacts}, tools={_tools}). "
+                    f"Breaking loop to write final answer."
+                )
                 break
 
             active_tool_registry = tool_registry
@@ -5286,111 +5325,67 @@ If you fail to use the tools when data is available, your output will be rejecte
             _active_temp    = final_answer_temperature
             _saved_scratchpad = self.scratchpad
  
-            # ── Build per-round state block ───────────────────────────────────
-            state_lines: List[str] = []
- 
-            if _turn_action_history:
-                if any(
-                    "✓ SUCCESSFULLY implemented" in e or "✓ SUCCESSFULLY updated" in e
-                    for e in _turn_action_history
-                ):
-                    state_lines += [
-                        "╔══════════════════════════════════════════════════════════════════╗",
-                        "║ 🛑 STOP: MISSION ACCOMPLISHED                                    ║",
-                        "╠══════════════════════════════════════════════════════════════════╣",
-                        "║ SUCCESS: The requested changes have been applied and saved.      ║",
-                        "║                                                                  ║",
-                        "║ 1. DO NOT emit any more <artifact> or <tool_call> tags.          ║",
-                        "║ 2. DO NOT describe internal 'processing' or 'updating' steps.    ║",
-                        "║ 3. PROVIDE your final summary to the user immediately.           ║",
-                        "╚══════════════════════════════════════════════════════════════════╝",
-                    ]
-                state_lines.append("=== TURN ACTION SCRATCHPAD (Completed so far) ===")
-                state_lines.extend(_turn_action_history)
-                state_lines.append("================================================")
- 
-            if _completed_tool_calls or _created_artefact_titles:
-                state_lines.append(
-                    "=== AGENT STATE (already completed this turn — DO NOT repeat) ==="
-                )
+            # ── Build EPISODIC MEMORY scratchpad (pure factual record) ───────────
+            _memory_lines: List[str] = ["=== EPISODIC MEMORY ==="]
+
+            if _episodic_memory:
+                for ep in _episodic_memory:
+                    ep_type = ep.get("type", "action")
+                    ep_round = ep.get("round", 0)
+                    ep_action = ep.get("action", "")
+                    ep_details = ep.get("details", {})
+                    ep_output = ep.get("output_ref", "")
+                    ep_artifact = ep.get("artifact_ref", "")
+
+                    _memory_lines.append(f"\n[Round {ep_round}] {ep_type.upper()}: {ep_action}")
+
+                    if ep_details:
+                        params_summary = ", ".join(
+                            f"{k}={str(v)[:50]}" for k, v in list(ep_details.items())[:3]
+                        )
+                        if params_summary:
+                            _memory_lines.append(f"  Parameters: {params_summary}")
+
+                    if ep_output:
+                        if len(ep_output) > 500:
+                            _memory_lines.append(f"  Output: {ep_output[:500]}... [truncated]")
+                        else:
+                            _memory_lines.append(f"  Output: {ep_output}")
+
+                    if ep_artifact:
+                        _memory_lines.append(f"  Artifact: {ep_artifact}")
+
+            _memory_lines.append("\n=== END EPISODIC MEMORY ===")
+
+            # Build AGENT STATE (current status, not history)
+            _state_lines: List[str] = ["\n=== AGENT STATE ==="]
+
+            if _mission_state.get("phase") == "COMPLETE":
+                _state_lines.append("STATUS: MISSION COMPLETE")
+                _state_lines.append("Write FINAL ANSWER summarizing what was accomplished.")
+                _state_lines.append("DO NOT emit more tool calls or artifact tags.")
+            else:
+                _state_lines.append(f"STATUS: {_mission_state.get('phase', 'ACTIVE')}")
                 if _completed_tool_calls:
-                    state_lines.append("⚠️  IMPORTANT: ACTIONS ALREADY COMPLETED:")
-                    state_lines.append("You have already executed these tools and received their results. Do NOT run them again:")
-                    state_lines.extend(f"  ✓ {c} (Completed - Result is in the context history below)" for c in _completed_tool_calls)
-                    state_lines.append("Your goal now is to analyze the results and present the final answer to the user.")
+                    _state_lines.append(f"Tools executed: {', '.join(_completed_tool_calls)}")
                 if _created_artefact_titles:
-                    state_lines.append("Artifacts / notes already created:")
-                    state_lines.extend(f"  ✓ {t}" for t in _created_artefact_titles)
-                state_lines.append("=== END AGENT STATE ===")
+                    _state_lines.append(f"Artifacts created/modified: {', '.join(_created_artefact_titles)}")
 
-            state_lines.append(_TOOL_CALL_REMINDER)
+            _state_lines.append("=== END AGENT STATE ===")
 
-            if has_data_arts:
-                # ENHANCED DATA ARTIFACT DIRECTIVE - More explicit with examples
-                state_lines.append(
-                    "╔══════════════════════════════════════════════════════════════════╗\n"
-                    "║  📊 DATA ARTIFACT DETECTED — MANDATORY QUERY PROTOCOL            ║\n"
-                    "╠══════════════════════════════════════════════════════════════════╣\n"
-                    "║  Active data artifacts found. You MUST query them for analytical ║\n"
-                    "║  questions. DO NOT guess values. DO NOT claim inability.         ║\n"
-                    "║                                                                  ║\n"
-                    "║  REQUIRED TWO-STEP PROCEDURE (copy exact format):                ║\n"
-                    "║                                                                  ║\n"
-                    "║  Step 1 — Save code to ephemeral artifact:                       ║\n"
-                    '║    <artifact name="query.py" type="code" language="python"       ║\n'
-                    "║               ephemeral=\"true\">                                  ║\n"
-                    "║    import pandas as pd                                           ║\n"
-                    "║    df = pd.read_csv('your_data.csv')                             ║\n"
-                    "║    print(df['column'].sum())                                     ║\n"
-                    "║    </artifact>                                                   ║\n"
-                    "║                                                                  ║\n"
-                    "║  Step 2 — Execute via tool call:                                 ║\n"
-                    '║    <tool_call>{"name": "execute_python_data_query",               ║\n'
-                    '║                  "parameters": {"code": "query.py"}}</tool_call>   ║\n'
-                    "║                                                                  ║\n"
-                    "║  ⚠️  FAILURE TO FOLLOW THIS PROTOCOL = REJECTED RESPONSE         ║\n"
-                    "╚══════════════════════════════════════════════════════════════════╝"
-                )
-
-            if _round == 1 and not _completed_tool_calls:
-                state_lines.append(
-                    "AVAILABLE TOOLS (quick list): " + ", ".join(tool_registry.keys())
-                )
- 
-            if any(
-                "internet_search" in call or "google" in call
-                for call in _completed_tool_calls
-            ):
-                state_lines += [
-                    "╔══════════════════════════════════════════════════════════════════╗",
-                    "║ 🛠️ ARCHITECT DIRECTIVE: SEARCH COMPLETE                          ║",
-                    "╠══════════════════════════════════════════════════════════════════╣",
-                    "║ You have retrieved external information. Your ONLY goal now is   ║",
-                    "║ to apply this knowledge to the project artifacts.                ║",
-                    "║                                                                  ║",
-                    "║ 1. DO NOT call 'show_tools' or other diagnostic tools.           ║",
-                    "║ 2. DO NOT build forms to ask the user for more choices.          ║",
-                    "║ 3. PROCEED IMMEDIATELY to <coding_plan> and <artifact> update.   ║",
-                    "╚══════════════════════════════════════════════════════════════════╝",
-                ]
- 
-            self.scratchpad = (
-                "\n".join(state_lines) +
-                ("\n\n" + (self.scratchpad or "") if self.scratchpad else "")
-            )
+            self.scratchpad = "\n".join(_memory_lines) + "\n" + "\n".join(_state_lines)
 
             if debug or self.lollmsClient.debug:
                 ASCIIColors.cyan("=== [DEBUG] MAIN CHAT LOOP STATE ===")
                 ASCIIColors.yellow(f"  • Round: {_round}")
+                ASCIIColors.yellow(f"  • Mission State: phase={_mission_state.get('phase')}, artifacts={_mission_state.get('artifacts_modified')}, tools={_mission_state.get('tools_executed')}")
                 ASCIIColors.yellow(f"  • Active Artifacts: {[a['title'] for a in self.artefacts.list(active_only=True)]}")
-                ASCIIColors.yellow(f"  • Scratchpad Summary: {self.scratchpad[:500]}...")
                 ASCIIColors.info("====================================")
 
             round_content_start = len(ai_message.content)
- 
-            _mission_complete = any(
-                "✓ SUCCESSFULLY" in entry for entry in _turn_action_history
-            )
+
+            # DETERMINISTIC: Mission complete flag from state machine, NOT text heuristics
+            _mission_complete = _mission_state.get("phase") == "COMPLETE"
             ss = _StreamState(
                 discussion            = self,
                 callback              = callback,
@@ -5468,21 +5463,52 @@ If you fail to use the tools when data is available, your output will be rejecte
                 metadata = getattr(m, 'metadata', {}) or {}
 
                 if role == "assistant":
-                    # Replace all processing blocks with the opaque marker
+                    # CRITICAL FIX: Preserve action continuity — extract tool calls & artifact actions
+                    # from metadata and inject as learnable history instead of opaque markers
+                    if metadata:
+                        artifacts_modified = metadata.get("artefacts_modified", [])
+                        events = metadata.get("events", [])
+
+                        # Build continuity summary from actual actions taken
+                        action_summaries = []
+                        for art_title in artifacts_modified:
+                            art = self.artefacts.get(art_title)
+                            if art:
+                                action_type = "created" if art.get("version", 1) == 1 else "updated"
+                                action_summaries.append(
+                                    f"[ACTION] {action_type.capitalize()} artifact '{art_title}' (v{art.get('version', 1)})"
+                                )
+
+                        for evt in events:
+                            if evt.get("type") == "tool_call":
+                                tool_name = evt.get("tool", "unknown")
+                                params = evt.get("params", {})
+                                # Summarize key params (truncate long values)
+                                param_summary = ", ".join(
+                                    f"{k}={str(v)[:50]}" for k, v in list(params.items())[:3]
+                                )
+                                action_summaries.append(
+                                    f"[ACTION] Called {tool_name}({param_summary})"
+                                )
+
+                        # Inject action summaries as learnable history
+                        if action_summaries:
+                            content += "\n\n=== CONTINUITY THREAD ===\n" + "\n".join(action_summaries) + "\n=== END CONTINUITY ==="
+
+                    # Replace processing blocks with concise action summary (not opaque marker)
                     content = re.sub(
                         r'<processing.*?>.*?</processing>',
-                        f'\n{_EXEC_MARKER}\n',
+                        '\n[Processing block — see CONTINUITY THREAD for actions taken]\n',
                         content, flags=re.DOTALL
                     )
                     content = re.sub(r'<lollms_event.*?>', '', content)
-                    # Strip any leaked status / log lines
+                    # Strip any leaked status / log lines (but preserve action summaries)
                     content = re.sub(
                         r'^[ \t]*[*✓🏗️🔧✅❌·ᴽЧØс].*$', '',
                         content, flags=re.MULTILINE
                     )
-                    # Strip the marker itself — the model must never see it in
-                    # an assistant turn it can learn to reproduce
-                    content = _EXEC_MARKER_RE.sub('', content)
+                    # Keep the marker for internal tracking but don't strip from assistant turns
+                    # (it helps the model understand framework boundaries)
 
                 msg_role = (
                     "assistant" if role == "assistant"
@@ -5493,8 +5519,8 @@ If you fail to use the tools when data is available, your output will be rejecte
                     _formatted_messages.append({"role": msg_role, "content": content})
 
                 # ── INJECT SYNTHETIC TOOL RESULTS FOR ACTION LEARNING ──────────────
-                # If this assistant message has action metadata, inject a synthetic
-                # tool_result that shows what happened after the action
+                # CRITICAL FIX: Include actual parameters and outputs so the LLM can learn
+                # what it accomplished and avoid repeating identical calls
                 if role == "assistant" and metadata:
                     artifacts_modified = metadata.get("artefacts_modified", [])
                     events = metadata.get("events", [])
@@ -5503,36 +5529,55 @@ If you fail to use the tools when data is available, your output will be rejecte
                     has_action = bool(artifacts_modified or events)
 
                     if has_action:
-                        # Inject artifact action results
+                        # Inject artifact action results with full details
                         for art_title in artifacts_modified:
-                            # Check if it was a creation or update based on content presence
                             art = self.artefacts.get(art_title)
                             if art:
                                 action_type = "artifact_created" if art.get("version", 1) == 1 else "artifact_updated"
-                                synth_result = _build_synthetic_result(
-                                    action_type,
-                                    art_title,
-                                    f"version {art.get('version', 1)}"
+                                # Include content preview for learning
+                                content_preview = (art.get("content", "")[:200] + "...") if art.get("content") else ""
+                                synth_result = (
+                                    f'\n<tool_result name="{action_type}">'
+                                    f'{{"success": true, "title": "{art_title}", "action": "{action_type}", '
+                                    f'"version": {art.get("version", 1)}, "content_preview": "{content_preview}"}}'
+                                    f'</tool_result>\n'
                                 )
-                                if synth_result:
-                                    _formatted_messages.append({
-                                        "role": "system",
-                                        "content": synth_result
-                                    })
+                                _formatted_messages.append({
+                                    "role": "system",
+                                    "content": synth_result
+                                })
 
-                        # Inject tool execution results
+                        # Inject tool execution results with parameters and outputs
                         for evt in events:
-                            if evt.get("type") == "tool_call" and evt.get("tool"):
-                                tool_name = evt.get("tool")
-                                synth_result = _build_synthetic_result(
-                                    "tool_execution",
-                                    tool_name
+                            if evt.get("type") == "tool_call":
+                                tool_name = evt.get("tool", "unknown")
+                                params = evt.get("params", {})
+                                result_evt = next(
+                                    (e for e in events if e.get("type") == "tool_output" and e.get("tool") == tool_name),
+                                    None
                                 )
-                                if synth_result:
-                                    _formatted_messages.append({
-                                        "role": "system",
-                                        "content": synth_result
-                                    })
+                                result_summary = ""
+                                if result_evt:
+                                    result_content = result_evt.get("content", "")
+                                    # Truncate long outputs
+                                    result_summary = result_content[:300] + "..." if len(result_content) > 300 else result_content
+
+                                # Summarize params (truncate long values)
+                                param_summary = {
+                                    k: (str(v)[:100] + "..." if len(str(v)) > 100 else str(v))
+                                    for k, v in list(params.items())[:5]
+                                }
+
+                                synth_result = (
+                                    f'\n<tool_result name="tool_execution">'
+                                    f'{{"success": true, "tool": "{tool_name}", "params": {json.dumps(param_summary)}, '
+                                    f'"result_summary": "{result_summary}"}}'
+                                    f'</tool_result>\n'
+                                )
+                                _formatted_messages.append({
+                                    "role": "system",
+                                    "content": synth_result
+                                })
                     else:
                         # CRITICAL FIX: Inject synthetic FAILURE marker for action-less turns
                         # This teaches the LLM that reasoning without action = failure
@@ -5637,12 +5682,9 @@ If you fail to use the tools when data is available, your output will be rejecte
             _tool_trigger  = ss.tool_trigger
             _tool_json_str = ss.get_tool_call_json()
 
+            # DETERMINISTIC: Use explicit state flags from StreamState, NOT text search
             _artefacts_built = len(ss.affected_artefacts) > 0
-            _has_action_tags = any(
-                tag in _so_far.lower()
-                for tag in ["<generate_image", "<edit_image", "<lollms_inline", "<lollms_form", "<revert_artifact", "<revert_artefact"]
-            )
-            # Check if specialist executed successfully (coding_plan with successful implementation)
+            _has_action_tags = ss._has_action_tags if hasattr(ss, '_has_action_tags') else False
             _specialist_executed = hasattr(ss, 'pending_final_content') and bool(ss.pending_final_content)
 
             _did_something   = _tool_trigger or _artefacts_built or _has_action_tags or _specialist_executed
@@ -5650,27 +5692,15 @@ If you fail to use the tools when data is available, your output will be rejecte
             # ── Round-1 correction: model produced prose instead of action ────
             if _round == 1 and not _did_something:
                 _output_clean = _round_clean.strip()
-                _intent_to_act = any(
-                    kw in user_message.lower()
-                    for kw in [
-                        "update", "add", "change", "fix", "create", "make",
-                        "music", "color", "search", "write",
-                    ]
-                )
                 _needs_correction = False
                 _correction_msg   = ""
 
-                if _has_external_tools and (
-                    len(_output_clean) < 50 or
-                    re.search(
-                        r"i (cannot|can't|don't|am unable|have no access|cannot access)",
-                        _output_clean, re.IGNORECASE
-                    )
-                ):
+                # DETERMINISTIC: Check for explicit failure patterns, NOT keyword heuristics
+                if _has_external_tools and len(_output_clean) < 50:
                     _needs_correction = True
                     _correction_msg   = _TOOL_CALL_CORRECTION
 
-                elif _intent_to_act and not _artefacts_built:
+                elif _has_external_tools and not _artefacts_built:
                     _needs_correction = True
                     # STRONGER CORRECTION - Explicit failure state + concrete examples
                     _correction_msg   = (
@@ -5701,22 +5731,12 @@ If you fail to use the tools when data is available, your output will be rejecte
 
                 if _needs_correction:
                     _round1_no_tool_call = True
-                    ASCIIColors.yellow(
-                        f"[chat] Round 1 failed to act — injecting correction."
-                    )
+                    ASCIIColors.yellow(f"[chat] Round 1 failed to act — injecting correction.")
                     _warning(callback, "Action missing; forcing model to emit tags/calls.")
-
-                    # Notify user of intent correction and loop restart
-                    ss._emit_processing_status("⚠️ Diagnostic: Action/tag was missing in response. Injecting correction and retrying...")
+                    ss._emit_processing_status("⚠️ Action missing. Injecting correction and retrying...")
                     ss._emit_processing_close()
-
-                    _clean_so_far_for_llm = re.sub(
-                        r'<processing.*?>.*?</processing>',
-                        _compact_repl, _so_far, flags=re.DOTALL
-                    )
-                    _virtual_history.append(SimpleNamespace(
-                        sender_type="assistant", content=_clean_so_far_for_llm.strip()
-                    ))
+                    _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
+                    _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
                     _virtual_history.append(SimpleNamespace(
                         sender_type="user", content=_TOOL_CALL_CORRECTION
                     ))
@@ -5726,57 +5746,33 @@ If you fail to use the tools when data is available, your output will be rejecte
                     ai_message.content = ai_message.content[:round_content_start]
                     continue
  
-            # ── LOOP EXIT DETECTION (minimal, deterministic) ─────────────────
-            if not _tool_trigger and not _artefacts_built and not _has_action_tags and not _specialist_executed:
-                _declared = _mission_state.get("declared_objectives", [])
-                _completed = _mission_state.get("completed_objectives", [])
-                _artifacts = _mission_state.get("artifacts_modified", 0)
-                _tools = _mission_state.get("tools_executed", 0)
+            # ── LOOP EXIT DETECTION (deterministic, state-based) ─────────────────
+            # CRITICAL FIX: Use explicit state flags, NOT text pattern matching
+            _declared = _mission_state.get("declared_objectives", [])
+            _completed = _mission_state.get("completed_objectives", [])
+            _artifacts = _mission_state.get("artifacts_modified", 0)
+            _tools = _mission_state.get("tools_executed", 0)
 
+            # Determine if mission is already complete using deterministic state
+            _mission_already_complete = _mission_state.get("phase") == "COMPLETE"
+            if not _mission_already_complete:
                 if _declared:
-                    _already_succeeded = set(_declared) <= set(_completed)
+                    _mission_already_complete = set(_declared) <= set(_completed)
                 else:
-                    _already_succeeded = _artifacts > 0 or _tools > 0
+                    # Legacy mode: require real work (artifacts or meaningful tools)
+                    _mission_already_complete = _artifacts > 0 or _tools > 0
 
-                if _already_succeeded:
-                    # Mission already complete - exit loop immediately
-                    ASCIIColors.success(
-                        f"[chat] Round {_round}: Mission already completed in previous rounds. Exiting."
-                    )
-                    break
+            if _mission_already_complete:
+                ASCIIColors.success(
+                    f"[chat] Round {_round}: Mission already completed (artifacts={_artifacts}, tools={_tools}). Exiting."
+                )
+                break
 
+            # Only check for "failed to act" if mission is NOT already complete
+            if not _tool_trigger and not _artefacts_built and not _has_action_tags and not _specialist_executed:
                 # Check if we're in Round 2+ and still no action - inject STRONGER correction before forcing answer
-                if _round >= 2:
-                    ASCIIColors.error(
-                        f"[chat] Round {_round} failed to act after correction. Injecting final warning before forcing answer."
-                    )
-                    # Inject explicit failure state into virtual history
-                    _virtual_history.append(SimpleNamespace(
-                        sender_type="system",
-                        content=(
-                            "╔══════════════════════════════════════════════════════════════════╗\n"
-                            "║  ⚠️  FINAL WARNING — LAST CHANCE TO ACT                          ║\n"
-                            "╠══════════════════════════════════════════════════════════════════╣\n"
-                            "║  You have failed to emit tool calls or artifact tags for 2 rounds.\n"
-                            "║  This is your FINAL opportunity to produce valid XML tags.       ║\n"
-                            "║                                                                  ║\n"
-                            "║  If you do not emit <artifact> or <tool_call> tags in this turn:  ║\n"
-                            "║  1. The system will FORCE a final answer without your changes    ║\n"
-                            "║  2. The user's request will remain UNFULFILLED                   ║\n"
-                            "║  3. Your response will be marked as FAILED                       ║\n"
-                            "║                                                                  ║\n"
-                            "║  EMIT TAGS NOW OR FAIL COMPLETELY.                               ║\n"
-                            "╚══════════════════════════════════════════════════════════════════╝"
-                        )
-                    ))
-                    _turn_action_history.append(
-                        f"⚠️ CRITICAL: Round {_round} failed. Final warning injected."
-                    )
-                    # Continue to one more round with the strong warning before forcing answer
-                    continue
-
-                elif _round >= 3:
-                    # After 3 failed rounds, force final answer
+                if _round >= 3:
+                    # After 3 failed rounds, force final answer immediately
                     ASCIIColors.error(
                         f"[chat] Round {_round} failed after final warning. Forcing final answer."
                     )
@@ -5784,7 +5780,29 @@ If you fail to use the tools when data is available, your output will be rejecte
                     _turn_action_history.append(
                         "🚨 FAILED: Model could not emit tool calls after 3 rounds + final warning."
                     )
-                break
+                    break
+                elif _round >= 2:
+                    ASCIIColors.error(f"[chat] Round {_round} failed to act after correction. Injecting final warning.")
+                    _virtual_history.append(SimpleNamespace(
+                        sender_type="system",
+                        content=(
+                            "⚠️ FINAL WARNING — LAST CHANCE TO ACT\n"
+                            "You failed to emit tool calls or artifact tags for 2 rounds.\n"
+                            "This is your FINAL opportunity to produce valid XML tags.\n"
+                            "\n"
+                            "If you do not emit <artifact> or <tool_call> tags this turn:\n"
+                            "1. System will FORCE final answer without your changes\n"
+                            "2. User request will remain UNFULFILLED\n"
+                            "3. Response marked as FAILED\n"
+                            "\n"
+                            "EMIT TAGS NOW OR FAIL COMPLETELY."
+                        )
+                    ))
+                    _turn_action_history.append(
+                        f"⚠️ CRITICAL: Round {_round} failed. Final warning injected."
+                    )
+                    # Continue to ONE more round (round 3) with the strong warning, then force answer
+                    continue
 
         # ====================================================================
             #  Tool execution
@@ -5826,12 +5844,18 @@ If you fail to use the tools when data is available, your output will be rejecte
             _call_signature = f"{_tool_name}({_params_summary})"
             _call_tag       = f"round {_round}: {_call_signature}"
  
-            # Duplicate / semantic-loop detection
-            _identical_call_counts[_call_signature] = (
-                _identical_call_counts.get(_call_signature, 0) + 1
+            # Duplicate / semantic-loop detection — CRITICAL FIX: Track full param signatures
+            _full_param_hash = hash(json.dumps(_tool_params, sort_keys=True))
+            _param_signature = f"{_tool_name}#{_full_param_hash}"
+            _identical_call_counts[_param_signature] = (
+                _identical_call_counts.get(_param_signature, 0) + 1
             )
-            _sig_count = _identical_call_counts[_call_signature]
- 
+            _sig_count = _identical_call_counts[_param_signature]
+
+            # Check for identical params (not just query string)
+            _is_identical_dup = _sig_count > 1
+
+            # Also check semantic duplication for query-based tools
             _query_key    = str(
                 _tool_params.get("query", _tool_params.get("prompt", ""))
             ).strip().lower()
@@ -5842,23 +5866,39 @@ If you fail to use the tools when data is available, your output will be rejecte
                     _is_semantic_dup = True
                 _prev_queries.add(_query_key)
  
-            if _sig_count > _MAX_IDENTICAL_REPEATS or _is_semantic_dup:
-                _dup_type = (
-                    "IDENTICAL" if _sig_count > _MAX_IDENTICAL_REPEATS
-                    else "SEMANTIC DUPLICATE"
-                )
-                _warning(callback,
-                         f"[RUNAWAY] {_dup_type} call — injecting pattern-break.")
+            if _is_identical_dup or _is_semantic_dup:
+                _dup_type = "IDENTICAL PARAMETERS" if _is_identical_dup else "SEMANTIC DUPLICATE"
+                _warning(callback, f"[RUNAWAY] {_dup_type} call detected — injecting correction.")
+
+                # Build detailed correction showing what was already tried
+                _prev_attempts = []
+                for evt in all_events:
+                    if evt.get("type") == "tool_call" and evt.get("tool") == _tool_name:
+                        prev_params = evt.get("params", {})
+                        prev_sig = hash(json.dumps(prev_params, sort_keys=True))
+                        if prev_sig == _full_param_hash:
+                            _prev_attempts.append(f"  - Round {_round}: {evt.get('tool')}({json.dumps(prev_params)[:100]}...)")
+
                 _shake_prompt = (
                     "\n"
                     "╔══════════════════════════════════════════════════════════════════╗\n"
-                    "║  🧠 MENTAL RESET — PATTERN DISRUPTION ACTIVE                     ║\n"
+                    f"║  🚨 DUPLICATE ACTION DETECTED — {_dup_type}                     ║\n"
                     "╠══════════════════════════════════════════════════════════════════╣\n"
-                    "║  You have fallen into a repetitive logic loop.                   ║\n"
-                    "║  1. STOP following your previous reasoning path.                 ║\n"
-                    "║  2. DISREGARD your previous failed tool attempts.                ║\n"
-                    "║  3. RE-EVALUATE the user's need from a fresh perspective.        ║\n"
-                    "║  4. ACT NOW: Change your approach or provide the final answer.   ║\n"
+                    "║  You are attempting to call a tool with parameters identical to  ║\n"
+                    "║  a previous call. This is FORBIDDEN — it wastes tokens and       ║\n"
+                    "║  produces no new information.                                    ║\n"
+                    "║                                                                  ║\n"
+                    "║  PREVIOUS ATTEMPTS WITH THESE PARAMETERS:                        ║\n"
+                )
+                if _prev_attempts:
+                    _shake_prompt += "\n".join(_prev_attempts[:3]) + "\n"
+                _shake_prompt += (
+                    "║                                                                  ║\n"
+                    "║  REQUIRED ACTION:                                                ║\n"
+                    "║  1. CHANGE your parameters (different query, different file,     ║\n"
+                    "║     different approach)                                          ║\n"
+                    "║  2. OR proceed to FINAL ANSWER if you have sufficient info       ║\n"
+                    "║  3. NEVER repeat identical tool calls                            ║\n"
                     "╚══════════════════════════════════════════════════════════════════╝\n"
                 )
                 _clean_so_far_for_llm = re.sub(
@@ -6031,37 +6071,72 @@ If you fail to use the tools when data is available, your output will be rejecte
                     _completed_tool_calls.append(_call_tag)
 
                     _is_failed = not _result_obj.success
+
                     # DETERMINISTIC: Track successful tool execution
-                    # EXCLUSION: REPL helper tools don't count UNLESS followed by text_to_artefact
-                    _HELPER_TOOLS = {"text_store", "text_read", "text_list", "text_delete", "text_append"}
+                    _HELPER_TOOLS = {"text_store", "text_read", "text_list", "text_delete", "text_append", "text_search", "text_get_range", "text_get_record"}
                     _FINAL_TOOLS = {"final_answer"}
+                    _ARTIFACT_TOOLS = {"text_to_artefact", "create_artifact", "update_artifact", "promote_artifact"}
 
                     if _result_obj.success:
                         _mission_state["success"] = True
 
-                        # Track REPL tool chains: text_store → text_to_artefact = artifact created
-                        if _tool_name == "text_store":
+                        # Record episode in episodic memory with memory-tier awareness
+                        _output_summary = ""
+                        if _result_obj.output:
+                            _output_summary = str(_result_obj.output)[:500]
+                        if _result_obj.sources:
+                            _output_summary += f" | Found {len(_result_obj.sources)} sources"
+
+                        # Special handling for memory queries to track tier usage
+                        if _tool_name == "query_memories":
+                            _mem_count = _result_obj.metadata.get("memory_count", 0) if _result_obj.metadata else 0
+                            _record_episode(
+                                episode_type="memory_query",
+                                round_num=_round,
+                                action=f"Queried memory: {_tool_params.get('query', '')[:50]}",
+                                details={"query": _tool_params.get('query', ''), "results": _mem_count},
+                                output_ref=_output_summary if _output_summary else f"Found {_mem_count} memories",
+                            )
+                        else:
+                            _record_episode(
+                                episode_type="tool_execution",
+                                round_num=_round,
+                                action=f"Called {_tool_name}",
+                                details=_tool_params,
+                                output_ref=_output_summary if _output_summary else "Success (no output)",
+                            )
+
+                        # Helper tools: track but don't count as progress
+                        if _tool_name in _HELPER_TOOLS:
                             _mission_state["_pending_buffer"] = _tool_params.get("handle", "")
 
-                        elif _tool_name == "text_to_artefact":
-                            # REPL chain completed - count as artifact creation
+                        # Artifact creation tools: count as mission progress
+                        elif _tool_name in _ARTIFACT_TOOLS:
                             _mission_state["artifacts_modified"] += 1
                             _mission_state["last_action_round"] = _round
-                            _log_state_transition("VERIFY", f"Artifact created via REPL chain")
+                            _log_state_transition("VERIFY", f"Artifact action: {_tool_name}")
+                            _record_episode(
+                                episode_type="artifact_action",
+                                round_num=_round,
+                                action=f"Artifact tool: {_tool_name}",
+                                artifact_ref=_tool_params.get("title") or _tool_params.get("name") or "unnamed",
+                            )
 
-                        elif _tool_name not in _HELPER_TOOLS and _tool_name not in _FINAL_TOOLS:
+                        # Final answer: mark complete
+                        elif _tool_name in _FINAL_TOOLS:
                             _mission_state["tools_executed"] += 1
                             _mission_state["last_action_round"] = _round
-
-                        # Log state evolution
-                        if debug or self.lollmsClient.debug:
-                            ASCIIColors.magenta(
-                                f"[State Round {_round}] Tool='{_tool_name}' | "
-                                f"obj={_mission_state['declared_objectives']} | "
-                                f"done={_mission_state['completed_objectives']} | "
-                                f"art={_mission_state['artifacts_modified']} | "
-                                f"tools={_mission_state['tools_executed']}"
+                            _record_episode(
+                                episode_type="final_answer",
+                                round_num=_round,
+                                action="Final answer signaled",
                             )
+
+                        # Other meaningful tools: count as progress
+                        else:
+                            _mission_state["tools_executed"] += 1
+                            _mission_state["last_action_round"] = _round
+                            _log_state_transition("VERIFY", f"Tool executed: {_tool_name}")
 
                     _created_title = (
                         _result_obj.metadata.get("title") or _result_obj.metadata.get("name") or
@@ -6259,17 +6334,15 @@ If you fail to use the tools when data is available, your output will be rejecte
                 _result_str_for_llm = _result_str
  
             # ── GOAL DECLARATION PHASE (Round 1 only) ─────────────────────────
-            # Extract objectives with ROBUST fallback chain
             if _round == 1 and not _mission_state.get("declared_objectives"):
                 _objectives_extracted = False
 
-                # Try 1: Structured generation with SIMPLE schema (direct array, not nested)
                 try:
                     _obj_result = self.lollmsClient.generate_structured_content(
-                        prompt="List your planned objectives as a JSON array. Example: [\"research\", \"write_artifact\"]. Output ONLY the array.",
+                        prompt="List planned objectives as JSON array. Example: [\"research\", \"write_artifact\"]. Output ONLY array.",
                         schema={"type": "array", "items": {"type": "string"}},
                         temperature=0.0,
-                        debug=True  # Enable debug logging to see what LLM returns
+                        debug=True
                     )
                     if _obj_result and isinstance(_obj_result, list) and len(_obj_result) > 0:
                         _filtered = [
@@ -6296,55 +6369,68 @@ If you fail to use the tools when data is available, your output will be rejecte
                     _mission_state["declared_objectives"] = _default_objectives
                     ASCIIColors.yellow(f"[Goals] Using defaults: {_default_objectives}")
 
-                _mission_state["goal_declaration_round"] = 1
-                _log_state_transition("ACT", f"Goals declared ({len(_mission_state['declared_objectives'])} objectives)")
+                    _record_episode(
+                        episode_type="goal_declaration",
+                        round_num=1,
+                        action=f"Declared objectives: {', '.join(_default_objectives)}",
+                    )
 
-                # ── OBJECTIVE PROGRESS CHECK (minimal, fuzzy matching) ───────────
+                    _mission_state["goal_declaration_round"] = 1
+                    _log_state_transition("ACT", f"Goals declared ({len(_mission_state['declared_objectives'])} objectives)")
+
+                # ── OBJECTIVE PROGRESS CHECK (deterministic, explicit matching) ───────────
                 _declared = _mission_state.get("declared_objectives", [])
                 _completed = _mission_state.get("completed_objectives", [])
 
                 if _declared:
-                    # Fuzzy match: check if action satisfies ANY declared objective
-                    _action_keywords = []
+                    # DETERMINISTIC: Match based on explicit action types, NOT string containment
                     if _artefacts_built:
-                        _action_keywords = ["write_artifact", "create_artifact", "update_artifact"]
-                    elif _tool_trigger:
-                        _action_keywords = [_tool_name]
-
-                    for _action in _action_keywords:
+                        # Artifact built → mark artifact-related objectives complete
                         for _obj in _declared:
-                            if _obj not in _completed and (
-                                _action == _obj or
-                                _action in _obj or
-                                _obj in _action or
-                                (_obj == "research" and "search" in _action) or
-                                (_obj == "use_tools" and _tool_trigger)
-                            ):
+                            if _obj not in _completed and _obj in ("create_artifact", "update_artifacts", "write_artifact"):
                                 _completed.append(_obj)
                                 ASCIIColors.success(f"[Goals] Completed: {_obj} ({len(_completed)}/{len(_declared)})")
-                                _log_state_transition("VERIFY", f"Objective '{_obj}' completed")
+                                _log_state_transition("VERIFY", f"Objective '{_obj}' completed via artifact build")
+
+                    if _tool_trigger:
+                        # Tool called → mark tool-related objectives complete
+                        for _obj in _declared:
+                            if _obj not in _completed and _obj in ("use_tools", "research", "search"):
+                                _completed.append(_obj)
+                                ASCIIColors.success(f"[Goals] Completed: {_obj} ({len(_completed)}/{len(_declared)})")
+                                _log_state_transition("VERIFY", f"Objective '{_obj}' completed via tool call")
 
                 _mission_state["completed_objectives"] = _completed
 
             # ── Update virtual history for the next round ─────────────────────
-            # Strip processing blocks and status markers; use the opaque marker.
+            # Strip processing blocks; preserve action continuity via CONTINUITY THREAD
             _clean_so_far_for_llm = re.sub(
                 r'<processing.*?>.*?</processing>',
                 _compact_repl, _so_far, flags=re.DOTALL
             )
-            _clean_so_far_for_llm = re.sub(
-                r'^[ \t]*[*✓🏗️🔧✅❌].*$', '',
-                _clean_so_far_for_llm, flags=re.MULTILINE
-            )
-            # Final safety: remove the marker itself so the model can't see it
             _clean_so_far_for_llm = _EXEC_MARKER_RE.sub('', _clean_so_far_for_llm)
+
+            # Build CONTINUITY THREAD from episodic memory
+            _continuity_entries = []
+            for ep in _episodic_memory:
+                if ep.get("round") == _round:
+                    _ep_type = ep.get("type", "action")
+                    _ep_action = ep.get("action", "")
+                    _ep_artifact = ep.get("artifact_ref", "")
+                    if _ep_artifact:
+                        _continuity_entries.append(f"[ACTION] {_ep_type}: {_ep_action} → artifact '{_ep_artifact}'")
+                    else:
+                        _continuity_entries.append(f"[ACTION] {_ep_type}: {_ep_action}")
+
+            _continuity_block = ""
+            if _continuity_entries:
+                _continuity_block = "\n\n=== CONTINUITY THREAD ===\n" + "\n".join(_continuity_entries) + "\n=== END CONTINUITY ==="
 
             _virtual_history.append(SimpleNamespace(
                 sender_type="assistant",
-                content=_clean_so_far_for_llm.strip()
+                content=(_clean_so_far_for_llm.strip() + _continuity_block) if _continuity_block else _clean_so_far_for_llm.strip()
             ))
-            # Keep the real tool result for tool calls in plain English for small models
-            _status_lbl = "FAILED to execute. Error details" if _is_failed else "executed successfully. Return Value"
+            _status_lbl = "FAILED" if _is_failed else "SUCCESS"
             _virtual_history.append(SimpleNamespace(
                 sender_type="user",
                 content=f'[SYSTEM: Tool "{_tool_name}" {_status_lbl}:\n{_result_str_for_llm}]'
@@ -6356,7 +6442,19 @@ If you fail to use the tools when data is available, your output will be rejecte
             if ss.affected_artefacts:
                 for art in ss.affected_artefacts:
                     art_title = art.get("title", "unknown")
-                    action_type = "artifact_created" if art.get("version", 1) == 1 else "artifact_updated"
+                    art_version = art.get("version", 1)
+                    art_type = art.get("type", "document")
+                    action_type = "artifact_created" if art_version == 1 else "artifact_updated"
+
+                    # Record artifact episode
+                    _record_episode(
+                        episode_type="artifact_modified",
+                        round_num=_round,
+                        action=f"{action_type.replace('_', ' ').title()}: {art_title}",
+                        details={"version": art_version, "type": art_type},
+                        artifact_ref=art_title,
+                    )
+
                     synth_result = _build_synthetic_result(
                         action_type,
                         art_title,
@@ -6368,10 +6466,9 @@ If you fail to use the tools when data is available, your output will be rejecte
                             content=synth_result
                         ))
             elif not _did_something:
-                # Inject failure marker ONLY when absolutely no action was taken
                 synth_failure = (
                     f'\n<tool_result name="action_failure">'
-                    f'{{"success": false, "error": "NO ACTION TAKEN: You produced reasoning but no tools were called and no artifacts were modified. The system requires you to call tools or emit <artifact> tags to make progress."}}'
+                    f'{{"success": false, "error": "NO ACTION: You produced reasoning but no tools called and no artifacts modified. Call tools or emit <artifact> tags to progress."}}'
                     f'</tool_result>\n'
                 )
                 _virtual_history.append(SimpleNamespace(
@@ -6392,48 +6489,30 @@ If you fail to use the tools when data is available, your output will be rejecte
         # ====================================================================
         #  Forced final-answer pass
         # ====================================================================
-        _tool_call_count   = len(tool_calls_this_turn)
-        # Use ai_message.content as the source of truth for text produced,
-        # since it accumulates everything including between tool calls.
-        _has_produced_text = (
-            bool(ai_message.content.strip()) and
-            len(ai_message.content.strip()) > 100
-        )
-        _seems_stuck = _tool_call_count >= 3 and not _has_produced_text
-
-        # Check if specialist successfully executed but no final answer was shown
+        # DETERMINISTIC: Use explicit state flags, NOT text length heuristics
+        _tool_call_count = len(tool_calls_this_turn)
+        _has_produced_text = bool(ai_message.content.strip())
         _specialist_succeeded = hasattr(ss, 'pending_final_content') and bool(ss.pending_final_content)
 
-        # Detect if we exited the loop after multiple failed reasoning rounds
-        _loop_exit_after_correction_failure = (
-            _round >= 2 and 
-            not _tool_trigger and 
-            not _artefacts_built and
-            any("failed to act" in entry or "CORRECTION" in entry for entry in _turn_action_history)
-        )
-
-        # ── FORCED ANSWER CHECK (minimal) ────────────────────────────────────
+        # DETERMINISTIC: Check mission state flags, NOT text pattern matching
         _declared = _mission_state.get("declared_objectives", [])
         _completed = _mission_state.get("completed_objectives", [])
         _artifacts = _mission_state.get("artifacts_modified", 0)
         _tools = _mission_state.get("tools_executed", 0)
 
+        _mission_success = False
         if _declared:
-            _already_succeeded = set(_declared) <= set(_completed)
+            _mission_success = set(_declared) <= set(_completed)
         else:
-            _already_succeeded = _artifacts > 0 or _tools > 0
+            _mission_success = _artifacts > 0 or _tools > 0
 
+        # DETERMINISTIC: Forced answer conditions based on explicit state
         _needs_forced_answer = (
-            is_agentic_turn and not _already_succeeded and (
-                not _has_produced_text or  # No text at all
-                _loop_exit_after_correction_failure or  # Failed to act in Round 2+ after correction
-                (_specialist_succeeded and not ai_message.content.strip()) or  # Specialist worked but no output shown
-                (_round >= max_reasoning_steps) or  # Max rounds reached
-                (_seems_stuck) or  # Too many tool calls with no text
-                (tool_calls_this_turn and not any(
-                    c.get("name") == "final_answer"
-                    for c in tool_calls_this_turn
-                ))  # Tools called but no final answer signal
+            is_agentic_turn and not _mission_success and (
+                not _has_produced_text or
+                _round >= max_reasoning_steps or
+                (_specialist_succeeded and not _has_produced_text) or
+                (tool_calls_this_turn and not any(c.get("name") == "final_answer" for c in tool_calls_this_turn))
             )
         )
 
@@ -6467,23 +6546,22 @@ If you fail to use the tools when data is available, your output will be rejecte
             _scratch_before_final = self.scratchpad
  
             _forced_prompt_parts = [
-                "[SYSTEM INSTRUCTION — MANDATORY — FINAL ANSWER REQUIRED]",
+                "[SYSTEM INSTRUCTION — FINAL ANSWER REQUIRED]",
                 "",
-                "You have completed all necessary research and tool calls.",
-                "Your task NOW is to write a comprehensive final answer to the user's",
-                "original question using the information gathered below.",
+                "You completed all research and tool calls.",
+                "Task NOW: Write comprehensive final answer using gathered information.",
                 "",
-                "⚠️  ABSOLUTE PROHIBITIONS:",
-                "• Do NOT call any more tools — there are no more tool calls allowed",
-                "• Do NOT emit <tool_call> tags — they will be ignored",
-                "• Do NOT ask follow-up questions — answer what you have",
-                "• Do NOT say 'I need more information' — use what you have gathered",
+                "⚠️ PROHIBITIONS:",
+                "• NO more tool calls",
+                "• NO <tool_call> tags — ignored",
+                "• NO follow-up questions",
+                "• NO 'I need more information' — use what you have",
                 "",
-                "✅  REQUIREMENTS:",
-                "• Synthesize ALL gathered information into a coherent response",
-                "• Cite sources using [1], [2] format when applicable",
-                "• Answer directly, completely, and concisely",
-                "• If information is incomplete, say so briefly then answer with what you have",
+                "✅ REQUIREMENTS:",
+                "• Synthesize ALL gathered info into coherent response",
+                "• Cite sources as [1], [2] when applicable",
+                "• Answer directly, completely, concisely",
+                "• If info incomplete, say so briefly then answer with what you have",
             ]
  
             if _scratch_before_final and _scratch_before_final.strip():
@@ -6512,11 +6590,10 @@ If you fail to use the tools when data is available, your output will be rejecte
             # Temporarily override system prompt to force direct final answer and prevent loops
             _original_system_prompt = self.system_prompt
             _final_system_prompt = (
-                "You are Lollms, a direct, concise Technical Explainer.\n"
-                "Your ONLY task is to write a clear, natural language final answer to the user's "
-                "question using the gathered tool outputs below.\n"
-                "DO NOT write any <coding_plan>, <artifact>, or <tool_call> tags. "
-                "Do NOT describe your internal planning or tool steps. Just answer the user directly."
+                "You are Lollms, a direct Technical Explainer.\n"
+                "Task: Write clear final answer using gathered tool outputs.\n"
+                "DO NOT write <coding_plan>, <artifact>, or <tool_call> tags.\n"
+                "Do NOT describe internal planning. Just answer directly."
             )
             object.__setattr__(self, "_system_prompt", _final_system_prompt)
 
@@ -6651,6 +6728,18 @@ If you fail to use the tools when data is available, your output will be rejecte
 
         if _mm:
             self._save_episodic_memory_turn(user_message, ai_message.content, _mm)
+            # Save memory zone state snapshot for future reference
+            _mm.add(
+                f"Turn snapshot: Zones — User:{len(self.user_data_zone)} chars, Discussion:{len(self.discussion_data_zone)} chars, Personality:{len(self.personality_data_zone)} chars",
+                importance=0.3,
+                tags=["zone_snapshot", "context_state"],
+            )
+            # Also save memory zone state snapshot for future reference
+            _mm.add(
+                f"Turn snapshot: Zones — User:{len(self.user_data_zone)} chars, Discussion:{len(self.discussion_data_zone)} chars, Personality:{len(self.personality_data_zone)} chars",
+                importance=0.3,
+                tags=["zone_snapshot", "context_state"],
+            )
 
         if self._is_db_backed and self.autosave:
             self.commit()
