@@ -216,8 +216,10 @@ class OpenAIBinding(LollmsLLMBinding):
                 try:
                     chat_completion = self.client.chat.completions.create(**params)
                 except Exception as ex:
+                    trace_exception(ex)
                     # exception for new openai models
-                    params["max_completion_tokens"]=params["max_tokens"]
+                    if "max_tokens" in params:
+                        params["max_completion_tokens"]=params["max_tokens"]
                     params["temperature"]=1
                     try: del params["max_tokens"] 
                     except Exception: pass
