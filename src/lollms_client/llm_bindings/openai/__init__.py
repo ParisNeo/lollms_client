@@ -243,10 +243,10 @@ class OpenAIBinding(LollmsLLMBinding):
                             if not in_thinking:
                                 in_thinking = True
                                 if streaming_callback:
-                                    streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                                    streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                                 output += "<think>\n"
                             if streaming_callback:
-                                streaming_callback(reasoning_content, MSG_TYPE.MSG_TYPE_CHUNK)
+                                streaming_callback(reasoning_content, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                             output += reasoning_content
                             count += 1
                             continue
@@ -255,7 +255,7 @@ class OpenAIBinding(LollmsLLMBinding):
                             if in_thinking:
                                 in_thinking = False
                                 if streaming_callback:
-                                    streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                                    streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                                 output += "\n</think>\n"
                             if streaming_callback:
                                 if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
@@ -265,7 +265,7 @@ class OpenAIBinding(LollmsLLMBinding):
 
                     if in_thinking:
                         if streaming_callback:
-                            streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                            streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                         output += "\n</think>\n"
                 else:
                     message_obj = chat_completion.choices[0].message
@@ -448,10 +448,10 @@ class OpenAIBinding(LollmsLLMBinding):
                         if not in_thinking:
                             in_thinking = True
                             if streaming_callback:
-                                streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                                streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                             output += "<think>\n"
                         if streaming_callback:
-                            streaming_callback(reasoning_content, MSG_TYPE.MSG_TYPE_CHUNK)
+                            streaming_callback(reasoning_content, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                         output += reasoning_content
                         continue
 
@@ -459,7 +459,7 @@ class OpenAIBinding(LollmsLLMBinding):
                         if in_thinking:
                             in_thinking = False
                             if streaming_callback:
-                                streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                                streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                             output += "\n</think>\n"
                         if streaming_callback:
                             if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
@@ -468,7 +468,7 @@ class OpenAIBinding(LollmsLLMBinding):
 
                 if in_thinking:
                     if streaming_callback:
-                        streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
+                        streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                     output += "\n</think>\n"
             else:
                 message_obj = completion.choices[0].message
