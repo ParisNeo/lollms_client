@@ -195,3 +195,38 @@ class MemoryMixin:
         if self.memory_manager:
             return self.memory_manager.dream(lollms_client)
         return None
+
+    def add_memory_relationship(self, source_id: str, target_id: str, relationship_type: str = "RELATED_TO", weight: float = 1.0, metadata: Optional[Dict] = None) -> Optional[Dict]:
+        """Create an explicit graph relationship between two memories."""
+        if self.memory_manager:
+            return self.memory_manager.add_relationship(source_id, target_id, relationship_type, weight, metadata)
+        return None
+
+    def remove_memory_relationship(self, source_id: str, target_id: str) -> bool:
+        """Remove a graph relationship between two memories."""
+        if self.memory_manager:
+            return self.memory_manager.remove_relationship(source_id, target_id)
+        return False
+
+    def get_memory_relationships(self, memory_id: str, relationship_type: Optional[str] = None) -> List[Dict]:
+        """Get all relationships for a memory node."""
+        if self.memory_manager:
+            return self.memory_manager.get_relationships(memory_id, relationship_type)
+        return []
+
+    def traverse_memory_graph(self, start_id: str, max_depth: int = 3, relationship_types: Optional[List[str]] = None) -> List[Dict]:
+        """Perform BFS traversal of the memory graph from a starting node."""
+        if self.memory_manager:
+            return self.memory_manager.traverse_graph(start_id, max_depth, relationship_types)
+        return []
+
+    def get_high_centrality_memories(self, top_k: int = 10, level: Optional[int] = None) -> List[Dict]:
+        """Get memories with highest graph centrality (most connected/important)."""
+        if self.memory_manager:
+            return self.memory_manager.get_high_centrality_memories(top_k, level)
+        return []
+
+    def recalculate_memory_centrality(self):
+        """Recalculate centrality scores for all memories (expensive operation)."""
+        if self.memory_manager:
+            self.memory_manager.recalculate_all_centrality()
