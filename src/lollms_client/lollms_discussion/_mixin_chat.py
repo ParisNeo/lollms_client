@@ -140,6 +140,19 @@ def _requests_tool_list(msg: str) -> bool:
     return any(kw in m for kw in tool_keywords)
 
 
+def _requires_agent_mode(msg: str) -> bool:
+    """Heuristic to detect implicit file, code, or artifact generation/modification commands."""
+    m = msg.lower().strip()
+    action_keywords = [
+        "convert", "make it", "save as", "create a", "write a", "implement", "build a",
+        "rewrite", "modify", "update", "patch", "edit", "fix code", "add a feature", "to html", "to python"
+    ]
+    code_extensions = [
+        ".py", ".html", ".js", ".css", ".xml", ".json", ".yaml", ".sh", ".bash", ".cpp", ".c", ".h", ".owl"
+    ]
+    return any(kw in m for kw in action_keywords) or any(ext in m for ext in code_extensions)
+
+
 _SECONDARY_TAG_MAP = {
     "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK,
                        MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
@@ -160,7 +173,7 @@ _SECONDARY_TAG_MAP = {
     "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,
                        MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
     "<think>":          ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,
-                       MSG_TYPE.MSG_TYPE_INFO,              "</<think>>"),
+                       MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
     "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,
                        MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
     "<agent_mode":    ("agent_mode_start",    MSG_TYPE.MSG_TYPE_INFO,
@@ -1244,12 +1257,14 @@ class _StreamState:
         auto_activate_artefacts: bool = True,
         enable_artefacts: bool = True,
         enable_in_message_status: bool = True,
+        enable_specialized_events_stream: bool = False,
     ):
         self.discussion            = discussion
         self.callback              = callback
         self.ai_message            = ai_message
         self.enable_artefacts      = enable_artefacts
         self.enable_in_message_status = enable_in_message_status
+        self.enable_specialized_events_stream = enable_specialized_events_stream
 
         if not enable_artefacts:
             self.enable_notes          = False
@@ -1790,6 +1805,8 @@ class _StreamState:
         else:
             self.proc_type = proc_type_map.get(prefix, "building")
             new_title = raw_title
+            if prefix == "<agent_mode":
+                ASCIIColors.success("\n[StreamState] <agent_mode> tag detected! Activating sovereign agentic execution workflow.\n")
 
         # If we are already in a processing block, just update the title/status instead of re-opening
         if self.proc_has_opened:
@@ -2484,8 +2501,8 @@ class _StreamState:
                     diff = len(new_c) - len(old_c)
                     ASCIIColors.green(f"  [Integrity] Change confirmed: {diff:+} chars.")
                     # DETERMINISTIC: Mark mission success on real changes
-                    _mission_state["success"] = True
-                    _mission_state["artifacts_modified"] += 1
+                    self._mission_state["success"] = True
+                    self._mission_state["artifacts_modified"] += 1
                 else:
                     # If we had a patch accepted but content is same, it was a null-op
                     ASCIIColors.red("  [Integrity] FAILED: Content is binary-identical to previous version.")
@@ -2505,8 +2522,8 @@ class _StreamState:
                     f"Artefact saved as version {result_art.get('version', '?')}"
                 )
                 # DETERMINISTIC: Track artifact modification
-                _mission_state["artifacts_modified"] += 1
-                _mission_state["success"] = True
+                self._mission_state["artifacts_modified"] += 1
+                self._mission_state["success"] = True
             else:
                 self._emit_processing_status(
                     "❌ No changes detected: Content remains identical to original."
@@ -2960,10 +2977,20 @@ class _StreamState:
                     collected_chunks.append(chunk)
                     nonlocal line_buffer, last_status_time, total_lines_written
 
-                    # Print dot to server console for active low-overhead feedback
-                    print(".", end="", flush=True)
+                    if self.enable_specialized_events_stream:
+                        # Relay raw chunk directly to the main chat stream so the user sees live streaming in the chat bubble
+                        _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    else:
+                        # If specialized direct stream is not active, stream the raw chunk inside the active <processing> status block as an elegant backup!
+                        line_buffer += chunk
+                        if "\n" in line_buffer:
+                            lines = line_buffer.split("\n")
+                            for line in lines[:-1]:
+                                if line.strip():
+                                    self._emit_processing_status(f"  {line}")
+                            line_buffer = lines[-1]
 
-                    # Relay the raw chunk to the frontend under MSG_TYPE_ARTEFACT_CHUNK
+                    # Always relay the raw chunk to the frontend under MSG_TYPE_ARTEFACT_CHUNK
                     # so the user can see the code being written in real-time!
                     _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, {
                         "title":    target_example,
@@ -3038,9 +3065,6 @@ class _StreamState:
                 stream=True,
                 streaming_callback=specialist_stream_callback
             )
-
-            # Ensure we print a newline after console dot streams
-            print()
 
             # Safeguard: If the LLM call returned an error dictionary, raise the error message
             if isinstance(raw_output, dict):
@@ -3207,6 +3231,7 @@ class ChatMixin:
             auto_activate_artefacts = kwargs.get("auto_activate_artefacts", True),
             enable_artefacts      = kwargs.get("enable_artefacts", True),
             enable_in_message_status = kwargs.get("enable_in_message_status", True),
+            enable_specialized_events_stream = kwargs.get("enable_specialized_events_stream", False),
         )
 
         def _streaming_relay(chunk, msg_type=None, meta=None):
@@ -3407,6 +3432,7 @@ class ChatMixin:
         enable_auto_dream:       bool = True,
         enable_deep_memory_pulling: bool = True,
         enable_in_message_status: bool = True,
+        enable_specialized_events_stream: bool = False,
         **kwargs
         ) -> Dict[str, Any]:
         self.scratchpad = ""
@@ -3481,6 +3507,86 @@ class ChatMixin:
             original_sp = self._system_prompt or ""
             if extra_instructions not in original_sp:
                 object.__setattr__(self, "_system_prompt", original_sp + extra_instructions)
+
+        # ── Unified Preflight RAG Retrieval ──────────────────────────────────
+        # Automatically recover context chunks from both personality knowledge and memory system
+        # using a query constructed from current prompt and history.
+        if preflight_rag_enabled and (personality.has_data or _mm):
+            preflight_id = _step_start(callback, "Retrieving relevant knowledge and memories...")
+            try:
+                # Gather recent conversation context
+                recent_history_text = ""
+                recent_msgs = self.get_branch(branch_tip_id or self.active_branch_id)[-3:]
+                for m in recent_msgs:
+                    if m.content:
+                        recent_history_text += f"{m.sender}: {m.content[:300]}\n"
+
+                # Generate search query
+                query_prompt = (
+                    f"Given the user request and recent conversation context, "
+                    f"generate a single concise search query (keywords only) to retrieve relevant facts, "
+                    f"documentation, or memories.\n\n"
+                    f"Recent Conversation:\n{recent_history_text}\n"
+                    f"Current Request: {user_message}\n\n"
+                    f"Search Query (JSON format with key 'query'):"
+                )
+                query_json = self.lollmsClient.generate_structured_content(
+                    prompt=query_prompt,
+                    schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Concise search keywords"
+                            }
+                        },
+                        "required": ["query"]
+                    },
+                    temperature=0.0
+                )
+
+                _rag_query = user_message
+                if query_json and query_json.get("query"):
+                    _rag_query = query_json["query"]
+                    ASCIIColors.info(f"[RAG Preflight] Generated search query: {_rag_query}")
+
+                _rag_chunks = []
+                if personality.has_data:
+                    rag_result = personality.query_data(_rag_query)
+                    if rag_result and rag_result.get("success"):
+                        for idx, chunk in enumerate(rag_result.get("sources", [])):
+                            src = chunk.get("source", "")
+                            _score = chunk.get("score", 1.0)
+                            if _score >= rag_min_similarity_percent:
+                                _rag_chunks.append(
+                                    f"[Knowledge Chunk] (Source: {src})\n{chunk.get('content', '')}"
+                                )
+
+                _mem_chunks = []
+                if _mm:
+                    mem_res = _mm.query(_rag_query, top_k=rag_top_k)
+                    for m in mem_res:
+                        if m.get("importance", 1.0) >= 0.1:
+                            _tier = "Deep" if m.get("level", 1) == 2 else "Working"
+                            _mem_chunks.append(
+                                f"[Memory Chunk] (Tier: {_tier}, Importance: {m['importance']:.0%})\n{m['content']}"
+                            )
+
+                _combined_context = []
+                if _rag_chunks:
+                    _combined_context.append("=== RELEVANT KNOWLEDGE BASE DOCUMENTATION ===")
+                    _combined_context.extend(_rag_chunks[:5])
+                if _mem_chunks:
+                    _combined_context.append("=== RELEVANT HISTORICAL MEMORIES ===")
+                    _combined_context.extend(_mem_chunks[:5])
+
+                if _combined_context:
+                    self.scratchpad = (self.scratchpad or "") + "\n\n" + "\n\n".join(_combined_context)
+                    ASCIIColors.success(f"[RAG Preflight] Successfully injected {len(_rag_chunks)} knowledge chunk(s) and {len(_mem_chunks)} memory chunk(s) into scratchpad.")
+
+            except Exception as preflight_err:
+                ASCIIColors.warning(f"[RAG Preflight] Preflight retrieval failed: {preflight_err}")
+            _step_end(callback, "Pre-flight retrieval complete", preflight_id)
 
         user_msg = None
         if add_user_message:
@@ -3577,11 +3683,6 @@ class ChatMixin:
             return {"user_message": user_msg, "ai_message": ai,
                     "sources": [], "artefacts": affected,
                     "memory_report": mem_report, "dream_report": dream_report}
-
-        if _is_fast_message(user_message):
-            _info(callback, "Simple response path")
-            return _finish(self._stream_final_answer(
-                callback, images, branch_tip_id, 0.1, **kwargs))
 
         if self.memory and user_message.lower() in self.memory.lower():
             _info(callback, "Answering from memory")
@@ -3802,6 +3903,9 @@ class ChatMixin:
                     r'<processing.*?>.*?</processing>', '',
                     m.content or '', flags=_re.DOTALL
                 ).strip()
+                # Safely strip any unclosed/orphaned processing tags to prevent mimicry
+                clean = _re.sub(r'<processing.*?>', '', clean, flags=_re.IGNORECASE)
+                clean = _re.sub(r'</processing>', '', clean, flags=_re.IGNORECASE)
                 last_ai_msg = SimpleNamespace(
                     sender_type="assistant", content=clean, metadata={}
                 )
@@ -3857,6 +3961,7 @@ class ChatMixin:
         enable_memory:                bool = True,
         enable_auto_dream:            bool = True,
         enable_deep_memory_pulling:   bool = True,
+        enable_specialized_events_stream: bool = False,
         **kwargs
         ) -> Dict[str, Any]:
         self.scratchpad = ""
@@ -3910,10 +4015,13 @@ class ChatMixin:
             for a in self.artefacts.list(active_only=True)
         )
 
-        # Precompute has_data_arts so we can filter LCP tools contextually
-        has_data_arts = any(
-            a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
-            for a in self.artefacts.list(active_only=True)
+        _has_external_tools = bool(
+            tools or 
+            (personality and getattr(personality, "tools", None)) or 
+            enable_show_tools or 
+            enable_extract_artefact or 
+            enable_repl_tools or 
+            enable_final_answer
         )
  
         # ====================================================================
@@ -3959,7 +4067,7 @@ class ChatMixin:
         user_msg_lower = user_message.lower()
 
         # CRITICAL FIX #1: Define _user_requests_tools at function scope start
-        _user_requests_tools = _requests_tool_list(user_message)
+        _user_requests_tools = _requests_tool_list(user_message) or _requires_agent_mode(user_message)
 
         # Always include these (lightweight)
         if enable_artefacts:
@@ -4019,6 +4127,7 @@ EMIT <agent_mode/> tag IMMEDIATELY when the user request involves ANY of these:
    - "Run this command...", "Execute..."
    - "Use the [tool_name] tool..."
    - Any explicit tool invocation request
+   - Questions about past conversation history, prior error logs, or decisions made in collapsed rounds (use the `search_conversation_history` tool)
 
 5. 🔄 MULTI-STEP WORKFLOWS
    - Tasks requiring multiple actions in sequence
@@ -4442,7 +4551,7 @@ TRIGGER EXAMPLES:
             user_message = user_msg.content
 
         # ====================================================================
-        #  FAST PATH — no external tools registered
+        #  FAST PATH — On-demand agentic routing
         # ====================================================================
         _has_external_tools = bool(tool_registry)
 
@@ -4451,7 +4560,36 @@ TRIGGER EXAMPLES:
         if debug or self.lollmsClient.debug:
             ASCIIColors.cyan(f"[FAST PATH] _user_requests_tools={_user_requests_tools}, _has_external_tools={_has_external_tools}")
 
-        if not _has_external_tools:
+        # Build dynamic lightweight system prompt for conversational fast-path
+        fast_system_prompt = (
+            (personality.system_prompt or self.system_prompt or "") + 
+            "\n\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
+            "Cite retrieved sources as [1],[2]... "
+            "Never fabricate facts. Say 'I don't know' when uncertain.\n"
+            "\n=== CODE & STRUCTURED FORMATTING RULES (MANDATORY) ===\n"
+            "ALWAYS wrap any code, scripts, configurations, markup, or structured data formats "
+            "(such as OWL, Turtle, RDF, XML, JSON, YAML, HTML, CSS, Python, C++, etc.) inside standard "
+            "markdown code blocks specifying the correct language identifier, e.g.:\n"
+            "```turtle\n"
+            "# turtle code here\n"
+            "```\n"
+            "Never output raw code or markup directly in conversational text without these code blocks.\n"
+            "=== END ===\n"
+        )
+        if _has_external_tools:
+            fast_system_prompt += """
+=== AGENT MODE ACTIVATION TRIGGER ===
+If the user's request requires writing/updating files, running commands, performing web searches, or executing multi-step actions, you MUST activate Agent Mode immediately.
+To activate Agent Mode, simply start your response with the `<agent_mode/>` tag.
+EXAMPLE:
+User: \"Search for Python tutorials and create a summary file\"
+Assistant: <agent_mode/>
+=== END ===
+"""
+
+        # Always run through the fast path first to allow the LLM to decide on-demand
+        # whether to trigger Agent Mode by emitting the <agent_mode/> tag.
+        if not _user_requests_tools:
             ss = _StreamState(
                 discussion            = self,
                 callback              = callback,
@@ -4462,8 +4600,10 @@ TRIGGER EXAMPLES:
                 enable_forms          = enable_forms,
                 auto_activate_artefacts = auto_activate_artefacts,
                 enable_artefacts      = enable_artefacts,
+                enable_in_message_status = kwargs.get("enable_in_message_status", True),
+                enable_specialized_events_stream = kwargs.get("enable_specialized_events_stream", False),
             )
- 
+
             ai_message = self.add_message(
                 sender=personality.name,
                 sender_type="assistant",
@@ -4482,20 +4622,24 @@ TRIGGER EXAMPLES:
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
+                    # Prevent re-entrant feedback loops for system-generated statuses
+                    if meta and meta.get("was_processed"):
+                        return True
+
                     # Check for <agent_mode/> tag in streaming chunk
                     if "<agent_mode" in chunk.lower() and not _agent_mode_triggered:
                         _agent_mode_triggered = True
-                        ASCIIColors.info("[FAST PATH] <agent_mode/> tag detected — switching to agentic loop.")
-                    # Forward chunk to user callback FIRST for streaming
-                    _cb(callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, meta)
-                    # Then feed to state machine for tag detection
+                        ASCIIColors.success("\n[FAST PATH] <agent_mode/> tag detected — switching to agentic loop.\n")
+                    # Feed to state machine for tag detection and streaming dispatch
                     return ss.feed(chunk)
                 return True
 
             raw_text = self._stream_final_answer(
                 _fast_relay, images,
                 branch_tip_id or self.active_branch_id,
-                final_answer_temperature, **kwargs,
+                final_answer_temperature, 
+                system_prompt=fast_system_prompt,
+                **kwargs,
             )
  
             ss.flush_remaining_buffer()
@@ -4564,12 +4708,13 @@ TRIGGER EXAMPLES:
             # CRITICAL FIX: Also check the _agent_mode_triggered flag from streaming relay
             _agent_mode_requested = (
                 "<agent_mode" in raw_text.lower() or
-                _user_requests_tools or
                 _agent_mode_triggered
             )
 
             if _agent_mode_requested and _has_external_tools:
                 ASCIIColors.info("[chat] Agent mode requested in fast path — re-entering agent loop.")
+                # Explicitly close any open processing blocks from the fast path to ensure DOM consistency
+                ss.flush_remaining_buffer()
                 # Clear fast path content and fall through to agent loop
                 ai_message.content = ""
                 _entered_agentic_mode = True
@@ -4623,16 +4768,17 @@ TRIGGER EXAMPLES:
                     self.commit()
                 self.scratchpad = ""
                 object.__setattr__(self, '_active_callback', None)
-                return {
-                    "user_message":     user_msg,
-                    "ai_message":       ai_message,
-                    "sources":          collected_sources,
-                    "scratchpad":       None,
-                    "self_corrections": None,
-                    "artefacts":        affected,
-                    "memory_report":    _mem_report,
-                    "dream_report":     dream_report,
-                }
+                if not _entered_agentic_mode:
+                    return {
+                        "user_message":     user_msg,
+                        "ai_message":       ai_message,
+                        "sources":          collected_sources,
+                        "scratchpad":       None,
+                        "self_corrections": None,
+                        "artefacts":        affected,
+                        "memory_report":    _mem_report,
+                        "dream_report":     dream_report,
+                    }
 
             # If we reach here, agent mode was requested — fall through to agent loop setup
             # Build full tool system prompt now that we're entering agent mode
@@ -4710,139 +4856,25 @@ TRIGGER EXAMPLES:
                 "Use 'From my understanding...' for general knowledge.\n"
                 "Never fabricate facts. Say 'I don't know' when uncertain.\n"
                 "=== END ===\n"
+                "\n=== CODE & STRUCTURED FORMATTING RULES (MANDATORY) ===\n"
+                "ALWAYS wrap any code, scripts, configurations, markup, or structured data formats "
+                "(such as OWL, Turtle, RDF, XML, JSON, YAML, HTML, CSS, Python, C++, etc.) inside standard "
+                "markdown code blocks specifying the correct language identifier, e.g.:\n"
+                "```turtle\n"
+                "# turtle code here\n"
+                "```\n"
+                "Never output raw code or markup directly in conversational text without these code blocks.\n"
+                "=== END ===\n"
             )
             object.__setattr__(
                 self, "_system_prompt",
                 personality.system_prompt + veracity + extra_instructions,
             )
  
-        # ── Pre-flight RAG ────────────────────────────────────────────────────
-        if preflight_rag_enabled and personality.has_data:
-            preflight_id = _step_start(callback, "Pre-flight knowledge retrieval...")
-            ctx = self.export("markdown", suppress_system_prompt=True)
-            try:
-                query_json = self.lollmsClient.generate_structured_content(
-                    prompt=ctx[-2000:] + "\nGenerate a concise search query (JSON).",
-                    schema={"query": "Your concise search query string"},
-                    system_prompt="Output only JSON.",
-                    temperature=0.1,
-                )
-                if query_json and "query" in query_json:
-                    rag_result = personality.query_data(query_json["query"])
-                    if rag_result.get("success"):
-                        fmt = ""
-                        for idx, chunk in enumerate(rag_result.get("sources", [])):
-                            src  = chunk.get("source", "")
-                            meta = chunk.get("metadata", {})
-                            title = (
-                                chunk.get("title") or meta.get("title") or
-                                meta.get("filename") or meta.get("name") or
-                                (src.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if src else "") or
-                                f"Source {idx + 1}"
-                            )
-                            fmt += (
-                                f"[Source {idx+1}] ({src}, "
-                                f"{chunk.get('score', 0):.2f})\n"
-                                f"{chunk.get('content', '')}\n\n"
-                            )
-                            collected_sources.append({
-                                "title":           title,
-                                "content":         chunk.get("content", ""),
-                                "source":          src,
-                                "query":           query_json["query"],
-                                "relevance_score": chunk.get("score", 0),
-                                "index":           idx + 1,
-                                "phase":           "preflight",
-                                "metadata":        meta,
-                            })
-                        if fmt:
-                            self.scratchpad = (
-                                fmt.strip() + "\n\nIMPORTANT: Cite sources as [1],[2],..."
-                            )
-                        if collected_sources:
-                            _cb(callback, collected_sources, MSG_TYPE.MSG_TYPE_SOURCES_LIST)
-            except Exception as e:
-                trace_exception(e)
-            _step_end(callback, "Pre-flight retrieval complete", preflight_id,
-                      {"source_count": len(collected_sources)})
+        # ── Pre-flight RAG (Bypassed — Unified Preflight handles this automatically) ──
+        pass
  
-        if has_active_data_artifacts and tool_registry:
-            try:
-                intent_prompt = (
-                    f"User message: \"{user_message}\"\n\n"
-                    "IMPORTANT CONTEXT: There is an active DATA artifact in this session (a database or dataset file).\n\n"
-                    "Analyze if this message requires:\n"
-                    "1. Executing a tool to query/analyze the data artifact\n"
-                    "2. Modifying/creating files (artifacts)\n"
-                    "3. Generating/editing images\n\n"
-                    "CRITICAL: If the question is analytical, factual, or asks about specific values/frequencies/count/comparisons,\n"
-                    "it likely requires querying the data artifact even if it doesn't explicitly mention 'database' or 'query'.\n\n"
-                    "Return false ONLY if:\n"
-                    "- The user is greeting you (hello, hi, etc.)\n"
-                    "- The question has NO relation to data analysis (e.g., philosophical, abstract)\n"
-                    "- It's purely conversational chit-chat\n\n"
-                    f"When in doubt with analytical questions and an active data artifact, return TRUE.\n"
-                )
-                intent_res = self.lollmsClient.generate_structured_content(
-                    prompt=intent_prompt,
-                    schema={
-                        "requires_tools_or_actions": {
-                            "type": "boolean",
-                            "description": "True if the message requires tool execution (especially data queries), file modification/creation, or image generation/edit. False only for pure conversation."
-                        },
-                        "reasoning": {
-                            "type": "string",
-                            "description": "Brief reasoning explaining why tools are or aren't needed"
-                        }
-                    },
-                    temperature=0.0
-                )
-                if intent_res and isinstance(intent_res, dict):
-                    _needs_tools = intent_res.get("requires_tools_or_actions", False)
-
-                    # Additional safety: If data artifact exists AND question has analytical keywords, override to True
-                    if has_active_data_artifacts and data_intent_score >= 2:
-                        _needs_tools = True
-                        ASCIIColors.info(f"[Intent Classifier] Overrode to TRUE due to active data artifact + {data_intent_score} analytical keywords")
-
-                    ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
-            except Exception as e:
-                # If intent classification fails AND there's a data artifact, default to True (safer)
-                if has_active_data_artifacts:
-                    _needs_tools = True
-                    ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to TRUE due to active data artifact.")
-                else:
-                    _needs_tools = False
-        elif tool_registry or enable_image_generation or enable_image_editing or enable_artefacts:
-            # Standard path for non-data-artifact scenarios
-            try:
-                intent_prompt = (
-                    f"User message: \"{user_message}\"\n\n"
-                    "Analyze if this message requires executing an external tool, modifying/creating files (artifacts), or generating/editing images.\n"
-                    "Return false if the user is just having a normal conversation, greeting you, asking a general question, or talking casually."
-                )
-                intent_res = self.lollmsClient.generate_structured_content(
-                    prompt=intent_prompt,
-                    schema={
-                        "requires_tools_or_actions": {
-                            "type": "boolean",
-                            "description": "True if the message requests a tool execution, file modification/creation, or image generation/edit. False for normal conversation."
-                        },
-                        "reasoning": {
-                            "type": "string",
-                            "description": "Brief reasoning for the decision."
-                        }
-                    },
-                    temperature=0.0
-                )
-                if intent_res and isinstance(intent_res, dict):
-                    _needs_tools = intent_res.get("requires_tools_or_actions", False)
-                    ASCIIColors.info(f"[Intent Classifier] Requires tools/actions: {_needs_tools} | Reasoning: {intent_res.get('reasoning')}")
-            except Exception as e:
-                _needs_tools = True
-                ASCIIColors.warning(f"[Intent Classifier] Failed: {e}. Defaulting to True.")
-        else:
-            _needs_tools = False
+        _needs_tools = False
 
         # ====================================================================
         #  FAST PATH — no external tools registered
@@ -5016,6 +5048,53 @@ TRIGGER EXAMPLES:
         #  Built-in tools (only when external tools exist)
         # ====================================================================
  
+        # ── Conversation History Search Tool ──
+        def _search_conversation_history_impl(query: str) -> Dict[str, Any]:
+            branch_msgs = self.get_branch(branch_tip_id or self.active_branch_id)
+            hits = []
+            query_words = set(re.findall(r'\b\w{3,}\b', query.lower()))
+
+            for idx, msg in enumerate(branch_msgs):
+                content = (msg.content or "").strip()
+                if not content:
+                    continue
+                content_lower = content.lower()
+
+                match_count = sum(1 for w in query_words if w in content_lower) if query_words else 1
+                if match_count > 0:
+                    preview = content[:400] + "..." if len(content) > 400 else content
+                    hits.append({
+                        "message_index": idx,
+                        "sender": msg.sender,
+                        "sender_type": msg.sender_type,
+                        "match_score": match_count,
+                        "content": preview
+                    })
+
+            hits.sort(key=lambda x: x["match_score"], reverse=True)
+
+            formatted = []
+            for h in hits[:5]:
+                formatted.append(
+                    f"--- Message #{h['message_index']} ({h['sender'].upper()}) ---\n{h['content']}"
+                )
+
+            return {
+                "success": True,
+                "query": query,
+                "results": hits[:5],
+                "output": "\n\n".join(formatted) if formatted else "No matching historical messages found in this conversation.",
+                "total_matches": len(hits)
+            }
+
+        _register(
+            name="search_conversation_history",
+            fn=_search_conversation_history_impl,
+            params=[{"name": "query", "type": "str", "description": "Keywords to search for in past messages of the current conversation."}],
+            description="Query the complete uncompressed history of the current conversation to find past user requests, error logs, technical decisions, or previous code snippets.",
+            output=[{"name": "output", "type": "str"}]
+        )
+
         if enable_show_tools:
             def _show_tools_impl():
                 catalogue: List[Dict[str, Any]] = []
@@ -5233,16 +5312,22 @@ TRIGGER EXAMPLES:
         _recent_queries: Dict[str, set]        = {}
 
         _round1_no_tool_call = False
- 
-        ai_message = self.add_message(
-            sender=personality.name,
-            sender_type="assistant",
-            content="",
-            parent_id=user_msg.id,
-            model_name=self.lollmsClient.llm.model_name,
-            binding_name=self.lollmsClient.llm.binding_name,
-            metadata={"mode": "agentic", "events": []}
-        )
+
+        # Re-use the existing conversational message if we transitioned from the fast path,
+        # otherwise create a new assistant message for the agentic loop.
+        if 'ai_message' in locals() and ai_message is not None:
+            ai_message.metadata = {"mode": "agentic", "events": []}
+            ai_message.content = ""
+        else:
+            ai_message = self.add_message(
+                sender=personality.name,
+                sender_type="assistant",
+                content="",
+                parent_id=user_msg.id,
+                model_name=self.lollmsClient.llm.model_name,
+                binding_name=self.lollmsClient.llm.binding_name,
+                metadata={"mode": "agentic", "events": []}
+            )
         if self._is_db_backed:
             self.commit()
         _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE,
@@ -5404,6 +5489,7 @@ TRIGGER EXAMPLES:
         # it emits <artifact>, <tool_call>, or <agent_mode> tags which trigger the loop.
 
         _entered_agentic_mode = False  # Track if we actually entered agent loop
+        _action_plan = None            # Initialize to prevent UnboundLocalError in ACT phase on round 1
 
         while _round < max_reasoning_steps:
             _round += 1
@@ -5411,17 +5497,6 @@ TRIGGER EXAMPLES:
             # ── CHECK IF MODEL SIGNALLED AGENT MODE ─────────────────────────
             # Already in agent mode if we reached here (fast path detected <agent_mode> or user requested tools)
             _entered_agentic_mode = True
-
-            # Auto-call show_tools if user explicitly requested tool list
-            if _round == 1 and _user_requests_tools and "show_tools" in active_tool_registry:
-                ASCIIColors.info("[chat] User requested tool list — auto-calling show_tools.")
-                _tool_result = active_tool_registry["show_tools"]()
-                _virtual_history.append(SimpleNamespace(
-                    sender_type="system",
-                    content=f'<tool_result name="show_tools">{{"success": true, "tool_count": {_tool_result.get("tool_count", 0)}}}</tool_result>'
-                ))
-                _mission_state["tools_executed"] += 1
-                ss._emit_processing_status(f"Retrieved {_tool_result.get('tool_count', 0)} available tools.")
 
             # ── MISSION COMPLETE CHECK ──────────────────────────────────────
             _artifacts = _mission_state.get("artifacts_modified", 0)
@@ -5436,11 +5511,11 @@ TRIGGER EXAMPLES:
                 break
 
             active_tool_registry = tool_registry
- 
+
             _recent_queries.clear()
             _active_temp    = final_answer_temperature
             _saved_scratchpad = self.scratchpad
- 
+
             # ── Build EPISODIC MEMORY scratchpad (pure factual record) ───────────
             _memory_lines: List[str] = ["=== EPISODIC MEMORY ==="]
 
@@ -5518,6 +5593,8 @@ TRIGGER EXAMPLES:
                 enable_forms          = enable_forms,
                 auto_activate_artefacts = auto_activate_artefacts,
                 enable_artefacts      = enable_artefacts,
+                enable_in_message_status = kwargs.get("enable_in_message_status", True),
+                enable_specialized_events_stream = kwargs.get("enable_specialized_events_stream", False),
             )
             ss._turn_action_history = _turn_action_history
             ss._mission_complete = _mission_complete
@@ -5549,14 +5626,14 @@ TRIGGER EXAMPLES:
                         return False
                     return result
                 return True
- 
+
             merged_images = self._merge_artefact_images(images)
- 
+
             _gen_kwargs = kwargs.copy()
             _gen_kwargs.pop("stream",              None)
             _gen_kwargs.pop("temperature",         None)
             _gen_kwargs.pop("streaming_callback",  None)
- 
+
             # ── Build sanitized message list for this round ───────────────────
             # The system context (instructions + active artifacts) is always
             # injected fresh as the first message so the model has a clean view.
@@ -5565,9 +5642,16 @@ TRIGGER EXAMPLES:
             # This prevents the model from treating framework markers as prose
             # it should reproduce.
             _formatted_messages: List[Dict[str, str]] = []
- 
+
+            # Compile robust dynamic system prompt for agentic loop execution
+            agent_system_prompt = (
+                (personality.system_prompt or self.system_prompt or "") + 
+                extra_instructions + 
+                _SURGICAL_UPDATE_GUIDANCE
+            )
+
             full_system_context = (
-                (self.system_prompt or "") + "\n\n" + self.get_full_data_zone()
+                agent_system_prompt + "\n\n" + self.get_full_data_zone()
             )
             if self.scratchpad:
                 full_system_context += "\n\n" + f"=== SCRATCHPAD / TEMPORARY CONTEXT ===\n{self.scratchpad}\n=== END SCRATCHPAD ==="
@@ -5575,7 +5659,7 @@ TRIGGER EXAMPLES:
                 "role":    "system",
                 "content": full_system_context.strip(),
             })
- 
+
             for m in _virtual_history:
                 if m.sender_type == "system":
                     # Already injected above; skip to avoid duplication
@@ -5623,6 +5707,9 @@ TRIGGER EXAMPLES:
                         '\n[Processing block — see CONTINUITY THREAD for actions taken]\n',
                         content, flags=re.DOTALL
                     )
+                    # Safely strip any unclosed/orphaned processing tags to prevent mimicry
+                    content = re.sub(r'<processing.*?>', '', content, flags=re.IGNORECASE)
+                    content = re.sub(r'</processing>', '', content, flags=re.IGNORECASE)
                     content = re.sub(r'<lollms_event.*?>', '', content)
                     # Strip any leaked status / log lines (but preserve action summaries)
                     content = re.sub(
@@ -5712,7 +5799,7 @@ TRIGGER EXAMPLES:
                             "role": "system",
                             "content": synth_failure
                         })
- 
+
             # Images
             _binding = getattr(self.lollmsClient, 'llm', None)
             _vision_ok = getattr(_binding, 'supports_vision', True)  # default True for compat
@@ -5742,22 +5829,22 @@ TRIGGER EXAMPLES:
                 streaming_callback = _inline_relay,
                 **_gen_kwargs
             )
- 
+
             ss.flush_remaining_buffer()
             if ss.affected_artefacts:
                 all_affected_artefacts.extend(ss.affected_artefacts)
             self.scratchpad = _saved_scratchpad
- 
+
             # ── Post-round scrub: remove any leaked internal markers ───────────
             if _EXEC_MARKER_RE.search(ai_message.content):
                 ASCIIColors.warning(
                     "[chat] Scrubbing leaked internal markers from ai_message.content"
                 )
                 ai_message.content = _EXEC_MARKER_RE.sub('', ai_message.content).strip()
- 
+
             _so_far = "".join(ss.stream_buf)
             _accumulated_full += _so_far
- 
+
             # Clean up raw tool_call block from visible content if it leaked
             if ss.tool_trigger:
                 match = re.search(
@@ -5768,10 +5855,10 @@ TRIGGER EXAMPLES:
                     ai_message.content = (
                         ai_message.content[:round_content_start + match.start()]
                     )
- 
+
             _round_clean       = "".join(ss.clean_prose)
             _clean_text_so_far += _round_clean
- 
+
             # ── Artifact-update failure: re-loop with correction ───────────────
             if ss.patch_error_occurred and not ss.affected_artefacts:
                 _error_breadcrumb = (
@@ -5800,7 +5887,7 @@ TRIGGER EXAMPLES:
                     "[chat] Artifact update failed — re-looping to inform LLM."
                 )
                 continue
- 
+
             _tool_trigger  = ss.tool_trigger
             _tool_json_str = ss.get_tool_call_json()
 
@@ -5808,7 +5895,7 @@ TRIGGER EXAMPLES:
             # ║  ACT PHASE: Execute the action plan                               ║
             # ╚══════════════════════════════════════════════════════════════════╝
             if debug or self.lollmsClient.debug:
-                ASCIIColors.yellow(f"[ACT] Round {_round}: Executing action_type={_action_plan.get('action_type')}")
+                ASCIIColors.yellow(f"[ACT] Round {_round}: Executing action_type={_action_plan.get('action_type') if _action_plan else None}")
 
             if _action_plan and _action_plan.get("action_type") == "tool_call":
                 _tool_name = _action_plan.get("tool_name")
@@ -5933,7 +6020,7 @@ TRIGGER EXAMPLES:
                     _accumulated_full  = _accumulated_full[:len("".join(ss.stream_buf[:0]))] or ""
                     ai_message.content = ai_message.content[:round_content_start]
                     continue
- 
+
             # ── EXIT IF NO ACTION DETECTED (Round 2+) ───────────────────────
             # If model didn't emit tags in Round 1, we already broke out above.
             # This handles Round 2+ where model emitted tags but then went silent.
@@ -6988,14 +7075,11 @@ TRIGGER EXAMPLES:
         if _mm:
             self._save_episodic_memory_turn(user_message, ai_message.content, _mm)
             # Save memory zone state snapshot for future reference
+            u_len = len(self.user_data_zone) if self.user_data_zone else 0
+            d_len = len(self.discussion_data_zone) if self.discussion_data_zone else 0
+            p_len = len(self.personality_data_zone) if self.personality_data_zone else 0
             _mm.add(
-                f"Turn snapshot: Zones — User:{len(self.user_data_zone)} chars, Discussion:{len(self.discussion_data_zone)} chars, Personality:{len(self.personality_data_zone)} chars",
-                importance=0.3,
-                tags=["zone_snapshot", "context_state"],
-            )
-            # Also save memory zone state snapshot for future reference
-            _mm.add(
-                f"Turn snapshot: Zones — User:{len(self.user_data_zone)} chars, Discussion:{len(self.discussion_data_zone)} chars, Personality:{len(self.personality_data_zone)} chars",
+                f"Turn snapshot: Zones — User:{u_len} chars, Discussion:{d_len} chars, Personality:{p_len} chars",
                 importance=0.3,
                 tags=["zone_snapshot", "context_state"],
             )

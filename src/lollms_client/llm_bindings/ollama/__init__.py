@@ -1212,7 +1212,6 @@ if __name__ == '__main__':
         full_streamed_text = ""
         def stream_callback(chunk: str, msg_type: int):
             global full_streamed_text
-            print(f"{ASCIIColors.GREEN}Stream chunk: {chunk}[/green]", end="", flush=True)
             full_streamed_text += chunk
             if len(full_streamed_text) > 100: # Example: stop after 100 chars for test
                 # print("\nStopping stream early for test.")
