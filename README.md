@@ -9,7 +9,8 @@
 [![GitHub stars](https://img.shields.io/github/stars/ParisNeo/lollms_client.svg?style=social&label=Star&maxAge=2592000)](https://github.com/ParisNeo/lollms_client/stargazers/)
 [![GitHub issues](https://img.shields.io/github/issues/ParisNeo/lollms_client.svg)](https://github.com/ParisNeo/lollms_client/issues)
 
-<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/efa07446-3669-412b-826d-73be86f40950" />
+<img width="941" height="1672" alt="ChatGPT Image 10 juin 2026, 12_43_49" src="https://github.com/user-attachments/assets/bebb5958-5037-4e7c-b167-a198530c1438" />
+
 
 
 **`lollms_client`** is a powerful and flexible Python library designed to simplify interactions with the **LoLLMs (Lord of Large Language Models)** ecosystem and various other Large Language Model (LLM) backends. It provides a unified API for text generation, multimodal operations (text-to-image, text-to-speech, etc.), and robust function calling through the Model Context Protocol (MCP).
