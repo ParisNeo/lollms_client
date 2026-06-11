@@ -447,7 +447,7 @@ document.addEventListener("DOMContentLoaded", () => {
     funcBadges.forEach(badge => {
         const funcKey = badge.dataset.func;
         let defaultVal = "true";
-        if (funcKey === "enable_skills" || funcKey === "enable_books") {
+        if (funcKey === "enable_skills" || funcKey === "enable_books" || funcKey === "think") {
             defaultVal = "false";
         }
 
@@ -5703,6 +5703,37 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function formatMessageContent(text, msgId, msgObj = null) {
+        const cleanedText = runMarkdownCleanup(text);
+        const processedText = resolveProcessingTags(cleanedText);
+
+        const placeholders = {};
+        let maskedText = processedText;
+
+        const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
+        maskedText = maskedText.replace(inlinePattern, (match) => {
+            const id = `__WIDGET_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+            placeholders[id] = match;
+            return id;
+        });
+
+        const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
+        maskedText = maskedText.replace(formPattern, (match) => {
+            const id = `__FORM_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+            placeholders[id] = match;
+            return id;
+        });
+
+        const parsedMarkdown = marked.parse(maskedText);
+
+        let restoredHTML = parsedMarkdown;
+        for (const [id, original] of Object.entries(placeholders)) {
+            restoredHTML = restoredHTML.split(id).join(original);
+        }
+
+        return resolveImageAnchors(restoredHTML, activeArtifactTitle, msgId, null, msgObj);
+    }
+
     function renderMessageBubble(msgId, sender, text, metrics = {}, msgObj = null) {
         const bubble = document.createElement("div");
         bubble.className = `chat-bubble ${sender}`;
@@ -5717,12 +5748,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const proseSpan = document.createElement("span");
         proseSpan.className = "prose-span";
 
-        // Un-escape any backticks/formatting, then resolve processing and markdown
-        const cleanedText = runMarkdownCleanup(text);
-        const processedText = resolveProcessingTags(cleanedText);
-        const parsedMarkdown = marked.parse(processedText);
-        const resolvedHTML = resolveImageAnchors(parsedMarkdown, activeArtifactTitle, msgId, null, msgObj);
-        proseSpan.innerHTML = resolvedHTML;
+        proseSpan.innerHTML = formatMessageContent(text, msgId, msgObj);
         contentDiv.appendChild(proseSpan);
 
         // Render any active message images (such as sandboxed Matplotlib plots) at the bottom of the bubble
@@ -6486,9 +6512,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 enable_books: funcStates["enable_books"],
                 enable_skills: funcStates["enable_skills"],
                 enable_image_generation: funcStates["enable_image_generation"],
-                enable_image_editing: funcStates["enable_image_generation"],
+                enable_image_editing: funcStates["enable_image_editing"],
                 enable_forms: funcStates["enable_forms"],
-                enable_inline_widgets: funcStates["enable_inline_widgets"]
+                enable_inline_widgets: funcStates["enable_inline_widgets"],
+                think: funcStates["think"]
             };
 
             if (tempOverrideEnable && tempOverrideEnable.checked) {
@@ -6585,35 +6612,7 @@ document.addEventListener("DOMContentLoaded", () => {
                             }
 
                             currentProse += event.chunk;
-                            const cleanedProse = runMarkdownCleanup(currentProse);
-                            const processedText = resolveProcessingTags(cleanedProse);
-
-                            const placeholders = {};
-                            let maskedText = processedText;
-
-                            const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
-                            maskedText = maskedText.replace(inlinePattern, (match) => {
-                                const id = `__WIDGET_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
-                                placeholders[id] = match;
-                                return id;
-                            });
-
-                            const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
-                            maskedText = maskedText.replace(formPattern, (match) => {
-                                const id = `__FORM_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
-                                placeholders[id] = match;
-                                return id;
-                            });
-
-                            const parsedMarkdown = marked.parse(maskedText);
-
-                            let restoredHTML = parsedMarkdown;
-                            for (const [id, original] of Object.entries(placeholders)) {
-                                restoredHTML = restoredHTML.replace(id, original);
-                            }
-
-                            const resolvedHTML = resolveImageAnchors(restoredHTML, activeArtifactTitle, activeMsgId);
-                            proseSpan.innerHTML = resolvedHTML;
+                            proseSpan.innerHTML = formatMessageContent(currentProse, activeMsgId);
                             renderMath(proseSpan);
                             chatHistory.scrollTop = chatHistory.scrollHeight;
                         }

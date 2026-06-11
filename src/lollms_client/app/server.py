@@ -3309,15 +3309,7 @@ class ChatRequest(BaseModel):
     enable_forms: Optional[bool] = True
     enable_inline_widgets: Optional[bool] = True
     temperature: Optional[float] = None
-    enable_memory: Optional[bool] = True
-    enable_artefacts: Optional[bool] = True
-    enable_in_message_status: Optional[bool] = True
-    enable_presentations: Optional[bool] = True
-    enable_books: Optional[bool] = True
-    enable_skills: Optional[bool] = True
-    enable_image_generation: Optional[bool] = True
-    enable_image_editing: Optional[bool] = True
-    enable_forms: Optional[bool] = True
+    think: Optional[bool] = False
 
 
 class ScanSkillsRequest(BaseModel):
@@ -3597,6 +3589,7 @@ async def chat_with_document(request: ChatRequest):
                         enable_forms=request.enable_forms if request.enable_forms is not None else True,
                         enable_inline_widgets=request.enable_inline_widgets if request.enable_inline_widgets is not None else True,
                         temperature=request.temperature,
+                        think=request.think,
                         debug=True
                     )
                 finally:

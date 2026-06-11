@@ -337,18 +337,32 @@ class LollmsClient():
 
     def generate_text(self, *args, **kwargs) -> Union[str, dict]:
         self._cooperative_unload_except("llm")
-        if self.llm: return self.llm.generate_text(*args, **kwargs)
-        raise RuntimeError("LLM binding not initialized.")
+        if not self.llm:
+            raise RuntimeError("LLM binding not initialized.")
+
+        # Default think to False if not explicitly provided as True
+        if "think" not in kwargs:
+            kwargs["think"] = False
+        else:
+            kwargs["think"] = kwargs["think"] is True
+
+        return self.llm.generate_text(*args, **kwargs)
 
     def generate(self, *args, **kwargs) -> Union[str, dict]:
-        self._cooperative_unload_except("llm")
-        if self.llm: return self.llm.generate_text(*args, **kwargs)
-        raise RuntimeError("LLM binding not initialized.")
+        return self.generate_text(*args, **kwargs)
 
     def generate_from_messages(self, *args, **kwargs) -> Union[str, dict]:
         self._cooperative_unload_except("llm")
-        if self.llm: return self.llm.generate_from_messages(*args, **kwargs)
-        raise RuntimeError("LLM binding not initialized.")
+        if not self.llm:
+            raise RuntimeError("LLM binding not initialized.")
+
+        # Default think to False if not explicitly provided as True
+        if "think" not in kwargs:
+            kwargs["think"] = False
+        else:
+            kwargs["think"] = kwargs["think"] is True
+
+        return self.llm.generate_from_messages(*args, **kwargs)
 
     def generate_with_tools(
         self,

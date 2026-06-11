@@ -16,25 +16,32 @@
 
 Whether you're connecting to a remote LoLLMs server, an Ollama instance, the OpenAI API, or running models locally using GGUF (via `llama-cpp-python` or a managed `llama.cpp` server), Hugging Face Transformers, or vLLM, `lollms-client` offers a consistent and developer-friendly experience.
 
-## Key Features
+## ⚡ Why LoLLMs Client? Key Competitive Advantages
 
-*   🔌 **Versatile Binding System:** Seamlessly switch between different LLM backends (LoLLMs, Ollama, OpenAI, Llama.cpp, Transformers, vLLM, OpenLLM, Gemini, Claude, Groq, OpenRouter, Hugging Face Inference API) using a unified `llm_binding_config` dictionary for all parameters.
-*   🗣️ **Comprehensive Multimodal Support:** Interact with models capable of processing images and generate various outputs like speech (TTS), video (TTV), and music (TTM).
-*   🎨 **Advanced Image Generation and Editing:** A new `diffusers` binding provides powerful text-to-image capabilities. It supports a wide range of models from Hugging Face and Civitai, including specialized models like `Qwen-Image-Edit` for single-image editing and the cutting-edge `Qwen-Image-Edit-2509` for **multi-image fusion, pose transfer, and character swapping**.
-*   🖼️ **Selective Image Activation:** Control which images in a message are active and sent to the model, allowing for fine-grained multimodal context management without deleting the original data.
-*   🤖 **Agentic Workflows with MCP:** Empower LLMs to act as sophisticated agents, breaking down complex tasks, selecting and executing external tools (e.g., internet search, code interpreter, file I/O, image generation) through the Model Context Protocol (MCP) using a robust "observe-think-act" loop.
-*   🎭 **Personalities as Agents:** Personalities can now define their own set of required tools (MCPs) and have access to static or dynamic knowledge bases (`data_source`), turning them into self-contained, ready-to-use agents.
-*   🚀 **Streaming & Callbacks:** Efficiently handle real-time text generation with customizable callback functions across all generation methods, including during agentic (MCP) interactions.
-*   📑 **Long Context Processing:** The `long_context_processing` method (formerly `sequential_summarize`) intelligently chunks and synthesizes texts that exceed the model's context window, suitable for summarization or deep analysis.
-*   📝 **Advanced Structured Content Generation:** Reliably generate structured JSON output from natural language prompts using the `generate_structured_content` helper method, enforcing a specific schema.
-*   💬 **Advanced Discussion Management:** Robustly manage conversation histories with `LollmsDiscussion`, featuring branching, context exporting, and automatic pruning.
-*   🧠 **Persistent Memory & Data Zones:** `LollmsDiscussion` now supports multiple, distinct data zones (`user_data_zone`, `discussion_data_zone`, `personality_data_zone`) and a long-term `memory` field. This allows for sophisticated context layering and state management, enabling agents to learn and remember over time.
-*   🧠 **Persistent Human-Inspired Memory System:** Features a tiered biological-like memory system (Working, Deep, and Archived layers) that supports time-based decay, usage reinforcement, and AI-assisted "dreaming" consolidation and selective forgetting.
-*   ✍️ **Structured Memorization:** The `memorize()` method analyzes a conversation to extract its essence (e.g., a problem and its solution), creating a structured "memory" with a title and content. These memories are stored and can be explicitly loaded into the AI's context, providing a more robust and manageable long-term memory system.
-*   📊 **Detailed Context Analysis:** The `get_context_status()` method provides a rich, detailed breakdown of the prompt context, showing the content and token count for each individual component (system prompt, data zones, message history).
-*   ⚙️ **Standardized Configuration Management:** A unified dictionary-based system (`llm_binding_config`) to configure any binding in a consistent manner.
-*   🧩 **Extensible:** Designed to easily incorporate new LLM backends and modality services, including custom MCP toolsets.
-*   📝 **High-Level Operations:** Includes convenience methods for complex tasks like sequential summarization and deep text analysis directly within `LollmsClient`.
+`lollms_client` is not just another API wrapper. It is a highly optimized, production-grade coordination engine built to grant Large Language Models true local and hybrid autonomy.
+
+### 🧠 Biological-Inspired 4-Tier Memory System (Memory Level 1-4)
+*   **Persistent Multi-Level Storage**: Features an advanced, cognitive hierarchical storage system consisting of **Working Memory** (directly injected into prompt space), **Deep Memory** (stubbed as handles to prevent context bloating), **Archived Memory** (historical backup), and **Episodic Memory** (immutable step-by-step trace of interactions).
+*   **Memory Decay & Consolidation**: Memories decay logarithmically over time. Frequently referenced concepts are automatically reinforced.
+*   **AI-Assisted Dreaming (`dream()`)**: During idle cycles, an automated "dream consolidation pass" cleans up old data. Important rules and architecture patterns are maintained, while low-importance noise is forgotten.
+
+### 🤖 Sovereign Multi-Step Agency & MCP Integration
+*   **Deterministic State Control**: Uses a robust **Observe-Think-Act-Verify** state machine. If the model generates a thought process but fails to act, the parser detects the omission, restricts reasoning, and injects precise structural corrections to guide it back on track.
+*   **Model Context Protocol (MCP)**: Native integration of local and remote MCP tool registries (e.g., File I/O, Web Search, Sandboxed Code Execution) giving agents direct hands-on power.
+*   **Real-Time Performance Metrics**: Tracks exact performance statistics per spinoff agent turn, capturing **Time to First Token (TTFT)**, **Average Generation Speed (TPS)**, and total token usage stored directly in the discussion database.
+
+### 💻 Aider-Style Structural Code Patching & Text Processor (`tp`)
+*   **Non-Destructive SEARCH/REPLACE Edits**: Features the **Lollms Text Processor** layer (`lc.llm.tp`). Instead of full document rewrites, it supports structural, aider-style Search/Replace code patches.
+*   **Schema & Pydantic Enforcement**: Easily output structured data with built-in schema validation and truncation-recovery algorithms. If the model's output gets cut off, the Text Processor reconstructs the JSON tree and repairs the output.
+*   **Yes/No & Multi-Choice Helpers**: Built-in helper primitives to perform discrete evaluations, ranking, and classification.
+
+### 🖼️ Multimodal Context Isolation & Multi-Image Fusion
+*   **Fine-Grained Vision Controls**: Multi-image inputs can be selectively toggled active or inactive on each message turn without purging original databases—significantly reducing vision model token costs.
+*   **Qwen Multi-Image Fusion**: Diffusers integration supports cutting-edge local image-to-image engines capable of single-image semantic edits and advanced **multi-image fusion, character swaps, pose transfers, and background transplants**.
+
+### 🔌 Standardized, Multi-Provider Architecture
+*   **Unified Configuration**: Run local GGUFs (via llama.cpp/python), local Ollama instances, or scale to OpenAI, Anthropic, Gemini, Groq, and OpenRouter using a single, unified `llm_binding_config` block.
+*   **Automatic Context Compression**: Dynamically monitors context token sizes, summarizes old turns using targeted AI-synthesizers, and collapses long historical sequences into a clean, single-turn **Project State Synopsis** to keep models sharp and conversational context pristine.
 
 ## Installation
 

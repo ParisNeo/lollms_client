@@ -43,6 +43,7 @@
 import json
 import re
 import uuid
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1329,6 +1330,10 @@ class _StreamState:
             "last_action_round": 0,
         }
 
+        # ── Thinking & Generation Metrics ──
+        self.thinking_duration = 0.0
+        self.thinking_tokens = 0
+
     # ---------------------------------------------------------------- public entry point
 
     def feed(self, chunk: str) -> bool:
@@ -1471,15 +1476,34 @@ class _StreamState:
                 _cb(self.callback, text, MSG_TYPE.MSG_TYPE_CHUNK)
 
         if next_char == '<':
-            self.state = self.STATE_BUFFERING
-            self.bracket_buf = ["<"]
-            return next_special + 1
+            # Check if `<` is at the start of a line (preceded only by whitespace after a newline or start of string)
+            pre_text = (self.ai_message.content or "") + chunk[pos:next_special]
+            is_start_of_line = False
+            if not pre_text:
+                is_start_of_line = True
+            else:
+                last_nl = pre_text.rfind('\n')
+                if last_nl == -1:
+                    is_start_of_line = not pre_text.strip()
+                else:
+                    after_nl = pre_text[last_nl + 1:]
+                    is_start_of_line = not after_nl.strip()
+
+            if is_start_of_line:
+                self.state = self.STATE_BUFFERING
+                self.bracket_buf = ["<"]
+                return next_special + 1
+            else:
+                self.ai_message.content += "<"
+                self.clean_prose.append("<")
+                _cb(self.callback, "<", MSG_TYPE.MSG_TYPE_CHUNK)
+                return next_special + 1
         elif next_char == '[':
             self.state = self.STATE_BUFFERING
             self.bracket_buf = ["["]
             self._suppress_mode = True
             return next_special + 1
-        
+
         # For '`', return the index directly so the main loop can process the code block/inline state transition
         return next_special
 
@@ -1753,6 +1777,9 @@ class _StreamState:
 
         ann_type, chunk_mt, done_mt, close_tag = _SECONDARY_TAG_MAP[prefix]
 
+        if prefix in ("<think", "<think>"):
+            self.thought_start_time = time.time()
+
         self.sec_prefix     = prefix
         self.sec_chunk_mt   = chunk_mt
         self.sec_done_mt    = done_mt
@@ -1790,8 +1817,18 @@ class _StreamState:
                 raw_title = "Strategic Planning"
             elif prefix in ("<mem_new", "<mem_update"):
                 raw_title = "Memory System Update"
+            elif prefix in ("<artifact", "<artefact"):
+                raw_title = "Code Implementation"
+            elif prefix == "<note":
+                raw_title = "Sovereign Note"
+            elif prefix == "<skill":
+                raw_title = "Specialized Skill"
+            elif prefix == "<lollms_inline":
+                raw_title = "Interactive Widget"
+            elif prefix == "<lollms_form":
+                raw_title = "Form Questionnaire"
             else:
-                raw_title = "Untitled Task"
+                raw_title = "Sovereign Task"
         existing_titles = self.discussion.artefacts._all_latest_titles()
         is_update = raw_title in existing_titles or _find_best_title_match(raw_title, existing_titles) is not None
 
@@ -2543,6 +2580,9 @@ class _StreamState:
         # ── Thought Process ───────────────────────────────────────────────────
         elif prefix in ("<think", "<think>"):
             thought_text = full_content.strip()
+            if hasattr(self, "thought_start_time"):
+                self.thinking_duration += time.time() - self.thought_start_time
+            self.thinking_tokens += self.discussion.lollmsClient.count_tokens(thought_text)
             escaped_thought = thought_text.replace("<", "&lt;").replace(">", "&gt;")
 
             details_html = (
@@ -2774,9 +2814,18 @@ class _StreamState:
         supporting_match = re.search(r"Supporting Context:\s*([^\n\r]+)", plan, re.I)
         skills_match = re.search(r"Relevant Skills:\s*([^\n\r]+)", plan, re.I)
 
-        target_names = [name.strip() for name in target_match.group(1).split(",") if name.strip()] if target_match else []
-        supporting_names = [name.strip() for name in supporting_match.group(1).split(",") if name.strip()] if supporting_match else []
-        skill_names = [name.strip() for name in skills_match.group(1).split(",") if name.strip()] if skills_match else []
+        target_names = [
+            name.strip() for name in target_match.group(1).split(",") 
+            if name.strip() and not name.strip().lower().startswith("none")
+        ] if target_match else []
+        supporting_names = [
+            name.strip() for name in supporting_match.group(1).split(",") 
+            if name.strip() and not name.strip().lower().startswith("none")
+        ] if supporting_match else []
+        skill_names = [
+            name.strip() for name in skills_match.group(1).split(",") 
+            if name.strip() and not name.strip().lower().startswith("none")
+        ] if skills_match else []
 
         existing_titles = self.discussion.artefacts._all_latest_titles()
 
@@ -2833,7 +2882,11 @@ class _StreamState:
         full_context = "\n\n".join(parts)
 
         # 5. Build the On-The-Fly Spinoff System Prompt
-        target_example = resolved_targets[0] if resolved_targets else "example.py"
+        if "html" in plan.lower() or "css" in plan.lower() or "js" in plan.lower() or "game" in plan.lower():
+            default_ext = "index.html"
+        else:
+            default_ext = "example.py"
+        target_example = resolved_targets[0] if resolved_targets else default_ext
         surgical_prompt = (
             f"You are the {requested_persona}.\n"
             "You are a specialized spinoff spinoff persona spawned by the main system architect specifically to complete this implementation.\n"
@@ -2971,11 +3024,20 @@ class _StreamState:
             line_buffer = ""
             last_status_time = time.time()
             total_lines_written = 0
+            total_tokens_generated = 0
+            start_time = time.time()
+            first_token_time = None
+            ttft_ms = None
 
             def specialist_stream_callback(chunk, msg_type, meta=None):
                 if isinstance(chunk, str) and chunk:
                     collected_chunks.append(chunk)
-                    nonlocal line_buffer, last_status_time, total_lines_written
+                    nonlocal line_buffer, last_status_time, total_lines_written, total_tokens_generated, first_token_time, ttft_ms
+                    total_tokens_generated += 1
+
+                    if total_tokens_generated == 1:
+                        first_token_time = time.time()
+                        ttft_ms = round((first_token_time - start_time) * 1000, 2)
 
                     if self.enable_specialized_events_stream:
                         # Relay raw chunk directly to the main chat stream so the user sees live streaming in the chat bubble
@@ -3054,13 +3116,30 @@ class _StreamState:
                                 )
                                 last_status_time = now
 
+                    # ── Runaway Loop Guard ──
+                    # Retrieve the actual model context window limit
+                    ctx_size = 4096
+                    try:
+                        ctx_size = getattr(self.discussion.lollmsClient.llm, 'config', {}).get('ctx_size', 4096) or 4096
+                    except Exception:
+                        pass
+                    # Allow up to 100% of the context size so the model has every opportunity to complete its generation
+                    token_limit = ctx_size
+                    if total_tokens_generated > token_limit:
+                        ASCIIColors.warning(
+                            f"\n[Runaway Loop Guard] Interrupted generation! "
+                            f"Exceeded safe token budget ({total_tokens_generated:,} tokens > {token_limit:,} limit). "
+                            "Aborting stream to prevent infinite hang."
+                        )
+                        return False
+
                 return True
 
             raw_output = self.discussion.lollmsClient.generate_text(
                 prompt=final_payload,
                 system_prompt=surgical_prompt,
                 images=effective_images,
-                temperature=None,
+                temperature=None,  # Rely on backend's advised default temperature settings as preferred
                 n_predict=None,
                 stream=True,
                 streaming_callback=specialist_stream_callback
@@ -3070,7 +3149,31 @@ class _StreamState:
             if isinstance(raw_output, dict):
                 raise RuntimeError(raw_output.get("error", "Unknown LLM service error"))
 
-            # Specialist output received (debug logging removed for cleaner output)
+            # Specialist output received - compute performance metrics
+            end_time = time.time()
+            total_duration = end_time - start_time
+            generation_duration = (end_time - first_token_time) if first_token_time else total_duration
+            avg_tps = round(total_tokens_generated / generation_duration, 2) if generation_duration > 0 else 0.0
+
+            metrics = {
+                "specialist_name": requested_persona,
+                "target_artifact": target_example,
+                "ttft_ms": ttft_ms,
+                "tokens_generated": total_tokens_generated,
+                "duration_seconds": round(total_duration, 3),
+                "avg_tps": avg_tps
+            }
+
+            # Log metrics to status drawer
+            self._emit_processing_status(
+                f"📊 Metrics: TTFT={ttft_ms or '?'}ms | Speed={avg_tps} tok/s | Total={total_tokens_generated} tokens"
+            )
+
+            # Save metrics directly to message metadata
+            if self.ai_message:
+                curr_meta = dict(getattr(self.ai_message, "metadata", {}) or {})
+                curr_meta.setdefault("specialist_metrics", []).append(metrics)
+                self.ai_message.metadata = curr_meta
 
             # 7. ANTI-HALLUCINATION FILTER
             # Extract expected targets from the plan
@@ -4065,11 +4168,10 @@ class ChatMixin:
         # Tool instructions are only added when agent mode is activated.
         extra_instructions = ""
         user_msg_lower = user_message.lower()
-
+        
         # CRITICAL FIX #1: Define _user_requests_tools at function scope start
         _user_requests_tools = _requests_tool_list(user_message) or _requires_agent_mode(user_message)
 
-        # Always include these (lightweight)
         if enable_artefacts:
             extra_instructions += self._build_artefact_instructions()
             if enable_inline_widgets:
@@ -4134,12 +4236,14 @@ EMIT <agent_mode/> tag IMMEDIATELY when the user request involves ANY of these:
    - "First search, then summarize..."
    - "Create files and then test them..."
 
-ACTIVATION SYNTAX: <agent_mode/>
-Place this tag at the START of your response when any trigger above applies.
+ACTIVATION SYNTAX:
+<agent_mode/>
+Place this tag on a BRAND NEW line at the very START of your response when any trigger above applies.
 
 EXAMPLE:
 User: "Search for Python tutorials and create a summary file"
-Assistant: <agent_mode/>
+Assistant:
+<agent_mode/>
 <tool_call>{"name": "search_web_duckduckgo", "parameters": {"query": "Python tutorials beginners"}}</tool_call>
 <artifact name="python_tutorials_summary.md" type="document">
 # Summary of Python Tutorials
@@ -4718,6 +4822,12 @@ Assistant: <agent_mode/>
                 # Clear fast path content and fall through to agent loop
                 ai_message.content = ""
                 _entered_agentic_mode = True
+
+                # Build full tool system prompt now that we're entering agent mode
+                object.__setattr__(
+                    self, "_system_prompt",
+                    _build_tool_system_prompt(self._system_prompt or "", tool_descriptions)
+                )
             else:
                 # Continue with fast path finalization
                 branch_for_handles = self.get_branch(ai_message.id)
@@ -4768,84 +4878,16 @@ Assistant: <agent_mode/>
                     self.commit()
                 self.scratchpad = ""
                 object.__setattr__(self, '_active_callback', None)
-                if not _entered_agentic_mode:
-                    return {
-                        "user_message":     user_msg,
-                        "ai_message":       ai_message,
-                        "sources":          collected_sources,
-                        "scratchpad":       None,
-                        "self_corrections": None,
-                        "artefacts":        affected,
-                        "memory_report":    _mem_report,
-                        "dream_report":     dream_report,
-                    }
-
-            # If we reach here, agent mode was requested — fall through to agent loop setup
-            # Build full tool system prompt now that we're entering agent mode
-            object.__setattr__(
-                self, "_system_prompt",
-                _build_tool_system_prompt(self._system_prompt or "", tool_descriptions)
-            )
-
-            branch_for_handles = self.get_branch(ai_message.id)
-            raw_after_handles, handle_arts = _apply_handles(
-                raw_text, branch_for_handles, self.artefacts
-            )
-            ai_message.content = raw_after_handles
-
-            cleaned, affected_pp = self._post_process_llm_response(
-                raw_after_handles, ai_message, _eff_img_gen, _eff_img_edit,
-                auto_activate_artefacts,
-                enable_inline_widgets=enable_inline_widgets if enable_artefacts else False,
-                enable_notes=enable_notes if enable_artefacts else False,
-                enable_skills=enable_skills if enable_artefacts else False,
-                enable_forms=enable_forms if enable_artefacts else False,
-                enable_silent_artefact_explanation=enable_silent_artefact_explanation if enable_artefacts else False,
-                already_processed_artifacts=[a.get("title") for a in ss.affected_artefacts]
-            )
-            affected = handle_arts + ss.affected_artefacts + affected_pp
-            if cleaned != raw_after_handles:
-                ai_message.content = cleaned
- 
-            _mem_cleaned, _mem_report = self._process_memory_tags(
-                ai_message.content, _mm, callback)
-            if _mem_cleaned != ai_message.content:
-                ai_message.content = _mem_cleaned
-
-            # Auto-dream pass
-            dream_report = None
-            if enable_auto_dream and _mm is not None:
-                try:
-                    dream_report = _mm.dream(self.lollmsClient)
-                    if dream_report and not dream_report.get("skipped"):
-                        ASCIIColors.cyan(f"[Memory] Auto-Dream complete: {dream_report}")
-                        if callback:
-                            try:
-                                callback(
-                                    json.dumps(dream_report, default=str), 
-                                    text="subconscious dream consolidation", 
-                                    msg_type=MSG_TYPE.MSG_TYPE_INFO, 
-                                    meta={"type": "memory_dream", "report": dream_report}
-                                )
-                            except Exception:
-                                pass
-                except Exception as dream_err:
-                    ASCIIColors.warning(f"[Memory] Auto-dream execution failed: {dream_err}")
-
-            if self._is_db_backed and self.autosave:
-                self.commit()
-            self.scratchpad = ""
-            object.__setattr__(self, '_active_callback', None)
-            return {
-                "user_message":     user_msg,
-                "ai_message":       ai_message,
-                "sources":          collected_sources,
-                "scratchpad":       None,
-                "self_corrections": None,
-                "artefacts":        affected,
-                "memory_report":    _mem_report,
-                "dream_report":     dream_report,
-            }
+                return {
+                    "user_message":     user_msg,
+                    "ai_message":       ai_message,
+                    "sources":          collected_sources,
+                    "scratchpad":       None,
+                    "self_corrections": None,
+                    "artefacts":        affected,
+                    "memory_report":    _mem_report,
+                    "dream_report":     dream_report,
+                }
  
  
         # ── Personality system prompt ──────────────────────────────────────────
@@ -5630,6 +5672,7 @@ Assistant: <agent_mode/>
             merged_images = self._merge_artefact_images(images)
 
             _gen_kwargs = kwargs.copy()
+            _gen_kwargs["think"] = kwargs.get("think") is True
             _gen_kwargs.pop("stream",              None)
             _gen_kwargs.pop("temperature",         None)
             _gen_kwargs.pop("streaming_callback",  None)
@@ -6013,7 +6056,7 @@ Assistant: <agent_mode/>
                     _clean_so_far_for_llm = re.sub(r'<processing.*?>.*?</processing>', _compact_repl, _so_far, flags=re.DOTALL)
                     _virtual_history.append(SimpleNamespace(sender_type="assistant", content=_clean_so_far_for_llm.strip()))
                     _virtual_history.append(SimpleNamespace(
-                        sender_type="user", content=_TOOL_CALL_CORRECTION
+                        sender_type="user", content=_correction_msg
                     ))
                     # Preserve prior accumulated content; reset trackers for next round
                     _clean_text_so_far = ai_message.content[:round_content_start]
@@ -6164,7 +6207,7 @@ Assistant: <agent_mode/>
  
             _marker    = f"\n<lollms_event id=\"{_call_id}\" />\n"
             _clean_text_so_far    += _marker
-            ai_message.content     = _clean_text_so_far
+            ai_message.content     += _marker
             ai_message.metadata["events"] = list(all_events)
  
             _step_lbl = f"Running: {_tool_name.replace('_', ' ').title()}"
@@ -6834,11 +6877,11 @@ Assistant: <agent_mode/>
                     sender_type="user",
                     content=synth_failure
                 ))
-            # CRITICAL FIX: Preserve the full accumulated content in ai_message.content,
-            # not just the clean prose. This ensures tool results and all text survive.
-            ai_message.content = _accumulated_full
+            # Preserve the full accumulated content (conversational text + processing/tool logs) in _accumulated_full.
+            # ai_message.content remains the single source of truth of the active chronological log.
+            _accumulated_full = ai_message.content
 
-            # CRITICAL FIX: If there's pending_final_content from specialist/coding_plan, add it!
+            # If there's pending_final_content from specialist/coding_plan, add it!
             if hasattr(ss, 'pending_final_content') and ss.pending_final_content:
                 ai_message.content += "\n\n" + ss.pending_final_content
                 # Don't append to clean_prose here - that's for streaming chunks only
@@ -6993,6 +7036,19 @@ Assistant: <agent_mode/>
         token_count = self.lollmsClient.count_tokens(_clean)
         tok_per_sec = (token_count / duration) if duration > 0 else 0
 
+        # Calculate thinking & generation metrics
+        thinking_duration = getattr(ss, "thinking_duration", 0.0)
+        thinking_tokens = getattr(ss, "thinking_tokens", 0)
+
+        # Non-streaming fallback for counting thinking tokens
+        if thinking_tokens == 0:
+            thinking_blocks = self.lollmsClient.extract_thinking_blocks(_accumulated_full or ai_message.content or "")
+            if thinking_blocks:
+                thinking_text = "\n\n".join(thinking_blocks)
+                thinking_tokens = self.lollmsClient.count_tokens(thinking_text)
+
+        generation_duration = max(0.0, duration - thinking_duration)
+
         message_meta: Dict[str, Any] = {
             "mode": (
                 "rlm_agentic" if rlm_enabled
@@ -7001,6 +7057,9 @@ Assistant: <agent_mode/>
             "duration_seconds":  duration,
             "token_count":       token_count,
             "tokens_per_second": tok_per_sec,
+            "thinking_duration": thinking_duration,
+            "thinking_tokens":   thinking_tokens,
+            "generation_duration": generation_duration,
         }
         if tool_calls_this_turn:
             message_meta["tool_calls"] = tool_calls_this_turn
