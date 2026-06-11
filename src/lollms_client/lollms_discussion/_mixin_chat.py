@@ -1711,7 +1711,7 @@ class _StreamState:
         self.proc_title = f"Executing {tool_name.replace('_', ' ').title()}"
         params_str = json.dumps(params, ensure_ascii=False)[:200]
         params_escaped = params_str.replace('"', '&quot;')
-        tag = f'<processing type="tool_execution" title="{self.proc_title}" tool="{tool_name}" params="{params_escaped}">\n'
+        tag = f'\n<processing type="tool_execution" title="{self.proc_title}" tool="{tool_name}" params="{params_escaped}">\n'
         self.ai_message.content += tag
         _cb(self.callback, tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_open",
@@ -1750,7 +1750,7 @@ class _StreamState:
         if not self.proc_has_opened:
             return
 
-        close_tag = "</processing>\n\n"
+        close_tag = "\n</processing>\n\n"
         self.ai_message.content += close_tag
         _cb(self.callback, close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_close",
@@ -1971,7 +1971,7 @@ class _StreamState:
         for k, v in self.proc_attrs.items():
             if v:
                 attrs_str += f' {k}="{v}"'
-        tag = f"<processing{attrs_str}>\n"
+        tag = f"\n<processing{attrs_str}>\n"
         self.ai_message.content += tag
         _cb(self.callback, tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_open",
@@ -2014,7 +2014,7 @@ class _StreamState:
                 self.pending_final_content = final_content
             return
 
-        close_tag = "</processing>\n\n"
+        close_tag = "\n</processing>\n\n"
         self.ai_message.content += close_tag
         _cb(self.callback, close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_close",
@@ -2732,9 +2732,9 @@ class _StreamState:
                     field_lines.append('  <field ' + ' '.join(attrs_parts) + ' />')
                 sep = " " if form_attrs_parts else ""
                 full_form_tag = (
-                    f'<lollms_form{sep}{" ".join(form_attrs_parts)}>\n'
+                    f'\n<lollms_form{sep}{" ".join(form_attrs_parts)}>\n'
                     + ('\n'.join(field_lines) + '\n' if field_lines else '')
-                    + '</lollms_form>'
+                    + '</lollms_form>\n'
                 )
                 self._emit_processing_status("Form ready")
                 self._emit_processing_close(full_form_tag)
@@ -4201,9 +4201,21 @@ class ChatMixin:
 
         # FAST PATH NOTE: Mention agent mode availability without bloating context with tool details
         if enable_artefacts and _has_external_tools:
-            extra_instructions += """
+            active_arts = self.artefacts.list(active_only=True)
+            active_art_list = [f"'{a['title']}'" for a in active_arts]
+            art_hint = ""
+            if active_art_list:
+                art_hint = (
+                    f"\n⚠️ ACTIVE ARTIFACTS AVAILABLE ON DISK:\n  {', '.join(active_art_list)}\n"
+                    f"If the user asks to modify, edit, fix, rewrite, refactor, add features to, or update "
+                    f"any of these existing files, you MUST start your response with '<agent_mode/>' "
+                    f"and use surgical search/replace patches to update them. DO NOT just write code in prose."
+                )
+
+            extra_instructions += f"""
 === AGENT MODE ACTIVATION TRIGGERS ===
 You are currently in FAST RESPONSE mode. For simple questions, answer directly.
+{art_hint}
 
 EMIT <agent_mode/> tag IMMEDIATELY when the user request involves ANY of these:
 
@@ -4215,7 +4227,7 @@ EMIT <agent_mode/> tag IMMEDIATELY when the user request involves ANY of these:
 
 2. 📁 FILE / ARTIFACT OPERATIONS
    - "Create a file...", "Write code...", "Build an artifact..."
-   - "Update...", "Modify...", "Edit..." existing files
+   - "Update...", "Modify...", "Edit..." existing files (e.g. any of the active artifacts listed above)
    - "Save this as...", "Export to..."
    - Any request involving <artifact> tags
 
@@ -4244,7 +4256,7 @@ EXAMPLE:
 User: "Search for Python tutorials and create a summary file"
 Assistant:
 <agent_mode/>
-<tool_call>{"name": "search_web_duckduckgo", "parameters": {"query": "Python tutorials beginners"}}</tool_call>
+<tool_call>{{"name": "search_web_duckduckgo", "parameters": {{"query": "Python tutorials beginners"}}}}</tool_call>
 <artifact name="python_tutorials_summary.md" type="document">
 # Summary of Python Tutorials
 ...
@@ -5751,8 +5763,8 @@ Assistant: <agent_mode/>
                         content, flags=re.DOTALL
                     )
                     # Safely strip any unclosed/orphaned processing tags to prevent mimicry
-                    content = re.sub(r'<processing.*?>', '', content, flags=re.IGNORECASE)
-                    content = re.sub(r'</processing>', '', content, flags=re.IGNORECASE)
+                    content = re.sub(r'<processing[^>]*>', '', content, flags=re.IGNORECASE)
+                    content = content.replace("</processing>", "")
                     content = re.sub(r'<lollms_event.*?>', '', content)
                     # Strip any leaked status / log lines (but preserve action summaries)
                     content = re.sub(

@@ -1516,6 +1516,33 @@ async def get_memories_endpoint():
     res = discussion.list_all_memories(page=1, page_size=100)
     return res.get("memories", [])
 
+
+@app.get("/api/memories/graph")
+async def get_memory_graph_endpoint():
+    """Retrieves the complete semantic memory network graph (nodes and edges) for Cytoscape rendering."""
+    if not discussion.memory_manager:
+        raise HTTPException(status_code=400, detail="Memory manager is not active.")
+    try:
+        # Fetch all memories (page size 1000 to cover full local graph)
+        res = discussion.list_all_memories(page_size=1000)
+        memories = res.get("memories", [])
+
+        # Fetch all relationships from database
+        with discussion.memory_manager._session() as s:
+            from lollms_client.lollms_discussion.lollms_memory import _MemoryRelationship
+            rels = s.query(_MemoryRelationship).all()
+            relationships = [discussion.memory_manager._rel_to_dict(r) for r in rels]
+
+        return {
+            "success": True,
+            "nodes": memories,
+            "edges": relationships
+        }
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.delete("/api/memories/{memory_id}")
 async def delete_memory_endpoint(memory_id: str):
     """Permanently deletes a memory."""

@@ -11,6 +11,8 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js"></script>
+    <!-- Load Cytoscape.js for interactive semantic graph rendering -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
     <!-- Load Graphviz Viz.js libraries for conceptual graph rendering -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/viz.js/2.1.2/viz.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/viz.js/2.1.2/full.render.js"></script>
@@ -651,13 +653,21 @@
 
     <!-- 🧠 Memory Network Graph Modal -->
     <div class="modal-overlay" id="memory-graph-modal" style="display: none; z-index: 100000;">
-        <div class="modal-container" style="width: 800px; max-width: 95vw; height: 80vh;">
+        <div class="modal-container" style="width: 1000px; max-width: 95vw; height: 85vh; display: flex; flex-direction: column;">
             <div class="modal-header">
                 <h2>🧠 Semantic Memory Network</h2>
                 <button class="modal-close-btn" id="btn-close-memory-graph">×</button>
             </div>
-            <div class="modal-body" id="memory-graph-viewport" style="display: flex; align-items: center; justify-content: center; overflow: auto; background-color: #0b0f19; padding: 20px;">
-                <!-- SVG Graph is dynamically injected here -->
+            <div class="modal-body" style="display: flex; flex: 1; overflow: hidden; padding: 0; background-color: #0b0f19;">
+                <!-- Left: Cytoscape viewport -->
+                <div id="memory-graph-viewport" style="flex: 1; height: 100%; position: relative;"></div>
+                <!-- Right: Node inspector panel -->
+                <div id="memory-graph-inspector" style="width: 320px; border-left: 1px solid var(--border-color); background-color: var(--bg-panel); padding: 20px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto;">
+                    <h3 style="color: var(--accent-color); font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border-color); padding-bottom: 6px;">🔍 Node Inspector</h3>
+                    <div id="inspector-content" class="empty-viewer-msg" style="justify-content: flex-start; text-align: left; font-style: normal; color: var(--text-secondary);">
+                        Click on any memory node in the network to inspect its full semantic details.
+                    </div>
+                </div>
             </div>
         </div>
     </div>

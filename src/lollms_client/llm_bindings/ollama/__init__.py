@@ -542,8 +542,17 @@ class OllamaBinding(LollmsLLMBinding):
                             full_response_text += chunk_content
                             if streaming_callback:
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
-                                    break # Callback requested stop
-
+                                    break 
+                    return full_response_text
+                else:
+                    chat_kwargs["stream"] = False
+                    eff_think = think if "gpt-oss" not in self.model_name else reasoning_effort
+                    if eff_think:
+                        chat_kwargs["think"] = eff_think
+                    response = client.chat(**chat_kwargs)
+                    full_response_text = response.message.content
+                    if think:
+                        full_response_text = "<think>\n"+response.message.thinking+"\n/think>\n"+full_response_text
                     return full_response_text
 
         except ollama.ResponseError as e:
@@ -1214,7 +1223,7 @@ if __name__ == '__main__':
             global full_streamed_text
             full_streamed_text += chunk
             if len(full_streamed_text) > 100: # Example: stop after 100 chars for test
-                # print("\nStopping stream early for test.")
+                print("\nStopping stream early for test.")
                 # return False # uncomment to test early stop
                 pass
             return True

@@ -67,6 +67,33 @@ from ascii_colors import ASCIIColors
 
 _Base = declarative_base()
 
+class MemoryOntology:
+    """Lightweight Memory Ontology representing standard classes and predicates."""
+    # Node Classes (Sovereign categories)
+    class NodeClass:
+        CONCEPT = "CONCEPT"          # Abstract ideas, subjects, tools
+        PREFERENCE = "PREFERENCE"    # User settings, guidelines, rules
+        EVENT = "EVENT"              # Episodes, historical milestones, tool executions
+        DECISION = "DECISION"        # Architectural/code choices, plans
+
+    # Semantic Predicates (Relationships)
+    class Predicate:
+        RELATED_TO = "RELATED_TO"          # Faded / default association
+        PREFERS = "PREFERS"                # User/Subject preference association
+        IMPLEMENTS = "IMPLEMENTS"          # Code implementation of a concept/goal
+        CONTRADICTS = "CONTRADICTS"        # Logic conflicts
+        SUPPORTS = "SUPPORTS"              # Logical validation
+        TEMPORAL_AFTER = "TEMPORAL_AFTER"  # Chronological order of events
+        PART_OF = "PART_OF"                # Parent-child hierarchy decomposition
+
+    @classmethod
+    def validate_predicate(cls, predicate: str) -> str:
+        p = str(predicate).strip().upper()
+        valid = {cls.Predicate.RELATED_TO, cls.Predicate.PREFERS, cls.Predicate.IMPLEMENTS, 
+                 cls.Predicate.CONTRADICTS, cls.Predicate.SUPPORTS, cls.Predicate.TEMPORAL_AFTER, 
+                 cls.Predicate.PART_OF}
+        return p if p in valid else cls.Predicate.RELATED_TO
+
 class _MemoryRecord(_Base):
     __tablename__ = "memories"
     id              = Column(String,   primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -259,9 +286,20 @@ class LollmsMemoryManager:
 
         self._Session      = sessionmaker(bind=self._engine, autoflush=False)
         self._last_dream   = datetime.utcnow() - timedelta(days=1)
+
+        # In-Memory Cache representing active network state
+        self._cache = {}
+        self._working_zone_cache = None
+        self._handles_zone_cache = None
+
         ASCIIColors.info(f"[MemoryManager] Initialised — db={db_path}, owner={owner_id}")
 
     # ──────────────────────────────────────────────── session helper
+
+    def _clear_cache(self):
+        self._cache.clear()
+        self._working_zone_cache = None
+        self._handles_zone_cache = None
 
     @contextmanager
     def _session(self):
@@ -269,6 +307,8 @@ class LollmsMemoryManager:
         try:
             yield s
             s.commit()
+            # Clear caches on successful commit of any transaction (writes, tags, deletes)
+            self._clear_cache()
         except Exception:
             s.rollback()
             raise
@@ -314,7 +354,7 @@ class LollmsMemoryManager:
                 use_count=0, tags=",".join(tags) if tags else None, subject_group=subject_group,
                 created_at=now, updated_at=now, last_used_at=now,
                 subject=sub_val.strip().lower(),
-                predicate=pred_val.strip().upper(),
+                predicate=MemoryOntology.validate_predicate(pred_val),
                 object=obj_val.strip().lower(),
                 activation=0.0
             )
@@ -329,9 +369,16 @@ class LollmsMemoryManager:
             return self._to_dict(rec)
 
     def get(self, memory_id: str) -> Optional[Dict]:
+        # Check in-memory cache first
+        if memory_id in self._cache:
+            return self._cache[memory_id]
         with self._session() as s:
             r = self._q(s).filter(_MemoryRecord.id == memory_id).first()
-            return self._to_dict(r) if r else None
+            if r:
+                d = self._to_dict(r)
+                self._cache[memory_id] = d
+                return d
+            return None
 
     def update(self, memory_id: str, new_content: str) -> Optional[Dict]:
         with self._session() as s:
@@ -650,6 +697,10 @@ class LollmsMemoryManager:
     # ──────────────────────────────────────────────── context assembly
     # ──────────────────────────────────────────────── context assembly
     def build_working_zone(self, token_counter=None) -> str:
+        # Check cache
+        if self._working_zone_cache is not None:
+            return self._working_zone_cache
+
         records = self.list_working()
         if not records: return ""
         # Sort chronologically by created_at (oldest first, newest last)
@@ -657,15 +708,37 @@ class LollmsMemoryManager:
         budget, lines, used_tok = self.config.working_token_budget, [], 0
         for r in records:
             ts = r['created_at'][:19].replace('T', ' ')
-            entry = f"[{ts}] [{r['id'][:8]}] ({r['importance']:.0%}) {r['content']}"
+            entry = f"[{ts}] [{r['id'][:8]}] ({r['importance']:.0%}) [Centrality: {r['centrality']:.0%}] {r['content']}"
             if r.get('tags'): entry += f"  #{r['tags'].replace(',', ' #')}"
             tok = token_counter(entry) if token_counter else len(entry) // 4
             if used_tok + tok > budget: break
             lines.append(entry)
             used_tok += tok
-        return "=== WORKING MEMORY ===\n" + "\n".join(lines) + "\n=== END WORKING MEMORY ===\n" if lines else ""
+
+        # Query relationships between these working memory nodes
+        rel_lines = []
+        if lines:
+            active_ids = {r['id'] for r in records[:len(lines)]}
+            with self._session() as s:
+                rels = s.query(_MemoryRelationship).filter(
+                    _MemoryRelationship.source_id.in_(active_ids),
+                    _MemoryRelationship.target_id.in_(active_ids)
+                ).all()
+                for rel in rels:
+                    rel_lines.append(f"  [{rel.source_id[:8]}] --({rel.relationship_type})--> [{rel.target_id[:8]}]")
+
+        rel_block = ""
+        if rel_lines:
+            rel_block = "\n\n=== SEMANTIC CONNECTIONS ===\n" + "\n".join(rel_lines) + "\n=== END CONNECTIONS ===\n"
+
+        result = "=== WORKING MEMORY ===\n" + "\n".join(lines) + rel_block + "\n=== END WORKING MEMORY ===\n" if lines else ""
+        self._working_zone_cache = result
+        return result
 
     def build_handles_zone(self, token_counter=None) -> str:
+        # Check cache
+        if self._handles_zone_cache is not None:
+            return self._handles_zone_cache
         with self._session() as s:
             recs = (self._q(s).filter(_MemoryRecord.level == 2).order_by(_MemoryRecord.importance.desc()).all())
             if not recs: return ""
@@ -688,7 +761,9 @@ class LollmsMemoryManager:
                 if used + tok > budget: break
                 lines.append(line); used += tok
             body = "\n".join(lines)
-        return "=== DEEP MEMORY HANDLES ===\n(Use <mem_load id=\"ID\"/> to bring into working memory)\n" + body + "\n=== END DEEP MEMORY HANDLES ===\n"
+        result = "=== DEEP MEMORY HANDLES ===\n(Use <mem_load id=\"ID\"/> to bring into working memory)\n" + body + "\n=== END DEEP MEMORY HANDLES ===\n"
+        self._handles_zone_cache = result
+        return result
 
     def build_system_instructions(self) -> str:
         return (
@@ -739,8 +814,18 @@ class LollmsMemoryManager:
             if not content or not content.strip():
                 continue
 
-            res = self.add(content.strip(), importance=max(0.0, min(1.0, imp)))
-            report["created"].append(res)
+            tags_list = [t.strip().lower() for t in attrs.get("tags", "").split(",") if t.strip()] if attrs.get("tags") else None
+            res = self.add(
+                content=content.strip(),
+                importance=max(0.0, min(1.0, imp)),
+                tags=tags_list,
+                subject_group=attrs.get("subject_group") or attrs.get("subject"),
+                subject=attrs.get("subject"),
+                predicate=attrs.get("predicate"),
+                obj=attrs.get("object") or attrs.get("obj")
+            )
+            if res:
+                report["created"].append(res)
             cleaned = cleaned.replace(m.group(0), "", 1)
         for pat, key, fn in [(self._PAT_TAG, "tagged", self.tag), (self._PAT_LOAD, "loaded", self.load_to_working)]:
             for m in pat.finditer(text):
@@ -943,7 +1028,7 @@ class LollmsMemoryManager:
 
             rel = _MemoryRelationship(
                 id=str(uuid.uuid4()), source_id=source_id, target_id=target_id,
-                relationship_type=relationship_type.upper(), weight=max(0.0, min(10.0, weight)),
+                relationship_type=MemoryOntology.validate_predicate(relationship_type), weight=max(0.0, min(10.0, weight)),
                 relationship_metadata=json.dumps(metadata) if metadata else None, created_at=now
             )
             s.add(rel)

@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-11 05:16]
+
+- feat(memory): add memories endpoint and management UI
+
 ## [2026-06-08 02:25]
 
 - feat(lollms_client): Improve state tracking for markdown code blocks

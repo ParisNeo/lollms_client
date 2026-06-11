@@ -4813,89 +4813,262 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
-    function renderMemoryNetworkGraph() {
-        if (!cachedMemories || cachedMemories.length === 0) {
-            graphViewport.innerHTML = `<div class="empty-viewer-msg">No memories available to graph.</div>`;
-            return;
-        }
+    async function renderMemoryNetworkGraph() {
+        const viewport = document.getElementById("memory-graph-viewport");
+        const inspector = document.getElementById("inspector-content");
 
-        // Filter memories that have semantic triples
-        const tripleMems = cachedMemories.filter(m => m.subject && m.object);
-        if (tripleMems.length === 0) {
-            graphViewport.innerHTML = `<div class="empty-viewer-msg">No semantic triple connections (Subject/Object) found to build a graph. Add some relational memories first!</div>`;
-            return;
-        }
+        if (!viewport || !inspector) return;
 
-        graphViewport.innerHTML = `<div class="empty-viewer-msg"><span class="spinner inline" style="margin-right: 8px;"></span> Rendering Semantic Memory Network...</div>`;
+        viewport.innerHTML = `<div class="empty-viewer-msg"><span class="spinner inline" style="margin-right: 8px;"></span> Retrieving complete semantic memory network topology...</div>`;
+        inspector.innerHTML = `<div class="empty-viewer-msg" style="justify-content: flex-start; text-align: left; font-style: normal; color: var(--text-secondary);">Click on any memory node in the network to inspect its full semantic details.</div>`;
 
         try {
-            const dot = generateMemoryGraphDot(tripleMems);
-            const viz = new Viz();
-            viz.renderSVGElement(dot)
-                .then(element => {
-                    element.style.width = "100%";
-                    element.style.height = "100%";
-                    graphViewport.innerHTML = "";
-                    graphViewport.appendChild(element);
-                })
-                .catch(err => {
-                    console.error(err);
-                    graphViewport.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444;">Graph rendering failed: ${err.message || err}</div>`;
+            const res = await fetch("/api/memories/graph");
+            const data = await res.json();
+
+            if (!data.success || !data.nodes || data.nodes.length === 0) {
+                viewport.innerHTML = `<div class="empty-viewer-msg">No memories stored in the semantic graph yet.</div>`;
+                return;
+            }
+
+            viewport.innerHTML = ""; // Clear loader
+
+            // 1. Prepare Cytoscape elements (nodes and edges)
+            const elements = [];
+            const nodeIds = new Set();
+
+            // Append memory nodes
+            data.nodes.forEach(m => {
+                const isWorking = m.level === 1;
+                const label = m.subject && m.object ? `${m.subject.toUpperCase()} → ${m.object.toUpperCase()}` : (m.summary || m.content).substring(0, 30) + "...";
+
+                elements.push({
+                    group: "nodes",
+                    data: {
+                        id: m.id,
+                        label: label,
+                        raw: m,
+                        is_working: isWorking,
+                        level: m.level,
+                        importance: m.importance,
+                        centrality: m.centrality || 0.0
+                    }
                 });
+                nodeIds.add(m.id);
+            });
+
+            // Append explicit relationships (edges)
+            data.edges.forEach(e => {
+                if (nodeIds.has(e.source_id) && nodeIds.has(e.target_id)) {
+                    elements.push({
+                        group: "edges",
+                        data: {
+                            id: e.id,
+                            source: e.source_id,
+                            target: e.target_id,
+                            label: e.relationship_type,
+                            raw: e
+                        }
+                    });
+                }
+            });
+
+            if (typeof cytoscape === "undefined") {
+                viewport.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444;">Cytoscape.js library was not loaded properly. Check your internet connection.</div>`;
+                return;
+            }
+
+            // 2. Instantiate Cytoscape
+            const cy = cytoscape({
+                container: viewport,
+                elements: elements,
+                style: [
+                    {
+                        selector: 'node',
+                        style: {
+                            'label': 'data(label)',
+                            'color': '#cbd5e1',
+                            'font-size': '11px',
+                            'font-family': 'sans-serif',
+                            'text-wrap': 'wrap',
+                            'text-max-width': '140px',
+                            'background-color': '#1e293b',
+                            'border-width': '2px',
+                            'border-color': '#475569',
+                            'width': 'mapData(centrality, 0, 1, 30, 50)',
+                            'height': 'mapData(centrality, 0, 1, 30, 50)',
+                            'text-valign': 'bottom',
+                            'text-margin-y': '6px',
+                            'transition-property': 'background-color, border-color, box-shadow',
+                            'transition-duration': '0.2s'
+                        }
+                    },
+                    {
+                        selector: 'node[level = 1]', // Working/Live Memory - Emerald Green Glow!
+                        style: {
+                            'background-color': 'rgba(16, 185, 129, 0.15)',
+                            'border-color': '#10b981',
+                            'color': '#a7f3d0',
+                            'font-weight': 'bold',
+                            'border-width': '3px'
+                        }
+                    },
+                    {
+                        selector: 'node[level = 2]', // Deep Memory - Amber!
+                        style: {
+                            'background-color': 'rgba(245, 158, 11, 0.1)',
+                            'border-color': '#f59e0b',
+                            'color': '#fde68a'
+                        }
+                    },
+                    {
+                        selector: 'node[level = 3]', // Archived Memory - Faded!
+                        style: {
+                            'background-color': '#0f172a',
+                            'border-color': 'rgba(71, 85, 105, 0.4)',
+                            'color': '#64748b'
+                        }
+                    },
+                    {
+                        selector: 'node:selected', // Highlight selected node
+                        style: {
+                            'background-color': 'rgba(79, 70, 229, 0.25)',
+                            'border-color': '#818cf8',
+                            'border-width': '4px',
+                            'color': '#fff'
+                        }
+                    },
+                    {
+                        selector: 'edge',
+                        style: {
+                            'label': 'data(label)',
+                            'font-size': '8px',
+                            'color': '#94a3b8',
+                            'width': 1.5,
+                            'line-color': '#334155',
+                            'target-arrow-color': '#334155',
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'bezier',
+                            'text-background-opacity': 0.8,
+                            'text-background-color': '#0b0f19',
+                            'text-background-padding': '3px',
+                            'text-background-shape': 'roundrectangle'
+                        }
+                    },
+                    {
+                        selector: 'edge[label = "CONTRADICTS"]',
+                        style: {
+                            'line-color': '#ef4444',
+                            'target-arrow-color': '#ef4444',
+                            'color': '#fca5a5'
+                        }
+                    },
+                    {
+                        selector: 'edge[label = "SUPPORTS"]',
+                        style: {
+                            'line-color': '#10b981',
+                            'target-arrow-color': '#10b981',
+                            'color': '#a7f3d0'
+                        }
+                    },
+                    {
+                        selector: 'edge[label = "IMPLEMENTS"]',
+                        style: {
+                            'line-color': '#3b82f6',
+                            'target-arrow-color': '#3b82f6',
+                            'color': '#93c5fd'
+                        }
+                    }
+                ],
+                layout: {
+                    name: 'cose',
+                    idealEdgeLength: 100,
+                    nodeOverlap: 20,
+                    refresh: 20,
+                    fit: true,
+                    padding: 30,
+                    randomize: false,
+                    componentSpacing: 100,
+                    nodeRepulsion: 400000,
+                    edgeElasticity: 100,
+                    nestingFactor: 5,
+                    gravity: 80,
+                    numIter: 1000,
+                    initialTemp: 200,
+                    coolingFactor: 0.95,
+                    minTemp: 1.0
+                }
+            });
+
+            // 3. Bind click events for Node Inspection
+            cy.on('tap', 'node', function(evt) {
+                const node = evt.target;
+                const r = node.data('raw');
+
+                const levelLabels = { 1: "Working (Level 1)", 2: "Deep / Associative (Level 2)", 3: "Archived (Level 3)", 4: "Episodic (Level 4)" };
+                const levelClasses = { 1: "working", 2: "deep", 3: "archived", 4: "episodic" };
+
+                let tripleHtml = "";
+                if (r.subject && r.object) {
+                    tripleHtml = `
+                        <div style="margin-top: 8px;">
+                            <span style="font-size: 10px; text-transform: uppercase; font-weight: bold; color: var(--text-secondary); display: block; margin-bottom: 4px;">Ontological Triplet</span>
+                            <div style="display: inline-flex; align-items: center; gap: 4px; font-family: monospace; font-size: 10.5px; background-color: rgba(79, 70, 229, 0.15); color: #818cf8; border: 1px solid rgba(79, 70, 229, 0.3); padding: 4px 8px; border-radius: 4px; width: 100%;">
+                                <strong>${r.subject}</strong> -[${r.predicate}]-> <strong>${r.object}</strong>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                let tagsHtml = "";
+                if (r.tags) {
+                    tagsHtml = `
+                        <div style="margin-top: 8px;">
+                            <span style="font-size: 10px; text-transform: uppercase; font-weight: bold; color: var(--text-secondary); display: block; margin-bottom: 4px;">Tags</span>
+                            <div style="display: flex; flex-wrap: wrap; gap: 4px;">
+                                ${r.tags.split(",").map(t => `<span class="category-tag" style="background-color: rgba(245, 158, 11, 0.15); color: var(--accent-color); padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: bold;">#${t.strip ? t.strip() : t.trim()}</span>`).join("")}
+                            </div>
+                        </div>
+                    `;
+                }
+
+                inspector.innerHTML = `
+                    <div style="display: flex; flex-direction: column; gap: 12px; width: 100%;">
+                        <div>
+                            <span class="level-tag ${levelClasses[r.level]}" style="font-size: 9px; font-weight: bold; text-transform: uppercase; color: ${r.level === 1 ? 'var(--success-color)' : r.level === 2 ? 'var(--accent-color)' : '#64748b'};">${levelLabels[r.level]}</span>
+                            <span style="float: right; font-size: 10px; font-weight: bold; background-color: rgba(255,255,255,0.05); padding: 2px 6px; border-radius: 4px;">Imp: ${(r.importance * 100).toFixed(0)}%</span>
+                        </div>
+
+                        <div style="display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--border-color); padding-top: 10px;">
+                            <span style="font-size: 10px; text-transform: uppercase; font-weight: bold; color: var(--text-secondary);">Memory Content</span>
+                            <p style="font-size: 12.5px; line-height: 1.5; color: var(--text-primary); margin: 0; white-space: pre-wrap;">${r.content}</p>
+                        </div>
+
+                        ${tripleHtml}
+                        ${tagsHtml}
+
+                        <div style="border-top: 1px solid var(--border-color); padding-top: 10px; font-size: 10px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 4px;">
+                            <span>ID: <code style="font-family: monospace;">${r.id}</code></span>
+                            <span>Centrality Index: <strong>${(r.centrality * 100).toFixed(1)}%</strong></span>
+                            <span>Activation Score: <strong>${r.activation.toFixed(2)}</strong></span>
+                            <span>Usage Count: <strong>${r.use_count} times</strong></span>
+                            <span>Created: <strong>${r.created_at.replace("T", " ").substring(0, 19)}</strong></span>
+                        </div>
+                    </div>
+                `;
+            });
+
+            // Deselect reset inspector
+            cy.on('tap', function(evt) {
+                if (evt.target === cy) {
+                    inspector.innerHTML = `<div class="empty-viewer-msg" style="justify-content: flex-start; text-align: left; font-style: normal; color: var(--text-secondary);">Click on any memory node in the network to inspect its full semantic details.</div>`;
+                }
+            });
+
         } catch (err) {
-            graphViewport.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444;">Viz.js initialization failed: ${err.message || err}</div>`;
+            console.error("Memory graph rendering failed:", err);
+            viewport.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444;">Failed to build semantic network: ${err.message || err}</div>`;
         }
-    }
-
-    function generateMemoryGraphDot(memories) {
-        let dot = 'digraph G {\n';
-        dot += '  background="transparent";\n';
-        dot += '  node [fontname="Helvetica", fontsize=10, style="filled", shape="box", penwidth=1.5];\n';
-        dot += '  edge [fontname="Helvetica", fontsize=8, color="#818cf8", fontcolor="#cbd5e1", arrowsize=0.6];\n';
-
-        const declaredNodes = new Set();
-
-        memories.forEach(m => {
-            const sub = m.subject || "unknown";
-            const obj = m.object || "unknown";
-            const pred = m.predicate || "RELATED_TO";
-
-            const subId = makeSafeId(sub);
-            const objId = makeSafeId(obj);
-
-            // Color based on activation
-            let fillColor = "#1e293b"; // dark slate
-            let fontColor = "#cbd5e1";
-            let borderColor = "#334155";
-
-            const activation = m.activation || 0.0;
-            if (activation > 2.0) {
-                fillColor = "#78350f"; // glowing amber
-                borderColor = "#f59e0b";
-                fontColor = "#fef3c7";
-            } else if (activation > 0.0) {
-                fillColor = "rgba(245, 158, 11, 0.15)";
-                borderColor = "#d97706";
-            } else if (m.level === 3) {
-                fillColor = "#0f172a"; // faded
-                borderColor = "rgba(51, 65, 85, 0.3)";
-                fontColor = "#64748b";
-            }
-
-            if (!declaredNodes.has(subId)) {
-                dot += `  ${subId} [label="${sub.toUpperCase()}", fillcolor="${fillColor}", color="${borderColor}", fontcolor="${fontColor}"];\n`;
-                declaredNodes.add(subId);
-            }
-            if (!declaredNodes.has(objId)) {
-                dot += `  ${objId} [label="${obj.toUpperCase()}", fillcolor="${fillColor}", color="${borderColor}", fontcolor="${fontColor}"];\n`;
-                declaredNodes.add(objId);
-            }
-
-            dot += `  ${subId} -> ${objId} [label="${pred}"];\n`;
-        });
-
-        dot += '}\n';
-        return dot;
     }
 
     // ── Settings Sub-Tabs Navigation (Parameters vs Custom Commands) ──

@@ -30,7 +30,7 @@ classifiers = [
 dependencies = [
     "httpx",
     "requests",
-    "ascii-colors>=0.11.22",
+    "ascii-colors>=0.11.24",
     "pipmaster>=1.1.13",
     "pyyaml",
     "tiktoken",
