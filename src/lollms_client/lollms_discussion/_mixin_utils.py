@@ -12,7 +12,11 @@ from ascii_colors import ASCIIColors, trace_exception
 
 from lollms_client.lollms_utilities import build_image_dicts
 from ._artefacts import ArtefactType
+import ascii_colors as logging
 
+# Create module-level loggers for easy access
+logger = logging.getLogger(__name__)
+discussion_logger = logging.getLogger("lollms_client.lollms_discussion._mixin_utils")
 
 class UtilsMixin:
     """
@@ -288,7 +292,205 @@ class UtilsMixin:
                 token_counter=self.lollmsClient.count_tokens,
             )
 
+        # ── OpenAI Format Validation & Normalization ─────────────────────
+        # Ensure system message is at the beginning and user/assistant alternate
+        if format_type == "openai_chat" and messages:
+            messages = self._normalize_openai_messages(messages)
+
         return "\n".join(messages) if format_type == "markdown" else messages
+
+    def _normalize_openai_messages(self, messages: List[Dict]) -> List[Dict]:
+        """
+        Normalize messages for OpenAI API compliance:
+        1. Fuse all system messages into ONE at the beginning
+        2. Ensure user/assistant messages alternate (merge consecutive same-role messages)
+        3. Remove empty messages
+
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys
+
+        Returns:
+            Normalized list of messages ready for OpenAI API
+        """
+        if not messages:
+            return messages
+
+        # ── DEBUG LOGGING: Log message roles before normalization ───────────
+        ASCIIColors.cyan("[OpenAI Export] BEFORE normalization:")
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content_preview = ""
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [item.get("text", "")[:50] for item in content if item.get("type") == "text"]
+                content_preview = " | ".join(text_parts)[:100]
+            else:
+                content_preview = str(content)[:100]
+            ASCIIColors.cyan(f"  [{i}] role={role} | content_len={len(content_preview)} | preview={content_preview!r}")
+        ASCIIColors.cyan(f"[OpenAI Export] Total messages before: {len(messages)}")
+
+        normalized = []
+        system_content_parts = []
+
+        # Step 1: Extract all system messages
+        non_system_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Handle multimodal content - extract text parts
+                    text_parts = [item.get("text", "") for item in content if item.get("type") == "text"]
+                    system_content_parts.append("\n".join(text_parts))
+                else:
+                    system_content_parts.append(str(content))
+            else:
+                non_system_messages.append(msg)
+
+        # Step 2: Create single fused system message if any system content exists
+        if system_content_parts:
+            fused_system_content = "\n\n".join(part for part in system_content_parts if part.strip())
+            if fused_system_content.strip():
+                # Preserve images from first system message if present
+                first_sys = next((m for m in messages if m.get("role") == "system"), {})
+                first_content = first_sys.get("content", "")
+                if isinstance(first_content, list):
+                    # Keep image_url parts from first system message
+                    image_parts = [item for item in first_content if item.get("type") == "image_url"]
+                    normalized.append({
+                        "role": "system",
+                        "content": [{"type": "text", "text": fused_system_content}] + image_parts
+                    })
+                else:
+                    normalized.append({"role": "system", "content": fused_system_content})
+
+        # Step 3: Merge consecutive messages of the same role (user/assistant)
+        if non_system_messages:
+            current_role = None
+            current_content = []
+            current_images = []
+
+            for msg in non_system_messages:
+                role = msg.get("role")
+                content = msg.get("content", "")
+
+                # Skip empty messages
+                if not content and not msg.get("images"):
+                    continue
+
+                if role == current_role:
+                    # Merge with current message
+                    if isinstance(content, list):
+                        # Multimodal content
+                        for item in content:
+                            if item.get("type") == "text":
+                                current_content.append(item.get("text", ""))
+                            elif item.get("type") == "image_url":
+                                current_images.append(item)
+                    else:
+                        current_content.append(str(content))
+
+                    # Merge images from consecutive messages
+                    if msg.get("images"):
+                        current_images.extend(msg["images"])
+                else:
+                    # Flush previous message if exists
+                    if current_role is not None and current_content:
+                        merged_content = "\n\n".join(c for c in current_content if c.strip())
+                        if merged_content.strip():
+                            if current_images:
+                                # Reconstruct multimodal content
+                                text_part = {"type": "text", "text": merged_content}
+                                normalized.append({
+                                    "role": current_role,
+                                    "content": [text_part] + current_images
+                                })
+                            else:
+                                normalized.append({"role": current_role, "content": merged_content})
+
+                    # Start new message
+                    current_role = role
+                    current_content = []
+                    current_images = []
+
+                    if isinstance(content, list):
+                        for item in content:
+                            if item.get("type") == "text":
+                                current_content.append(item.get("text", ""))
+                            elif item.get("type") == "image_url":
+                                current_images.append(item)
+                    else:
+                        current_content.append(str(content))
+
+                    if msg.get("images"):
+                        current_images.extend(msg["images"])
+
+            # Flush last message
+            if current_role is not None and current_content:
+                merged_content = "\n\n".join(c for c in current_content if c.strip())
+                if merged_content.strip():
+                    if current_images:
+                        text_part = {"type": "text", "text": merged_content}
+                        normalized.append({
+                            "role": current_role,
+                            "content": [text_part] + current_images
+                        })
+                    else:
+                        normalized.append({"role": current_role, "content": merged_content})
+
+        # Step 4: Ensure first non-system message is user (not assistant)
+        # If it starts with assistant, prepend a minimal user prompt
+        non_sys_start = 0
+        for i, msg in enumerate(normalized):
+            if msg.get("role") != "system":
+                non_sys_start = i
+                break
+
+        if non_sys_start < len(normalized):
+            first_non_sys = normalized[non_sys_start]
+            if first_non_sys.get("role") == "assistant":
+                # Insert a minimal user message to maintain alternation
+                normalized.insert(non_sys_start, {
+                    "role": "user",
+                    "content": "Continue."
+                })
+
+        # Step 5: Validate alternation (debug check)
+        prev_role = None
+        for msg in normalized:
+            role = msg.get("role")
+            if role == "system":
+                continue
+            if prev_role and prev_role != "system" and prev_role == role:
+                ASCIIColors.warning(
+                    f"[OpenAI Export] Consecutive {role} messages detected after normalization. "
+                    "This may cause API errors."
+                )
+            prev_role = role
+
+        # ── DEBUG LOGGING: Log message roles after normalization ───────────
+        discussion_logger.info("AFTER normalization:")
+        for i, msg in enumerate(normalized):
+            role = msg.get("role", "unknown")
+            content_preview = ""
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [item.get("text", "")[:50] for item in content if item.get("type") == "text"]
+                content_preview = " | ".join(text_parts)[:100]
+            else:
+                content_preview = str(content)[:100]
+            discussion_logger.info(f"  [{i}] role={role} | content_len={len(content_preview)} | preview={content_preview!r}")
+        discussion_logger.info(f"[OpenAI Export] Total messages after: {len(normalized)}")
+
+        # ── DEBUG LOGGING: Verify system message is at beginning ───────────
+        if normalized and normalized[0].get("role") != "system":
+            discussion_logger.error(
+                f"[OpenAI Export] CRITICAL: First message role is '{normalized[0].get('role')}', "
+                f"NOT 'system'. This will cause 'System message must be at the beginning' error."
+            )
+        else:
+            discussion_logger.info("[OpenAI Export] System message correctly positioned at beginning.")
+
+        return normalized
     
 
     

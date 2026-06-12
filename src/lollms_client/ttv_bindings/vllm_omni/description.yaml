@@ -1,0 +1,119 @@
+title: "vLLM-Omni TTV"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "vllm_omni"
+description: |
+  A binding for Text-to-Video generation using vLLM-Omni, a fully disaggregated
+  serving system for any-to-any multimodal models.
+
+  Supports state-of-the-art video generation models including:
+    - Wan 2.1 / 2.2 (T2V, I2V, TI2V)
+    - HunyuanVideo 1.5 (480p / 720p)
+    - LTX-2 / LTX-2.3
+    - NVIDIA Cosmos3 (Nano, T2V, I2V, V2V)
+
+  Unlike the Diffusers binding, vLLM-Omni runs a dedicated high-performance
+  server with per-stage GPU allocation, request batching, and disaggregated
+  diffusion/LLM pipeline execution. Start your server with:
+
+    vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+      --deploy-config vllm_omni/deploy/wan_t2v.yaml \
+      --omni --port 8000 --trust-remote-code
+
+
+global_input_parameters:
+  - name: "base_url"
+    type: "str"
+    default: "http://localhost:8000"
+    description: "Full base URL of the running vLLM-Omni server (e.g., http://localhost:8000)."
+
+  - name: "api_key"
+    type: "str"
+    default: ""
+    description: "Optional Bearer token if the vLLM-Omni server is configured with authentication."
+    is_secret: true
+
+  - name: "timeout"
+    type: "int"
+    default: 300
+    description: "HTTP request timeout in seconds. Video generation can take several minutes on large models."
+
+
+model_input_parameters:
+  - name: "model"
+    type: "str"
+    default: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+    description: >
+      Model identifier forwarded to the server. Must match the model loaded at server startup.
+      Leave empty to use whichever model the server currently has loaded.
+
+  - name: "width"
+    type: "int"
+    default: 832
+    description: "Video width in pixels. Must be divisible by 16 and compatible with the model's resolution buckets (e.g., 832, 1280)."
+
+  - name: "height"
+    type: "int"
+    default: 480
+    description: "Video height in pixels. Must be divisible by 16 (e.g., 480, 720)."
+
+  - name: "default_num_frames"
+    type: "int"
+    default: 49
+    description: >
+      Number of frames to generate. Combined with fps this controls video duration
+      (49 frames @ 16fps ≈ 3s). Wan models require odd frame counts (e.g. 49, 81).
+
+  - name: "default_fps"
+    type: "int"
+    default: 16
+    description: "Frames-per-second hint forwarded to the diffusion pipeline. Does not re-encode; affects motion speed."
+
+  - name: "num_inference_steps"
+    type: "int"
+    default: 50
+    description: "Number of denoising steps. Higher values improve quality at the cost of latency (recommended: 30–50)."
+
+  - name: "guidance_scale"
+    type: "float"
+    default: 5.0
+    description: "Classifier-free guidance (CFG) scale. Higher values follow the prompt more strictly (typical range: 3.5–7.5)."
+
+  - name: "output_format"
+    type: "str"
+    default: "mp4"
+    description: "Output container format. Supported values: 'mp4', 'webm'."
+
+
+commands:
+  - name: "health_check"
+    description: "Ping the vLLM-Omni server's /health endpoint to verify it is reachable and ready."
+    params: []
+
+  - name: "server_info"
+    description: "Fetch server metadata from /info or /v1/models (loaded model, version, GPU allocation)."
+    params: []
+
+  - name: "list_models"
+    description: "Query the running server for its currently loaded model(s) via the OpenAI-compatible /v1/models endpoint."
+    params: []
+
+  - name: "generate_video_from_image"
+    description: >
+      Image-to-video generation for I2V and TI2V models (e.g., Wan2.2-I2V-A14B, Wan2.2-TI2V-5B).
+      Requires a model that supports image conditioning.
+    params:
+      - name: "image"
+        type: "str"
+        description: "Path to the input image file, or a base64-encoded image string."
+      - name: "prompt"
+        type: "str"
+        description: "Text description of the desired video motion."
+      - name: "negative_prompt"
+        type: "str"
+        default: ""
+        description: "Negative guidance text to steer generation away from unwanted content."
+      - name: "seed"
+        type: "int"
+        default: -1
+        description: "RNG seed for reproducible generation. Use -1 for random."

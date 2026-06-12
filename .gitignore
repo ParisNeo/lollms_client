@@ -167,3 +167,8 @@ cython_debug/
 examples_perso
 data
 data_workspace
+
+# Logging output
+logs/
+*.log
+!log.log

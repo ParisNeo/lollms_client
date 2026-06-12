@@ -1,12 +1,25 @@
+# ── Logging Initialization (MUST be first) ───────────────────────────────────
+# Configure per-module file routing with rolling rotation BEFORE any other imports
+import ascii_colors as logging
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    log_folder="./logs",                # Per-module file routing
+    log_folder_mode="rolling",          # Rotate by size
+    log_folder_maxBytes=10000000,       # 10MB per file before rotation
+    log_folder_backupCount=5,           # Keep 5 backup files
+)
+
+# Now import the rest of the library
 from lollms_client.lollms_core import LollmsClient, ELF_COMPLETION_FORMAT
-from lollms_client.lollms_types import MSG_TYPE # Assuming ELF_GENERATION_FORMAT is not directly used by users from here
+from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager, LollmsMessage
 from lollms_client.lollms_personality import LollmsPersonality
-from lollms_client.lollms_utilities import PromptReshaper # Keep general utilities
-# Import new MCP binding classes
+from lollms_client.lollms_utilities import PromptReshaper
 from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
-# Import new bindings utils
 from lollms_client.lollms_bindings_utils import list_bindings, get_binding_desc
 
 __version__ = "1.14.22" # Updated version
@@ -21,9 +34,12 @@ __all__ = [
     "LollmsPersonality",
     "LollmsDataManager",
     "PromptReshaper",
-    "LollmsToolBinding", # Export LollmsToolBinding ABC
+    "LollmsToolBinding",
     "LollmsLLMBindingManager",
-    "LollmsTOOLBindingManager", # Export LollmsTOOLBindingManager
+    "LollmsTOOLBindingManager",
     "list_bindings",
-    "get_binding_desc"
+    "get_binding_desc",
+    "logger",
+    "openai_logger",
+    "discussion_logger",
 ]
