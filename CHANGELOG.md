@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-12 16:31]
+
+- chore(gitignore): ignore all log files
+
 ## [2026-06-12 01:59]
 
 - feat(memory): add debug flag to suppress verbose init logs

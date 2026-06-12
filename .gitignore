@@ -172,3 +172,4 @@ data_workspace
 logs/
 *.log
 !log.log
+*.log
