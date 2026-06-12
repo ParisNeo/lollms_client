@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-12 01:18]
+
+- fix(chat): robustly detect and prevent duplicate `<processing>` tag emissions
+
 ## [2026-06-11 05:16]
 
 - feat(memory): add memories endpoint and management UI

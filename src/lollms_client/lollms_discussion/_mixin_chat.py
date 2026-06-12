@@ -1707,11 +1707,17 @@ class _StreamState:
         """Emit opening <processing> tag for tool call execution with full types and details."""
         if not self.enable_in_message_status:
             return
+        if self.proc_has_opened or self._is_processing_tag_currently_open():
+            self.proc_has_opened = True
+            return
         self.proc_type = "tool_execution"
         self.proc_title = f"Executing {tool_name.replace('_', ' ').title()}"
         params_str = json.dumps(params, ensure_ascii=False)[:200]
         params_escaped = params_str.replace('"', '&quot;')
-        tag = f'\n<processing type="tool_execution" title="{self.proc_title}" tool="{tool_name}" params="{params_escaped}">\n'
+        if self.ai_message and self.ai_message.content and not self.ai_message.content.endswith("\n"):
+            tag = f'\n<processing type="tool_execution" title="{self.proc_title}" tool="{tool_name}" params="{params_escaped}">\n'
+        else:
+            tag = f'<processing type="tool_execution" title="{self.proc_title}" tool="{tool_name}" params="{params_escaped}">\n'
         self.ai_message.content += tag
         _cb(self.callback, tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_open",
@@ -1728,8 +1734,9 @@ class _StreamState:
         line = f"* {status_text}\n"
         self.proc_content.append(line)
         if self.enable_in_message_status:
-            if not self.proc_has_opened:
-                return
+            if not self.proc_has_opened and not self._is_processing_tag_currently_open():
+                self._emit_tool_processing_open()
+            self.proc_has_opened = True
             self.ai_message.content += line
             _cb(self.callback, line, MSG_TYPE.MSG_TYPE_CHUNK, {
                 "type": "processing_status",
@@ -1747,7 +1754,7 @@ class _StreamState:
         if not self.enable_in_message_status:
             return
 
-        if not self.proc_has_opened:
+        if not self.proc_has_opened and not self._is_processing_tag_currently_open():
             return
 
         close_tag = "\n</processing>\n\n"
@@ -1961,17 +1968,31 @@ class _StreamState:
 
     # ---------------------------------------------------------------- Processing helpers
 
+    def _is_processing_tag_currently_open(self) -> bool:
+        if not self.ai_message or not hasattr(self.ai_message, 'content') or not self.ai_message.content:
+            return False
+        content = self.ai_message.content
+        last_open = content.rfind("<processing")
+        if last_open == -1:
+            return False
+        last_close = content.rfind("</processing>")
+        return last_close < last_open
+
     def _emit_processing_open(self):
         """Emit the opening <processing> tag with attributes."""
         if not self.enable_in_message_status:
             return
-        if self.proc_has_opened:
+        if self.proc_has_opened or self._is_processing_tag_currently_open():
+            self.proc_has_opened = True
             return
         attrs_str = f' type="{self.proc_type}" title="{self.proc_title}"'
         for k, v in self.proc_attrs.items():
             if v:
                 attrs_str += f' {k}="{v}"'
-        tag = f"\n<processing{attrs_str}>\n"
+        if self.ai_message and self.ai_message.content and not self.ai_message.content.endswith("\n"):
+            tag = f"\n<processing{attrs_str}>\n"
+        else:
+            tag = f"<processing{attrs_str}>\n"
         self.ai_message.content += tag
         _cb(self.callback, tag, MSG_TYPE.MSG_TYPE_CHUNK, {
             "type": "processing_open",
@@ -1987,8 +2008,9 @@ class _StreamState:
         line = f"* {status_text}\n"
         self.proc_content.append(line)
         if self.enable_in_message_status:
-            if not self.proc_has_opened:
+            if not self.proc_has_opened and not self._is_processing_tag_currently_open():
                 self._emit_processing_open()
+            self.proc_has_opened = True
             self.ai_message.content += line
             _cb(self.callback, line, MSG_TYPE.MSG_TYPE_CHUNK, {
                 "type": "processing_status",
@@ -2000,7 +2022,7 @@ class _StreamState:
     def _emit_processing_close(self, final_content: str = ""):
         """Close the <processing> tag only if it's open.
 
-        NOTE: In the current 'sticky' architecture, this is usually called
+        Note: In the current 'sticky' architecture, this is usually called
         at the very end of the stream by flush_remaining_buffer() or if 
         we transition back to conversational text.
         """
@@ -2009,7 +2031,7 @@ class _StreamState:
                 self.pending_final_content = final_content
             return
 
-        if not self.proc_has_opened:
+        if not self.proc_has_opened and not self._is_processing_tag_currently_open():
             if final_content:
                 self.pending_final_content = final_content
             return
