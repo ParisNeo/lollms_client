@@ -8,7 +8,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     log_folder="./logs",                # Per-module file routing
     log_folder_mode="rolling",          # Rotate by size
-    log_folder_maxBytes=10_000_000,     # 10MB per file before rotation
+    log_folder_maxBytes=10000000,       # 10MB per file before rotation
     log_folder_backupCount=5,           # Keep 5 backup files
 )
 
