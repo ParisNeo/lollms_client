@@ -236,6 +236,7 @@ class LollmsMemoryManager:
         owner_id:      Optional[str]   = None,
         lollms_client: Optional[Any]   = None,
         config:        Optional[MemoryConfig] = None,
+        debug:         bool            = False,
     ):
         # Normalize Windows backslashes to forward slashes for SQLAlchemy compatibility
         if db_path.startswith("sqlite:///"):
@@ -251,6 +252,7 @@ class LollmsMemoryManager:
         self.owner_id      = owner_id
         self.lollms_client = lollms_client
         self.config        = config or MemoryConfig()
+        self.debug         = debug
         # Use StaticPool to ensure all connections share the same in-memory SQLite database instance
         engine_kwargs = {}
         if db_path.startswith("sqlite"):
@@ -278,7 +280,8 @@ class LollmsMemoryManager:
                 ]
                 for col, sql in migrations:
                     if col not in columns:
-                        ASCIIColors.info(f"  -> Upgrading 'memories' table: Adding '{col}' column.")
+                        if self.debug:
+                            ASCIIColors.info(f"  -> Upgrading 'memories' table: Adding '{col}' column.")
                         connection.execute(text(sql))
                 connection.commit()
         except Exception as e:
@@ -292,7 +295,8 @@ class LollmsMemoryManager:
         self._working_zone_cache = None
         self._handles_zone_cache = None
 
-        ASCIIColors.info(f"[MemoryManager] Initialised — db={db_path}, owner={owner_id}")
+        if self.debug:
+            ASCIIColors.info(f"[MemoryManager] Initialised — db={db_path}, owner={owner_id}")
 
     # ──────────────────────────────────────────────── session helper
 
