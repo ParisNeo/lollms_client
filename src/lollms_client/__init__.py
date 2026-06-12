@@ -24,10 +24,6 @@ from lollms_client.lollms_bindings_utils import list_bindings, get_binding_desc
 
 __version__ = "1.14.23"
 
-# Create module-level loggers for easy access
-logger = logging.getLogger(__name__)
-openai_logger = logging.getLogger("lollms_client.llm_bindings.openai")
-discussion_logger = logging.getLogger("lollms_client.lollms_discussion")
 
 __all__ = [
     "LollmsClient",
