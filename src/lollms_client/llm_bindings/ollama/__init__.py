@@ -113,8 +113,9 @@ class OllamaBinding(LollmsLLMBinding):
     def clean_message_images(self, messages: List[Dict]) -> List[Dict]:
         """
         Ensures all base64-encoded images in the messages list are clean,
-        raw base64 strings (stripping any 'data:image/...;base64,' prefix).
+        decoded bytes objects (stripping any 'data:image/...;base64,' prefix).
         """
+        import base64
         cleaned_messages = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -142,7 +143,14 @@ class OllamaBinding(LollmsLLMBinding):
             for img in images:
                 if isinstance(img, str):
                     cleaned = re.sub(r"^data:image/[^;]+;base64,", "", img)
-                    cleaned_images.append(cleaned)
+                    try:
+                        # Decode base64 to raw bytes as expected by the ollama-python client
+                        decoded = base64.b64decode(cleaned)
+                        cleaned_images.append(decoded)
+                    except Exception:
+                        cleaned_images.append(img)
+                elif isinstance(img, bytes):
+                    cleaned_images.append(img)
                 else:
                     cleaned_images.append(img)
 
@@ -272,13 +280,18 @@ class OllamaBinding(LollmsLLMBinding):
             with self._client() as client:
                 if images: # Multimodal
                     # ollama-python expects paths or bytes for images
+                    import base64
                     processed_images = []
                     for img_path in images:
-                        # Assuming img_path is a file path. ollama-python will read and encode it.
-                        # If images were base64 strings, they would need decoding to bytes first.
-                        if img_path.startswith("data:image/png;base64,"):
-                            img_path = img_path[len("data:image/png;base64,"):]
-                        processed_images.append(img_path)
+                        if isinstance(img_path, str):
+                            cleaned = re.sub(r"^data:image/[^;]+;base64,", "", img_path)
+                            try:
+                                decoded = base64.b64decode(cleaned)
+                                processed_images.append(decoded)
+                            except Exception:
+                                processed_images.append(img_path)
+                        else:
+                            processed_images.append(img_path)
 
                     messages = [
                                 {'role': 'system', 'content':system_prompt},
@@ -442,15 +455,15 @@ class OllamaBinding(LollmsLLMBinding):
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
             ASCIIColors.error(error_message)
-            return {"status": False, "error": error_message, "status_code": e.status_code}
+            raise RuntimeError(error_message)
         except ollama.RequestError as e: # Covers connection errors, timeouts during request
             error_message = f"Ollama API RequestError: {str(e)}"
             ASCIIColors.error(error_message)
-            return {"status": False, "error": error_message}
+            raise RuntimeError(error_message)
         except Exception as ex:
             error_message = f"An unexpected error occurred: {str(ex)}"
             trace_exception(ex)
-            return {"status": False, "error": error_message}
+            raise RuntimeError(error_message)
 
     def generate_from_messages(self,
                         messages: List[Dict],
@@ -558,15 +571,15 @@ class OllamaBinding(LollmsLLMBinding):
         except ollama.ResponseError as e:
             error_message = f"Ollama API ResponseError: {e.error or 'Unknown error'} (status code: {e.status_code})"
             ASCIIColors.error(error_message)
-            return {"status": False, "error": error_message, "status_code": e.status_code}
+            raise RuntimeError(error_message)
         except ollama.RequestError as e:
             error_message = f"Ollama API RequestError: {str(e)}"
             ASCIIColors.error(error_message)
-            return {"status": False, "error": error_message}
+            raise RuntimeError(error_message)
         except Exception as ex:
             error_message = f"An unexpected error occurred: {str(ex)}"
             trace_exception(ex)
-            return {"status": False, "error": error_message}
+            raise RuntimeError(error_message)
     
 
     def _chat(self,

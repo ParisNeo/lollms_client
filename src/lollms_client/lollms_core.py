@@ -700,7 +700,14 @@ class LollmsClient():
 
     def chat(self, *args, **kwargs) -> Union[str, dict]:
         self._cooperative_unload_tti()
-        if self.llm: return self.llm.chat(*args, **kwargs)
+        if self.llm:
+            # Log image payload status at core client layer
+            images = kwargs.get("images")
+            if images is not None:
+                ASCIIColors.info(f"[LollmsClient.chat] Forwarding 'images' to binding: count={len(images)}, types={[type(img).__name__ for img in images[:5]]}")
+            else:
+                ASCIIColors.warning("[LollmsClient.chat] No 'images' parameter found in kwargs")
+            return self.llm.chat(*args, **kwargs)
         raise RuntimeError("LLM binding not initialized.")
 
     def embed(self, *args, **kwargs):

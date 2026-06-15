@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-15 01:02]
+
+- refactor(core): update chat logic and ollama bindings
+
 ## [2026-06-12 16:31]
 
 - chore(gitignore): ignore all log files

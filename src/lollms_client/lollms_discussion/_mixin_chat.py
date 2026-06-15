@@ -1255,6 +1255,8 @@ class _StreamState:
         enable_skills: bool,
         enable_inline_widgets: bool,
         enable_forms: bool,
+        enable_books: bool = False,
+        enable_presentations: bool = False,
         auto_activate_artefacts: bool = True,
         enable_artefacts: bool = True,
         enable_in_message_status: bool = True,
@@ -1272,11 +1274,15 @@ class _StreamState:
             self.enable_skills         = False
             self.enable_inline_widgets = False
             self.enable_forms          = False
+            self.enable_books          = False
+            self.enable_presentations  = False
         else:
             self.enable_notes          = enable_notes
             self.enable_skills         = enable_skills
-            self.enable_inline_widgets = enable_inline_widgets
+            self.enable_inline_widgets = inline_widgets if 'inline_widgets' in locals() else enable_inline_widgets
             self.enable_forms          = enable_forms
+            self.enable_books          = enable_books
+            self.enable_presentations  = enable_presentations
 
         self.auto_activate         = auto_activate_artefacts
 
@@ -3353,6 +3359,8 @@ class ChatMixin:
             enable_skills         = kwargs.get("enable_skills", False),
             enable_inline_widgets = kwargs.get("enable_inline_widgets", True),
             enable_forms          = kwargs.get("enable_forms", True),
+            enable_books          = kwargs.get("enable_books", False),
+            enable_presentations  = kwargs.get("enable_presentations", False),
             auto_activate_artefacts = kwargs.get("auto_activate_artefacts", True),
             enable_artefacts      = kwargs.get("enable_artefacts", True),
             enable_in_message_status = kwargs.get("enable_in_message_status", True),
@@ -4093,6 +4101,13 @@ class ChatMixin:
 
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
+        if images is not None:
+            ASCIIColors.info(f"[LollmsDiscussion.chat] Received 'images' parameter: count={len(images)}, types={[type(img).__name__ for img in images[:5]]}")
+        else:
+            ASCIIColors.warning("[LollmsDiscussion.chat] Received 'images' parameter as None")
+        # Disable proactive memory pulling if the user has provided an image to avoid context dilution
+        if images and len(images) > 0:
+            enable_deep_memory_pulling = False
 
         # ── 🧠 Memory ────────────────────────────────────────────────────────────
         _mm      = self._get_memory_manager(memory_manager) if enable_memory else None
@@ -4651,23 +4666,24 @@ TRIGGER EXAMPLES:
                     _tool_categories["data"].append(_tname)
                 else:
                     _tool_categories["other"].append(_tname)
-
-            ASCIIColors.cyan("╔══════════════════════════════════════════════════════════════════╗")
-            ASCIIColors.cyan("║  [FAST-PATH DEFAULT] Agent mode on-demand via tags              ║")
-            ASCIIColors.cyan(f"║  • Context size: {_ctx_tokens:,} tokens                                ║")
-            ASCIIColors.cyan(f"║  • Tools registered: {len(tool_registry)}                                  ║")
+            text = f"""
+ Context size: {_ctx_tokens:,} tokens
+ Tools registered: {len(tool_registry)}
+ Active artifacts: {len(self.artefacts.list(active_only=True))}
+ Images : {len(images) if images else 0}
+"""
             if _tool_categories["search"]:
-                ASCIIColors.cyan(f"║    └─ Search: {', '.join(_tool_categories['search'])}")
+                text += f"    └─ Search: {', '.join(_tool_categories['search'])}"
             if _tool_categories["artifact"]:
-                ASCIIColors.cyan(f"║    └─ Artifact: {', '.join(_tool_categories['artifact'])}")
+                text += f"    └─ Artifact: {', '.join(_tool_categories['artifact'])}"
             if _tool_categories["memory"]:
-                ASCIIColors.cyan(f"║    └─ Memory: {', '.join(_tool_categories['memory'])}")
+                text += f"    └─ Memory: {', '.join(_tool_categories['memory'])}"
             if _tool_categories["data"]:
-                ASCIIColors.cyan(f"║    └─ Data: {', '.join(_tool_categories['data'])}")
+                text += f"    └─ Data: {', '.join(_tool_categories['data'])}"
             if _tool_categories["other"]:
-                ASCIIColors.cyan(f"║    └─ Other: {', '.join(_tool_categories['other'])}")
-            ASCIIColors.cyan(f"║  • Active artifacts: {len(self.artefacts.list(active_only=True))}                        ║")
-            ASCIIColors.cyan("╚══════════════════════════════════════════════════════════════════╝")
+                text += f"    └─ Other: {', '.join(_tool_categories['other'])}"
+
+            ASCIIColors.panel(text, title="[FAST-PATH DEFAULT] Agent mode on-demand via tags", border_style="green")
 
         # ── Add user message ──────────────────────────────────────────────────
         if add_user_message:
@@ -5667,6 +5683,8 @@ Assistant: <agent_mode/>
                 enable_skills         = enable_skills,
                 enable_inline_widgets = enable_inline_widgets,
                 enable_forms          = enable_forms,
+                enable_books          = enable_books,
+                enable_presentations  = enable_presentations,
                 auto_activate_artefacts = auto_activate_artefacts,
                 enable_artefacts      = enable_artefacts,
                 enable_in_message_status = kwargs.get("enable_in_message_status", True),

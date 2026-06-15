@@ -6632,10 +6632,18 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     async function sendChatMessage(regenerate = false) {
+        console.log("🚀 [DEBUG] sendChatMessage triggered", { regenerate, pastedImagesCount: pastedImages.length });
         let text = "";
         if (!regenerate) {
             text = chatInput.value.trim();
-            if (!text) return;
+            if (!text && pastedImages.length === 0) {
+                console.log("⚠️ [DEBUG] sendChatMessage aborted: both text and pastedImages are empty");
+                return;
+            }
+            if (!text && pastedImages.length > 0) {
+                text = "Analyze the attached image.";
+                console.log("ℹ️ [DEBUG] Empty text with images, defaulted prompt to:", text);
+            }
             chatInput.value = "";
         }
 
@@ -6688,6 +6696,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 enable_image_editing: funcStates["enable_image_editing"],
                 enable_forms: funcStates["enable_forms"],
                 enable_inline_widgets: funcStates["enable_inline_widgets"],
+                temperature: (tempOverrideEnable && tempOverrideEnable.checked) ? parseFloat(tempOverrideValue.value) : null,
                 think: funcStates["think"]
             };
 
@@ -6697,6 +6706,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             activeChatAbortController = new AbortController();
+            console.log("📡 [DEBUG] Sending POST request to /api/chat with payload:", payload);
             const res = await fetch("/api/chat", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -6813,6 +6823,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 }
             }
         } catch (err) {
+            console.error("❌ [DEBUG] sendChatMessage caught error during execution:", err);
             if (proseSpan) proseSpan.innerHTML = `<span style="color: #ef4444;">Connection failed: ${err}</span>`;
         } finally {
             chatInput.disabled = false;
