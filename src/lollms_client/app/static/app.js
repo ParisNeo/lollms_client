@@ -468,6 +468,27 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
+    // ── 🎯 Chat Functions Dropdown Menu Toggle ──
+    const btnFunctionsToggle = document.getElementById("btn-chat-functions-toggle");
+    const dropdownFunctions = document.getElementById("chat-functions-dropdown");
+
+    if (btnFunctionsToggle && dropdownFunctions) {
+        btnFunctionsToggle.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const isHidden = dropdownFunctions.style.display === "none";
+            dropdownFunctions.style.display = isHidden ? "flex" : "none";
+            btnFunctionsToggle.classList.toggle("active", isHidden);
+        });
+
+        // Close dropdown when clicking outside
+        document.addEventListener("click", (e) => {
+            if (!dropdownFunctions.contains(e.target) && e.target !== btnFunctionsToggle) {
+                dropdownFunctions.style.display = "none";
+                btnFunctionsToggle.classList.remove("active");
+            }
+        });
+    }
+
     // ── 🌡️ Temperature Override Handler ──
     const tempOverrideEnable = document.getElementById("temp-override-enable");
     const tempOverrideValue = document.getElementById("temp-override-value");
@@ -607,7 +628,8 @@ document.addEventListener("DOMContentLoaded", () => {
             await fetchMessageHistory();
 
             // 4. Verify server configuration status and trigger settings redirect if needed
-            await verifyServerStatus();
+    // Verify server configuration status and trigger settings redirect if needed
+    await verifyServerStatus();
         } catch (err) {
             console.error("Workspace initialization failed:", err);
         } finally {
@@ -619,6 +641,204 @@ document.addEventListener("DOMContentLoaded", () => {
                 setTimeout(() => globalLoader.remove(), 400);
             }
         }
+    }
+
+    // ── 📁 Left & Right Sidebars Collapsible Affordance ──
+    const btnToggleLeft = document.getElementById("btn-toggle-left");
+    const btnToggleRight = document.getElementById("btn-toggle-right");
+    const sidebarLeft = document.getElementById("sidebar-left");
+    const sidebarRight = document.getElementById("sidebar-right");
+
+    if (btnToggleLeft && sidebarLeft) {
+        btnToggleLeft.addEventListener("click", () => {
+            const isCollapsed = sidebarLeft.classList.toggle("collapsed");
+            btnToggleLeft.textContent = isCollapsed ? "▶" : "◀";
+            btnToggleLeft.style.left = isCollapsed ? "0" : "360px";
+            // Trigger window resize to recalculate canvas elements
+            window.dispatchEvent(new Event("resize"));
+        });
+    }
+
+    if (btnToggleRight && sidebarRight) {
+        btnToggleRight.addEventListener("click", () => {
+            const isCollapsed = sidebarRight.classList.toggle("collapsed");
+            btnToggleRight.textContent = isCollapsed ? "◀" : "▶";
+            btnToggleRight.style.right = isCollapsed ? "0" : "360px";
+            // Trigger window resize to recalculate canvas elements
+            window.dispatchEvent(new Event("resize"));
+        });
+    }
+
+    // ── ⚡ Collapsible Macro Operations Section ──
+    const macroHeader = document.getElementById("macro-section-header");
+    const macroContent = document.getElementById("macro-section-content");
+
+    if (macroHeader && macroContent) {
+        macroHeader.addEventListener("click", () => {
+            const isCollapsed = macroContent.classList.toggle("collapsed");
+            const chevron = macroHeader.querySelector(".chevron");
+            if (chevron) {
+                chevron.style.transform = isCollapsed ? "rotate(-90deg)" : "rotate(0deg)";
+            }
+        });
+    }
+
+    // ── 🔍 Ctrl+K Command Palette Sub-System ──
+    const cmdPaletteModal = document.getElementById("command-palette-modal");
+    const cmdPaletteInput = document.getElementById("command-palette-input");
+    const cmdPaletteResults = document.getElementById("command-palette-results");
+    const btnCloseCmdPalette = document.getElementById("btn-close-command-palette");
+
+    function openCommandPalette() {
+        if (!cmdPaletteModal) return;
+        cmdPaletteModal.style.display = "flex";
+        cmdPaletteInput.value = "";
+        cmdPaletteInput.focus();
+        renderCommandPaletteResults("");
+    }
+
+    function closeCommandPalette() {
+        if (cmdPaletteModal) {
+            cmdPaletteModal.style.display = "none";
+        }
+    }
+
+    if (btnCloseCmdPalette) {
+        btnCloseCmdPalette.addEventListener("click", closeCommandPalette);
+    }
+
+    window.addEventListener("keydown", (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+            e.preventDefault();
+            openCommandPalette();
+        } else if (e.key === "Escape" && cmdPaletteModal && cmdPaletteModal.style.display === "flex") {
+            closeCommandPalette();
+        }
+    });
+
+    if (cmdPaletteInput) {
+        cmdPaletteInput.addEventListener("input", (e) => {
+            renderCommandPaletteResults(e.target.value.toLowerCase().trim());
+        });
+    }
+
+    async function renderCommandPaletteResults(query) {
+        if (!cmdPaletteResults) return;
+        cmdPaletteResults.innerHTML = "";
+
+        const items = [];
+
+        // 1. Add Active Macros
+        const macros = [
+            { title: "Summarize Content", type: "macro", id: "macro-summarize", icon: "📝" },
+            { title: "Compare Documents", type: "macro", id: "macro-compare", icon: "⚖️" },
+            { title: "Build Knowledge Graph", type: "macro", id: "macro-graph", icon: "🕸️" },
+            { title: "Generate Full Report", type: "macro", id: "macro-report", icon: "📊" },
+            { title: "Build Infographic", type: "macro", id: "macro-infographic", icon: "🖼️" },
+            { title: "Build Presentation", type: "macro", id: "macro-presentation", icon: "🎬" },
+            { title: "Test Interactive Form", type: "macro", id: "macro-test-form", icon: "📋" }
+        ];
+        macros.forEach(m => {
+            if (!query || m.title.toLowerCase().includes(query)) {
+                items.push(m);
+            }
+        });
+
+        // 2. Add Active Artifacts
+        try {
+            const res = await fetch("/api/artifacts");
+            const arts = await res.json();
+            arts.forEach(a => {
+                if (!query || a.title.toLowerCase().includes(query)) {
+                    let icon = "📄";
+                    if (a.type === "skill") icon = "🎓";
+                    else if (a.type === "tool") icon = "🛠️";
+                    else if (a.type === "data") icon = "📊";
+                    else if (a.type === "code") icon = "💻";
+
+                    items.push({
+                        title: a.title,
+                        type: "artifact",
+                        id: a.title,
+                        icon: icon
+                    });
+                }
+            });
+        } catch (e) {
+            console.error("Command palette failed to fetch artifacts:", e);
+        }
+
+        // 3. Add Cached Memories
+        if (Array.isArray(cachedMemories)) {
+            cachedMemories.forEach(m => {
+                if (!query || m.content.toLowerCase().includes(query)) {
+                    items.push({
+                        title: m.content.substring(0, 60) + "...",
+                        type: "memory",
+                        id: m.id,
+                        icon: "🧠"
+                    });
+                }
+            });
+        }
+
+        if (items.length === 0) {
+            cmdPaletteResults.innerHTML = `<li class="empty-msg" style="text-align:center; padding: 12px;">No matching results found.</li>`;
+            return;
+        }
+
+        // Keep results capped at top 10 for clean look
+        cmdPaletteResults.innerHTML = items.slice(0, 10).map((item, idx) => `
+            <li class="command-palette-item ${idx === 0 ? 'selected' : ''}" data-type="${item.type}" data-id="${item.id}">
+                <span class="item-title">${item.icon} ${item.title}</span>
+                <span class="item-type">${item.type}</span>
+            </li>
+        `).join("");
+
+        // Bind clicks to items
+        cmdPaletteResults.querySelectorAll(".command-palette-item").forEach(el => {
+            el.addEventListener("click", () => {
+                const type = el.dataset.type;
+                const id = el.dataset.id;
+
+                closeCommandPalette();
+
+                if (type === "macro") {
+                    const macroBtn = document.getElementById(id);
+                    if (macroBtn) {
+                        macroBtn.click();
+                    }
+                } else if (type === "artifact") {
+                    selectArtifact(id);
+                } else if (type === "memory") {
+                    const memCard = document.querySelector(`.memory-card[data-mem-id="${id}"]`);
+                    if (memCard) {
+                        memCard.scrollIntoView({ behavior: "smooth", block: "center" });
+                        memCard.style.outline = "2px solid var(--accent-color)";
+                        setTimeout(() => {
+                            memCard.style.outline = "none";
+                        }, 2000);
+                    } else {
+                        // Switch tab to the memory level first
+                        const foundMem = cachedMemories.find(m => m.id === id);
+                        if (foundMem) {
+                            activeMemoryLevel = foundMem.level;
+                            renderMemories();
+                            setTimeout(() => {
+                                const freshCard = document.querySelector(`.memory-card[data-mem-id="${id}"]`);
+                                if (freshCard) {
+                                    freshCard.scrollIntoView({ behavior: "smooth", block: "center" });
+                                    freshCard.style.outline = "2px solid var(--accent-color)";
+                                    setTimeout(() => {
+                                        freshCard.style.outline = "none";
+                                    }, 2000);
+                                }
+                            }, 150);
+                        }
+                    }
+                }
+            });
+        });
     }
 
     // Launch workspace bootstrapper
@@ -6106,7 +6326,7 @@ document.addEventListener("DOMContentLoaded", () => {
         attachDataQueryInterceptors(contentDiv);
     }
 
-    function bindMessageActions(bubbleElement) {
+    async function bindMessageActions(bubbleElement) {
         const msgId = bubbleElement.dataset.msgId;
         const proseSpan = bubbleElement.querySelector(".prose-span");
         const actionsRow = bubbleElement.querySelector(".msg-actions-row");
@@ -6206,7 +6426,10 @@ document.addEventListener("DOMContentLoaded", () => {
                     const res = await fetch(`/api/discussions/viewer_session/messages/${parentId}/fork`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ initial_content: originalText })
+                        body: JSON.stringify({ 
+                            initial_content: originalText,
+                            images: msgObj && msgObj.images ? msgObj.images : []
+                        })
                     });
                     const data = await res.json();
                     if (data.success) {
@@ -6235,6 +6458,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         });
     }
+    
 
     // ── 🗃️ Workspaces CRUD & Selection Screen Sub-System ──
     async function fetchWorkspaces() {
@@ -6983,7 +7207,6 @@ document.addEventListener("DOMContentLoaded", () => {
             });
         });
     }
-
 });
 
 /**

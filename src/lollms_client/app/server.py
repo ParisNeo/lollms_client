@@ -119,29 +119,31 @@ def initialize_workspace_state(workspace_name: str):
 
     active_personality_prompt = None
     if cfg and cfg.get("llm_binding_name") and cfg.get("llm_binding_config", {}).get("model_name"):
-        try:
-            LLM_MODEL_NAME = cfg["llm_binding_config"]["model_name"]
-            client_kwargs = {
-                "llm_binding_name": cfg["llm_binding_name"],
-                "llm_binding_config": cfg["llm_binding_config"],
-                "tools_binding_name": "lcp",
-                "tools_binding_config": {
-                    "tools_folders": [
-                        str(APP_WORKSPACE_DIR.resolve()),
-                        str(Path(__file__).resolve().parent.parent / "tools_bindings" / "lcp" / "default_tools")
-                    ]
-                }
+        LLM_MODEL_NAME = cfg["llm_binding_config"]["model_name"]
+        client_kwargs = {
+            "llm_binding_name": cfg["llm_binding_name"],
+            "llm_binding_config": cfg["llm_binding_config"],
+            "tools_binding_name": "lcp",
+            "tools_binding_config": {
+                "tools_folders": [
+                    str(APP_WORKSPACE_DIR.resolve()),
+                    str(Path(__file__).resolve().parent.parent / "tools_bindings" / "lcp" / "default_tools")
+                ]
             }
-            if cfg.get("tti_binding_name"):
-                client_kwargs["tti_binding_name"] = cfg["tti_binding_name"]
-                client_kwargs["tti_binding_config"] = cfg.get("tti_binding_config", {})
-            if cfg.get("stt_binding_name"):
-                client_kwargs["stt_binding_name"] = cfg["stt_binding_name"]
-                client_kwargs["stt_binding_config"] = cfg.get("stt_binding_config", {})
+        }
+        if cfg.get("tti_binding_name"):
+            client_kwargs["tti_binding_name"] = cfg["tti_binding_name"]
+            client_kwargs["tti_binding_config"] = cfg.get("tti_binding_config", {})
+        if cfg.get("stt_binding_name"):
+            client_kwargs["stt_binding_name"] = cfg["stt_binding_name"]
+            client_kwargs["stt_binding_config"] = cfg.get("stt_binding_config", {})
 
+        # Configuration exists on disk; assume valid to prevent false-positive setups on startup delays
+        needs_configuration = False
+
+        try:
             client = LollmsClient(**client_kwargs)
             ASCIIColors.green(f"⚡ [Workspace '{workspace_name_clean}'] Loaded saved configuration: {LLM_MODEL_NAME} via {cfg['llm_binding_name']}")
-            needs_configuration = False
 
             p_name = cfg.get("personality_name")
             if p_name and "/" in p_name:
@@ -151,8 +153,7 @@ def initialize_workspace_state(workspace_name: str):
                     content = soul_file.read_text(encoding="utf-8", errors="ignore")
                     active_personality_prompt = re.sub(r'^---\s*(.*?)\s*---', '', content, flags=re.DOTALL).strip()
         except Exception as e:
-            ASCIIColors.yellow(f"⚠️ [Workspace '{workspace_name_clean}'] Saved config failed to load ({e}). Falling back to mock.")
-            needs_configuration = True
+            ASCIIColors.yellow(f"⚠️ [Workspace '{workspace_name_clean}'] Active LLM service offline or unreachable during boot ({e}). Retaining config and falling back to mock until client reconnects.")
             client = DummyClient()
     else:
         ASCIIColors.yellow(f"⚠️ [Workspace '{workspace_name_clean}'] No saved configuration found. User must configure LLM.")
@@ -3605,6 +3606,7 @@ async def chat_with_document(request: ChatRequest):
                         streaming_callback=streaming_callback,
                         tools=active_tools if active_tools else None,
                         add_user_message=False,  # Already added cleanly above
+                        images=request.images if request.images else [],
                         enable_memory=request.enable_memory if request.enable_memory is not None else True,
                         enable_artefacts=request.enable_artefacts if request.enable_artefacts is not None else True,
                         enable_in_message_status=request.enable_in_message_status if request.enable_in_message_status is not None else True,
@@ -4229,6 +4231,7 @@ async def switch_session_branch_endpoint(payload: SwitchBranchRequest):
 
 class ForkMessageRequest(BaseModel):
     initial_content: str
+    images: Optional[List[str]] = None
 
 
 @app.post("/api/discussions/viewer_session/messages/{message_id}/fork")
@@ -4241,12 +4244,14 @@ async def fork_session_message_endpoint(message_id: str, payload: ForkMessageReq
                 sender=discussion.lollmsClient.user_name if (discussion.lollmsClient and hasattr(discussion.lollmsClient, "user_name")) else "user",
                 sender_type="user",
                 content=payload.initial_content.strip(),
+                images=payload.images if payload.images else [],
                 parent_id=None
             )
         else:
             new_msg = discussion.fork_from(
                 message_id=p_id,
-                initial_content=payload.initial_content.strip()
+                initial_content=payload.initial_content.strip(),
+                images=payload.images if payload.images else []
             )
         discussion.commit()
         return {

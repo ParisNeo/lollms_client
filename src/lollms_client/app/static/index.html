@@ -71,44 +71,57 @@
     <header class="app-header">
         <div class="logo">🧠 Lollms Client Demonstration App</div>
         <div class="header-controls">
-            <div style="position: relative; display: inline-block;">
-                <select id="header-model-select" class="header-select" title="Active Model">
-                    <option value="">-- Model --</option>
-                </select>
-                <span class="spinner inline" id="header-model-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
-            </div>
-            <div style="position: relative; display: inline-block;">
-                <select id="header-tti-model-select" class="header-select" title="Active TTI Model">
-                    <option value="">-- TTI Model --</option>
-                </select>
-                <span class="spinner inline" id="header-tti-model-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
-            </div>
-            <div style="position: relative; display: inline-block;">
-                <select id="header-personality-select" class="header-select" title="Active Personality">
-                    <option value="">-- Personality --</option>
-                </select>
-                <span class="spinner inline" id="header-personality-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
+            <div class="config-pill-group">
+                <div style="position: relative; display: inline-block;">
+                    <select id="header-model-select" class="header-select" title="Active Model">
+                        <option value="">-- Model --</option>
+                    </select>
+                    <span class="spinner inline" id="header-model-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
+                </div>
+                <div style="position: relative; display: inline-block;">
+                    <select id="header-tti-model-select" class="header-select" title="Active TTI Model">
+                        <option value="">-- TTI Model --</option>
+                    </select>
+                    <span class="spinner inline" id="header-tti-model-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
+                </div>
+                <div style="position: relative; display: inline-block;">
+                    <select id="header-personality-select" class="header-select" title="Active Personality">
+                        <option value="">-- Personality --</option>
+                    </select>
+                    <span class="spinner inline" id="header-personality-spinner" style="display: none; position: absolute; right: 28px; top: 12px; pointer-events: none;"></span>
+                </div>
             </div>
             <button id="btn-back-to-workspaces" class="btn-icon" title="Switch Workspace" style="margin-right: 4px;">🗃️</button>
             <button id="btn-open-settings" class="btn-icon" title="Settings">⚙️</button>
         </div>
-        <div class="status-badge" id="server-status">Initializing...</div>
+        <div class="status-badge" id="server-status">
+            <span class="pulse-dot"></span>
+            <span class="status-text">Initializing...</span>
+        </div>
     </header>
 
     <main class="app-container">
+        <!-- Sidebar Collapse Toggle Buttons -->
+        <button id="btn-toggle-left" class="sidebar-toggle-handle left" title="Toggle Left Sidebar">◀</button>
+        <button id="btn-toggle-right" class="sidebar-toggle-handle right" title="Toggle Right Sidebar">▶</button>
+
         <!-- Area 1: Left Panel (Session Artifacts & Stored Memories) -->
-        <aside class="panel sidebar-left">
-            <div class="panel-section">
+        <aside class="panel sidebar-left" id="sidebar-left">
+            <div class="panel-section section-artifacts">
                 <div class="sidebar-section-header">
                     <h2>📂 Active Artifacts</h2>
                     <button class="part-export-btn" id="btn-export-artifacts-part" title="Export artifacts...">📤 Export</button>
                 </div>
                 <ul class="artifact-list" id="artifacts-list">
-                    <li class="empty-msg">No active artifacts in session.</li>
+                    <li class="empty-msg" style="border: 1px dashed var(--border-color); padding: 16px; border-radius: 8px; text-align: center; cursor: pointer;" onclick="document.getElementById('btn-open-import').click()">
+                        <span style="font-size: 24px; display: block; margin-bottom: 6px;">📂</span>
+                        No active artifacts.<br/>
+                        <span style="color: var(--accent-color); font-size: 11px; text-decoration: underline;">+ Ingest File</span>
+                    </li>
                 </ul>
             </div>
 
-            <div class="panel-section">
+            <div class="panel-section section-memories">
                 <div class="sidebar-section-header">
                     <h2>🧠 Stored Memories</h2>
                     <button class="part-export-btn" id="btn-view-memory-graph" title="View Semantic Memory Network Graph">🧠 Graph</button>
@@ -116,10 +129,10 @@
                 <p class="section-desc">Tiered persistent SQLite memory.</p>
                 <!-- Local Tabbed Memory Widget -->
                 <div class="memory-tabs" style="display: flex; gap: 4px; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 6px; overflow-x: auto; user-select: none;">
-                    <button class="mem-tab-btn active" data-mem-level="1">Working</button>
-                    <button class="mem-tab-btn" data-mem-level="2">Deep / Assoc</button>
-                    <button class="mem-tab-btn" data-mem-level="3">Archived</button>
-                    <button class="mem-tab-btn" data-mem-level="4">Episodic</button>
+                    <button class="mem-tab-btn active" data-mem-level="1">🟢 Working</button>
+                    <button class="mem-tab-btn" data-mem-level="2">🟣 Deep</button>
+                    <button class="mem-tab-btn" data-mem-level="3">⚫ Archive</button>
+                    <button class="mem-tab-btn" data-mem-level="4">🔵 Episode</button>
                 </div>
                 <div class="memory-tab-actions" style="display: flex; gap: 6px; margin-bottom: 10px; justify-content: flex-end; user-select: none;">
                     <button class="part-export-btn" id="btn-add-memory-part" title="Import a new memory" style="padding: 4px 10px; font-size: 11.5px;">➕ Add</button>
@@ -127,11 +140,15 @@
                     <button class="part-export-btn" id="btn-export-memories-part" title="Export memories..." style="padding: 4px 10px; font-size: 11.5px;">📤 Export</button>
                 </div>
                 <ul class="memory-list" id="memories-list">
-                    <li class="empty-msg">No memories stored yet.</li>
+                    <li class="empty-msg" style="border: 1px dashed var(--border-color); padding: 16px; border-radius: 8px; text-align: center;">
+                        <span style="font-size: 24px; display: block; margin-bottom: 6px;">🧠</span>
+                        No memories stored yet.<br/>
+                        <span style="font-size: 10px; color: var(--text-secondary); display: block; margin-top: 4px; line-height: 1.3;">Insights appear here when you save thoughts from chat.</span>
+                    </li>
                 </ul>
             </div>
 
-            <div class="panel-section">
+            <div class="panel-section section-tools">
                 <div class="sidebar-section-header">
                     <h2>🛠️ Discovered Tools</h2>
                     <div style="display:flex; gap:6px;">
@@ -168,44 +185,6 @@
                         </div>
                     </div>
 
-                    <!-- Context Budget Progress Bar -->
-                    <div class="context-budget-container">
-                        <div class="context-budget-header">
-                            <span>🧠 Context Budget</span>
-                            <span id="context-budget-text">0 / 8,192 tokens (0%)</span>
-                        </div>
-                        <div class="context-budget-bar-bg" id="context-budget-bar">
-                            <!-- Segment bars will be dynamically injected here -->
-                        </div>
-                        <div class="context-budget-legend" id="context-budget-legend">
-                            <!-- Legend items will be injected here -->
-                        </div>
-                    </div>
-
-                    <!-- Active Chat Functions Badges -->
-                    <div class="chat-functions-container" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; padding: 8px 12px; background-color: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 8px; box-shadow: var(--shadow-sm); flex-shrink: 0; align-items: center;">
-                        <span style="font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px;">🎯 Chat Functions:</span>
-                        <button class="func-badge active" id="badge-memory" data-func="enable_memory" title="Toggle persistent tiered memory injection">🧠 Memory</button>
-                        <button class="func-badge active" id="badge-artefacts" data-func="enable_artefacts" title="Toggle active workspace artifacts context">📄 Artifacts</button>
-                        <button class="func-badge active" id="badge-status" data-func="enable_in_message_status" title="Toggle in-message diagnostic status logs">⚙️ Status Logs</button>
-                        <button class="func-badge active" id="badge-presentations" data-func="enable_presentations" title="Toggle presentation slideshow generator">🎬 Presentations</button>
-                        <button class="func-badge active" id="badge-books" data-func="enable_books" title="Toggle book generator">📚 Books</button>
-                        <button class="func-badge active" id="badge-skills" data-func="enable_skills" title="Toggle long-term skill injection">🎓 Skills</button>
-                        <button class="func-badge active" id="badge-images" data-func="enable_image_generation" title="Toggle Text-to-Image generation">🖼️ Image Gen</button>
-                        <button class="func-badge active" id="badge-forms" data-func="enable_forms" title="Toggle interactive form generation">📋 Forms</button>
-                        <button class="func-badge active" id="badge-widgets" data-func="enable_inline_widgets" title="Toggle interactive HTML inline widgets">🎛️ Widgets</button>
-                        <button class="func-badge" id="badge-think" data-func="think" title="Enable or Disable deep thinking mode (for models supporting thinking)">🧠 Think</button>
-
-                        <!-- Temperature Override Control -->
-                        <div style="display: flex; align-items: center; gap: 6px; margin-left: auto; border-left: 1px solid var(--border-color); padding-left: 12px;">
-                            <label style="font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; display: flex; align-items: center; gap: 4px; user-select: none;">
-                                <input type="checkbox" id="temp-override-enable" style="width: auto; height: auto; accent-color: var(--accent-color); cursor: pointer;" />
-                                <span>🌡️ Temp Override</span>
-                            </label>
-                            <input type="number" id="temp-override-value" value="0.7" min="0.0" max="2.0" step="0.1" style="width: 54px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 4px; padding: 2px 6px; font-size: 11px; outline: none; font-weight: bold; text-align: center; display: none;" />
-                        </div>
-                    </div>
-
                     <!-- Chat Message Area -->
                     <div class="chat-history" id="chat-history">
                         <!-- Thinking Indicator -->
@@ -214,6 +193,53 @@
                             <span class="typing-dot"></span>
                             <span class="typing-dot"></span>
                             <span style="font-size: 11.5px; font-weight: bold; color: var(--text-secondary); margin-left: 4px;">Lollms is thinking...</span>
+                        </div>
+                    </div>
+
+                    <!-- Context Budget Progress Bar & Settings Menu -->
+                    <div class="context-budget-container" style="margin-bottom: 12px;">
+                        <div class="context-budget-header" style="align-items: center;">
+                            <span>🧠 Context Budget: <span id="context-budget-text" style="font-weight: bold; color: var(--text-primary);">0 / 8,192 tokens (0%)</span></span>
+
+                            <!-- Toggleable Dropdown Menu wrapper -->
+                            <div style="position: relative; display: inline-block;">
+                                <button id="btn-chat-functions-toggle" class="btn" style="width: auto; padding: 4px 10px; font-size: 11px; font-weight: 700; border-radius: 12px; display: flex; align-items: center; gap: 6px; background-color: var(--border-color); color: var(--text-primary); border: 1px solid var(--border-color); margin: 0; line-height: 1.2; text-transform: uppercase; letter-spacing: 0.03em;">
+                                    🎯 Chat Settings <span style="font-size: 8px;">▼</span>
+                                </button>
+
+                                <div id="chat-functions-dropdown" class="chat-functions-dropdown" style="display: none; position: absolute; bottom: 100%; right: 0; margin-bottom: 10px; background-color: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 10px; box-shadow: var(--shadow-lg); padding: 16px; width: 320px; z-index: 100; flex-direction: column; gap: 12px;">
+                                    <div style="font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border-color); padding-bottom: 6px; margin-bottom: 4px;">🎯 Chat Functions</div>
+                                    <div class="chat-functions-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                                        <button class="func-badge active" id="badge-memory" data-func="enable_memory" title="Toggle persistent tiered memory injection">🧠 Memory</button>
+                                        <button class="func-badge active" id="badge-artefacts" data-func="enable_artefacts" title="Toggle active workspace artifacts context">📄 Artifacts</button>
+                                        <button class="func-badge active" id="badge-status" data-func="enable_in_message_status" title="Toggle in-message diagnostic status logs">⚙️ Status Logs</button>
+                                        <button class="func-badge active" id="badge-presentations" data-func="enable_presentations" title="Toggle presentation slideshow generator">🎬 Presentations</button>
+                                        <button class="func-badge active" id="badge-books" data-func="enable_books" title="Toggle book generator">📚 Books</button>
+                                        <button class="func-badge active" id="badge-skills" data-func="enable_skills" title="Toggle long-term skill injection">🎓 Skills</button>
+                                        <button class="func-badge active" id="badge-images" data-func="enable_image_generation" title="Toggle Text-to-Image generation">🖼️ Image Gen</button>
+                                        <button class="func-badge active" id="badge-forms" data-func="enable_forms" title="Toggle interactive form generation">📋 Forms</button>
+                                        <button class="func-badge active" id="badge-widgets" data-func="enable_inline_widgets" title="Toggle interactive HTML inline widgets">🎛️ Widgets</button>
+                                        <button class="func-badge" id="badge-think" data-func="think" title="Enable or Disable deep thinking mode (for models supporting thinking)">🧠 Think</button>
+                                    </div>
+
+                                    <div style="border-top: 1px solid var(--border-color); padding-top: 10px; margin-top: 4px; display: flex; flex-direction: column; gap: 6px;">
+                                        <div style="font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em;">🌡️ Temperature Override</div>
+                                        <div style="display: flex; align-items: center; gap: 8px; justify-content: space-between; background-color: var(--bg-app); padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color);">
+                                            <label style="font-size: 11.5px; font-weight: bold; color: var(--text-primary); cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none; margin: 0; text-transform: none; letter-spacing: normal;">
+                                                <input type="checkbox" id="temp-override-enable" style="width: auto; height: auto; accent-color: var(--accent-color); cursor: pointer;" />
+                                                <span>Enable Override</span>
+                                            </label>
+                                            <input type="number" id="temp-override-value" value="0.7" min="0.0" max="2.0" step="0.1" style="width: 54px; background-color: var(--bg-panel); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 4px; padding: 4px 6px; font-size: 11px; outline: none; font-weight: bold; text-align: center; display: none;" />
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="context-budget-bar-bg" id="context-budget-bar">
+                            <!-- Segment bars will be dynamically injected here -->
+                        </div>
+                        <div class="context-budget-legend" id="context-budget-legend">
+                            <!-- Legend items will be injected here -->
                         </div>
                     </div>
 
@@ -239,59 +265,68 @@
         </section>
 
         <!-- Area 3: Right Panel (Macros) -->
-        <aside class="panel sidebar-right">
-            <h2>⚡ Macro Operations</h2>
-            <p class="section-desc">Macros trigger high-level AI analysis across all currently active/loaded artifacts in the session.</p>
-            <div class="macro-list">
-                <button class="macro-btn" id="macro-summarize" title="Generate a comprehensive summary of all active artifacts">
-                    <span class="macro-icon">📝</span>
-                    <div class="macro-meta">
-                        <span class="macro-name">Summarize Content</span>
-                        <span class="macro-desc">Creates a unified technical summary of all active documents.</span>
+        <aside class="panel sidebar-right" id="sidebar-right">
+            <div class="panel-section">
+                <div class="sidebar-section-header collapsible-header" id="macro-section-header" style="cursor: pointer; user-select: none;">
+                    <h2 style="border-bottom: none; margin-bottom: 0; padding-bottom: 0; display: flex; align-items: center; gap: 8px;">
+                        <span>⚡ Macro Operations</span>
+                    </h2>
+                    <span class="chevron" style="font-size: 11px; transition: transform 0.3s ease; transform: rotate(0deg); color: var(--text-secondary);">▼</span>
+                </div>
+                <div class="collapsible-content" id="macro-section-content">
+                    <p class="section-desc" style="margin-top: 8px;">Macros trigger high-level AI analysis across all currently active/loaded artifacts in the session.</p>
+                    <div class="macro-list">
+                        <button class="macro-btn" id="macro-summarize" title="Generate a comprehensive summary of all active artifacts">
+                            <span class="macro-icon">📝</span>
+                            <div class="macro-meta">
+                                <span class="macro-name">Summarize Content <span class="macro-badge instant">⚡</span></span>
+                                <span class="macro-desc">Creates a unified technical summary of all active documents.</span>
+                            </div>
+                        </button>
+                        <button class="macro-btn" id="macro-compare" title="Generate a comparative analysis across all active artifacts">
+                            <span class="macro-icon">⚖️</span>
+                            <div class="macro-meta">
+                                <span class="macro-name">Compare Documents <span class="macro-badge instant">⚡</span></span>
+                                <span class="macro-desc">Synthesizes differences, overlaps, and contradictions.</span>
+                            </div>
+                        </button>
+                        <button class="macro-btn" id="macro-graph" title="Generate a Graphviz concept relationship map">
+                            <span class="macro-icon">🕸️</span>
+                            <div class="macro-meta">
+                                <span class="macro-name">Build Knowledge Graph <span class="macro-badge instant">⚡</span></span>
+                                <span class="macro-desc">Creates an interactive Graphviz network of key concepts.</span>
+                            </div>
+                        </button>
+                        <button class="macro-btn" id="macro-report" title="Generate a comprehensive, structured technical report">
+                            <span class="macro-icon">📊</span>
+                            <div class="macro-meta">
+                                <span class="macro-name">Generate Full Report <span class="macro-badge guided">🛠️</span></span>
+                                <span class="macro-desc">Creates a beautifully structured, multi-section PDF report artifact.</span>
+                            </div>
+                        </button>
+                        <button class="macro-btn" id="macro-infographic" title="Generate a visually stunning infographic artifact (Requires active TTI)">
+                            <span class="macro-icon">🖼️</span>
+                            <div class="macro-meta">
+                                <span class="macro-name">Build Infographic <span class="macro-badge guided">🛠️</span></span>
+                                <span class="macro-desc">Fuses data into a visual poster artifact using the TTI engine.</span>
+                            </div>
+                        </button>
+                        <button class="macro-btn" id="macro-presentation" title="Convert active artifacts into a beautiful slide deck">
+                            <span class="macro-icon">🎬</span>
+                            <div class="macro-meta">
+                                <span class="macro-name">Build Presentation <span class="macro-badge guided">🛠️</span></span>
+                                <span class="macro-desc">Creates an interactive, styled HTML5 presentation slide deck.</span>
+                            </div>
+                        </button>
+                        <button class="macro-btn" id="macro-test-form" title="Generate an interactive form to test the form rendering engine">
+                            <span class="macro-icon">📋</span>
+                            <div class="macro-meta">
+                                <span class="macro-name">Test Interactive Form <span class="macro-badge instant">⚡</span></span>
+                                <span class="macro-desc">Requests the model to generate a rich, interactive form to gather inputs.</span>
+                            </div>
+                        </button>
                     </div>
-                </button>
-                <button class="macro-btn" id="macro-compare" title="Generate a comparative analysis across all active artifacts">
-                    <span class="macro-icon">⚖️</span>
-                    <div class="macro-meta">
-                        <span class="macro-name">Compare Documents</span>
-                        <span class="macro-desc">Synthesizes differences, overlaps, and contradictions.</span>
-                    </div>
-                </button>
-                <button class="macro-btn" id="macro-graph" title="Generate a Graphviz concept relationship map">
-                    <span class="macro-icon">🕸️</span>
-                    <div class="macro-meta">
-                        <span class="macro-name">Build Knowledge Graph</span>
-                        <span class="macro-desc">Creates an interactive Graphviz network of key concepts.</span>
-                    </div>
-                </button>
-                <button class="macro-btn" id="macro-report" title="Generate a comprehensive, structured technical report">
-                    <span class="macro-icon">📊</span>
-                    <div class="macro-meta">
-                        <span class="macro-name">Generate Full Report</span>
-                        <span class="macro-desc">Creates a beautifully structured, multi-section PDF report artifact.</span>
-                    </div>
-                </button>
-                <button class="macro-btn" id="macro-infographic" title="Generate a visually stunning infographic artifact (Requires active TTI)">
-                    <span class="macro-icon">🖼️</span>
-                    <div class="macro-meta">
-                        <span class="macro-name">Build Infographic</span>
-                        <span class="macro-desc">Fuses data into a visual poster artifact using the TTI engine.</span>
-                    </div>
-                </button>
-                <button class="macro-btn" id="macro-presentation" title="Convert active artifacts into a beautiful slide deck">
-                    <span class="macro-icon">🎬</span>
-                    <div class="macro-meta">
-                        <span class="macro-name">Build Presentation</span>
-                        <span class="macro-desc">Creates an interactive, styled HTML5 presentation slide deck.</span>
-                    </div>
-                </button>
-                <button class="macro-btn" id="macro-test-form" title="Generate an interactive form to test the form rendering engine">
-                    <span class="macro-icon">📋</span>
-                    <div class="macro-meta">
-                        <span class="macro-name">Test Interactive Form</span>
-                        <span class="macro-desc">Requests the model to generate a rich, interactive form to gather inputs.</span>
-                    </div>
-                </button>
+                </div>
             </div>
         </aside>
     </main>
@@ -893,6 +928,22 @@
                 <div id="settings-apply-group" style="display: none;"></div>
                 <button class="btn btn-secondary" id="btn-cancel-settings" style="width: auto;">Cancel</button>
                 <button class="btn btn-primary" id="btn-apply-global-settings" style="width: auto;">💾 Save Configuration</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 🔍 Command Palette (Ctrl+K) Modal -->
+    <div class="modal-overlay" id="command-palette-modal" style="display: none; z-index: 100010;">
+        <div class="modal-container" style="width: 500px; max-height: 400px;">
+            <div class="modal-header" style="padding: 12px 20px;">
+                <h2 style="font-size: 14px;">🔍 Command Palette</h2>
+                <button class="modal-close-btn" id="btn-close-command-palette">×</button>
+            </div>
+            <div class="modal-body" style="padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow: hidden;">
+                <input type="text" id="command-palette-input" placeholder="Type to search files, memories, macros... (Esc to close)" style="width: 100%; padding: 10px 14px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 8px; outline: none; font-size: 13px;" />
+                <ul id="command-palette-results" style="list-style: none; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; max-height: 240px; padding-right: 4px;">
+                    <!-- Results will be injected dynamically -->
+                </ul>
             </div>
         </div>
     </div>

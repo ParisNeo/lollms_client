@@ -1299,7 +1299,8 @@ class ArtefactManager:
 
     def get_context_images(self) -> List[Dict[str, Any]]:
         """
-        Returns ALL images from active artefacts that have images.
+        Returns ALL images from active artefacts that have images,
+        including companion images artefacts.
 
         Each entry:
             {
@@ -1315,7 +1316,10 @@ class ArtefactManager:
         The chat layer merges these with message-level images before calling the LLM.
         """
         result: List[Dict[str, Any]] = []
-        for a in self._get_all_raw():
+        raw_list = self._get_all_raw()
+        by_title = {a.get('title'): a for a in raw_list}
+
+        for a in raw_list:
             if not a.get('active', False):
                 continue
             imgs   = a.get('images') or []
@@ -1332,6 +1336,25 @@ class ArtefactManager:
                     "index":      idx,
                     "active":     True,
                 })
+
+            # Retrieve from companion images artefact (e.g., "title::images") if present
+            comp_title = f"{a.get('title')}::images"
+            if comp_title in by_title:
+                comp_a = by_title[comp_title]
+                comp_imgs = comp_a.get('images') or []
+                comp_mtypes = comp_a.get('image_media_types') or []
+                for idx, img_b64 in enumerate(comp_imgs):
+                    if not img_b64:
+                        continue
+                    mtype = comp_mtypes[idx] if idx < len(comp_mtypes) else "image/jpeg"
+                    result.append({
+                        "id":         make_image_id(comp_title, idx),
+                        "data":       img_b64,
+                        "media_type": mtype,
+                        "title":      comp_title,
+                        "index":      idx,
+                        "active":     True,
+                    })
         return result
 
     def get_active_images(self) -> List[Dict[str, Any]]:

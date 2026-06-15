@@ -367,10 +367,16 @@ class LollmsLLMBinding(LollmsBaseBinding):
             if role == "system":
                 role = "user"
 
-            normalized.append({
+            msg_entry = {
                 "role": role,
                 "content": content
-            })
+            }
+            if "images" in msg:
+                msg_entry["images"] = list(msg["images"])
+            if "active_images" in msg:
+                msg_entry["active_images"] = list(msg["active_images"])
+
+            normalized.append(msg_entry)
 
         # 4. Merge consecutive messages with the same role
         merged = []
@@ -416,6 +422,16 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     prev["content"] = combined_parts[0]["text"]
                 else:
                     prev["content"] = combined_parts
+
+                # Merge image lists when combining messages of the same role
+                if "images" in msg:
+                    prev_images = prev.setdefault("images", [])
+                    for img in msg["images"]:
+                        if img not in prev_images:
+                            prev_images.append(img)
+                if "active_images" in msg:
+                    prev_active = prev.setdefault("active_images", [])
+                    prev_active.extend(msg["active_images"])
             else:
                 merged.append(msg)
 

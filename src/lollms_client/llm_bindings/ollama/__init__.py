@@ -145,6 +145,9 @@ class OllamaBinding(LollmsLLMBinding):
                     cleaned = re.sub(r"^data:image/[^;]+;base64,", "", img)
                     try:
                         # Decode base64 to raw bytes as expected by the ollama-python client
+                        missing_padding = len(cleaned) % 4
+                        if missing_padding:
+                            cleaned += '=' * (4 - missing_padding)
                         decoded = base64.b64decode(cleaned)
                         cleaned_images.append(decoded)
                     except Exception:
@@ -286,6 +289,9 @@ class OllamaBinding(LollmsLLMBinding):
                         if isinstance(img_path, str):
                             cleaned = re.sub(r"^data:image/[^;]+;base64,", "", img_path)
                             try:
+                                missing_padding = len(cleaned) % 4
+                                if missing_padding:
+                                    cleaned += '=' * (4 - missing_padding)
                                 decoded = base64.b64decode(cleaned)
                                 processed_images.append(decoded)
                             except Exception:
@@ -353,6 +359,10 @@ class OllamaBinding(LollmsLLMBinding):
                                 if streaming_callback:
                                     if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
                                         break # Callback requested stop
+                        if in_thinking:
+                            full_response_text += "\n</think>\n"
+                            if streaming_callback:
+                                streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
                         return full_response_text
                     else: # Not streaming
                         chat_kwargs = {
@@ -397,7 +407,6 @@ class OllamaBinding(LollmsLLMBinding):
                     if self.debug:
                         ASCIIColors.cyan(f"[{self.binding_name}] Sending chat request to Ollama:")
                         ASCIIColors.cyan(f"  • Model: {self.model_name}")
-                        ASCIIColors.cyan(f"  • Messages: {json.dumps(chat_kwargs['messages'], indent=2)}")
                         if chat_kwargs.get("options"):
                             ASCIIColors.cyan(f"  • Options: {json.dumps(chat_kwargs['options'], indent=2)}")
 
@@ -422,8 +431,6 @@ class OllamaBinding(LollmsLLMBinding):
                                 chunk_content = None
 
                             if chunk_thinking:
-                                if self.debug:
-                                    ASCIIColors.rich_print(f"[purple]{chunk_thinking}[/purple]", end="", flush=True)
                                 if not in_thinking:
                                     full_response_text += "<think>\n"
                                     in_thinking = True
@@ -532,8 +539,6 @@ class OllamaBinding(LollmsLLMBinding):
 
                         # Process and stream thinking tokens dynamically to prevent idle silences
                         if chunk_thinking:
-                            if self.debug:
-                                ASCIIColors.rich_print(f"[purple]{chunk_thinking}[/purple]", end="", flush=True)
                             if not in_thinking:
                                 in_thinking = True
                                 if streaming_callback:
@@ -550,12 +555,14 @@ class OllamaBinding(LollmsLLMBinding):
                                 streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
 
                         if chunk_content: # Ensure there is content to process
-                            if self.debug:
-                                ASCIIColors.rich_print(f"[cyan]{chunk_content}[/cyan]", end="", flush=True)
                             full_response_text += chunk_content
                             if streaming_callback:
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
                                     break 
+                    if in_thinking:
+                        full_response_text += "\n</think>\n"
+                        if streaming_callback:
+                            streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
                     return full_response_text
                 else:
                     chat_kwargs["stream"] = False
@@ -665,7 +672,6 @@ class OllamaBinding(LollmsLLMBinding):
                     if self.debug:
                         ASCIIColors.cyan(f"[{self.binding_name}] Sending chat request to Ollama:")
                         ASCIIColors.cyan(f"  • Model: {self.model_name}")
-                        ASCIIColors.cyan(f"  • Messages: {json.dumps(ollama_messages, indent=2)}")
 
                     response_stream = client.chat(**chat_kwargs)
                     in_thinking = False
@@ -688,8 +694,6 @@ class OllamaBinding(LollmsLLMBinding):
 
                         # Process and stream thinking tokens dynamically to prevent idle silences
                         if chunk_thinking:
-                            if self.debug:
-                                ASCIIColors.rich_print(f"[purple]{chunk_thinking}[/purple]", end="", flush=True)
                             if not in_thinking:
                                 in_thinking = True
                                 if streaming_callback:
@@ -713,6 +717,10 @@ class OllamaBinding(LollmsLLMBinding):
                                 if not streaming_callback(chunk_content, MSG_TYPE.MSG_TYPE_CHUNK):
                                     break # Callback requested stop
 
+                    if in_thinking:
+                        full_response_text += "\n</think>\n"
+                        if streaming_callback:
+                            streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_CHUNK)
                     return full_response_text
                 else: # Not streaming
                     chat_kwargs["stream"] = False
@@ -838,6 +846,38 @@ class OllamaBinding(LollmsLLMBinding):
             trace_exception(ex)
             raise Exception(f"Embedding failed: {str(ex)}") from ex
         
+    @property
+    def supports_vision(self) -> bool:
+        """
+        Dynamically determine if the active model supports vision.
+        """
+        if not self.model_name:
+            return False
+        try:
+            # Query Ollama to get model details
+            with self._client() as client:
+                info = client.show(self.model_name)
+
+                # Check families in details
+                details = info.get("details", {})
+                families = details.get("families", []) or [details.get("family", "")]
+                families = [f.lower() for f in families if f]
+
+                if any(f in families for f in ("llava", "mllama", "clip", "vision")):
+                    return True
+
+                # Check keys in model_info
+                model_info = info.get("model_info", {})
+                for key in model_info.keys():
+                    key_lower = key.lower()
+                    if "vision" in key_lower or "clip" in key_lower or "projector" in key_lower:
+                        return True
+
+            return False
+        except Exception:
+            # Fallback to True for compatibility/safety if show fails
+            return True
+
     def get_model_info(self) -> dict:
         """
         Return information about the current Ollama model setup.
@@ -851,7 +891,7 @@ class OllamaBinding(LollmsLLMBinding):
             "host_address": self.host_address,
             "model_name": self.model_name,
             "supports_structured_output": False, # Ollama primarily supports text/chat
-            "supports_vision": True # Many Ollama models (e.g. llava, bakllava) support vision
+            "supports_vision": self.supports_vision
         }
 
     def pull_model(self, model_name: str, progress_callback: Callable[[dict], None] = None, **kwargs) -> dict:

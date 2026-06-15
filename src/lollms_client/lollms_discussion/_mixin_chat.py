@@ -5800,7 +5800,13 @@ Assistant: <agent_mode/>
                 "content": full_system_context.strip(),
             })
 
-            for m in _virtual_history:
+            # Identify the last user message in the virtual history
+            last_user_index_in_history = -1
+            for idx, m in enumerate(_virtual_history):
+                if getattr(m, "sender_type", None) == "user":
+                    last_user_index_in_history = idx
+
+            for idx, m in enumerate(_virtual_history):
                 if m.sender_type == "system":
                     # Already injected above; skip to avoid duplication
                     continue
@@ -5864,8 +5870,38 @@ Assistant: <agent_mode/>
                     else ("user" if role == "user" else "system")
                 )
                 content = content.strip()
-                if content:
-                    _formatted_messages.append({"role": msg_role, "content": content})
+
+                active_images = []
+                if hasattr(m, "get_active_images"):
+                    active_images = m.get_active_images()
+                elif hasattr(m, "images") and m.images:
+                    active_images = m.images
+
+                # Attach newly merged chat turn images to the last user message
+                if idx == last_user_index_in_history and images:
+                    for img in images:
+                        if img not in active_images:
+                            active_images.append(img)
+
+                if content or active_images:
+                    msg_entry = {"role": msg_role}
+                    if active_images:
+                        # 1. Content list-of-parts (OpenAI standard)
+                        content_parts = [{"type": "text", "text": content}] if content else []
+                        for img_b64 in active_images:
+                            clean_b64 = img_b64.split(";base64,")[-1] if ";base64," in img_b64 else img_b64
+                            content_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{clean_b64}", "detail": "auto"}
+                            })
+                        msg_entry["content"] = content_parts
+
+                        # 2. Parallel "images" list of raw base64 (Ollama standard)
+                        msg_entry["images"] = [img_b64.split(";base64,")[-1] if ";base64," in img_b64 else img_b64 for img_b64 in active_images]
+                    else:
+                        msg_entry["content"] = content
+
+                    _formatted_messages.append(msg_entry)
 
                 # ── INJECT SYNTHETIC TOOL RESULTS FOR ACTION LEARNING ──────────────
                 # CRITICAL FIX: Include actual parameters and outputs so the LLM can learn
