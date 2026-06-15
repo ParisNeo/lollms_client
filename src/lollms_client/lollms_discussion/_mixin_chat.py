@@ -4099,12 +4099,22 @@ class ChatMixin:
         ) -> Dict[str, Any]:
         self.scratchpad = ""
 
+        # ── CRITICAL FIX: Initialize personality and integrate its parameters ─────────────
         personality = personality or NullPersonality()
+
+        # Integrate personality system prompt into discussion context
+        if personality.system_prompt and bool(personality):
+            # Prepend personality system prompt to ensure it's the primary instruction
+            original_sp = self._system_prompt or ""
+            if personality.system_prompt not in original_sp:
+                object.__setattr__(
+                    self, "_system_prompt",
+                    personality.system_prompt + "\n\n" + original_sp
+                )
+            ASCIIColors.info(f"[chat] Personality system prompt integrated: {personality.name}")
+
         callback    = kwargs.get("streaming_callback")
-        if images is not None:
-            ASCIIColors.info(f"[LollmsDiscussion.chat] Received 'images' parameter: count={len(images)}, types={[type(img).__name__ for img in images[:5]]}")
-        else:
-            ASCIIColors.warning("[LollmsDiscussion.chat] Received 'images' parameter as None")
+        ASCIIColors.info(f"[LollmsDiscussion.chat] Received 'images' parameter: count={len(images) if images else 0}, types={[type(img).__name__ for img in images[:5]] if images else ''}")
         # Disable proactive memory pulling if the user has provided an image to avoid context dilution
         if images and len(images) > 0:
             enable_deep_memory_pulling = False
@@ -4368,7 +4378,21 @@ TRIGGER EXAMPLES:
         tool_descriptions: List[str]      = []
         rag_registry:      Dict[str, Any] = {}
         rag_tool_specs:    Dict[str, Any] = {}
- 
+
+        # ── CRITICAL FIX: Pre-register personality tools BEFORE other tools ─────────────
+        # This ensures personality tools are always available and prioritized
+        _pt_specs = {}
+        if bool(personality):
+            try:
+                _pt_specs = personality.tool_specs(
+                    client_binding=getattr(self.lollmsClient, "tools", None)
+                )
+                if _pt_specs:
+                    ASCIIColors.info(f"[chat] Personality '{personality.name}' provides {len(_pt_specs)} tool(s)")
+            except Exception as _pte:
+                _warning(callback, f"  Personality tool discovery failed: {_pte}")
+                trace_exception(_pte)
+
         composable_answer  = {"sections": [], "complete": False, "last_updated": None}
         scratchpad_state   = {"notes": {}, "history": [], "assumptions": {}, "corrections": []}
         collected_sources: List[Dict] = []
@@ -4439,7 +4463,7 @@ TRIGGER EXAMPLES:
                 else:
                     parts.append(f"{pn}: {pt}")
             return ", ".join(parts)
- 
+
         def _register(name, fn, params, description, output=None):
             tool_registry[name] = _make_wrapper(fn, params)
             tool_descriptions.append(f"- {name}({_sig(params)}): {description}")
@@ -4449,8 +4473,25 @@ TRIGGER EXAMPLES:
                     "default_top_k":   rag_top_k,
                     "default_min_sim": rag_min_similarity_percent,
                 }
- 
-        # ── Layer 1: caller-supplied tools ────────────────────────────────────
+
+        # ── Layer 1: Personality tools (ALREADY registered above, skip duplicate) ────────
+        # Personality tools were pre-registered at the start of tool registry section
+        if _pt_specs:
+            for pt_name, pt_spec in _pt_specs.items():
+                fn = pt_spec.get("callable")
+                if not callable(fn):
+                    continue
+                # Skip if already registered (from pre-registration)
+                if pt_name not in tool_registry:
+                    _register(
+                        name        = pt_name,
+                        fn          = fn,
+                        params      = pt_spec.get("parameters", []),
+                        description = pt_spec.get("description", f"Execute {pt_name}"),
+                        output      = pt_spec.get("output", []),
+                    )
+
+        # ── Layer 2: caller-supplied tools ────────────────────────────────────
         for tool_name, tool_spec in (tools or {}).items():
             if not isinstance(tool_spec, dict):
                 continue
@@ -4464,32 +4505,6 @@ TRIGGER EXAMPLES:
                 description = tool_spec.get("description", f"Execute {tool_name}"),
                 output      = tool_spec.get("output", []),
             )
- 
-        # ── Layer 2: personality.tool_specs() ─────────────────────────────────
-        _pt_specs = {}
-        try:
-            _pt_specs = personality.tool_specs(
-                client_binding=getattr(self.lollmsClient, "tools", None)
-            )
-        except Exception as _pte:
-            _warning(callback, f"  Personality tool discovery failed: {_pte}")
-            trace_exception(_pte)
- 
-        if _pt_specs:
-            _pt_step_id = _step_start(callback, f"Loading {len(_pt_specs)} personality tool(s)...")
-            for pt_name, pt_spec in _pt_specs.items():
-                fn = pt_spec.get("callable")
-                if not callable(fn):
-                    continue
-                _register(
-                    name        = pt_name,
-                    fn          = fn,
-                    params      = pt_spec.get("parameters", []),
-                    description = pt_spec.get("description", f"Execute {pt_name}"),
-                    output      = pt_spec.get("output", []),
-                )
-            _step_end(callback, f"{len(_pt_specs)} personality tool(s) ready", _pt_step_id,
-                      {"tool_count": len(_pt_specs)})
  
         # ── Layer 3: personality RAG tool ─────────────────────────────────────
         if personality.has_data:
@@ -4520,7 +4535,37 @@ TRIGGER EXAMPLES:
                 output      = [{"name": "sources", "type": "list"}],
             )
 
-        # ── Layer 4: Global Memory RAG tool ──
+        # ── Layer 4: Personality RAG data injection into context ─────────────────────────
+        # CRITICAL FIX: Inject personality RAG data directly into scratchpad for immediate access
+        if personality.has_data:
+            try:
+                # Query personality knowledge base with user message as initial query
+                _rag_query = user_message
+                _rag_result = personality.query_data(_rag_query)
+
+                if _rag_result and _rag_result.get("success") and _rag_result.get("sources"):
+                    _rag_chunks = []
+                    for idx, chunk in enumerate(_rag_result.get("sources", [])):
+                        src = chunk.get("source", "")
+                        _score = chunk.get("score", 1.0)
+                        if _score >= rag_min_similarity_percent:
+                            _rag_chunks.append(
+                                f"[Personality Knowledge Chunk] (Source: {src}, Score: {_score:.2f})\n{chunk.get('content', '')}"
+                            )
+
+                    if _rag_chunks:
+                        # Prepend personality RAG data to scratchpad
+                        rag_context = "\n\n".join(_rag_chunks[:5])  # Top 5 chunks
+                        self.scratchpad = (
+                            f"=== PERSONALITY KNOWLEDGE BASE ===\n{rag_context}\n=== END PERSONALITY KNOWLEDGE ===\n\n" +
+                            (self.scratchpad or "")
+                        )
+                        ASCIIColors.success(f"[chat] Personality RAG: Injected {len(_rag_chunks)} knowledge chunk(s) into context")
+            except Exception as _rag_err:
+                _warning(callback, f"  Personality RAG injection failed: {_rag_err}")
+                trace_exception(_rag_err)
+
+        # ── Layer 5: Global Memory RAG tool ──
         if _mm:
             def _query_memories_tool_impl(query: str) -> Dict[str, Any]:
                 res = _mm.query(query, top_k=5)
