@@ -4673,15 +4673,15 @@ TRIGGER EXAMPLES:
  Images : {len(images) if images else 0}
 """
             if _tool_categories["search"]:
-                text += f"    └─ Search: {', '.join(_tool_categories['search'])}"
+                text += f"    └─ Search: {', '.join(_tool_categories['search'])}\n"
             if _tool_categories["artifact"]:
-                text += f"    └─ Artifact: {', '.join(_tool_categories['artifact'])}"
+                text += f"    └─ Artifact: {', '.join(_tool_categories['artifact'])}\n"
             if _tool_categories["memory"]:
-                text += f"    └─ Memory: {', '.join(_tool_categories['memory'])}"
+                text += f"    └─ Memory: {', '.join(_tool_categories['memory'])}\n"
             if _tool_categories["data"]:
-                text += f"    └─ Data: {', '.join(_tool_categories['data'])}"
+                text += f"    └─ Data: {', '.join(_tool_categories['data'])}\n"
             if _tool_categories["other"]:
-                text += f"    └─ Other: {', '.join(_tool_categories['other'])}"
+                text += f"    └─ Other: {', '.join(_tool_categories['other'])}\n"
 
             ASCIIColors.panel(text, title="[FAST-PATH DEFAULT] Agent mode on-demand via tags", border_style="green")
 
