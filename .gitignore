@@ -173,3 +173,7 @@ logs/
 *.log
 !log.log
 *.log
+
+# ignore data files
+*.xlsx
+*.csv
