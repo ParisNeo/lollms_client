@@ -31,6 +31,7 @@ from ._mixin_memory import MemoryMixin
 from ._mixin_file_import import FileImportMixin
 from ._mixin_internet_import import InternetImportMixin
 from ._mixin_export import ExportMixin
+from .lollms_memory import FailureMemory
 
 class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixin, MemoryMixin, FileImportMixin, InternetImportMixin, ExportMixin):
     """
@@ -112,5 +113,6 @@ __all__ = [
     "MemoryMixin",
     "FileImportMixin",
     "InternetImportMixin",
-    "ExportMixin"
+    "ExportMixin",
+    "FailureMemory"
 ]

@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-17 22:59]
+
+- refactor(client): update web interface and enhance core discussion logic
+
 ## [2026-06-15 22:20]
 
 - feat(app): update frontend UI and refine LLM binding integrations

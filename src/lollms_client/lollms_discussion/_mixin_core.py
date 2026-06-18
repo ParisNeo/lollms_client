@@ -48,6 +48,8 @@ class CoreMixin:
         object.__setattr__(self, 'scratchpad', "")
         object.__setattr__(self, '_session', None)
         object.__setattr__(self, '_db_discussion', None)
+        import threading
+        object.__setattr__(self, '_db_lock', threading.Lock())
         object.__setattr__(self, '_message_index', None)
         object.__setattr__(self, '_messages_to_delete_from_db', set())
         object.__setattr__(self, '_is_db_backed', db_manager is not None)
@@ -264,20 +266,28 @@ class CoreMixin:
     def commit(self):
         if not self._is_db_backed or not self._session:
             return
-        if self._messages_to_delete_from_db:
-            for msg_id in self._messages_to_delete_from_db:
-                msg_to_del = self._session.get(self.db_manager.MessageModel, msg_id)
-                if msg_to_del:
-                    self._session.delete(msg_to_del)
-            self._messages_to_delete_from_db.clear()
-        try:
-            self._session.commit()
-            self._rebuild_message_index()
-        except Exception as e:
-            # Trace the specific DB error before rolling back
-            trace_exception(e)
-            self._session.rollback()
-            raise e
+
+        with self._db_lock:
+            if not self._session.is_active:
+                return
+
+            if self._messages_to_delete_from_db:
+                for msg_id in self._messages_to_delete_from_db:
+                    msg_to_del = self._session.get(self.db_manager.MessageModel, msg_id)
+                    if msg_to_del:
+                        self._session.delete(msg_to_del)
+                self._messages_to_delete_from_db.clear()
+            try:
+                self._session.commit()
+                self._rebuild_message_index()
+            except Exception as e:
+                # Trace the specific DB error before rolling back
+                trace_exception(e)
+                try:
+                    self._session.rollback()
+                except Exception:
+                    pass
+                raise e
 
     def close(self):
         if self._session:
@@ -340,6 +350,21 @@ class CoreMixin:
             return []
         branch_orms = []
         current_id = leaf_id
+
+        # Concurrency Guard: If the requested leaf_id is not in the message index (which
+        # occurs during active background generation before the transaction is committed),
+        # we dynamically fall back to the latest committed message in the index to prevent
+        # the entire conversation history from being wiped or hidden from the user.
+        if current_id not in self._message_index:
+            self._rebuild_message_index()
+            if current_id not in self._message_index:
+                all_msgs = list(self._message_index.values())
+                if all_msgs:
+                    all_msgs.sort(key=lambda m: m.created_at or datetime.min)
+                    current_id = all_msgs[-1].id
+                else:
+                    return []
+
         while current_id and current_id in self._message_index:
             msg_orm = self._message_index[current_id]
             branch_orms.append(msg_orm)

@@ -634,9 +634,10 @@ class UtilsMixin:
     def get_context_status(self, branch_tip_id=None) -> Dict[str, Any]:
         """
         Provides a detailed breakdown of token usage across all context zones.
-        Ensures all content (zones, scratchpad, grouped artefacts, history) is contabilized.
-        Images are fixed at 256 tokens each.
+        Ensures all content (zones, scratchpad, grouped artifacts, history) is contabilized.
+        Optimized with persistent, change-invalidated caching to prevent network floods.
         """
+        import hashlib
         max_ctx = self.max_context_size or 8192
         result = {
             "max_tokens": max_ctx,
@@ -646,6 +647,27 @@ class UtilsMixin:
         }
         tokenizer = self.lollmsClient.count_tokens
         
+        # Lazy-initialize a persistent token cache in the discussion metadata dict
+        meta = dict(self.metadata or {})
+        token_cache = meta.setdefault("_token_cache", {})
+        cache_dirty = False
+
+        def _get_cached_tokens(text_block: str, category_key: str) -> int:
+            nonlocal cache_dirty
+            if not text_block:
+                return 0
+            # Use MD5 hash of content as the cache invalidation key
+            h = hashlib.md5(text_block.encode('utf-8', errors='ignore')).hexdigest()
+            cache_entry = token_cache.get(category_key, {})
+            if cache_entry.get("hash") == h:
+                return cache_entry["tokens"]
+            
+            # Recalculate only on change
+            count = tokenizer(text_block)
+            token_cache[category_key] = {"hash": h, "tokens": count}
+            cache_dirty = True
+            return count
+
         # ── 1. System & Data Zones ──────────────────────────────────────────
         system_prompt_text = (self._system_prompt or "").strip()
         pruning_block = ""
@@ -664,17 +686,19 @@ class UtilsMixin:
             ("pruning_summary", (pruning_block or ""))
         ]
 
-        for key, text in zone_map:
-            val = (text or "").strip()
+        for key, text_val in zone_map:
+            val = (text_val or "").strip()
             if val:
-                zone_breakdown[key] = {"tokens": tokenizer(val)}
+                zone_breakdown[key] = {"tokens": _get_cached_tokens(val, f"zone_{key}")}
 
         _mm = getattr(self, "memory_manager", None)
         if _mm:
             working_txt = _mm.build_working_zone(token_counter=tokenizer)
             deep_txt = _mm.build_handles_zone(token_counter=tokenizer)
-            if working_txt: zone_breakdown["working_memory"] = {"tokens": tokenizer(working_txt)}
-            if deep_txt: zone_breakdown["deep_memory"] = {"tokens": tokenizer(deep_txt)}
+            if working_txt: 
+                zone_breakdown["working_memory"] = {"tokens": _get_cached_tokens(working_txt, "working_mem")}
+            if deep_txt: 
+                zone_breakdown["deep_memory"] = {"tokens": _get_cached_tokens(deep_txt, "deep_mem_handles")}
 
         # ── 2. Artefacts Grouped Breakdown ──────────────────────────────────
         active_artefacts = self.artefacts.list(active_only=True)
@@ -693,7 +717,7 @@ class UtilsMixin:
             fence = f"```{lang}\n{content}\n```" if content else ""
             art_block = header + fence
             
-            art_tokens = tokenizer(art_block)
+            art_tokens = _get_cached_tokens(art_block, f"art_{art['title']}_v{art.get('version', 1)}")
             if atype not in active_artefacts_by_type:
                 active_artefacts_by_type[atype] = {"tokens": 0, "count": 0}
             
@@ -712,7 +736,7 @@ class UtilsMixin:
         full_sys_content = f"{system_prompt_text}\n\n{full_data_zone}\n\n{pruning_block}".strip()
         sys_block_formatted = f"!@>system:\n{full_sys_content}\n"
         
-        sys_tokens = tokenizer(sys_block_formatted)
+        sys_tokens = _get_cached_tokens(sys_block_formatted, "full_system_context")
         result["zones"]["system_context"] = {
             "tokens": sys_tokens,
             "breakdown": zone_breakdown
@@ -741,13 +765,24 @@ class UtilsMixin:
                 # Handle Images in history
                 active_imgs = msg.get_active_images()
                 img_count = len(active_imgs)
+                img_toks = 0
                 if img_count > 0:
                     img_toks = sum(self.lollmsClient.count_image_tokens(img_data) for img_data in active_imgs)
                     history_breakdown["image_tokens"] += img_toks
                     content += f"\n({img_count} image(s) attached)"
                 
                 msg_text = f"!@>{sender_clean}:\n{content}\n"
-                history_breakdown["text_tokens"] += tokenizer(msg_text)
+                
+                # Check persistent cache on the LollmsMessage object directly
+                # Invalidate if message is still being modified or tokens not yet set
+                if getattr(msg, "tokens", None) is not None and msg.tokens > 0:
+                    msg_toks = msg.tokens
+                else:
+                    msg_toks = tokenizer(msg_text)
+                    msg.tokens = msg_toks
+                    cache_dirty = True
+                
+                history_breakdown["text_tokens"] += msg_toks
             
             history_tokens = history_breakdown["text_tokens"] + history_breakdown["image_tokens"]
             result["zones"]["message_history"] = {
@@ -769,7 +804,12 @@ class UtilsMixin:
         total_tokens = sum(z.get("tokens", 0) for z in result["zones"].values())
         result["current_tokens"] = total_tokens
         result["percent"] = round((total_tokens / max_ctx) * 100, 2)
-        
+
+        if cache_dirty:
+            self.metadata = meta
+            self.touch()
+            self.commit()
+
         return result
 
     def get_all_images(self, branch_tip_id=None):

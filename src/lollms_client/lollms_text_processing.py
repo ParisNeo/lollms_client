@@ -1896,9 +1896,11 @@ Generate ONLY the JSON within the tags. No explanations before or after."""
         return [match.group(2).strip() for match in matches]
     
     def remove_thinking_blocks(self, text: str) -> str:
-        """Remove thinking blocks from text."""
+        """Remove thinking blocks and any orphaned agent/mode tags from text."""
+        if not text:
+            return ""
         # Match <thinking>, <think>, AND <think> tags (case insensitive)
-        pattern = r'<(thinking|think|think)>\s*.*?\s*</\1>\s*'
+        pattern = r'<(thinking|think|think|agent_mode|mem_new|mem_update)>\s*.*?\s*</\1>\s*'
         cleaned = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
 
         # Also match <think>...</think> (no angle brackets, common in OpenAI models)
@@ -1913,6 +1915,17 @@ Generate ONLY the JSON within the tags. No explanations before or after."""
             if end_pos != -1:
                 # Keep everything after </think>, discard everything before
                 cleaned = cleaned[end_pos + len('</think>'):].lstrip()
+
+        # Strip standalone agent_mode or partially leaked remains (like _mode/>, _new, or _done)
+        cleaned = re.sub(r'<agent_mode\s*/?>|<mem_[a-z_]+\s*[^>]*>|<done\s*/?>', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r'^\s*_*agent_mode\s*/?>|^\s*_*mode\s*/?>|^\s*_*_mode\s*/?>|'
+            r'^\s*_*new\s*[^>]*/?>|^\s*_*update\s*[^>]*/?>|'
+            r'^\s*_*tag\s*[^>]*/?>|^\s*_*load\s*[^>]*/?>|'
+            r'^\s*_*delete\s*[^>]*/?>|'
+            r'^\s*_*done\s*/?>',
+            '', cleaned, flags=re.IGNORECASE
+        )
 
         # Clean up excessive newlines from the removal
         return re.sub(r'\n{3,}', '\n\n', cleaned).strip()

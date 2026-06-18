@@ -251,19 +251,37 @@ def tool_execute_python_data_query(
     active_file = workspace_dir / f"{title}{ext}"
     active_file_mtime_before = active_file.stat().st_mtime if active_file.exists() else 0
 
+    # Pre-execution Path Sanitization: Convert accidental absolute paths to clean relative ones
+    code_sanitized = re.sub(r'["\']/?(?:workspace|data_workspace)/([^"\']+)["\']', r"'\1'", code)
+
+    def sanitize_output_paths(text: str, ws_path: Path) -> str:
+        if not text:
+            return ""
+        # Replace absolute workspace path with relative dot
+        abs_path_str = str(ws_path.resolve()).replace("\\", "/")
+        text_clean = text.replace("\\", "/").replace(abs_path_str, ".")
+        # Sanitize home directory leaks
+        home_str = str(Path.home().resolve()).replace("\\", "/")
+        text_clean = text_clean.replace(home_str, "~")
+        # Normalize virtual workspace references
+        text_clean = text_clean.replace("/workspace/", "./")
+        return text_clean
+
     try:
         if workspace_dir and workspace_dir.exists():
             os.chdir(str(workspace_dir))
 
         plt.clf()
         plt.close('all')
-        ASCIIColors.info(f"⚡ Executing Sandboxed Python code:\n{code}")
-        exec(code, local_vars)
+        ASCIIColors.info(f"⚡ Executing Sandboxed Python code:\n{code_sanitized}")
+        exec(code_sanitized, local_vars)
     except Exception as e:
         sys.stdout = old_stdout
-        err_msg = f"Generated code execution error: {e}"
+        raw_output = redirected_output.getvalue()
+        err_msg = sanitize_output_paths(f"Generated code execution error: {e}", workspace_dir)
+        clean_output = sanitize_output_paths(raw_output, workspace_dir)
         ASCIIColors.error(f"❌ {err_msg}")
-        return {"success": False, "error": err_msg, "output": redirected_output.getvalue()}
+        return {"success": False, "error": err_msg, "output": clean_output}
 
     try:
         files_after = set(os.listdir(str(workspace_dir))) if workspace_dir.exists() else set()
@@ -387,8 +405,9 @@ def tool_execute_python_data_query(
             pass
 
     out_str = redirected_output.getvalue()
+    clean_output = sanitize_output_paths(out_str, workspace_dir)
     result = {
         "success": True,
-        "output": out_str or "Code executed successfully (no stdout prints)."
+        "output": clean_output or "Code executed successfully (no stdout prints)."
     }
     return result

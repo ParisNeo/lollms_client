@@ -1162,7 +1162,7 @@ class FileImportMixin:
 
         # ── data mode (Single File) ──────────────────────────────────────────
         if mode == IMPORT_MODE_DATA:
-            is_data_file = ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3")
+            is_data_file = ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".ttl", ".rdf", ".xml")
             if not is_data_file:
                 warnings.append(f"data mode requested but '{ext}' is not a CSV or Excel file.")
                 mode = IMPORT_MODE_TEXT

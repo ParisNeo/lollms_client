@@ -1007,8 +1007,9 @@ class ArtefactManager:
                     resolved = file_path.resolve()
                     ws_resolved = workspace_dir.resolve()
 
-                    if not str(resolved).startswith(str(ws_resolved)):
-                        ASCIIColors.warning(f"[ArtefactCleanup] Skipping deletion of {file_path} - outside workspace")
+                    # Explicit path verification guard
+                    if resolved.parts[:len(ws_resolved.parts)] != ws_resolved.parts:
+                        ASCIIColors.warning(f"[ArtefactCleanup] Skipping deletion of {file_path} - outside workspace boundary")
                         continue
 
                     file_path.unlink()
@@ -1763,8 +1764,8 @@ class ArtefactManager:
         cleaned  = text
 
         artefact_pattern = re.compile(
-            r'<art[ei]fact\s([^>]*)>(.*?)</art[ei]fact>',
-            re.DOTALL | re.IGNORECASE
+            r'^[ \t]*<art[ei]fact\s([^>]*)>(.*?)</art[ei]fact>',
+            re.DOTALL | re.IGNORECASE | re.MULTILINE
         )
 
         def _parse_attrs(attr_str: str) -> Dict[str, str]:
@@ -1926,7 +1927,7 @@ class ArtefactManager:
 
         cleaned = artefact_pattern.sub(handle_artefact, cleaned)
 
-        revert_pattern = re.compile(r'<revert_art[ei]fact\s([^>]+)/?>', re.IGNORECASE)
+        revert_pattern = re.compile(r'^[ \t]*<revert_art[ei]fact\s([^>]+)/?>', re.IGNORECASE | re.MULTILINE)
 
         def handle_revert(match: re.Match) -> str:
             attrs   = _parse_attrs(match.group(1))

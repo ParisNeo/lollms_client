@@ -1,0 +1,17 @@
+patent_number,title,assignee,co_inventors,filing_date,grant_date,status,category,application_number,classifications
+US9703001B2,Method for automatic recognition of a mobile magnetic object,CEA,"Hautson, Aloui Rabeb, Jobert",2013-11-12,2017-07-11,Granted,Magnetic Recognition & Locating,14443755,"G01R33/0094, G01V3/081"
+US9778016B2,Method and device for locating a magnetic object,CEA,"Hautson, Dominique, Jobert, Vassilev",2013-03-29,2017-10-03,Granted,Magnetic Recognition & Locating,14389056,"G06F3/046, G01V3/081, G01B7/004"
+US10310030B2,Method for automatically recognising a magnetic object,CEA,"Hautson, Aloui Rabeb, Jobert",2014-02-26,2019-06-04,Granted,Magnetic Recognition & Locating,14773509,"G01V3/081, G01R33/10, G01R33/12"
+US20150057969A1,Method and device for locating a magnetic object (application),CEA,"Hautson, Dominique, Jobert, Vassilev",2013-03-29,—,Application,Magnetic Recognition & Locating,14389056,"G06F3/046, G01V3/081, G01B7/004"
+US20150301216A1,Method for automatic recognition of a mobile magnetic object (application),CEA,"Hautson, Aloui Rabeb, Jobert",2013-11-12,—,Application,Magnetic Recognition & Locating,14443755,"G01R33/0094, G01V3/081"
+US20160018485A1,Method for automatically recognising a magnetic object (application),CEA,"Hautson, Aloui Rabeb, Jobert",2014-02-26,—,Application,Magnetic Recognition & Locating,14773509,"G01V3/081, G01R33/10, G01R33/12"
+US10830917B2,Method for detecting an anomaly in the context of using a magnetic locating device,CEA / MinMaxMedical,"Bertrand, Chave, Lavallee",2017-03-09,2020-11-10,Granted,Anomaly Detection & Synchronization,16083435,G01V3/08
+US11632169B2,Method for synchronizing a magnetic locating system,CEA,"Josselin, Bertrand, Paulet",2018-10-12,2023-04-18,Granted,Anomaly Detection & Synchronization,16158690,"G06F1/08, H04L7/0016, G01V3/081"
+US20190086573A1,Method for detecting an anomaly in using a magnetic locating device (application),CEA / MinMaxMedical,"Bertrand, Chave, Lavallee",2017-03-09,—,Application,Anomaly Detection & Synchronization,16083435,G01V3/08
+US11480422B2,Method for estimating angular deviation between magnetic axis and reference axis of a magnetic object,CEA / AMI,Vial Franck,2017-07-10,2022-10-25,Granted,Magnetic Axis & Angular Deviation,16317434,"G01R33/0035, G01B7/31, G01V3/08"
+US20190301848A1,Method for estimating angular deviation between magnetic axis and reference axis (application),CEA / AMI,"Vial, Dupre La Tour, Sauvagnac, Hautson",2017-07-10,—,Application,Magnetic Axis & Angular Deviation,16317434,"G01V3/08, G01R33/02, G01B7/31"
+US12189882B2,Force sensor,CEA,Vial Franck,2021-12-14,2025-01-07,Granted,Robotics & Tactile Sensing,17644118,"G01L5/165, G01L1/2206, G06F3/0446"
+US20220187971A1,Force sensor (application),CEA,Vial Franck,2021-12-14,—,Application,Robotics & Tactile Sensing,17644118,"G01L1/205, G01L1/2206, G06F3/0445"
+US20230026597A1,"Matrix pressure sensor with neural network, and calibration method",CEA,"Bardet Adrien, Vial Franck",2022-07-25,—,Application,Robotics & Tactile Sensing,17872121,"G01L1/205, G01L1/14, G06V10/82"
+US20250222600A1,Robotic gripper and control method,CEA,"Grossard Mathieu, Ayral Theo",2025-01-07,—,Application,Robotics & Tactile Sensing,19011931,"B25J15/103, B25J9/163, B25J13/083"
+US10371764B2,All-optical and isotropic magnetometer,CEA,"Bertrand, Chave, Lavallee",—,—,Granted,Magnetic Recognition & Locating,—,—

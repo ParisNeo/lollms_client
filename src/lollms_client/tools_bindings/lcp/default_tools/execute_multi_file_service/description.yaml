@@ -1,0 +1,38 @@
+binding_name: execute_multi_file_service
+title: Multi-File Local Service Runner
+author: ParisNeo & Lollms
+version: 1.0.0
+description: Concurrently launches and manages a Python backend (FastAPI/Uvicorn) and a companion HTML/JS front-end, handling port allocation and cleanup.
+input_parameters:
+  - name: backend_file
+    type: str
+    description: Filename of the Python backend (default "main.py").
+    mandatory: false
+    default: main.py
+  - name: frontend_file
+    type: str
+    description: Filename of the HTML frontend (default "index.html").
+    mandatory: false
+    default: index.html
+  - name: backend_port
+    type: int
+    description: Preferred port for the backend (default 8000).
+    mandatory: false
+    default: 8000
+  - name: frontend_port
+    type: int
+    description: Preferred port for the frontend (default 8080).
+    mandatory: false
+    default: 8080
+  - name: uvicorn_app_import
+    type: str
+    description: Uvicorn app import string (default "main:app").
+    mandatory: false
+    default: main:app
+commands:
+  - name: tool_execute_multi_file_service
+    title: Start Multi-File Service
+    description: Launches both the backend API server and serves the frontend client concurrently.
+  - name: tool_terminate_active_services
+    title: Stop All Services
+    description: Terminates any active servers spawned by this runner.

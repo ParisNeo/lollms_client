@@ -18,6 +18,53 @@ class MemoryMixin:
     def _init_memory(self, memory_manager: Optional['LollmsMemoryManager'] = None):
         object.__setattr__(self, 'memory_manager', memory_manager)
 
+    def _trigger_evolutionary_reflection(self, tool_name: str, params: Dict[str, Any], result: str):
+        """Generates a high-density lesson learned from successful recovery and saves it to long-term memory."""
+        if not getattr(self, "memory_manager", None) or not getattr(self, "lollmsClient", None):
+            return
+
+        failures = [f for f in self.failure_memory.failures if f["tool_name"] == tool_name]
+        if not failures:
+            return
+
+        failure_details = "\n".join([
+            f"Attempt {idx+1}: Params={json.dumps(f['params'])} | Error={f['error']}"
+            for idx, f in enumerate(failures)
+        ])
+
+        prompt = (
+            "You are a Synaptic Reflection Engine.\n"
+            f"A tool execution for '{tool_name}' just succeeded after previous failures in this session.\n\n"
+            "=== PREVIOUS FAILURES ===\n"
+            f"{failure_details}\n\n"
+            "=== SUCCESSFUL ATTEMPT ===\n"
+            f"Params: {json.dumps(params)}\n"
+            f"Result: {str(result)[:1000]}\n\n"
+            "Your task is to write a concise, high-density technical lesson summarizing why "
+            "the previous attempts failed and how the successful configuration resolved it. "
+            "Focus on specific rules, parameter mappings, or platform-specific constraints.\n\n"
+            "Requirements:\n"
+            "1. Output ONLY the technical lesson as a clear, standalone paragraph.\n"
+            "2. Keep it professional, objective, and action-oriented.\n"
+            "3. Do not write preamble, conversational text, or explanations."
+        )
+        try:
+            lesson = self.lollmsClient.generate_text(prompt=prompt, temperature=0.1).strip()
+            if lesson:
+                self.memory_manager.add(
+                    content=f"Technical Lesson Learned: {lesson}",
+                    importance=1.0,
+                    tags=["technical_lesson", "recovery", tool_name],
+                    subject=tool_name,
+                    predicate="IMPLEMENTS",
+                    obj="recovery_pattern"
+                )
+                ASCIIColors.success(f"[FailureMemory] Promoted successful recovery lesson to long-term memory: '{lesson[:60]}...'")
+                # Clear failures for this tool once reflected to prevent duplicate reflections
+                self.failure_memory.failures = [f for f in self.failure_memory.failures if f["tool_name"] != tool_name]
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to generate evolutionary reflection: {e}")
+
     def _get_memory_manager(self, override: Optional['LollmsMemoryManager']) -> Optional['LollmsMemoryManager']:
         return override if override is not None else getattr(self, 'memory_manager', None)
 

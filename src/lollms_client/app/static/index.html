@@ -106,62 +106,86 @@
         <button id="btn-toggle-right" class="sidebar-toggle-handle right" title="Toggle Right Sidebar">▶</button>
 
         <!-- Area 1: Left Panel (Session Artifacts & Stored Memories) -->
-        <aside class="panel sidebar-left" id="sidebar-left">
-            <div class="panel-section section-artifacts">
-                <div class="sidebar-section-header">
-                    <h2>📂 Active Artifacts</h2>
-                    <button class="part-export-btn" id="btn-export-artifacts-part" title="Export artifacts...">📤 Export</button>
-                </div>
-                <ul class="artifact-list" id="artifacts-list">
-                    <li class="empty-msg" style="border: 1px dashed var(--border-color); padding: 16px; border-radius: 8px; text-align: center; cursor: pointer;" onclick="document.getElementById('btn-open-import').click()">
-                        <span style="font-size: 24px; display: block; margin-bottom: 6px;">📂</span>
-                        No active artifacts.<br/>
-                        <span style="color: var(--accent-color); font-size: 11px; text-decoration: underline;">+ Ingest File</span>
-                    </li>
-                </ul>
+        <aside class="panel sidebar-left" id="sidebar-left" style="display: flex; flex-direction: column; padding: 0 !important; gap: 0 !important; overflow: hidden !important;">
+            <!-- Sidebar Navigation Tabs -->
+            <div class="sidebar-tabs" style="display: flex; background-color: rgba(0, 0, 0, 0.25); border-bottom: 1px solid var(--border-color); padding: 8px; gap: 4px; user-select: none; flex-shrink: 0;">
+                <button class="sidebar-tab-btn active" data-sidebar-tab="artifacts-pane" style="flex: 1; background: none; border: none; color: var(--text-secondary); padding: 10px 6px; font-size: 11px; font-weight: bold; cursor: pointer; border-radius: 6px; transition: all 0.15s; text-align: center; white-space: nowrap; display: flex; align-items: center; justify-content: center; gap: 4px;">📂 Artifacts</button>
+                <button class="sidebar-tab-btn" data-sidebar-tab="memories-pane" style="flex: 1; background: none; border: none; color: var(--text-secondary); padding: 10px 6px; font-size: 11px; font-weight: bold; cursor: pointer; border-radius: 6px; transition: all 0.15s; text-align: center; white-space: nowrap; display: flex; align-items: center; justify-content: center; gap: 4px;">🧠 Memories</button>
+                <button class="sidebar-tab-btn" data-sidebar-tab="tools-pane" style="flex: 1; background: none; border: none; color: var(--text-secondary); padding: 10px 6px; font-size: 11px; font-weight: bold; cursor: pointer; border-radius: 6px; transition: all 0.15s; text-align: center; white-space: nowrap; display: flex; align-items: center; justify-content: center; gap: 4px;">🛠️ Tools</button>
             </div>
 
-            <div class="panel-section section-memories">
-                <div class="sidebar-section-header">
-                    <h2>🧠 Stored Memories</h2>
-                    <button class="part-export-btn" id="btn-view-memory-graph" title="View Semantic Memory Network Graph">🧠 Graph</button>
-                </div>
-                <p class="section-desc">Tiered persistent SQLite memory.</p>
-                <!-- Local Tabbed Memory Widget -->
-                <div class="memory-tabs" style="display: flex; gap: 4px; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 6px; overflow-x: auto; user-select: none;">
-                    <button class="mem-tab-btn active" data-mem-level="1">🟢 Working</button>
-                    <button class="mem-tab-btn" data-mem-level="2">🟣 Deep</button>
-                    <button class="mem-tab-btn" data-mem-level="3">⚫ Archive</button>
-                    <button class="mem-tab-btn" data-mem-level="4">🔵 Episode</button>
-                </div>
-                <div class="memory-tab-actions" style="display: flex; gap: 6px; margin-bottom: 10px; justify-content: flex-end; user-select: none;">
-                    <button class="part-export-btn" id="btn-add-memory-part" title="Import a new memory" style="padding: 4px 10px; font-size: 11.5px;">➕ Add</button>
-                    <button class="part-export-btn" id="btn-clear-memories-part" title="Clear/delete all memories of the selected category" style="padding: 4px 10px; font-size: 11.5px; color: #ef4444; border-color: rgba(239, 68, 68, 0.25);">🧹 Clear</button>
-                    <button class="part-export-btn" id="btn-export-memories-part" title="Export memories..." style="padding: 4px 10px; font-size: 11.5px;">📤 Export</button>
-                </div>
-                <ul class="memory-list" id="memories-list">
-                    <li class="empty-msg" style="border: 1px dashed var(--border-color); padding: 16px; border-radius: 8px; text-align: center;">
-                        <span style="font-size: 24px; display: block; margin-bottom: 6px;">🧠</span>
-                        No memories stored yet.<br/>
-                        <span style="font-size: 10px; color: var(--text-secondary); display: block; margin-top: 4px; line-height: 1.3;">Insights appear here when you save thoughts from chat.</span>
-                    </li>
-                </ul>
-            </div>
+            <!-- Tab Content Panes -->
+            <div class="sidebar-tab-panes" style="flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; width: 100%;">
 
-            <div class="panel-section section-tools">
-                <div class="sidebar-section-header">
-                    <h2>🛠️ Discovered Tools</h2>
-                    <div style="display:flex; gap:6px;">
-                        <button class="part-export-btn" id="btn-create-tool" title="Create a new custom tool" style="background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg);">➕ Create</button>
-                        <button class="part-export-btn" id="btn-import-tools-part" title="Import LCP Python tool or ZIP archive">📥 Import</button>
-                        <button class="part-export-btn" id="btn-export-tools-part" title="Export tools...">📤 Export</button>
+                <!-- Pane 1: Artifacts -->
+                <div class="sidebar-tab-pane active" id="artifacts-pane" style="display: flex; flex-direction: column; height: 100%; overflow-y: auto; padding: 16px;">
+                    <div class="panel-section section-artifacts" style="display: flex; flex-direction: column; height: 100%;">
+                        <div class="sidebar-section-header">
+                            <h2>📂 Active Artifacts</h2>
+                            <button class="part-export-btn" id="btn-export-artifacts-part" title="Export artifacts...">📤 Export</button>
+                        </div>
+                        <ul class="artifact-list" id="artifacts-list" style="flex: 1; overflow-y: auto;">
+                            <li class="empty-msg" style="border: 1px dashed var(--border-color); padding: 16px; border-radius: 8px; text-align: center; cursor: pointer;" onclick="document.getElementById('btn-open-import').click()">
+                                <span style="font-size: 24px; display: block; margin-bottom: 6px;">📂</span>
+                                No active artifacts.<br/>
+                                <span style="color: var(--accent-color); font-size: 11px; text-decoration: underline;">+ Ingest File</span>
+                            </li>
+                        </ul>
                     </div>
-                    <input type="file" id="tool-import-file-input" hidden accept=".py,.zip">
                 </div>
-                <p class="section-desc">Active local LCP tools.</p>
-                <ul class="tool-list" id="tools-list">
-                    <li class="empty-msg">No discovered tools.</li>
-                </ul>
+
+                <!-- Pane 2: Memories -->
+                <div class="sidebar-tab-pane" id="memories-pane" style="display: none; flex-direction: column; height: 100%; overflow-y: auto; padding: 16px;">
+                    <div class="panel-section section-memories" style="display: flex; flex-direction: column; height: 100%;">
+                        <div class="sidebar-section-header">
+                            <h2>🧠 Stored Memories</h2>
+                            <div style="display: flex; gap: 4px;">
+                                <button class="part-export-btn" id="btn-toggle-tbox-abox" title="Toggle TBox (Schema) vs ABox (Instances)">📐 TBox/ABox</button>
+                                <button class="part-export-btn" id="btn-view-memory-graph" title="View Semantic Memory Network Graph">🧠 Graph</button>
+                            </div>
+                        </div>
+                        <p class="section-desc">Tiered persistent SQLite memory.</p>
+                        <!-- Local Tabbed Memory Widget -->
+                        <div class="memory-tabs" style="display: flex; gap: 4px; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 6px; overflow-x: auto; user-select: none;">
+                            <button class="mem-tab-btn active" data-mem-level="1">🟢 Working</button>
+                            <button class="mem-tab-btn" data-mem-level="2">🟣 Deep</button>
+                            <button class="mem-tab-btn" data-mem-level="3">⚫ Archive</button>
+                            <button class="mem-tab-btn" data-mem-level="4">🔵 Episode</button>
+                        </div>
+                        <div class="memory-tab-actions" style="display: flex; gap: 6px; margin-bottom: 10px; justify-content: flex-end; user-select: none;">
+                            <button class="part-export-btn" id="btn-add-memory-part" title="Import a new memory" style="padding: 4px 10px; font-size: 11.5px;">➕ Add</button>
+                            <button class="part-export-btn" id="btn-dream-memories-part" title="Consolidate and decay memories (Dream Pass)" style="padding: 4px 10px; font-size: 11.5px; color: var(--accent-color); border-color: rgba(245, 158, 11, 0.25);">💤 Dream</button>
+                            <button class="part-export-btn" id="btn-clear-memories-part" title="Clear/delete all memories of the selected category" style="padding: 4px 10px; font-size: 11.5px; color: #ef4444; border-color: rgba(239, 68, 68, 0.25);">🧹 Clear</button>
+                            <button class="part-export-btn" id="btn-export-memories-part" title="Export memories..." style="padding: 4px 10px; font-size: 11.5px;">📤 Export</button>
+                        </div>
+                        <ul class="memory-list" id="memories-list" style="flex: 1; overflow-y: auto;">
+                            <li class="empty-msg" style="border: 1px dashed var(--border-color); padding: 16px; border-radius: 8px; text-align: center;">
+                                <span style="font-size: 24px; display: block; margin-bottom: 6px;">🧠</span>
+                                No memories stored yet.<br/>
+                                <span style="font-size: 10px; color: var(--text-secondary); display: block; margin-top: 4px; line-height: 1.3;">Insights appear here when you save thoughts from chat.</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Pane 3: Tools -->
+                <div class="sidebar-tab-pane" id="tools-pane" style="display: none; flex-direction: column; height: 100%; overflow-y: auto; padding: 16px;">
+                    <div class="panel-section section-tools" style="display: flex; flex-direction: column; height: 100%;">
+                        <div class="sidebar-section-header">
+                            <h2>🛠️ Discovered Tools</h2>
+                            <div style="display:flex; gap:6px;">
+                                <button class="part-export-btn" id="btn-create-tool" title="Create a new custom tool" style="background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg);">➕ Create</button>
+                                <button class="part-export-btn" id="btn-import-tools-part" title="Import LCP Python tool or ZIP archive">📥 Import</button>
+                                <button class="part-export-btn" id="btn-export-tools-part" title="Export tools...">📤 Export</button>
+                            </div>
+                            <input type="file" id="tool-import-file-input" hidden accept=".py,.zip">
+                        </div>
+                        <p class="section-desc">Active local LCP tools.</p>
+                        <ul class="tool-list" id="tools-list" style="flex: 1; overflow-y: auto;">
+                            <li class="empty-msg">No discovered tools.</li>
+                        </ul>
+                    </div>
+                </div>
             </div>
         </aside>
 
@@ -177,8 +201,8 @@
                 
                 <!-- Always-Present Chat Companion Tab Content -->
                 <div class="tab-content active" id="tab-chat" style="position: relative;">
-                    <!-- Connection Spinner Overlay -->
-                    <div id="connection-overlay" class="connection-overlay-inline">
+                    <!-- Connection Spinner Overlay (Defaulted to hidden/non-blocking) -->
+                    <div id="connection-overlay" class="connection-overlay-inline" style="display: none !important;">
                         <div class="connection-spinner-container">
                             <span class="spinner" style="width: 40px; height: 40px; border-width: 3px;"></span>
                             <span id="connection-overlay-text">🧠 Connecting to LLM server... Please wait.</span>
@@ -186,7 +210,13 @@
                     </div>
 
                     <!-- Chat Message Area -->
-                    <div class="chat-history" id="chat-history">
+                    <div class="chat-history" id="chat-history" style="position: relative;">
+                        <!-- Localized Startup Spinner -->
+                        <div id="discussion-startup-spinner" style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; height: 100%; width: 100%; color: var(--text-secondary); font-size: 13.5px; font-style: italic; user-select: none; position: absolute; inset: 0; background-color: #0b0f19; z-index: 10;">
+                            <span class="spinner" style="width: 36px; height: 36px; border-width: 3px;"></span>
+                            <span>Connecting to LLM service and synchronizing workspace...</span>
+                        </div>
+
                         <!-- Thinking Indicator -->
                         <div id="thinking-indicator" class="typing-indicator">
                             <span class="typing-dot"></span>
@@ -691,6 +721,10 @@
         <div class="modal-container" style="width: 1000px; max-width: 95vw; height: 85vh; display: flex; flex-direction: column;">
             <div class="modal-header">
                 <h2>🧠 Semantic Memory Network</h2>
+                <div style="display: flex; gap: 10px; align-items: center; margin-left: auto; margin-right: 16px;">
+                    <button class="part-export-btn" id="btn-recenter-memory-graph" title="Recenter and fit graph inside viewport">🎯 Recenter Graph</button>
+                    <button class="part-export-btn" id="btn-graph-toggle-tbox-abox">📐 Switch to TBox Schema</button>
+                </div>
                 <button class="modal-close-btn" id="btn-close-memory-graph">×</button>
             </div>
             <div class="modal-body" style="display: flex; flex: 1; overflow: hidden; padding: 0; background-color: #0b0f19;">

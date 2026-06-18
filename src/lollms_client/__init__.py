@@ -2,16 +2,6 @@
 # Configure per-module file routing with rolling rotation BEFORE any other imports
 import ascii_colors as logging
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    log_folder="./logs",                # Per-module file routing
-    log_folder_mode="rolling",          # Rotate by size
-    log_folder_maxBytes=10000000,       # 10MB per file before rotation
-    log_folder_backupCount=5,           # Keep 5 backup files
-)
-
 # Now import the rest of the library
 from lollms_client.lollms_core import LollmsClient, ELF_COMPLETION_FORMAT
 from lollms_client.lollms_types import MSG_TYPE
@@ -22,7 +12,7 @@ from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBind
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
 from lollms_client.lollms_bindings_utils import list_bindings, get_binding_desc
 
-__version__ = "1.14.22" # Updated version
+__version__ = "1.14.24" # Updated version
 
 # Optionally, you could define __all__ if you want to be explicit about exports
 __all__ = [

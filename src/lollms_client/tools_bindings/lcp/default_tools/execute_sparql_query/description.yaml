@@ -1,0 +1,18 @@
+binding_name: execute_sparql_query
+title: SPARQL Query Runner
+author: ParisNeo & Lollms
+version: 1.0.0
+description: Parses local Turtle (.ttl) files and executes fully compliant SPARQL 1.1 queries, returning structured bindings or serialized graphs.
+input_parameters:
+  - name: file_name
+    type: str
+    description: Filename of the .ttl file in the workspace.
+    mandatory: true
+  - name: sparql_query
+    type: str
+    description: The valid SPARQL 1.1 query to execute (SELECT, ASK, CONSTRUCT).
+    mandatory: true
+commands:
+  - name: tool_execute_sparql_query
+    title: Execute SPARQL Query
+    description: Runs a SPARQL query against the specified Turtle file and returns structured results.

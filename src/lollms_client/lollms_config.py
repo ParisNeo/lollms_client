@@ -547,7 +547,12 @@ class TypedConfig:
                 elif entry_type == "list":
                     entry_value = list(entry_value)
                 elif entry_type == "dict":
-                    entry_value = eval(entry_value)
+                    import ast
+                    try:
+                        entry_value = json.loads(entry_value) if isinstance(entry_value, str) else entry_value
+                    except Exception:
+                        # Fallback to ast.literal_eval (which is 100% safe, unlike eval())
+                        entry_value = ast.literal_eval(entry_value) if isinstance(entry_value, str) else entry_value
                 else:
                     raise ValueError(f"Invalid field type '{entry_type}' for entry '{entry_name}'.")
 

@@ -346,16 +346,20 @@ class LollmsMemoryManager:
                 if now <= max_created[0]:
                     now = max_created[0] + timedelta(microseconds=1)
 
-            # Standardise Ontological Triples fallback if omitted by caller
-            sub_val = subject or (tags[0] if tags and len(tags) > 0 else "unknown")
-            pred_val = predicate or "RELATED_TO"
-            obj_val = obj or (tags[1] if tags and len(tags) > 1 else "unknown")
+            # Resolve or auto-extract Ontological Triples & tags if omitted
+            auto_sub, auto_pred, auto_obj, auto_tags = auto_extract_ontology_from_content(content)
+
+            sub_val = subject if (subject and subject != "unknown") else auto_sub
+            pred_val = predicate if (predicate and predicate != "RELATED_TO") else auto_pred
+            obj_val = obj if (obj and obj != "unknown") else auto_obj
+            resolved_tags = tags if tags else auto_tags
 
             rec = _MemoryRecord(
                 id=str(uuid.uuid4()), owner_id=self.owner_id, content=content.strip(),
                 summary=self._auto_summary(content), level=level,
                 importance=max(0.0, min(1.0, importance if importance is not None else self.config.default_importance)),
-                use_count=0, tags=",".join(tags) if tags else None, subject_group=subject_group,
+                use_count=0, tags=",".join(resolved_tags) if resolved_tags else None, 
+                subject_group=subject_group or sub_val,
                 created_at=now, updated_at=now, last_used_at=now,
                 subject=sub_val.strip().lower(),
                 predicate=MemoryOntology.validate_predicate(pred_val),
@@ -528,6 +532,21 @@ class LollmsMemoryManager:
             return self._to_dict(r)
 
     def delete(self, memory_id: str) -> bool:
+        """
+        Soft-deletion: sets importance to 0.0 and archives the node.
+        The permanent hard delete is performed during the Dream Cycle.
+        """
+        with self._session() as s:
+            r = self._q(s).filter(_MemoryRecord.id == memory_id).first()
+            if r is None: return False
+            r.importance = 0.0
+            r.level = 3  # Archive
+            r.updated_at = datetime.utcnow()
+            s.flush()
+            return True
+
+    def hard_delete(self, memory_id: str) -> bool:
+        """Surgically purges a memory node from disk completely."""
         with self._session() as s:
             r = self._q(s).filter(_MemoryRecord.id == memory_id).first()
             if r is None: return False
@@ -791,6 +810,12 @@ class LollmsMemoryManager:
             "     Relationship types: RELATED_TO, DERIVED_FROM, CONTRADICTS, SUPPORTS, TEMPORAL_AFTER\n\n"
             "── Rules: Use exact 8-character ID prefixes. All tags are automatically stripped from your reply before display.\n"
             "── CRITICAL: Memory tags are processed silently by the system. After using any memory tag, you MUST continue with a natural, helpful conversational response to the user. Do not stop after only emitting a memory tag.\n"
+            "── ONTOLOGICAL TAGGING (MANDATORY):\n"
+            "   When issuing `<mem_new>`, you MUST always include the following attributes:\n"
+            "     - `tags`: comma-separated lowercase semantic tags (e.g. `tags=\"user_name,preference\"`)\n"
+            "     - `subject`: the lowercase subject entity (e.g. `subject=\"user\"`)\n"
+            "     - `predicate`: valid uppercase TBox predicate (PREFERS, RELATED_TO, IMPLEMENTS, CONTRADICTS, SUPPORTS)\n"
+            "     - `object`: the lowercase object entity (e.g. `object=\"saif\"`)\n"
             "=== END MEMORY SYSTEM ===\n"
         )
 
@@ -893,11 +918,14 @@ class LollmsMemoryManager:
         return demoted
 
     def dream(self, lollms_client: Optional[Any] = None) -> Dict:
-        """Consolidation pass — recompute importance, build clusters, and prune low-value memories."""
+        """
+        Consolidation pass — recomputes graph centrality, applies usage reinforcement,
+        performs synaptic fusion of overlapping nodes, auto-tags orphans, and prunes low-value memories.
+        """
         elapsed = (datetime.utcnow() - self._last_dream).total_seconds() / 3600
         if elapsed < self.config.dream_min_interval_hours:
             return {"skipped": True, "reason": "too_soon"}
-            
+
         start = datetime.utcnow()
         report = {
             "decayed": self.apply_decay(),
@@ -905,29 +933,155 @@ class LollmsMemoryManager:
             "reinforced": 0,
             "forgotten": 0,
             "retained_by_dreamer": 0,
+            "fused_nodes": 0,
+            "audited_orphans": 0,
             "duration_seconds": 0.0
         }
-        
-        # 1. Usage-based Reinforcement & Decay adjustments
+
+        # 1. Hard purge of all zero-importance marked nodes (Soft Deletes)
+        with self._session() as s:
+            forgotten_count = s.query(_MemoryRecord).filter(_MemoryRecord.importance <= 0.0).delete(synchronize_session=False)
+            report["forgotten"] += forgotten_count
+            s.flush()
+
+        # 2. PageRank degree centrality recalculation across the network
+        with self._session() as s:
+            recs = self._q(s).all()
+            for r in recs:
+                self._recalculate_centrality(s, r.id)
+            s.flush()
+
+        # 3. Usage-based Reinforcement & Decay adjustments
         # Memories with active retrieval (use_count > 0) are boosted logarithmically to reinforce them
         with self._session() as s:
             for r in self._q(s).all():
                 if r.use_count > 0:
-                    boost = math.log1p(r.use_count) * 0.05
+                    boost = math.log1p(r.use_count) * 0.08
                     r.importance = min(1.0, r.importance + boost)
                     report["reinforced"] += 1
                     # Gradual reduction of use_count so memory can decay again if left unused
                     r.use_count = max(0, r.use_count - 1)
-        
-        # 2. Rule-based promotion for recently used archived memories
+
+        # 4. Sandbox-to-Deep Memory Migration (Dual-Phase sleep-persistence)
+        # Any local sandbox memory (Level 1) that has cooled down is committed to Deep Memory (Level 2)
+        # so that the active scratchpad remains clean and unpolluted.
+        with self._session() as s:
+            sandbox_nodes = self._q(s).filter(_MemoryRecord.level == 1).all()
+            for node in sandbox_nodes:
+                # If node has not been used recently or has cooled down, migrate to Deep
+                time_since_use = (datetime.utcnow() - node.last_used_at).total_seconds()
+                if time_since_use > 300 or node.importance < self.config.demotion_threshold:
+                    node.level = 2  # Sleep-persist to Deep Memory
+                    s.flush()
+                    ASCIIColors.info(f"[Dual-Phase Memory] Committed sandbox node '{node.id[:8]}' to Deep Memory.")
+
+        # 5. Rule-based promotion for recently used archived memories
         with self._session() as s:
             for r in self._q(s).filter(_MemoryRecord.level == 3).all():
                 if (datetime.utcnow() - r.last_used_at).total_seconds() < 86400:
                     r.level = 2; report["promoted"] += 1
+
+        # 6. Synaptic Fusion (Semantic Merging of redundant nodes & Fuzzy Tag Normalization)
+        # Scan for low-importance pairs sharing the same subject_group or tags
+        with self._session() as s:
+            candidates = self._q(s).filter(_MemoryRecord.importance < 0.5).all()
+            fused_ids = set()
+            for i, c1 in enumerate(candidates):
+                if c1.id in fused_ids:
+                    continue
+                for c2 in candidates[i+1:]:
+                    if c2.id in fused_ids or c2.id == c1.id:
+                        continue
                     
+                    # Fusion Trigger: match by identical subject_group or high tag overlap
+                    match = False
+                    if c1.subject_group and c2.subject_group and c1.subject_group == c2.subject_group:
+                        match = True
+                    elif c1.tags and c2.tags:
+                        t1 = set(t.strip().lower() for t in c1.tags.split(",") if t.strip())
+                        t2 = set(t.strip().lower() for t in c2.tags.split(",") if t.strip())
+                        if t1 & t2 and len(t1 & t2) / max(len(t1 | t2), 1) >= 0.75:
+                            match = True
+
+                    if match:
+                        # Fuse c2 into c1
+                        fused_text = sanitize_memory_content(f"{c1.content}\n[Merged Note]: {c2.content}")
+                        c1.content = fused_text
+                        c1.importance = min(1.0, max(c1.importance, c2.importance) + 0.1)
+                        c1.updated_at = datetime.utcnow()
+                        c1.use_count += c2.use_count
+                        
+                        # Fuzzy Tag Normalization during fusion (e.g. merge #username -> #user_name)
+                        if c1.tags and c2.tags:
+                            t1 = set(t.strip().lower() for t in c1.tags.split(",") if t.strip())
+                            t2 = set(t.strip().lower() for t in c2.tags.split(",") if t.strip())
+                            fused_tags = t1 | t2
+                            # Remove similar redundant tags by keeping the snake_case longer/standardized version
+                            for tag in list(fused_tags):
+                                if "_" in tag:
+                                    fused_tags.discard(tag.replace("_", ""))
+                            c1.tags = ",".join(sorted(fused_tags))
+                        
+                        # Move all relation links from c2 to c1
+                        rels_to_move = s.query(_MemoryRelationship).filter(
+                            (_MemoryRelationship.source_id == c2.id) | (_MemoryRelationship.target_id == c2.id)
+                        ).all()
+                        for rel in rels_to_move:
+                            if rel.source_id == c2.id:
+                                rel.source_id = c1.id
+                            if rel.target_id == c2.id:
+                                rel.target_id = c1.id
+                        
+                        fused_ids.add(c2.id)
+                        s.delete(c2)
+                        report["fused_nodes"] += 1
+                        ASCIIColors.info(f"[Synaptic Fusion] Merged redundant node '{c2.id[:8]}' into '{c1.id[:8]}'")
+            s.flush()
+
+        # 5. Synaptic Auditing (Auto-tagging & Subject Grouping of orphaned/unindexed nodes)
+        if lollms_client:
+            with self._session() as s:
+                orphans = self._q(s).filter(
+                    (_MemoryRecord.subject_group == None) | (_MemoryRecord.tags == None)
+                ).limit(5).all() # Limit per cycle to avoid high token latency
+
+                for r in orphans:
+                    prompt = (
+                        "You are the Synaptic Auditor.\n"
+                        "Your job is to categorize and index orphaned memory records to maintain graph integrity.\n\n"
+                        f"Memory Content: \"{r.content}\"\n\n"
+                        "Task:\n"
+                        "1. Propose a short 1-to-2 word subject_group (TBox category, e.g. 'coding_style', 'preferences', 'terminal_fix').\n"
+                        "2. Propose 2-3 specific, relevant lowercase tags (separated by commas, no spaces).\n"
+                        "3. Write a concise, 1-sentence summary.\n"
+                        "4. Strictly use the provided JSON schema."
+                    )
+                    try:
+                        res = lollms_client.generate_structured_content(
+                            prompt=prompt,
+                            schema={
+                                "subject_group": {"type": "string", "description": "1-2 word category"},
+                                "tags": {"type": "string", "description": "comma-separated tags"},
+                                "summary": {"type": "string", "description": "1-sentence summary"}
+                            },
+                            temperature=0.1
+                        )
+                        if res:
+                            # Apply strict tag sanitization to content and summary before saving
+                            r.content = sanitize_memory_content(r.content)
+                            r.subject_group = res.get("subject_group", "general").strip().lower().replace(" ", "_")
+                            r.tags = ",".join(t.strip().lower() for t in res.get("tags", "").split(",") if t.strip())
+                            r.summary = sanitize_memory_content(res.get("summary", r.summary))
+                            r.updated_at = datetime.utcnow()
+                            report["audited_orphans"] += 1
+                            ASCIIColors.success(f"[Synaptic Auditor] Indexed node '{r.id[:8]}' as '{r.subject_group}' with tags #{r.tags}")
+                    except Exception as e:
+                        ASCIIColors.warning(f"Synaptic audit failed for node '{r.id[:8]}': {e}")
+                s.flush()
+
         self.enforce_budget()
-        
-        # 3. Forgetting Pass: Faded memories (Level 3 with importance < forget_threshold) are purged
+
+        # 6. Forgetting Pass: Faded memories (Level 3 with importance < forget_threshold) are purged
         #    unless the dreamer thinks they are still important
         to_evaluate = []
         with self._session() as s:
@@ -968,7 +1122,7 @@ class LollmsMemoryManager:
                         reason = res.get("reason", "")
                 except Exception as ex:
                     ASCIIColors.warning(f"[MemoryManager] Dreamer evaluation failed: {ex}")
-            
+
             if keep:
                 # Retain the memory and restore its importance to demotion threshold + small buffer
                 with self._session() as s:
@@ -984,7 +1138,7 @@ class LollmsMemoryManager:
                 self.delete(item["id"])
                 report["forgotten"] += 1
                 ASCIIColors.warning(f"[MemoryManager] Forgotten memory '{item['id'][:8]}': {reason}")
-                
+
         report["duration_seconds"] = (datetime.utcnow() - start).total_seconds()
         self._last_dream = datetime.utcnow()
         return report
@@ -1145,3 +1299,125 @@ class LollmsMemoryManager:
             "metadata": json.loads(r.relationship_metadata) if r.relationship_metadata else {},
             "created_at": r.created_at.isoformat()
         }
+
+
+def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalizes parameter structures for robust duplicate and loop detection.
+    Strips internal thoughts, maps synonymous keys, and sorts alphabetically.
+    """
+    if not isinstance(params, dict):
+        return {}
+
+    # 1. Strip reasoning, explanation, thoughts keys
+    stripped = {
+        k: v for k, v in params.items() 
+        if k not in ("thoughts", "explanation", "scratchpad", "reasoning")
+    }
+
+    # 2. Map synonymous path keys to 'path' and normalize backslashes/dots
+    normalized = {}
+    for k, v in stripped.items():
+        if k in ("file_path", "filepath", "target", "path"):
+            normalized["path"] = str(v).replace("\\", "/").lstrip("./") if v else v
+        else:
+            normalized[k] = v
+
+    # 3. Sort keys alphabetically
+    return {k: normalized[k] for k in sorted(normalized.keys())}
+
+
+def sanitize_memory_content(text: str) -> str:
+    """
+    Strips accidental XML tags, unclosed brackets, and stray system markers
+    to prevent engram pollution.
+    """
+    if not text:
+        return ""
+    # 1. Strip complete XML-style tags
+    cleaned = re.sub(r'<[^>]+>', '', text)
+    # 2. Strip stray/unclosed brackets
+    cleaned = re.sub(r'<[^>]*$', '', cleaned)
+    cleaned = re.sub(r'^[^<]*>', '', cleaned)
+    return cleaned.strip()
+
+
+def auto_extract_ontology_from_content(content: str) -> Tuple[str, str, str, List[str]]:
+    """
+    Surgically extracts subject, predicate, object, and tags from plain text content
+    when the LLM omits them, preventing "unknown" pollution in the ABox.
+    """
+    content_lower = content.lower().strip()
+
+    # Defaults
+    subject = "concept"
+    predicate = "RELATED_TO"
+    obj = "general"
+    tags = ["concept"]
+
+    # 1. Identity / Name pattern (e.g. "My name is Saif")
+    name_match = re.search(r"\bmy\s+name\s+is\s+([a-zA-Z0-9_-]+)", content_lower)
+    if name_match:
+        subject = "user"
+        predicate = "PREFERS"
+        obj = name_match.group(1)
+        tags = ["user_name", "identity", "preference"]
+        return subject, predicate, obj, tags
+
+    # 2. Tool / Script patterns
+    if "tool" in content_lower or "lcp" in content_lower:
+        subject = "tool"
+        predicate = "IMPLEMENTS"
+        obj = "action"
+        tags = ["tool", "execution"]
+        return subject, predicate, obj, tags
+
+    # 3. Code / Refactoring patterns
+    if "code" in content_lower or "script" in content_lower or "fastapi" in content_lower:
+        subject = "code"
+        predicate = "IMPLEMENTS"
+        obj = "architecture"
+        tags = ["code", "development", "architecture"]
+        return subject, predicate, obj, tags
+
+    # 4. Fallback Keyword extractor for tags
+    keywords_map = {
+        "style": "style", "css": "style", "theme": "style",
+        "error": "error_log", "fail": "error_log", "bug": "error_log",
+        "standard": "standard", "rule": "standard", "guideline": "standard",
+        "fastapi": "fastapi", "server": "server", "backend": "backend"
+    }
+    for kw, tag in keywords_map.items():
+        if kw in content_lower:
+            tags.append(tag)
+            obj = tag
+
+    return subject, predicate, obj, list(set(tags))
+
+
+class FailureMemory:
+    """
+    Reflexive Short-Term Memory tracking tool execution failures
+    to prevent repetitive loops and guide adaptive recovery.
+    """
+    def __init__(self):
+        self.failures: List[Dict[str, Any]] = []
+
+    def record_failure(self, tool_name: str, params: Dict[str, Any], error: str):
+        """Log normalized representation of a failed tool execution."""
+        import time
+        self.failures.append({
+            "tool_name": tool_name,
+            "params": params,
+            "norm_params": normalize_parameters(params),
+            "error": str(error),
+            "timestamp": time.time()
+        })
+
+    def has_previous_failure(self, tool_name: str, params: Dict[str, Any]) -> bool:
+        """Check if this tool has failed with synonymous parameters previously."""
+        norm = normalize_parameters(params)
+        return any(
+            f["tool_name"] == tool_name and f["norm_params"] == norm 
+            for f in self.failures
+        )

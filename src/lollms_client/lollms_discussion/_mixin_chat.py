@@ -146,7 +146,8 @@ def _requires_agent_mode(msg: str) -> bool:
     m = msg.lower().strip()
     action_keywords = [
         "convert", "make it", "save as", "create a", "write a", "implement", "build a",
-        "rewrite", "modify", "update", "patch", "edit", "fix code", "add a feature", "to html", "to python"
+        "rewrite", "modify", "update", "patch", "edit", "fix code", "add a feature", "to html", "to python",
+        "plot", "graph", "chart", "histogram", "statistics", "analyse", "analyze", "query"
     ]
     code_extensions = [
         ".py", ".html", ".js", ".css", ".xml", ".json", ".yaml", ".sh", ".bash", ".cpp", ".c", ".h", ".owl"
@@ -2938,7 +2939,8 @@ class _StreamState:
             "4. Provide exactly 2 lines of context in SEARCH blocks to ensure match uniqueness.\n"
             "5. For new artifacts, provide 100% of the content.\n"
             "6. Match indentation, punctuation, and blank lines character-for-character.\n"
-            "7. VISION CHECK: If images are provided, they have been pre-filtered by the main agent as relevant. \n"
+            "7. TERMINATION PROTOCOL (MANDATORY): When all objectives are reached, or if the user's request is a simple conversational/capability question requiring no further tool or file actions, you MUST output `<Done />` on a brand-new line at the very end of your response to signal completion.\n"
+            "8. VISION CHECK: If images are provided, they have been pre-filtered by the main agent as relevant. \n"
             "   However, you MUST still verify their relevance to the specific code task. \n"
             "   If an image is clearly unrelated (e.g. a bunny when fixing code), IGNORE IT completely.\n"
             "   Do not let irrelevant images distract you from the code architecture.\n"
@@ -3032,7 +3034,13 @@ class _StreamState:
 
         user_payload.append(f"=== CONTEXTUAL ARTEFACTS ===\n{full_context}")
         user_payload.append(f"=== PLAN TO EXECUTE ===\n{plan}")
-        user_payload.append("Execute the plan now. Output only the required XML tags.")
+        user_payload.append(
+            "Execute the plan now. \n"
+            "Requirements:\n"
+            "1. Output the required XML tags first.\n"
+            "2. IMPORTANT: After the tags, you MUST write a brief, friendly, natural-language explanation "
+            "summarizing what you accomplished, what files were affected, and how the user can run or test them."
+        )
 
         final_payload = "\n\n".join(user_payload)
 
@@ -3067,18 +3075,17 @@ class _StreamState:
                         first_token_time = time.time()
                         ttft_ms = round((first_token_time - start_time) * 1000, 2)
 
-                    if self.enable_specialized_events_stream:
-                        # Relay raw chunk directly to the main chat stream so the user sees live streaming in the chat bubble
-                        _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                    else:
-                        # If specialized direct stream is not active, stream the raw chunk inside the active <processing> status block as an elegant backup!
-                        line_buffer += chunk
-                        if "\n" in line_buffer:
-                            lines = line_buffer.split("\n")
-                            for line in lines[:-1]:
-                                if line.strip():
-                                    self._emit_processing_status(f"  {line}")
-                            line_buffer = lines[-1]
+                    # Relay raw chunk directly to the main chat stream so the user sees live streaming in the chat bubble
+                    _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    # Also keep a clean log in the processing status panel
+                    line_buffer += chunk
+                    if "\n" in line_buffer:
+                        lines = line_buffer.split("\n")
+                        for line in lines[:-1]:
+                            if line.strip() and len(line) < 120:
+                                self._emit_processing_status(f"  {line.strip()}")
+                        line_buffer = lines[-1]
 
                     # Always relay the raw chunk to the frontend under MSG_TYPE_ARTEFACT_CHUNK
                     # so the user can see the code being written in real-time!
@@ -3569,6 +3576,9 @@ class ChatMixin:
         **kwargs
         ) -> Dict[str, Any]:
         self.scratchpad = ""
+        if not hasattr(self, "failure_memory") or self.failure_memory is None:
+            from lollms_client.lollms_discussion.lollms_memory import FailureMemory
+            object.__setattr__(self, "failure_memory", FailureMemory())
         personality = personality or NullPersonality()
         callback    = kwargs.get("streaming_callback")
 
@@ -4278,6 +4288,11 @@ EMIT <agent_mode/> tag IMMEDIATELY when the user request involves ANY of these:
    - "Save this as...", "Export to..."
    - Any request involving <artifact> tags
 
+🚨 DIRECT CONVERSATIONAL EXCEPTION:
+If the user is introducing themselves, giving their name, stating a personal preference, or sharing simple conversational facts (e.g. "my name is saif"), you MUST NOT activate Agent Mode.
+Instead, immediately answer them politely and issue a <mem_new> tag containing the fact:
+<mem_new importance="0.9" tags="user_name,preference" subject="user" predicate="PREFERS" object="saif">My name is Saif.</mem_new>
+
 3. 📊 DATA QUERIES & ANALYSIS
    - "Query the database...", "Analyze this dataset..."
    - "Calculate...", "Count...", "Find statistics..."
@@ -4332,6 +4347,12 @@ TRIGGER EXAMPLES:
 - "Show me sales by..." → REQUIRES QUERY
 - "Find duplicates..." → REQUIRES QUERY
 - "What's the total..." → REQUIRES QUERY
+
+⚠️ DEFENSIVE DATA CODING GUIDELINE (MANDATORY):
+- When writing Python code to parse date columns, always handle missing values or non-standard characters safely.
+- ALWAYS use `pd.to_datetime(df[column], errors='coerce')` so that invalid entries (or placeholders like dashes '—') do not throw a ValueError.
+- ALWAYS load files in your scripts using plain relative filenames (e.g. `pd.read_csv('dataset.csv')`). Do NOT prepend `/workspace/`, `/data_workspace/`, or other directory paths, as the execution sandbox runs directly inside the active workspace directory.
+- VISUALIZATION RULE: For any data visualization or plotting requests (charts, histograms, graphs), always write Python code using `matplotlib` and execute it via the `execute_python_data_query` tool. The backend sandbox will automatically capture, save, and display your matplotlib figures. Do NOT generate HTML files that attempt to load local CSV files directly, as browser CORS security will block the load.
 
 ⚠️ FABRICATION = REJECTION. Always query first.
 === END COGNITIVE DIRECTIVE ===
@@ -4814,6 +4835,9 @@ Assistant: <agent_mode/>
             )
             ss.ai_message = ai_message
 
+            _cb(callback, ai_message.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE,
+                {"message_id": ai_message.id})
+
             # CRITICAL FIX: Define _fast_relay BEFORE conditional branching (fixes undefined name error)
             _agent_mode_triggered = False
 
@@ -5185,6 +5209,40 @@ Assistant: <agent_mode/>
         #  Built-in tools (only when external tools exist)
         # ====================================================================
  
+        # ── Read Artifact Tool ──
+        def _read_artifact_impl(artifact_name: str) -> Dict[str, Any]:
+            """Retrieve the current content of an artifact by name."""
+            import re
+            cleaned_name = re.sub(r'\s*\(type=\w+\)\.?\s*$', '', artifact_name).strip()
+            art = self.artefacts.get(cleaned_name)
+            if not art:
+                # Fuzzy match fallback
+                existing_titles = self.artefacts._all_latest_titles()
+                matched = _find_best_title_match(cleaned_name, existing_titles)
+                if matched:
+                    art = self.artefacts.get(matched)
+            if not art:
+                return {
+                    "success": False,
+                    "error": f"Artifact '{artifact_name}' not found."
+                }
+            return {
+                "success": True,
+                "title": art.get("title"),
+                "type": art.get("type"),
+                "version": art.get("version"),
+                "content": art.get("content", ""),
+                "output": art.get("content", "")
+            }
+
+        _register(
+            name="read_artifact",
+            fn=_read_artifact_impl,
+            params=[{"name": "artifact_name", "type": "str", "description": "The exact title of the artifact to read."}],
+            description="Retrieve and read the current content of any artifact (e.g. Markdown files or code files) saved in the workspace.",
+            output=[{"name": "output", "type": "str"}]
+        )
+
         # ── Conversation History Search Tool ──
         def _search_conversation_history_impl(query: str) -> Dict[str, Any]:
             branch_msgs = self.get_branch(branch_tip_id or self.active_branch_id)
@@ -6021,6 +6079,13 @@ Assistant: <agent_mode/>
             _so_far = "".join(ss.stream_buf)
             _accumulated_full += _so_far
 
+            # Strict deterministic termination check
+            if "<done" in _so_far.lower():
+                _mission_state["phase"] = "COMPLETE"
+                _mission_complete = True
+                ASCIIColors.success(f"[chat] Round {_round}: Model signaled mission completion via <Done /> tag.")
+                break
+
             # Clean up raw tool_call block from visible content if it leaked
             if ss.tool_trigger:
                 match = re.search(
@@ -6278,8 +6343,12 @@ Assistant: <agent_mode/>
                     _is_semantic_dup = True
                 _prev_queries.add(_query_key)
  
-            if _is_identical_dup or _is_semantic_dup:
-                _dup_type = "IDENTICAL PARAMETERS" if _is_identical_dup else "SEMANTIC DUPLICATE"
+            _has_failed_previously = False
+            if getattr(self, "failure_memory", None) and self.failure_memory.has_previous_failure(_tool_name, _tool_params):
+                _has_failed_previously = True
+
+            if _is_identical_dup or _is_semantic_dup or _has_failed_previously:
+                _dup_type = "IDENTICAL PARAMETERS" if _is_identical_dup else ("SEMANTIC DUPLICATE" if _is_semantic_dup else "PREVIOUS EXECUTION FAILURE")
                 _warning(callback, f"[RUNAWAY] {_dup_type} call detected — injecting correction.")
 
                 # Build detailed correction showing what was already tried
@@ -6291,16 +6360,22 @@ Assistant: <agent_mode/>
                         if prev_sig == _full_param_hash:
                             _prev_attempts.append(f"  - Round {_round}: {evt.get('tool')}({json.dumps(prev_params)[:100]}...)")
 
+                # Add previous failure records if applicable
+                if _has_failed_previously and getattr(self, "failure_memory", None):
+                    failures = [f for f in self.failure_memory.failures if f["tool_name"] == _tool_name]
+                    for idx, f in enumerate(failures):
+                        _prev_attempts.append(f"  - Failure {idx+1}: Params={json.dumps(f['params'])[:100]}... | Error={f['error']}")
+
                 _shake_prompt = (
                     "\n"
                     "╔══════════════════════════════════════════════════════════════════╗\n"
-                    f"║  🚨 DUPLICATE ACTION DETECTED — {_dup_type}                     ║\n"
+                    f"║  🚨 DUPLICATE OR FAILED ACTION DETECTED — {_dup_type}           ║\n"
                     "╠══════════════════════════════════════════════════════════════════╣\n"
-                    "║  You are attempting to call a tool with parameters identical to  ║\n"
-                    "║  a previous call. This is FORBIDDEN — it wastes tokens and       ║\n"
-                    "║  produces no new information.                                    ║\n"
+                    "║  You are attempting to call a tool with parameters that either   ║\n"
+                    "║  are identical to a previous call or have FAILED previously.     ║\n"
+                    "║  This is FORBIDDEN — it wastes tokens and causes infinite loops. ║\n"
                     "║                                                                  ║\n"
-                    "║  PREVIOUS ATTEMPTS WITH THESE PARAMETERS:                        ║\n"
+                    "║  PREVIOUS ATTEMPTS / FAILURES:                                   ║\n"
                 )
                 if _prev_attempts:
                     _shake_prompt += "\n".join(_prev_attempts[:3]) + "\n"
@@ -6401,6 +6476,13 @@ Assistant: <agent_mode/>
                     _is_failed = False
                     ss._emit_tool_processing_status(f"Executing {_tool_name}...")
                     _result = active_tool_registry[_tool_name](**_tool_params)
+
+                    # Check if there were previous failures for this tool in FailureMemory
+                    if getattr(self, "failure_memory", None) and any(f["tool_name"] == _tool_name for f in self.failure_memory.failures):
+                        try:
+                            self._trigger_evolutionary_reflection(_tool_name, _tool_params, str(_result))
+                        except Exception as ref_err:
+                            ASCIIColors.warning(f"Failed during evolutionary reflection step: {ref_err}")
 
                     # Normalize multi-structured tool output into a robust LCPResult instance
                     from lollms_client.lollms_types import LCPResult
@@ -6685,6 +6767,8 @@ Assistant: <agent_mode/>
  
                 except Exception as e:
                     _is_failed = True
+                    if getattr(self, "failure_memory", None):
+                        self.failure_memory.record_failure(_tool_name, _tool_params, str(e))
                     if self.lollmsClient.debug:
                         trace_exception(e)
                     ss._emit_tool_processing_status(f"Error during execution: {str(e)[:100]}")
@@ -7150,7 +7234,7 @@ Assistant: <agent_mode/>
             else:
                 self.db_manager.delete_message(mid)
 
-        # ── Final content cleanup ─────────────────────────────────────────────
+        # Final content cleanup ─────────────────────────────────────────────
         import re as _re
         # Use ai_message.content as the primary source — it contains the
         # complete accumulated text including all rounds and final answer.
@@ -7161,6 +7245,27 @@ Assistant: <agent_mode/>
         ).strip()
         # Remove any residual internal markers
         _clean = _EXEC_MARKER_RE.sub('', _clean).strip()
+        
+        # Robustly scrub any leaked, partially cut, or orphaned memory, agent_mode, and Done tags before displaying
+        _clean = _re.sub(r'^[ \t]*<mem_new\s*[^>]*>.*?</mem_new>', '', _clean, flags=_re.DOTALL | _re.IGNORECASE)
+        _clean = _re.sub(r'^[ \t]*<mem_update\s*[^>]*>.*?</mem_update>', '', _clean, flags=_re.DOTALL | _re.IGNORECASE)
+        
+        # Aggressively strip any system processing blocks or adjacent HTML remains from the final visible content
+        _clean = _re.sub(r'<processing.*?>.*?</processing>', '', _clean, flags=_re.DOTALL | _re.IGNORECASE)
+        _clean = _re.sub(r'<processing[^>]*>', '', _clean, flags=_re.IGNORECASE)
+        _clean = _clean.replace("</processing>", "")
+
+        _clean = _re.sub(
+            r'<mem_[a-z_]+\s*[^>]*>|^\s*_*mem_[a-z_]+\s*[^>]*/?>|'
+            r'^\s*_*new\s*[^>]*/?>|^\s*_*update\s*[^>]*/?>|'
+            r'^\s*_*tag\s*[^>]*/?>|^\s*_*load\s*[^>]*/?>|'
+            r'^\s*_*delete\s*[^>]*/?>|'
+            r'<agent_mode\s*/?>|^\s*_*agent_mode\s*/?>|^\s*_*mode\s*/?>|'
+            r'^\s*_*_mode\s*/?>|^\s*/?>|'
+            r'<done\s*/?>|^\s*_*done\s*/?>',
+            '', _clean, flags=_re.IGNORECASE
+        ).strip()
+
         if remove_thinking_blocks:
             _clean = self.lollmsClient.remove_thinking_blocks(_clean)
 

@@ -97,6 +97,19 @@ discussion = None
 client = None
 
 
+def _is_safe_path(base_dir: Path, target_path: Path) -> bool:
+    """
+    Verifies that a target path resolves strictly inside the allowed base directory,
+    effectively blocking Directory Traversal (../) attacks.
+    """
+    try:
+        resolved_base = base_dir.resolve()
+        resolved_target = target_path.resolve()
+        return resolved_target.parts[:len(resolved_base.parts)] == resolved_base.parts
+    except Exception:
+        return False
+
+
 def initialize_workspace_state(workspace_name: str):
     """Dynamically switch active project workspace databases, files, and clients in-process."""
     global CURRENT_WORKSPACE_DIR, APP_DATA_DIR, APP_WORKSPACE_DIR, db_mgr, discussion, client, LLM_MODEL_NAME, needs_configuration
@@ -143,7 +156,10 @@ def initialize_workspace_state(workspace_name: str):
 
         try:
             client = LollmsClient(**client_kwargs)
-            ASCIIColors.green(f"⚡ [Workspace '{workspace_name_clean}'] Loaded saved configuration: {LLM_MODEL_NAME} via {cfg['llm_binding_name']}")
+
+            # Assume connected if config is present on disk (avoids blocking tokenize tests on boot)
+            needs_configuration = False
+            ASCIIColors.success(f"⚡ [Workspace '{workspace_name_clean}'] Lollms Client initialized successfully. Active model: {LLM_MODEL_NAME}")
 
             p_name = cfg.get("personality_name")
             if p_name and "/" in p_name:
@@ -153,7 +169,7 @@ def initialize_workspace_state(workspace_name: str):
                     content = soul_file.read_text(encoding="utf-8", errors="ignore")
                     active_personality_prompt = re.sub(r'^---\s*(.*?)\s*---', '', content, flags=re.DOTALL).strip()
         except Exception as e:
-            ASCIIColors.yellow(f"⚠️ [Workspace '{workspace_name_clean}'] Active LLM service offline or unreachable during boot ({e}). Retaining config and falling back to mock until client reconnects.")
+            ASCIIColors.yellow(f"⚠️ [Workspace '{workspace_name_clean}'] Initializing client fell back to mock: {e}")
             client = DummyClient()
     else:
         ASCIIColors.yellow(f"⚠️ [Workspace '{workspace_name_clean}'] No saved configuration found. User must configure LLM.")
@@ -656,12 +672,16 @@ async def get_binary_image(title: str, index: int, version: Optional[int] = None
 
 @app.get("/api/workspace_files/{filename}")
 async def get_workspace_file_endpoint(filename: str):
-    """Dynamically serve active workspace data files for HTML widget rendering."""
+    """Dynamic serve active workspace data files for HTML widget rendering."""
     if not APP_WORKSPACE_DIR:
         raise HTTPException(status_code=400, detail="No active workspace directory.")
 
-    file_path = APP_WORKSPACE_DIR / filename
-    if not file_path.exists():
+    # Sanitize and guard against Directory Traversal
+    file_path = (APP_WORKSPACE_DIR / filename).resolve()
+    if not _is_safe_path(APP_WORKSPACE_DIR, file_path):
+        raise HTTPException(status_code=403, detail="Access Denied: Path traversal detected.")
+
+    if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found in active workspace.")
 
     from fastapi.responses import FileResponse
@@ -677,7 +697,18 @@ async def validate_folder_endpoint(payload: dict):
     """
     from pathlib import Path
 
-    folder_path = Path(payload.get("folder_path", "").strip())
+    folder_raw = payload.get("folder_path", "").strip()
+    if not folder_raw:
+        return {"success": False, "error": "Folder path cannot be empty."}
+
+    folder_path = Path(folder_raw).resolve()
+
+    # Security check: Ensure we only validate paths inside safe directories
+    # (Allow home folder and the application workspaces directory)
+    allowed_bases = [Path.home(), APP_DIR]
+    is_allowed = any(_is_safe_path(base, folder_path) for base in allowed_bases)
+    if not is_allowed:
+        return {"success": False, "error": "Access Denied: Requested directory is outside allowed workspace boundaries."}
 
     if not folder_path.exists():
         return {"success": False, "error": f"Path does not exist: {folder_path}"}
@@ -708,8 +739,14 @@ async def import_folder_endpoint(payload: ImportFolderRequest):
     from fastapi.responses import StreamingResponse
     import json
 
-    folder_path = Path(payload.folder_path.strip())
+    folder_path = Path(payload.folder_path.strip()).resolve()
     title = payload.title
+
+    # Security check: Ensure we only import folders inside safe directories
+    allowed_bases = [Path.home(), APP_DIR]
+    is_allowed = any(_is_safe_path(base, folder_path) for base in allowed_bases)
+    if not is_allowed:
+        return {"success": False, "error": "Access Denied: Target folder is outside allowed boundaries."}
 
     if not folder_path.exists() or not folder_path.is_dir():
         return {"success": False, "error": f"Invalid folder path: {folder_path}"}
@@ -1578,6 +1615,23 @@ async def edit_memory_endpoint(memory_id: str, payload: EditMemoryRequest):
         if client and client.debug:
             trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/memories/dream")
+async def dream_memories_endpoint():
+    """Manually triggers subconscious memory dream consolidation, bypassing the time gate."""
+    if not discussion.memory_manager:
+        raise HTTPException(status_code=400, detail="Memory manager is not active.")
+    try:
+        from datetime import datetime, timedelta
+        # Force the dream pass by rewinding the last dream time stamp
+        discussion.memory_manager._last_dream = datetime.utcnow() - timedelta(days=1)
+        report = discussion.dream_memories(client)
+        return {"success": True, "report": report}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/memories/import")
 async def import_memory_endpoint(payload: ImportMemoryRequest):
@@ -2646,6 +2700,39 @@ async def get_data_grid(title: str, version: Optional[int] = None):
                 pass
 
     if not file_path or not file_path.exists():
+        # Fallback scan: check other workspaces and the global data_workspace
+        found_path = None
+        scan_dirs = [Path("./data_workspace")]
+        if APP_DIR and APP_DIR.exists():
+            ws_dir = APP_DIR / "workspaces"
+            if ws_dir.exists():
+                for d in ws_dir.iterdir():
+                    if d.is_dir():
+                        scan_dirs.append(d / "data_workspace")
+        for sd in scan_dirs:
+            for base_name in [f"{title}_consolidated.db", f"{title}_v{current_version}{ext}", f"{title}{ext}"]:
+                cand = sd / base_name
+                if cand.exists():
+                    found_path = cand
+                    break
+            if found_path:
+                break
+
+        if found_path:
+            import shutil
+            try:
+                workspace_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy(str(found_path), str(file_path))
+                unversioned_path = workspace_dir / f"{title}{ext}"
+                try:
+                    shutil.copy(str(found_path), str(unversioned_path))
+                except Exception:
+                    pass
+                ASCIIColors.success(f"✓ Recovered missing data file for grid: {file_path}")
+            except Exception:
+                pass
+
+    if not file_path or not file_path.exists():
         raise HTTPException(status_code=404, detail=f"Raw data file missing from workspace. Searched: {possible_paths}")
 
     import pandas as pd
@@ -2690,6 +2777,49 @@ async def get_data_grid(title: str, version: Optional[int] = None):
                     "rows": df.to_dict(orient="records")
                 }
             conn.close()
+        elif ext in (".ttl", ".rdf", ".xml"):
+            # Native support to serve TTL triples to the data grid
+            import pipmaster as pm
+            pm.ensure_packages("rdflib")
+            import rdflib
+            g = rdflib.Graph()
+            g.parse(str(file_path), format="turtle" if ext == ".ttl" else "xml")
+            
+            triples_list = []
+            for s, p, o in list(g)[:200]:  # Limit preview to 200 triples for UI safety
+                triples_list.append({
+                    "subject": str(s),
+                    "predicate": str(p),
+                    "object": str(o)
+                })
+            
+            result = {
+                "type": "csv",  # Render as flat grid sheet
+                "columns": ["subject", "predicate", "object"],
+                "rows": triples_list
+            }
+
+        elif ext in (".ttl", ".rdf", ".xml"):
+            # Native support to serve TTL triples to the data grid
+            import pipmaster as pm
+            pm.ensure_packages("rdflib")
+            import rdflib
+            g = rdflib.Graph()
+            g.parse(str(file_path), format="turtle" if ext == ".ttl" else "xml")
+
+            triples_list = []
+            for s, p, o in list(g)[:200]:  # Limit preview to 200 triples for UI safety
+                triples_list.append({
+                    "subject": str(s),
+                    "predicate": str(p),
+                    "object": str(o)
+                })
+
+            result = {
+                "type": "csv",  # Render as flat grid sheet
+                "columns": ["subject", "predicate", "object"],
+                "rows": triples_list
+            }
         else:
             sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
             df = pd.read_csv(str(file_path), sep=sep).head(100)
@@ -3595,9 +3725,9 @@ async def chat_with_document(request: ChatRequest):
                                 }
                                 for p_name, p_info in t["input_schema"].get("properties", {}).items()
                             ],
-                            "callable": lambda tname=t["name"], **kw: self.lollmsClient.tools.execute_tool(
-                                tname, kw, self.lollmsClient, discussion=self
-                            ).get("output", {})
+                            "callable": lambda tname=t["name"], **kw: client.tools.execute_tool(
+                                tname, kw, client, discussion=discussion
+                            )
                         }
 
                 try:
@@ -3864,19 +3994,54 @@ async def generate_image_for_message_endpoint(message_id: str, payload: Optional
         if is_edit:
             # For editing, find the source image
             source_b64: Optional[str] = None
-            artefact_name = attrs.get('name', '')
+            artefact_name = attrs.get('name', '').strip()
+
             if artefact_name:
+                # 1. Try exact lookup
                 a = discussion.artefacts.get(artefact_name)
                 if a and a.get('images'):
                     source_b64 = a['images'][-1]
+                else:
+                    # 2. Try fuzzy lookup among all artifacts
+                    all_arts = discussion.artefacts.list()
+                    for art in all_arts:
+                        if artefact_name in art["title"] and art.get("images"):
+                            source_b64 = art["images"][-1]
+                            break
+
+            # 3. Fallback: retrieve the most recent image from the active message
             if source_b64 is None:
                 active_imgs = msg.get_active_images()
                 if active_imgs:
                     source_b64 = active_imgs[-1]
-            if source_b64 is None:
-                raise HTTPException(status_code=400, detail="Source image not found for editing.")
 
-            img_bytes = tti.edit_image(image=source_b64, prompt=prompt)
+            # 4. Ultimate Fallback: walk backwards through the entire discussion branch to find ANY image
+            if source_b64 is None:
+                branch = discussion.get_branch(message_id)
+                for historical_msg in reversed(branch):
+                    hist_imgs = historical_msg.get_active_images()
+                    if hist_imgs:
+                        source_b64 = hist_imgs[-1]
+                        break
+
+            if source_b64 is None:
+                raise HTTPException(status_code=400, detail="Source image not found for editing. Please generate an image first.")
+
+            # Sanitize base64 payload to ensure compat with all TTI bindings
+            if ";base64," in source_b64:
+                source_b64 = source_b64.split(";base64,")[1]
+            source_b64 = source_b64.strip()
+
+            # Robust Safety Wrap: Prevent binding exceptions from crashing the server
+            try:
+                img_bytes = tti.edit_image(images=source_b64, prompt=prompt)
+            except Exception as edit_err:
+                trace_exception(edit_err)
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"The image editing engine encountered an error: {edit_err}. Please verify your TTI model configuration."
+                )
+
             art_prefix = "edited_image"
             group_type = "edited"
         else:
@@ -4120,13 +4285,18 @@ async def open_settings_folder_endpoint():
     import platform
     try:
         path_str = str(APP_DIR.resolve())
+        # Strict validation: Ensure the path matches exactly the expected APP_DIR
+        if Path(path_str).resolve() != APP_DIR.resolve():
+            raise HTTPException(status_code=403, detail="Access Denied: Attempted to open an invalid system path.")
+
         system = platform.system()
         if system == "Windows":
             os.startfile(path_str)
         elif system == "Darwin":  # macOS
-            subprocess.Popen(["open", path_str])
+            # Avoid using generic shell=True processes; arguments passed as structured list
+            subprocess.Popen(["open", path_str], shell=False)
         else:  # Linux
-            subprocess.Popen(["xdg-open", path_str])
+            subprocess.Popen(["xdg-open", path_str], shell=False)
         return {"success": True}
     except Exception as e:
         if client and client.debug:

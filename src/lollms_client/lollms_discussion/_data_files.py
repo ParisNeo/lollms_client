@@ -205,6 +205,38 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                 schema_parts.append("\n---\n")
             conn.close()
 
+        elif ext in (".ttl", ".rdf", ".xml"):
+            if progress_cb: progress_cb("Parsing Turtle RDF graph...")
+            _ensure_installed("rdflib")
+            import rdflib
+            g = rdflib.Graph()
+            g.parse(str(path), format="turtle" if ext == ".ttl" else "xml")
+
+            subjects = set(g.subjects())
+            predicates = set(g.predicates())
+            objects = set(g.objects())
+
+            schema_parts.append(f"Format: Semantic Web RDF Graph ({ext.upper()}) | Total Triples: {len(g):,}\n")
+            schema_parts.append(f"## Graph Summary")
+            schema_parts.append(f"- Unique Subjects: {len(subjects):,}")
+            schema_parts.append(f"- Unique Predicates (Properties): {len(predicates):,}")
+            schema_parts.append(f"- Unique Objects: {len(objects):,}\n")
+
+            schema_parts.append("### Active Namespace Bindings:")
+            for prefix, ns in g.namespaces():
+                if prefix:
+                    schema_parts.append(f"  • PREFIX {prefix}: &lt;{ns}&gt;")
+
+            schema_parts.append("\n### Unique Predicates / Relations List:")
+            for pred in sorted(predicates):
+                schema_parts.append(f"  • {pred}")
+
+            schema_parts.append("\n### Sample Triples Preview (First 5):")
+            sample_rows = []
+            for s, p, o in list(g)[:5]:
+                sample_rows.append(f"  • &lt;{s}&gt; &lt;{p}&gt; &lt;{o}&gt; .")
+            schema_parts.append("\n".join(sample_rows))
+
         elif ext in (".xlsx", ".xls"):
             if progress_cb: progress_cb("Reading Excel sheets...")
             xl = pd.ExcelFile(str(path))

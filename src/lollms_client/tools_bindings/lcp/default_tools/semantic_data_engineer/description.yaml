@@ -1,0 +1,50 @@
+binding_name: semantic_data_engineer
+title: Semantic Data Engineer
+author: ParisNeo & Lollms
+version: 1.0.0
+description: Processes tabular databases, generates matplotlib figures, bootstraps TBox schemas, and compiles relational rows into semantic ABox graph engrams.
+input_parameters:
+  - name: file_name
+    type: str
+    description: Filename of the target CSV, Excel, or SQLite file.
+    mandatory: true
+  - name: table_name
+    type: str
+    description: Name of the sheet (Excel) or table (SQLite).
+    mandatory: false
+  - name: plot_type
+    type: str
+    description: Plot type to generate (bar, line, scatter, histogram).
+    mandatory: false
+    default: bar
+  - name: x_column
+    type: str
+    description: Independent variable column name.
+    mandatory: false
+  - name: y_column
+    type: str
+    description: Dependent variable column name.
+    mandatory: false
+  - name: title
+    type: str
+    description: Plot title.
+    mandatory: false
+  - name: color
+    type: str
+    description: Hex color code for the plot (default '#4f46e5').
+    mandatory: false
+    default: '#4f46e5'
+  - name: tbox_file_name
+    type: str
+    description: Filename of the TBox schema file (required for ABox conversion).
+    mandatory: false
+commands:
+  - name: tool_compute_statistics_and_plot
+    title: Compute Stats and Plot
+    description: Calculates column statistics and saves a corresponding PNG figure in the workspace.
+  - name: tool_bootstrap_tbox_from_database
+    title: Bootstrap TBox Ontology
+    description: Automatically generates an ontological schema (TBox) matching the database's physical tables and columns.
+  - name: tool_convert_to_abox
+    title: Convert Relational rows to ABox Graph
+    description: Translates physical database rows into semantic engram nodes (ABox) and links them to the long-term memory graph.

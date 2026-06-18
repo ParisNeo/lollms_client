@@ -9,6 +9,12 @@
  * LaTeX math rendering with KaTeX, and a modal ingestion panel.
  */
 
+// ── Global Function States for Chat Settings ──
+let funcStates = {};
+
+// Expose funcStates to the window scope for global visibility
+window.funcStates = funcStates;
+
 document.addEventListener("DOMContentLoaded", () => {
     // ── 🔔 Modern Toast Notification System ──
     function showNotification(message, type = "info", duration = 4500) {
@@ -134,6 +140,8 @@ document.addEventListener("DOMContentLoaded", () => {
     let savedTtiConfigs = {};
     let savedSttConfigs = {};
     let isConfigLoading = false;
+    let memViewMode = "abox";
+    let graphViewMode = "abox";
 
     // ── 🌿 Custom Asynchronous Modal Prompt (Drop-in replacement for window.prompt) ──
     function showCustomPrompt(title, placeholder = "", defaultValue = "") {
@@ -442,7 +450,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // ── 🎯 Chat Function Badges Handler ──
     const funcBadges = document.querySelectorAll(".func-badge");
-    const funcStates = {};
 
     funcBadges.forEach(badge => {
         const funcKey = badge.dataset.func;
@@ -612,33 +619,37 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function initializeApp() {
+        // 1. Immediately remove the full page spinner on start so the user can interact with the UI instantly
+        const globalLoader = document.getElementById("global-page-loader");
+        if (globalLoader) {
+            globalLoader.style.opacity = "0";
+            globalLoader.style.visibility = "hidden";
+            setTimeout(() => globalLoader.remove(), 400);
+        }
+
         try {
-            // 1. Run core sidebar and budget fetches in parallel
+            // 2. Load all workspace data and parameters asynchronously in the background
             await Promise.all([
                 fetchArtifacts(),
                 fetchMemories(),
                 fetchDiscoveredTools(),
-                updateContextBudget()
+                updateContextBudget(),
+                loadSettingsIntoUI(),
+                fetchMessageHistory(),
+                verifyServerStatus()
             ]);
-
-            // 2. Load and resolve dropdown select listings
-            await loadSettingsIntoUI();
-
-            // 3. Retrieve chronological message history
-            await fetchMessageHistory();
-
-            // 4. Verify server configuration status and trigger settings redirect if needed
-    // Verify server configuration status and trigger settings redirect if needed
-    await verifyServerStatus();
         } catch (err) {
-            console.error("Workspace initialization failed:", err);
+            console.error("Workspace background initialization failed:", err);
         } finally {
-            // 5. Smoothly fade out and remove the global loader once everything is ready
-            const globalLoader = document.getElementById("global-page-loader");
-            if (globalLoader) {
-                globalLoader.style.opacity = "0";
-                globalLoader.style.visibility = "hidden";
-                setTimeout(() => globalLoader.remove(), 400);
+            // 3. Smoothly hide and unmount the localized discussion spinner once background loading is complete
+            const startupSpinner = document.getElementById("discussion-startup-spinner");
+            if (startupSpinner) {
+                startupSpinner.style.opacity = "0";
+                startupSpinner.style.transition = "opacity 0.25s ease";
+                setTimeout(() => {
+                    startupSpinner.style.display = "none";
+                    startupSpinner.remove();
+                }, 250);
             }
         }
     }
@@ -841,6 +852,67 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    // Stored Memories TBox/ABox Toggle Listener
+    const btnToggleTBoxABox = document.getElementById("btn-toggle-tbox-abox");
+    if (btnToggleTBoxABox) {
+        btnToggleTBoxABox.addEventListener("click", () => {
+            memViewMode = memViewMode === "abox" ? "tbox" : "abox";
+            btnToggleTBoxABox.classList.toggle("active", memViewMode === "tbox");
+            btnToggleTBoxABox.textContent = memViewMode === "tbox" ? "📐 TBox (Schema)" : "📐 ABox (Instances)";
+            renderMemories();
+        });
+    }
+
+    // Left Sidebar Dream Action Listener
+    const btnDreamMemories = document.getElementById("btn-dream-memories-part");
+    if (btnDreamMemories) {
+        btnDreamMemories.addEventListener("click", async () => {
+            btnDreamMemories.disabled = true;
+            btnDreamMemories.textContent = "Dreaming...";
+            try {
+                const res = await fetch("/api/memories/dream", { method: "POST" });
+                const data = await res.json();
+                if (data.success && data.report) {
+                    const r = data.report;
+                    if (r.skipped) {
+                        alert("💤 Dreaming skipped: " + r.reason);
+                    } else {
+                        alert(`💤 Subconscious Dream Consolidation complete!\n\n• Decayed: ${r.decayed} memory nodes\n• Promoted: ${r.promoted} nodes\n• Reinforced: ${r.reinforced} nodes\n• Forgotten: ${r.forgotten} nodes\n• Retained by Dreamer: ${r.retained_by_dreamer} nodes\n• Fused (Redundant Merges): ${r.fused_nodes || 0} nodes\n• Audited Orphans: ${r.audited_orphans || 0} nodes\n• Time taken: ${r.duration_seconds.toFixed(2)}s`);
+                        fetchMemories();
+                    }
+                } else {
+                    alert("Consolidation pass returned no report.");
+                }
+            } catch (err) {
+                alert("Dreaming pass failed: " + err);
+            } finally {
+                btnDreamMemories.disabled = false;
+                btnDreamMemories.textContent = "💤 Dream";
+            }
+        });
+    }
+
+    // Left Sidebar Tab Switcher
+    const sidebarTabButtons = document.querySelectorAll(".sidebar-tab-btn");
+    const sidebarTabPanes = document.querySelectorAll(".sidebar-tab-pane");
+
+    sidebarTabButtons.forEach(btn => {
+        btn.addEventListener("click", () => {
+            sidebarTabButtons.forEach(b => b.classList.remove("active"));
+            sidebarTabPanes.forEach(p => {
+                p.classList.remove("active");
+                p.style.display = "none";
+            });
+
+            btn.classList.add("active");
+            const targetPane = document.getElementById(btn.dataset.sidebarTab);
+            if (targetPane) {
+                targetPane.classList.add("active");
+                targetPane.style.display = "flex";
+            }
+        });
+    });
+
     // Launch workspace bootstrapper
     initializeApp();
 
@@ -902,16 +974,19 @@ document.addEventListener("DOMContentLoaded", () => {
     async function updateContextBudget() {
         try {
             const res = await fetch("/api/context_status");
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
             const data = await res.json();
 
-            const maxTokens = data.max_tokens || 8192;
-            const currentTokens = data.current_tokens || 0;
+            const maxTokens = (data && data.max_tokens) ? data.max_tokens : 8192;
+            const currentTokens = (data && data.current_tokens) ? data.current_tokens : 0;
             const percent = ((currentTokens / maxTokens) * 100).toFixed(1);
 
             contextBudgetText.textContent = `${currentTokens.toLocaleString()} / ${maxTokens.toLocaleString()} tokens (${percent}%)`;
 
             let sysTokens = 0;
-            const sysCtx = data.zones.system_context;
+            const sysCtx = (data && data.zones) ? data.zones.system_context : null;
             if (sysCtx) {
                 sysTokens = sysCtx.tokens || 0;
             }
@@ -919,8 +994,20 @@ document.addEventListener("DOMContentLoaded", () => {
             let artTokens = 0;
             if (sysCtx && sysCtx.breakdown && sysCtx.breakdown.artefacts) {
                 artTokens = sysCtx.breakdown.artefacts.tokens || 0;
-                sysTokens = Math.max(0, sysTokens - artTokens);
             }
+
+            let memTokens = 0;
+            if (sysCtx && sysCtx.breakdown) {
+                if (sysCtx.breakdown.working_memory) {
+                    memTokens += sysCtx.breakdown.working_memory.tokens || 0;
+                }
+                if (sysCtx.breakdown.deep_memory) {
+                    memTokens += sysCtx.breakdown.deep_memory.tokens || 0;
+                }
+            }
+
+            // Subtract sub-components from raw system context block to avoid double-counting
+            sysTokens = Math.max(0, sysTokens - artTokens - memTokens);
 
             let histTokens = 0;
             const histCtx = data.zones.message_history;
@@ -930,17 +1017,20 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const sysPercent = ((sysTokens / maxTokens) * 100).toFixed(2);
             const artPercent = ((artTokens / maxTokens) * 100).toFixed(2);
+            const memPercent = ((memTokens / maxTokens) * 100).toFixed(2);
             const histPercent = ((histTokens / maxTokens) * 100).toFixed(2);
 
             contextBudgetBar.innerHTML = `
                 <div class="context-budget-segment system" style="width: ${sysPercent}%" title="System / Static Prompt: ${sysTokens} tokens"></div>
                 <div class="context-budget-segment artifacts" style="width: ${artPercent}%" title="Active Artifacts: ${artTokens} tokens"></div>
+                <div class="context-budget-segment memories" style="width: ${memPercent}%" title="Stored Memories: ${memTokens} tokens"></div>
                 <div class="context-budget-segment history" style="width: ${histPercent}%" title="Message History: ${histTokens} tokens"></div>
             `;
 
             contextBudgetLegend.innerHTML = `
                 <div class="legend-item"><span class="legend-color-dot system"></span> System (${sysTokens.toLocaleString()})</div>
                 <div class="legend-item"><span class="legend-color-dot artifacts"></span> Artifacts (${artTokens.toLocaleString()})</div>
+                <div class="legend-item"><span class="legend-color-dot memories" style="background-color: var(--success-color);"></span> Memories (${memTokens.toLocaleString()})</div>
                 <div class="legend-item"><span class="legend-color-dot history"></span> History (${histTokens.toLocaleString()})</div>
             `;
         } catch (err) {
@@ -995,11 +1085,18 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function sanitizeTabTitle(title) {
+        if (!title) return "";
+        // Normalize away trailing type annotations e.g. "myfile.md (type=document)" -> "myfile.md"
+        return title.replace(/\s*\(type=\w+\)\.?\s*$/i, "").trim();
+    }
+
     function createArtifactTab(title, type) {
-        const safeId = makeSafeId(title);
+        const cleanTitle = sanitizeTabTitle(title);
+        const safeId = makeSafeId(cleanTitle);
         const tabId = `tab-art-${safeId}`;
 
-        if (openTabs.has(title)) {
+        if (openTabs.has(cleanTitle)) {
             switchCenterTab(tabId);
             return;
         }
@@ -1014,10 +1111,10 @@ document.addEventListener("DOMContentLoaded", () => {
         const tabBtn = document.createElement("button");
         tabBtn.className = "tab-btn";
         tabBtn.dataset.tab = tabId;
-        tabBtn.dataset.artTitle = title;
+        tabBtn.dataset.artTitle = cleanTitle;
         tabBtn.innerHTML = `
-            <span>${icon} ${title}</span>
-            <span class="tab-close" data-art-title="${title}">×</span>
+            <span>${icon} ${cleanTitle}</span>
+            <span class="tab-close" data-art-title="${cleanTitle}">×</span>
         `;
         workspaceTabs.appendChild(tabBtn);
 
@@ -1049,7 +1146,7 @@ document.addEventListener("DOMContentLoaded", () => {
         `;
         viewport.appendChild(tabContent);
 
-        openTabs.add(title);
+        openTabs.add(cleanTitle);
 
         const subTabButtons = tabContent.querySelectorAll(".sub-tab-btn");
         const subTabPanes = tabContent.querySelectorAll(".sub-tab-content");
@@ -1059,8 +1156,8 @@ document.addEventListener("DOMContentLoaded", () => {
                 subTabPanes.forEach(p => p.classList.remove("active"));
                 btn.classList.add("active");
                 tabContent.querySelector(`#sub-tab-${btn.dataset.subTab}`).classList.add("active");
-                if (btn.dataset.subTab === `rendered-${safeId}` && codeEditors[title]) {
-                    setTimeout(() => codeEditors[title].refresh(), 10);
+                if (btn.dataset.subTab === `rendered-${safeId}` && codeEditors[cleanTitle]) {
+                    setTimeout(() => codeEditors[cleanTitle].refresh(), 10);
                 }
             });
         });
@@ -1073,7 +1170,7 @@ document.addEventListener("DOMContentLoaded", () => {
         // 1. Browsing a version simply loads it visually (no auto-activation)
         vSelect.addEventListener("change", async (e) => {
             const selectedVer = parseInt(e.target.value, 10);
-            await loadArtifactVersion(title, selectedVer, type);
+            await loadArtifactVersion(cleanTitle, selectedVer, type);
         });
 
         // 2. Set Active Button Click
@@ -1082,14 +1179,14 @@ document.addEventListener("DOMContentLoaded", () => {
             btnSetActive.disabled = true;
             btnSetActive.textContent = "Setting...";
             try {
-                const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/select_version?version=${selectedVer}`, {
+                const res = await fetch(`/api/artifacts/${encodeURIComponent(cleanTitle)}/select_version?version=${selectedVer}`, {
                     method: "POST"
                 });
                 const data = await res.json();
                 if (data.success) {
                     alert(`Version v${selectedVer} is now set as the active/default version in the session context!`);
                     await fetchArtifacts(); // Refreshes active/dormant icons in left sidebar
-                    await selectArtifact(title); // Reload dropdown listing & state
+                    await selectArtifact(cleanTitle); // Reload dropdown listing & state
                 }
             } catch (err) {
                 alert(`Failed to set active version: ${err}`);
@@ -1104,14 +1201,14 @@ document.addEventListener("DOMContentLoaded", () => {
             const selectedVer = parseInt(vSelect.value, 10);
             const confirmed = await showSlickConfirm(
                 "🗑️ Delete Artifact Version",
-                `Are you sure you want to permanently delete version v${selectedVer} of the artifact '${title}'? This cannot be undone.`
+                `Are you sure you want to permanently delete version v${selectedVer} of the artifact '${cleanTitle}'? This cannot be undone.`
             );
             if (!confirmed) return;
 
             btnDeleteVer.disabled = true;
             btnDeleteVer.textContent = "Deleting...";
             try {
-                const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/versions/${selectedVer}`, {
+                const res = await fetch(`/api/artifacts/${encodeURIComponent(cleanTitle)}/versions/${selectedVer}`, {
                     method: "DELETE"
                 });
                 const data = await res.json();
@@ -1119,7 +1216,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     alert(`Version v${selectedVer} successfully deleted.`);
                     await fetchArtifacts();
                     // Reload artifact – this automatically switches the view to the new active version
-                    await selectArtifact(title);
+                    await selectArtifact(cleanTitle);
                 } else {
                     alert(`Deletion failed: ${data.detail}`);
                 }
@@ -1156,7 +1253,7 @@ document.addEventListener("DOMContentLoaded", () => {
             btnSquash.disabled = true;
             btnSquash.textContent = "Squashing...";
             try {
-                const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/squash`, {
+                const res = await fetch(`/api/artifacts/${encodeURIComponent(cleanTitle)}/squash`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(payload)
@@ -1165,7 +1262,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (data.success) {
                     alert(`Successfully squashed version history! Space reclaimed: ${data.report.space_reclaimed_estimate.toLocaleString()} characters.`);
                     await fetchArtifacts();
-                    await selectArtifact(title);
+                    await selectArtifact(cleanTitle);
                 } else {
                     alert(`Squash failed: ${data.detail}`);
                 }
@@ -1186,8 +1283,8 @@ document.addEventListener("DOMContentLoaded", () => {
                     const selectedVer = parseInt(vSelect.value, 10) || 1;
                     const imgIndex = selectedVer - 1; // 0-based index
                     const a = document.createElement("a");
-                    a.href = `/api/images/${encodeURIComponent(title)}/${imgIndex}`;
-                    a.download = `${title}_v${selectedVer}.png`;
+                    a.href = `/api/images/${encodeURIComponent(cleanTitle)}/${imgIndex}`;
+                    a.download = `${cleanTitle}_v${selectedVer}.png`;
                     document.body.appendChild(a);
                     a.click();
                     document.body.removeChild(a);
@@ -1197,7 +1294,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     setTimeout(() => {
                         const sel = document.getElementById("export-art-select");
                         if (sel) {
-                            sel.value = title;
+                            sel.value = cleanTitle;
                             sel.dispatchEvent(new Event("change"));
                         }
                     }, 150);
@@ -1209,13 +1306,13 @@ document.addEventListener("DOMContentLoaded", () => {
             if (e.target.classList.contains("tab-close")) {
                 return;
             }
-            selectArtifact(title);
+            selectArtifact(cleanTitle);
         });
 
         const closeBtn = tabBtn.querySelector(".tab-close");
         closeBtn.addEventListener("click", (e) => {
             e.stopPropagation();
-            closeArtifactTab(title);
+            closeArtifactTab(cleanTitle);
         });
 
         // Bind raw source code "Save Changes" button
@@ -1228,13 +1325,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
             // Clear cache for this artifact to ensure fresh data is loaded
             for (const key of datasetCache.keys()) {
-                if (key.startsWith(`${title}-`)) {
+                if (key.startsWith(`${cleanTitle}-`)) {
                     datasetCache.delete(key);
                 }
             }
 
             try {
-                const res = await fetch(`/api/artifacts/${encodeURIComponent(title)}/update`, {
+                const res = await fetch(`/api/artifacts/${encodeURIComponent(cleanTitle)}/update`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ content: rawTextarea.value })
@@ -1244,7 +1341,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     alert(`Artifact successfully saved as version ${data.version}!`);
                     // Re-fetch list and reload selection to refresh the Rendered View!
                     await fetchArtifacts();
-                    await selectArtifact(title);
+                    await selectArtifact(cleanTitle);
                 } else {
                     alert(`Save failed: ${data.detail}`);
                 }
@@ -1260,7 +1357,8 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function closeArtifactTab(title) {
-        const safeId = makeSafeId(title);
+        const cleanTitle = sanitizeTabTitle(title);
+        const safeId = makeSafeId(cleanTitle);
         const tabId = `tab-art-${safeId}`;
         const tabBtn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
         const tabContent = document.getElementById(tabId);
@@ -1268,12 +1366,12 @@ document.addEventListener("DOMContentLoaded", () => {
         if (tabBtn) tabBtn.remove();
         if (tabContent) tabContent.remove();
 
-        openTabs.delete(title);
-        if (codeEditors[title]) {
-            delete codeEditors[title];
+        openTabs.delete(cleanTitle);
+        if (codeEditors[cleanTitle]) {
+            delete codeEditors[cleanTitle];
         }
 
-        if (activeArtifactTitle === title) {
+        if (activeArtifactTitle === cleanTitle) {
             activeArtifactTitle = null;
             activeArtifactType = null;
             selectedVersion = null;
@@ -1408,7 +1506,29 @@ document.addEventListener("DOMContentLoaded", () => {
                 isReadOnly = matched.read_only;
             }
 
-            if (activeType === "data") {
+            if (activeType === "image") {
+                // Direct high-fidelity binary image preview in Rendered View
+                const selectedVer = version || 1;
+                const imgIndex = selectedVer - 1; // 0-based
+                renderedView.style.height = "100%";
+                renderedView.style.overflow = "auto";
+                renderedView.style.display = "flex";
+                renderedView.style.flexDirection = "column";
+                renderedView.style.justifyContent = "center";
+                renderedView.style.alignItems = "center";
+                renderedView.style.padding = "20px";
+
+                renderedView.innerHTML = `
+                    <div class="rendered-image-container" style="max-width: 100%; max-height: 100%; display: flex; flex-direction: column; align-items: center; gap: 12px; margin: 0;">
+                        <img src="/api/images/${encodeURIComponent(title)}/${imgIndex}?version=${selectedVer}" style="max-width: 100%; max-height: 65vh; object-fit: contain; border-radius: 8px; border: 1px solid var(--border-color); box-shadow: var(--shadow-lg);" />
+                        <span style="font-size: 11px; color: var(--text-secondary); font-weight: bold; background-color: rgba(0,0,0,0.4); padding: 4px 12px; border-radius: 12px;">🎨 ${title} (v${selectedVer})</span>
+                    </div>
+                `;
+
+                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
+                const art = await artRes.json();
+                rawView.value = art.content;
+            } else if (activeType === "data") {
                 await renderSpreadsheetGridInTab(title, version, renderedView);
 
                 const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
@@ -4809,66 +4929,23 @@ document.addEventListener("DOMContentLoaded", () => {
                         }
                     }
 
-                    // Trigger validation with the loaded config values directly
-                    const valRes = await fetch("/api/bindings/llm/test", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ binding_name: data.llm_binding_name, config: config })
-                    });
-                    const valData = await valRes.json();
-                    if (valData.success && Array.isArray(valData.models)) {
-                        discoveredLlmModels = valData.models;
-                        renderLlmModelDropdown(discoveredLlmModels);
-                        modelGroup.style.display = "flex";
-                        currentBindingConfig = config;
-
-                        if (config.model_name) {
-                            selModel.value = config.model_name;
-                            selModel.dispatchEvent(new Event("change"));
-                        }
-                    } else {
-                        console.warn("Saved binding validation failed:", valData.error);
-                    }
-                } else {
-                    console.warn(`❌ Saved binding '${data.llm_binding_name}' not found in available bindings.`);
-                    console.log("📋 Available binding names:", availableBindings.map(b => b.binding_name));
+                    // Populates the configuration UI form without blocking the thread with heavy /test calls
+                    renderLlmModelDropdown([config.model_name || "unknown"]);
+                    modelGroup.style.display = "flex";
+                    currentBindingConfig = config;
                 }
 
                 // ── Load TTI Configuration ──
                 if (data.tti_binding_name) {
                     const ttiBindingExists = availableTtiBindings.some(b => b.binding_name === data.tti_binding_name);
-
                     if (ttiBindingExists) {
                         selTtiBinding.value = data.tti_binding_name;
                         selTtiBinding.dataset.prevTtiBinding = data.tti_binding_name;
-                        console.log("⚙️ TTI Pre-selecting binding:", data.tti_binding_name);
-
-                        // Wait for DOM to render the selection, then trigger change event
-                        setTimeout(() => {
-                            console.log("🔁 Verifying TTI binding selection after DOM render...");
-                            console.log("📋 selTtiBinding.value after timeout:", selTtiBinding.value);
-
-                            // IMPORTANT: Trigger change event to populate TTI config form
-                            const ttiChangeEvent = new Event('change', { bubbles: true });
-                            selTtiBinding.dispatchEvent(ttiChangeEvent);
-                            console.log("📤 TTI Change event dispatched for binding selection");
-
-                            // Verify selection persisted
-                            setTimeout(() => {
-                                console.log("🔍 Final TTI verification - selTtiBinding.value:", selTtiBinding.value);
-                                if (selTtiBinding.value !== data.tti_binding_name) {
-                                    console.error("❌ TTI Binding selection was reset! Re-applying...");
-                                    selTtiBinding.value = data.tti_binding_name;
-                                    console.log("✅ Re-applied TTI binding selection:", selTtiBinding.value);
-                                }
-                            }, 50);
-                        }, 100);
-
                         renderTtiConfigForm(data.tti_binding_name);
 
                         const ttiConfig = data.tti_binding_config || {};
                         for (const [key, value] of Object.entries(ttiConfig)) {
-                            const input = document.getElementById(`tti-cfg-${key}`);
+                            const input = document.getElementById("tti-cfg-" + key);
                             if (input) {
                                 if (input.type === "checkbox") {
                                     input.checked = !!value;
@@ -4877,50 +4954,22 @@ document.addEventListener("DOMContentLoaded", () => {
                                 }
                             }
                         }
-
-                        // Trigger validation with TTI config directly
-                        const ttiValRes = await fetch("/api/bindings/tti/test", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ binding_name: data.tti_binding_name, config: ttiConfig })
-                        });
-                        const ttiValData = await ttiValRes.json();
-                        if (ttiValData.success && Array.isArray(ttiValData.models)) {
-                            discoveredTtiModels = ttiValData.models;
-                            renderTtiModelDropdown(discoveredTtiModels);
-                            ttiModelGroup.style.display = "flex";
-                            currentTtiBindingConfig = ttiConfig;
-
-                            if (ttiConfig.model_name) {
-                                selTtiModel.value = ttiConfig.model_name;
-                                selTtiModel.dispatchEvent(new Event("change"));
-                            }
-                        } else {
-                            console.warn("Saved TTI binding validation failed:", ttiValData.error);
-                        }
-                    } else {
-                        console.warn("Saved TTI binding '" + data.tti_binding_name + "' not found in available bindings.");
+                        renderTtiModelDropdown([ttiConfig.model_name || "unknown"]);
+                        ttiModelGroup.style.display = "flex";
+                        currentTtiBindingConfig = ttiConfig;
                     }
                 }
 
                 if (data.stt_binding_name) {
                     const sttBindingExists = availableSttBindings.some(b => b.binding_name === data.stt_binding_name);
-
                     if (sttBindingExists) {
                         selSttBinding.value = data.stt_binding_name;
                         selSttBinding.dataset.prevSttBinding = data.stt_binding_name;
-                        console.log("⚙️ STT Pre-selecting binding:", data.stt_binding_name);
-
-                        setTimeout(() => {
-                            const sttChangeEvent = new Event('change', { bubbles: true });
-                            selSttBinding.dispatchEvent(sttChangeEvent);
-                        }, 100);
-
                         renderSttConfigForm(data.stt_binding_name);
 
-                        const sttConfig = data.stt_binding_config || {};
-                        for (const [key, value] of Object.entries(sttConfig)) {
-                            const input = document.getElementById(`stt-cfg-${key}`);
+                        const r_key_map = data.stt_binding_config || {};
+                        for (const [key, value] of Object.entries(r_key_map)) {
+                            const input = document.getElementById("stt-cfg-" + key);
                             if (input) {
                                 if (input.type === "checkbox") {
                                     input.checked = !!value;
@@ -4929,25 +4978,9 @@ document.addEventListener("DOMContentLoaded", () => {
                                 }
                             }
                         }
-
-                        // Trigger validation with STT config directly
-                        const sttValRes = await fetch("/api/bindings/stt/test", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ binding_name: data.stt_binding_name, config: sttConfig })
-                        });
-                        const sttValData = await sttValRes.json();
-                        if (sttValData.success && Array.isArray(sttValData.models)) {
-                            discoveredSttModels = sttValData.models;
-                            renderSttModelDropdown(discoveredSttModels);
-                            sttModelGroup.style.display = "flex";
-                            currentSttBindingConfig = sttConfig;
-
-                            if (sttConfig.model_name) {
-                                selSttModel.value = sttConfig.model_name;
-                                selSttModel.dispatchEvent(new Event("change"));
-                            }
-                        }
+                        renderSttModelDropdown([r_key_map.model_name || "unknown"]);
+                        sttModelGroup.style.display = "flex";
+                        currentSttBindingConfig = r_key_map;
                     }
                 }
 
@@ -5000,6 +5033,9 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCloseExportModal.addEventListener("click", closeExportModal);
     btnCancelExport.addEventListener("click", closeExportModal);
 
+    // Active Cytoscape Instance Reference
+    let activeCyInstance = null;
+
     // ── Memory Network Graph Modal Handlers ──
     const btnViewGraph = document.getElementById("btn-view-memory-graph");
     const memoryGraphModal = document.getElementById("memory-graph-modal");
@@ -5010,6 +5046,27 @@ document.addEventListener("DOMContentLoaded", () => {
         btnViewGraph.addEventListener("click", () => {
             memoryGraphModal.style.display = "flex";
             renderMemoryNetworkGraph();
+            // Critical Fix: Trigger Cytoscape redraw/recenter after DOM layout paint completes
+            setTimeout(() => {
+                if (activeCyInstance) {
+                    activeCyInstance.resize();
+                    activeCyInstance.invalidateDimensions && activeCyInstance.invalidateDimensions();
+                    activeCyInstance.fit();
+                    activeCyInstance.center();
+                }
+            }, 100);
+        });
+    }
+
+    const btnRecenterGraph = document.getElementById("btn-recenter-memory-graph");
+    if (btnRecenterGraph) {
+        btnRecenterGraph.addEventListener("click", () => {
+            if (activeCyInstance) {
+                activeCyInstance.resize();
+                activeCyInstance.fit();
+                activeCyInstance.center();
+                showNotification("🎯 Graph recentered and scaled to viewport.", "success", 2000);
+            }
         });
     }
 
@@ -5039,8 +5096,113 @@ document.addEventListener("DOMContentLoaded", () => {
 
         if (!viewport || !inspector) return;
 
+        const graphToggleBtn = document.getElementById("btn-graph-toggle-tbox-abox");
+        if (graphToggleBtn && !graphToggleBtn.dataset.listenerAdded) {
+            graphToggleBtn.dataset.listenerAdded = "true";
+            graphToggleBtn.addEventListener("click", () => {
+                graphViewMode = graphViewMode === "abox" ? "tbox" : "abox";
+                graphToggleBtn.textContent = graphViewMode === "tbox" ? "📐 Switch to ABox Instances" : "📐 Switch to TBox Schema";
+                graphToggleBtn.classList.toggle("active", graphViewMode === "tbox");
+                renderMemoryNetworkGraph();
+            });
+        }
+
+        if (graphViewMode === "tbox") {
+            viewport.innerHTML = "";
+            inspector.innerHTML = `
+                <div style="display: flex; flex-direction: column; gap: 12px; width: 100%;">
+                    <span class="level-tag deep" style="font-size: 9.5px; font-weight: bold; text-transform: uppercase; color: var(--accent-color);">TBox Ontological Schema</span>
+                    <p style="font-size: 12.5px; line-height: 1.5; color: var(--text-primary); margin: 0;">This graph represents the abstract terminological box (TBox) schema of the memory system, defining valid concept classes and their relationships.</p>
+                    <div style="border-top: 1px solid var(--border-color); padding-top: 10px; font-size: 11px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 6px;">
+                        <span>• Tap any class node to inspect its description.</span>
+                        <span>• Hover over edges to see their semantic predicates.</span>
+                    </div>
+                </div>
+            `;
+
+            const tboxElements = [
+                { group: "nodes", data: { id: "CONCEPT", label: "LABEL: CONCEPT", color: "#818cf8" } },
+                { group: "nodes", data: { id: "PREFERENCE", label: "LABEL: PREFERENCE", color: "#10b981" } },
+                { group: "nodes", data: { id: "EVENT", label: "LABEL: EVENT", color: "#f59e0b" } },
+                { group: "nodes", data: { id: "DECISION", label: "LABEL: DECISION", color: "#f43f5e" } },
+
+                { group: "edges", data: { id: "e1", source: "PREFERENCE", target: "CONCEPT", label: "PREFERS" } },
+                { group: "edges", data: { id: "e2", source: "CONCEPT", target: "DECISION", label: "IMPLEMENTS" } },
+                { group: "edges", data: { id: "e3", source: "EVENT", target: "EVENT", label: "TEMPORAL_AFTER" } },
+                { group: "edges", data: { id: "e4", source: "CONCEPT", target: "CONCEPT", label: "PART_OF" } },
+                { group: "edges", data: { id: "e5", source: "CONCEPT", target: "CONCEPT", label: "CONTRADICTS" } },
+                { group: "edges", data: { id: "e6", source: "CONCEPT", target: "CONCEPT", label: "SUPPORTS" } },
+                { group: "edges", data: { id: "e7", source: "CONCEPT", target: "CONCEPT", label: "RELATED_TO" } }
+            ];
+
+            const cy = cytoscape({
+                container: viewport,
+                elements: tboxElements,
+                style: [
+                    {
+                        selector: 'node',
+                        style: {
+                            'label': 'data(id)',
+                            'color': '#fff',
+                            'font-size': '10px',
+                            'font-family': 'monospace',
+                            'font-weight': 'bold',
+                            'background-color': 'data(color)',
+                            'border-width': '2px',
+                            'border-color': '#fff',
+                            'width': '64px',
+                            'height': '64px',
+                            'text-valign': 'center',
+                            'text-halign': 'center'
+                        }
+                    },
+                    {
+                        selector: 'edge',
+                        style: {
+                            'label': 'data(label)',
+                            'font-size': '8.5px',
+                            'color': '#94a3b8',
+                            'width': 2,
+                            'line-color': '#475569',
+                            'target-arrow-color': '#475569',
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'bezier',
+                            'text-background-opacity': 0.85,
+                            'text-background-color': '#0b0f19',
+                            'text-background-padding': '3px',
+                            'text-background-shape': 'roundrectangle'
+                        }
+                    }
+                ],
+                layout: {
+                    name: 'circle',
+                    fit: true,
+                    padding: 60
+                }
+            });
+
+            activeCyInstance = cy;
+
+            cy.on('tap', 'node', function(evt) {
+                const node = evt.target;
+                const id = node.data('id');
+                const descs = {
+                    "CONCEPT": "Abstract ideas, subjects, tools, or entities active in the workspace.",
+                    "PREFERENCE": "User settings, operational guidelines, constraints, and custom personality rules.",
+                    "EVENT": "Episodes, historical milestones, turn contexts, or tool execution outcomes.",
+                    "DECISION": "Architectural choices, code designs, technical lessons, or executed plan milestones."
+                };
+                inspector.innerHTML = `
+                    <div style="display: flex; flex-direction: column; gap: 12px; width: 100%;">
+                        <span class="level-tag deep" style="font-size: 9.5px; font-weight: bold; text-transform: uppercase; color: var(--accent-color);">Class: ${id}</span>
+                        <p style="font-size: 13px; line-height: 1.5; color: var(--text-primary); margin: 0;">${descs[id]}</p>
+                    </div>
+                `;
+            });
+            return;
+        }
+
         viewport.innerHTML = `<div class="empty-viewer-msg"><span class="spinner inline" style="margin-right: 8px;"></span> Retrieving complete semantic memory network topology...</div>`;
-        inspector.innerHTML = `<div class="empty-viewer-msg" style="justify-content: flex-start; text-align: left; font-style: normal; color: var(--text-secondary);">Click on any memory node in the network to inspect its full semantic details.</div>`;
 
         try {
             const res = await fetch("/api/memories/graph");
@@ -5060,7 +5222,15 @@ document.addEventListener("DOMContentLoaded", () => {
             // Append memory nodes
             data.nodes.forEach(m => {
                 const isWorking = m.level === 1;
-                const label = m.subject && m.object ? `${m.subject.toUpperCase()} → ${m.object.toUpperCase()}` : (m.summary || m.content).substring(0, 30) + "...";
+                
+                // Formulate a clean, human-readable label based on subject/object, or fall back to summary/content
+                let label = "";
+                if (m.subject && m.object && m.subject !== "unknown" && m.object !== "unknown") {
+                    label = `${m.subject.toUpperCase()} ➔ ${m.object.toUpperCase()}`;
+                } else {
+                    const cleanContent = m.content.replace(/Entity type:.*$/i, "").trim();
+                    label = (m.summary || cleanContent).substring(0, 24) + "...";
+                }
 
                 elements.push({
                     group: "nodes",
@@ -5219,6 +5389,8 @@ document.addEventListener("DOMContentLoaded", () => {
                     minTemp: 1.0
                 }
             });
+
+            activeCyInstance = cy;
 
             // 3. Bind click events for Node Inspection
             cy.on('tap', 'node', function(evt) {
@@ -5818,13 +5990,19 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             messages.forEach(msg => {
-                const sender = msg.sender_type === "user" ? "user" : "assistant";
-                renderMessageBubble(msg.id, sender, msg.content, {
-                    model_name: msg.model_name,
-                    tokens: msg.tokens,
-                    speed: msg.generation_speed,
-                    ttft: msg.metadata ? msg.metadata.ttft : null
-                }, msg);
+                try {
+                    const sender = msg.sender_type === "user" ? "user" : "assistant";
+                    renderMessageBubble(msg.id, sender, msg.content, {
+                        model_name: msg.model_name,
+                        tokens: msg.tokens,
+                        speed: msg.generation_speed,
+                        ttft: msg.metadata ? msg.metadata.ttft : null
+                    }, msg);
+                } catch (renderErr) {
+                    console.error("Failed to render message:", msg.id, renderErr);
+                    // Fallback to avoid blank screen
+                    appendChatBubble(msg.sender_type, msg.content || "");
+                }
             });
             if (wasActive) {
                 showThinkingIndicator(activeText);
@@ -6687,6 +6865,53 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function renderMemories() {
+        const memTabs = document.querySelector(".memory-tabs");
+        const memTabActions = document.querySelector(".memory-tab-actions");
+
+        if (memViewMode === "tbox") {
+            if (memTabs) memTabs.style.display = "none";
+            if (memTabActions) memTabActions.style.display = "none";
+
+            // Render TBox Schema
+            memoriesList.innerHTML = `
+                <div class="tbox-schema-container" style="display: flex; flex-direction: column; gap: 12px; padding: 4px; user-select: none;">
+                    <div style="font-size: 11px; font-weight: bold; color: var(--accent-color); text-transform: uppercase; border-bottom: 1px solid var(--border-color); padding-bottom: 4px;">📐 Ontological TBox Classes</div>
+                    <div class="tbox-class-card" style="background-color: rgba(79, 70, 229, 0.1); border: 1px solid rgba(79, 70, 229, 0.25); padding: 10px; border-radius: 6px;">
+                        <span style="font-weight: bold; font-size: 12px; color: #818cf8;">🏷️ CONCEPT</span>
+                        <p style="font-size: 11px; color: var(--text-secondary); margin-top: 4px; line-height: 1.3;">Abstract ideas, subjects, tools, or entities active in the workspace.</p>
+                    </div>
+                    <div class="tbox-class-card" style="background-color: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25); padding: 10px; border-radius: 6px;">
+                        <span style="font-weight: bold; font-size: 12px; color: var(--success-color);">⚙️ PREFERENCE</span>
+                        <p style="font-size: 11px; color: var(--text-secondary); margin-top: 4px; line-height: 1.3;">User settings, operational guidelines, constraints, and custom personality rules.</p>
+                    </div>
+                    <div class="tbox-class-card" style="background-color: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); padding: 10px; border-radius: 6px;">
+                        <span style="font-weight: bold; font-size: 12px; color: var(--accent-color);">📅 EVENT</span>
+                        <p style="font-size: 11px; color: var(--text-secondary); margin-top: 4px; line-height: 1.3;">Episodes, historical milestones, turn contexts, or tool execution outcomes.</p>
+                    </div>
+                    <div class="tbox-class-card" style="background-color: rgba(244, 63, 94, 0.1); border: 1px solid rgba(244, 63, 94, 0.25); padding: 10px; border-radius: 6px;">
+                        <span style="font-weight: bold; font-size: 12px; color: #f43f5e;">💡 DECISION</span>
+                        <p style="font-size: 11px; color: var(--text-secondary); margin-top: 4px; line-height: 1.3;">Architectural choices, code designs, technical lessons, or executed plan milestones.</p>
+                    </div>
+
+                    <div style="font-size: 11px; font-weight: bold; color: var(--accent-color); text-transform: uppercase; border-bottom: 1px solid var(--border-color); padding-bottom: 4px; margin-top: 8px;">🔗 Semantic Relationships</div>
+                    <ul style="list-style: none; display: flex; flex-direction: column; gap: 6px; padding-left: 4px; font-size: 11px; line-height: 1.4;">
+                        <li><strong>RELATED_TO</strong>: Default associative link</li>
+                        <li><strong>PREFERS</strong>: Preference binding</li>
+                        <li><strong>IMPLEMENTS</strong>: Concrete realization of choices</li>
+                        <li><strong>CONTRADICTS</strong>: Semantic conflicts and blocks</li>
+                        <li><strong>SUPPORTS</strong>: Validating evidence</li>
+                        <li><strong>TEMPORAL_AFTER</strong>: Chronological ordering</li>
+                        <li><strong>PART_OF</strong>: Component hierarchy decomposition</li>
+                    </ul>
+                </div>
+            `;
+            return;
+        }
+
+        // ABox View
+        if (memTabs) memTabs.style.display = "flex";
+        if (memTabActions) memTabActions.style.display = "flex";
+
         // Synchronize active local tab button highlight
         document.querySelectorAll(".mem-tab-btn").forEach(btn => {
             const lvl = parseInt(btn.dataset.memLevel, 10);
@@ -6712,9 +6937,14 @@ document.addEventListener("DOMContentLoaded", () => {
         memoriesList.innerHTML = filtered.map(m => {
             let tripleHtml = "";
             if (m.subject && m.object) {
+                // High-fidelity structured ABox triple display
                 tripleHtml = `
-                    <div class="memory-triple-badge" style="display: inline-flex; align-items: center; gap: 4px; font-family: monospace; font-size: 9px; background-color: rgba(79, 70, 229, 0.1); color: #818cf8; border: 1px solid rgba(79, 70, 229, 0.2); padding: 2px 6px; border-radius: 4px; margin-top: 6px; user-select: none;">
-                        <strong>${m.subject}</strong> --[${m.predicate || 'RELATED_TO'}]--> <strong>${m.object}</strong>
+                    <div class="memory-triple-badge" style="display: flex; flex-direction: column; gap: 4px; font-family: monospace; font-size: 10px; background-color: rgba(15, 23, 42, 0.5); border: 1px solid var(--border-color); padding: 6px; border-radius: 6px; margin-top: 8px; width: 100%;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="color: #94a3b8; font-weight: bold; background-color: rgba(255,255,255,0.05); padding: 1px 4px; border-radius: 3px;">Sub: ${m.subject}</span>
+                            <span style="color: var(--accent-color); font-weight: 800; font-size: 8.5px;">[${m.predicate || 'RELATED_TO'}]</span>
+                        </div>
+                        <div style="color: #cbd5e1; font-weight: bold; padding-left: 4px;">Obj: ${m.object}</div>
                     </div>
                 `;
             }
@@ -6740,15 +6970,18 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             return `
-                <li class="memory-card ${classes[m.level]}" data-mem-id="${m.id}">
-                    <div class="memory-header">
+                <li class="memory-card ${classes[m.level]}" data-mem-id="${m.id}" style="box-shadow: var(--shadow-sm); border-radius: 8px; padding: 12px; margin-bottom: 8px; transition: all 0.15s ease;">
+                    <div class="memory-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 4px; margin-bottom: 6px;">
                         <span class="level-tag ${classes[m.level]}">${labels[m.level]} (Level ${m.level})</span>
                         <span class="importance-badge">Imp: ${(m.importance * 100).toFixed(0)}%</span>
                     </div>
-                    <p class="desc-text" style="color: var(--text-primary); margin-top: 6px; white-space: pre-wrap; line-height: 1.4;">${m.content}</p>
+                    <p class="desc-text" style="color: var(--text-primary); margin-top: 4px; white-space: pre-wrap; line-height: 1.4; font-size: 12.5px;">${m.content}</p>
                     ${tripleHtml}
                     ${activationHtml}
-                    <div class="details" style="font-size: 10px; margin-top: 6px;">Uses: ${m.use_count} · ID: ${m.id.substring(0, 8)}</div>
+                    <div class="details" style="font-size: 9.5px; margin-top: 6px; color: var(--text-secondary); display: flex; justify-content: space-between;">
+                        <span>Uses: ${m.use_count}</span>
+                        <span>ID: <code style="font-family: monospace;">${m.id.substring(0, 8)}</code></span>
+                    </div>
                     <div class="memory-actions" style="margin-top: 8px;">
                         <button class="mem-btn" data-action="up" title="Promote (decrease level)">⬆️</button>
                         <button class="mem-btn" data-action="down" title="Demote (increase level)">⬇️</button>
@@ -6989,18 +7222,19 @@ document.addEventListener("DOMContentLoaded", () => {
                     if (event.msg_type === "MSG_TYPE_ARTEFACT_CHUNK") {
                         const title = meta.title;
                         const chunk = event.chunk;
-                        const safeId = makeSafeId(title);
+                        const cleanTitle = sanitizeTabTitle(title);
+                        const safeId = makeSafeId(cleanTitle);
 
-                        if (!openTabs.has(title)) {
-                            createArtifactTab(title, meta.art_type || "code");
-                            switchCenterTab(`tab-art-${safeId}`);
+                        if (!openTabs.has(cleanTitle)) {
+                            // Create the tab silently in the background — DO NOT switch focus from the Chat Companion!
+                            createArtifactTab(cleanTitle, meta.art_type || "code");
                         }
 
                         const rawView = document.getElementById(`raw-view-${safeId}`);
                         if (rawView) {
                             rawView.value += chunk;
-                            if (codeEditors[title]) {
-                                const editor = codeEditors[title];
+                            if (codeEditors[cleanTitle]) {
+                                const editor = codeEditors[cleanTitle];
                                 const doc = editor.getDoc();
                                 editor.replaceRange(chunk, { line: doc.lineCount() });
                             }
@@ -7216,12 +7450,16 @@ document.addEventListener("DOMContentLoaded", () => {
 function resolveProcessingTags(content) {
     if (!content) return "";
 
-    // ── Render <think> tags as a beautiful, styled collapsible details block ──
+    // ── Render <think> tags or strip them based on active toggle state ──
     const thinkPattern = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
-    content = content.replace(thinkPattern, (match, bodyText) => {
-        const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
-        return `<details class="inline-proc-accordion" open style="border-color: rgba(147, 51, 234, 0.15);"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05);"><span class="chevron">▶</span><span>💭 Thought Process / Reasoning</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15);"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
-    });
+    if (window.funcStates && window.funcStates["think"]) {
+        content = content.replace(thinkPattern, (match, bodyText) => {
+            const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
+            return `<details class="inline-proc-accordion" open style="border-color: rgba(147, 51, 234, 0.15);"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05);"><span class="chevron">▶</span><span>💭 Thought Process / Reasoning</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15);"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
+        });
+    } else {
+        content = content.replace(thinkPattern, "");
+    }
 
     const procPattern = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;
     return content.replace(procPattern, (match, attrsStr, bodyText) => {
@@ -7463,13 +7701,16 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
     // 4. Parse and resolve any failed generate_image / edit_image tags into an interactive retry card
     const genPattern = /<(generate_image|edit_image)\s*([^>]*)>([\s\S]*?)<\/\1>/gi;
     content = content.replace(genPattern, (match, tagName, attrsStr, promptText) => {
+        // Strict HTML tag stripping to prevent leaking status containers inside prompt box
+        const cleanPrompt = promptText.replace(/<\/?[^>]+>/g, "").trim();
+
         if (!msgId) {
             return `
                 <div class="failed-image-card">
                     <div class="failed-image-header">
                         <span>🎨 Image Prompt (${tagName === 'edit_image' ? 'Edit' : 'Generation'})</span>
                     </div>
-                    <textarea class="failed-image-prompt-input" readonly style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${promptText.trim()}</textarea>
+                    <textarea class="failed-image-prompt-input" readonly style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${cleanPrompt}</textarea>
                 </div>
             `;
         }
@@ -7478,8 +7719,10 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
                 <div class="failed-image-header">
                     <span>🎨 Image Prompt (${tagName === 'edit_image' ? 'Edit' : 'Generation'})</span>
                 </div>
-                <textarea class="failed-image-prompt-input" style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${promptText.trim()}</textarea>
-                <button class="btn btn-primary btn-retry-image" onclick="retryImageGeneration('${msgId}')" style="margin-top: 8px;">🎨 Generate Image</button>
+                <textarea class="failed-image-prompt-input" style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${cleanPrompt}</textarea>
+                <button class="btn btn-primary btn-retry-image" onclick="retryImageGeneration('${msgId}')" style="margin-top: 8px;">
+                    ${tagName === 'edit_image' ? '🎨 Edit Image' : '🎨 Generate Image'}
+                </button>
             </div>
         `;
     });

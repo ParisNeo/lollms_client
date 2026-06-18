@@ -123,6 +123,13 @@ body {
     border-color: var(--accent-color);
 }
 
+/* Enforce highly visible contrasting text inside all select dropdown options */
+.header-select option,
+select option {
+    background-color: #1e293b !important; /* Force matching dark background */
+    color: #f8fafc !important;            /* Force contrasting near-white text */
+}
+
 .btn-icon {
     background-color: var(--bg-app);
     border: 1px solid var(--border-color);
@@ -207,8 +214,63 @@ body {
     width: 360px;
     border-right: 1px solid var(--border-color);
     background-color: var(--bg-panel);
-    gap: 24px;
     flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 0 !important;
+    gap: 0 !important;
+    overflow: hidden !important;
+}
+
+.sidebar-tabs {
+    display: flex;
+    background-color: rgba(0, 0, 0, 0.25);
+    border-bottom: 1px solid var(--border-color);
+    padding: 8px;
+    gap: 4px;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.sidebar-tab-btn {
+    flex: 1;
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    padding: 10px 6px;
+    font-size: 11px;
+    font-weight: bold;
+    cursor: pointer;
+    border-radius: 6px;
+    transition: all 0.15s;
+    text-align: center;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+}
+
+.sidebar-tab-btn:hover {
+    color: var(--text-primary);
+    background-color: rgba(255, 255, 255, 0.03);
+}
+
+.sidebar-tab-btn.active {
+    background-color: var(--chat-user-bg);
+    color: white;
+}
+
+.sidebar-tab-pane {
+    display: none;
+    flex-direction: column;
+    height: 100%;
+    overflow: hidden;
+    padding: 16px;
+}
+
+.sidebar-tab-pane.active {
+    display: flex;
 }
 
 .sidebar-left.collapsed {
@@ -476,7 +538,7 @@ body {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    max-height: 40vh;
+    flex: 1;
     overflow-y: auto;
     padding-right: 4px;
 }
@@ -562,7 +624,7 @@ body {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    max-height: 25vh;
+    flex: 1;
     overflow-y: auto;
     padding-right: 4px;
 }
@@ -913,6 +975,10 @@ body {
 
 .context-budget-segment.history {
     background-color: #8b5cf6; /* Purple */
+}
+
+.context-budget-segment.memories {
+    background-color: var(--success-color); /* Emerald Green */
 }
 
 .context-budget-legend {
@@ -1991,7 +2057,7 @@ html, body, select, textarea, div {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    max-height: 25vh;
+    flex: 1;
     overflow-y: auto;
     padding-right: 4px;
 }

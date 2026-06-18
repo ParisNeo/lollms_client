@@ -288,9 +288,16 @@ class LollmsClient():
             return self._token_count_cache[text_hash]
 
         if self.llm: 
-            count = self.llm.count_tokens(text)
-            self._token_count_cache[text_hash] = count
-            return count
+            try:
+                # Attempt to get exact token count from active LLM binding
+                count = self.llm.count_tokens(text)
+                self._token_count_cache[text_hash] = count
+                return count
+            except Exception:
+                # Fast offline fallback: estimate tokens to prevent external API flooding on connection errors
+                count = len(text) // 4
+                self._token_count_cache[text_hash] = count
+                return count
         raise RuntimeError("LLM binding not initialized.")
 
     def count_image_tokens(self, image: str) -> int:
