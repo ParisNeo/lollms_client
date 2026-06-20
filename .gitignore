@@ -177,3 +177,4 @@ logs/
 # ignore data files
 *.xlsx
 *.csv
+None

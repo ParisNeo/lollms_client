@@ -144,7 +144,7 @@ class LollmsDataManager:
         )
         engine_kwargs = {}
         if db_path.startswith("sqlite"):
-            engine_kwargs["connect_args"] = {"check_same_thread": False}
+            engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30.0}
         if db_path == "sqlite:///:memory:":
             from sqlalchemy.pool import StaticPool
             engine_kwargs["poolclass"] = StaticPool
@@ -178,6 +178,8 @@ class LollmsDataManager:
         self.Base.metadata.create_all(bind=self.engine)
         try:
             with self.engine.connect() as connection:
+                connection.execute(text("PRAGMA journal_mode=WAL"))
+                connection.execute(text("PRAGMA busy_timeout=30000"))
                 cursor = connection.execute(text("PRAGMA table_info(discussions)"))
                 columns = {row[1] for row in cursor.fetchall()}
                 migrations = [

@@ -299,26 +299,6 @@ class OpenWebUIBinding(LollmsLLMBinding):
         )
         return self._process_request(params, stream, streaming_callback)
 
-    def _chat(
-        self,
-        discussion: LollmsDiscussion,
-        branch_tip_id: Optional[str] = None,
-        n_predict: Optional[int] = None,
-        stream: Optional[bool] = None,
-        temperature: float = 0.7,
-        top_k: int = 40,
-        top_p: float = 0.9,
-        repeat_penalty: float = 1.1,
-        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-        **kwargs,
-    ) -> Union[str, dict]:
-        messages = discussion.export("openai_chat", branch_tip_id)
-        params = self._build_request_params(
-            messages=messages, n_predict=n_predict, stream=stream,
-            temperature=temperature, top_k=top_k, top_p=top_p,
-            repeat_penalty=repeat_penalty, **kwargs,
-        )
-        return self._process_request(params, stream, streaming_callback)
 
     def generate_from_messages(
         self,

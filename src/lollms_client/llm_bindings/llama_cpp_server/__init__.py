@@ -1239,58 +1239,6 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             trace_exception(e)
             return {"status": False, "error": str(e)}
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # _chat  (discussion-based, chat/completions endpoint)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _chat(
-        self,
-        discussion: LollmsDiscussion,
-        branch_tip_id: Optional[str] = None,
-        n_predict: Optional[int] = None,
-        stream: Optional[bool] = None,
-        temperature: Optional[float] = None,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
-        repeat_penalty: Optional[float] = None,
-        repeat_last_n: Optional[int] = None,
-        seed: Optional[int] = None,
-        n_threads: Optional[int] = None,
-        ctx_size: Optional[int] = None,
-        streaming_callback: Optional[Callable] = None,
-        think: Optional[bool] = False,
-        reasoning_effort: Optional[str] = "low",
-        reasoning_summary: Optional[str] = "auto",
-        **kwargs,
-    ) -> Union[str, dict]:
-        """
-        Conducts a chat turn using a LollmsDiscussion object.
-        Exports the discussion to OpenAI-style messages and calls
-        /v1/chat/completions.
-        """
-        n_predict   = self._resolve(n_predict,   self.default_n_predict or 1024)
-        temperature = self._resolve(temperature, self.default_temperature or 0.7)
-        top_k       = self._resolve(top_k,       self.default_top_k or 40)
-        top_p       = self._resolve(top_p,       self.default_top_p or 0.9)
-        repeat_penalty = self._resolve(repeat_penalty, self.default_repeat_penalty or 1.1)
-        repeat_last_n  = self._resolve(repeat_last_n,  self.default_repeat_last_n or 64)
-        seed        = self._resolve(seed, self.default_seed)
-        cb          = streaming_callback or self.default_streaming_callback
-        do_stream   = self._resolve(stream, True if cb else (self.default_stream or False))
-
-        try:
-            messages = discussion.export("openai_chat", branch_tip_id)
-            return self._run_chat_messages(
-                messages,
-                n_predict=n_predict, stream=do_stream, temperature=temperature,
-                top_k=top_k, top_p=top_p, repeat_penalty=repeat_penalty,
-                repeat_last_n=repeat_last_n, seed=seed, cb=cb,
-                think=think, reasoning_effort=reasoning_effort,
-                reasoning_summary=reasoning_summary,
-            )
-        except Exception as e:
-            trace_exception(e)
-            return {"status": False, "error": str(e)}
 
     # ──────────────────────────────────────────────────────────────────────────
     # generate_from_messages  (raw messages list)

@@ -181,16 +181,59 @@ class UtilsMixin:
                 # Convert reversed index back to forward index
                 fwd_idx    = len(messages_to_render) - 1 - idx
                 sender_str = msg.sender.replace(':','').replace('!@>','')
-                content    = get_full_content(msg)
-                active_images = msg.get_active_images()
-                if active_images:
-                    content += f"\n({len(active_images)} image(s) attached)"
-                msg_text = f"!@>{sender_str}:\n{content}\n"
-                msg_toks = self.lollmsClient.count_tokens(msg_text)
-                if max_allowed_tokens is not None and current_tokens + msg_toks > max_allowed_tokens:
-                    break
-                message_parts.insert(0, msg_text)
-                current_tokens += msg_toks
+                
+                tool_calls = msg.metadata.get("tool_calls", []) if (msg.metadata and isinstance(msg.metadata, dict)) else []
+                if msg.sender_type == "assistant" and tool_calls:
+                    raw_content = getattr(msg, "raw_content", "") or msg.content or ""
+                    parts = re.split(r'(<(?:tool|tool_call)>.*?</(?:tool|tool_call)>)', raw_content, flags=re.DOTALL | re.IGNORECASE)
+                    num_calls = min(len(parts) // 2, len(tool_calls))
+                    
+                    expanded_parts = []
+                    for i in range(num_calls):
+                        assistant_part = parts[2*i] + parts[2*i + 1]
+                        tc = tool_calls[i]
+                        tool_name = tc.get("name", "unknown")
+                        result_obj = tc.get("result", {})
+                        
+                        if isinstance(result_obj, dict) and "output" in result_obj:
+                            result_str = result_obj["output"]
+                        else:
+                            result_str = json.dumps(result_obj, indent=2, ensure_ascii=False)
+                            
+                        # Truncate very large results for export to avoid context bloat
+                        max_result_len = 4000
+                        if len(result_str) > max_result_len:
+                            result_str = result_str[:max_result_len] + f"\n... [{len(result_str) - max_result_len} chars truncated]"
+                        
+                        user_part = f"Tool output for {tool_name}:\n{result_str}\n\nPlease continue your response based on this information."
+                        
+                        expanded_parts.append(f"!@>{sender_str}:\n{assistant_part}\n")
+                        expanded_parts.append(f"!@>user:\n{user_part}\n")
+                        
+                    remaining_assistant_part = parts[2*num_calls] if 2*num_calls < len(parts) else ""
+                    if remaining_assistant_part.strip():
+                        clean_rem = re.sub(r'<processing.*?>.*?</processing>', '', remaining_assistant_part, flags=re.DOTALL | re.IGNORECASE)
+                        clean_rem = re.sub(r'<processing[^>]*>', '', clean_rem, flags=re.IGNORECASE).replace("</processing>", "")
+                        expanded_parts.append(f"!@>{sender_str}:\n{clean_rem.strip()}\n")
+                        
+                    # Insert in correct order
+                    for part_text in reversed(expanded_parts):
+                        part_toks = self.lollmsClient.count_tokens(part_text)
+                        if max_allowed_tokens is not None and current_tokens + part_toks > max_allowed_tokens:
+                            break
+                        message_parts.insert(0, part_text)
+                        current_tokens += part_toks
+                else:
+                    content    = get_full_content(msg)
+                    active_images = msg.get_active_images()
+                    if active_images:
+                        content += f"\n({len(active_images)} image(s) attached)"
+                    msg_text = f"!@>{sender_str}:\n{content}\n"
+                    msg_toks = self.lollmsClient.count_tokens(msg_text)
+                    if max_allowed_tokens is not None and current_tokens + msg_toks > max_allowed_tokens:
+                        break
+                    message_parts.insert(0, msg_text)
+                    current_tokens += msg_toks
 
                 # Inject scratchpad ONLY when non-empty, right after last user message
                 # For OpenAI/ollama_chat formats, we inject as a user message to avoid
@@ -203,11 +246,11 @@ class UtilsMixin:
                     )
                     # Use user role with special marker to avoid template issues
                     scratch_text = f"!@>user:\n[SYSTEM CONTEXT]\n{scratch_content}\n[/SYSTEM CONTEXT]\n"
-                    scratch_toks = self.lollmsClient.count_tokens(scratch_text)
-                    if max_allowed_tokens is None or current_tokens + scratch_toks <= max_allowed_tokens:
+                    scratch_text_toks = self.lollmsClient.count_tokens(scratch_text)
+                    if max_allowed_tokens is None or current_tokens + scratch_text_toks <= max_allowed_tokens:
                         # index 1 = immediately after the user msg prepended at [0]
                         message_parts.insert(1, scratch_text)
-                        current_tokens += scratch_toks
+                        current_tokens += scratch_text_toks
 
             final_parts.extend(message_parts)
             return "".join(final_parts).strip()
@@ -259,33 +302,85 @@ class UtilsMixin:
             role = participants.get(msg.sender, "user" if msg.sender_type=='user' else "assistant")
             if isinstance(role, dict):
                 role = role.get("name","user" if msg.sender_type=='user' else "assistant")
-            content = get_full_content(msg)
-            active_images_b64 = msg.get_active_images()
-            images_dicts = build_image_dicts(active_images_b64)
-            if format_type == "openai_chat":
-                if images_dicts:
-                    parts = [{"type":"text","text":content}] if content else []
-                    for img in images_dicts:
-                        url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
-                        parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
-                    messages.append({"role":role,"content":parts})
-                else:
-                    messages.append({"role":role,"content":content})
-            elif format_type == "ollama_chat":
-                md = {"role":role,"content":content}
-                b64s = [i['data'] for i in images_dicts if i['type']=='base64']
-                if b64s:
-                    md["images"] = b64s
-                messages.append(md)
-            elif format_type == "markdown":
-                line = f"**{role.capitalize()}**: {content}\n"
-                if images_dicts and not suppress_images:
-                    for img in images_dicts:
-                        url = f"![Image](data:image/jpeg;base64,{img['data']})" if img['type']=='base64' else f"![Image]({img['data']})"
-                        line += f"\n{url}\n"
-                messages.append(line)
+            
+            tool_calls = msg.metadata.get("tool_calls", []) if (msg.metadata and isinstance(msg.metadata, dict)) else []
+            if msg.sender_type == "assistant" and tool_calls:
+                raw_content = getattr(msg, "raw_content", "") or msg.content or ""
+                parts = re.split(r'(<(?:tool|tool_call)>.*?</(?:tool|tool_call)>)', raw_content, flags=re.DOTALL | re.IGNORECASE)
+                num_calls = min(len(parts) // 2, len(tool_calls))
+                
+                for i in range(num_calls):
+                    assistant_part = parts[2*i] + parts[2*i + 1]
+                    tc = tool_calls[i]
+                    tool_name = tc.get("name", "unknown")
+                    result_obj = tc.get("result", {})
+                    
+                    if isinstance(result_obj, dict) and "output" in result_obj:
+                        result_str = result_obj["output"]
+                    else:
+                        result_str = json.dumps(result_obj, indent=2, ensure_ascii=False)
+                        
+                    # Truncate very large results for export to avoid context bloat
+                    max_result_len = 4000
+                    if len(result_str) > max_result_len:
+                        result_str = result_str[:max_result_len] + f"\n... [{len(result_str) - max_result_len} chars truncated]"
+                    
+                    user_part = f"Tool output for {tool_name}:\n{result_str}\n\nPlease continue your response based on this information."
+                    
+                    # 1. Append assistant_part
+                    if format_type == "openai_chat":
+                        messages.append({"role": role, "content": assistant_part})
+                    elif format_type == "ollama_chat":
+                        messages.append({"role": role, "content": assistant_part})
+                    elif format_type == "markdown":
+                        messages.append(f"**{role.capitalize()}**: {assistant_part}\n")
+                        
+                    # 2. Append user_part
+                    if format_type == "openai_chat":
+                        messages.append({"role": "user", "content": user_part})
+                    elif format_type == "ollama_chat":
+                        messages.append({"role": "user", "content": user_part})
+                    elif format_type == "markdown":
+                        messages.append(f"**User**: {user_part}\n")
+                        
+                remaining_assistant_part = parts[2*num_calls] if 2*num_calls < len(parts) else ""
+                if remaining_assistant_part.strip():
+                    clean_rem = re.sub(r'<processing.*?>.*?</processing>', '', remaining_assistant_part, flags=re.DOTALL | re.IGNORECASE)
+                    clean_rem = re.sub(r'<processing[^>]*>', '', clean_rem, flags=re.IGNORECASE).replace("</processing>", "")
+                    if format_type == "openai_chat":
+                        messages.append({"role": role, "content": clean_rem.strip()})
+                    elif format_type == "ollama_chat":
+                        messages.append({"role": role, "content": clean_rem.strip()})
+                    elif format_type == "markdown":
+                        messages.append(f"**{role.capitalize()}**: {clean_rem.strip()}\n")
             else:
-                raise ValueError(f"Unsupported format_type: {format_type}")
+                content = get_full_content(msg)
+                active_images_b64 = msg.get_active_images()
+                images_dicts = build_image_dicts(active_images_b64)
+                if format_type == "openai_chat":
+                    if images_dicts:
+                        parts = [{"type":"text","text":content}] if content else []
+                        for img in images_dicts:
+                            url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
+                            parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
+                        messages.append({"role":role,"content":parts})
+                    else:
+                        messages.append({"role":role,"content":content})
+                elif format_type == "ollama_chat":
+                    md = {"role":role,"content":content}
+                    b64s = [i['data'] for i in images_dicts if i['type']=='base64']
+                    if b64s:
+                        md["images"] = b64s
+                    messages.append(md)
+                elif format_type == "markdown":
+                    line = f"**{role.capitalize()}**: {content}\n"
+                    if images_dicts and not suppress_images:
+                        for img in images_dicts:
+                            url = f"![Image](data:image/jpeg;base64,{img['data']})" if img['type']=='base64' else f"![Image]({img['data']})"
+                            line += f"\n{url}\n"
+                    messages.append(line)
+                else:
+                    raise ValueError(f"Unsupported format_type: {format_type}")
 
             # Inject scratchpad ONLY when non-empty, right after last user message
             # For OpenAI-compatible APIs with strict templates, use a user message
@@ -704,23 +799,27 @@ class UtilsMixin:
         active_artefacts = self.artefacts.list(active_only=True)
         active_artefacts_by_type = {}
         total_art_tokens = 0
-        
+
         for art in active_artefacts:
             atype = art.get('type', 'document')
             content = art.get('content', '').strip()
             if not content and not art.get('url'):
                 continue
-            
-            # Replicate assembly logic from build_artefacts_context_zone for accurate counting
-            lang = art.get('language') or ''
-            header = f"###[{atype.capitalize()}] {art['title']} (v{art['version']})\n"
-            fence = f"```{lang}\n{content}\n```" if content else ""
-            art_block = header + fence
-            
-            art_tokens = _get_cached_tokens(art_block, f"art_{art['title']}_v{art.get('version', 1)}")
+
+            art_tokens = art.get("token_count")
+            if art_tokens is None:
+                # Fallback if cache is missing (first run / legacy database)
+                lang = art.get('language') or ''
+                header = f"###[{atype.capitalize()}] {art['title']} (v{art['version']})\n"
+                fence = f"```{lang}\n{content}\n```" if content else ""
+                art_block = header + fence
+                art_tokens = _get_cached_tokens(art_block, f"art_{art['title']}_v{art.get('version', 1)}")
+                art["token_count"] = art_tokens
+                cache_dirty = True
+
             if atype not in active_artefacts_by_type:
                 active_artefacts_by_type[atype] = {"tokens": 0, "count": 0}
-            
+
             active_artefacts_by_type[atype]["tokens"] += art_tokens
             active_artefacts_by_type[atype]["count"] += 1
             total_art_tokens += art_tokens

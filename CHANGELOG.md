@@ -42,6 +42,14 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-20 23:56]
+
+- refactor(core): restructure lollms client and update llm bindings
+
+## [2026-06-19 09:33]
+
+- chore: remove unnecessary None file containing patent data
+
 ## [2026-06-17 22:59]
 
 - refactor(client): update web interface and enhance core discussion logic

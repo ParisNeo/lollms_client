@@ -270,7 +270,7 @@ class LCPBinding(LollmsToolBinding):
         if not self.tools_folders and not self.tool_files:
             return []
 
-        # Re-scan if needed, or if discovery hasn't happened
+        # Only re-scan if explicitly forced or if our cache is empty
         if kwargs.get("force_refresh", False) or not self.discovered_tools:
              self._discover_local_tools()
 

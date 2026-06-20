@@ -153,163 +153,253 @@ class OpenAIBinding(LollmsLLMBinding):
 
         return params
 
-
-
-
-
-    
-    def generate_text(self,
-                    prompt: str,
-                    images: Optional[List[str]] = None,
-                    system_prompt: str = "",
-                    n_predict: Optional[int] = None,
-                    stream: Optional[bool] = None,
-                    temperature: float = 0.7, 
-                    top_k: int = 40,          
-                    top_p: float = 0.9,       
-                    repeat_penalty: float = 1.1, 
-                    repeat_last_n: int = 64, 
-                    seed: Optional[int] = None,
-                    n_threads: Optional[int] = None,
-                    ctx_size: int | None = None,
-                    streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                    split: Optional[bool] = False,
-                    user_keyword: Optional[str] = "!@>user:",
-                    ai_keyword: Optional[str] = "!@>assistant:"
-                    ) -> Union[str, dict]:
+   
+    def generate_text(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+        system_prompt: str = "",
+        n_predict: Optional[int] = None,
+        stream: Optional[bool] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        repeat_last_n: Optional[int] = None,
+        seed: Optional[int] = None,
+        n_threads: Optional[int] = None,
+        ctx_size: int | None = None,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+        split: Optional[bool] = False,
+        user_keyword: Optional[str] = "!@>user:",
+        ai_keyword: Optional[str] = "!@>assistant:",
+        think: Optional[bool] = False,
+        reasoning_effort: Optional[str] = "low",
+        reasoning_summary: Optional[str] = "auto",
+        **kwargs
+    ) -> Union[str, dict]:
 
         count = 0
         output = ""
-        messages = [{"role": "system", "content": system_prompt or "You are a helpful assistant."}]
+
+        # ── Build message list ────────────────────────────────────────────────
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt or "You are a helpful assistant."
+            }
+        ]
 
         if images:
             if split:
-                # Original call to split message roles
-                messages += self.split_discussion(prompt, user_keyword=user_keyword, ai_keyword=ai_keyword)
-                # Convert the last message content to the structured content array
+                messages += self.split_discussion(
+                    prompt,
+                    user_keyword=user_keyword,
+                    ai_keyword=ai_keyword
+                )
                 last = messages[-1]
-                text_block = {"type": "text", "text": last["content"]}
-                image_blocks = [normalize_image_input(img) for img in images]
-                last["content"] = [text_block] + image_blocks
+                last["content"] = (
+                    [{"type": "text", "text": last["content"]}]
+                    + [normalize_image_input(img) for img in images]
+                )
             else:
-                messages.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": prompt}] + [
-                        normalize_image_input(img) for img in images
-                    ]
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            [{"type": "text", "text": prompt}]
+                            + [normalize_image_input(img) for img in images]
+                        )
+                    }
+                )
         else:
             if split:
-                messages += self.split_discussion(prompt, user_keyword=user_keyword, ai_keyword=ai_keyword)
+                messages += self.split_discussion(
+                    prompt,
+                    user_keyword=user_keyword,
+                    ai_keyword=ai_keyword
+                )
             else:
-                messages.append({'role': 'user', 'content': [{"type": "text", "text": prompt}]})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}]
+                    }
+                )
+
+        # ── Helper: extract reasoning from any delta / message object ─────────
+        def extract_reasoning(obj):
+            for attr in ("reasoning_content", "reasoning", "thinking", "reasoning_text"):
+                value = getattr(obj, attr, None)
+                if value:
+                    return value
+            return None
 
         try:
+
+            # ══════════════════════════════════════════════════════════════════
+            # Chat-completion path
+            # ══════════════════════════════════════════════════════════════════
             if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
-                params = self._build_openai_params(messages=messages,
-                                                n_predict=n_predict,
-                                                stream=stream,
-                                                temperature=temperature,
-                                                top_p=top_p,
-                                                repeat_penalty=repeat_penalty,
-                                                seed=seed)
+
+                params = self._build_openai_params(
+                    messages=messages,
+                    n_predict=n_predict,
+                    stream=stream,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repeat_penalty=repeat_penalty,
+                    seed=seed
+                )
+
+                # ── Inject think / reasoning params ───────────────────────────
+                if think:
+                    if self.is_vllm:
+                        # vLLM: enable thinking via chat_template_kwargs
+                        params.setdefault("extra_body", {}).setdefault(
+                            "chat_template_kwargs", {}
+                        )["enable_thinking"] = True
+                    else:
+                        # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
+                        params["reasoning"] = {
+                            "effort": reasoning_effort or "low",
+                            "summary": reasoning_summary or "auto"
+                        }
+                        # These models reject temperature / top_p
+                        params.pop("temperature", None)
+                        params.pop("top_p", None)
+                else:
+                    if self.is_vllm:
+                        # Explicitly disable thinking so vLLM doesn't carry it
+                        # over from a cached template state
+                        params.setdefault("extra_body", {}).setdefault(
+                            "chat_template_kwargs", {}
+                        )["enable_thinking"] = False
+
+                # ── First attempt ─────────────────────────────────────────────
                 try:
                     chat_completion = self.client.chat.completions.create(**params)
+
                 except Exception as ex:
                     trace_exception(ex)
-                    # exception for new openai models
-                    if "max_tokens" in params:
-                        params["max_completion_tokens"]=params["max_tokens"]
-                    params["temperature"]=1
-                    try: del params["max_tokens"] 
-                    except Exception: pass
-                    try: del params["top_p"]
-                    except Exception: pass
-                    try: del params["frequency_penalty"]
-                    except Exception: pass
-                    
-                    chat_completion = self.client.chat.completions.create(**params)                
 
+                    # Retry: adapt params for servers that reject certain fields
+                    if "max_tokens" in params:
+                        params["max_completion_tokens"] = params.pop("max_tokens")
+
+                    params.pop("top_p", None)
+                    params.pop("frequency_penalty", None)
+                    params.pop("reasoning", None)
+
+                    if not think:
+                        params["temperature"] = 1
+
+                    # Strip vLLM-specific extras so the retry is clean
+                    if "extra_body" in params:
+                        params["extra_body"].pop("chat_template_kwargs", None)
+
+                    chat_completion = self.client.chat.completions.create(**params)
+
+                # ── Streaming ─────────────────────────────────────────────────
                 if stream:
-                    in_thinking = False
+                    in_reasoning = False
+
                     for resp in chat_completion:
-                        if count >= (n_predict or float('inf')):
+                        if count >= (n_predict or float("inf")):
                             break
+
                         delta = resp.choices[0].delta
-                        reasoning_content = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                        reasoning = extract_reasoning(delta)
                         content = getattr(delta, "content", None)
 
-                        if reasoning_content:
-                            if not in_thinking:
-                                in_thinking = True
+                        if reasoning:
+                            if not in_reasoning:
+                                in_reasoning = True
+                                chunk = "<think>\n"
+                                output += chunk
                                 if streaming_callback:
-                                    streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                                output += "<think>\n"
+                                    streaming_callback(chunk, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                            output += reasoning
                             if streaming_callback:
-                                streaming_callback(reasoning_content, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                            output += reasoning_content
+                                streaming_callback(reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                             count += 1
                             continue
 
                         if content:
-                            if in_thinking:
-                                in_thinking = False
+                            if in_reasoning:
+                                in_reasoning = False
+                                closing = "\n</think>\n"
+                                output += closing
                                 if streaming_callback:
-                                    streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                                output += "\n</think>\n"
+                                    streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                            output += content
                             if streaming_callback:
                                 if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
                                     break
-                            output += content
                             count += 1
 
-                    if in_thinking:
+                    # Close any dangling <think> block
+                    if in_reasoning:
+                        closing = "\n</think>\n"
+                        output += closing
                         if streaming_callback:
-                            streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                        output += "\n</think>\n"
+                            streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+
+                # ── Non-streaming ─────────────────────────────────────────────
                 else:
                     message_obj = chat_completion.choices[0].message
-                    reasoning_content = getattr(message_obj, "reasoning_content", None) or getattr(message_obj, "reasoning", None)
+                    reasoning = extract_reasoning(message_obj)
                     content = message_obj.content or ""
-                    if reasoning_content:
-                        output = f"<think>\n{reasoning_content}\n</think>\n{content}"
+
+                    if reasoning:
+                        # Server returned reasoning separately — wrap it
+                        output = f"<think>\n{reasoning}\n</think>\n{content}"
                     else:
+                        # vLLM (and some others) embed <think>…</think> directly
+                        # in content, or thinking was disabled — pass through as-is
                         output = content
 
+            # ══════════════════════════════════════════════════════════════════
+            # Legacy completion path  (think / reasoning not supported here)
+            # ══════════════════════════════════════════════════════════════════
             else:
-                params = self._build_openai_params(prompt=prompt,
-                                                n_predict=n_predict,
-                                                stream=stream,
-                                                temperature=temperature,
-                                                top_p=top_p,
-                                                repeat_penalty=repeat_penalty,
-                                                seed=seed)
-                try:
-                    completion =  self.client.completions.create(**params)
-                except Exception as ex:
-                    # exception for new openai models
-                    params["max_completion_tokens"]=params["max_tokens"]
-                    params["temperature"]=1
-                    try: del params["max_tokens"] 
-                    except Exception: pass
-                    try: del params["top_p"]
-                    except Exception: pass
-                    try: del params["frequency_penalty"]
-                    except Exception: pass
+                params = self._build_openai_params(
+                    prompt=prompt,
+                    n_predict=n_predict,
+                    stream=stream,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repeat_penalty=repeat_penalty,
+                    seed=seed
+                )
 
-                    
-                    completion =  self.client.completions.create(**params)                
+                try:
+                    completion = self.client.completions.create(**params)
+
+                except Exception as ex:
+                    trace_exception(ex)
+
+                    if "max_tokens" in params:
+                        params["max_completion_tokens"] = params.pop("max_tokens")
+
+                    params["temperature"] = 1
+                    params.pop("top_p", None)
+                    params.pop("frequency_penalty", None)
+
+                    completion = self.client.completions.create(**params)
 
                 if stream:
                     for resp in completion:
-                        if count >= (n_predict or float('inf')):
+                        if count >= (n_predict or float("inf")):
                             break
                         word = getattr(resp.choices[0], "text", "") or ""
-                        if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                            break
                         if word:
                             output += word
                             count += 1
+                        if streaming_callback and not streaming_callback(
+                            word, MSG_TYPE.MSG_TYPE_CHUNK
+                        ):
+                            break
                 else:
                     output = completion.choices[0].text
 
@@ -322,237 +412,204 @@ class OpenAIBinding(LollmsLLMBinding):
 
         return output
 
-
     
-    def generate_from_messages(self,
-                     messages: List[Dict],
-                     n_predict: Optional[int] = None,
-                     stream: Optional[bool] = None,
-                     temperature: Optional[float] = None,
-                     top_k: Optional[int] = None,
-                     top_p: Optional[float] = None,
-                     repeat_penalty: Optional[float] = None,
-                     repeat_last_n: Optional[int] = None,
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     **kwargs
-                     ) -> Union[str, dict]:
-        
-        # --- Standardize Messages for OpenAI ---
+    def generate_from_messages(
+        self,
+        messages: List[Dict],
+        n_predict: Optional[int] = None,
+        stream: Optional[bool] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        repeat_last_n: Optional[int] = None,
+        seed: Optional[int] = None,
+        n_threads: Optional[int] = None,
+        ctx_size: int | None = None,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+        think: Optional[bool] = False,
+        reasoning_effort: Optional[str] = "low",   # low, medium, high
+        reasoning_summary: Optional[str] = "auto",  # auto
+        **kwargs
+    ) -> Union[str, dict]:
+
+        # ── Normalize messages to the OpenAI wire format ──────────────────────
         def normalize_message(msg: Dict) -> Dict:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             text_parts = []
             images = []
 
-            # 1. Extract Text and Images from input
             if isinstance(content, str):
                 text_parts.append(content)
             elif isinstance(content, list):
                 for item in content:
                     if item.get("type") == "text":
                         text_parts.append(item.get("text", ""))
-                    elif item.get("type") in ["input_image", "image_url"]:
-                        # Handle various internal representations of images
+                    elif item.get("type") in ("input_image", "image_url"):
                         val = item.get("image_url")
                         if isinstance(val, dict):
-                            # Handle dicts like {"url": "..."} or {"base64": "..."}
                             val = val.get("url") or val.get("base64")
-                        
                         if isinstance(val, str) and val:
                             images.append(val)
 
-            text_content = "\n".join([p for p in text_parts if p.strip()])
+            text_content = "\n".join(p for p in text_parts if p.strip())
 
-            # 2. Format for OpenAI API
             if not images:
-                # Simple text-only message
                 return {"role": role, "content": text_content}
-            else:
-                # Multimodal message
-                openai_content = []
-                if text_content:
-                    openai_content.append({"type": "text", "text": text_content})
-                
-                for img in images:
-                    # OpenAI STRICTLY requires the data URI prefix for base64
-                    # or a valid http/https URL.
-                    img_url = img
-                    if not img.startswith("http"):
-                        if not img.startswith("data:"):
-                            # If raw base64 is passed without header, add default jpeg header
-                            img_url = f"data:image/jpeg;base64,{img}"
-                    
-                    openai_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": img_url}
-                    })
-                
-                return {"role": role, "content": openai_content}
 
-        # Process and clean the list
+            openai_content = []
+            if text_content:
+                openai_content.append({"type": "text", "text": text_content})
+            for img in images:
+                img_url = img
+                if not img.startswith("http") and not img.startswith("data:"):
+                    img_url = f"data:image/jpeg;base64,{img}"
+                openai_content.append(
+                    {"type": "image_url", "image_url": {"url": img_url}}
+                )
+            return {"role": role, "content": openai_content}
+
+        # ── Helper: extract reasoning from any delta / message object ─────────
+        def extract_reasoning(obj):
+            for attr in ("reasoning_content", "reasoning", "thinking", "reasoning_text"):
+                value = getattr(obj, attr, None)
+                if value:
+                    return value
+            return None
+
         openai_messages = [normalize_message(m) for m in messages]
-        
-        # --- Build Request ---
+
+        # ── Build base params ─────────────────────────────────────────────────
         params = {
             "model": self.model_name,
-            "messages": openai_messages, # Use the standardized list
+            "messages": openai_messages,
             "max_tokens": n_predict,
             "n": 1,
             "temperature": temperature,
             "top_p": top_p,
             "frequency_penalty": repeat_penalty,
-            "stream": stream
+            "stream": stream,
         }
-
-        # Add seed if available
         if seed is not None:
             params["seed"] = seed
 
-        # Remove None values
+        # Drop None values
         params = {k: v for k, v in params.items() if v is not None}
-        
+
+        # ── Inject think / reasoning params ───────────────────────────────────
+        if think:
+            if self.is_vllm:
+                params.setdefault("extra_body", {}).setdefault(
+                    "chat_template_kwargs", {}
+                )["enable_thinking"] = True
+            else:
+                # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
+                params["reasoning"] = {
+                    "effort": reasoning_effort or "low",
+                    "summary": reasoning_summary or "auto",
+                }
+                # These models reject temperature / top_p
+                params.pop("temperature", None)
+                params.pop("top_p", None)
+        else:
+            if self.is_vllm:
+                # Explicitly disable so vLLM doesn't carry over a cached state
+                params.setdefault("extra_body", {}).setdefault(
+                    "chat_template_kwargs", {}
+                )["enable_thinking"] = False
+
         output = ""
-        
-        # --- Call API ---
+
         try:
+            # ── First attempt ─────────────────────────────────────────────────
             try:
                 completion = self.client.chat.completions.create(**params)
+
             except Exception as ex:
-                # Fallback/Handling for 'reasoning' models (o1, o3-mini) 
-                # which don't support max_tokens, temperature, etc.
+                trace_exception(ex)
+
+                # Retry: adapt for servers that reject certain fields
                 if "max_tokens" in params:
-                    params["max_completion_tokens"] = params["max_tokens"]
-                    del params["max_tokens"]
-                
-                # Set temperature to 1 (required for some o-series models) or remove it
-                params["temperature"] = 1
-                
-                keys_to_remove = ["top_p", "frequency_penalty", "presence_penalty"]
-                for k in keys_to_remove:
-                    if k in params:
-                        del params[k]
+                    params["max_completion_tokens"] = params.pop("max_tokens")
+
+                params.pop("top_p", None)
+                params.pop("frequency_penalty", None)
+                params.pop("presence_penalty", None)
+                params.pop("reasoning", None)
+
+                if not think:
+                    params["temperature"] = 1
+
+                # Strip vLLM-specific extras so the retry is clean
+                if "extra_body" in params:
+                    params["extra_body"].pop("chat_template_kwargs", None)
 
                 completion = self.client.chat.completions.create(**params)
 
+            # ── Streaming ─────────────────────────────────────────────────────
             if stream:
-                in_thinking = False
+                in_reasoning = False
+
                 for chunk in completion:
                     delta = chunk.choices[0].delta
-                    reasoning_content = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    reasoning = extract_reasoning(delta)
                     content = getattr(delta, "content", None)
 
-                    if reasoning_content:
-                        if not in_thinking:
-                            in_thinking = True
+                    if reasoning:
+                        if not in_reasoning:
+                            in_reasoning = True
+                            opening = "<think>\n"
+                            output += opening
                             if streaming_callback:
-                                streaming_callback("<think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                            output += "<think>\n"
+                                streaming_callback(opening, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        output += reasoning
                         if streaming_callback:
-                            streaming_callback(reasoning_content, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                        output += reasoning_content
+                            streaming_callback(reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
                         continue
 
                     if content:
-                        if in_thinking:
-                            in_thinking = False
+                        if in_reasoning:
+                            in_reasoning = False
+                            closing = "\n</think>\n"
+                            output += closing
                             if streaming_callback:
-                                streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                            output += "\n</think>\n"
+                                streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        output += content
                         if streaming_callback:
                             if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
                                 break
-                        output += content
 
-                if in_thinking:
+                # Close any dangling <think> block
+                if in_reasoning:
+                    closing = "\n</think>\n"
+                    output += closing
                     if streaming_callback:
-                        streaming_callback("\n</think>\n", MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
-                    output += "\n</think>\n"
+                        streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+
+            # ── Non-streaming ─────────────────────────────────────────────────
             else:
                 message_obj = completion.choices[0].message
-                reasoning_content = getattr(message_obj, "reasoning_content", None) or getattr(message_obj, "reasoning", None)
+                reasoning = extract_reasoning(message_obj)
                 content = message_obj.content or ""
-                if reasoning_content:
-                    output = f"<think>\n{reasoning_content}\n</think>\n{content}"
+
+                if reasoning:
+                    # Server returned reasoning separately — wrap it
+                    output = f"<think>\n{reasoning}\n</think>\n{content}"
                 else:
+                    # vLLM (and some others) embed <think>…</think> in content,
+                    # or thinking was disabled — pass through as-is
                     output = content
-        
-        except Exception as e:
-            error_message = f"An error occurred with the OpenAI API: {e}"
-            if streaming_callback:
-                streaming_callback(error_message, MSG_TYPE.MSG_TYPE_EXCEPTION)
-            return {"status": "error", "message": error_message}
-            
-        return output
-        
-    def _chat(self,
-            discussion: LollmsDiscussion,
-            branch_tip_id: Optional[str] = None,
-            n_predict: Optional[int] = None,
-            stream: Optional[bool] = None,
-            temperature: float = 0.7,
-            top_k: int = 40,
-            top_p: float = 0.9,
-            repeat_penalty: float = 1.1,
-            repeat_last_n: int = 64,
-            seed: Optional[int] = None,
-            n_threads: Optional[int] = None,
-            ctx_size: Optional[int] = None,
-            streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-            **kwargs
-            ) -> Union[str, dict]:
-
-        messages = discussion.export("openai_chat", branch_tip_id)
-        params = self._build_openai_params(messages=messages,
-                                        n_predict=n_predict,
-                                        stream=stream,
-                                        temperature=temperature,
-                                        top_p=top_p,
-                                        repeat_penalty=repeat_penalty,
-                                        seed=seed)
-
-        output = ""
-        try:
-            if self.completion_format == ELF_COMPLETION_FORMAT.Chat:
-                completion = self.client.chat.completions.create(**params)
-                if stream:
-                    for chunk in completion:
-                        delta = chunk.choices[0].delta
-                        if delta.content:
-                            word = delta.content
-                            if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
-                            output += word
-                else:
-                    output = completion.choices[0].message.content
-            else:
-                legacy_prompt = discussion.export("openai_completion", branch_tip_id)
-                legacy_params = self._build_openai_params(prompt=legacy_prompt,
-                                                        n_predict=n_predict,
-                                                        stream=stream,
-                                                        temperature=temperature,
-                                                        top_p=top_p,
-                                                        repeat_penalty=repeat_penalty,
-                                                        seed=seed)
-                completion = self.client.completions.create(**legacy_params)
-                if stream:
-                    for chunk in completion:
-                        word = chunk.choices[0].text
-                        if streaming_callback and not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                            break
-                        output += word
-                else:
-                    output = completion.choices[0].text
 
         except Exception as e:
-            err = f"An error occurred with the OpenAI API: {e}"
+            trace_exception(e)
+            err_msg = f"An error occurred with the OpenAI API: {e}"
             if streaming_callback:
-                streaming_callback(err, MSG_TYPE.MSG_TYPE_EXCEPTION)
-            return {"status": "error", "message": err}
+                streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": err_msg}
 
         return output
+        
 
     def _get_encoding(self, model_name: str | None = None):
         """

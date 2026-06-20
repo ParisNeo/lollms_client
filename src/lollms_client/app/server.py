@@ -19,7 +19,7 @@ import asyncio
 import inspect
 import uuid
 from pathlib import Path
-from typing import Optional, Dict, Callable, List, Any
+from typing import Optional, Dict, Callable, List, Any, Union
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
 from lollms_client.lollms_discussion import ArtefactType
@@ -108,6 +108,14 @@ def _is_safe_path(base_dir: Path, target_path: Path) -> bool:
         return resolved_target.parts[:len(resolved_base.parts)] == resolved_base.parts
     except Exception:
         return False
+
+
+def get_discussion_workspace():
+    if discussion:
+        p = APP_WORKSPACE_DIR / "discussions" / discussion.id
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return APP_WORKSPACE_DIR
 
 
 def initialize_workspace_state(workspace_name: str):
@@ -673,12 +681,13 @@ async def get_binary_image(title: str, index: int, version: Optional[int] = None
 @app.get("/api/workspace_files/{filename}")
 async def get_workspace_file_endpoint(filename: str):
     """Dynamic serve active workspace data files for HTML widget rendering."""
-    if not APP_WORKSPACE_DIR:
+    disc_ws = get_discussion_workspace()
+    if not disc_ws:
         raise HTTPException(status_code=400, detail="No active workspace directory.")
 
     # Sanitize and guard against Directory Traversal
-    file_path = (APP_WORKSPACE_DIR / filename).resolve()
-    if not _is_safe_path(APP_WORKSPACE_DIR, file_path):
+    file_path = (disc_ws / filename).resolve()
+    if not _is_safe_path(disc_ws, file_path):
         raise HTTPException(status_code=403, detail="Access Denied: Path traversal detected.")
 
     if not file_path.exists() or not file_path.is_file():
@@ -838,11 +847,11 @@ async def raw_sql_query_endpoint(title: str, payload: RawSQLQueryRequest):
         current_version = active.get("version", 1)
         is_read_only = active.get("read_only", False)
 
-        workspace_dir = APP_WORKSPACE_DIR
+        workspace_dir = get_discussion_workspace()
         if is_read_only:
             file_path = workspace_dir / f"{title}{ext}"
         else:
-            file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+            file_path = workspace_dir / "versions" / f"{title}_v{current_version}{ext}"
 
         if not file_path.exists():
             file_path = workspace_dir / f"{title}{ext}"
@@ -1145,7 +1154,7 @@ async def ai_data_query_endpoint(title: str, payload: AIDataQueryRequest):
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
                 tables = [row[0] for row in cursor.fetchall()]
 
-                new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                new_file_path = workspace_dir / "versions" / f"{title}_v{current_version + 1}{ext}"
                 with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
                     for t in tables:
                         df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
@@ -1161,7 +1170,7 @@ async def ai_data_query_endpoint(title: str, payload: AIDataQueryRequest):
                     file_ext=ext
                 )
             else:
-                new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                new_file_path = workspace_dir / "versions" / f"{title}_v{current_version + 1}{ext}"
                 df_write = pd.read_sql_query(f"SELECT * FROM {title.replace(' ', '_')}", conn)
                 df_write.to_csv(new_file_path, index=False, sep=sep)
 
@@ -1289,6 +1298,155 @@ async def delete_artifact_endpoint(title: str):
         if client and client.debug:
             trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class CreateFolderRequest(BaseModel):
+    folder_path: str
+
+class ToggleFolderRequest(BaseModel):
+    folder_path: str
+    active: bool
+
+class ImportPhysicalFolderRequest(BaseModel):
+    local_path: str
+    auto_load: Optional[bool] = True
+
+@app.post("/api/folders/create")
+async def create_folder_endpoint(payload: CreateFolderRequest):
+    """Creates a physical directory tree inside the active workspace."""
+    workspace_dir = APP_WORKSPACE_DIR
+    if not workspace_dir:
+        raise HTTPException(status_code=400, detail="No active workspace directory.")
+
+    # Guard against Directory Traversal (../)
+    target_path = (workspace_dir / payload.folder_path.strip()).resolve()
+    if not _is_safe_path(workspace_dir, target_path):
+        raise HTTPException(status_code=403, detail="Access Denied: Path traversal detected.")
+
+    try:
+        target_path.mkdir(parents=True, exist_ok=True)
+        ASCIIColors.success(f"✓ Created physical directory: {payload.folder_path}")
+        return {"success": True, "path": payload.folder_path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create folder: {e}")
+
+
+@app.post("/api/folders/toggle")
+async def toggle_folder_context_endpoint(payload: ToggleFolderRequest):
+    """Recursively activates or deactivates all artifacts residing inside a specific folder path."""
+    folder_prefix = payload.folder_path.strip().lower()
+    if not folder_prefix.endswith("/"):
+        folder_prefix += "/"
+
+    try:
+        artifacts = discussion.artefacts.list()
+        modified_count = 0
+
+        for art in artifacts:
+            title_lower = art["title"].lower()
+            if title_lower.startswith(folder_prefix):
+                discussion.artefacts._set_active(art["title"], None, payload.active)
+                modified_count += 1
+
+        discussion.commit()
+        state_label = "activated" if payload.active else "deactivated"
+        ASCIIColors.success(f"✓ Recursively {state_label} {modified_count} artifacts inside folder '{payload.folder_path}'")
+        return {"success": True, "modified_count": modified_count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Folder toggle failed: {e}")
+
+
+@app.post("/api/folders/import")
+async def import_physical_folder_endpoint(payload: ImportPhysicalFolderRequest):
+    """
+    Recursively scans a local folder on the host machine, imports all valid files 
+    as session artifacts, and writes them to the workspace disk.
+    """
+    local_dir = Path(payload.local_path.strip()).resolve()
+    workspace_dir = APP_WORKSPACE_DIR
+
+    if not local_dir.exists() or not local_dir.is_dir():
+        raise HTTPException(status_code=400, detail="Local directory does not exist or is not a folder.")
+
+    # Security check: Ensure we only import folders inside safe directories (Allow home folder and app config)
+    allowed_bases = [Path.home(), APP_DIR]
+    is_allowed = any(_is_safe_path(base, local_dir) for base in allowed_bases)
+    if not is_allowed:
+        raise HTTPException(status_code=403, detail="Access Denied: Target folder is outside allowed boundaries.")
+
+    ignored_patterns = {
+        "__pycache__", ".git", ".venv", "venv", ".pytest_cache", ".vscode", "node_modules", ".idea"
+    }
+
+    imported_files = []
+
+    try:
+        for root, dirs, files in os.walk(str(local_dir)):
+            # Prune ignored directories in place
+            dirs[:] = [d for d in dirs if d not in ignored_patterns]
+
+            for file in files:
+                file_path = Path(root) / file
+                # Determine relative path from parent root
+                rel_path = file_path.relative_to(local_dir)
+                rel_path_str = str(rel_path).replace("\\", "/")
+
+                # Exclude temporary or heavy system files
+                if file.startswith(".") or file_path.suffix.lower() in (".pyc", ".pyo", ".exe", ".bin", ".tar", ".gz", ".zip"):
+                    continue
+
+                # Read text content safely
+                from lollms_client.lollms_discussion._mixin_file_import import _extract_text_file
+                try:
+                    content = _extract_text_file(file_path)
+
+                    # Register file as an artifact
+                    art = discussion.artefacts.add(
+                        title=rel_path_str,
+                        content=content,
+                        active=payload.auto_load,
+                        file_ext=file_path.suffix.lower()
+                    )
+                    imported_files.append(rel_path_str)
+                except Exception as read_err:
+                    ASCIIColors.warning(f"Skipped file '{rel_path_str}' during folder import: {read_err}")
+
+        discussion.commit()
+        ASCIIColors.success(f"✓ Imported {len(imported_files)} files from physical folder '{local_dir.name}'")
+        return {"success": True, "count": len(imported_files), "files": imported_files}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Physical folder import failed: {e}")
+
+
+@app.post("/api/artifacts/wipe")
+async def wipe_all_artifacts_endpoint():
+    """Wipes all artifacts in the session and purges the physical workspace directory."""
+    try:
+        # 1. Clear database entries
+        all_arts = discussion.artefacts.list()
+        for art in all_arts:
+            discussion.artefacts.remove(art["title"])
+        discussion.commit()
+
+        # 2. Empty physical workspace directory
+        workspace_dir = APP_WORKSPACE_DIR
+        if workspace_dir and workspace_dir.exists():
+            import shutil
+            for item in workspace_dir.iterdir():
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(str(item))
+                    else:
+                        item.unlink()
+                except Exception as del_err:
+                    ASCIIColors.warning(f"Wipe: could not delete {item.name}: {del_err}")
+
+        ASCIIColors.success("✓ All artifacts wiped and workspace directory cleared.")
+        return {"success": True}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=f"Wipe failed: {e}")
 
 
 @app.post("/api/artifacts/{title}/toggle_read_only")
@@ -2653,11 +2811,16 @@ async def get_data_grid(title: str, version: Optional[int] = None):
     current_version = active.get("version", 1)
     workspace_dir = APP_WORKSPACE_DIR
 
+    # Strip any duplicated extensions in title representation
+    base_title = title
+    if base_title.lower().endswith(ext.lower()):
+        base_title = base_title[:-len(ext)]
+
     # Check multiple possible file paths for data_bundle imports
     possible_paths = [
-        workspace_dir / f"{title}_consolidated.db",  # Folder bundle consolidation
-        workspace_dir / f"{title}_v{current_version}{ext}",  # Standard versioned
-        workspace_dir / f"{title}{ext}",  # Unversioned fallback
+        workspace_dir / f"{base_title}_consolidated.db",  # Folder bundle consolidation
+        workspace_dir / "versions" / f"{base_title}_v{current_version}{ext}",  # Standard versioned
+        workspace_dir / f"{base_title}{ext}",  # Unversioned fallback
     ]
 
     file_path = None
@@ -2667,6 +2830,9 @@ async def get_data_grid(title: str, version: Optional[int] = None):
             break
 
     if not file_path:
+        # Default destination path to restore to if recovered
+        file_path = workspace_dir / "versions" / f"{base_title}_v{current_version}{ext}"
+
         # Fallback scan: check other workspaces and the global data_workspace
         found_path = None
         scan_dirs = [Path("./data_workspace")]
@@ -2677,7 +2843,7 @@ async def get_data_grid(title: str, version: Optional[int] = None):
                     if d.is_dir():
                         scan_dirs.append(d / "data_workspace")
         for sd in scan_dirs:
-            for base_name in [f"{title}_consolidated.db", f"{title}_v{current_version}{ext}", f"{title}{ext}"]:
+            for base_name in [f"{base_title}_consolidated.db", f"{base_title}_v{current_version}{ext}", f"{base_title}{ext}"]:
                 cand = sd / base_name
                 if cand.exists():
                     found_path = cand
@@ -2690,7 +2856,7 @@ async def get_data_grid(title: str, version: Optional[int] = None):
             try:
                 workspace_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy(str(found_path), str(file_path))
-                unversioned_path = workspace_dir / f"{title}{ext}"
+                unversioned_path = workspace_dir / f"{base_title}{ext}"
                 try:
                     shutil.copy(str(found_path), str(unversioned_path))
                 except Exception:
@@ -2700,6 +2866,9 @@ async def get_data_grid(title: str, version: Optional[int] = None):
                 pass
 
     if not file_path or not file_path.exists():
+        # Assign a fallback destination path in the current active workspace
+        file_path = workspace_dir / "versions" / f"{base_title}_v{current_version}{ext}"
+
         # Fallback scan: check other workspaces and the global data_workspace
         found_path = None
         scan_dirs = [Path("./data_workspace")]
@@ -2710,7 +2879,7 @@ async def get_data_grid(title: str, version: Optional[int] = None):
                     if d.is_dir():
                         scan_dirs.append(d / "data_workspace")
         for sd in scan_dirs:
-            for base_name in [f"{title}_consolidated.db", f"{title}_v{current_version}{ext}", f"{title}{ext}"]:
+            for base_name in [f"{base_title}_consolidated.db", f"{base_title}_v{current_version}{ext}", f"{base_title}{ext}"]:
                 cand = sd / base_name
                 if cand.exists():
                     found_path = cand
@@ -2723,7 +2892,7 @@ async def get_data_grid(title: str, version: Optional[int] = None):
             try:
                 workspace_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy(str(found_path), str(file_path))
-                unversioned_path = workspace_dir / f"{title}{ext}"
+                unversioned_path = workspace_dir / f"{base_title}{ext}"
                 try:
                     shutil.copy(str(found_path), str(unversioned_path))
                 except Exception:
@@ -2731,6 +2900,25 @@ async def get_data_grid(title: str, version: Optional[int] = None):
                 ASCIIColors.success(f"✓ Recovered missing data file for grid: {file_path}")
             except Exception:
                 pass
+
+    # ── 🛡️ SELF-HEALING RESTORATION PROTOCOL ──
+    # If the file is still missing from the physical workspace directory, but exists
+    # in the SQLite artifact version record, write it back to disk instantly so the renderer never fails.
+    if not file_path or not file_path.exists():
+        try:
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            # Establish versioned path
+            file_path = workspace_dir / "versions" / f"{base_title}_v{current_version}{ext}"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(active.get("content", ""), encoding="utf-8")
+
+            # Write unversioned copy to active folder too
+            unversioned_path = workspace_dir / f"{base_title}{ext}"
+            unversioned_path.write_text(active.get("content", ""), encoding="utf-8")
+
+            ASCIIColors.success(f"✓ [Self-Healing] Restored missing data file on disk from SQLite artifact record: {file_path.name}")
+        except Exception as restore_err:
+            ASCIIColors.warning(f"Self-healing file restoration failed: {restore_err}")
 
     if not file_path or not file_path.exists():
         raise HTTPException(status_code=404, detail=f"Raw data file missing from workspace. Searched: {possible_paths}")
@@ -3159,37 +3347,246 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
         import sys
         import io
         import os
+        import shutil
         old_stdout = sys.stdout
         redirected_output = io.StringIO()
         sys.stdout = redirected_output
 
+        disc_ws = get_discussion_workspace()
+
         # Ensure active unversioned copies exist for all data artifacts in the workspace
-        if discussion and APP_WORKSPACE_DIR:
+        if discussion and disc_ws:
             try:
+                # Scan all potential directories where the dataset files might have been written
+                possible_dirs = [
+                    APP_WORKSPACE_DIR,
+                    Path("./data_workspace"),
+                    Path(".")
+                ]
+
+                ASCIIColors.info(f"=== [Sandbox Sync Debug] Active Sandbox Directory: {disc_ws.resolve()} ===")
+
+                for src_dir in possible_dirs:
+                    if src_dir and src_dir.exists():
+                        src_resolved = src_dir.resolve()
+                        ASCIIColors.info(f"  -> Scanning source folder: {src_resolved}")
+                        try:
+                            contents = os.listdir(str(src_resolved))
+                            ASCIIColors.info(f"     Contents: {contents}")
+                        except Exception as list_err:
+                            ASCIIColors.warning(f"     Could not list contents: {list_err}")
+
+                        # 1. Mirror all flat files from source directory directly into active discussion sandbox
+                        for item in src_dir.iterdir():
+                            if item.is_file():
+                                dest_file = disc_ws / item.name
+                                if item.resolve() != dest_file.resolve():
+                                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+                                    try:
+                                        shutil.copy(str(item), str(dest_file))
+                                        ASCIIColors.success(f"     ✓ Copied: {item.name} -> {dest_file.name}")
+                                    except Exception as copy_err:
+                                        ASCIIColors.warning(f"     ❌ Failed to copy {item.name}: {copy_err}")
+
+                        # 2. Mirror versioned file history
+                        versions_src = src_dir / "versions"
+                        if versions_src.exists():
+                            versions_dest = disc_ws / "versions"
+                            versions_dest.mkdir(parents=True, exist_ok=True)
+                            for item in versions_src.iterdir():
+                                if item.is_file():
+                                    dest_file = versions_dest / item.name
+                                    if item.resolve() != dest_file.resolve():
+                                        try:
+                                            shutil.copy(str(item), str(dest_file))
+                                            ASCIIColors.success(f"     ✓ Copied versioned: {item.name}")
+                                        except Exception as copy_err:
+                                            ASCIIColors.warning(f"     ❌ Failed to copy versioned {item.name}: {copy_err}")
+
+                # 3. Dynamic Double-Extension Auto-Healing (e.g., test_plot_data.csv.csv -> test_plot_data.csv)
+                if disc_ws.exists():
+                    for item in list(disc_ws.iterdir()):
+                        if item.is_file():
+                            name_lower = item.name.lower()
+                            # Check for common duplicate extension formats
+                            for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite"):
+                                double_ext = f"{ext}{ext}"
+                                if name_lower.endswith(double_ext):
+                                    clean_name = item.name[:-len(ext)]
+                                    clean_dest = disc_ws / clean_name
+                                    try:
+                                        shutil.copy(str(item), str(clean_dest))
+                                        ASCIIColors.success(f"     ✓ Auto-healed double extension: {item.name} -> {clean_name}")
+                                    except Exception as heal_err:
+                                        ASCIIColors.warning(f"     ❌ Failed to auto-heal {item.name}: {heal_err}")
+
+                # 4. Rename Auto-Healing: Map active data artifact titles to physical files if named differently on disk
                 for art in discussion.artefacts.list(active_only=True):
                     if art.get("type") == "data":
                         title = art["title"]
                         ext = art.get("file_ext", ".csv")
-                        version = art.get("version", 1)
-                        versioned_path = APP_WORKSPACE_DIR / f"{title}_v{version}{ext}"
-                        unversioned_path = APP_WORKSPACE_DIR / f"{title}{ext}"
-                        if versioned_path.exists() and not unversioned_path.exists():
-                            import shutil
-                            shutil.copy(str(versioned_path), str(unversioned_path))
+                        base_title = title
+                        if base_title.lower().endswith(ext.lower()):
+                            base_title = base_title[:-len(ext)]
+
+                        target_unversioned = disc_ws / f"{base_title}{ext}"
+                        if not target_unversioned.exists():
+                            # Scan physical source folders for any available file of the same extension to map as fallback
+                            for src_dir in possible_dirs:
+                                if src_dir and src_dir.exists():
+                                    for item in src_dir.iterdir():
+                                        if item.is_file() and item.suffix.lower() == ext.lower() and not item.name.endswith(f"{ext}{ext}"):
+                                            try:
+                                                shutil.copy(str(item), str(target_unversioned))
+                                                ASCIIColors.success(f"     ✓ [Rename Auto-Heal] Mapped missing '{target_unversioned.name}' to physical file: '{item.name}'")
+                                                break
+                                            except Exception as map_err:
+                                                ASCIIColors.warning(f"     ❌ Failed to map {item.name}: {map_err}")
+                                if target_unversioned.exists():
+                                    break
+
+                # 5. CSV Delimiter Auto-Healing: Standardize ';' separators to ',' to avoid KeyError in default pd.read_csv()
+                if disc_ws.exists():
+                    for item in list(disc_ws.iterdir()):
+                        if item.is_file() and item.name.lower().endswith(".csv"):
+                            try:
+                                text_content = item.read_text(encoding="utf-8", errors="ignore")
+                                first_line = text_content.splitlines()[0] if text_content.splitlines() else ""
+                                if ";" in first_line and "," not in first_line:
+                                    import csv
+                                    reader = csv.reader(io.StringIO(text_content), delimiter=';')
+                                    rows = list(reader)
+                                    if rows:
+                                        out_val = io.StringIO()
+                                        writer = csv.writer(out_val, delimiter=',')
+                                        writer.writerows(rows)
+                                        item.write_text(out_val.getvalue(), encoding="utf-8")
+                                        ASCIIColors.success(f"     ✓ [Separator Auto-Heal] Standardized ';' separators to ',' in '{item.name}'")
+                            except Exception as sep_err:
+                                ASCIIColors.warning(f"     ❌ Semicolon standardizer skipped for {item.name}: {sep_err}")
+
+                # Print final sandbox files to help diagnose live
+                if disc_ws.exists():
+                    final_contents = os.listdir(str(disc_ws.resolve()))
+                    ASCIIColors.info(f"=== [Sandbox Sync Debug] Final files inside execution folder: {final_contents} ===")
             except Exception as ex:
                 if client and client.debug:
                     trace_exception(ex)
 
+        # Path sanitization filter to prevent host folder disclosures
+        def sanitize_output_paths(text: str, ws_path: Path) -> str:
+            if not text:
+                return ""
+            text_clean = text.replace("\\", "/")
+            abs_path_str = str(ws_path.resolve()).replace("\\", "/")
+            text_clean = text_clean.replace(abs_path_str, "./")
+            try:
+                user_home_str = str(Path.home().resolve()).replace("\\", "/")
+                text_clean = text_clean.replace(user_home_str, "~")
+                text_clean = re.sub(r'(?:[a-zA-Z]:/Users|/home)/[^/]+', '~', text_clean, flags=re.I)
+            except Exception:
+                pass
+            return text_clean
+
+        # ── 🛡️ SECURE EXECUTION SANDBOX (RCE & Path Traversal Prevention) ──
+        def _is_safe_path(target_path: Union[str, Path]) -> bool:
+            try:
+                resolved_base = disc_ws.resolve()
+                resolved_target = Path(target_path).resolve()
+                return resolved_target.parts[:len(resolved_base.parts)] == resolved_base.parts
+            except Exception:
+                return False
+
+        _original_open = open
+        def _restricted_open(file, mode='r', *args, **kwargs):
+            resolved_file = Path(file)
+            if not resolved_file.is_absolute():
+                resolved_file = disc_ws / resolved_file
+            if not _is_safe_path(resolved_file):
+                raise PermissionError(f"Access Denied: Path '{file}' is outside the authorized sandbox folder.")
+            return _original_open(resolved_file, mode, *args, **kwargs)
+
+        _original_import = __import__
+        def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+            forbidden_modules = {
+                "os", "sys", "subprocess", "shutil", "socket", "ctypes", "pty", "platform",
+                "requests", "urllib", "http", "multiprocessing", "threading"
+            }
+            if name in forbidden_modules or any(mod in name for mod in forbidden_modules):
+                raise ImportError(f"Security Block: Import of dangerous module '{name}' is forbidden in the sandbox.")
+            return _original_import(name, globals, locals, fromlist, level)
+
+        # Assemble secure context builtins in a 100% bulletproof way
+        import builtins
+        sandbox_builtins = {}
+        for name in dir(builtins):
+            sandbox_builtins[name] = getattr(builtins, name)
+
+        sandbox_builtins["open"] = _restricted_open
+        sandbox_builtins["__import__"] = _restricted_import
+        for dangerous_builtin in ["eval", "exec", "compile", "globals", "locals"]:
+            sandbox_builtins.pop(dangerous_builtin, None)
+
+        # ── Robust pandas read_csv wrapper ──
+        # Injects a custom read_csv that automatically handles BOM markers (\ufeff)
+        # and auto-detects semicolon vs comma separators to avoid KeyError: 'Date'
+        import pandas as pd
+        _original_read_csv = pd.read_csv
+
+        def _robust_read_csv(filepath_or_buffer, *args, **kwargs):
+            # Resolve physical path
+            f_path = Path(filepath_or_buffer)
+            if not f_path.is_absolute() and disc_ws:
+                f_path = disc_ws / f_path
+
+            if f_path.exists() and f_path.is_file():
+                try:
+                    # Detect delimiter and strip any UTF-8 BOM (Byte Order Mark)
+                    text_content = f_path.read_text(encoding="utf-8", errors="ignore")
+                    first_line = text_content.splitlines()[0] if text_content.splitlines() else ""
+
+                    # Set default separator
+                    if "sep" not in kwargs and "delimiter" not in kwargs:
+                        kwargs["sep"] = ";" if ";" in first_line and "," not in first_line else ","
+
+                    # Ensure UTF-8-SIG to strip BOM automatically
+                    if "encoding" not in kwargs:
+                        kwargs["encoding"] = "utf-8-sig"
+                except Exception:
+                    pass
+            return _original_read_csv(filepath_or_buffer, *args, **kwargs)
+
+        # Inject robust wrapper into pandas namespace
+        pd.read_csv = _robust_read_csv
+
+        local_vars = {
+            "__builtins__": sandbox_builtins,
+            "pd": pd
+        }
+
         old_cwd = os.getcwd()
         try:
-            if APP_WORKSPACE_DIR and APP_WORKSPACE_DIR.exists():
-                os.chdir(str(APP_WORKSPACE_DIR))
-            exec(payload.code, {})
-            return {"success": True, "output": redirected_output.getvalue()}
+            if disc_ws and disc_ws.exists():
+                os.chdir(str(disc_ws))
+            exec(payload.code, local_vars)
+
+            raw_out = redirected_output.getvalue()
+            sanitized_out = sanitize_output_paths(raw_out, disc_ws)
+            return {"success": True, "output": sanitized_out}
         except Exception as e:
+            import traceback
             if client and client.debug:
                 trace_exception(e)
-            return {"success": False, "error": str(e), "output": redirected_output.getvalue()}
+
+            # Capture complete traceback details
+            raw_tb = traceback.format_exc()
+            sanitized_tb = sanitize_output_paths(raw_tb, disc_ws)
+            sanitized_out = sanitize_output_paths(redirected_output.getvalue(), disc_ws)
+            return {
+                "success": False, 
+                "error": f"Execution Error:\n{sanitized_tb}", 
+                "output": sanitized_out
+            }
         finally:
             sys.stdout = old_stdout
             try:
@@ -3501,7 +3898,7 @@ async def scan_skills_directory(payload: ScanSkillsRequest):
 
 import re
 
-def _execute_sequential_reading_subroutine(discussion, user_message: str, max_tokens: int, streaming_callback: Optional[Callable] = None) -> List[str]:
+def _execute_sequential_reading_subroutine(discussion, user_message: str, max_tokens: int, streaming_callback: Optional[Callable] = None, ai_msg: Any = None) -> List[str]:
     """
     Sequentially reads active artifacts in chunks, extracting relevant information
     for the user_message using LLM calls. Saves a synthesized summary to the scratchpad
@@ -3510,17 +3907,16 @@ def _execute_sequential_reading_subroutine(discussion, user_message: str, max_to
     active_artifacts = discussion.artefacts.list(active_only=True)
     tokenizer = discussion.lollmsClient.count_tokens
     detokenizer = discussion.lollmsClient.detokenize
-    
+
     extracted_knowledge = []
     deactivated_titles = []
-    
+
     # 1. Start processing box in the UI
-    if streaming_callback:
+    if streaming_callback and ai_msg:
         try:
-            streaming_callback("", MSG_TYPE.MSG_TYPE_CHUNK, {
-                "type": "processing_open",
-                "title": "Sequential Cognitive Scan"
-            })
+            open_tag = '\n<processing type="sequential_scan" title="Sequential Cognitive Scan">\n'
+            ai_msg.content += open_tag
+            streaming_callback(open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
         except Exception as e:
             ASCIIColors.warning(f"Failed to open processing block: {e}")
 
@@ -3528,27 +3924,26 @@ def _execute_sequential_reading_subroutine(discussion, user_message: str, max_to
         content = art.get("content", "").strip()
         if not content:
             continue
-            
+
         art_tokens = tokenizer(content)
-        
+
         # Target artifacts that are large or contribute to context budget overflow
         if art_tokens > 2000:
             msg = f"Large document detected: '{art['title']}' ({art_tokens:,} tokens). Initiating scan..."
             ASCIIColors.warning(f"[Sequential Reader] {msg}")
-            if streaming_callback:
+            if streaming_callback and ai_msg:
                 try:
-                    streaming_callback("", MSG_TYPE.MSG_TYPE_CHUNK, {
-                        "type": "progress",
-                        "message": msg
-                    })
+                    status_line = f"* {msg}\n"
+                    ai_msg.content += status_line
+                    streaming_callback(status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 except Exception:
                     pass
-            
+
             if not hasattr(discussion, "deactivated_contents"):
                 discussion.deactivated_contents = set()
             discussion.deactivated_contents.add(art["title"])
             deactivated_titles.append(art["title"])
-            
+
             # Chunk into roughly 1000-token blocks
             tokens = discussion.lollmsClient.tokenize(content)
             chunk_size = 1000
@@ -3556,18 +3951,17 @@ def _execute_sequential_reading_subroutine(discussion, user_message: str, max_to
             for i in range(0, len(tokens), chunk_size):
                 chunk_tokens = tokens[i : i + chunk_size]
                 chunks.append(detokenizer(chunk_tokens))
-            
+
             # Scan chunks sequentially
             art_knowledge = []
             for idx, chunk_text in enumerate(chunks):
                 status_msg = f"Scanning chunk {idx+1}/{len(chunks)} of '{art['title']}'..."
                 ASCIIColors.info(f"  ↳ {status_msg}")
-                if streaming_callback:
+                if streaming_callback and ai_msg:
                     try:
-                        streaming_callback("", MSG_TYPE.MSG_TYPE_CHUNK, {
-                            "type": "processing_status",
-                            "status": status_msg
-                        })
+                        status_line = f"* {status_msg}\n"
+                        ai_msg.content += status_line
+                        streaming_callback(status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                     except Exception:
                         pass
 
@@ -3598,11 +3992,11 @@ def _execute_sequential_reading_subroutine(discussion, user_message: str, max_to
                 discussion.sequential_summaries[art["title"]] = "\n\n".join(art_knowledge)
 
     # 2. Close processing box in the UI
-    if streaming_callback:
+    if streaming_callback and ai_msg:
         try:
-            streaming_callback("", MSG_TYPE.MSG_TYPE_CHUNK, {
-                "type": "processing_close"
-            })
+            close_line = f"* Cognitive scan complete.\n</processing>\n\n"
+            ai_msg.content += close_line
+            streaming_callback(close_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
         except Exception as e:
             ASCIIColors.warning(f"Failed to close processing block: {e}")
 
@@ -3686,7 +4080,7 @@ async def chat_with_document(request: ChatRequest):
                         "Executing sequential cognitive reading subroutine..."
                     )
                     # Trigger sequential reading and capture which artifacts were deactivated
-                    deactivated_titles, synthesis = _execute_sequential_reading_subroutine(discussion, user_message, max_tokens, streaming_callback)
+                    deactivated_titles, synthesis = _execute_sequential_reading_subroutine(discussion, user_message, max_tokens, streaming_callback, ai_msg)
                 else:
                     # Clear scratchpad if using normal mode
                     discussion.scratchpad = ""
@@ -3705,8 +4099,8 @@ async def chat_with_document(request: ChatRequest):
 
                 active_tools = {}
                 if discussion.lollmsClient and getattr(discussion.lollmsClient, "tools", None):
-                    # Gather discovered local LCP tools (respecting user activation toggle)
-                    for t in discussion.lollmsClient.tools.list_tools(force_refresh=True):
+                    # Gather discovered local LCP tools (utilizing cached memory list)
+                    for t in discussion.lollmsClient.tools.list_tools(force_refresh=False):
                         if not tool_states.get(t["name"], True):
                             continue
                         # Skip data tools if no active data artifacts are present
@@ -3726,7 +4120,11 @@ async def chat_with_document(request: ChatRequest):
                                 for p_name, p_info in t["input_schema"].get("properties", {}).items()
                             ],
                             "callable": lambda tname=t["name"], **kw: client.tools.execute_tool(
-                                tname, kw, client, discussion=discussion
+                                tname, 
+                                {k: v for k, v in kw.items() if k not in ("lollms_client_instance", "discussion_instance")}, 
+                                lollms_client_instance=kw.get("lollms_client_instance", client), 
+                                discussion_instance=kw.get("discussion_instance", discussion),
+                                discussion=kw.get("discussion_instance", discussion)
                             )
                         }
 

@@ -70,10 +70,23 @@ class MemoryMixin:
 
     def _memory_pre_turn(self, mm: Optional['LollmsMemoryManager'], user_message: Optional[str] = None, enable_deep_memory_pulling: bool = True, token_counter=None):
         if mm is None: return
-        mm.apply_decay()
-        if user_message and enable_deep_memory_pulling:
-            mm.auto_pull_deep_memories(user_message)
-        mm.enforce_budget(token_counter=token_counter)
+        import time
+        start_time = time.time()
+        try:
+            # Enforce strict 5-second budget for all pre-turn operations combined
+            mm.apply_decay()
+            if time.time() - start_time > 4.0:
+                raise TimeoutError("Memory operations exceeded pre-turn safety budget.")
+
+            if user_message and enable_deep_memory_pulling:
+                mm.auto_pull_deep_memories(user_message)
+
+            if time.time() - start_time > 4.5:
+                raise TimeoutError("Memory operations exceeded pre-turn safety budget.")
+
+            mm.enforce_budget(token_counter=token_counter)
+        except Exception as e:
+            ASCIIColors.warning(f"[Memory] Pre-turn memory operations bypassed: {e}")
 
     def _build_memory_system_instructions(self, mm: Optional['LollmsMemoryManager']) -> str:
         return mm.build_system_instructions() if mm else ""

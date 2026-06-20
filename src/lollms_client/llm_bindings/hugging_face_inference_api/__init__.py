@@ -137,12 +137,6 @@ class HuggingFaceInferenceAPIBinding(LollmsLLMBinding):
             trace_exception(ex)
             return {"status": "error", "message": error_message}
 
-    def _chat(self, discussion: LollmsDiscussion, **kwargs) -> Union[str, dict]:
-        """
-        Conduct a chat session using the Inference API by formatting the discussion into a single prompt.
-        """
-        prompt = self._format_chat_prompt(discussion)
-        return self.generate_text(prompt, **kwargs)
 
     def tokenize(self, text: str) -> list:
         """Tokenize text using tiktoken as a fallback."""

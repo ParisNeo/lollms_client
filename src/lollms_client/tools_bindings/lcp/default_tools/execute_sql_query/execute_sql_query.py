@@ -91,16 +91,15 @@ def tool_execute_sql_query(
 
     workspace_dir = Path("./data_workspace")
     try:
-        from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-        if awd is not None:
-            workspace_dir = awd
+        from lollms_client.app.server import get_discussion_workspace
+        workspace_dir = get_discussion_workspace()
     except ImportError:
         pass
 
     if is_read_only:
         file_path = workspace_dir / f"{title}{ext}"
     else:
-        file_path = workspace_dir / f"{title}_v{current_version}{ext}"
+        file_path = workspace_dir / "versions" / f"{title}_v{current_version}{ext}"
 
     if not file_path.exists():
         file_path = workspace_dir / f"{title}{ext}"
@@ -266,7 +265,7 @@ def tool_execute_sql_query(
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
                 tables = [row[0] for row in cursor.fetchall()]
 
-                new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                new_file_path = workspace_dir / "versions" / f"{title}_v{current_version + 1}{ext}"
                 with pd.ExcelWriter(new_file_path, engine="openpyxl") as writer:
                     for t in tables:
                         df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
@@ -282,7 +281,7 @@ def tool_execute_sql_query(
                     file_ext=ext
                 )
             else:
-                new_file_path = workspace_dir / f"{title}_v{current_version + 1}{ext}"
+                new_file_path = workspace_dir / "versions" / f"{title}_v{current_version + 1}{ext}"
                 df_write = pd.read_sql_query(f"SELECT * FROM {title.replace(' ', '_')}", conn)
                 df_write.to_csv(new_file_path, index=False, sep=sep)
 

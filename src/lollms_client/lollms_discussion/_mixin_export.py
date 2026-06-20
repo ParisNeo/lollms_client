@@ -569,7 +569,7 @@ class ExportMixin:
                 conn = sqlite3.connect(str(file_path))
                 cursor = conn.cursor()
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                tables = [row[0] for row in cursor.fetchall()]
+                tables = [row[0] for row in cursor.fetchall() if row[0] != "sqlite_sequence"]
                 if not tables:
                     raise ValueError("No tables found in SQLite DB.")
                 df = pd.read_sql_query(f"SELECT * FROM {tables[0]};", conn)
@@ -635,110 +635,144 @@ class ExportMixin:
             trace_exception(e)
             raise RuntimeError(f"Excel export failed: {e}")
 
-def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
-    import base64
-    parts = image_id.split("::")
-    if len(parts) < 2:
-        return None
-    try:
-        img_index = int(parts[-1])
-    except ValueError:
-        return None
-    title = "::".join(parts[:-1])
-
-    # Check both main and companion
-    main_art = self.artefacts.get(title)
-    comp_art = self.artefacts.get(f"{title}::images")
-
-    target_art = None
-    target_index = None
-
-    if comp_art and img_index < len(comp_art.get("images", [])):
-        target_art = comp_art
-        target_index = img_index
-    elif main_art and img_index < len(main_art.get("images", [])):
-        target_art = main_art
-        target_index = img_index
-
-    if target_art:
-        imgs = target_art.get("images", [])
-        if 0 <= target_index < len(imgs):
-            b64_str = imgs[target_index]
-            if b64_str:
-                if ";base64," in b64_str:
-                    b64_str = b64_str.split(";base64,")[1]
-                return base64.b64decode(b64_str)
-    return None
-
-def _export_as_zip(self, art: Dict[str, Any]) -> bytes:
-    import zipfile
-    import io
-    import base64
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        content = art.get("content", "")
-        title = art["title"]
-
-        # 1. Parse and extract all embedded image anchors
-        img_pattern = re.compile(r'<artefact_image\s+id=["\']([^"\']+)["\']', re.IGNORECASE)
-        image_ids = img_pattern.findall(content)
-
-        # Track replaced image paths to update HTML refs
-        replacements = {}
-        for img_id in image_ids:
-            if "::" in img_id:
-                img_bytes = self._get_image_bytes_by_id(img_id)
-                if img_bytes:
-                    parts = img_id.split("::")
-                    img_index = int(parts[-1])
-                    img_title = "::".join(parts[:-1])
-                    # Save image to zip under images/
-                    safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{img_title}_{img_index}.png")
-                    zip_image_path = f"images/{safe_filename}"
-                    z.writestr(zip_image_path, img_bytes)
-                    replacements[img_id] = zip_image_path
-
-        # 2. Update all <artefact_image> XML tags with relative <img> links in the zip's HTML index
-        updated_content = content
-        for img_id, rel_path in replacements.items():
-            tag_pattern = re.compile(rf'<artefact_image\s+id=["\']{re.escape(img_id)}["\']\s*(?:\/>|>)', re.IGNORECASE)
-            updated_content = tag_pattern.sub(f'<img src="{rel_path}" style="width:100%; height:100%; object-fit:cover;" />', updated_content)
-
-        # Write the main index file to the zip
-        index_filename = f"{title}.html" if not title.endswith(".html") else title
-        z.writestr(index_filename, updated_content.encode("utf-8"))
-
-        # 3. Search and bundle any sister/companion files (e.g., CSS/JS artifacts)
-        related = self.artefacts.list()
-        for r in related:
-            r_title = r["title"]
-            if r_title != title and (r_title.startswith(title.split(".")[0]) or r_title == f"{title}::images"):
-                if r_title == f"{title}::images":
-                    continue  # Images already processed individually
-                r_content = r.get("content", "")
-                if r_content:
-                    z.writestr(r_title, r_content.encode("utf-8"))
-
-        # 4. Find and bundle all active datasets (CSVs, Excel files) in the workspace
+    def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
+        import base64
+        parts = image_id.split("::")
+        if len(parts) < 2:
+            return None
         try:
-            from lollms_client.app.server import APP_WORKSPACE_DIR
-            if APP_WORKSPACE_DIR and APP_WORKSPACE_DIR.exists():
-                for active_art in self.artefacts.list(active_only=True):
-                    if active_art.get("type") == "data":
-                        d_title = active_art["title"]
-                        ext = active_art.get("file_ext", ".csv")
-                        version = active_art.get("version", 1)
-                        # We save both the versioned and unversioned names inside the zip so the code works under any reference style!
-                        for name in (f"{d_title}{ext}", f"{d_title}_v{version}{ext}"):
-                            file_path = APP_WORKSPACE_DIR / name
-                            if file_path.exists():
-                                z.write(str(file_path), name)
-        except Exception:
-            pass
+            img_index = int(parts[-1])
+        except ValueError:
+            return None
+        title = "::".join(parts[:-1])
 
-    return buffer.getvalue()
+        # Check both main and companion
+        main_art = self.artefacts.get(title)
+        comp_art = self.artefacts.get(f"{title}::images")
 
+        target_art = None
+        target_index = None
+
+        if comp_art and img_index < len(comp_art.get("images", [])):
+            target_art = comp_art
+            target_index = img_index
+        elif main_art and img_index < len(main_art.get("images", [])):
+            target_art = main_art
+            target_index = img_index
+
+        if target_art:
+            imgs = target_art.get("images", [])
+            if 0 <= target_index < len(imgs):
+                b64_str = imgs[target_index]
+                if b64_str:
+                    if ";base64," in b64_str:
+                        b64_str = b64_str.split(";base64,")[1]
+                    return base64.b64decode(b64_str)
+        return None
+
+    def _export_as_zip(self, art: Dict[str, Any]) -> bytes:
+        import zipfile
+        import io
+        import base64
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+            content = art.get("content", "")
+            title = art["title"]
+
+            # 1. Parse and extract all embedded image anchors
+            img_pattern = re.compile(r'<artefact_image\s+id=["\']([^"\']+)["\']', re.IGNORECASE)
+            image_ids = img_pattern.findall(content)
+
+            # Track replaced image paths to update HTML refs
+            replacements = {}
+            for img_id in image_ids:
+                if "::" in img_id:
+                    img_bytes = self._get_image_bytes_by_id(img_id)
+                    if img_bytes:
+                        parts = img_id.split("::")
+                        img_index = int(parts[-1])
+                        img_title = "::".join(parts[:-1])
+                        # Save image to zip under images/
+                        safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{img_title}_{img_index}.png")
+                        zip_image_path = f"images/{safe_filename}"
+                        z.writestr(zip_image_path, img_bytes)
+                        replacements[img_id] = zip_image_path
+
+            # 2. Update all <artefact_image> XML tags with relative <img> links in the zip's HTML index
+            updated_content = content
+            for img_id, rel_path in replacements.items():
+                tag_pattern = re.compile(rf'<artefact_image\s+id=["\']{re.escape(img_id)}["\']\s*(?:\/>|>)', re.IGNORECASE)
+                updated_content = tag_pattern.sub(f'<img src="{rel_path}" style="width:100%; height:100%; object-fit:cover;" />', updated_content)
+
+            # Write the main index file to the zip
+            index_filename = self._get_filename_with_ext(title, art.get('type'), art.get('language'), art.get('file_ext'))
+            z.writestr(index_filename, updated_content.encode("utf-8"))
+
+            # 3. Export ALL active workspace artifacts (code, tools, notes, pages)
+            # This ensures that complex multi-file applications (e.g. index.html + style.css + app.js + main.py)
+            # are completely bundled together into the root of the ZIP archive.
+            all_active = self.artefacts.list(active_only=True)
+            for item in all_active:
+                item_title = item["title"]
+                if item_title != title and not item_title.endswith("::images"):
+                    item_content = item.get("content", "")
+                    if item_content:
+                        # Re-write and resolve any image anchors inside sibling artifacts as well
+                        sibling_images = img_pattern.findall(item_content)
+                        sibling_replacements = {}
+                        for s_img_id in sibling_images:
+                            if "::" in s_img_id:
+                                s_img_bytes = self._get_image_bytes_by_id(s_img_id)
+                                if s_img_bytes:
+                                    s_parts = s_img_id.split("::")
+                                    s_img_index = int(s_parts[-1])
+                                    s_img_title = "::".join(s_parts[:-1])
+                                    s_safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{s_img_title}_{s_img_index}.png")
+                                    s_zip_image_path = f"images/{s_safe_filename}"
+                                    try:
+                                        # Only write the image if not already written to zip
+                                        z.writestr(s_zip_image_path, s_img_bytes)
+                                    except UserWarning:
+                                        pass # Duplicate file inside zip is fine
+                                    sibling_replacements[s_img_id] = s_zip_image_path
+
+                        sibling_updated_content = item_content
+                        for s_img_id, s_rel_path in sibling_replacements.items():
+                            s_tag_pattern = re.compile(rf'<artefact_image\s+id=["\']{re.escape(s_img_id)}["\']\s*(?:\/>|>)', re.IGNORECASE)
+                            sibling_updated_content = s_tag_pattern.sub(f'<img src="{s_rel_path}" style="width:100%; height:100%; object-fit:cover;" />', sibling_updated_content)
+
+                        # Save clean file to the zip
+                        sibling_filename = self._get_filename_with_ext(item_title, item.get('type'), item.get('language'), item.get('file_ext'))
+                        z.writestr(sibling_filename, sibling_updated_content.encode("utf-8"))
+
+            # 4. Find and bundle all active datasets (CSVs, Excel files) in the workspace
+            try:
+                from lollms_client.app.server import APP_WORKSPACE_DIR
+                if APP_WORKSPACE_DIR and APP_WORKSPACE_DIR.exists():
+                    for active_art in self.artefacts.list(active_only=True):
+                        if active_art.get("type") == "data":
+                            d_title = active_art["title"]
+                            ext = active_art.get("file_ext", ".csv")
+                            version = active_art.get("version", 1)
+                            
+                            # Trim extension suffix from the title to prevent double-extension bugs during export
+                            base_title = d_title
+                            if base_title.lower().endswith(ext.lower()):
+                                base_title = base_title[:-len(ext)]
+                            
+                            # We save both the versioned and unversioned names inside the zip so the code works under any reference style!
+                            for name in (f"{base_title}{ext}", f"{base_title}_v{version}{ext}"):
+                                file_path = APP_WORKSPACE_DIR / name
+                                if file_path.exists():
+                                    try:
+                                        z.write(str(file_path), name)
+                                    except UserWarning:
+                                        pass
+            except Exception:
+                pass
+
+        return buffer.getvalue()
 def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
     import base64
     parts = image_id.split("::")

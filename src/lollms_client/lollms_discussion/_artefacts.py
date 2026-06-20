@@ -41,6 +41,8 @@
 
 import re
 import uuid
+import os
+from pathlib import Path
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -54,12 +56,18 @@ if TYPE_CHECKING:
 # ArtefactType
 # ---------------------------------------------------------------------------
 
+class ArtefactVisibility:
+    """Visibility tiers for context optimization."""
+    HIDDEN          = "hidden"           # Level 0: Invisible to LLM
+    TREE_LOCKED     = "tree_locked"      # Level 1: In tree, cannot be unlocked
+    TREE_UNLOCKABLE = "tree_unlockable"  # Level 2: In tree, can be unlocked by LLM
+    METADATA        = "metadata"         # Level 3: Visible with schema/signatures only
+    FULL            = "full"             # Level 4: Fully loaded in context
+
+
 class ArtefactType:
     """
     Registry for supported artefact types.
-
-    Standard types: file, search_result, note, skill, code, document, image.
-    Use register_custom_type() to add domain-specific types.
     """
     FILE          = "file"
     SEARCH_RESULT = "search_result"
@@ -125,6 +133,125 @@ _ARTEFACT_IMAGE_TAG_RE = re.compile(
     r'<artefact_image\s+id=["\']([^"\']+)["\'](?:\s*/?>|>)',
     re.IGNORECASE,
 )
+
+
+# ---------------------------------------------------------------------------
+# Code Signature & Metadata Extraction Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_code_signatures(content: str, language: Optional[str]) -> str:
+    """Extracts function, class, and method definitions to create a signature stub."""
+    lang = (language or "").lower()
+
+    # 1. Python Signature Extractor
+    if lang == "python" or "def " in content or "class " in content:
+        import ast
+        try:
+            tree = ast.parse(content)
+            sigs = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    methods = []
+                    for child in node.body:
+                        if isinstance(child, ast.FunctionDef):
+                            args = [arg.arg for arg in child.args.args]
+                            methods.append(f"    def {child.name}({', '.join(args)}): ...")
+                    base_classes = [ast.unparse(base) for base in node.bases]
+                    base_str = f"({', '.join(base_classes)})" if base_classes else ""
+                    sigs.append(f"class {node.name}{base_str}:\n" + "\n".join(methods))
+                elif isinstance(node, ast.FunctionDef) and not any(isinstance(p, ast.ClassDef) for p in ast.walk(tree) if node in p.body):
+                    args = [arg.arg for arg in node.args.args]
+                    sigs.append(f"def {node.name}({', '.join(args)}): ...")
+            if sigs:
+                return "\n\n".join(sigs)
+        except Exception:
+            pass
+
+    # 2. Regular Expression Based Definition Scanner (C, C++, JS, TS, Rust, Go)
+    signatures = []
+    lines = content.splitlines()
+
+    # Regex patterns matching standard function, class, or interface declarations
+    patterns = [
+        # JS/TS/Go/Rust: function name(args), fn name(args), func name(args)
+        r'^\s*(async\s+)?(function|fn|func|class|interface|struct)\s+([a-zA-Z0-9_]+)\b',
+        # C/C++: type name(args) {
+        r'^\s*(void|int|float|double|char|bool|auto|std::\w+)\s+([a-zA-Z0-9_]+)\s*\([^)]*\)\s*\{?',
+        # JS ES6 Arrow function assignments: const name = (args) =>
+        r'^\s*(const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(async\s*)?\([^)]*\)\s*=>'
+    ]
+    compiled = [re.compile(p) for p in patterns]
+
+    for line in lines:
+        line_strip = line.strip()
+        if not line_strip or line_strip.startswith(("//", "#", "/*", "*")):
+            continue
+        for rx in compiled:
+            if rx.match(line_strip):
+                # Clean up braces and print definition stub
+                clean_line = re.sub(r'\s*\{\s*$', '', line_strip)
+                signatures.append(clean_line + " { ... }")
+                break
+
+    if signatures:
+        return "\n".join(signatures)
+
+    # 3. Fallback: return line/character metadata only
+    return f"// [Code Signature Extraction Unavailable: File contains {len(lines)} lines]"
+
+
+def _extract_file_metadata_and_signature(art: Dict[str, Any]) -> str:
+    """Compiles a compact signature metadata descriptor for partial visibility tiers."""
+    content = art.get("content", "")
+    atype = art.get("type", "document")
+    title = art["title"]
+    lang = art.get("language")
+
+    size_chars = len(content)
+    line_count = len(content.splitlines())
+
+    summary = [
+        f"### [Partial Metadata] {title}",
+        f"- Format Type: {atype.upper()} {f'({lang})' if lang else ''}",
+        f"- Size: {size_chars:,} characters | {line_count:,} lines"
+    ]
+
+    # For data structures, we already have a compact schema in the content
+    if atype == ArtefactType.DATA:
+        # Extract headers and first few rows only
+        schema_lines = []
+        for line in content.splitlines()[:20]:
+            schema_lines.append(line)
+        if len(content.splitlines()) > 20:
+            schema_lines.append("\n  ... [remaining schema lines truncated]")
+        summary.append("\n".join(schema_lines))
+        return "\n".join(summary)
+
+    # For HTML/Presentation layouts, extract outline
+    if lang == "html" or atype == "presentation":
+        soup_headings = re.findall(r'<h[1-3][^>]*>(.*?)</h[1-3]>|<section\s+class="slide[^"]*"[^>]*data-notes="([^"]*)"', content, re.I)
+        if soup_headings:
+            summary.append("#### Structure Outline:")
+            for h in soup_headings[:15]:
+                h_text = h[0] or f"Slide with notes: {h[1][:40]}..."
+                summary.append(f"  • {re.sub(r'<[^>]+>', '', h_text).strip()}")
+            return "\n".join(summary)
+
+    # For code, extract signatures
+    if atype in (ArtefactType.CODE, ArtefactType.TOOL) or lang in _CODE_EXTENSIONS:
+        summary.append("#### Abstract Class & Function Signatures:")
+        summary.append("```" + (lang or "python"))
+        summary.append(_extract_code_signatures(content, lang))
+        summary.append("```")
+        return "\n".join(summary)
+
+    # General plain text fallback
+    preview = []
+    for line in content.splitlines()[:6]:
+        preview.append(line)
+    summary.append("#### Context Preview:")
+    summary.append("\n".join(preview) + "\n  ... [remaining document content truncated]")
+    return "\n".join(summary)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +393,14 @@ class ArtefactManager:
             if "language"         not in fixed: fixed["language"]         = None; dirty = True
             if "url"              not in fixed: fixed["url"]              = None; dirty = True
             if "tags"             not in fixed: fixed["tags"]             = []; dirty = True
-            if "active"           not in fixed: fixed["active"]           = False; dirty = True
+
+            # Migrate legacy binary active state to the 5-tier visibility string
+            if "visibility" not in fixed:
+                legacy_active = fixed.get("active", False)
+                fixed["visibility"] = ArtefactVisibility.FULL if legacy_active else ArtefactVisibility.HIDDEN
+                dirty = True
+
+            if "active"           not in fixed: fixed["active"]           = (fixed["visibility"] == ArtefactVisibility.FULL); dirty = True
             if "version"          not in fixed: fixed["version"]          = 1; dirty = True
             if "created_at"       not in fixed: fixed["created_at"]       = now; dirty = True
             if "updated_at"       not in fixed: fixed["updated_at"]       = now; dirty = True
@@ -279,6 +413,68 @@ class ArtefactManager:
             self._discussion.metadata = new_meta
             self._discussion.commit()
         return migrated
+
+    def _get_filename_with_ext(self, title: str, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None) -> str:
+        if "." in title and len(title.split(".")[-1]) <= 5:
+            return title
+        ext = file_ext or ""
+        if not ext:
+            if language:
+                lang_map = {
+                    "python": ".py", "javascript": ".js", "typescript": ".ts",
+                    "html": ".html", "css": ".css", "markdown": ".md",
+                    "latex": ".tex", "tex": ".tex", "sparql": ".rq", "sql": ".sql"
+                }
+                ext = lang_map.get(language.lower(), "")
+            if not ext:
+                type_map = {
+                    "code": ".py", "document": ".md", "note": ".txt",
+                    "skill": ".md", "data": ".csv", "presentation": ".html",
+                    "tool": ".py"
+                }
+                ext = type_map.get(atype, ".txt")
+        return f"{title}{ext}"
+
+    def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None):
+        """Saves artifact content to the discussion's isolated virtual workspace on disk."""
+        try:
+            from pathlib import Path
+            workspace_dir = Path("./data_workspace")
+            try:
+                from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                if awd is not None:
+                    workspace_dir = awd
+            except ImportError:
+                pass
+
+            disc_id = self._discussion.id
+            disc_ws_dir = workspace_dir  # Save directly to primary workspace so tools can read other artifacts easily!
+            disc_ver_dir = disc_ws_dir / "versions"
+
+            disc_ws_dir.mkdir(parents=True, exist_ok=True)
+            disc_ver_dir.mkdir(parents=True, exist_ok=True)
+
+            filename = self._get_filename_with_ext(title, atype, language, file_ext)
+
+            # Ensure any nested directory structures are created
+            primary_path = workspace_dir / filename
+            working_path = disc_ws_dir / filename
+
+            # Map versioned files safely into versions/ folder, keeping names clean
+            safe_ver_name = filename.replace("/", "_")
+            name_part, ext_part = os.path.splitext(safe_ver_name)
+            versioned_path = disc_ver_dir / f"{name_part}_v{version}{ext_part}"
+
+            if isinstance(content, str):
+                for p in (primary_path, working_path, versioned_path):
+                    try:
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_text(content, encoding="utf-8", errors="ignore")
+                    except Exception as p_err:
+                        pass
+                ASCIIColors.success(f"[Workspace Sync] Synchronized file '{filename}' (v{version}) directly to primary workspace.")
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to sync artifact '{title}' to disk workspace: {e}")
 
     def _save_all(self, artefacts: List[Dict]):
         new_meta = (self._discussion.metadata or {}).copy()
@@ -310,7 +506,8 @@ class ArtefactManager:
         url:               Optional[str] = None,
         tags:              Optional[List[str]] = None,
         version:           int = 1,
-        active:            bool = True,
+        active:            Optional[bool] = None,
+        visibility:        Optional[str] = None,
         commit_message:    Optional[str] = None,
         version_tags:      Optional[List[str]] = None,
         **extra_data
@@ -326,6 +523,15 @@ class ArtefactManager:
         for a in artefacts:
             if a.get('title') == title:
                 a['active'] = False
+                a['visibility'] = ArtefactVisibility.HIDDEN
+
+        # Determine visibility based on active flag / fallback parameters
+        resolved_visibility = visibility
+        if not resolved_visibility:
+            if active is not None:
+                resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
+            else:
+                resolved_visibility = ArtefactVisibility.FULL  # default to active/full
 
         imgs  = images or []
         mtypes = image_media_types or []
@@ -334,12 +540,14 @@ class ArtefactManager:
             mtypes = mtypes + ["image/jpeg"] * (len(imgs) - len(mtypes))
 
         now = datetime.utcnow().isoformat()
+        token_count = self._discussion.lollmsClient.count_tokens(content) if (self._discussion and self._discussion.lollmsClient) else len(content) // 4
         new_artefact: Dict[str, Any] = {
             "id":               str(uuid.uuid4()),
             "title":            title,
             "type":             artefact_type,
             "version":          version,
             "content":          content,
+            "token_count":      token_count,  # Cache token length
             "images":           imgs,
             "image_media_types": mtypes,
             "audios":           audios or [],
@@ -348,7 +556,8 @@ class ArtefactManager:
             "language":         language,
             "url":              url,
             "tags":             tags or [],
-            "active":           active,
+            "visibility":       resolved_visibility,
+            "active":           (resolved_visibility == ArtefactVisibility.FULL),
             "created_at":       now,
             "updated_at":       now,
             "commit_message":   commit_message,
@@ -357,6 +566,9 @@ class ArtefactManager:
         }
         artefacts.append(new_artefact)
         self._save_all(artefacts)
+
+        # Sync to disk workspace
+        self._sync_to_disk_workspace(title, content, version, artefact_type, language, extra_data.get("file_ext"))
         return new_artefact
 
     def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -420,6 +632,7 @@ class ArtefactManager:
         new_title:         Optional[str] = None,
         bump_version:      bool = True,
         active:            Optional[bool] = None,
+        visibility:        Optional[str] = None,
         commit_message:    Optional[str] = None,
         version_tags:      Optional[List[str]] = None,
         version:           Optional[int] = None,
@@ -438,12 +651,23 @@ class ArtefactManager:
             new_version = version
         else:
             new_version  = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
-        new_active   = active if active is not None else latest.get('active', True)
+
+        # Map visibility parameters
+        resolved_visibility = visibility or latest.get("visibility")
+        if not resolved_visibility:
+            if active is not None:
+                resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
+            else:
+                resolved_visibility = latest.get("visibility") or ArtefactVisibility.FULL
+
+        if active is not None:
+            resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
+
         target_title = new_title if new_title else title
 
         internal_keys = {
             "id", "title", "type", "version", "content", "images", "image_media_types",
-            "audios", "videos", "zip", "language", "url", "tags", "active",
+            "audios", "videos", "zip", "language", "url", "tags", "active", "visibility",
             "created_at", "updated_at", "artefact_type", "commit_message", "version_tags"
         }
         merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
@@ -456,6 +680,22 @@ class ArtefactManager:
                     a['active'] = False
             self._save_all(artefacts)
             ASCIIColors.info(f"Renaming artefact '{title}' → '{new_title}'")
+            try:
+                # Remove unversioned copy of old file from working directory
+                from pathlib import Path
+                workspace_dir = Path("./data_workspace")
+                try:
+                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                    if awd is not None:
+                        workspace_dir = awd
+                except ImportError:
+                    pass
+                old_filename = self._get_filename_with_ext(title, latest.get('type'), latest.get('language'), latest.get('file_ext'))
+                old_path = workspace_dir / "discussions" / self._discussion.id / old_filename
+                if old_path.exists():
+                    old_path.unlink()
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to clear old renamed file from workspace: {e}")
 
         # When renaming, rewrite any image-anchor IDs in the content
         use_content = new_content if new_content is not None else latest.get('content', '')
@@ -488,7 +728,7 @@ class ArtefactManager:
             url               = url if url is not None else latest.get('url'),
             tags              = new_tags if new_tags is not None else latest.get('tags', []),
             version           = new_version,
-            active            = new_active,
+            visibility        = resolved_visibility,
             commit_message    = commit_message if commit_message is not None else latest.get('commit_message'),
             version_tags      = version_tags if version_tags is not None else latest.get('version_tags', []),
             **merged_extra,
@@ -928,6 +1168,24 @@ class ArtefactManager:
         # First, clean up any associated workspace files for DATA type artefacts
         self._cleanup_data_artefact_files(title, version)
 
+        art = self.get(title, version)
+        if art:
+            try:
+                from pathlib import Path
+                workspace_dir = Path("./data_workspace")
+                try:
+                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                    if awd is not None:
+                        workspace_dir = awd
+                except ImportError:
+                    pass
+                del_filename = self._get_filename_with_ext(title, art.get('type'), art.get('language'), art.get('file_ext'))
+                del_path = workspace_dir / "discussions" / self._discussion.id / del_filename
+                if del_path.exists():
+                    del_path.unlink()
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to delete working file on remove: {e}")
+
         artefacts = self._get_all_raw()
         initial = len(artefacts)
         if version is None:
@@ -1214,114 +1472,156 @@ class ArtefactManager:
         changed = False
         for a in artefacts:
             if a.get('title') == title and (version is None or a.get('version') == version):
+                a['visibility'] = ArtefactVisibility.FULL if state else ArtefactVisibility.HIDDEN
                 a['active'] = state
                 changed = True
         if changed:
             self._save_all(artefacts)
 
+    def set_visibility(self, title: str, visibility: str, version: Optional[int] = None) -> bool:
+        """Sets the exact visibility tier of an artifact."""
+        if visibility not in (ArtefactVisibility.HIDDEN, ArtefactVisibility.TREE_LOCKED, ArtefactVisibility.TREE_UNLOCKABLE, ArtefactVisibility.METADATA, ArtefactVisibility.FULL):
+            raise ValueError(f"Invalid visibility tier: '{visibility}'")
+        artefacts = self._get_all_raw()
+        changed = False
+        for a in artefacts:
+            if a.get('title') == title and (version is None or a.get('version') == version):
+                a['visibility'] = visibility
+                a['active'] = (visibility == ArtefactVisibility.FULL)
+                changed = True
+        if changed:
+            self._save_all(artefacts)
+            return True
+        return False
+
     # --------------------------------------------------------- context zone
 
     def build_artefacts_context_zone(self) -> str:
         """
-        Assembles a text block describing all active artefacts.
-
-        <artefact_image id="TITLE::N" /> anchors in artefact content are
-        preserved verbatim so the LLM can correlate text with images.
-        The companion image list is obtained via get_context_images().
+        Assembles the comprehensive multi-tier workspace context zone.
+        Exposes a unified directory tree index outlining file positions and visibility markers,
+        followed by complete file contents for Full artifacts, and schemas/signatures for Partial ones.
         """
-        active = [a for a in self._get_all_raw() if a.get('active', False)]
-        with_content = [a for a in active if a.get('content', '').strip() or a.get('url')]
-        if not with_content:
+        all_raw = self._get_all_raw()
+
+        # Exclude temporary, hidden, or companion images from tree and context compilation
+        visible_artifacts = [
+            a for a in all_raw 
+            if a.get("visibility", ArtefactVisibility.HIDDEN) != ArtefactVisibility.HIDDEN 
+            and not a.get("title", "").endswith("::images")
+        ]
+
+        if not visible_artifacts:
             return ""
-        parts = []
-        for item in with_content:
-            atype    = item.get('type', ArtefactType.DOCUMENT)
-            lang     = item.get('language') or ''
-            fence    = f"```{lang}" if lang else "```"
-            url_line = f"\nSource: {item['url']}" if item.get('url') else ""
 
-            # Formulate the display name and hide the version suffix for data and read-only artifacts
-            title_disp = item['title']
-            if atype == "data":
-                ext = item.get("file_ext", ".csv")
-                title_disp = f"{item['title']}{ext}"
+        # ── 1. COMPILE WORKSPACE DIRECTORY TREE INDEX ─────────────────────────
+        tree_lines = ["  workspace/"]
 
-            if atype == "data" or item.get("read_only"):
-                version_str = "Read-Only" if item.get("read_only") else ""
-            else:
-                versions = [a.get('version', 1) for a in self._get_all_raw() if a.get('title') == item['title']]
-                total_versions = len(versions)
-                version_str = f"v{item['version']}"
-                if total_versions > 1:
-                    version_str += f" | {total_versions} total versions exist"
+        # Group artifacts by hierarchical paths
+        root_node = {"files": [], "folders": {}}
+        for a in visible_artifacts:
+            parts = a["title"].split("/")
+            curr = root_node
+            for i in range(len(parts) - 1):
+                folder = parts[i]
+                curr = curr["folders"].setdefault(folder, {"files": [], "folders": {}})
+            curr["files"].append(a)
 
-            meta_str = ""
-            # Omit metadata fields from LLM-facing context zone for skills to conserve tokens
-            if atype != ArtefactType.SKILL:
-                if item.get('author'):      meta_str += f" | Author: {item['author']}"
-                if item.get('description'): meta_str += f"\nDescription: {item['description']}"
-            label  = ArtefactType.LABELS.get(atype, atype.capitalize())
-            v_info = f" ({version_str})" if version_str else ""
-            header = f"###[{label}] {title_disp}{v_info}{meta_str}{url_line}"
+        def _traverse_tree_prompt(node, depth=1):
+            lines = []
+            indent = "  " * depth
 
-            # Image count note (only when images present)
-            img_note = ""
-            imgs = item.get('images') or []
-            if imgs:
-                img_note = (
-                    f"\n<!-- This artefact has {len(imgs)} image(s). "
-                    f"They are referenced inline via <artefact_image id=\"{item['title']}::N\" /> tags. "
-                    f"The actual image data has been appended to the conversation context. -->"
-                )
+            # Print folders
+            for f_name, f_node in sorted(node["folders"].items()):
+                lines.append(f"{indent}├── {f_name}/")
+                lines.extend(_traverse_tree_prompt(f_node, depth + 1))
 
-            # Check if this content is truncated for context budget reasons
-            deactivated_contents = getattr(self._discussion, "deactivated_contents", set())
-            is_truncated = item['title'] in deactivated_contents
+            # Print files with state-contrast markers
+            # [C] Loaded/Active Content  | [M] Signature/Metadata  | [U] Unlockable by LLM  | [L] Locked in Tree
+            for a in sorted(node["files"], key=lambda x: x["title"]):
+                v_tier = a.get("visibility", ArtefactVisibility.FULL)
+                marker = "[L]"
+                if v_tier == ArtefactVisibility.FULL:
+                    marker = "[C]" # Fully Loaded
+                elif v_tier == ArtefactVisibility.METADATA:
+                    marker = "[M]" # Signature / Metadata Only
+                elif v_tier == ArtefactVisibility.TREE_UNLOCKABLE:
+                    marker = "[U]" # Unlockable via `<add_files_to_context>
 
-            if is_truncated:
-                seq_summaries = getattr(self._discussion, "sequential_summaries", {})
-                art_summary = seq_summaries.get(item['title'], "Detailed summary not available.")
-                parts.append(f"{header}{img_note}\n[THE FOLLOWING IS A DETAILED SEQUENTIAL EXTRACTED SUMMARY OF THIS DOCUMENT DUE TO CONTEXT WINDOW LIMITATIONS]:\n{art_summary}")
-            elif item.get('content', '').strip():
-                # For code artefacts that have no image anchors, keep the fence.
-                # For document artefacts that embed image anchors, use plain text
-                # so the anchors are not hidden inside a code block.
-                content_text = item['content'].strip()
-                if atype == ArtefactType.CODE or (
-                    lang and not _ARTEFACT_IMAGE_TAG_RE.search(content_text)
-                ):
-                    parts.append(f"{header}{img_note}\n{fence}\n{content_text}\n```")
+                f_name = a["title"].split("/")[-1]
+                lines.append(f"{indent}├── {f_name}  {marker}")
+            return lines
+
+        tree_lines.extend(_traverse_tree_prompt(root_node))
+        tree_text = "\n".join(tree_lines)
+
+        # ── 2. COMPILE FULL CONTENT & SIGNATURES SECTIONS ─────────────────────
+        full_visible_parts = []
+        partial_visible_parts = []
+
+        for item in visible_artifacts:
+            v_tier = item.get("visibility", ArtefactVisibility.FULL)
+            atype = item.get("type", ArtefactType.DOCUMENT)
+            lang = item.get("language") or ""
+            fence = f"```{lang}" if lang else "```"
+
+            if v_tier == ArtefactVisibility.FULL:
+                # Full Content visibility
+                content_text = item.get("content", "").strip()
+                if not content_text:
+                    continue
+
+                header = f"### [Full File: '{item['title']}']"
+
+                # Check for RAG / sequential summaries
+                deactivated_contents = getattr(self._discussion, "deactivated_contents", set())
+                if item['title'] in deactivated_contents:
+                    seq_summaries = getattr(self._discussion, "sequential_summaries", {})
+                    summary_text = seq_summaries.get(item['title'], "Detailed summary not available.")
+                    full_visible_parts.append(f"{header}\n[SEQUENTIAL COMPRESSED DATA DUE TO BUDGET CONSTRAINTS]:\n{summary_text}")
                 else:
-                    parts.append(f"{header}{img_note}\n{content_text}")
-            else:
-                parts.append(header + img_note)
+                    if atype == ArtefactType.CODE or (lang and not _ARTEFACT_IMAGE_TAG_RE.search(content_text)):
+                        full_visible_parts.append(f"{header}\n{fence}\n{content_text}\n```")
+                    else:
+                        full_visible_parts.append(f"{header}\n{content_text}")
 
-        return "## Active Artifacts\n\n" + "\n\n".join(parts)
+            elif v_tier == ArtefactVisibility.METADATA:
+                # Definitions / Signature / Metadata Only visibility
+                partial_desc = _extract_file_metadata_and_signature(item)
+                if partial_desc:
+                    partial_visible_parts.append(partial_desc)
+
+        # ── 3. ASSEMBLE SYSTEM CONTEXT ZONE ───────────────────────────────────
+        context_parts = [
+            "## Workspace Directory Tree Index",
+            "This index displays all files in your workspace directory tree with their context state markers:",
+            "  - [C] Fully Loaded in Context (Verbatim text/code is read-ready below)",
+            "  - [M] Signature / Metadata Only (Exposes schemas, layouts, or code signatures below)",
+            "  - [U] Inactive/Unlockable (Excluded from context, but you can unlock/load it to [C] by calling <add_files_to_context>)",
+            "  - [L] Locked in Tree (Excluded from context and cannot be unlocked)\n",
+            tree_text
+        ]
+
+        if partial_visible_parts:
+            context_parts.append("\n## Partial File Signatures & Metadata [M]\n" + "\n\n---\n\n".join(partial_visible_parts))
+
+        if full_visible_parts:
+            context_parts.append("\n## Fully Loaded File Contents [C]\n" + "\n\n---\n\n".join(full_visible_parts))
+
+        return "\n\n".join(context_parts)
 
     def get_context_images(self) -> List[Dict[str, Any]]:
         """
-        Returns ALL images from active artefacts that have images,
+        Returns ALL images from active/fully visible artefacts that have images,
         including companion images artefacts.
-
-        Each entry:
-            {
-                "id":         str  – "<title>::<index>"
-                "data":       str  – base64 encoded image data
-                "media_type": str  – e.g. "image/jpeg", "image/png"
-                "title":      str  – artefact title
-                "index":      int  – 0-based index within the artefact
-                "active":     bool – True
-            }
-
-        The list is ordered: artefacts in activation order, images in index order.
-        The chat layer merges these with message-level images before calling the LLM.
         """
         result: List[Dict[str, Any]] = []
         raw_list = self._get_all_raw()
         by_title = {a.get('title'): a for a in raw_list}
 
         for a in raw_list:
-            if not a.get('active', False):
+            # For image-type artifacts, we only load pixels into the vision context when visibility is set to FULL
+            if a.get('visibility', ArtefactVisibility.FULL) != ArtefactVisibility.FULL:
                 continue
             imgs   = a.get('images') or []
             mtypes = a.get('image_media_types') or []
@@ -1342,20 +1642,21 @@ class ArtefactManager:
             comp_title = f"{a.get('title')}::images"
             if comp_title in by_title:
                 comp_a = by_title[comp_title]
-                comp_imgs = comp_a.get('images') or []
-                comp_mtypes = comp_a.get('image_media_types') or []
-                for idx, img_b64 in enumerate(comp_imgs):
-                    if not img_b64:
-                        continue
-                    mtype = comp_mtypes[idx] if idx < len(comp_mtypes) else "image/jpeg"
-                    result.append({
-                        "id":         make_image_id(comp_title, idx),
-                        "data":       img_b64,
-                        "media_type": mtype,
-                        "title":      comp_title,
-                        "index":      idx,
-                        "active":     True,
-                    })
+                if comp_a.get('visibility', ArtefactVisibility.FULL) == ArtefactVisibility.FULL:
+                    comp_imgs = comp_a.get('images') or []
+                    comp_mtypes = comp_a.get('image_media_types') or []
+                    for idx, img_b64 in enumerate(comp_imgs):
+                        if not img_b64:
+                            continue
+                        mtype = comp_mtypes[idx] if idx < len(comp_mtypes) else "image/jpeg"
+                        result.append({
+                            "id":         make_image_id(comp_title, idx),
+                            "data":       img_b64,
+                            "media_type": mtype,
+                            "title":      comp_title,
+                            "index":      idx,
+                            "active":     True,
+                        })
         return result
 
     def get_active_images(self) -> List[Dict[str, Any]]:
@@ -1793,6 +2094,7 @@ class ArtefactManager:
             language    = attrs.pop('language', None)
             version_str = attrs.pop('version', '1')
             version     = int(version_str) if version_str.isdigit() else 1
+            is_ephemeral = attrs.pop('ephemeral', 'false').lower() in ('true', '1', 'yes')
 
             commit_message = attrs.pop('commit_message', None)
             version_tags_raw = attrs.pop('version_tags', None)
@@ -1820,7 +2122,8 @@ class ArtefactManager:
                 art = self.get(resolved_title)
                 if art:
                     affected.append(art)
-                return ''
+                tag_name = "artifact" if "artifact" in match.group(0).lower() else "artefact"
+                return f'<{tag_name} {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</{tag_name}>'
             
             is_new = False
 
@@ -1854,6 +2157,7 @@ class ArtefactManager:
                         title=resolved_title, artefact_type=atype, content=content,
                         language=language, version=version, active=auto_activate,
                         commit_message=commit_message, version_tags=version_tags,
+                        ephemeral=is_ephemeral,
                         **attrs
                     )
                     is_new = True
@@ -1871,6 +2175,7 @@ class ArtefactManager:
                             active=auto_activate,
                             commit_message=commit_message,
                             version_tags=version_tags,
+                            ephemeral=is_ephemeral,
                             **attrs
                         )
                         final_title = result_artefact.get('title', resolved_title)
@@ -1892,6 +2197,7 @@ class ArtefactManager:
                         content=content.strip(),
                         language=language, version=version, active=auto_activate,
                         commit_message=commit_message, version_tags=version_tags,
+                        ephemeral=is_ephemeral,
                         **attrs
                     )
                 else:
@@ -1905,6 +2211,7 @@ class ArtefactManager:
                         active=auto_activate,
                         commit_message=commit_message,
                         version_tags=version_tags,
+                        ephemeral=is_ephemeral,
                         **attrs
                     )
                     final_title = result_artefact.get('title', resolved_title)
@@ -1923,7 +2230,8 @@ class ArtefactManager:
                 except Exception as _ecb_err:
                     ASCIIColors.warning(f"Artefact event callback error: {_ecb_err}")
 
-            return ''
+            tag_name = "artifact" if "artifact" in match.group(0).lower() else "artefact"
+            return f'<{tag_name} {match.group(1)}>\n[content stripped, refer to the artefact for details]\n</{tag_name}>'
 
         cleaned = artefact_pattern.sub(handle_artefact, cleaned)
 

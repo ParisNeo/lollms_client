@@ -1046,6 +1046,16 @@ select option {
     font-size: 13.5px;
     line-height: 1.5;
     word-wrap: break-word;
+    overflow-wrap: break-word; /* Ensure extremely long words wrap correctly */
+    word-break: break-word;
+}
+
+.prose-span {
+    display: block;
+    width: 100%;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    word-break: break-word;
 }
 
 .chat-bubble.user {
@@ -1437,6 +1447,12 @@ select option {
     transform: rotate(90deg);
 }
 
+/* Ensure details summaries are fully clickable and have pointer cursor */
+.inline-proc-accordion summary {
+    cursor: pointer !important;
+    user-select: none;
+}
+
 .proc-accordion-content {
     padding: 12px 14px;
     display: flex;
@@ -1712,6 +1728,75 @@ select option {
     color: var(--text-primary);
     font-weight: 600;
     font-size: 14px;
+}
+
+/* 💻 Premium Code Block and Copy/Download Utility Bar */
+.prose-span pre {
+    position: relative;
+    margin: 14px 0;
+    padding-top: 40px !important; /* Spacing for the floating header bar */
+    border-radius: 8px;
+    background-color: #020617 !important;
+    border: 1px solid var(--border-color);
+    overflow: hidden;
+}
+
+.code-utility-header {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 34px;
+    background-color: rgba(15, 23, 42, 0.95);
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 14px;
+    user-select: none;
+    z-index: 5;
+}
+
+.code-utility-lang {
+    font-size: 11px;
+    font-weight: bold;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    font-family: 'Fira Code', 'Courier New', monospace;
+}
+
+.code-utility-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.code-action-btn {
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-secondary);
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    outline: none;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.code-action-btn:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: var(--text-primary);
+    border-color: var(--border-color);
+}
+
+.code-action-btn.copy:active {
+    background-color: rgba(16, 185, 129, 0.15);
+    color: var(--success-color);
+    border-color: var(--success-color);
 }
 
 /* Custom Scrollbars */
@@ -2664,11 +2749,18 @@ html, body, select, textarea, div {
 
 /* Base pre formatting inside collapsible blocks */
 .proc-accordion-content pre {
+    position: relative !important;
     margin-top: 6px;
     font-size: 11px;
     background: none !important;
     border: none !important;
     padding: 0 !important;
+    padding-top: 0 !important;
+}
+
+/* Ensure no floating utility header can bleed into the thought accordion */
+.proc-accordion-content pre .code-utility-header {
+    display: none !important;
 }
 
 /* 1. Red Error details styling */

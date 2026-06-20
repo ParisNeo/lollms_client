@@ -186,7 +186,19 @@ class CoreMixin:
                 self._session.flush()
             except Exception:
                 pass
-            self._session.refresh(self._db_discussion, ['messages'])
+
+            try:
+                self._session.refresh(self._db_discussion, ['messages'])
+            except Exception as e:
+                # If transaction is in a pending rollback state, clear it and retry refresh
+                if "pendingrollback" in str(e).lower() or "rollback" in str(e).lower():
+                    try:
+                        self._session.rollback()
+                        self._session.refresh(self._db_discussion, ['messages'])
+                    except Exception as retry_err:
+                        ASCIIColors.error(f"Failed to refresh messages after rollback: {retry_err}")
+                else:
+                    ASCIIColors.error(f"Database refresh error: {e}")
         self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
 
     def _find_deepest_leaf(self, start_id):
@@ -239,6 +251,7 @@ class CoreMixin:
             if new_id:
                 object.__setattr__(self._db_discussion, 'active_branch_id', new_id)
         else:
+            # If the active branch has children, find the deepest leaf under it
             children = [m.id for m in self._message_index.values()
                         if m.parent_id == current_active_id]
             if children:
@@ -271,11 +284,24 @@ class CoreMixin:
             if not self._session.is_active:
                 return
 
+            # Clean up pending rollback states before attempting changes
+            try:
+                self._session.flush()
+            except Exception as e:
+                if "rollback" in str(e).lower():
+                    try:
+                        self._session.rollback()
+                    except Exception:
+                        pass
+
             if self._messages_to_delete_from_db:
                 for msg_id in self._messages_to_delete_from_db:
-                    msg_to_del = self._session.get(self.db_manager.MessageModel, msg_id)
-                    if msg_to_del:
-                        self._session.delete(msg_to_del)
+                    try:
+                        msg_to_del = self._session.get(self.db_manager.MessageModel, msg_id)
+                        if msg_to_del:
+                            self._session.delete(msg_to_del)
+                    except Exception as del_err:
+                        ASCIIColors.warning(f"Message deletion error deferred: {del_err}")
                 self._messages_to_delete_from_db.clear()
             try:
                 self._session.commit()
@@ -287,7 +313,11 @@ class CoreMixin:
                     self._session.rollback()
                 except Exception:
                     pass
-                raise e
+                # Reset indices silently so session can heal on next turn
+                try:
+                    self._rebuild_message_index()
+                except Exception:
+                    pass
 
     def close(self):
         if self._session:
@@ -346,29 +376,39 @@ class CoreMixin:
         return wrapped_msg
 
     def get_branch(self, leaf_id):
+        """
+        Walks recursively from the specified leaf_id up to its absolute root ancestor (parent=None),
+        returning a list of LollmsMessage objects sorted chronologically from root (oldest) to leaf (newest).
+        """
         if not leaf_id:
             return []
-        branch_orms = []
+
+        self._rebuild_message_index()
         current_id = leaf_id
 
-        # Concurrency Guard: If the requested leaf_id is not in the message index (which
-        # occurs during active background generation before the transaction is committed),
-        # we dynamically fall back to the latest committed message in the index to prevent
-        # the entire conversation history from being wiped or hidden from the user.
+        # Concurrency Guard: Fall back to latest committed message if the leaf_id is missing
         if current_id not in self._message_index:
-            self._rebuild_message_index()
-            if current_id not in self._message_index:
-                all_msgs = list(self._message_index.values())
-                if all_msgs:
-                    all_msgs.sort(key=lambda m: m.created_at or datetime.min)
-                    current_id = all_msgs[-1].id
-                else:
-                    return []
+            all_msgs = list(self._message_index.values())
+            if all_msgs:
+                all_msgs.sort(key=lambda m: m.created_at or datetime.min)
+                current_id = all_msgs[-1].id
+            else:
+                return []
 
+        branch_orms = []
+        visited = set()
+
+        # Traverse upwards from leaf to root
         while current_id and current_id in self._message_index:
+            if current_id in visited:
+                break  # Prevent infinite loop on circular parent links
+            visited.add(current_id)
+
             msg_orm = self._message_index[current_id]
             branch_orms.append(msg_orm)
             current_id = msg_orm.parent_id
+
+        # Reverse the list to produce a clean root-to-leaf (oldest-to-newest) chronological sequence
         return [LollmsMessage(self, orm) for orm in reversed(branch_orms)]
 
     def get_message(self, message_id):

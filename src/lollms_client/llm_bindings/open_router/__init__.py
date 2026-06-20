@@ -128,51 +128,6 @@ class OpenRouterBinding(LollmsLLMBinding):
                         ai_keyword=ai_keyword,
                         **kwargs)
 
-    def _chat(self,
-             discussion: LollmsDiscussion,
-             branch_tip_id: Optional[str] = None,
-             n_predict: Optional[int] = 2048,
-             stream: Optional[bool] = False,
-             temperature: float = 0.7,
-             top_p: float = 0.9,
-             seed: Optional[int] = None,
-             streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-             **kwargs
-             ) -> Union[str, dict]:
-        """
-        Conduct a chat session with a model via OpenRouter.
-        """
-        if not self.client:
-            return {"status": "error", "message": "OpenRouter client not initialized."}
-
-        messages = self._prepare_messages(discussion, branch_tip_id)
-        api_params = self._construct_parameters(temperature, top_p, n_predict, seed)
-        full_response_text = ""
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                stream=stream if stream else False,
-                **api_params
-            )
-
-            if stream:
-                for chunk in response:
-                    delta = chunk.choices[0].delta.content
-                    if delta:
-                        full_response_text += delta
-                        if streaming_callback:
-                            if not streaming_callback(delta, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
-                return full_response_text
-            else:
-                return response.choices[0].message.content
-
-        except Exception as ex:
-            error_message = f"An unexpected error occurred with OpenRouter API: {str(ex)}"
-            trace_exception(ex)
-            return {"status": "error", "message": error_message}
 
     def tokenize(self, text: str) -> list:
         """Tokenize text using tiktoken as a general-purpose fallback."""

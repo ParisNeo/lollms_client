@@ -56,6 +56,7 @@ import math
 import re
 import uuid
 import json
+from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -253,10 +254,23 @@ class LollmsMemoryManager:
         self.lollms_client = lollms_client
         self.config        = config or MemoryConfig()
         self.debug         = debug
+
+        # Resolve clean absolute path on disk for logging
+        self.resolved_disk_path = "In-Memory Database"
+        if db_path.startswith("sqlite:///"):
+            self.resolved_disk_path = str(Path(db_path[10:]).resolve())
+        elif db_path.startswith("sqlite://"):
+            self.resolved_disk_path = str(Path(db_path[9:]).resolve())
+
         # Use StaticPool to ensure all connections share the same in-memory SQLite database instance
         engine_kwargs = {}
         if db_path.startswith("sqlite"):
-            engine_kwargs["connect_args"] = {"check_same_thread": False}
+            # Set a high busy timeout of 30.0 seconds and disable thread checking for concurrent access
+            engine_kwargs["connect_args"] = {
+                "check_same_thread": False, 
+                "timeout": 30.0,
+                "isolation_level": None  # Autocommit mode for cleaner transaction isolation
+            }
 
         if db_path == "sqlite:///:memory:":
             from sqlalchemy.pool import StaticPool
@@ -269,6 +283,10 @@ class LollmsMemoryManager:
         try:
             with self._engine.connect() as connection:
                 from sqlalchemy import text
+                # Configure high-performance Write-Ahead Logging (WAL) and busy timeout
+                connection.execute(text("PRAGMA journal_mode=WAL"))
+                connection.execute(text("PRAGMA busy_timeout=30000"))
+                connection.execute(text("PRAGMA synchronous=NORMAL"))
                 cursor = connection.execute(text("PRAGMA table_info(memories)"))
                 columns = {row[1] for row in cursor.fetchall()}
                 migrations = [
@@ -280,12 +298,11 @@ class LollmsMemoryManager:
                 ]
                 for col, sql in migrations:
                     if col not in columns:
-                        if self.debug:
-                            ASCIIColors.info(f"  -> Upgrading 'memories' table: Adding '{col}' column.")
+                        ASCIIColors.info(f"  -> Upgrading 'memories' table: Adding '{col}' column.")
                         connection.execute(text(sql))
                 connection.commit()
         except Exception as e:
-            ASCIIColors.warning(f"Memory migration warning: {e}")
+            ASCIIColors.warning(f"Memory migration warning (DB path: {self.resolved_disk_path}): {e}")
 
         self._Session      = sessionmaker(bind=self._engine, autoflush=False)
         self._last_dream   = datetime.utcnow() - timedelta(days=1)
@@ -295,8 +312,8 @@ class LollmsMemoryManager:
         self._working_zone_cache = None
         self._handles_zone_cache = None
 
-        if self.debug:
-            ASCIIColors.info(f"[MemoryManager] Initialised — db={db_path}, owner={owner_id}")
+        # Always log the memories database absolute path for user visibility & diagnostics
+        ASCIIColors.info(f"[MemoryManager] Initialised memories DB at: {self.resolved_disk_path}")
 
     # ──────────────────────────────────────────────── session helper
 
@@ -307,17 +324,46 @@ class LollmsMemoryManager:
 
     @contextmanager
     def _session(self):
-        s = self._Session()
-        try:
-            yield s
-            s.commit()
-            # Clear caches on successful commit of any transaction (writes, tags, deletes)
-            self._clear_cache()
-        except Exception:
-            s.rollback()
-            raise
-        finally:
-            s.close()
+        import time
+        max_retries = 5
+        retry_delay = 0.15
+        start_time = time.time()
+
+        for attempt in range(max_retries):
+            s = self._Session()
+            try:
+                # Enable high-concurrency WAL mode and a generous 30-second busy timeout
+                from sqlalchemy import text
+                s.execute(text("PRAGMA journal_mode=WAL"))
+                s.execute(text("PRAGMA busy_timeout=30000"))
+                s.execute(text("PRAGMA synchronous=NORMAL"))
+                yield s
+
+                # Check elapsed time before committing
+                if time.time() - start_time > 4.5:
+                    raise TimeoutError("Memory operation exceeded strict 5-second deadline.")
+
+                s.commit()
+                self._clear_cache()
+                break  # Successful session transaction
+            except Exception as e:
+                try:
+                    s.rollback()
+                except Exception:
+                    pass
+
+                # Check for lock contention
+                if "database is locked" in str(e).lower():
+                    s.close()
+                    if attempt < max_retries - 1:
+                        # Back off and wait for concurrent lock to release
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    else:
+                        ASCIIColors.warning(f"[MemoryManager] SQLite database lock contention could not be resolved on: {self.resolved_disk_path}")
+                raise e
+            finally:
+                s.close()
 
     def _q(self, session: Session):
         q = session.query(_MemoryRecord)

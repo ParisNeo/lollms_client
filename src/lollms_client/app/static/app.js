@@ -126,6 +126,20 @@ document.addEventListener("DOMContentLoaded", () => {
     let openTabs = new Set(); // Stores titles of currently open tabs
     let codeEditors = {}; // Keeps track of active CodeMirror instances key-mapped by artifact title
     let activeChatAbortController = null;
+
+    // Declarative Accordion Open States (keyed by stable ID, e.g. "msgId-think" or "msgId-proc-0")
+    let accordionOpenStates = {};
+    window.accordionOpenStates = accordionOpenStates;
+
+    // Smart scroll helper: only scroll if user is already near bottom (within 120px) or forced
+    function scrollToBottom(force = false) {
+        if (!chatHistory) return;
+        const isNearBottom = chatHistory.scrollHeight - chatHistory.clientHeight - chatHistory.scrollTop < 120;
+        if (force || isNearBottom) {
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+    }
+
     let toolRefDocs = {}; // Reference doc contents mapped to tool titles: { title: [{name, content}] }
     let availableBindings = [];
     let currentBindingConfig = {};
@@ -913,6 +927,165 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
+    // Global Accordion Event Delegator (Immune to Streaming Wipes) ──
+    chatHistory.addEventListener("toggle", (e) => {
+        const details = e.target.closest(".inline-proc-accordion, .folder-tree-details, .proc-params-details");
+        if (details && details.id) {
+            window.accordionOpenStates[details.id] = details.hasAttribute("open");
+            console.log(`[Toggle Delegator] Recorded '${details.id}' open=${details.hasAttribute("open")}`);
+        }
+    }, true); // Use capture phase because 'toggle' does not bubble
+
+    // Delegator for Folder Tree summaries (preserves custom UI tree collapse across ticks)
+    document.getElementById("artifacts-list").addEventListener("toggle", (e) => {
+        const details = e.target.closest(".folder-tree-details");
+        if (details && details.id) {
+            window.accordionOpenStates[details.id] = details.hasAttribute("open");
+            console.log(`[Folder Tree Toggle] Recorded '${details.id}' open=${details.hasAttribute("open")}`);
+        }
+    }, true);
+
+    document.getElementById("artifacts-list").addEventListener("click", async (e) => {
+        // Intercept folder-level context toggle clicks
+        const toggleFolderBtn = e.target.closest(".toggle-folder-btn");
+        if (toggleFolderBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const folderPath = toggleFolderBtn.dataset.folderPath;
+            const targetActive = toggleFolderBtn.dataset.active === "true";
+
+            toggleFolderBtn.disabled = true;
+            toggleFolderBtn.textContent = "...";
+
+            try {
+                const res = await fetch("/api/folders/toggle", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ folder_path: folderPath, active: targetActive })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showNotification(`✓ ${targetActive ? 'Activated' : 'Deactivated'} folder contents recursively!`, "success", 2000);
+                    fetchArtifacts();
+                    updateContextBudget();
+                }
+            } catch (err) {
+                alert(`Folder toggle failed: ${err}`);
+            }
+            return;
+        }
+    });
+
+    // Bind "Create Folder" Sidebar Button Click Handler
+    const btnCreateFolderSidebar = document.getElementById("btn-create-folder-sidebar");
+    if (btnCreateFolderSidebar) {
+        btnCreateFolderSidebar.addEventListener("click", async () => {
+            const path = await showCustomPrompt("Create Folder in Workspace", "Enter relative directory path (e.g., src/utils)");
+            if (!path) return;
+
+            btnCreateFolderSidebar.disabled = true;
+            btnCreateFolderSidebar.textContent = "Creating...";
+
+            try {
+                const res = await fetch("/api/folders/create", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ folder_path: path })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showNotification(`✓ Created physical folder: '${path}'!`, "success", 3000);
+                    fetchArtifacts();
+                } else {
+                    alert(`Failed to create folder: ${data.detail}`);
+                }
+            } catch (err) {
+                alert(`Request failed: ${err}`);
+            } finally {
+                btnCreateFolderSidebar.disabled = false;
+                btnCreateFolderSidebar.textContent = "📁+ Folder";
+            }
+        });
+    }
+
+    // Bind Ingestion Modal File Selection & Import Folder triggers
+    const btnSelectLocalFiles = document.getElementById("btn-select-local-files");
+    if (btnSelectLocalFiles) {
+        btnSelectLocalFiles.addEventListener("click", () => fileInput.click());
+    }
+
+    const btnImportFolderModal = document.getElementById("btn-import-folder-modal");
+    if (btnImportFolderModal) {
+        btnImportFolderModal.addEventListener("click", async () => {
+            const path = await showCustomPrompt("Import Host Folder as Project", "Enter the absolute local directory path on your host machine");
+            if (!path) return;
+
+            btnImportFolderModal.disabled = true;
+            btnImportFolderModal.textContent = "Scanning...";
+            progressContainer.style.display = "flex";
+            progressBarFill.style.width = "25%";
+            progressStatusText.textContent = "Scanning files recursively in physical directory...";
+
+            try {
+                const res = await fetch("/api/folders/import", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ local_path: path, auto_load: true })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showNotification(`✓ Successfully imported ${data.count} file(s) into your project workspace!`, "success", 4000);
+                    importModal.style.display = "none";
+                    fetchArtifacts();
+                    updateContextBudget();
+                } else {
+                    alert(`Import failed: ${data.detail || data.error}`);
+                }
+            } catch (err) {
+                alert(`Request failed: ${err}`);
+            } finally {
+                btnImportFolderModal.disabled = false;
+                btnImportFolderModal.textContent = "📁 Import Local Folder";
+                progressContainer.style.display = "none";
+            }
+        });
+    }
+
+    // Bind "Wipe All" Button Click Handler
+    const btnWipe = document.getElementById("btn-wipe-artifacts");
+    if (btnWipe) {
+        btnWipe.addEventListener("click", async () => {
+            const confirmed = await showSlickConfirm(
+                "🧹 Wipe All Artifacts",
+                "Are you absolutely sure you want to permanently delete ALL artifacts and completely clear your physical disk workspace? This cannot be undone."
+            );
+            if (!confirmed) return;
+
+            btnWipe.disabled = true;
+            btnWipe.textContent = "Wiping...";
+
+            try {
+                const res = await fetch("/api/artifacts/wipe", { method: "POST" });
+                const data = await res.json();
+                if (data.success) {
+                    showNotification("✓ Successfully wiped all artifacts and cleared workspace disk folder", "success", 4000);
+                    // Clear all open tabs except Chat Companion
+                    openTabs.forEach(title => closeArtifactTab(title));
+                    fetchArtifacts();
+                    updateContextBudget();
+                } else {
+                    alert("Wipe failed: " + data.detail);
+                }
+            } catch (err) {
+                alert("Wipe request failed: " + err);
+            } finally {
+                btnWipe.disabled = false;
+                btnWipe.textContent = "🧹 Wipe All";
+            }
+        });
+    }
+
     // Launch workspace bootstrapper
     initializeApp();
 
@@ -1506,6 +1679,16 @@ document.addEventListener("DOMContentLoaded", () => {
                 isReadOnly = matched.read_only;
             }
 
+            const lowerTitle = title.toLowerCase();
+            const isDataArtifact = activeType === "data" || 
+                                   lowerTitle.endsWith(".csv") || 
+                                   lowerTitle.endsWith(".tsv") || 
+                                   lowerTitle.endsWith(".xlsx") || 
+                                   lowerTitle.endsWith(".xls") || 
+                                   lowerTitle.endsWith(".db") || 
+                                   lowerTitle.endsWith(".sqlite") || 
+                                   lowerTitle.endsWith(".sqlconn");
+
             if (activeType === "image") {
                 // Direct high-fidelity binary image preview in Rendered View
                 const selectedVer = version || 1;
@@ -1528,7 +1711,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
                 const art = await artRes.json();
                 rawView.value = art.content;
-            } else if (activeType === "data") {
+            } else if (isDataArtifact) {
                 await renderSpreadsheetGridInTab(title, version, renderedView);
 
                 const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
@@ -1583,38 +1766,54 @@ document.addEventListener("DOMContentLoaded", () => {
                     renderedView.style.display = "flex";
                     renderedView.style.flexDirection = "column";
 
+                    // Direct Live Multi-File Preview inside an Iframe with a localized base directory
+                    let resolvedHTML = art.content;
+                    if (!resolvedHTML.includes("<base ")) {
+                        // Inject base tag inside head to resolve sibling assets (like style.css, app.js) from physical workspace
+                        const baseTag = '\n<base href="/api/workspace_files/">\n';
+                        if (resolvedHTML.includes("<head>")) {
+                            resolvedHTML = resolvedHTML.replace("<head>", `<head>${baseTag}`);
+                        } else if (resolvedHTML.includes("<html>")) {
+                            resolvedHTML = resolvedHTML.replace("<html>", `<html><head>${baseTag}</head>`);
+                        } else {
+                            resolvedHTML = `${baseTag}${resolvedHTML}`;
+                        }
+                    }
+
+                    const blob = new Blob([resolvedHTML], { type: "text/html" });
+                    const iframeUrl = URL.createObjectURL(blob);
+
                     renderedView.innerHTML = `
                         <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-shrink: 0;">
-                            <span style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; font-weight: bold;">HTML Source</span>
-                            <button class="btn btn-primary" id="btn-run-code-${safeId}" style="width:auto; padding: 6px 14px; font-size: 12px;">▶ Run HTML</button>
+                            <span style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; font-weight: bold;">🌐 Live Web Project Preview</span>
+                            <button class="btn btn-primary" id="btn-run-code-${safeId}" style="width:auto; padding: 6px 14px; font-size: 12px;">↗ Open in New Tab</button>
                         </div>
-                        <div class="code-editor-scroll-container" style="flex: 1; min-height: 150px; overflow: hidden; display: flex; flex-direction: column;">
-                            <textarea id="cm-rendered-${safeId}"></textarea>
+                        <div style="flex: 1; border: 1px solid var(--border-color); border-radius: 8px; overflow: hidden; background-color: white;">
+                            <iframe id="iframe-preview-${safeId}" style="width: 100%; height: 100%; border: none;" sandbox="allow-scripts allow-modals allow-same-origin"></iframe>
                         </div>
-                        <div id="code-run-output-${safeId}" class="console-locked-panel" style="display:none; margin-top: 12px; flex-shrink: 0; max-height: 220px; overflow-y: auto; background-color: #020617; border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; flex-direction: column; gap: 6px;"></div>
                     `;
-                    const txtArea = renderedView.querySelector(`#cm-rendered-${safeId}`);
-                    const cm = CodeMirror.fromTextArea(txtArea, {
-                        mode: "htmlmixed",
-                        theme: "dracula",
-                        lineNumbers: true,
-                        readOnly: true,
-                        lineWrapping: true,
-                        tabSize: 4,
-                    });
-                    cm.setValue(art.content);
-                    codeEditors[title] = cm;
+
+                    // Load the HTML content directly into the iframe via srcdoc to allow standard base-href resolution over HTTP
+                    const iframeEl = renderedView.querySelector(`#iframe-preview-${safeId}`);
+                    if (iframeEl) {
+                        iframeEl.srcdoc = resolvedHTML;
+                    }
 
                     const runBtn = renderedView.querySelector(`#btn-run-code-${safeId}`);
                     runBtn.addEventListener("click", () => {
-                        const blob = new Blob([art.content], { type: "text/html" });
-                        const url = URL.createObjectURL(blob);
-                        window.open(url, "_blank");
-                        setTimeout(() => URL.revokeObjectURL(url), 60000);
+                        window.open(iframeUrl, "_blank");
                     });
                 } else if (activeType === "code") {
-                    const lang = art.language || "";
-                    if (lang === "graphviz" || art.content.includes("digraph") || art.content.includes("graph")) {
+                    const lang = (art.language || "").toLowerCase();
+                    const isPythonFile = title.endsWith(".py") || lang === "python";
+                    
+                    // Graphviz verification: must have exact DOT grammar keywords, and NEVER match Python files
+                    const isGraphviz = !isPythonFile && (
+                        lang === "graphviz" || 
+                        /^\s*(strict\s+)?(digraph|graph)\s*[a-zA-Z0-9_]*\s*\{/i.test(art.content.trim())
+                    );
+
+                    if (isGraphviz) {
                         renderedView.style.height = "100%";
                         renderedView.style.overflow = "auto";
                         renderedView.style.display = "block";
@@ -1635,7 +1834,8 @@ document.addEventListener("DOMContentLoaded", () => {
                         } catch (err) {
                             renderedView.innerHTML = `<div class="empty-viewer-msg" style="color: #ef4444;">Viz.js library initialization failed: ${err.message || err}</div>`;
                         }
-                    } else if (lang === "python" || lang === "html") {
+                    } else if (isPythonFile || lang === "html") {
+                        const actualDisplayLang = isPythonFile ? "Python" : lang.toUpperCase();
                         if (codeEditors[title]) {
                             try { codeEditors[title].toTextArea(); } catch(e) {}
                             delete codeEditors[title];
@@ -1647,8 +1847,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
                         renderedView.innerHTML = `
                             <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-shrink: 0;">
-                                <span style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; font-weight: bold;">${lang} Source</span>
-                                <button class="btn btn-primary" id="btn-run-code-${safeId}" style="width:auto; padding: 6px 14px; font-size: 12px;">▶ Run ${lang.toUpperCase()}</button>
+                                <span style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase; font-weight: bold;">${actualDisplayLang} Source</span>
+                                <button class="btn btn-primary" id="btn-run-code-${safeId}" style="width:auto; padding: 6px 14px; font-size: 12px;">▶ Run ${actualDisplayLang.toUpperCase()}</button>
                             </div>
                             <div class="code-editor-scroll-container" style="flex: 1; min-height: 150px; overflow: hidden; display: flex; flex-direction: column;">
                                 <textarea id="cm-rendered-${safeId}"></textarea>
@@ -1657,7 +1857,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         `;
                         const txtArea = renderedView.querySelector(`#cm-rendered-${safeId}`);
                         const cm = CodeMirror.fromTextArea(txtArea, {
-                            mode: lang === "html" ? "htmlmixed" : "python",
+                            mode: isPythonFile ? "python" : "htmlmixed",
                             theme: "dracula",
                             lineNumbers: true,
                             readOnly: true,
@@ -1671,7 +1871,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         const outputBox = renderedView.querySelector(`#code-run-output-${safeId}`);
 
                         runBtn.addEventListener("click", async () => {
-                            if (lang === "html") {
+                            if (!isPythonFile && lang === "html") {
                                 const blob = new Blob([art.content], { type: "text/html" });
                                 const url = URL.createObjectURL(blob);
                                 window.open(url, "_blank");
@@ -1687,7 +1887,21 @@ document.addEventListener("DOMContentLoaded", () => {
                                         headers: { "Content-Type": "application/json" },
                                         body: JSON.stringify({ code: art.content, language: "python" })
                                     });
-                                    const data = await res.json();
+
+                                    // Robust parse response text first to handle 500 server HTML dumps gracefully
+                                    const rawText = await res.text();
+                                    let data;
+                                    try {
+                                        data = JSON.parse(rawText);
+                                    } catch(jsonErr) {
+                                        // Handle non-JSON server error dumps cleanly
+                                        outputBox.innerHTML = `
+                                            <div class="query-title" style="color: #ef4444; user-select: none;">❌ Server Error (Non-JSON)</div>
+                                            <pre class="query-stdout" style="color: #fca5a5;">${rawText || "No response body returned from server."}</pre>
+                                        `;
+                                        return;
+                                    }
+
                                     if (data.success) {
                                         outputBox.innerHTML = `
                                             <div class="query-title" style="user-select: none;">💻 Sandbox Output</div>
@@ -1704,7 +1918,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                     outputBox.innerHTML = `<div class="query-title" style="color: #ef4444; user-select: none;">Request Failed</div><pre class="query-stdout">${err}</pre>`;
                                 } finally {
                                     runBtn.disabled = false;
-                                    runBtn.textContent = "▶ Run PYTHON";
+                                    runBtn.textContent = `▶ Run ${actualDisplayLang.toUpperCase()}`;
                                 }
                             }
                         });
@@ -1748,8 +1962,9 @@ document.addEventListener("DOMContentLoaded", () => {
                     }
 
                     const resolvedHTML = resolveImageAnchors(restoredHTML, activeArtifactTitle, null, version);
-                    renderedView.innerHTML = restoredHTML;
+                    renderedView.innerHTML = marked.parse(renderContent);
                     renderMath(renderedView);
+                    attachCodeBlockInterceptors(renderedView);
                 }
             }
             updateContextBudget();
@@ -3152,7 +3367,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 const { value, done } = await reader.read();
                 if (done) {
                     if (buffer.trim()) {
-                        processSkillLine(buffer);
+                        processStreamLine(buffer);
                     }
                     break;
                 }
@@ -3162,7 +3377,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 buffer = lines.pop();
 
                 for (const line of lines) {
-                    processSkillLine(line);
+                    processStreamLine(line);
                 }
             }
         } catch (err) {
@@ -5729,83 +5944,140 @@ document.addEventListener("DOMContentLoaded", () => {
         try {
             const res = await fetch("/api/artifacts");
             const arts = await res.json();
-            
+
             if (arts.length === 0) {
                 artifactsList.innerHTML = `<li class="empty-msg">No active artifacts in session.</li>`;
                 return;
             }
 
-            artifactsList.innerHTML = arts.map(a => {
-                const isSelected = a.title === activeArtifactTitle ? "selected" : "";
-                const isInactive = !a.active ? "inactive" : "";
-                const toggleTitle = a.active ? "Deactivate (exclude from context)" : "Activate (include in context)";
-                const toggleIcon = a.active ? "👁️" : "💤";
+            // Build hierarchical folder tree from flat path list
+            const rootNode = { name: "Root", files: [], folders: {} };
+            arts.forEach(a => {
+                const parts = a.title.split("/");
+                let currentNode = rootNode;
 
-                let innerContent = "";
-                if (a.type === "skill") {
-                    const descHtml = a.description ? `<p class="desc-text">${a.description}</p>` : "";
-                    const catHtml = a.category ? `<span class="category-tag">${a.category}</span>` : "";
-                    const authorHtml = a.author ? ` · By: ${a.author}` : "";
-                    innerContent = `
-                        <div class="artifact-card-header">
-                            <span class="title">🎓 ${a.title}</span>
-                            <div class="artifact-actions">
-                                <button class="artifact-action-btn toggle" data-title="${a.title}" title="${toggleTitle}">${toggleIcon}</button>
-                                <button class="artifact-action-btn delete" data-title="${a.title}" title="Delete completely">🗑️</button>
-                            </div>
-                        </div>
-                        ${descHtml}
-                        <span class="details">${catHtml}${authorHtml} · v${a.version} · ${a.size} chars</span>
-                    `;
-                } else if (a.type === "tool") {
-                    const descHtml = a.description ? `<p class="desc-text">${a.description}</p>` : "";
-                    const catHtml = a.category ? `<span class="category-tag">${a.category}</span>` : `<span class="category-tag">lcp_tool</span>`;
-                    const authorHtml = a.author ? ` · By: ${a.author}` : "";
-                    innerContent = `
-                        <div class="artifact-card-header">
-                            <span class="title">🛠️ ${a.title}</span>
-                            <div class="artifact-actions">
-                                <button class="artifact-action-btn toggle" data-title="${a.title}" title="${toggleTitle}">${toggleIcon}</button>
-                                <button class="artifact-action-btn delete" data-title="${a.title}" title="Delete completely">🗑️</button>
-                            </div>
-                        </div>
-                        ${descHtml}
-                        <span class="details">${catHtml}${authorHtml} · v${a.version} · ${a.size} chars</span>
-                    `;
-                } else {
-                    let typeIcon = "📄";
-                    if (a.type === "data") typeIcon = "📊";
-                    else if (a.type === "code") typeIcon = "💻";
+                for (let i = 0; i < parts.length - 1; i++) {
+                    const folderName = parts[i];
+                    if (!currentNode.folders[folderName]) {
+                        currentNode.folders[folderName] = { name: folderName, files: [], folders: {} };
+                    }
+                    currentNode.folders[folderName].id = `folder-${makeSafeId(parts.slice(0, i+1).join("/"))}`;
+                    currentNode = currentNode.folders[folderName];
+                }
+                currentNode.files.push(a);
+            });
 
-                    let ro_badge = "";
-                    let ro_action_icon = "🔓 Make Writable";
-                    if (a.read_only) {
-                        ro_badge = `<span class="level-tag archived" style="display:inline-block; font-size:9px; font-weight:bold; margin-left:6px; background-color:rgba(239, 68, 68, 0.1); color:#ef4444; border:1px solid rgba(239, 68, 68, 0.2);">🔒 READ-ONLY</span>`;
-                        ro_action_icon = "🔓 Make Writable";
+            // Recursive function to generate HTML representation of the folder tree with active context controls
+            function renderFolderTree(node, parentPath = "") {
+                let html = "";
+
+                // 1. Render sub-folders
+                const sortedFolders = Object.values(node.folders).sort((a,b) => a.name.localeCompare(b.name));
+                sortedFolders.forEach(folder => {
+                    const hasState = window.accordionOpenStates[folder.id] !== undefined;
+                    const isOpen = hasState ? (window.accordionOpenStates[folder.id] ? "open" : "") : "open";
+
+                    const currentPath = parentPath ? `${parentPath}/${folder.name}` : folder.name;
+
+                    // Look up if folder's contents are mostly active or dormant to set the toggle icon
+                    const nestedFiles = arts.filter(a => a.title.startsWith(currentPath + "/"));
+                    const activeCount = nestedFiles.filter(a => a.active).length;
+                    const isAllActive = activeCount === nestedFiles.length && nestedFiles.length > 0;
+
+                    const folderToggleIcon = isAllActive ? "👁️" : "💤";
+                    const folderToggleTitle = isAllActive ? "Deactivate all files in this folder" : "Activate all files in this folder";
+
+                    html += `
+                        <details class="folder-tree-details inline-proc-accordion" id="${folder.id}" ${isOpen} style="margin: 4px 0; border: none; background: none;">
+                            <summary class="folder-tree-header proc-accordion-header" style="padding: 6px 8px; font-weight: bold; background: none; font-size: 13px; color: var(--text-primary); display: flex; justify-content: space-between; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 4px;">
+                                    <span class="chevron" style="transition: transform 0.2s; display: inline-block; margin-right: 6px;">▶</span>
+                                    <span>📁 ${folder.name}</span>
+                                </div>
+                                <div class="artifact-actions" style="margin-left: auto;">
+                                    <button class="artifact-action-btn toggle-folder-btn" data-folder-path="${currentPath}" data-active="${!isAllActive}" title="${folderToggleTitle}">${folderToggleIcon}</button>
+                                </div>
+                            </summary>
+                            <div class="folder-tree-content" style="padding-left: 14px; border-left: 1px dashed var(--border-color); margin-left: 14px; background: none; border-top: none;">
+                                ${renderFolderTree(folder, currentPath)}
+                            </div>
+                        </details>
+                    `;
+                });
+
+                // 2. Render files
+                node.files.forEach(a => {
+                    const isSelected = a.title === activeArtifactTitle ? "selected" : "";
+                    const isInactive = !a.active ? "inactive" : "";
+                    const toggleTitle = a.active ? "Deactivate (exclude from context)" : "Activate (include in context)";
+                    const toggleIcon = a.active ? "👁️" : "💤";
+
+                    let innerContent = "";
+                    if (a.type === "skill") {
+                        const descHtml = a.description ? `<p class="desc-text">${a.description}</p>` : "";
+                        const catHtml = a.category ? `<span class="category-tag">${a.category}</span>` : "";
+                        innerContent = `
+                            <div class="artifact-card-header">
+                                <span class="title">🎓 ${a.title.split("/").pop()}</span>
+                                <div class="artifact-actions">
+                                    <button class="artifact-action-btn toggle" data-title="${a.title}" title="${toggleTitle}">${toggleIcon}</button>
+                                    <button class="artifact-action-btn delete" data-title="${a.title}" title="Delete completely">🗑️</button>
+                                </div>
+                            </div>
+                            ${descHtml}
+                            <span class="details">${catHtml} · v${a.version} · ${a.size} chars</span>
+                        `;
+                    } else if (a.type === "tool") {
+                        const descHtml = a.description ? `<p class="desc-text">${a.description}</p>` : "";
+                        innerContent = `
+                            <div class="artifact-card-header">
+                                <span class="title">🛠️ ${a.title.split("/").pop()}</span>
+                                <div class="artifact-actions">
+                                    <button class="artifact-action-btn toggle" data-title="${a.title}" title="${toggleTitle}">${toggleIcon}</button>
+                                    <button class="artifact-action-btn delete" data-title="${a.title}" title="Delete completely">🗑️</button>
+                                </div>
+                            </div>
+                            ${descHtml}
+                            <span class="details">v${a.version} · ${a.size} chars</span>
+                        `;
                     } else {
-                        ro_badge = `<span class="level-tag working" style="display:inline-block; font-size:9px; font-weight:bold; margin-left:6px; background-color:rgba(16, 185, 129, 0.1); color:#10b981; border:1px solid rgba(16, 185, 129, 0.2);">✏️ WRITABLE</span>`;
-                        ro_action_icon = "🔒 Make Read-Only";
+                        let typeIcon = "📄";
+                        if (a.type === "data") typeIcon = "📊";
+                        else if (a.type === "code") typeIcon = "💻";
+
+                        let ro_badge = "";
+                        let ro_action_icon = "🔓 Make Writable";
+                        if (a.read_only) {
+                            ro_badge = `<span class="level-tag archived" style="display:inline-block; font-size:9px; font-weight:bold; margin-left:4px; background-color:rgba(239, 68, 68, 0.1); color:#ef4444; border:1px solid rgba(239, 68, 68, 0.2);">🔒 RO</span>`;
+                            ro_action_icon = "🔓 Make Writable";
+                        } else {
+                            ro_badge = `<span class="level-tag working" style="display:inline-block; font-size:9px; font-weight:bold; margin-left:4px; background-color:rgba(16, 185, 129, 0.1); color:#10b981; border:1px solid rgba(16, 185, 129, 0.2);">✏️ RW</span>`;
+                            ro_action_icon = "🔒 Make Read-Only";
+                        }
+
+                        innerContent = `
+                            <div class="artifact-card-header">
+                                <span class="title" style="font-size: 12.5px;">${typeIcon} ${a.title.split("/").pop()} ${ro_badge}</span>
+                                <div class="artifact-actions">
+                                    <button class="artifact-action-btn toggle-ro" data-title="${a.title}" title="${ro_action_icon}">${a.read_only ? '🔒' : '✏|'}</button>
+                                    <button class="artifact-action-btn toggle" data-title="${a.title}" title="${toggleTitle}">${toggleIcon}</button>
+                                    <button class="artifact-action-btn delete" data-title="${a.title}" title="Delete completely">🗑️</button>
+                                </div>
+                            </div>
+                        `;
                     }
 
-                    innerContent = `
-                        <div class="artifact-card-header">
-                            <span class="title">${typeIcon} ${a.title} ${ro_badge}</span>
-                            <div class="artifact-actions">
-                                <button class="artifact-action-btn toggle-ro" data-title="${a.title}" title="${ro_action_icon}">${a.read_only ? '🔒' : '✏️'}</button>
-                                <button class="artifact-action-btn toggle" data-title="${a.title}" title="${toggleTitle}">${toggleIcon}</button>
-                                <button class="artifact-action-btn delete" data-title="${a.title}" title="Delete completely">🗑️</button>
-                            </div>
+                    html += `
+                        <div class="artifact-card ${a.type} ${isSelected} ${isInactive}" data-title="${a.title}" style="margin-bottom: 6px; padding: 8px 12px; border-radius: 6px;">
+                            ${innerContent}
                         </div>
-                        <span class="details">Type: ${a.type} | Version: v${a.version} | Size: ${a.size} chars</span>
                     `;
-                }
+                });
 
-                return `
-                    <li class="artifact-card ${a.type} ${isSelected} ${isInactive}" data-title="${a.title}">
-                        ${innerContent}
-                    </li>
-                `;
-            }).join("");
+                return html;
+            }
+
+            artifactsList.innerHTML = `<div class="folder-tree-root">${renderFolderTree(rootNode, "")}</div>`;
 
             document.querySelectorAll(".artifact-card").forEach(card => {
                 card.addEventListener("click", (e) => {
@@ -5989,6 +6261,13 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
 
+            // Cache the currently open/closed state of all visible accordions before wiping the DOM
+            document.querySelectorAll(".inline-proc-accordion, .proc-params-details").forEach(el => {
+                if (el.id) {
+                    window.accordionOpenStates[el.id] = el.hasAttribute("open");
+                }
+            });
+
             messages.forEach(msg => {
                 try {
                     const sender = msg.sender_type === "user" ? "user" : "assistant";
@@ -6007,7 +6286,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (wasActive) {
                 showThinkingIndicator(activeText);
             }
-            chatHistory.scrollTop = chatHistory.scrollHeight;
+            scrollToBottom(true);
         } catch (err) {
             console.error("Failed to fetch message history:", err);
         }
@@ -6275,32 +6554,166 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function formatMessageContent(text, msgId, msgObj = null) {
-        const cleanedText = runMarkdownCleanup(text);
-        const processedText = resolveProcessingTags(cleanedText);
+        if (!text) return "";
+        let cleanedText = runMarkdownCleanup(text);
+
+        // ── In-Stream XML to Markdown Dynamic Converter ──────────────────────
+        // If we encounter open/unclosed <artifact> or <note> tags during active streaming,
+        // we dynamically convert them into standard markdown code blocks so that marked.js
+        // can apply instant syntax highlighting while the code is actively being typed.
+        cleanedText = cleanedText.replace(/<art[ei]fact\s+([^>]*?)>/gi, (match, attrsStr) => {
+            const attrs = {};
+            attrsStr.replace(/(\w+)=["\']([^"\']*)["\']/g, (m, k, v) => attrs[k] = v);
+            const lang = attrs.language || attrs.type || "python";
+            const name = attrs.name || attrs.title || "";
+            const headerInfo = name ? `\n*Writing file: \`${name}\`*\n` : "";
+            return `${headerInfo}\n\`\`\`${lang}\n`;
+        });
+        cleanedText = cleanedText.replace(/<\/art[ei]fact>/gi, "\n```\n");
+
+        cleanedText = cleanedText.replace(/<note\s+([^>]*?)>/gi, (match, attrsStr) => {
+            const attrs = {};
+            attrsStr.replace(/(\w+)=["\']([^"\']*)["\']/g, (m, k, v) => attrs[k] = v);
+            const title = attrs.title || attrs.name || "";
+            const headerInfo = title ? `\n*Writing note: \`${title}\`*\n` : "";
+            return `${headerInfo}\n\`\`\`markdown\n`;
+        });
+        cleanedText = cleanedText.replace(/<\/note>/gi, "\n```\n");
+
+        cleanedText = cleanedText.replace(/<skill\s+([^>]*?)>/gi, (match, attrsStr) => {
+            const attrs = {};
+            attrsStr.replace(/(\w+)=["\']([^"\']*)["\']/g, (m, k, v) => attrs[k] = v);
+            const title = attrs.title || attrs.name || "";
+            const headerInfo = title ? `\n*Writing skill: \`${title}\`*\n` : "";
+            return `${headerInfo}\n\`\`\`markdown\n`;
+        });
+        cleanedText = cleanedText.replace(/<\/skill>/gi, "\n```\n");
+
+        const processedText = resolveProcessingTags(cleanedText, msgId);
 
         const placeholders = {};
         let maskedText = processedText;
 
+        // 1. Mask <lollms_inline> with unique cryptographic placeholder tokens to avoid collisions
         const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
         maskedText = maskedText.replace(inlinePattern, (match) => {
-            const id = `__WIDGET_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
-            placeholders[id] = match;
-            return id;
+            const uniqueId = `WIDGET_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+            placeholders[uniqueId] = match;
+            return uniqueId;
         });
 
+        // 2. Mask <lollms_form> with unique cryptographic placeholder tokens
         const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
         maskedText = maskedText.replace(formPattern, (match) => {
-            const id = `__FORM_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
-            placeholders[id] = match;
-            return id;
+            const uniqueId = `FORM_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+            placeholders[uniqueId] = match;
+            return uniqueId;
         });
 
+        // 3. Mask <tool_call> with unique cryptographic placeholder tokens BEFORE markdown compile steps
+        const toolCallPattern = /<tool_call>(.*?)<\/tool_call>/gi;
+        let toolCallCount = 0;
+        maskedText = maskedText.replace(toolCallPattern, (match, bodyText) => {
+            let toolName = "Unknown Tool";
+            let paramsHtml = "";
+            try {
+                const data = JSON.parse(bodyText.trim());
+                toolName = data.name || "Unknown Tool";
+                if (data.parameters) {
+                    paramsHtml = Object.entries(data.parameters).map(([k, v]) => {
+                        return `<strong>⚙️ ${k}:</strong> <code style="font-family:monospace; background-color:#020617; padding:2px 6px; border-radius:4px; color:#cbd5e1; font-size:11.5px;">${JSON.stringify(v)}</code>`;
+                    }).join("<br/>");
+                }
+            } catch (e) {
+                const nameMatch = bodyText.match(/"name"\s*:\s*"([^"]+)"/);
+                if (nameMatch) {
+                    toolName = nameMatch[1];
+                }
+                paramsHtml = `<pre style="color: #94a3b8; font-size: 11px; font-family: monospace; white-space: pre-wrap; margin-top: 4px;">${bodyText.trim()}</pre>`;
+            }
+
+            const stateKey = `${msgId || 'temp'}-tool-call-${toolCallCount}`;
+            toolCallCount++;
+
+            const hasState = window.accordionOpenStates[stateKey] !== undefined;
+            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : "open";
+
+            // Generate the finished details block as the original string to replace back
+            const accordionHtml = `
+                <details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(245, 158, 11, 0.25); display: block; margin: 12px 0;">
+                    <summary class="proc-accordion-header" style="color: #f59e0b; background-color: rgba(245, 158, 11, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px; font-weight: bold;">
+                        <span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
+                        <span>🛠️ Tool Execution: ${toolName}</span>
+                    </summary>
+                    <div class="proc-accordion-content" style="background-color: #020617; padding: 12px 14px; font-family: sans-serif; font-size: 12.5px; line-height: 1.5; color: var(--text-primary);">
+                        ${paramsHtml || "No parameters provided."}
+                    </div>
+                </details>
+            `;
+
+            const uniqueId = `TOOLCALL_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+            placeholders[uniqueId] = accordionHtml;
+            return uniqueId;
+        });
+
+        // 4. Parse Markdown using marked.js
         const parsedMarkdown = marked.parse(maskedText);
 
+        // 4. Restore the masked XML blocks back into the compiled HTML output
         let restoredHTML = parsedMarkdown;
         for (const [id, original] of Object.entries(placeholders)) {
-            restoredHTML = restoredHTML.split(id).join(original);
+            // Fuzzy Match: Check if the placeholder is nested ANYWHERE inside a markdown code block (<pre><code...>...ID...</code></pre>)
+            const wrappedPattern = new RegExp(`<pre>\\s*<code[^>]*>[\\s\\S]*?(${id})[\\s\\S]*?</code>\\s*</pre>`, "gi");
+            if (wrappedPattern.test(restoredHTML)) {
+                // De-wrap completely: replace the entire code block with the native, functional XML block
+                restoredHTML = restoredHTML.replace(wrappedPattern, original);
+            } else {
+                restoredHTML = restoredHTML.split(id).join(original);
+            }
         }
+
+        // Clean up any unclosed or orphaned trailing details/summary tags safely
+        restoredHTML = restoredHTML.replace(/<\/details>\s*<\/details>/g, "</details>");
+
+        // 5. Intercept and replace the dry plain-text placeholders with beautiful, high-fidelity UI Success Cards
+        const strippedPattern = /\[content stripped, refer to the '([^']+)' (?:art[ei]fact|note|skill) for details\]/gi;
+        restoredHTML = restoredHTML.replace(strippedPattern, (match, artTitle) => {
+            let icon = "💾";
+            let typeLabel = "Artifact";
+            if (artTitle.includes("note_")) {
+                icon = "📝";
+                typeLabel = "Note";
+            } else if (artTitle.includes("skill_")) {
+                icon = "🎓";
+                typeLabel = "Skill";
+            }
+            return `
+                <div class="proc-item-no-bullet" style="margin: 14px 0; user-select: none;">
+                    <div class="proc-item complete" style="background-color: rgba(16, 185, 129, 0.05); padding: 12px 16px; border-radius: 8px; border: 1px dashed var(--success-color); display: inline-flex; align-items: center; gap: 10px; color: #a7f3d0; width: 100%; box-shadow: var(--shadow-sm); line-height: 1.4;">
+                        <span style="font-size: 18px;">${icon}</span>
+                        <span>${typeLabel} <strong style="color: white; font-family: monospace;">${artTitle}</strong> compiled, synchronized, and written to workspace disk successfully.</span>
+                    </div>
+                </div>
+            `;
+        });
+
+        // 6. Support double-bracket or unclosed think tag fallbacks cleanly
+        restoredHTML = restoredHTML.replace(/<think>([\s\S]*?)<\/think>/gi, (match, bodyText) => {
+            const stateKey = `${msgId || 'temp'}-think`;
+            const hasState = window.accordionOpenStates[stateKey] !== undefined;
+            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : "open";
+            return `
+                <details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.25); display: block; margin: 12px 0;">
+                    <summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
+                        <span class="chevron">▶</span>
+                        <span>💭 Thought Process / Reasoning</span>
+                    </summary>
+                    <div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;">
+                        <pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${bodyText.trim()}</pre>
+                    </div>
+                </details>
+            `;
+        });
 
         return resolveImageAnchors(restoredHTML, activeArtifactTitle, msgId, null, msgObj);
     }
@@ -6502,6 +6915,19 @@ document.addEventListener("DOMContentLoaded", () => {
         bindMessageActions(bubble);
         renderMath(proseSpan);
         attachDataQueryInterceptors(contentDiv);
+        attachCodeBlockInterceptors(contentDiv);
+
+        // Interactive Accordion Controller for <details> elements
+        contentDiv.querySelectorAll(".inline-proc-accordion").forEach(details => {
+            const summary = details.querySelector(".proc-accordion-header");
+            if (summary) {
+                // Ensure clicks toggle the parent open attribute smoothly
+                summary.addEventListener("click", (e) => {
+                    // Prevent nested interactive clicks from bubble triggers
+                    e.stopPropagation();
+                });
+            }
+        });
     }
 
     async function bindMessageActions(bubbleElement) {
@@ -6770,9 +7196,14 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
-    // ── 🧠 Dynamic Thinking Indicator Helpers ──
+    // ── 🧠 Dynamic Thinking Indicator Helpers with Live Timer ──
+    let thinkingTimerId = null;
+    let thinkingStartTime = null;
+
     function showThinkingIndicator(statusText = "Lollms is thinking...") {
         let indicator = document.getElementById("thinking-indicator");
+        thinkingStartTime = Date.now();
+        
         if (!indicator) {
             indicator = document.createElement("div");
             indicator.id = "thinking-indicator";
@@ -6781,15 +7212,25 @@ document.addEventListener("DOMContentLoaded", () => {
                 <span class="typing-dot"></span>
                 <span class="typing-dot"></span>
                 <span class="typing-dot"></span>
-                <span class="thinking-text" style="font-size: 11.5px; font-weight: bold; color: var(--text-secondary); margin-left: 4px;">${statusText}</span>
+                <span class="thinking-text" style="font-size: 11.5px; font-weight: bold; color: var(--text-secondary); margin-left: 8px;">${statusText} (0.0s)</span>
             `;
-        } else {
-            const textEl = indicator.querySelector(".thinking-text");
-            if (textEl) textEl.textContent = statusText;
         }
+
         chatHistory.appendChild(indicator);
         indicator.classList.add("active");
-        chatHistory.scrollTop = chatHistory.scrollHeight;
+        scrollToBottom(true);
+
+        // Clear any stale timer
+        if (thinkingTimerId) clearInterval(thinkingTimerId);
+
+        // Start live thinking stopwatch
+        thinkingTimerId = setInterval(() => {
+            const textEl = indicator.querySelector(".thinking-text");
+            if (textEl && thinkingStartTime) {
+                const elapsed = ((Date.now() - thinkingStartTime) / 1000).toFixed(1);
+                textEl.textContent = `${statusText} (${elapsed}s)`;
+            }
+        }, 100);
     }
 
     function hideThinkingIndicator() {
@@ -6797,6 +7238,11 @@ document.addEventListener("DOMContentLoaded", () => {
         if (indicator) {
             indicator.remove();
         }
+        if (thinkingTimerId) {
+            clearInterval(thinkingTimerId);
+            thinkingTimerId = null;
+        }
+        thinkingStartTime = null;
     }
 
     // ── Local Memories Tabbed Viewport Variables ──
@@ -7090,6 +7536,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function sendChatMessage(regenerate = false) {
         console.log("🚀 [DEBUG] sendChatMessage triggered", { regenerate, pastedImagesCount: pastedImages.length });
+
+        // Prevent concurrent double-submissions
+        if (btnChatSend.disabled && !regenerate) {
+            console.warn("⚠️ sendChatMessage block: execution already in progress.");
+            return;
+        }
+
         let text = "";
         if (!regenerate) {
             text = chatInput.value.trim();
@@ -7104,7 +7557,9 @@ document.addEventListener("DOMContentLoaded", () => {
             chatInput.value = "";
         }
 
+        // Lock inputs immediately before any async dispatch is fired
         chatInput.disabled = true;
+        btnChatSend.disabled = true;
 
         // Hide Send and show Stop button
         btnChatSend.style.display = "none";
@@ -7125,7 +7580,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Dynamically show the animated thinking indicator at the absolute bottom
         showThinkingIndicator("Lollms is thinking...");
-        chatHistory.scrollTop = chatHistory.scrollHeight;
+        scrollToBottom(true);
 
         let currentProse = "";
         let chatActiveProc = null;
@@ -7188,7 +7643,12 @@ document.addEventListener("DOMContentLoaded", () => {
                     const event = JSON.parse(rawJson);
 
                     if (event.error) {
-                        if (proseSpan) proseSpan.innerHTML = `<span style="color: #ef4444;">Error: ${event.error}</span>`;
+                        hideThinkingIndicator();
+                        if (proseSpan) {
+                            proseSpan.innerHTML = `<span style="color: #ef4444;">Error: ${event.error}</span>`;
+                        } else {
+                            appendChatBubble("assistant", `⚠️ **Error**: ${event.error}`);
+                        }
                         return;
                     }
 
@@ -7242,7 +7702,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         return;
                     }
 
-                    if ((event.msg_type === "MSG_TYPE_CHUNK" || event.msg_type === "MSG_TYPE_CODING_PLAN_CHUNK") && proseSpan) {
+                    if ((event.msg_type === "MSG_TYPE_CHUNK" || event.msg_type === "MSG_TYPE_CODING_PLAN_CHUNK" || event.msg_type === "MSG_TYPE_THOUGHT_CHUNK") && proseSpan) {
                         if (event.chunk) {
                             if (ttft === null && currentProse === "") {
                                 ttft = (Date.now() - startTime) / 1000;
@@ -7255,7 +7715,7 @@ document.addEventListener("DOMContentLoaded", () => {
                             currentProse += event.chunk;
                             proseSpan.innerHTML = formatMessageContent(currentProse, activeMsgId);
                             renderMath(proseSpan);
-                            chatHistory.scrollTop = chatHistory.scrollHeight;
+                            scrollToBottom(false);
                         }
                     }
                 } catch (e) {
@@ -7343,8 +7803,8 @@ document.addEventListener("DOMContentLoaded", () => {
         bubble.textContent = text;
         chatHistory.appendChild(bubble);
         renderMath(bubble); // Parse any math delimiters inside user chat bubble too
-        chatHistory.scrollTop = chatHistory.scrollHeight;
-        
+        scrollToBottom(true);
+
         const welcome = chatHistory.querySelector(".chat-welcome-msg");
         if (welcome) welcome.remove();
     }
@@ -7363,7 +7823,7 @@ document.addEventListener("DOMContentLoaded", () => {
         bubbleContentDiv.appendChild(proseSpan);
         bubble.appendChild(bubbleContentDiv);
         chatHistory.appendChild(bubble);
-        chatHistory.scrollTop = chatHistory.scrollHeight;
+        scrollToBottom(true);
 
         const welcome = chatHistory.querySelector(".chat-welcome-msg");
         if (welcome) welcome.remove();
@@ -7371,11 +7831,102 @@ document.addEventListener("DOMContentLoaded", () => {
         return { bubbleContentDiv, proseSpan };
     }
 
+    // ── 📋 Interactive Code Block Utility Bar Interceptor ──
+    function attachCodeBlockInterceptors(bubbleContentElement) {
+        const preBlocks = bubbleContentElement.querySelectorAll("pre");
+
+        preBlocks.forEach(pre => {
+            // Check if this pre block is nested inside a thought process or tool call accordion
+            if (pre.closest(".proc-accordion-content") || pre.closest(".inline-proc-accordion")) {
+                return; // Skip adding utility headers to thought or tool execution logs
+            }
+
+            const codeEl = pre.querySelector("code");
+            if (!codeEl || pre.querySelector(".code-utility-header")) {
+                return; // Already intercepted or not a code block
+            }
+
+            // Extract language class
+            let lang = "txt";
+            const classes = Array.from(codeEl.classList);
+            const langClass = classes.find(c => c.startsWith("language-"));
+            if (langClass) {
+                lang = langClass.replace("language-", "");
+            }
+
+            // Generate stable, sanitized filename based on language
+            const ext_map = {
+                "python": "py", "javascript": "js", "typescript": "ts",
+                "html": "html", "css": "css", "markdown": "md",
+                "latex": "tex", "tex": "tex", "sparql": "rq", "sql": "sql", "turtle": "ttl"
+            };
+            const ext = ext_map[lang.toLowerCase()] || lang;
+            const fallbackName = `code_export_${Math.random().toString(36).substr(2, 5)}.${ext}`;
+
+            // Try to find a customized filename from preceding headers or sibling artifacts
+            let filename = fallbackName;
+            const precedingText = pre.previousElementSibling ? pre.previousElementSibling.textContent : "";
+            const fileMatch = precedingText.match(/(?:file|filename|artifact):\s*`?([a-zA-Z0-9_/.-]+)`?/i);
+            if (fileMatch) {
+                filename = fileMatch[1];
+            }
+
+            // Create beautiful header bar
+            const header = document.createElement("div");
+            header.className = "code-utility-header";
+            header.innerHTML = `
+                <span class="code-utility-lang">${lang}</span>
+                <div class="code-utility-actions">
+                    <button class="code-action-btn copy-code-btn">📋 Copy</button>
+                    <button class="code-action-btn download-code-btn">💾 Download</button>
+                </div>
+            `;
+
+            pre.prepend(header);
+
+            // Bind Copy Click
+            const copyBtn = header.querySelector(".copy-code-btn");
+            copyBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+
+                // Get clean raw text (excluding utility header text)
+                const codeText = codeEl.textContent;
+
+                navigator.clipboard.writeText(codeText).then(() => {
+                    copyBtn.textContent = "✓ Copied!";
+                    showNotification(`✓ Code copied to clipboard!`, "success", 2000);
+                    setTimeout(() => {
+                        copyBtn.textContent = "📋 Copy";
+                    }, 2000);
+                }).catch(err => {
+                    alert("Failed to copy code: " + err);
+                });
+            });
+
+            // Bind Download Click
+            const downloadBtn = header.querySelector(".btn-version-action") || header.querySelector(".download-art-btn") || header.querySelector(".btn") || header.querySelector(".code-editor-scroll-container") || header.querySelector(".code-run-output") || header.querySelector("button");
+            const finalDownloadBtn = header.querySelector(".btn-primary") || header.querySelector(".btn-secondary") || header.querySelector(".btn") || header.querySelector("button") || downloadBtn;
+
+            header.querySelector(".btn-primary, .btn-secondary, .btn, button, .code-action-btn:last-child").addEventListener("click", (e) => {
+                e.stopPropagation();
+                const codeText = codeEl.textContent;
+                const blob = new Blob([codeText], { type: "text/plain" });
+                triggerBlobDownload(blob, filename);
+                showNotification(`✓ File '${filename}' downloaded!`, "success", 2000);
+            });
+        });
+    }
+
     // ── 🚀 Python Data Analysis Sandbox Interceptor ──
     function attachDataQueryInterceptors(bubbleContentElement) {
         const codeBlocks = bubbleContentElement.querySelectorAll("pre code.language-python");
         
         codeBlocks.forEach(block => {
+            // Check if this block is nested inside a thought process or tool call accordion
+            if (block.closest(".proc-accordion-content") || block.closest(".inline-proc-accordion")) {
+                return; // Skip adding execution buttons to logs
+            }
+
             if (!activeArtifactTitle) return;
 
             if (block.parentNode.nextSibling && block.parentNode.nextSibling.className === "inline-query-btn") {
@@ -7430,7 +7981,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     }
 
                     btnQuery.after(resultBox);
-                    chatHistory.scrollTop = chatHistory.scrollHeight;
+                    scrollToBottom(true);
 
                 } catch (err) {
                     alert(`Sandbox connection failed: ${err}`);
@@ -7447,21 +7998,26 @@ document.addEventListener("DOMContentLoaded", () => {
  * Resolves closed and unclosed <processing> tags into collapsible timeline panels.
  * Run BEFORE marked.parse to prevent markdown list item corruption on nested lines.
  */
-function resolveProcessingTags(content) {
+function resolveProcessingTags(content, msgId = null) {
     if (!content) return "";
+    
+    const stableMsgId = msgId || "temp";
 
-    // ── Render <think> tags or strip them based on active toggle state ──
+    // ── Render <think> tags elegantly with stable state-retention ──
     const thinkPattern = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
-    if (window.funcStates && window.funcStates["think"]) {
-        content = content.replace(thinkPattern, (match, bodyText) => {
-            const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
-            return `<details class="inline-proc-accordion" open style="border-color: rgba(147, 51, 234, 0.15);"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05);"><span class="chevron">▶</span><span>💭 Thought Process / Reasoning</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15);"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
-        });
-    } else {
-        content = content.replace(thinkPattern, "");
-    }
+    content = content.replace(thinkPattern, (match, bodyText) => {
+        const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
+        
+        // Check our global state-retention map first. If not yet clicked, check the global default toggle.
+        const stateKey = `${stableMsgId}-think`;
+        const hasState = window.accordionOpenStates[stateKey] !== undefined;
+        const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ((window.funcStates && window.funcStates["think"]) ? "open" : "open"); // Default to open so user sees progress, but respects manual collapse
+
+        return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.15); display: block;"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;"><span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span><span>💭 Thought Process / Reasoning</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
+    });
 
     const procPattern = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;
+    let procCount = 0;
     return content.replace(procPattern, (match, attrsStr, bodyText) => {
         const attrs = {};
         attrsStr.replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => attrs[k] = v);
@@ -7470,6 +8026,13 @@ function resolveProcessingTags(content) {
         const titleText = procTitle.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
 
         const isClosed = match.toLowerCase().endsWith("</processing>");
+        
+        const stateKey = `${stableMsgId}-proc-${procCount}`;
+        procCount++;
+        
+        // Defaults processing boxes to open so users see updates, but respects manual close clicks
+        const hasState = window.accordionOpenStates[stateKey] !== undefined;
+        const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : "open";
 
         // Extract multiline <details> blocks to placeholders so we don't chop them up with split('\n')
         const detailsMap = new Map();
@@ -7519,50 +8082,50 @@ function resolveProcessingTags(content) {
                 return `<div class="proc-item complete">✓ ${clean}</div>`;
             }).filter(x => x !== "").join("");
 
-            if (paramsHtml) {
-                statusItems = paramsHtml + statusItems;
-            }
+                if (paramsHtml) {
+                    statusItems = paramsHtml + statusItems;
+                }
 
-            return `<details class="inline-proc-accordion" open>
-<summary class="proc-accordion-header complete">
-<span class="chevron">▶</span>
+                return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
+<summary class="proc-accordion-header complete" style="cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
+<span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
 <span>✅ ${titleText} (Complete)</span>
 </summary>
-<div class="proc-accordion-content">
+<div class="proc-accordion-content" style="background-color: #020617; padding: 12px 14px;">
 ${statusItems}
 </div>
 </details>`;
-        } else {
-            let statusItems = lines.map(line => {
-                const clean = line.replace(/^\*\s*/, "").trim();
-                if (!clean) return "";
+            } else {
+                let statusItems = lines.map(line => {
+                    const clean = line.replace(/^\*\s*/, "").trim();
+                    if (!clean) return "";
 
-                // Restore complete <details> block if this is a placeholder
-                if (detailsMap.has(clean)) {
-                    return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
+                    // Restore complete <details> block if this is a placeholder
+                    if (detailsMap.has(clean)) {
+                        return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
+                    }
+
+                    if (clean.startsWith("<details>")) {
+                        return `<div class="proc-item-no-bullet">${clean}</div>`;
+                    }
+                    return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
+                }).filter(x => x !== "").join("");
+
+                if (paramsHtml) {
+                    statusItems = paramsHtml + statusItems;
                 }
 
-                if (clean.startsWith("<details>")) {
-                    return `<div class="proc-item-no-bullet">${clean}</div>`;
-                }
-                return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
-            }).filter(x => x !== "").join("");
-
-            if (paramsHtml) {
-                statusItems = paramsHtml + statusItems;
-            }
-
-            return `<details class="inline-proc-accordion" open>
-<summary class="proc-accordion-header">
-<span class="chevron">▶</span>
+                return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
+<summary class="proc-accordion-header" style="cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
+<span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
 <span>⚙️ ${titleText}...</span>
 <span class="spinner inline"></span>
 </summary>
-<div class="proc-accordion-content">
+<div class="proc-accordion-content" style="background-color: #020617; padding: 12px 14px;">
 ${statusItems}
 </div>
 </details>`;
-        }
+            }
     });
 }
 
@@ -7666,7 +8229,7 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
         `;
     });
 
-    // ── 🎛️ Parse and resolve <lollms_inline> tags into an interactive iframe card ──
+    // ── 🗛️ Parse and resolve <lollms_inline> tags into an interactive iframe card ──
     const inlinePattern = /<lollms_inline\s+([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
     content = content.replace(inlinePattern, (match, attrsStr, bodyText) => {
         const attrs = {};
@@ -7676,16 +8239,28 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
         const type = attrs.type || "html";
 
         // Clean any leading/trailing markdown code block fences if present
-        let cleanedBody = bodyText.trim();
+        let cleanedBody = bodyText.strip ? bodyText.strip() : bodyText.trim();
         const codeBlockMatch = cleanedBody.match(/^```(?:html)?\s*\n([\s\S]+?)\n```\s*$/i);
         if (codeBlockMatch) {
             cleanedBody = codeBlockMatch[1].trim();
         }
 
-        // Create a secure blob URL for the iframe
+        // Add base-href mapping inside inline widgets so they can also run relative fetches
+        if (!cleanedBody.includes("<base ")) {
+            cleanedBody = cleanedBody.replace("<head>", "<head><base href=\"/api/workspace_files/\">");
+        }
+
+        const widgetId = `inline-widget-${Math.random().toString(36).substr(2, 9)}`;
         const blob = new Blob([cleanedBody], { type: "text/html" });
         const iframeUrl = URL.createObjectURL(blob);
-        const widgetId = `inline-widget-${Math.random().toString(36).substr(2, 9)}`;
+
+        // Inject content via srcdoc and enable same-origin access for fetching
+        setTimeout(() => {
+            const iframe = document.getElementById(`iframe-widget-el-${widgetId}`);
+            if (iframe) {
+                iframe.srcdoc = cleanedBody;
+            }
+        }, 100);
 
         return `
             <div class="interactive-widget-card" id="${widgetId}" style="background-color: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 8px; margin: 12px 0; overflow: hidden; display: flex; flex-direction: column; width: 100%; max-width: 500px; box-shadow: var(--shadow-md);">
@@ -7693,7 +8268,7 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
                     <span>🎛️ ${title}</span>
                     <button class="btn btn-secondary" onclick="window.open('${iframeUrl}', '_blank')" style="width: auto; padding: 4px 10px; font-size: 11px; border-radius: 12px; height:auto;">↗ Open in New Tab</button>
                 </div>
-                <iframe src="${iframeUrl}" style="width: 100%; height: 320px; border: none; background: #fff;" sandbox="allow-scripts"></iframe>
+                <iframe id="iframe-widget-el-${widgetId}" style="width: 100%; height: 320px; border: none; background: #fff;" sandbox="allow-scripts allow-modals allow-same-origin"></iframe>
             </div>
         `;
     });
@@ -7727,8 +8302,9 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
         `;
     });
 
+    // 1. Resolve `<artefact_image>` tags into direct artifact image endpoints
     const pattern = /<artefact_image\s+id=["']([^"']+)["']\s*(?:\/>|>)/gi;
-    return content.replace(pattern, (match, imageId) => {
+    let resolved = content.replace(pattern, (match, imageId) => {
         if (imageId.includes("::")) {
             const parts = imageId.split("::");
             const imgIndex = parts[parts.length - 1];
@@ -7758,6 +8334,20 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
         }
         return match;
     });
+
+    // 2. Resolve relative markdown images into active workspace file endpoints
+    const imgTagPattern = /<img\s+([^>]*?)src=["']([^"']+)["']([^>]*?)>/gi;
+    resolved = resolved.replace(imgTagPattern, (match, pre, src, post) => {
+        const isRelativeLocalFile = src.endsWith(".png") || src.endsWith(".jpg") || src.endsWith(".jpeg") || src.endsWith(".gif") || src.endsWith(".webp");
+        const isAbsolute = src.startsWith("http://") || src.startsWith("https://") || src.startsWith("data:") || src.startsWith("/api/");
+
+        if (isRelativeLocalFile && !isAbsolute) {
+            return `<img ${pre}src="/api/workspace_files/${encodeURIComponent(src)}" ${post}>`;
+        }
+        return match;
+    });
+
+    return resolved;
 }
 
 window.openImageEditor = function(title, index) {

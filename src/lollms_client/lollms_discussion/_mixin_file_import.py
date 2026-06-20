@@ -203,6 +203,8 @@ def _pil_image_to_b64(img: Any, fmt: str = "JPEG") -> Tuple[str, str]:
 
 def _detect_artefact_type(path: Path) -> str:
     ext = path.suffix.lower()
+    if ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".sqlconn"):
+        return ArtefactType.DATA
     if ext in _CODE_EXTENSIONS:
         return ArtefactType.CODE
     if ext in _IMAGE_EXTENSIONS:
@@ -1479,6 +1481,8 @@ class FileImportMixin:
         else:
             atype = _detect_artefact_type(path)
             extra_data = {}
+            if atype == ArtefactType.DATA:
+                extra_data["file_ext"] = path.suffix.lower()
 
         language = _detect_language(path)
 

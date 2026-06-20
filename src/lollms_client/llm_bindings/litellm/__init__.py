@@ -138,11 +138,6 @@ class LiteLLMBinding(LollmsLLMBinding):
         return self._perform_generation(messages, n_predict, is_streaming, temperature, top_p, repeat_penalty, seed, streaming_callback)
         
 
-    def _chat(self, discussion: LollmsDiscussion, branch_tip_id: Optional[str] = None, n_predict: Optional[int] = None, stream: Optional[bool] = None, temperature: float = 0.7, top_p: float = 0.9, repeat_penalty: float = 1.1, seed: Optional[int] = None, streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None, **kwargs) -> Union[str, dict]:
-        is_streaming = stream if stream is not None else (streaming_callback is not None)
-        messages = discussion.export("openai_chat", branch_tip_id)
-        return self._perform_generation(messages, n_predict, is_streaming, temperature, top_p, repeat_penalty, seed, streaming_callback)
-
     def embed(self, text: str, **kwargs) -> List[float]:
         url = f'{self.host_address}/v1/embeddings'
         headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {self.service_key}'}

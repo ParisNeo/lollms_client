@@ -122,7 +122,11 @@
                     <div class="panel-section section-artifacts" style="display: flex; flex-direction: column; height: 100%;">
                         <div class="sidebar-section-header">
                             <h2>📂 Active Artifacts</h2>
-                            <button class="part-export-btn" id="btn-export-artifacts-part" title="Export artifacts...">📤 Export</button>
+                            <div style="display: flex; gap: 4px;">
+                                <button class="part-export-btn" id="btn-create-folder-sidebar" title="Create a new folder in workspace" style="color: var(--accent-color); border-color: rgba(245, 158, 11, 0.25);">📁+ Folder</button>
+                                <button class="part-export-btn" id="btn-wipe-artifacts" title="Wipe all artifacts and clear disk workspace" style="color: #ef4444; border-color: rgba(239, 68, 68, 0.25);">🧹 Wipe All</button>
+                                <button class="part-export-btn" id="btn-export-artifacts-part" title="Export artifacts...">📤 Export</button>
+                            </div>
                         </div>
                         <ul class="artifact-list" id="artifacts-list" style="flex: 1; overflow-y: auto;">
                             <li class="empty-msg" style="border: 1px dashed var(--border-color); padding: 16px; border-radius: 8px; text-align: center; cursor: pointer;" onclick="document.getElementById('btn-open-import').click()">
@@ -443,6 +447,10 @@
 
                 <!-- Local File Ingestion Pane -->
                 <div class="modal-tab-content-pane active" id="modal-tab-local">
+                    <div style="display: flex; gap: 10px; margin-bottom: 12px;">
+                        <button class="btn btn-secondary" id="btn-select-local-files" style="flex: 1;">📄 Select Files</button>
+                        <button class="btn btn-secondary" id="btn-import-folder-modal" style="flex: 1; color: var(--accent-color); border-color: rgba(245, 158, 11, 0.25);">📁 Import Local Folder</button>
+                    </div>
                     <div class="drop-zone" id="upload-dropzone">
                         <p>Drag & drop PDF, DOCX, PPTX, MD, CSV, XLSX, DB, Image, or Audio file here, or click to upload (supports multiple files)</p>
                         <input type="file" id="file-input" hidden multiple>
