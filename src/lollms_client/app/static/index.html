@@ -122,7 +122,8 @@
                     <div class="panel-section section-artifacts" style="display: flex; flex-direction: column; height: 100%;">
                         <div class="sidebar-section-header">
                             <h2>📂 Active Artifacts</h2>
-                            <div style="display: flex; gap: 4px;">
+                            <div style="display: flex; gap: 4px; flex-wrap: wrap;">
+                                <button class="part-export-btn" id="btn-open-workspace-folder" title="Open the physical workspace folder on your computer" style="color: var(--success-color); border-color: rgba(16, 185, 129, 0.25); font-weight: bold;">📂 Open Folder</button>
                                 <button class="part-export-btn" id="btn-create-folder-sidebar" title="Create a new folder in workspace" style="color: var(--accent-color); border-color: rgba(245, 158, 11, 0.25);">📁+ Folder</button>
                                 <button class="part-export-btn" id="btn-wipe-artifacts" title="Wipe all artifacts and clear disk workspace" style="color: #ef4444; border-color: rgba(239, 68, 68, 0.25);">🧹 Wipe All</button>
                                 <button class="part-export-btn" id="btn-export-artifacts-part" title="Export artifacts...">📤 Export</button>
@@ -633,7 +634,9 @@
                             <button class="btn btn-primary" id="btn-download-zoo-persona">Download & Install</button>
                         </div>
                         <div style="width: 240px; display: flex; flex-direction: column; gap: 12px; justify-content: center;">
-                            <h3 style="color: var(--accent-color); font-size: 13px;">📦 Import Custom Persona</h3>
+                            <h3 style="color: var(--accent-color); font-size: 13px;">🎨 Craft Custom Persona</h3>
+                            <button class="btn btn-primary" id="btn-open-personality-builder" style="background-color: var(--chat-user-bg); border-color: var(--chat-user-bg);">🎨 Build New Persona</button>
+                            <h3 style="color: var(--accent-color); font-size: 13px; margin-top: 10px;">📦 Import Custom Persona</h3>
                             <button class="btn btn-secondary" id="btn-import-personality">Import Zipped Personality</button>
                             <input type="file" id="personality-zip-input" hidden accept=".zip">
                         </div>
@@ -986,6 +989,76 @@
                 <ul id="command-palette-results" style="list-style: none; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; max-height: 240px; padding-right: 4px;">
                     <!-- Results will be injected dynamically -->
                 </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 🎨 Craft Custom Personality Builder Modal -->
+    <div class="modal-overlay" id="personality-builder-modal" style="display: none; z-index: 100020;">
+        <div class="modal-container" style="width: 680px; max-height: 85vh;">
+            <div class="modal-header">
+                <h2>🎨 Build Custom AI Agent Persona</h2>
+                <button class="modal-close-btn" id="btn-close-personality-builder">×</button>
+            </div>
+
+            <div class="modal-tabs">
+                <button class="modal-tab active" data-pb-tab="pb-tab-details">📋 Meta Details</button>
+                <button class="modal-tab" data-pb-tab="pb-tab-soul">🧠 Soul Instructions</button>
+                <button class="modal-tab" data-pb-tab="pb-tab-tools">🛠️ Built-in LCP Tools</button>
+            </div>
+
+            <div class="modal-body" style="padding: 20px; overflow-y: auto;">
+                <!-- Tab 1: Meta Details -->
+                <div class="modal-tab-content-pane active" id="pb-tab-details">
+                    <p class="section-desc">Set up your custom AI agent's name, category, and general description.</p>
+                    <div class="input-group">
+                        <label for="pb-name">Agent Name <span style="color:#ef4444">*</span></label>
+                        <input type="text" id="pb-name" placeholder="e.g. Sales Oracle">
+                    </div>
+                    <div class="input-group">
+                        <label for="pb-category">Category</label>
+                        <input type="text" id="pb-category" placeholder="e.g. generic, analytics, assistant (Default: custom_personalities)">
+                    </div>
+                    <div class="input-group">
+                        <label for="pb-author">Author / Creator</label>
+                        <input type="text" id="pb-author" placeholder="Your name/alias">
+                    </div>
+                    <div class="input-group">
+                        <label for="pb-description">General Description</label>
+                        <textarea id="pb-description" rows="3" placeholder="Describe your agent's unique skills and target focus..." style="width: 100%; padding: 8px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none; resize: vertical; font-size: 13px;"></textarea>
+                    </div>
+                </div>
+
+                <!-- Tab 2: Soul Instructions -->
+                <div class="modal-tab-content-pane" id="pb-tab-soul">
+                    <p class="section-desc">Write your custom agent's core instructions and behavioural guidelines (this will compile as SOUL.md on disk).</p>
+                    <div class="input-group" style="height: 280px;">
+                        <label for="pb-soul-instructions">SOUL.md Prompt / Guidelines</label>
+                        <textarea id="pb-soul-instructions" style="flex: 1; width: 100%; padding: 12px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none; resize: none; font-family: inherit; font-size: 13px;" placeholder="Act as a specialized... You always approach issues by..."></textarea>
+                    </div>
+                </div>
+
+                <!-- Tab 3: Built-in LCP Tools -->
+                <div class="modal-tab-content-pane" id="pb-tab-tools">
+                    <p class="section-desc">Create or link direct Python LCP scripts that compile directly inside this agent's tools folder.</p>
+                    <div class="input-group">
+                        <label for="pb-tool-name">Tool Name (lowercase snake_case)</label>
+                        <input type="text" id="pb-tool-name" placeholder="e.g. format_checker">
+                    </div>
+                    <div class="input-group" style="height: 180px;">
+                        <label for="pb-tool-code">LCP Python Implementation</label>
+                        <textarea id="pb-tool-code" style="flex: 1; width: 100%; padding: 10px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none; resize: none; font-family: monospace; font-size: 11.5px;" placeholder="def tool_format_checker(text: str) -> dict:&#10;    return {'status': True}"></textarea>
+                    </div>
+                    <button class="btn btn-secondary" id="btn-add-pb-tool" style="width: auto; align-self: flex-start; padding: 6px 14px; font-size: 12px;">➕ Add Tool to Agent Bundle</button>
+                    <ul class="artifact-list" id="pb-attached-tools-list" style="margin-top: 12px; max-height: 120px; overflow-y: auto;">
+                        <li class="empty-msg">No built-in tools attached yet.</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="modal-footer" style="padding: 16px 24px; border-top: 1px solid var(--border-color); display: flex; gap: 12px; justify-content: flex-end; background-color: var(--bg-panel); border-bottom-left-radius: 12px; border-bottom-right-radius: 12px;">
+                <button class="btn btn-secondary" id="btn-cancel-pb-builder" style="width: auto; padding: 8px 16px;">Cancel</button>
+                <button class="btn btn-primary" id="btn-submit-pb-builder" style="width: auto; padding: 8px 16px;">💾 Save & Install Agent</button>
             </div>
         </div>
     </div>

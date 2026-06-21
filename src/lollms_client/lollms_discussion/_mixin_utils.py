@@ -116,6 +116,33 @@ class UtilsMixin:
 
         def get_full_content(msg):
             content = msg.content.strip()
+
+            # ── SECURITY & CONTEXT OPTIMIZATION: STRIP THOUGHTS BY DEFAULT ──
+            # Completely strip any <think>...</think> reasoning blocks from past messages
+            # before sending them to the LLM to prevent reinforcement of old reasoning paths.
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<think>.*$', '', content, flags=re.DOTALL | re.IGNORECASE)
+
+            def _parse_attrs(attr_str: str) -> Dict[str, str]:
+                return {m.group(1): m.group(2)
+                        for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
+
+            # ── SINGLE SOURCE OF TRUTH CONTEXT DOCTRINE ──
+            # To prevent massive token duplication and bloat in the context window,
+            # we must NEVER export the full verbatim content of artifacts/notes/skills inside past messages.
+            # We strip any complete XML blocks and replace them with their lightweight placeholders during export.
+            pattern = re.compile(r'<(artifact|artefact|note|skill)\b([^>]*?)>(.*?)</\1>', re.DOTALL | re.IGNORECASE)
+
+            def _strip_tag_to_placeholder(match: re.Match) -> str:
+                tag_name = match.group(1).lower()
+                attrs = _parse_attrs(match.group(2))
+                title = attrs.get("name") or attrs.get("title") or "artifact"
+                type_label = "note" if tag_name == "note" else ("skill" if tag_name == "skill" else "artefact")
+                # Export as a stable, lightweight Lollms Artifact Anchor tag so the LLM retains situational awareness
+                return f'\n<lollms_artifact id="{title}" type="{type_label}" version="1" />\n'
+
+            content = pattern.sub(_strip_tag_to_placeholder, content)
+
             if msg.sender_type == 'assistant':
                 # Strip completed/closed processing blocks
                 content = re.sub(

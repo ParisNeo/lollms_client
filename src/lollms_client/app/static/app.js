@@ -11,9 +11,15 @@
 
 // ── Global Function States for Chat Settings ──
 let funcStates = {};
+let tool_states = {};
 
-// Expose funcStates to the window scope for global visibility
+// Expose states to the window scope for global visibility
 window.funcStates = funcStates;
+window.tool_states = tool_states;
+
+// Set Python Sandbox tool to false (opt-in) by default for safety
+funcStates["execute_python_data_query"] = false;
+tool_states["execute_python_data_query"] = false;
 
 document.addEventListener("DOMContentLoaded", () => {
     // ── 🔔 Modern Toast Notification System ──
@@ -119,6 +125,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // ── Global State variables ──
     let selectedFiles = [];
+
+    // Set Python Sandbox tool to false (opt-in) by default for safety
+    funcStates["execute_python_data_query"] = false;
+    tool_states["execute_python_data_query"] = false;
     let activeArtifactTitle = null;
     let activeArtifactType = null;
     let selectedVersion = null;
@@ -1009,6 +1019,22 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    // Bind Open Workspace Folder Button Click Handler
+    const btnOpenWorkspaceFolder = document.getElementById("btn-open-workspace-folder");
+    if (btnOpenWorkspaceFolder) {
+        btnOpenWorkspaceFolder.addEventListener("click", async () => {
+            try {
+                const res = await fetch("/api/workspaces/open_folder", { method: "POST" });
+                const data = await res.json();
+                if (!data.success) {
+                    alert("Failed to open workspace folder: " + data.detail);
+                }
+            } catch (err) {
+                alert("Request failed: " + err);
+            }
+        });
+    }
+
     // Bind Ingestion Modal File Selection & Import Folder triggers
     const btnSelectLocalFiles = document.getElementById("btn-select-local-files");
     if (btnSelectLocalFiles) {
@@ -1048,6 +1074,173 @@ document.addEventListener("DOMContentLoaded", () => {
                 btnImportFolderModal.disabled = false;
                 btnImportFolderModal.textContent = "📁 Import Local Folder";
                 progressContainer.style.display = "none";
+            }
+        });
+    }
+
+    // ── 🎨 Craft Custom Personality Builder Modal Handlers ──
+    const pbModal = document.getElementById("personality-builder-modal");
+    const btnOpenPb = document.getElementById("btn-open-personality-builder");
+    const btnClosePb = document.getElementById("btn-close-personality-builder");
+    const btnCancelPb = document.getElementById("btn-cancel-pb-builder");
+    const btnSubmitPb = document.getElementById("btn-submit-pb-builder");
+    const btnAddPbTool = document.getElementById("btn-add-pb-tool");
+    const pbAttachedToolsList = document.getElementById("pb-attached-tools-list");
+
+    const pbTabs = document.querySelectorAll("#personality-builder-modal .modal-tab");
+    const pbTabPanes = document.querySelectorAll("#personality-builder-modal .modal-tab-content-pane");
+
+    let pbAttachedTools = []; // Temporary cache of attached tools: [{name, code}]
+
+    if (btnOpenPb) {
+        btnOpenPb.addEventListener("click", () => {
+            importModal.style.display = "none"; // Close parent ingestion
+            pbModal.style.display = "flex";
+
+            // Reset fields
+            document.getElementById("pb-name").value = "";
+            document.getElementById("pb-category").value = "";
+            document.getElementById("pb-author").value = "";
+            document.getElementById("pb-description").value = "";
+            document.getElementById("pb-soul-instructions").value = "";
+            document.getElementById("pb-tool-name").value = "";
+            document.getElementById("pb-tool-code").value = "";
+            pbAttachedTools = [];
+            pbAttachedToolsList.innerHTML = `<li class="empty-msg">No built-in tools attached yet.</li>`;
+
+            // Reset tab highlights
+            pbTabs.forEach(t => t.classList.remove("active"));
+            pbTabPanes.forEach(p => p.classList.remove("active"));
+            pbTabs[0].classList.add("active");
+            pbTabPanes[0].classList.add("active");
+        });
+    }
+
+    const closePbModal = () => {
+        pbModal.style.display = "none";
+    };
+
+    if (btnClosePb) btnClosePb.addEventListener("click", closePbModal);
+    if (btnCancelPb) btnCancelPb.addEventListener("click", closePbModal);
+
+    // Bulletproof click-outside closure tracking for Personality Builder
+    let isMouseDownOnPbOverlay = false;
+    if (pbModal) {
+        pbModal.addEventListener("mousedown", (e) => {
+            isMouseDownOnPbOverlay = (e.target === pbModal);
+        });
+        pbModal.addEventListener("mouseup", (e) => {
+            if (isMouseDownOnPbOverlay && e.target === pbModal) {
+                pbModal.style.display = "none";
+            }
+            isMouseDownOnPbOverlay = false;
+        });
+    }
+
+    // Tab switcher
+    pbTabs.forEach(tab => {
+        tab.addEventListener("click", () => {
+            pbTabs.forEach(t => t.classList.remove("active"));
+            pbTabPanes.forEach(p => p.classList.remove("active"));
+
+            tab.classList.add("active");
+            document.getElementById(tab.dataset.pbTab).classList.add("active");
+        });
+    });
+
+    // Add tool to current building agent bundle
+    if (btnAddPbTool) {
+        btnAddPbTool.addEventListener("click", () => {
+            const tNameInput = document.getElementById("pb-tool-name");
+            const tCodeInput = document.getElementById("pb-tool-code");
+
+            const tName = tNameInput.value.trim().toLowerCase();
+            const tCode = tCodeInput.value.trim();
+
+            if (!tName || !tCode) {
+                alert("Please specify both a tool name and the python implementation code.");
+                return;
+            }
+
+            if (pbAttachedTools.some(t => t.name === tName)) {
+                alert("A tool with this name is already attached to this agent.");
+                return;
+            }
+
+            pbAttachedTools.push({ name: tName, code: tCode });
+
+            // Refresh attached tools UI list
+            pbAttachedToolsList.innerHTML = pbAttachedTools.map((t, idx) => `
+                <li class="artifact-card" style="padding: 6px 12px; display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-weight: bold; font-family: monospace;">🔧 ${t.name}.py</span>
+                    <button class="artifact-action-btn remove-pb-tool" data-index="${idx}" title="Detach tool">✕</button>
+                </li>
+            `).join("");
+
+            pbAttachedToolsList.querySelectorAll(".remove-pb-tool").forEach(delBtn => {
+                delBtn.addEventListener("click", () => {
+                    const i = parseInt(delBtn.dataset.index, 10);
+                    pbAttachedTools.splice(i, 1);
+                    btnAddPbTool.click(); // force trigger re-render
+                });
+            });
+
+            // Reset inputs
+            tNameInput.value = "";
+            tCodeInput.value = "";
+            showNotification(`✓ Tool '${tName}' attached to agent bundle!`, "success", 2000);
+        });
+    }
+
+    // Save & Install Personality
+    if (btnSubmitPb) {
+        btnSubmitPb.addEventListener("click", async () => {
+            const name = document.getElementById("pb-name").value.trim();
+            const category = document.getElementById("pb-category").value.trim() || "custom_personalities";
+            const author = document.getElementById("pb-author").value.trim() || "Unknown";
+            const description = document.getElementById("pb-description").value.trim();
+            const systemPrompt = document.getElementById("pb-soul-instructions").value.strip ? document.getElementById("pb-soul-instructions").value.strip() : document.getElementById("pb-soul-instructions").value.trim();
+
+            if (!name) {
+                alert("Please provide a name for your custom AI Agent.");
+                return;
+            }
+            if (!systemPrompt) {
+                alert("Please write the core System Instructions / Soul template for your agent.");
+                return;
+            }
+
+            btnSubmitPb.disabled = true;
+            btnSubmitPb.textContent = "Installing Agent...";
+
+            try {
+                const res = await fetch("/api/personalities/build", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        name,
+                        author,
+                        category,
+                        description,
+                        system_prompt: systemPrompt,
+                        tools: pbAttachedTools.length > 0 ? pbAttachedTools : null
+                    })
+                });
+
+                const data = await res.json();
+                if (data.success) {
+                    showNotification(`✓ Custom Agent '${name}' compiled and installed successfully!`, "success", 4000);
+                    pbModal.style.display = "none";
+                    await fetchPersonalities();
+                    activatePersonality(data.category, data.persona);
+                } else {
+                    alert(`Compilation failed: ${data.detail || data.error}`);
+                }
+            } catch (err) {
+                alert(`Request failed: ${err}`);
+            } finally {
+                btnSubmitPb.disabled = false;
+                btnSubmitPb.textContent = "💾 Save & Install Agent";
             }
         });
     }
@@ -1907,6 +2100,9 @@ document.addEventListener("DOMContentLoaded", () => {
                                             <div class="query-title" style="user-select: none;">💻 Sandbox Output</div>
                                             <pre class="query-stdout">${data.output || "(No stdout output)"}</pre>
                                         `;
+                                        // Auto-refresh artifacts list and context budget so newly generated/modified files appear in real-time!
+                                        fetchArtifacts();
+                                        updateContextBudget();
                                     } else {
                                         outputBox.innerHTML = `
                                             <div class="query-title" style="color: #ef4444; user-select: none;">❌ Execution Error</div>
@@ -6557,41 +6753,29 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!text) return "";
         let cleanedText = runMarkdownCleanup(text);
 
-        // ── In-Stream XML to Markdown Dynamic Converter ──────────────────────
-        // If we encounter open/unclosed <artifact> or <note> tags during active streaming,
-        // we dynamically convert them into standard markdown code blocks so that marked.js
-        // can apply instant syntax highlighting while the code is actively being typed.
-        cleanedText = cleanedText.replace(/<art[ei]fact\s+([^>]*?)>/gi, (match, attrsStr) => {
-            const attrs = {};
-            attrsStr.replace(/(\w+)=["\']([^"\']*)["\']/g, (m, k, v) => attrs[k] = v);
-            const lang = attrs.language || attrs.type || "python";
-            const name = attrs.name || attrs.title || "";
-            const headerInfo = name ? `\n*Writing file: \`${name}\`*\n` : "";
-            return `${headerInfo}\n\`\`\`${lang}\n`;
-        });
-        cleanedText = cleanedText.replace(/<\/art[ei]fact>/gi, "\n```\n");
+        const placeholders = {};
 
-        cleanedText = cleanedText.replace(/<note\s+([^>]*?)>/gi, (match, attrsStr) => {
+        // Render unclosed streaming tags nicely as subtle, non-flickering, code-like blocks with an active loading indicator at the bottom
+        cleanedText = cleanedText.replace(/<(artifact|artefact)\s+([^>]*?)>([\s\S]*?)$/gi, (match, tag, attrsStr, innerBody) => {
             const attrs = {};
             attrsStr.replace(/(\w+)=["\']([^"\']*)["\']/g, (m, k, v) => attrs[k] = v);
-            const title = attrs.title || attrs.name || "";
-            const headerInfo = title ? `\n*Writing note: \`${title}\`*\n` : "";
-            return `${headerInfo}\n\`\`\`markdown\n`;
-        });
-        cleanedText = cleanedText.replace(/<\/note>/gi, "\n```\n");
+            const title = attrs.name || attrs.title || "Resource";
+            const type = attrs.type || "document";
 
-        cleanedText = cleanedText.replace(/<skill\s+([^>]*?)>/gi, (match, attrsStr) => {
-            const attrs = {};
-            attrsStr.replace(/(\w+)=["\']([^"\']*)["\']/g, (m, k, v) => attrs[k] = v);
-            const title = attrs.title || attrs.name || "";
-            const headerInfo = title ? `\n*Writing skill: \`${title}\`*\n` : "";
-            return `${headerInfo}\n\`\`\`markdown\n`;
+            // Mask this HTML component immediately to prevent markdown parser from escaping its tags
+            const uniqueId = `UNCLOSED_ART_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+            const html = `
+                <div class="failed-image-card" style="border-color: var(--accent-color); background-color: rgba(245, 158, 11, 0.02); margin: 12px 0; border: 1px solid var(--border-color); border-radius: 8px; padding: 16px;">
+                    <div class="failed-image-header" style="color: var(--accent-color); font-weight: bold; margin-bottom: 8px; font-size: 11px; text-transform: uppercase;">⏳ Building ${type.toUpperCase()}: ${title}...</div>
+                    <pre style="background-color: #020617; border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 11.5px; color: #cbd5e1; white-space: pre-wrap; margin: 0; line-height: 1.5; max-height: 240px; overflow-y: auto;">${innerBody}</pre>
+                </div>
+            `;
+            placeholders[uniqueId] = html;
+            return uniqueId;
         });
-        cleanedText = cleanedText.replace(/<\/skill>/gi, "\n```\n");
 
         const processedText = resolveProcessingTags(cleanedText, msgId);
 
-        const placeholders = {};
         let maskedText = processedText;
 
         // 1. Mask <lollms_inline> with unique cryptographic placeholder tokens to avoid collisions
@@ -6675,23 +6859,55 @@ document.addEventListener("DOMContentLoaded", () => {
         // Clean up any unclosed or orphaned trailing details/summary tags safely
         restoredHTML = restoredHTML.replace(/<\/details>\s*<\/details>/g, "</details>");
 
-        // 5. Intercept and replace the dry plain-text placeholders with beautiful, high-fidelity UI Success Cards
-        const strippedPattern = /\[content stripped, refer to the '([^']+)' (?:art[ei]fact|note|skill) for details\]/gi;
-        restoredHTML = restoredHTML.replace(strippedPattern, (match, artTitle) => {
+        // 5. Intercept and replace the stable Lollms Artifact Anchors with beautiful, non-flickering UI File Cards
+        const strippedPattern = /<lollms_artifact\s+([^>]*?)(?:\/>|>)/gi;
+        restoredHTML = restoredHTML.replace(strippedPattern, (match, attrsStr) => {
+            const attrs = {};
+            attrsStr.replace(/(\w+)=["\']([^"\']*)["\']/g, (m, k, v) => attrs[k] = v);
+
+            const artTitle = attrs.id || "artifact";
+            const typeLabel = attrs.type || "document";
+            const versionVal = attrs.version || "1";
+
             let icon = "💾";
-            let typeLabel = "Artifact";
-            if (artTitle.includes("note_")) {
+            let typeName = "Artifact";
+            if (typeLabel === "note") {
                 icon = "📝";
-                typeLabel = "Note";
-            } else if (artTitle.includes("skill_")) {
+                typeName = "Note";
+            } else if (typeLabel === "skill") {
                 icon = "🎓";
-                typeLabel = "Skill";
+                typeName = "Skill";
+            } else if (typeLabel === "data") {
+                icon = "📊";
+                typeName = "Dataset";
+            } else if (typeLabel === "presentation") {
+                icon = "🎬";
+                typeName = "Presentation";
             }
             return `
                 <div class="proc-item-no-bullet" style="margin: 14px 0; user-select: none;">
-                    <div class="proc-item complete" style="background-color: rgba(16, 185, 129, 0.05); padding: 12px 16px; border-radius: 8px; border: 1px dashed var(--success-color); display: inline-flex; align-items: center; gap: 10px; color: #a7f3d0; width: 100%; box-shadow: var(--shadow-sm); line-height: 1.4;">
-                        <span style="font-size: 18px;">${icon}</span>
-                        <span>${typeLabel} <strong style="color: white; font-family: monospace;">${artTitle}</strong> compiled, synchronized, and written to workspace disk successfully.</span>
+                    <div class="proc-item complete" style="background-color: rgba(16, 185, 129, 0.05); padding: 12px 16px; border-radius: 8px; border: 1px dashed var(--success-color); display: inline-flex; align-items: center; gap: 10px; color: #a7f3d0; width: 100%; box-shadow: var(--shadow-sm); line-height: 1.4; justify-content: space-between;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="font-size: 18px;">${icon}</span>
+                            <span>${typeName} <strong style="color: white; font-family: monospace;">${artTitle}</strong> (v${versionVal}) created and synchronized to disk successfully.</span>
+                        </div>
+                        <button class="btn btn-secondary select-workspace-art" onclick="window.selectArtifactGlobal('${encodeURIComponent(artTitle)}')" style="width: auto; padding: 4px 10px; font-size: 11px; margin: 0; border-radius: 4px; font-weight: bold; background-color: var(--border-color); color: var(--text-primary);">👁️ View File</button>
+                    </div>
+                </div>
+            `;
+        });
+
+        // 5. Replace bracketed raw artifact placeholders with beautiful, interactive file cards
+        const placeholderPattern = /\[content stripped, refer to the '([^']+)' art[ei]fact for details\]/gi;
+        restoredHTML = restoredHTML.replace(placeholderPattern, (match, artTitle) => {
+            return `
+                <div class="proc-item-no-bullet" style="margin: 14px 0; user-select: none;">
+                    <div class="proc-item complete" style="background-color: rgba(16, 185, 129, 0.05); padding: 12px 16px; border-radius: 8px; border: 1px dashed var(--success-color); display: inline-flex; align-items: center; gap: 10px; color: #a7f3d0; width: 100%; box-shadow: var(--shadow-sm); line-height: 1.4; justify-content: space-between;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span style="font-size: 18px;">📄</span>
+                            <span>Artifact <strong style="color: white; font-family: monospace;">${artTitle}</strong> was successfully updated and saved to your workspace.</span>
+                        </div>
+                        <button class="btn btn-secondary select-workspace-art" onclick="window.selectArtifactGlobal('${encodeURIComponent(artTitle)}')" style="width: auto; padding: 4px 10px; font-size: 11px; margin: 0; border-radius: 4px; font-weight: bold; background-color: var(--border-color); color: var(--text-primary);">👁️ View File</button>
                     </div>
                 </div>
             `;
@@ -8276,30 +8492,35 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
     // 4. Parse and resolve any failed generate_image / edit_image tags into an interactive retry card
     const genPattern = /<(generate_image|edit_image)\s*([^>]*)>([\s\S]*?)<\/\1>/gi;
     content = content.replace(genPattern, (match, tagName, attrsStr, promptText) => {
-        // Strict HTML tag stripping to prevent leaking status containers inside prompt box
         const cleanPrompt = promptText.replace(/<\/?[^>]+>/g, "").trim();
+        const uniqueId = `RETRY_CARD_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
 
+        let html = "";
         if (!msgId) {
-            return `
-                <div class="failed-image-card">
-                    <div class="failed-image-header">
+            html = `
+                <div class="failed-image-card" style="border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; margin: 12px 0; background-color: var(--bg-panel); display: flex; flex-direction: column; gap: 10px;">
+                    <div class="failed-image-header" style="font-size: 11px; font-weight: bold; color: var(--accent-color); text-transform: uppercase;">
                         <span>🎨 Image Prompt (${tagName === 'edit_image' ? 'Edit' : 'Generation'})</span>
                     </div>
                     <textarea class="failed-image-prompt-input" readonly style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${cleanPrompt}</textarea>
                 </div>
             `;
-        }
-        return `
-            <div class="failed-image-card" data-msg-id="${msgId}">
-                <div class="failed-image-header">
-                    <span>🎨 Image Prompt (${tagName === 'edit_image' ? 'Edit' : 'Generation'})</span>
+        } else {
+            html = `
+                <div class="failed-image-card" data-msg-id="${msgId}" style="border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; margin: 12px 0; background-color: var(--bg-panel); display: flex; flex-direction: column; gap: 10px;">
+                    <div class="failed-image-header" style="font-size: 11px; font-weight: bold; color: var(--accent-color); text-transform: uppercase;">
+                        <span>🎨 Image Prompt (${tagName === 'edit_image' ? 'Edit' : 'Generation'})</span>
+                    </div>
+                    <textarea class="failed-image-prompt-input" style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${cleanPrompt}</textarea>
+                    <button class="btn btn-primary btn-retry-image" onclick="retryImageGeneration('${msgId}')" style="margin-top: 8px; width: auto !important; padding: 6px 14px !important; font-size: 12px !important;">
+                        ${tagName === 'edit_image' ? '🎨 Edit Image' : '🎨 Generate Image'}
+                    </button>
                 </div>
-                <textarea class="failed-image-prompt-input" style="width: 100%; min-height: 60px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px; border-radius: 4px; resize: vertical; outline: none; font-family: inherit; font-size: 13px;">${cleanPrompt}</textarea>
-                <button class="btn btn-primary btn-retry-image" onclick="retryImageGeneration('${msgId}')" style="margin-top: 8px;">
-                    ${tagName === 'edit_image' ? '🎨 Edit Image' : '🎨 Generate Image'}
-                </button>
-            </div>
-        `;
+            `;
+        }
+
+        placeholders[uniqueId] = html;
+        return uniqueId;
     });
 
     // 1. Resolve `<artefact_image>` tags into direct artifact image endpoints
@@ -8510,5 +8731,21 @@ window.deleteArtifactImage = async function(title, index) {
         }
     } catch (err) {
         alert(`Failed to delete image: ${err}`);
+    }
+};
+
+// Global direct-trigger view file card click binder
+window.selectArtifactGlobal = function(encodedTitle) {
+    const title = decodeURIComponent(encodedTitle);
+    const card = document.querySelector(`.artifact-card[data-title="${title}"]`);
+    if (card) {
+        card.click();
+    } else {
+        // Fallback: force select directly
+        try {
+            selectArtifact(title);
+        } catch (e) {
+            console.error("Failed to select artifact via global trigger:", e);
+        }
     }
 };

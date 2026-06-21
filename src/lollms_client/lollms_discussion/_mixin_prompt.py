@@ -567,9 +567,17 @@ RULES:
             "=== DATA VIEWS ===",
             "NEVER render large tables in prose. Save as CSV via tool → auto-rendered as interactive grid.",
             "",
-            "=== DATA INTERFACE POLICY ===",
-            "🚨 FORBIDDEN: Editing type='data' artifacts with <artifact> tags.",
-            "USE: execute_python_data_query tool for CSV/Excel/SQLite modifications.",
+            "=== DATA INTERFACE POLICY (MANDATORY SECURITY RULES) ===",
+            "🚨 STRICTLY FORBIDDEN: Generating or executing Python code blocks (including `execute_python_data_query` or custom scripts) to analyze, slice, query, filter, or plot datasets.",
+            "   You are completely BLOCKED from running custom Python code for data processing.",
+            "👉 MANDATORY: You MUST exclusively use the pre-compiled, safe, high-performance macros inside the `semantic_data_engineer` tool library for all dataset interactions:",
+            "   - To query structures, columns, and data types: Call `tool_get_table_schema`",
+            "   - To filter, slice, or query rows matching criteria: Call `tool_filter_and_slice_data`",
+            "   - To get category frequencies or unique values: Call `tool_get_unique_values`",
+            "   - To calculate sums, averages, counts, or min/max values: Call `tool_compute_column_aggregations`",
+            "   - To run standard SQL queries over data tables: Call `tool_query_database_sql`",
+            "   - To generate beautiful visualizations (line, bar, stacked, scatter, pie): Call `tool_generate_advanced_visualization` or `tool_compute_statistics_and_plot`",
+            "🚨 FORBIDDEN: Editing type='data' artifacts with raw <artifact> tags. Use the safe data macros instead.",
             "",
         ]
         return "\n".join(lines)
@@ -1096,11 +1104,11 @@ EXAMPLE OF CORRECT FORM:
                 atype     = art.get('type', 'artifact')
                 title     = art.get('title', 'untitled')
                 lang      = art.get('language', '')
-                version   = art.get('version', 1)
+                art_ver   = art.get('version', 1)
                 desc      = art.get('description', '')
                 img_count = len(art.get('images') or [])
                 lang_str  = f" ({lang})"       if lang           else ""
-                ver_str   = f" — version {version}" if version > 1 else ""
+                ver_str   = f" — version {art_ver}" if art_ver > 1 else ""
                 desc_str  = f": {desc}"         if desc           else ""
                 img_str   = f" · {img_count} image(s)" if img_count else ""
                 summary_parts.append(

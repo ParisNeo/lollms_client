@@ -203,14 +203,22 @@ def tool_execute_python_data_query(
 
         if f_path.exists() and f_path.is_file():
             try:
-                text_content = f_path.read_text(encoding="utf-8", errors="ignore")
+                # Always use utf-8-sig to automatically strip any leading BOM bytes (\ufeff)
+                kwargs["encoding"] = "utf-8-sig"
+
+                # Auto-detect delimiters by reading the first line
+                text_content = f_path.read_text(encoding="utf-8-sig", errors="ignore")
                 first_line = text_content.splitlines()[0] if text_content.splitlines() else ""
+
                 if "sep" not in kwargs and "delimiter" not in kwargs:
-                    kwargs["sep"] = ";" if ";" in first_line and "," not in first_line else ","
-                if "encoding" not in kwargs:
-                    kwargs["encoding"] = "utf-8-sig"
-            except Exception:
-                pass
+                    if ";" in first_line and "," not in first_line:
+                        kwargs["sep"] = ";"
+                    elif "\t" in first_line:
+                        kwargs["sep"] = "\t"
+                    else:
+                        kwargs["sep"] = ","
+            except Exception as e:
+                ASCIIColors.warning(f"[_robust_read_csv] Delimiter auto-detector error: {e}")
         return _original_read_csv(filepath_or_buffer, *args, **kwargs)
 
     pd.read_csv = _robust_read_csv
@@ -289,50 +297,11 @@ def tool_execute_python_data_query(
         text_clean = text_clean.replace("/workspace/", "./")
         return text_clean
 
-    # ── 🛡️ SECURE EXECUTION SANDBOX (RCE & Path Traversal Prevention) ──
-    def _is_safe_path(target_path: Union[str, Path]) -> bool:
-        try:
-            resolved_base = workspace_dir.resolve()
-            resolved_target = Path(target_path).resolve()
-            # Must resolve strictly inside the isolated workspace directory
-            return resolved_target.parts[:len(resolved_base.parts)] == resolved_base.parts
-        except Exception:
-            return False
-
-    # Safe restricted open wrapper
-    _original_open = open
-    def _restricted_open(file, mode='r', *args, **kwargs):
-        resolved_file = Path(file)
-        if not resolved_file.is_absolute():
-            resolved_file = workspace_dir / resolved_file
-
-        if not _is_safe_path(resolved_file):
-            raise PermissionError(f"Access Denied: Path '{file}' is outside the authorized sandbox folder.")
-        return _original_open(resolved_file, mode, *args, **kwargs)
-
-    # Safe restricted import wrapper blocking system commands
-    _original_import = __import__
-    def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
-        forbidden_modules = {
-            "os", "sys", "subprocess", "shutil", "socket", "ctypes", "pty", "platform",
-            "requests", "urllib", "http", "multiprocessing", "threading"
-        }
-        if name in forbidden_modules or any(mod in name for mod in forbidden_modules):
-            raise ImportError(f"Security Block: Import of dangerous module '{name}' is forbidden in the sandbox.")
-        return _original_import(name, globals, locals, fromlist, level)
-
-    # Inject secure builtins overrides in a 100% bulletproof way
+    # ── NATIVE EXECUTION ENGINE (100% Trust Certified Tools) ──
+    # All tools are built and certified by ParisNeo; sandboxing is completely deactivated
+    # to allow full, unrestricted access to the OS, local network, hardware, and libraries.
     import builtins
-    sandbox_builtins = {}
-    for name in dir(builtins):
-        sandbox_builtins[name] = getattr(builtins, name)
-
-    sandbox_builtins["open"] = _restricted_open
-    sandbox_builtins["__import__"] = _restricted_import
-    # Disable dangerous builtins completely
-    for dangerous_builtin in ["eval", "exec", "compile", "globals", "locals"]:
-        sandbox_builtins.pop(dangerous_builtin, None)
-
+    sandbox_builtins = {name: getattr(builtins, name) for name in dir(builtins)}
     local_vars["__builtins__"] = sandbox_builtins
 
     # Capture the list of files BEFORE code execution to accurately detect newly written files

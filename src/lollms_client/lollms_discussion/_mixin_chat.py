@@ -176,11 +176,30 @@ class _StreamState:
         self.ai_message.content += chunk
         _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
 
-            # 2. Check the fully accumulated message content for newly closed XML blocks,
-        # but STRICTLY ignore any blocks nested inside the model's thoughts (<think>...</think>).
+        # 2. Stateless Thoughts Detection
         content = self.ai_message.content
+        last_open_think = content.rfind("<think>")
+        last_close_think = content.rfind("</think>")
+        is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
 
-        # Create a safe content copy by removing all closed and unclosed thinking blocks
+        if is_inside_thoughts:
+            return True
+
+        # 3. Protect Active Unclosed Artifact Blocks from Tag Interception
+        # If the LLM is actively outputting inside an open <artifact> or <note> block,
+        # we must STRICTLY disable secondary tag parsing. This prevents aider symbols
+        # like "<<<<<<< SEARCH" from triggering false-positive tag parsing!
+        last_open_art = max(content.rfind("<artifact"), content.rfind("<artefact"))
+        last_close_art = max(content.rfind("</artifact>"), content.rfind("</artefact>"))
+        is_inside_artifact = (last_open_art != -1) and (last_open_art > last_close_art)
+
+        if is_inside_artifact:
+            # We are currently streaming inside an open artifact block — do not trigger secondary parses
+            # until the closing tag is typed
+            if not content.endswith("</artifact>") and not content.endswith("</artefact>"):
+                return True
+
+        # 4. Create a safe content copy by removing all closed and unclosed thinking blocks
         safe_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
         safe_content = re.sub(r'<think>.*$', '', safe_content, flags=re.DOTALL | re.IGNORECASE)
 
@@ -259,15 +278,17 @@ class _StreamState:
                 _cb(self.callback, f"Artifact '{title}' successfully updated.", MSG_TYPE.MSG_TYPE_INFO)
             
             # ── SWIFT REPLACEMENT PROTOCOL ──
-            # Strips the full raw XML from the message body and replaces it with the placeholder
-            placeholder = f"\n[content stripped, refer to the '{title}' artefact for details]\n"
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
-            
+            # Replaces the raw XML block in the message body with a stable, self-closing Lollms Artifact Anchor tag.
+            # This completely avoids context bloat and prevents any in-stream UI flickering.
+            version_val = art.get("version", 1) if art else 1
+            anchor = f'\n<lollms_artifact id="{title}" type="{atype}" version="{version_val}" />\n'
+            self.ai_message.content = self.ai_message.content.replace(full_match_text, anchor)
+
             # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+            _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_updated" if not is_new else "artifact_created",
                 "title": title,
-                "version": art.get("version", 1) if art else 1,
+                "version": version_val,
                 "art_type": atype
             })
             return True
@@ -289,10 +310,10 @@ class _StreamState:
             )
             if art:
                 self.affected_artefacts.append(art)
-            
-            placeholder = f"\n[content stripped, refer to the '{title}' note for details]\n"
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+
+            anchor = f'\n<lollms_artifact id="{title}" type="note" version="1" />\n'
+            self.ai_message.content = self.ai_message.content.replace(full_match_text, anchor)
+            _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
                 "title": title,
                 "art_type": "note"
@@ -311,10 +332,10 @@ class _StreamState:
             )
             if art:
                 self.affected_artefacts.append(art)
-                
-            placeholder = f"\n[content stripped, refer to the '{title}' skill for details]\n"
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+
+            anchor = f'\n<lollms_artifact id="{title}" type="skill" version="1" />\n'
+            self.ai_message.content = self.ai_message.content.replace(full_match_text, anchor)
+            _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
                 "title": title,
                 "art_type": "skill"
@@ -655,11 +676,15 @@ class ChatMixin:
         enable_sub_agents:            bool = True,  # Enable spinoff agents as executable tools
         verbose_traceback:            bool = True,  # Disclose full sanitised traceback to the LLM
         sandbox_cwd:                  Optional[str] = None, # Custom relative sandbox run directory
+        tolerance_level:              Optional[str] = "strict",
         **kwargs
     ) -> Dict[str, Any]:
         """
         Runs the conversational loop, resolving RAG, tiered memories, and tool calls.
         """
+        # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
+        if not hasattr(self, "tolerance_level") or tolerance_level:
+            object.__setattr__(self, "tolerance_level", tolerance_level or "strict")
         self.scratchpad = ""
         callback = kwargs.get("streaming_callback")
         temperature = kwargs.get("temperature")
@@ -834,6 +859,10 @@ class ChatMixin:
         tool_calls_this_turn = []
         round_count = 0
 
+        # Initialize the transient in-process FailureMemory tracker
+        if not hasattr(self, "failure_memory") or not self.failure_memory:
+            object.__setattr__(self, "failure_memory", FailureMemory())
+
         # Initialize the single, clean database assistant message ONCE before entering the loop
         ASCIIColors.info("[Trace] Initializing database assistant message stub...")
         ai_msg = self.add_message(
@@ -850,7 +879,14 @@ class ChatMixin:
         while round_count < max_reasoning_steps:
             round_count += 1
             ASCIIColors.info(f"[Trace] Loop round {round_count}/{max_reasoning_steps} starting...")
-            
+
+            # Guarantee a clean, un-canceled state before launching each independent generation round
+            if self.lollmsClient and getattr(self.lollmsClient, "llm", None):
+                try:
+                    self.lollmsClient.llm.reset_cancel()
+                except Exception:
+                    pass
+
             current_system_prompt = full_system_prompt
             if tools_prompt:
                 current_system_prompt += "\n" + tools_prompt
@@ -929,40 +965,78 @@ class ChatMixin:
                     ai_msg.content += status_line
                     _cb(callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                    # Execute the tool
-                    try:
-                        # Always pass the active discussion and client instances as context keywords
-                        if active_tools and tool_name in active_tools:
-                            tool_res = active_tools[tool_name]["callable"](
-                                lollms_client_instance=self.lollmsClient,
-                                discussion_instance=self,
-                                **tool_params
-                            )
-                        else:
-                            tool_res = self.lollmsClient.tools.execute_tool(
-                                tool_name, 
-                                tool_params, 
-                                lollms_client_instance=self.lollmsClient, 
-                                discussion_instance=self,
-                                discussion=self
-                            )
+                    # ── REFLEXIVE LOOP DETECTION (FailureMemory) ──
+                    if self.failure_memory.has_previous_failure(tool_name, tool_params):
+                        ASCIIColors.error(f"[FailureMemory] Intercepted repetitive execution loop for tool '{tool_name}'!")
+                        result_str = (
+                            f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round of this conversation. "
+                            f"To prevent an infinite loop, execution was blocked. You must modify your parameters, inspect the data schemas, "
+                            f"or try a different approach instead of repeating the failing call."
+                        )
+                        # Write the error notice to the UI before terminating
+                        status_err_line = f"* Tool call blocked to prevent loop.\n"
+                        details_block = f'<details class="proc-error-details"><summary>Loop Intercepted</summary><pre>{result_str}</pre></details>\n'
+                        tool_close_tag = f"{status_err_line}{details_block}</processing>\n\n"
+                        ai_msg.content += tool_close_tag
+                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        
+                        # Instantly terminate the generation loop to stop empty accordion spams!
+                        break
+                    else:
+                        # Execute the tool safely
+                        try:
+                            # Always pass the active discussion and client instances as context keywords
+                            if active_tools and tool_name in active_tools:
+                                tool_res = active_tools[tool_name]["callable"](
+                                    lollms_client_instance=self.lollmsClient,
+                                    discussion_instance=self,
+                                    **tool_params
+                                )
+                            else:
+                                tool_res = self.lollmsClient.tools.execute_tool(
+                                    tool_name, 
+                                    tool_params, 
+                                    lollms_client_instance=self.lollmsClient, 
+                                    discussion_instance=self,
+                                    discussion=self
+                                )
 
-                        if isinstance(tool_res, dict):
-                            result_str = tool_res.get("output", json.dumps(tool_res, indent=2))
-                        else:
-                            result_str = str(tool_res)
-                    except Exception as e:
-                        result_str = f"Error executing tool '{tool_name}': {e}"
+                            if isinstance(tool_res, dict):
+                                if not tool_res.get("success", True):
+                                    error_msg = tool_res.get("error", "Unknown tool error")
+                                    self.failure_memory.record_failure(tool_name, tool_params, error_msg)
+                                    result_str = f"Error executing tool '{tool_name}': {error_msg}"
+                                    
+                                    # Write error block
+                                    status_done_line = f"* Completed execution with errors.\n"
+                                    details_block = f'<details class="proc-error-details"><summary>Error Logs</summary><pre>{html.escape(error_msg)}</pre></details>\n'
+                                else:
+                                    result_str = tool_res.get("output", json.dumps(tool_res, indent=2))
+                                    # Trigger evolutionary reflection on successful recovery
+                                    self._trigger_evolutionary_reflection(tool_name, tool_params, result_str)
+                                    
+                                    # Write success block
+                                    status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
+                                    clean_result_str = str(result_str)
+                                    safe_output = html.escape(clean_result_str[:2000] + ("..." if len(clean_result_str) > 2000 else ""))
+                                    details_block = f'<details class="proc-success-details"><summary>Output Logs</summary><pre>{safe_output}</pre></details>\n'
+                            else:
+                                result_str = str(tool_res)
+                                if "error" in result_str.lower() or "fail" in result_str.lower():
+                                    self.failure_memory.record_failure(tool_name, tool_params, result_str)
+                                    status_done_line = f"* Completed execution with errors.\n"
+                                    details_block = f'<details class="proc-error-details"><summary>Error Logs</summary><pre>{html.escape(result_str)}</pre></details>\n'
+                                else:
+                                    status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
+                                    clean_result_str = str(result_str)
+                                    safe_output = html.escape(clean_result_str[:2000] + ("..." if len(clean_result_str) > 2000 else ""))
+                                    details_block = f'<details class="proc-success-details"><summary>Output Logs</summary><pre>{safe_output}</pre></details>\n'
+                        except Exception as e:
+                            self.failure_memory.record_failure(tool_name, tool_params, str(e))
+                            result_str = f"Error executing tool '{tool_name}': {e}"
+                            status_done_line = f"* Execution crashed.\n"
+                            details_block = f'<details class="proc-error-details"><summary>Crash Details</summary><pre>{html.escape(str(e))}</pre></details>\n'
 
-                    # Write the completion status and result details into the timeline
-                    status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
-                    
-                    # Embed details block for outputs in collapsible view
-                    # Explicitly convert to string first to avoid unhashable slice exceptions on dict/object outputs
-                    clean_result_str = str(result_str)
-                    safe_output = html.escape(clean_result_str[:2000] + ("..." if len(clean_result_str) > 2000 else ""))
-                    details_block = f'<details class="proc-success-details"><summary>Output Logs</summary><pre>{safe_output}</pre></details>\n'
-                    
                     tool_close_tag = f"{status_done_line}{details_block}</processing>\n\n"
                     ai_msg.content += tool_close_tag
                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -974,27 +1048,39 @@ class ChatMixin:
                         "result": {"output": result_str, "success": "Error" not in result_str}
                     })
 
-                    # Add the assistant turn (the tool call) and the tool result to virtual history
-                    # We strip the visual <processing> logs from virtual history to avoid context bloating
-                    round_text = ai_msg.content
-                    assistant_clean = re.sub(r'<processing.*?>.*?</processing>', '', round_text, flags=re.DOTALL | re.IGNORECASE)
-                    
-                    # Clean up the active message content in-place so completed processing logs
-                    # are stripped and do not interfere with subsequent streaming turns!
-                    ai_msg.content = assistant_clean.strip()
-                    
+                    # ── HIGH-FIDELITY CONTEXT PRESERVATION ──
+                    # To prevent the model from falling into "dumb next-word prediction" auto-complete loops,
+                    # we must feed it the exact, raw sequence of its own previous actions.
+                    raw_round_text = ss.get_clean_text_so_far()
+
+                    # Find the newly added text segment of this round
+                    if virtual_history:
+                        # Strip previous virtual history content to get only this round's raw output
+                        for prev_m in virtual_history:
+                            if prev_m.sender_type == "assistant":
+                                raw_round_text = raw_round_text.replace(prev_m.content, "")
+
+                    raw_round_clean = re.sub(r'<processing.*?>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+                    # 1. Append the raw assistant turn (with unstripped <tool_call> tags) to virtual history
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
-                        content=assistant_clean.strip()
+                        content=raw_round_clean
                     ))
 
-                    user_part = f"Tool output for {tool_name}:\n{result_str}\n\nPlease continue your response based on this information."
+                    # 2. Append the raw tool result block to virtual history
+                    user_part = (
+                        f'<tool_result name="{tool_name}">\n'
+                        f"{result_str}\n"
+                        f"</tool_result>\n\n"
+                        f"Please analyze the tool output above and proceed with your response."
+                    )
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
                         content=user_part
                     ))
 
-                    # Append spacing to the single AI message content so it streams continuously
+                    # Append spacing so the next turn's stream flows continuously in the same bubble
                     ai_msg.content += "\n\n"
                 else:
                     break

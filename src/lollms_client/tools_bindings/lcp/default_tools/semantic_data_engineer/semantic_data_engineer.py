@@ -1,8 +1,10 @@
 """
 semantic_data_engineer.py
 =========================
-A comprehensive data engineering, statistics, plotting, and semantic translation tool
-for LOLLMS. Converts relational databases (SQL, CSV, Excel) into Ontological ABox Graphs.
+LOLLMS Unified Semantic Data Engineering & Safe Macro Library.
+Provides a comprehensive suite of pre-compiled, secure data macros
+to analyze, filter, aggregate, and visualize datasets without requiring 
+any LLM-generated code execution.
 """
 
 import os
@@ -13,15 +15,16 @@ import sqlite3
 import base64
 import io
 import uuid
+import shutil
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 TOOL_LIBRARY_NAME = "SEMANTIC_DATA_ENGINEER"
-TOOL_LIBRARY_DESC = "Performs mathematical statistics, generates plots, bootstraps TBox schemas from databases, and compiles physical relational data into semantic ABox graph engrams."
+TOOL_LIBRARY_DESC = "A highly specialized data engineering library providing safe pre-compiled data macros (filtering, aggregation, schemas, plotting, ABox conversion) without code execution."
 TOOL_LIBRARY_ICON = "📊"
 
 def init_tool_library() -> None:
-    """Ensure required packages are available."""
+    """Ensure required libraries are installed."""
     import pipmaster as pm
     pm.ensure_packages({
         "pandas": ">=1.3.0",
@@ -33,6 +36,7 @@ def init_tool_library() -> None:
 
 
 def _get_workspace_dir() -> Path:
+    """Returns the primary active workspace directory containing all user artifacts."""
     workspace_dir = Path("./data_workspace")
     try:
         from lollms_client.app.server import APP_WORKSPACE_DIR
@@ -43,9 +47,10 @@ def _get_workspace_dir() -> Path:
     return workspace_dir
 
 
-def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Any:
-    """Load a CSV, Excel, or SQLite file into a Pandas DataFrame."""
+def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Tuple[Any, str]:
+    """Load a CSV, Excel, or SQLite file into a Pandas DataFrame with automatic BOM and delimiter resolution."""
     import pandas as pd
+    import numpy as np
     ext = file_path.suffix.lower()
 
     if ext in (".db", ".sqlite", ".sqlite3"):
@@ -67,10 +72,804 @@ def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Any:
         df = pd.read_excel(str(file_path), sheet_name=sheet)
         return df, sheet
     else:
-        sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
-        df = pd.read_csv(str(file_path), sep=sep)
+        # Read the first line using utf-8-sig to safely detect the delimiter
+        try:
+            first_line = file_path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()[0]
+        except Exception:
+            first_line = ""
+            
+        sep = ","
+        if ";" in first_line and "," not in first_line:
+            sep = ";"
+        elif "\t" in first_line:
+            sep = "\t"
+
+        # Load using utf-8-sig to automatically strip any leading \ufeff BOM characters
+        df = pd.read_csv(str(file_path), sep=sep, encoding="utf-8-sig")
         return df, file_path.stem
 
+
+def _save_data_source(df: Any, file_path: Path, table_name: str) -> None:
+    """Write modified DataFrame back to disk, preserving format."""
+    ext = file_path.suffix.lower()
+    if ext in (".db", ".sqlite", ".sqlite3"):
+        conn = sqlite3.connect(str(file_path))
+        df.to_sql(table_name, conn, if_exists="replace", index=False)
+        conn.commit()
+        conn.close()
+    elif ext in (".xlsx", ".xls"):
+        import pandas as pd
+        # Write to single sheet
+        with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name=table_name[:31], index=False)
+    else:
+        sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+        df.to_csv(file_path, sep=sep, index=False)
+
+
+# ── 1. SCHEMA DETECTOR MACRO ────────────────────────────────────────────────
+
+def tool_get_table_schema(
+    file_name: str,
+    table_name: Optional[str] = None
+) -> dict:
+    """
+    Retrieves the exact column names, data types, row counts, and null counts of a dataset.
+
+    Args:
+        file_name (str): Filename of the target CSV, Excel, or SQLite file in the workspace.
+        table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+    """
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    try:
+        df, resolved_table = _load_data_source(file_path, table_name)
+        
+        schema = {}
+        for col in df.columns:
+            schema[col] = {
+                "dtype": str(df[col].dtype),
+                "null_count": int(df[col].isnull().sum()),
+                "sample_values": [str(x) for x in df[col].dropna().head(3).tolist()]
+            }
+
+        return {
+            "success": True,
+            "file_name": file_name,
+            "table_name": resolved_table,
+            "total_rows": len(df),
+            "columns_count": len(df.columns),
+            "schema": schema,
+            "output": f"Dataset '{file_name}' (table '{resolved_table}') has {len(df):,} rows and {len(df.columns)} columns."
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to retrieve schema: {e}"}
+
+
+# ── 2. FILTER & SLICE DATA MACRO ────────────────────────────────────────────
+
+def tool_filter_and_slice_data(
+    file_name: str,
+    table_name: Optional[str] = None,
+    filter_column: Optional[str] = None,
+    operator: Optional[str] = "==",  # "==", "!=", ">", "<", ">=", "<=", "contains"
+    filter_value: Optional[str] = None,
+    columns_to_keep: Optional[List[str]] = None,
+    limit: int = 50,
+    save_as_new_artifact: bool = False,
+    output_artifact_title: Optional[str] = None,
+    discussion_instance: Optional[Any] = None
+) -> dict:
+    """
+    Filters and slices a dataset without writing Python code, optionally saving the output as a new version or artifact.
+
+    Args:
+        file_name (str): Filename of the CSV, Excel, or SQLite file in the workspace.
+        table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+        filter_column (str, optional): The column name to filter by.
+        operator (str, optional): Comparison operator: '==', '!=', '>', '<', '>=', '<=', 'contains'. Defaults to '=='.
+        filter_value (str, optional): Value to match against.
+        columns_to_keep (list, optional): List of columns to keep (slices table).
+        limit (integer, optional): Maximum rows to return in the preview. Defaults to 50.
+        save_as_new_artifact (boolean, optional): If True, writes the filtered result back to a new workspace file and registers it. Defaults to False.
+        output_artifact_title (str, optional): Title of the new artifact if save_as_new_artifact is True.
+    """
+    import pandas as pd
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    try:
+        df, resolved_table = _load_data_source(file_path, table_name)
+        
+        # Apply columns slice
+        if columns_to_keep:
+            valid_cols = [c for c in columns_to_keep if c in df.columns]
+            if valid_cols:
+                df = df[valid_cols]
+
+        # Apply filter
+        if filter_column and filter_column in df.columns and filter_value is not None:
+            # Type-coerced comparisons
+            if operator == "==":
+                df = df[df[filter_column].astype(str) == str(filter_value)]
+            elif operator == "!=":
+                df = df[df[filter_column].astype(str) != str(filter_value)]
+            elif operator == "contains":
+                df = df[df[filter_column].astype(str).str.contains(str(filter_value), case=False, na=False)]
+            else:
+                # Numeric operators
+                try:
+                    num_val = float(filter_value)
+                    df[filter_column] = pd.to_numeric(df[filter_column])
+                    if operator == ">":
+                        df = df[df[filter_column] > num_val]
+                    elif operator == "<":
+                        df = df[df[filter_column] < num_val]
+                    elif operator == ">=":
+                        df = df[df[filter_column] >= num_val]
+                    elif operator == "<=":
+                        df = df[df[filter_column] <= num_val]
+                except Exception as num_err:
+                    return {"success": False, "error": f"Numerical operator '{operator}' failed on column '{filter_column}': {num_err}"}
+
+        total_matching_rows = len(df)
+        preview_df = df.head(limit)
+        
+        from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+        markdown_table = _dataframe_to_markdown(preview_df)
+
+        # Handle file persistence & new artifact registration
+        if save_as_new_artifact and discussion_instance:
+            out_title = output_artifact_title or f"{Path(file_name).stem}_filtered"
+            ext = file_path.suffix.lower()
+            out_filename = f"{out_title}{ext}"
+            out_path = workspace_dir / out_filename
+            
+            _save_data_source(df, out_path, resolved_table)
+            
+            # Setup new interactive data schema
+            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+            new_schema, _ = _parse_data_file(out_path, out_title, version=1, progress_cb=None)
+            
+            art = discussion_instance.artefacts.add(
+                title=out_title,
+                artefact_type=ArtefactType.DATA,
+                content=new_schema,
+                file_ext=ext,
+                active=True,
+                read_only=True
+            )
+            discussion_instance.commit()
+            
+            return {
+                "success": True,
+                "total_rows": total_matching_rows,
+                "artifact_created": out_title,
+                "output": f"Filtered dataset saved successfully as new active artifact '{out_title}'.\n\n### Preview (First {limit} rows):\n\n{markdown_table}"
+            }
+
+        return {
+            "success": True,
+            "total_rows": total_matching_rows,
+            "output": f"Query found {total_matching_rows:,} matching row(s).\n\n### Preview (First {limit} rows):\n\n{markdown_table}"
+        }
+
+    except Exception as e:
+        return {"success": False, "error": f"Data filtering failed: {e}"}
+
+
+# ── 3. GET UNIQUE VALUES MACRO ──────────────────────────────────────────────
+
+def tool_get_unique_values(
+    file_name: str,
+    column_name: str,
+    table_name: Optional[str] = None,
+    limit: int = 100
+) -> dict:
+    """
+    Returns unique elements and category frequency counts from a column.
+
+    Args:
+        file_name (str): Filename of the target CSV, Excel, or SQLite file in the workspace.
+        column_name (str): The column to analyze.
+        table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+        limit (integer, optional): Maximum unique items to list. Defaults to 100.
+    """
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    try:
+        df, _ = _load_data_source(file_path, table_name)
+        if column_name not in df.columns:
+            return {"success": False, "error": f"Column '{column_name}' not found in dataset."}
+
+        counts = df[column_name].value_counts().head(limit)
+        unique_list = []
+        for val, count in counts.items():
+            unique_list.append({"value": str(val), "count": int(count)})
+
+        from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+        import pandas as pd
+        counts_df = pd.DataFrame(unique_list)
+        md_table = _dataframe_to_markdown(counts_df)
+
+        return {
+            "success": True,
+            "column": column_name,
+            "total_unique": int(df[column_name].nunique()),
+            "unique_values": unique_list,
+            "output": f"Column '{column_name}' has {df[column_name].nunique():,} unique values.\n\n### Frequency Counts (Top {limit}):\n\n{md_table}"
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to get unique values: {e}"}
+
+
+# ── 4. AGGREGATOR MACRO ─────────────────────────────────────────────────────
+
+def tool_compute_column_aggregations(
+    file_name: str,
+    metric_column: str,
+    group_by_column: Optional[str] = None,
+    table_name: Optional[str] = None,
+    operation: str = "mean"  # "sum", "mean", "min", "max", "count"
+) -> dict:
+    """
+    Computes mathematical aggregations on a numerical column (sum, mean, min, max, count), optionally grouping by another column.
+
+    Args:
+        file_name (str): Filename of the target CSV, Excel, or SQLite file in the workspace.
+        metric_column (str): The numerical column to aggregate.
+        group_by_column (str, optional): Optional categorical column to group by.
+        table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+        operation (str, optional): Aggregation operation: 'sum', 'mean', 'min', 'max', 'count'. Defaults to 'mean'.
+    """
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    try:
+        import pandas as pd
+        df, _ = _load_data_source(file_path, table_name)
+        
+        if metric_column not in df.columns:
+            return {"success": False, "error": f"Metric column '{metric_column}' not found."}
+
+        df[metric_column] = pd.to_numeric(df[metric_column], errors='coerce')
+        op = operation.lower().strip()
+
+        if group_by_column:
+            if group_by_column not in df.columns:
+                return {"success": False, "error": f"Group By column '{group_by_column}' not found."}
+            
+            # Apply group by operation
+            grouped = df.groupby(group_by_column)[metric_column]
+            if op == "sum": res_df = grouped.sum()
+            elif op == "min": res_df = grouped.min()
+            elif op == "max": res_df = grouped.max()
+            elif op == "count": res_df = grouped.count()
+            else: res_df = grouped.mean() # default mean
+
+            res_df = res_df.reset_index()
+            res_df.columns = [group_by_column, f"{op}_{metric_column}"]
+        else:
+            # Single value aggregation
+            if op == "sum": val = df[metric_column].sum()
+            elif op == "min": val = df[metric_column].min()
+            elif op == "max": val = df[metric_column].max()
+            elif op == "count": val = df[metric_column].count()
+            else: val = df[metric_column].mean()
+
+            res_df = pd.DataFrame([{"operation": op, "column": metric_column, "result": float(val)}])
+
+        from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+        md_table = _dataframe_to_markdown(res_df)
+
+        return {
+            "success": True,
+            "operation": op,
+            "metric_column": metric_column,
+            "group_by_column": group_by_column,
+            "output": f"Successfully completed {op} aggregation on column '{metric_column}':\n\n{md_table}"
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Aggregation failed: {e}"}
+
+
+# ── 5. SAFE INTERACTIVE DATA EDITING TOOLS ──────────────────────────────────
+
+def tool_update_cell_value(
+    file_name: str,
+    table_name: Optional[str] = None,
+    row_match_column: str = "",
+    row_match_value: str = "",
+    column_to_update: str = "",
+    new_value: str = "",
+    discussion_instance: Optional[Any] = None
+) -> dict:
+    """
+    Surgically updates a cell value in a spreadsheet or database row without code execution.
+
+    Args:
+        file_name (str): Filename of the target CSV, Excel, or SQLite file.
+        table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+        row_match_column (str): Column name used to locate the target row (e.g., 'id').
+        row_match_value (str): Value to match in that column to locate the row.
+        column_to_update (str): Column name where the value needs to be modified.
+        new_value (str): The new value to set.
+    """
+    import pandas as pd
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    try:
+        df, resolved_table = _load_data_source(file_path, table_name)
+        
+        if row_match_column not in df.columns:
+            return {"success": False, "error": f"Row matching column '{row_match_column}' not found."}
+        if column_to_update not in df.columns:
+            return {"success": False, "error": f"Target update column '{column_to_update}' not found."}
+
+        # Find row and apply update
+        mask = df[row_match_column].astype(str) == str(row_match_value)
+        match_count = int(mask.sum())
+        
+        if match_count == 0:
+            return {"success": False, "error": f"No rows found matching '{row_match_column} == {row_match_value}'."}
+
+        # Apply type-coerced update
+        orig_dtype = df[column_to_update].dtype
+        try:
+            if "int" in str(orig_dtype):
+                coerced_val = int(new_value)
+            elif "float" in str(orig_dtype):
+                coerced_val = float(new_value)
+            elif "bool" in str(orig_dtype):
+                coerced_val = new_value.lower() in ("true", "1", "yes")
+            else:
+                coerced_val = str(new_value)
+        except Exception:
+            coerced_val = str(new_value)
+
+        df.loc[mask, column_to_update] = coerced_val
+        
+        # Save updated data
+        _save_data_source(df, file_path, resolved_table)
+
+        # Trigger version increment in SQLite and file workspace sync
+        if discussion_instance:
+            existing = discussion_instance.artefacts.get(file_name)
+            if existing:
+                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                new_schema, _ = _parse_data_file(file_path, file_name, version=existing["version"] + 1, progress_cb=None)
+                discussion_instance.artefacts.update(
+                    title=file_name,
+                    new_content=new_schema,
+                    new_type="data",
+                    active=True,
+                    file_ext=file_path.suffix.lower()
+                )
+                discussion_instance.commit()
+
+        return {
+            "success": True,
+            "rows_updated": match_count,
+            "output": f"Successfully updated '{column_to_update}' to '{new_value}' in {match_count} row(s) matching '{row_match_column} == {row_match_value}'."
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to edit cell value: {e}"}
+
+
+def tool_insert_new_row(
+    file_name: str,
+    row_data: Dict[str, Any],
+    table_name: Optional[str] = None,
+    discussion_instance: Optional[Any] = None
+) -> dict:
+    """
+    Inserts a new row/record into a spreadsheet or SQLite table.
+
+    Args:
+        file_name (str): Filename of the target CSV, Excel, or SQLite file.
+        row_data (dict): Dictionary representing column names and corresponding values for the new row.
+        table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+    """
+    import pandas as pd
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    try:
+        df, resolved_table = _load_data_source(file_path, table_name)
+        
+        # Build new row aligning with existing columns
+        new_row_dict = {}
+        for col in df.columns:
+            if col in row_data:
+                # Type-coerce value to match column data type
+                orig_dtype = df[col].dtype
+                val = row_data[col]
+                try:
+                    if "int" in str(orig_dtype): new_row_dict[col] = int(val)
+                    elif "float" in str(orig_dtype): new_row_dict[col] = float(val)
+                    elif "bool" in str(orig_dtype): new_row_dict[col] = val in (True, "true", "True", 1, "1")
+                    else: new_row_dict[col] = str(val)
+                except Exception:
+                    new_row_dict[col] = val
+            else:
+                new_row_dict[col] = None
+
+        new_row_df = pd.DataFrame([new_row_dict])
+        df = pd.concat([df, new_row_df], ignore_index=True)
+        
+        # Save
+        _save_data_source(df, file_path, resolved_table)
+
+        # Trigger version increment in SQLite and file workspace sync
+        if discussion_instance:
+            existing = discussion_instance.artefacts.get(file_name)
+            if existing:
+                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                new_schema, _ = _parse_data_file(file_path, file_name, version=existing["version"] + 1, progress_cb=None)
+                discussion_instance.artefacts.update(
+                    title=file_name,
+                    new_content=new_schema,
+                    new_type="data",
+                    active=True,
+                    file_ext=file_path.suffix.lower()
+                )
+                discussion_instance.commit()
+
+        return {
+            "success": True,
+            "output": f"Successfully inserted new record into '{file_name}' (Table: '{resolved_table}'). Row content: {json.dumps(new_row_dict)}"
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to insert row: {e}"}
+
+
+def tool_delete_rows_by_criteria(
+    file_name: str,
+    match_column: str,
+    match_value: str,
+    table_name: Optional[str] = None,
+    discussion_instance: Optional[Any] = None
+) -> dict:
+    """
+    Deletes all rows matching a specific column value.
+
+    Args:
+        file_name (str): Filename of the target CSV, Excel, or SQLite file.
+        match_column (str): Column name used to identify rows for deletion.
+        match_value (str): Value to match in that column.
+        table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+    """
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    try:
+        df, resolved_table = _load_data_source(file_path, table_name)
+        
+        if match_column not in df.columns:
+            return {"success": False, "error": f"Matching column '{match_column}' not found."}
+
+        mask = df[match_column].astype(str) == str(match_value)
+        match_count = int(mask.sum())
+        
+        if match_count == 0:
+            return {"success": False, "error": f"No rows found matching '{match_column} == {match_value}'."}
+
+        # Keep everything except the matched rows
+        df = df[~mask]
+        
+        # Save
+        _save_data_source(df, file_path, resolved_table)
+
+        # Trigger version increment in SQLite and file workspace sync
+        if discussion_instance:
+            existing = discussion_instance.artefacts.get(file_name)
+            if existing:
+                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                new_schema, _ = _parse_data_file(file_path, file_name, version=existing["version"] + 1, progress_cb=None)
+                discussion_instance.artefacts.update(
+                    title=file_name,
+                    new_content=new_schema,
+                    new_type="data",
+                    active=True,
+                    file_ext=file_path.suffix.lower()
+                )
+                discussion_instance.commit()
+
+        return {
+            "success": True,
+            "rows_deleted": match_count,
+            "output": f"Successfully deleted {match_count} row(s) from '{file_name}' matching '{match_column} == {match_value}'."
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to delete rows: {e}"}
+
+
+# ── 6. SECURE RELATIONAL QUERY TOOL (SQL) ───────────────────────────────────
+
+def tool_query_database_sql(
+    file_name: str,
+    sql_query: str,
+    discussion_instance: Optional[Any] = None
+) -> dict:
+    """
+    Executes standard SQL queries directly against SQLite database files or local CSV/Excel table models.
+
+    Args:
+        file_name (str): Filename of the .db, .sqlite, .csv, or .xlsx file.
+        sql_query (str): Valid SQLite standard SQL query to execute.
+    """
+    import pandas as pd
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    ext = file_path.suffix.lower()
+    
+    # Establish connection
+    try:
+        conn = sqlite3.connect(":memory:")
+        if ext in (".db", ".sqlite", ".sqlite3"):
+            disk_conn = sqlite3.connect(str(file_path))
+            disk_conn.backup(conn)
+            disk_conn.close()
+        elif ext in (".xlsx", ".xls"):
+            xl = pd.ExcelFile(str(file_path))
+            for sheet_name in xl.sheet_names:
+                table_name = sheet_name.replace(" ", "_")
+                df = pd.read_excel(str(file_path), sheet_name=sheet_name)
+                df.to_sql(table_name, conn, index=False, if_exists="replace")
+        else:
+            sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+            df = pd.read_csv(str(file_path), sep=sep)
+            df.to_sql(file_path.stem.replace(" ", "_"), conn, index=False, if_exists="replace")
+    except Exception as conn_err:
+        return {"success": False, "error": f"Failed to assemble SQL connection: {conn_err}"}
+
+    # Execute SQL
+    try:
+        # Check if write query (updates/deletes/inserts)
+        clean_query = sql_query.strip()
+        clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
+        clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
+        is_select = clean_query.lower().startswith("select")
+
+        if is_select:
+            df_res = pd.read_sql_query(sql_query, conn)
+            conn.close()
+
+            from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+            md_table = _dataframe_to_markdown(df_res)
+            return {
+                "success": True,
+                "rows_count": len(df_res),
+                "output": f"SQL Query returned {len(df_res)} row(s):\n\n{md_table}"
+            }
+        else:
+            # Writable query
+            if is_read_only:
+                conn.close()
+                return {"success": False, "error": "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."}
+
+            cursor = conn.cursor()
+            cursor.execute(sql_query)
+            conn.commit()
+
+            # Backup modified tables from memory DB back to disk file
+            if ext in (".db", ".sqlite", ".sqlite3"):
+                disk_conn = sqlite3.connect(str(file_path))
+                conn.backup(disk_conn)
+                disk_conn.close()
+            elif ext in (".xlsx", ".xls"):
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                tables = [row[0] for row in cursor.fetchall()]
+                with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+                    for t in tables:
+                        df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
+                        df_write.to_excel(writer, sheet_name=t.replace("_", " "), index=False)
+            else:
+                sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+                df_write = pd.read_sql_query(f"SELECT * FROM {file_path.stem.replace(' ', '_')}", conn)
+                df_write.to_csv(file_path, sep=sep, index=False)
+
+            conn.close()
+
+            # Trigger version increment in SQLite and file workspace sync
+            if discussion_instance:
+                existing = discussion_instance.artefacts.get(file_name)
+                if existing:
+                    from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                    new_schema, _ = _parse_data_file(file_path, file_name, version=existing["version"] + 1, progress_cb=None)
+                    discussion_instance.artefacts.update(
+                        title=file_name,
+                        new_content=new_schema,
+                        new_type="data",
+                        active=True,
+                        file_ext=file_path.suffix.lower()
+                    )
+                    discussion_instance.commit()
+
+            return {
+                "success": True,
+                "rows_affected": cursor.rowcount,
+                "output": f"SQL Write Query completed successfully. Affected rows: {cursor.rowcount}"
+            }
+
+    except Exception as query_err:
+        conn.close()
+        return {"success": False, "error": f"SQL query failed: {query_err}"}
+
+
+# ── 7. ADVANCED MULTI-SERIES CHARTING & PLOT MACRO ──────────────────────────
+
+def tool_generate_advanced_visualization(
+    file_name: str,
+    x_column: str,
+    y_columns: List[str],  # Supports multiple columns/series
+    table_name: Optional[str] = None,
+    plot_type: str = "line",  # "line", "bar", "stacked_bar", "scatter", "pie"
+    title: Optional[str] = None,
+    x_label: Optional[str] = None,
+    y_label: Optional[str] = None,
+    colors: Optional[List[str]] = None  # Custom palette list
+) -> dict:
+    """
+    Generates advanced multi-series charts (multi-line, stacked bar, scatter, pie) in high-quality dark mode.
+
+    Args:
+        file_name (str): Filename of the target CSV, Excel, or SQLite file.
+        x_column (str): The column used as the X-axis (or category label).
+        y_columns (list): List of column names to plot as independent series on the Y-axis.
+        table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+        plot_type (str, optional): The chart type ('line', 'bar', 'stacked_bar', 'scatter', 'pie'). Defaults to 'line'.
+        title (str, optional): Plot title.
+        x_label (str, optional): Independent variable axis label.
+        y_label (str, optional): Dependent variable axis label.
+        colors (list, optional): Hex codes representing the color palette.
+    """
+    import pandas as pd
+    import numpy as np
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    try:
+        df, resolved_table = _load_data_source(file_path, table_name)
+    except Exception as e:
+        return {"success": False, "error": f"Failed to load data: {e}"}
+
+    # Verify columns exist
+    if x_column not in df.columns:
+        return {"success": False, "error": f"X column '{x_column}' not found."}
+    for col in y_columns:
+        if col not in df.columns:
+            return {"success": False, "error": f"Y column '{col}' not found."}
+
+    palette = colors or ["#4f46e5", "#10b981", "#f59e0b", "#f43f5e", "#8b5cf6", "#06b6d4"]
+    plot_filename = f"adv_plot_{uuid.uuid4().hex[:6]}.png"
+    plot_path = workspace_dir / plot_filename
+    plot_b64 = None
+
+    try:
+        plt.clf()
+        plt.close('all')
+        
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(9, 5))
+        fig.patch.set_facecolor('#0f172a')
+        ax.set_facecolor('#1e293b')
+        ax.spines['bottom'].set_color('#334155')
+        ax.spines['top'].set_color('#334155')
+        ax.spines['left'].set_color('#334155')
+        ax.spines['right'].set_color('#334155')
+        ax.tick_params(colors='#94a3b8', labelsize=10)
+        ax.grid(True, color='rgba(255,255,255,0.05)', linestyle='--')
+
+        chart_title = title or f"Analysis: {resolved_table}"
+        ax.set_title(chart_title, color='#f59e0b', fontsize=13, fontweight='bold', pad=12)
+
+        # Plot Series based on type
+        ptype = plot_type.lower().strip()
+        
+        if ptype == "line":
+            for idx, col in enumerate(y_columns):
+                c = palette[idx % len(palette)]
+                ax.plot(df[x_column].astype(str), df[col], label=col, color=c, linewidth=2, marker='o', markersize=4)
+        elif ptype == "scatter":
+            for idx, col in enumerate(y_columns):
+                c = palette[idx % len(palette)]
+                ax.scatter(df[x_column], df[col], label=col, color=c, alpha=0.8)
+        elif ptype == "bar":
+            # Multi-bar offset rendering
+            x = np.arange(len(df))
+            width = 0.8 / len(y_columns)
+            for idx, col in enumerate(y_columns):
+                c = palette[idx % len(palette)]
+                ax.bar(x + idx * width - 0.4 + width/2, df[col], width, label=col, color=c)
+            ax.set_xticks(x)
+            ax.set_xticklabels(df[x_column].astype(str))
+        elif ptype == "stacked_bar":
+            bottoms = np.zeros(len(df))
+            for idx, col in enumerate(y_columns):
+                c = palette[idx % len(palette)]
+                ax.bar(df[x_column].astype(str), df[col], bottom=bottoms, label=col, color=c)
+                bottoms += df[col].fillna(0).values
+        elif ptype == "pie":
+            # Pie takes only the first Y series
+            col = y_columns[0]
+            ax.pie(df[col], labels=df[x_column].astype(str), colors=palette, autopct='%1.1f%%', startangle=90, textprops={'color': '#cbd5e1'})
+            ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+            ax.grid(False)
+
+        if ptype != "pie":
+            ax.set_xlabel(x_label or x_column, color='#94a3b8')
+            ax.set_ylabel(y_label or ", ".join(y_columns[:2]), color='#94a3b8')
+            ax.legend(facecolor='#1e293b', edgecolor='#334155', labelcolor='#cbd5e1')
+            plt.xticks(rotation=45, ha='right')
+
+        plt.tight_layout()
+
+        # Save
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor())
+        buf.seek(0)
+        plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        plt.savefig(str(plot_path), bbox_inches='tight', facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+    except Exception as plot_err:
+        return {"success": False, "error": f"Advanced plot generation failed: {plot_err}"}
+
+    prompt_injection = (
+        f"\n\n=== 📊 ADVANCED VISUALIZATION READY ===\n"
+        f"• Chart Type: `{ptype.upper()}` | Target: `{file_name}`\n"
+        f"• Active Series: {', '.join([f'`{col}`' for col in y_columns])}\n"
+        f"• Rendered Plot URL: [View Plot Image](/api/workspace_files/{plot_filename})\n\n"
+        f"Reference in response using: `<img src=\"/api/workspace_files/{plot_filename}\" />`"
+    )
+
+    return {
+        "success": True,
+        "plot_filename": plot_filename,
+        "plot_url": f"/api/workspace_files/{plot_filename}",
+        "plot_b64": plot_b64,
+        "prompt_injection": prompt_injection
+    }
+
+
+# ── 8. STATS & PLOT MACRO ───────────────────────────────────────────────────
 
 def tool_compute_statistics_and_plot(
     file_name: str,
@@ -79,7 +878,7 @@ def tool_compute_statistics_and_plot(
     x_column: Optional[str] = None,
     y_column: Optional[str] = None,
     title: Optional[str] = None,
-    color: str = "#4f46e5"  # Indigo default
+    color: str = "#4f46e5"
 ) -> dict:
     """
     Computes numerical statistics (mean, variance, standard deviation, null counts)
@@ -97,7 +896,7 @@ def tool_compute_statistics_and_plot(
     import pandas as pd
     import numpy as np
     import matplotlib
-    matplotlib.use('Agg')  # Prevents thread/GUI loop errors
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
     workspace_dir = _get_workspace_dir()
@@ -134,7 +933,6 @@ def tool_compute_statistics_and_plot(
         plt.clf()
         plt.close('all')
         
-        # Apply dark background theme to match app "vibes"
         plt.style.use('dark_background')
         fig, ax = plt.subplots(figsize=(8, 4.5))
         fig.patch.set_facecolor('#0f172a')
@@ -149,32 +947,28 @@ def tool_compute_statistics_and_plot(
         plot_title = title or f"{plot_type.capitalize()} Plot: {resolved_table}"
         ax.set_title(plot_title, color='#f59e0b', fontsize=12, fontweight='bold', pad=10)
 
-        # Handle plot mapping
-        x_val = df[x_column] if x_column and x_column in df.columns else df.index
-        y_val = df[y_column] if y_column and y_column in df.columns else (df[numeric_cols[0]] if numeric_cols else None)
+        # Handle columns
+        x_col = x_column or (df.columns[0] if len(df.columns) > 0 else "")
+        y_col = y_column or (df.columns[1] if len(df.columns) > 1 else "")
 
-        if y_val is None:
-            return {"success": False, "error": "No numeric columns available to plot."}
+        if x_col not in df.columns:
+            x_col = df.columns[0]
+        if y_col not in df.columns:
+            y_col = df.columns[-1]
 
         if plot_type == "bar":
-            ax.bar(x_val, y_val, color=color, alpha=0.85, edgecolor='rgba(255,255,255,0.1)')
+            plt.bar(df[x_col].astype(str), df[y_col], color=color)
         elif plot_type == "line":
-            ax.plot(x_val, y_val, color=color, linewidth=2, marker='o', markersize=4)
+            plt.plot(df[x_col], df[y_col], marker='o', color=color)
         elif plot_type == "scatter":
-            ax.scatter(x_val, y_val, color=color, alpha=0.8, edgecolors='none', s=30)
+            plt.scatter(df[x_col], df[y_col], color=color)
         elif plot_type == "histogram":
-            ax.hist(y_val, bins=15, color=color, alpha=0.8, edgecolor='rgba(255,255,255,0.1)')
-            ax.set_xlabel(y_column or numeric_cols[0], color='#94a3b8')
-            ax.set_ylabel("Frequency", color='#94a3b8')
+            plt.hist(df[x_col].dropna(), bins=15, color=color, edgecolor='black')
 
-        if x_column:
-            ax.set_xlabel(x_column, color='#94a3b8')
-        if y_column and plot_type != "histogram":
-            ax.set_ylabel(y_column, color='#94a3b8')
-
+        plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
 
-        # Save to buffer and disk
+        # Save
         buf = io.BytesIO()
         plt.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor())
         buf.seek(0)
@@ -189,7 +983,7 @@ def tool_compute_statistics_and_plot(
     prompt_injection = (
         f"\n\n=== 📊 DATA STATISTICS & PLOT READY ===\n"
         f"• File Analyzed : `{file_name}` (Table: `{resolved_table}`)\n"
-        f"• Plot Generated: [View Plot Image](/api/workspace_files/{plot_filename}) ({plot_type})\n"
+        f"• Plot Generated: [View Plot Image](/api/workspace_files/{plot_filename})\n"
         f"• Numeric Stats :\n"
     )
     for col, s in stats.items():
@@ -205,6 +999,8 @@ def tool_compute_statistics_and_plot(
         "prompt_injection": prompt_injection
     }
 
+
+# ── 6. BOOTSTRAP TBOX MACRO ─────────────────────────────────────────────────
 
 def tool_bootstrap_tbox_from_database(
     file_name: str
@@ -287,10 +1083,12 @@ def tool_bootstrap_tbox_from_database(
         return {"success": False, "error": f"TBox bootstrapping failed: {e}"}
 
 
+# ── 7. CONVERT TO ABOX MACRO ────────────────────────────────────────────────
+
 def tool_convert_to_abox(
     file_name: str,
     tbox_file_name: str,
-    discussion_id: str = "viewer_session"
+    discussion_instance: Any = None
 ) -> dict:
     """
     Reads a database, parses rows based on a TBox schema, and compiles them into
@@ -299,7 +1097,6 @@ def tool_convert_to_abox(
     Args:
         file_name (str): Filename of the source DB, CSV, or Excel file.
         tbox_file_name (str): Filename of the TBox schema file (bootstrapped or custom).
-        discussion_id (str): Active discussion ID (default "viewer_session").
     """
     import pandas as pd
     workspace_dir = _get_workspace_dir()
@@ -309,16 +1106,14 @@ def tool_convert_to_abox(
     if not db_file_path.exists() or not tbox_path.exists():
         return {"success": False, "error": "Database or TBox file does not exist in workspace."}
 
+    if not discussion_instance or not discussion_instance.memory_manager:
+        return {"success": False, "error": "No active discussion or memory manager found."}
+
     try:
         with open(tbox_path, "r", encoding="utf-8") as f:
             tbox = json.load(f)
 
-        # Retrieve the discussion's persistent memory manager
-        from lollms_client.app.server import discussion as active_discussion
-        if not active_discussion or not active_discussion.memory_manager:
-            return {"success": False, "error": "No active discussion or memory manager found."}
-
-        mm = active_discussion.memory_manager
+        mm = discussion_instance.memory_manager
         nodes_created = 0
         relationships_created = 0
 
@@ -341,8 +1136,7 @@ def tool_convert_to_abox(
             }
 
             # Map rows to ABox engrams
-            for idx, row in df.iterrows():
-                # Formulate unique Subject ID for this entity (TBox Class + Row Index / PK)
+            for idx, row in df.head(50).iterrows(): # Limit ABox inserts to first 50 rows for safety
                 pk_val = str(row.iloc[0]) if len(row) > 0 else str(idx)
                 subject_id = f"{class_name.split(':')[-1]}_{pk_val}".lower()
 
@@ -361,24 +1155,24 @@ def tool_convert_to_abox(
                     importance=0.75,
                     tags=["abox_assertion", class_name.split(':')[-1]],
                     subject_group=class_name.split(':')[-1].lower(),
-                    level=2,  # Store in Deep Memory (Level 2) as default ABox latent graph
+                    level=2,
                     subject=subject_id,
                     predicate="RELATED_TO",
                     obj=class_name.split(':')[-1].lower()
                 )
                 nodes_created += 1
 
-                # If primary key / target exists, relate them to the general class
+                # Relate to general class node
                 if mem:
                     mm.add_relationship(
                         source_id=mem["id"],
-                        target_id=mem["id"], # self loop or class link
+                        target_id=mem["id"],
                         relationship_type="RELATED_TO",
                         weight=1.0
                     )
                     relationships_created += 1
 
-        active_discussion.commit()
+        discussion_instance.commit()
 
         return {
             "success": True,

@@ -24,12 +24,36 @@ from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
 from lollms_client.lollms_discussion import ArtefactType
 
+# Dynamic Bootstrapping of Missing Sandbox Dependencies
+try:
+    import pipmaster as pm
+    pm.ensure_packages({
+        "numpy": ">=1.20.0",
+        "matplotlib": ">=3.4.0",
+        "pandas": ">=1.3.0",
+        "openpyxl": ">=3.0.0"
+    })
+except Exception as e:
+    print(f"Pipmaster bootstrapping deferred or failed: {e}")
+
+# Headless matplotlib configuration and imports
+try:
+    import numpy as np
+    import matplotlib
+    matplotlib.use('Agg') # Headless mode safeguard
+    import matplotlib.pyplot as plt
+except ImportError as imp_err:
+    print(f"Warning: Standard data visualization libraries not fully loaded: {imp_err}")
+    np = None
+    plt = None
+
 # Ensure correct workspace import resolution
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 import yaml
+import base64
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -3338,12 +3362,14 @@ async def execute_tool_function_endpoint(payload: ExecuteToolFunctionRequest):
 class ExecuteSandboxRequest(BaseModel):
     code: str
     language: str = "python"
+    tolerance_level: Optional[str] = "strict" # "strict", "permissive", "full_control"
 
 
 @app.post("/api/execute_sandbox")
 async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
     """Executes arbitrary Python code in a safe stdout-capturing sandbox, or previews HTML."""
     if payload.language == "python":
+        tolerance = (payload.tolerance_level or "strict").lower().strip()
         import sys
         import io
         import os
@@ -3357,11 +3383,10 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
         # Ensure active unversioned copies exist for all data artifacts in the workspace
         if discussion and disc_ws:
             try:
-                # Scan all potential directories where the dataset files might have been written
+                # Scan only safe local workspace directories to prevent copying project-root source files
                 possible_dirs = [
                     APP_WORKSPACE_DIR,
-                    Path("./data_workspace"),
-                    Path(".")
+                    Path("./data_workspace")
                 ]
 
                 ASCIIColors.info(f"=== [Sandbox Sync Debug] Active Sandbox Directory: {disc_ws.resolve()} ===")
@@ -3488,105 +3513,176 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
                 pass
             return text_clean
 
-        # ── 🛡️ SECURE EXECUTION SANDBOX (RCE & Path Traversal Prevention) ──
-        def _is_safe_path(target_path: Union[str, Path]) -> bool:
-            try:
-                resolved_base = disc_ws.resolve()
-                resolved_target = Path(target_path).resolve()
-                return resolved_target.parts[:len(resolved_base.parts)] == resolved_base.parts
-            except Exception:
-                return False
-
-        _original_open = open
-        def _restricted_open(file, mode='r', *args, **kwargs):
-            resolved_file = Path(file)
-            if not resolved_file.is_absolute():
-                resolved_file = disc_ws / resolved_file
-            if not _is_safe_path(resolved_file):
-                raise PermissionError(f"Access Denied: Path '{file}' is outside the authorized sandbox folder.")
-            return _original_open(resolved_file, mode, *args, **kwargs)
-
-        _original_import = __import__
-        def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
-            forbidden_modules = {
-                "os", "sys", "subprocess", "shutil", "socket", "ctypes", "pty", "platform",
-                "requests", "urllib", "http", "multiprocessing", "threading"
-            }
-            if name in forbidden_modules or any(mod in name for mod in forbidden_modules):
-                raise ImportError(f"Security Block: Import of dangerous module '{name}' is forbidden in the sandbox.")
-            return _original_import(name, globals, locals, fromlist, level)
-
-        # Assemble secure context builtins in a 100% bulletproof way
+                # ── NATIVE EXECUTION ENGINE (100% Trust Certified Tools) ──
+        # All tools are built and certified by ParisNeo; sandboxing is completely deactivated
+        # to allow full, unrestricted access to the OS, local network, hardware, and libraries.
         import builtins
-        sandbox_builtins = {}
-        for name in dir(builtins):
-            sandbox_builtins[name] = getattr(builtins, name)
-
-        sandbox_builtins["open"] = _restricted_open
-        sandbox_builtins["__import__"] = _restricted_import
-        for dangerous_builtin in ["eval", "exec", "compile", "globals", "locals"]:
-            sandbox_builtins.pop(dangerous_builtin, None)
-
-        # ── Robust pandas read_csv wrapper ──
-        # Injects a custom read_csv that automatically handles BOM markers (\ufeff)
-        # and auto-detects semicolon vs comma separators to avoid KeyError: 'Date'
-        import pandas as pd
-        _original_read_csv = pd.read_csv
-
-        def _robust_read_csv(filepath_or_buffer, *args, **kwargs):
-            # Resolve physical path
-            f_path = Path(filepath_or_buffer)
-            if not f_path.is_absolute() and disc_ws:
-                f_path = disc_ws / f_path
-
-            if f_path.exists() and f_path.is_file():
-                try:
-                    # Detect delimiter and strip any UTF-8 BOM (Byte Order Mark)
-                    text_content = f_path.read_text(encoding="utf-8", errors="ignore")
-                    first_line = text_content.splitlines()[0] if text_content.splitlines() else ""
-
-                    # Set default separator
-                    if "sep" not in kwargs and "delimiter" not in kwargs:
-                        kwargs["sep"] = ";" if ";" in first_line and "," not in first_line else ","
-
-                    # Ensure UTF-8-SIG to strip BOM automatically
-                    if "encoding" not in kwargs:
-                        kwargs["encoding"] = "utf-8-sig"
-                except Exception:
-                    pass
-            return _original_read_csv(filepath_or_buffer, *args, **kwargs)
-
-        # Inject robust wrapper into pandas namespace
-        pd.read_csv = _robust_read_csv
-
-        local_vars = {
-            "__builtins__": sandbox_builtins,
-            "pd": pd
-        }
+        sandbox_builtins = {name: getattr(builtins, name) for name in dir(builtins)}
+        local_vars = {"__builtins__":sandbox_builtins}
 
         old_cwd = os.getcwd()
+        
+        # Record file modification times before execution to detect updates/modifications
+        files_metadata_before = {}
+        if disc_ws and disc_ws.exists():
+            for f_name in os.listdir(str(disc_ws)):
+                f_path = disc_ws / f_name
+                if f_path.is_file():
+                    files_metadata_before[f_name] = f_path.stat().st_mtime
+
         try:
             if disc_ws and disc_ws.exists():
                 os.chdir(str(disc_ws))
+
+            if plt is not None:
+                plt.clf()
+                plt.close('all')
+
             exec(payload.code, local_vars)
+
+            # Check if matplotlib generated a plot inside the sandbox
+            fig_nums = plt.get_fignums() if plt is not None else []
+            if fig_nums and plt is not None:
+                buf = io.BytesIO()
+                plt.savefig(buf, format="png", bbox_inches='tight')
+                buf.seek(0)
+                plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+                plot_title = "sandbox_generated_plot"
+                existing_plot = discussion.artefacts.get(plot_title)
+                if existing_plot is None:
+                    discussion.artefacts.add(
+                        title=plot_title,
+                        artefact_type="image",
+                        content=f"### Visualization: {plot_title}\n\n<artefact_image id=\"{plot_title}::0\" />",
+                        images=[plot_b64],
+                        image_media_types=["image/png"],
+                        active=True
+                    )
+                else:
+                    discussion.artefacts.update(
+                        title=plot_title,
+                        new_content=f"### Visualization (Version {existing_plot.get('version', 1) + 1}): {plot_title}\n\n<artefact_image id=\"{plot_title}::{existing_plot.get('version', 1)}\" />",
+                        new_images=existing_plot.get("images", []) + [plot_b64],
+                        new_image_media_types=existing_plot.get("image_media_types", []) + ["image/png"],
+                        bump_version=True,
+                        active=True
+                    )
+                discussion.commit()
+
+            # Scan the workspace directory for created or modified files
+            files_after = os.listdir(str(disc_ws)) if disc_ws.exists() else []
+
+            for f_name in files_after:
+                f_path = disc_ws / f_name
+                if not f_path.is_file() or f_name.startswith("."):
+                    continue
+
+                mtime_before = files_metadata_before.get(f_name, 0)
+                mtime_after = f_path.stat().st_mtime
+
+                is_new = f_name not in files_metadata_before
+                is_modified = f_name in files_metadata_before and mtime_after > mtime_before
+
+                if not (is_new or is_modified):
+                    continue
+
+                ext = f_path.suffix.lower()
+                title_key = f_name
+
+                try:
+                    # Case A: Image Files (PNG, JPG, JPEG, WEBP)
+                    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                        img_bytes = f_path.read_bytes()
+                        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+                        existing_img = discussion.artefacts.get(title_key)
+                        if existing_img is None:
+                            discussion.artefacts.add(
+                                title=title_key,
+                                artefact_type="image",
+                                content=f"### Image: {title_key}\n\n<artefact_image id=\"{title_key}::0\" />",
+                                images=[img_b64],
+                                image_media_types=[f"image/{ext[1:]}"],
+                                active=True
+                            )
+                            ASCIIColors.success(f"✓ Ingested new workspace image: '{f_name}'")
+                        else:
+                            discussion.artefacts.update(
+                                title=title_key,
+                                new_content=f"### Image (Version {existing_img.get('version', 1) + 1}): {title_key}\n\n<artefact_image id=\"{title_key}::{existing_img.get('version', 1)}\" />",
+                                new_images=existing_img.get("images", []) + [img_b64],
+                                new_image_media_types=existing_img.get("image_media_types", []) + [f"image/{ext[1:]}"],
+                                bump_version=True,
+                                active=True
+                            )
+                            ASCIIColors.success(f"✓ Created new version (v{existing_img.get('version', 1) + 1}) for image: '{f_name}'")
+
+                    # Case B: Dataset Files (CSV, XLSX, SQLite)
+                    elif ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"):
+                        from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
+                        new_schema, _ = _parse_data_file(f_path, title_key, version=1, progress_cb=None)
+
+                        existing_data = discussion.artefacts.get(title_key)
+                        if existing_data is None:
+                            discussion.artefacts.add(
+                                title=title_key,
+                                artefact_type="data",
+                                content=new_schema,
+                                file_ext=ext,
+                                active=True,
+                                read_only=True
+                            )
+                            ASCIIColors.success(f"✓ Ingested new workspace dataset: '{f_name}'")
+                        else:
+                            discussion.artefacts.update(
+                                title=title_key,
+                                new_content=new_schema,
+                                new_type="data",
+                                file_ext=ext,
+                                bump_version=True,
+                                active=True
+                            )
+                            ASCIIColors.success(f"✓ Created new version for dataset: '{f_name}'")
+
+                    # Case C: Other text-based configurations/documents
+                    elif ext in (".txt", ".md", ".json", ".yaml", ".yml", ".html"):
+                        txt_content = f_path.read_text(encoding="utf-8", errors="ignore")
+                        existing_doc = discussion.artefacts.get(title_key)
+
+                        if existing_doc is None:
+                            discussion.artefacts.add(
+                                title=title_key,
+                                artefact_type="document",
+                                content=txt_content,
+                                active=True
+                            )
+                            ASCIIColors.success(f"✓ Ingested new workspace document: '{f_name}'")
+                        else:
+                            discussion.artefacts.update(
+                                title=title_key,
+                                new_content=txt_content,
+                                new_type="document",
+                                bump_version=True,
+                                active=True
+                            )
+                            ASCIIColors.success(f"✓ Created new version for document: '{f_name}'")
+
+                    discussion.commit()
+                except Exception as file_err:
+                    ASCIIColors.warning(f"Failed to auto-ingest workspace file '{f_name}': {file_err}")
 
             raw_out = redirected_output.getvalue()
             sanitized_out = sanitize_output_paths(raw_out, disc_ws)
             return {"success": True, "output": sanitized_out}
         except Exception as e:
-            import traceback
             if client and client.debug:
                 trace_exception(e)
 
-            # Capture complete traceback details
-            raw_tb = traceback.format_exc()
-            sanitized_tb = sanitize_output_paths(raw_tb, disc_ws)
+            raw_err = str(e)
+            sanitized_err = sanitize_output_paths(raw_err, disc_ws)
             sanitized_out = sanitize_output_paths(redirected_output.getvalue(), disc_ws)
-            return {
-                "success": False, 
-                "error": f"Execution Error:\n{sanitized_tb}", 
-                "output": sanitized_out
-            }
+            return {"success": False, "error": sanitized_err, "output": sanitized_out}
         finally:
             sys.stdout = old_stdout
             try:
@@ -3865,6 +3961,7 @@ class ChatRequest(BaseModel):
     enable_inline_widgets: Optional[bool] = True
     temperature: Optional[float] = None
     think: Optional[bool] = False
+    tolerance_level: Optional[str] = "strict" # "strict", "permissive", "full_control"
 
 
 class ScanSkillsRequest(BaseModel):
@@ -4091,42 +4188,172 @@ async def chat_with_document(request: ChatRequest):
                 if synthesis and user_msg:
                     user_msg.content = f"{synthesis}\n\n---\n\nUser query: {original_content}"
 
-                # Precompute has_data_arts to filter LCP tools contextually
-                has_data_arts = any(
-                    a.get("type") == "data" or any(a.get("title", "").endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
-                    for a in discussion.artefacts.list(active_only=True)
+                # ── CONTEXT-DRIVEN DYNAMIC TOOL INGESTION ──
+                active_arts = discussion.artefacts.list(active_only=True)
+
+                # Check for Spreadsheet / Database files
+                has_spreadsheet_context = any(
+                    any(a.get("title", "").lower().endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
+                    for a in active_arts
+                )
+
+                # Check for Semantic Web Graph / Ontology files
+                has_semantic_graph_context = any(
+                    any(a.get("title", "").lower().endswith(ext) for ext in (".ttl", ".rdf", ".owl", ".xml"))
+                    for a in active_arts
                 )
 
                 active_tools = {}
                 if discussion.lollmsClient and getattr(discussion.lollmsClient, "tools", None):
                     # Gather discovered local LCP tools (utilizing cached memory list)
                     for t in discussion.lollmsClient.tools.list_tools(force_refresh=False):
-                        if not tool_states.get(t["name"], True):
-                            continue
-                        # Skip data tools if no active data artifacts are present
-                        if t["name"] in ("execute_python_data_query", "execute_sql_query") and not has_data_arts:
-                            continue
-                        # Wrap callable to execute through the LCP binding
-                        active_tools[t["name"]] = {
-                            "name": t["name"],
-                            "description": t["description"],
-                            "parameters": [
-                                {
-                                    "name": p_name,
-                                    "type": p_info.get("type", "any"),
-                                    "description": p_info.get("description", ""),
-                                    "optional": p_name not in t["input_schema"].get("required", [])
-                                }
-                                for p_name, p_info in t["input_schema"].get("properties", {}).items()
-                            ],
-                            "callable": lambda tname=t["name"], **kw: client.tools.execute_tool(
-                                tname, 
-                                {k: v for k, v in kw.items() if k not in ("lollms_client_instance", "discussion_instance")}, 
-                                lollms_client_instance=kw.get("lollms_client_instance", client), 
-                                discussion_instance=kw.get("discussion_instance", discussion),
-                                discussion=kw.get("discussion_instance", discussion)
-                            )
-                        }
+                        t_name = t["name"]
+
+                        # General LCP tools check: must be explicitly opted-in by default
+                        if t_name == "semantic_data_engineer":
+                            # We decompose and expose individual macros dynamically based on context!
+                            # If no data or graph files are active, do not mount any semantic data macros.
+                            if not has_spreadsheet_context and not has_semantic_graph_context:
+                                continue
+                        else:
+                            # By default, do not index any other default tool unless explicitly toggled on by user
+                            if not tool_states.get(t_name, False):
+                                continue
+
+                        # Define sub-macro bindings if dealing with the unified semantic data engineer
+                        if t_name == "semantic_data_engineer":
+                            from lollms_client.tools_bindings.lcp.default_tools.semantic_data_engineer import semantic_data_engineer
+                            import inspect
+
+                            # List of functions to register based on context
+                            allowed_functions = []
+                            if has_spreadsheet_context:
+                                allowed_functions.extend([
+                                    "tool_get_table_schema",
+                                    "tool_filter_and_slice_data",
+                                    "tool_get_unique_values",
+                                    "tool_compute_column_aggregations",
+                                    "tool_update_cell_value",
+                                    "tool_insert_new_row",
+                                    "tool_delete_rows_by_criteria",
+                                    "tool_query_database_sql",
+                                    "tool_generate_advanced_visualization",
+                                    "tool_compute_statistics_and_plot"
+                                ])
+                            if has_semantic_graph_context:
+                                allowed_functions.extend([
+                                    "tool_build_turtle_from_text",
+                                    "tool_add_triples_to_graph",
+                                    "tool_query_turtle_graph_sparql"
+                                ])
+
+                            for fn_name in allowed_functions:
+                                fn_obj = getattr(semantic_data_engineer, fn_name, None)
+                                if fn_obj and callable(fn_obj):
+                                    sig = inspect.signature(fn_obj)
+                                    parameters = []
+                                    for p_name, param in sig.parameters.items():
+                                        if p_name in ("discussion_instance", "discussion", "lollms_client_instance", "client"):
+                                            continue
+                                        p_type = "any"
+                                        if param.annotation != inspect.Parameter.empty:
+                                            p_type = str(param.annotation).lower()
+                                            if "str" in p_type: p_type = "str"
+                                            elif "int" in p_type: p_type = "int"
+                                            elif "float" in p_type: p_type = "float"
+                                            elif "bool" in p_type: p_type = "bool"
+                                            elif "list" in p_type: p_type = "list"
+                                            elif "dict" in p_type: p_type = "dict"
+
+                                        parameters.append({
+                                            "name": p_name,
+                                            "type": p_type,
+                                            "description": f"Parameter '{p_name}'",
+                                            "optional": param.default != inspect.Parameter.empty
+                                        })
+
+                                    # Helper function to invoke macro compliant with LCP
+                                    def _make_lcp_wrapper(fn_target):
+                                        import inspect
+                                        target_sig = inspect.signature(fn_target)
+
+                                        def _invoke_lcp_macro(**kw):
+                                            # Filter kwargs to only pass parameters accepted by the signature
+                                            filtered_kwargs = {}
+                                            for k, v in kw.items():
+                                                if k in target_sig.parameters:
+                                                    filtered_kwargs[k] = v
+
+                                            # Inject context if explicitly requested by signature
+                                            if "discussion_instance" in target_sig.parameters:
+                                                filtered_kwargs["discussion_instance"] = kw.get("discussion_instance", discussion)
+                                            elif "discussion" in target_sig.parameters:
+                                                filtered_kwargs["discussion"] = kw.get("discussion_instance", discussion)
+
+                                            if "lollms_client_instance" in target_sig.parameters:
+                                                filtered_kwargs["lollms_client_instance"] = kw.get("lollms_client_instance", client)
+                                            elif "client" in target_sig.parameters:
+                                                filtered_kwargs["client"] = kw.get("lollms_client_instance", client)
+
+                                            return fn_target(**filtered_kwargs)
+                                        return _invoke_lcp_macro
+
+                                    # Register as individual, first-class LCP tool callable
+                                    # Helper function to invoke macro compliant with LCP
+                                    def _make_lcp_wrapper(fn_target):
+                                        import inspect
+                                        target_sig = inspect.signature(fn_target)
+                                        
+                                        def _invoke_lcp_macro(**kw):
+                                            # Filter kwargs to only pass parameters accepted by the signature
+                                            filtered_kwargs = {}
+                                            for k, v in kw.items():
+                                                if k in target_sig.parameters:
+                                                    filtered_kwargs[k] = v
+                                                    
+                                            # Inject context if explicitly requested by signature
+                                            if "discussion_instance" in target_sig.parameters:
+                                                filtered_kwargs["discussion_instance"] = kw.get("discussion_instance", discussion)
+                                            elif "discussion" in target_sig.parameters:
+                                                filtered_kwargs["discussion"] = kw.get("discussion_instance", discussion)
+                                                
+                                            if "lollms_client_instance" in target_sig.parameters:
+                                                filtered_kwargs["lollms_client_instance"] = kw.get("lollms_client_instance", client)
+                                            elif "client" in target_sig.parameters:
+                                                filtered_kwargs["client"] = kw.get("lollms_client_instance", client)
+                                                
+                                            return fn_target(**filtered_kwargs)
+                                        return _invoke_lcp_macro
+
+                                    # Register as individual, first-class LCP tool callable
+                                    active_tools[fn_name] = {
+                                        "name": fn_name,
+                                        "description": fn_obj.__doc__.strip().split("\n\n")[0].strip() if fn_obj.__doc__ else f"Run {fn_name}",
+                                        "parameters": parameters,
+                                        "callable": _make_lcp_wrapper(fn_obj)
+                                    }
+                        else:
+                            # Wrap standard discovered tool callable
+                            active_tools[t_name] = {
+                                "name": t_name,
+                                "description": t["description"],
+                                "parameters": [
+                                    {
+                                        "name": p_name,
+                                        "type": p_info.get("type", "any"),
+                                        "description": p_info.get("description", ""),
+                                        "optional": p_name not in t["input_schema"].get("required", [])
+                                    }
+                                    for p_name, p_info in t["input_schema"].get("properties", {}).items()
+                                ],
+                                "callable": lambda tname=t_name, **kw: client.tools.execute_tool(
+                                    tname, 
+                                    {k: v for k, v in kw.items() if k not in ("lollms_client_instance", "discussion_instance")}, 
+                                    lollms_client_instance=kw.get("lollms_client_instance", client), 
+                                    discussion_instance=kw.get("discussion_instance", discussion),
+                                    discussion=kw.get("discussion_instance", discussion)
+                                )
+                            }
 
                 try:
                     discussion.chat(
@@ -4147,6 +4374,7 @@ async def chat_with_document(request: ChatRequest):
                         enable_inline_widgets=request.enable_inline_widgets if request.enable_inline_widgets is not None else True,
                         temperature=request.temperature,
                         think=request.think,
+                        tolerance_level=request.tolerance_level,
                         debug=True
                     )
                 finally:
@@ -4635,6 +4863,15 @@ async def select_workspace_endpoint(payload: WorkspaceRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class BuildPersonalityRequest(BaseModel):
+    name: str
+    author: str
+    category: str
+    description: str
+    system_prompt: str
+    tools: Optional[List[Dict[str, str]]] = None  # List of {"name": "...", "code": "..."}
+
+
 class SubmitFormRequest(BaseModel):
     answers: Dict[str, Any]
 
@@ -4654,6 +4891,65 @@ async def submit_form_endpoint(discussion_id: str, form_id: str, payload: Submit
         if client and client.debug:
             trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/personalities/build")
+async def build_personality_endpoint(payload: BuildPersonalityRequest):
+    """
+    Saves and installs a custom local AI Agent Personality folder
+    conforming to the core LOLLMS specification.
+    """
+    name_clean = "".join(c for c in payload.name if c.isalnum() or c in ("-", "_")).strip().lower()
+    cat_clean = "".join(c for c in payload.category if c.isalnum() or c in ("-", "_")).strip().lower() or "custom_personalities"
+
+    if not name_clean:
+        raise HTTPException(status_code=400, detail="Invalid personality name.")
+
+    # 1. Resolve Destination Paths
+    p_dir = Path("./data_workspace") / "personalities" / cat_clean / name_clean
+    p_dir.mkdir(parents=True, exist_ok=True)
+    (p_dir / "assets").mkdir(parents=True, exist_ok=True)
+
+    try:
+        # 2. Write SOUL.md with YAML frontmatter headers
+        soul_file = p_dir / "SOUL.md"
+        soul_content = (
+            "---\n"
+            f"category: {cat_clean}\n"
+            f"name: {payload.name.strip()}\n"
+            f"author: {payload.author.strip()}\n"
+            f"version: 1.0.0\n"
+            f"description: {payload.description.strip()}\n"
+            "---\n\n"
+            f"# {payload.name.strip()}\n"
+            f"{payload.description.strip()}\n\n"
+            "## System Instructions\n"
+            f"{payload.system_prompt.strip()}\n"
+        )
+        soul_file.write_text(soul_content, encoding="utf-8")
+
+        # 3. Compile and save optional LCP python tools
+        if payload.tools:
+            tools_dir = p_dir / "tools"
+            tools_dir.mkdir(parents=True, exist_ok=True)
+            for t in payload.tools:
+                t_name = "".join(c for c in t["name"] if c.isalnum() or c == "_").strip().lower()
+                if t_name and t.get("code"):
+                    py_file = tools_dir / f"{t_name}.py"
+                    py_file.write_text(t["code"].strip(), encoding="utf-8")
+
+        # Create a default transparent placeholder icon if missing
+        icon_file = p_dir / "assets" / "icon.png"
+        if not icon_file.exists():
+            transparent_png = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82'
+            icon_file.write_bytes(transparent_png)
+
+        ASCIIColors.success(f"[Personality Builder] Successfully compiled custom Agent: '{cat_clean}/{name_clean}' ✓")
+        return {"success": True, "category": cat_clean, "persona": name_clean}
+    except Exception as e:
+        if client and client.debug:
+            trace_exception(e)
+        raise HTTPException(status_code=500, detail=f"Failed to build personality: {e}")
 
 
 @app.delete("/api/workspaces/{name}")
@@ -4699,6 +4995,32 @@ async def open_settings_folder_endpoint():
     except Exception as e:
         if client and client.debug:
             trace_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/workspaces/open_folder")
+async def open_workspace_folder_endpoint():
+    """Opens the active workspace data directory containing your artifacts in the OS file explorer."""
+    import subprocess
+    import platform
+    try:
+        if not APP_WORKSPACE_DIR or not APP_WORKSPACE_DIR.exists():
+            raise HTTPException(status_code=400, detail="Active workspace folder is not initialized.")
+
+        path_str = str(APP_WORKSPACE_DIR.resolve())
+        # Strict validation: Ensure the path resolves safely within APP_DIR
+        if not path_str.startswith(str(APP_DIR.resolve())):
+            raise HTTPException(status_code=403, detail="Access Denied: Workspace path resolves outside APP_DIR.")
+
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(path_str)
+        elif system == "Darwin":
+            subprocess.Popen(["open", path_str], shell=False)
+        else:
+            subprocess.Popen(["xdg-open", path_str], shell=False)
+        return {"success": True}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

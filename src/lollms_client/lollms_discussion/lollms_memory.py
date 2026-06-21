@@ -1467,3 +1467,125 @@ class FailureMemory:
             f["tool_name"] == tool_name and f["norm_params"] == norm 
             for f in self.failures
         )
+
+
+def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalizes parameter structures for robust duplicate and loop detection.
+    Strips internal thoughts, maps synonymous keys, and sorts alphabetically.
+    """
+    if not isinstance(params, dict):
+        return {}
+
+    # 1. Strip reasoning, explanation, thoughts keys
+    stripped = {
+        k: v for k, v in params.items() 
+        if k not in ("thoughts", "explanation", "scratchpad", "reasoning")
+    }
+
+    # 2. Map synonymous path keys to 'path' and normalize backslashes/dots
+    normalized = {}
+    for k, v in stripped.items():
+        if k in ("file_path", "filepath", "target", "path"):
+            normalized["path"] = str(v).replace("\\", "/").lstrip("./") if v else v
+        else:
+            normalized[k] = v
+
+    # 3. Sort keys alphabetically
+    return {k: normalized[k] for k in sorted(normalized.keys())}
+
+
+def sanitize_memory_content(text: str) -> str:
+    """
+    Strips accidental XML tags, unclosed brackets, and stray system markers
+    to prevent engram pollution.
+    """
+    if not text:
+        return ""
+    # 1. Strip complete XML-style tags
+    cleaned = re.sub(r'<[^>]+>', '', text)
+    # 2. Strip stray/unclosed brackets
+    cleaned = re.sub(r'<[^>]*$', '', cleaned)
+    cleaned = re.sub(r'^[^<]*>', '', cleaned)
+    return cleaned.strip()
+
+
+def auto_extract_ontology_from_content(content: str) -> Tuple[str, str, str, List[str]]:
+    """
+    Surgically extracts subject, predicate, object, and tags from plain text content
+    when the LLM omits them, preventing "unknown" pollution in the ABox.
+    """
+    content_lower = content.lower().strip()
+
+    # Defaults
+    subject = "concept"
+    predicate = "RELATED_TO"
+    obj = "general"
+    tags = ["concept"]
+
+    # 1. Identity / Name pattern (e.g. "My name is Saif")
+    name_match = re.search(r"\bmy\s+name\s+is\s+([a-zA-Z0-9_-]+)", content_lower)
+    if name_match:
+        subject = "user"
+        predicate = "PREFERS"
+        obj = name_match.group(1)
+        tags = ["user_name", "identity", "preference"]
+        return subject, predicate, obj, tags
+
+    # 2. Tool / Script patterns
+    if "tool" in content_lower or "lcp" in content_lower:
+        subject = "tool"
+        predicate = "IMPLEMENTS"
+        obj = "action"
+        tags = ["tool", "execution"]
+        return subject, predicate, obj, tags
+
+    # 3. Code / Refactoring patterns
+    if "code" in content_lower or "script" in content_lower or "fastapi" in content_lower:
+        subject = "code"
+        predicate = "IMPLEMENTS"
+        obj = "architecture"
+        tags = ["code", "development", "architecture"]
+        return subject, predicate, obj, tags
+
+    # 4. Fallback Keyword extractor for tags
+    keywords_map = {
+        "style": "style", "css": "style", "theme": "style",
+        "error": "error_log", "fail": "error_log", "bug": "error_log",
+        "standard": "standard", "rule": "standard", "guideline": "standard",
+        "fastapi": "fastapi", "server": "server", "backend": "backend"
+    }
+    for kw, tag in keywords_map.items():
+        if kw in content_lower:
+            tags.append(tag)
+            obj = tag
+
+    return subject, predicate, obj, list(set(tags))
+
+
+class FailureMemory:
+    """
+    Reflexive Short-Term Memory tracking tool execution failures
+    to prevent repetitive loops and guide adaptive recovery.
+    """
+    def __init__(self):
+        self.failures: List[Dict[str, Any]] = []
+
+    def record_failure(self, tool_name: str, params: Dict[str, Any], error: str):
+        """Log normalized representation of a failed tool execution."""
+        import time
+        self.failures.append({
+            "tool_name": tool_name,
+            "params": params,
+            "norm_params": normalize_parameters(params),
+            "error": str(error),
+            "timestamp": time.time()
+        })
+
+    def has_previous_failure(self, tool_name: str, params: Dict[str, Any]) -> bool:
+        """Check if this tool has failed with synonymous parameters previously."""
+        norm = normalize_parameters(params)
+        return any(
+            f["tool_name"] == tool_name and f["norm_params"] == norm 
+            for f in self.failures
+        )
