@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-22 22:22]
+
+- chore: bump version to 1.15.3
+
 ## [2026-06-22 01:27]
 
 - refactor: clean up formatting in app.js and _mixin_chat.py
