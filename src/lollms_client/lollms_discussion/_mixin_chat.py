@@ -16,7 +16,7 @@ from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE
 from ._message import LollmsMessage
 from ._artefacts import ArtefactType, make_image_id
-
+from .lollms_memory import FailureMemory
 # ── Cancellation state & limits ──────────────────────────────────────────────
 _MAX_BRACKET_BUF = 256
 
@@ -1041,6 +1041,7 @@ class ChatMixin:
                                     safe_output = html.escape(result_str[:2000] + ("..." if len(result_str) > 2000 else ""))
                                     details_block = f'<details class="proc-success-details"><summary>Output Logs</summary><pre>{safe_output}</pre></details>\n'
                         except Exception as e:
+                            trace_exception(e)
                             self.failure_memory.record_failure(tool_name, tool_params, str(e))
                             result_str = f"Error executing tool '{tool_name}': {e}"
                             clean_result_str = f"Error executing tool '{tool_name}': {e}"
