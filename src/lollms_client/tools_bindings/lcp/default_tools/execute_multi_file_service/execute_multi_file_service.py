@@ -13,7 +13,7 @@ import time
 import signal
 import json
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Optional, Any, List
 
 TOOL_LIBRARY_NAME = "MULTI_FILE_SERVICE_RUNNER"
 TOOL_LIBRARY_DESC = "Concurrently launches and manages a background Python backend (FastAPI/Flask) and a frontend web UI, handling port allocation and cleanup."
@@ -68,7 +68,9 @@ def tool_execute_multi_file_service(
     frontend_file: str = "index.html",
     backend_port: int = 8000,
     frontend_port: int = 8080,
-    uvicorn_app_import: str = "main:app"
+    uvicorn_app_import: str = "main:app",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Launches a Python web server (FastAPI/Uvicorn) in the background,
