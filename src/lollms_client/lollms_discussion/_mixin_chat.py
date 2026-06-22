@@ -9,7 +9,7 @@
 import re
 import json
 import uuid
-import time
+import os
 from typing import Any, Dict, List, Optional, Tuple, Callable, Union
 from types import SimpleNamespace
 from ascii_colors import ASCIIColors, trace_exception
@@ -55,6 +55,134 @@ def _cb(callback: Optional[Callable], text: str, msg_type: MSG_TYPE, meta: Optio
     except Exception as e:
         trace_exception(e)
     return True
+
+
+# ── Tool Result Sanitizer ───────────────────────────────────────────────────
+
+_BASE64_RE = re.compile(r'^[A-Za-z0-9+/=\s]{500,}$')
+
+# Field names whose values are typically large base64 binaries that should NOT
+# be fed back to the LLM (they bloat context, confuse the model, and trigger
+# tool-stutter loops where the LLM re-invokes the same tool on the data it
+# just produced).
+_BINARY_BLOB_KEYS = {
+    "plot_b64", "image_b64", "audio_b64", "video_b64", "file_b64",
+    "screenshot_b64", "pdf_b64", "thumbnail_b64", "base64",
+    "binary", "raw_image", "image_data", "raw_data",
+}
+
+_MAX_TOOL_RESULT_CHARS = 4000
+
+
+def _is_large_base64(v: str) -> bool:
+    """Heuristic: a long string composed of base64 alphabet + whitespace."""
+    sample = v.replace("\n", "").replace("\r", "").replace(" ", "")
+    if len(sample) < 500:
+        return False
+    return bool(_BASE64_RE.match(sample[:1000]))
+
+
+def _sanitize_tool_result(
+    tool_res: Any,
+    max_chars: int = _MAX_TOOL_RESULT_CHARS,
+) -> str:
+    """
+    Converts an arbitrary tool execution result into a clean, LLM-friendly
+    text representation.
+
+    Rules
+    -----
+    1.  If ``tool_res`` (or its LCP-wrapped ``output`` inner dict) exposes a
+        ``prompt_injection`` key anywhere in its tree, that string is used
+        verbatim. Tool authors craft ``prompt_injection`` to tell the LLM
+        *exactly* what to do next (e.g. reference the produced file with an
+        <img /> tag). Using it as the LLM-facing message prevents the LLM
+        from re-running the same tool on the freshly-produced artifact.
+    2.  Known large-binary fields (``plot_b64``, ``image_b64``, ...) are
+        stripped and replaced with a tiny "[base64 blob stripped: 24.3KB]"
+        note so the LLM knows a file was produced without ingesting the data.
+    3.  Any standalone long base64-looking string is replaced with the same
+        note (defence in depth).
+    4.  Any string longer than ``max_chars`` is truncated with an ellipsis.
+    5.  Lists are capped at 50 entries and walked recursively.
+    6.  The result is always returned as a plain ``str`` (JSON-serialised
+        when the input was structured).
+    """
+
+    def _find_prompt_injection(obj: Any, depth: int = 0) -> Optional[str]:
+        """Recursively hunt for a non-empty prompt_injection string anywhere in the tree."""
+        if depth > 4:
+            return None
+        if isinstance(obj, dict):
+            pinj = obj.get("prompt_injection")
+            if isinstance(pinj, str) and pinj.strip():
+                return pinj.strip()
+            for v in obj.values():
+                hit = _find_prompt_injection(v, depth + 1)
+                if hit:
+                    return hit
+        elif isinstance(obj, list):
+            for v in obj:
+                hit = _find_prompt_injection(v, depth + 1)
+                if hit:
+                    return hit
+        return None
+
+    def _walk(obj: Any, depth: int = 0) -> Any:
+        if depth > 6:
+            return "[truncated: depth limit]"
+        if obj is None or isinstance(obj, (bool, int, float)):
+            return obj
+        if isinstance(obj, str):
+            if _is_large_base64(obj):
+                approx_kb = len(obj) * 3 / 4 / 1024
+                return f"[base64 blob stripped: {approx_kb:.1f}KB]"
+            if len(obj) > max_chars:
+                return obj[:max_chars] + f"\n... [truncated, {len(obj) - max_chars} more chars]"
+            return obj
+        if isinstance(obj, dict):
+            cleaned: Dict[str, Any] = {}
+            for k, v in obj.items():
+                if k in _BINARY_BLOB_KEYS:
+                    if isinstance(v, str) and v:
+                        approx_kb = len(v) * 3 / 4 / 1024
+                        cleaned[k] = f"[base64 blob stripped: {approx_kb:.1f}KB]"
+                    elif isinstance(v, (list, tuple)) and v:
+                        approx_kb = sum(len(x) for x in v if isinstance(x, str)) * 3 / 4 / 1024
+                        cleaned[k] = f"[list of {len(v)} base64 blobs stripped: {approx_kb:.1f}KB]"
+                    else:
+                        cleaned[k] = None
+                else:
+                    cleaned[k] = _walk(v, depth + 1)
+            return cleaned
+        if isinstance(obj, (list, tuple)):
+            walked = [_walk(v, depth + 1) for v in obj[:50]]
+            if len(obj) > 50:
+                walked.append(f"... [truncated, {len(obj) - 50} more items]")
+            return walked
+        return str(obj)
+
+    # 1. Prefer the tool's hand-crafted prompt_injection when available (searches the whole tree)
+    pinj = _find_prompt_injection(tool_res)
+    if pinj:
+        # Look for success status somewhere in the result
+        success = True
+        inner = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
+        if isinstance(inner, dict):
+            success = inner.get("success", True)
+        success_status = "✓ Success" if success else "⚠ Partial Success"
+        return f"{success_status}\n{pinj}"
+
+    # 2. Otherwise, walk the result and strip blobs
+    sanitized = _walk(tool_res)
+    try:
+        text = json.dumps(sanitized, indent=2, default=str, ensure_ascii=False)
+    except Exception:
+        text = str(sanitized)
+
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n... [truncated, {len(text) - max_chars} more chars]"
+    return text
 
 
 def _resolve_handle(ref: str, branch_messages: List) -> Optional[Dict[str, str]]:
@@ -224,145 +352,6 @@ class _StreamState:
             keep_generating = self._dispatch_closed_tag(tag_name, attrs_str, body, full_match_text)
             if not keep_generating:
                 return False
-
-        return True
-
-    def _dispatch_closed_tag(self, tag_name: str, attrs_str: str, body: str, full_match_text: str) -> bool:
-        # Parse attributes with robust quote-style support
-        attrs = {}
-        for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
-            attrs[m.group(1).lower()] = m.group(2)
-
-        # 1. Artifact Creation & Patching
-        if tag_name in ("artifact", "artefact"):
-            if not self.enable_artefacts:
-                return True
-
-            # Retrieve the exact filename/title attributes (e.g. mock_plot_data.csv)
-            title = attrs.get("name") or attrs.get("title") or f"artifact_{uuid.uuid4().hex[:8]}"
-            atype = attrs.get("type", "document")
-            lang = attrs.get("language")
-            is_ephemeral = attrs.get("ephemeral", "false").lower() in ("true", "1", "yes")
-
-            # Extract the actual file extension (e.g. .csv) to ensure proper disk synchronization
-            file_ext = os.path.splitext(title)[1].lower() if "." in title else None
-
-            is_new = self.discussion.artefacts.get(title) is None
-            is_patch = "<<<<<<< SEARCH" in body
-
-            if is_patch and not is_new:
-                existing = self.discussion.artefacts.get(title)
-                try:
-                    patched = self.discussion.artefacts.apply_aider_patch(existing["content"], body)
-                    art = self.discussion.artefacts.update(
-                        title=title, new_content=patched, language=lang, bump_version=True, active=self.auto_activate,
-                        ephemeral=is_ephemeral, file_ext=file_ext
-                    )
-                except Exception as e:
-                    ASCIIColors.error(f"Failed to apply patch: {e}")
-                    art = None
-            else:
-                if is_new:
-                    art = self.discussion.artefacts.add(
-                        title=title, artefact_type=atype, content=body, language=lang, active=self.auto_activate,
-                        ephemeral=is_ephemeral, file_ext=file_ext
-                    )
-                else:
-                    art = self.discussion.artefacts.update(
-                        title=title, new_content=body, new_type=atype, language=lang, bump_version=True, active=self.auto_activate,
-                        ephemeral=is_ephemeral, file_ext=file_ext
-                    )
-
-            if art:
-                self.affected_artefacts.append(art)
-                _cb(self.callback, f"Artifact '{title}' successfully updated.", MSG_TYPE.MSG_TYPE_INFO)
-            
-            # ── SWIFT REPLACEMENT PROTOCOL ──
-            # Replaces the raw XML block in the message body with a stable, self-closing Lollms Artifact Anchor tag.
-            # This completely avoids context bloat and prevents any in-stream UI flickering.
-            version_val = art.get("version", 1) if art else 1
-            anchor = f'\n<lollms_artifact id="{title}" type="{atype}" version="{version_val}" />\n'
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, anchor)
-
-            # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
-            _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                "type": "artifact_updated" if not is_new else "artifact_created",
-                "title": title,
-                "version": version_val,
-                "art_type": atype
-            })
-            return True
-
-        # 2. Tools Execution Trigger
-        elif tag_name in ("tool_call", "tool"):
-            self.tool_trigger = True
-            self.tool_json_data = body
-            # Halt generation instantly so the executor can take over the loop
-            return False
-
-        # 3. User Note
-        elif tag_name == "note":
-            if not self.enable_notes:
-                return True
-            title = attrs.get("title") or attrs.get("name") or f"note_{uuid.uuid4().hex[:8]}"
-            art = self.discussion.artefacts.add(
-                title=title, artefact_type=ArtefactType.NOTE, content=body, active=self.auto_activate
-            )
-            if art:
-                self.affected_artefacts.append(art)
-
-            anchor = f'\n<lollms_artifact id="{title}" type="note" version="1" />\n'
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, anchor)
-            _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                "type": "artifact_created",
-                "title": title,
-                "art_type": "note"
-            })
-            return True
-
-        # 4. Long-term Skill
-        elif tag_name == "skill":
-            if not self.enable_skills:
-                return True
-            title = attrs.get("title") or attrs.get("name") or f"skill_{uuid.uuid4().hex[:8]}"
-            desc = attrs.get("description", "")
-            cat = attrs.get("category", "")
-            art = self.discussion.artefacts.add(
-                title=title, artefact_type=ArtefactType.SKILL, content=body, active=self.auto_activate, description=desc, category=cat
-            )
-            if art:
-                self.affected_artefacts.append(art)
-
-            anchor = f'\n<lollms_artifact id="{title}" type="skill" version="1" />\n'
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, anchor)
-            _cb(self.callback, anchor, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
-                "type": "artifact_created",
-                "title": title,
-                "art_type": "skill"
-            })
-            return True
-
-        # 5. Multi-tier Context Unlocks
-        elif tag_name == "add_files_to_context":
-            from ._artefacts import ArtefactVisibility
-            targets = [t.strip() for t in body.splitlines() if t.strip()]
-            unlocked_files = []
-
-            for t_file in targets:
-                art = self.discussion.artefacts.get(t_file)
-                if art:
-                    self.discussion.artefacts.set_visibility(t_file, ArtefactVisibility.FULL)
-                    unlocked_files.append(t_file)
-
-            if unlocked_files:
-                self.discussion.commit()
-                status_text = f"Unlocked and fully loaded {len(unlocked_files)} file(s) into context: " + ", ".join([f"'{f}'" for f in unlocked_files])
-                ASCIIColors.success(f"[Context Unlock] {status_text}")
-
-            placeholder = f"\n[unlocked and loaded context files: {', '.join(unlocked_files)}]\n"
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_CHUNK)
-            return True
 
         return True
 
@@ -747,6 +736,14 @@ class ChatMixin:
             "# python code here\n"
             "```\n"
             "Never output raw code or markup directly in conversational text without these code blocks.\n"
+            "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
+            "When a tool successfully returns a file (image, plot, screenshot, PDF, audio, etc.), "
+            "the file is ALREADY saved to the workspace by the tool. Do NOT call the same tool "
+            "again with the same parameters to regenerate it. Instead, reference the produced "
+            "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
+            "for images) and STOP generating. Repeating a successful tool call wastes tokens and "
+            "may trigger anti-loop protection. The tool's response already contains the exact "
+            "filename and URL you need to reference it.\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
             "If you decide to output a thought process enclosed in <think>...</think> tags, "
             "you MUST output all functional XML tags (such as <artifact>, <tool_call>, or <mem_new>) "
@@ -1006,30 +1003,42 @@ class ChatMixin:
                                     error_msg = tool_res.get("error", "Unknown tool error")
                                     self.failure_memory.record_failure(tool_name, tool_params, error_msg)
                                     result_str = f"Error executing tool '{tool_name}': {error_msg}"
-                                    
+                                    clean_result_str = result_str  # Errors are already concise and safe to feed back
+
                                     # Write error block
                                     status_done_line = f"* Completed execution with errors.\n"
                                     details_block = f'<details class="proc-error-details"><summary>Error Logs</summary><pre>{html.escape(error_msg)}</pre></details>\n'
                                 else:
-                                    result_str = tool_res.get("output", json.dumps(tool_res, indent=2))
+                                    # ── Stash the full raw output for the UI; build a sanitized
+                                    #    version (no base64 blobs, prefers prompt_injection) to
+                                    #    feed back to the LLM. This prevents the tool-stutter
+                                    #    loop where the model re-invokes the same tool on the
+                                    #    raw base64 data it just received.
+                                    raw_output = tool_res.get("output", tool_res)
+                                    if isinstance(raw_output, (dict, list)):
+                                        full_dump = json.dumps(raw_output, indent=2, default=str)
+                                    else:
+                                        full_dump = str(raw_output)
+                                    result_str = full_dump
+                                    clean_result_str = _sanitize_tool_result(tool_res)
                                     # Trigger evolutionary reflection on successful recovery
-                                    self._trigger_evolutionary_reflection(tool_name, tool_params, result_str)
-                                    
+                                    self._trigger_evolutionary_reflection(tool_name, tool_params, clean_result_str)
+
                                     # Write success block
                                     status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
-                                    clean_result_str = str(result_str)
-                                    safe_output = html.escape(clean_result_str[:2000] + ("..." if len(clean_result_str) > 2000 else ""))
+                                    safe_output = html.escape(full_dump[:2000] + ("..." if len(full_dump) > 2000 else ""))
                                     details_block = f'<details class="proc-success-details"><summary>Output Logs</summary><pre>{safe_output}</pre></details>\n'
                             else:
                                 result_str = str(tool_res)
                                 if "error" in result_str.lower() or "fail" in result_str.lower():
                                     self.failure_memory.record_failure(tool_name, tool_params, result_str)
+                                    clean_result_str = result_str  # Errors are already concise and safe
                                     status_done_line = f"* Completed execution with errors.\n"
                                     details_block = f'<details class="proc-error-details"><summary>Error Logs</summary><pre>{html.escape(result_str)}</pre></details>\n'
                                 else:
                                     status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
-                                    clean_result_str = str(result_str)
-                                    safe_output = html.escape(clean_result_str[:2000] + ("..." if len(clean_result_str) > 2000 else ""))
+                                    clean_result_str = _sanitize_tool_result(tool_res)
+                                    safe_output = html.escape(result_str[:2000] + ("..." if len(result_str) > 2000 else ""))
                                     details_block = f'<details class="proc-success-details"><summary>Output Logs</summary><pre>{safe_output}</pre></details>\n'
                         except Exception as e:
                             self.failure_memory.record_failure(tool_name, tool_params, str(e))
@@ -1042,10 +1051,11 @@ class ChatMixin:
                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                     # Track the tool call and result in this turn's metadata
+                    # (use clean_result_str to keep metadata bloat-free of base64)
                     tool_calls_this_turn.append({
                         "name": tool_name,
                         "params": tool_params,
-                        "result": {"output": result_str, "success": "Error" not in result_str}
+                        "result": {"output": clean_result_str, "success": "Error" not in clean_result_str}
                     })
 
                     # ── HIGH-FIDELITY CONTEXT PRESERVATION ──
@@ -1068,12 +1078,18 @@ class ChatMixin:
                         content=raw_round_clean
                     ))
 
-                    # 2. Append the raw tool result block to virtual history
+                    # 2. Append the SANITIZED tool result to virtual history.
+                    #    We deliberately do NOT use `result_str` here, which may
+                    #    contain multi-kilobyte base64 blobs. Feeding those blobs
+                    #    back to the LLM causes tool-stutter loops where the model
+                    #    re-invokes the same tool on the data it just produced.
                     user_part = (
                         f'<tool_result name="{tool_name}">\n'
-                        f"{result_str}\n"
+                        f"{clean_result_str}\n"
                         f"</tool_result>\n\n"
-                        f"Please analyze the tool output above and proceed with your response."
+                        f"Please analyze the tool output above and proceed with your response. "
+                        f"If the tool already produced a file (image, plot, document, etc.), "
+                        f"reference it in your final answer and STOP — do not call the same tool again."
                     )
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",

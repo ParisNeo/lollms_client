@@ -7809,7 +7809,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         try {
             const imagesPayload = pastedImages.map(img => img.data);
-
+            console.log(`Regenerate : ${regenerate}`)
             const payload = {
                 message: text,
                 regenerate: regenerate,
