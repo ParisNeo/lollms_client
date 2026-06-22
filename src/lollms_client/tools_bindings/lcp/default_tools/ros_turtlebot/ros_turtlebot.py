@@ -8,7 +8,7 @@ import sys
 import math
 import random
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 TOOL_LIBRARY_NAME = "ROS_TURTLEBOT"
 TOOL_LIBRARY_DESC = "Interface for TurtleBot3 robot control, navigation, sensor monitoring, and nociceptive pain systems."
@@ -343,7 +343,9 @@ def init_tool_library() -> None:
         print("🤖 ROS_TURTLEBOT: ROS 2 libraries not found. Operating in High-Fidelity Simulation Mode.")
 
 
-def tool_navigate_to(x: float, y: float, linear_speed: float = 0.15) -> Dict[str, Any]:
+def tool_navigate_to(x: float, y: float, linear_speed: float = 0.15,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None) -> Dict[str, Any]:
     """
     Commands the TurtleBot robot to navigate to the specified coordinate.
 
@@ -422,7 +424,8 @@ def tool_navigate_to(x: float, y: float, linear_speed: float = 0.15) -> Dict[str
     }
 
 
-def tool_get_robot_pose() -> Dict[str, Any]:
+def tool_get_robot_pose(discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None) -> Dict[str, Any]:
     """
     Retrieves the current odometry coordinates and orientation (pose) of the robot.
     """
@@ -442,7 +445,8 @@ def tool_get_robot_pose() -> Dict[str, Any]:
     }
 
 
-def tool_get_sensor_readings() -> Dict[str, Any]:
+def tool_get_sensor_readings(discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None) -> Dict[str, Any]:
     """
     Queries LiDAR lasers, bumper sensors, battery voltage, and accelerometers.
     This supplies essential data for mapping, collision avoidance, and nociception.
