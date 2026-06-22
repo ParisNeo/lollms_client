@@ -1562,30 +1562,3 @@ def auto_extract_ontology_from_content(content: str) -> Tuple[str, str, str, Lis
 
     return subject, predicate, obj, list(set(tags))
 
-
-class FailureMemory:
-    """
-    Reflexive Short-Term Memory tracking tool execution failures
-    to prevent repetitive loops and guide adaptive recovery.
-    """
-    def __init__(self):
-        self.failures: List[Dict[str, Any]] = []
-
-    def record_failure(self, tool_name: str, params: Dict[str, Any], error: str):
-        """Log normalized representation of a failed tool execution."""
-        import time
-        self.failures.append({
-            "tool_name": tool_name,
-            "params": params,
-            "norm_params": normalize_parameters(params),
-            "error": str(error),
-            "timestamp": time.time()
-        })
-
-    def has_previous_failure(self, tool_name: str, params: Dict[str, Any]) -> bool:
-        """Check if this tool has failed with synonymous parameters previously."""
-        norm = normalize_parameters(params)
-        return any(
-            f["tool_name"] == tool_name and f["norm_params"] == norm 
-            for f in self.failures
-        )
