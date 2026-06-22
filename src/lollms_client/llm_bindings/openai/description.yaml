@@ -14,6 +14,11 @@ global_input_parameters:
     description: "The base URL for the OpenAI API. Useful for proxies or custom endpoints. Defaults to the official OpenAI URL."
     mandatory: false
     default: ""
+  - name: is_vllm
+    type: bool
+    description: "If true, the server is a vllm server."
+    mandatory: false
+    default: false
 model_input_parameters:
   - name: model_name
     type: str
