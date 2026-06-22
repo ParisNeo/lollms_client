@@ -46,7 +46,9 @@ def tool_matter_controller(
     device_id: str = "",
     state: str = "",
     brightness: int = 100,
-    server_address: str = "ws://localhost:5580"
+    server_address: str = "ws://localhost:5580",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Control, commission, or query Matter smart home devices over local IP fabrics.
