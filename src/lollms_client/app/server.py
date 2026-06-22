@@ -67,7 +67,22 @@ from lollms_client.lollms_types import MSG_TYPE
 from ascii_colors import ASCIIColors, trace_exception
 from datetime import datetime
 
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
 app = FastAPI(title="Lollms Client Demonstration App")
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    # Print the exact fields that failed validation to the console for swift debugging
+    errors = exc.errors()
+    ASCIIColors.error(f"❌ [422 Validation Error] Path: {request.url.path} | Details:")
+    for err in errors:
+        ASCIIColors.error(f"  - Field: {err.get('loc')} | Error: {err.get('msg')} | Type: {err.get('type')}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": errors, "body": exc.body},
+    )
 
 # Define paths
 STATIC_DIR = Path(__file__).parent / "static"
@@ -3539,7 +3554,7 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
                 plt.close('all')
 
             exec(payload.code, local_vars)
-
+ 
             # Check if matplotlib generated a plot inside the sandbox
             fig_nums = plt.get_fignums() if plt is not None else []
             if fig_nums and plt is not None:
@@ -3946,7 +3961,7 @@ async def query_data_endpoint(payload: DataQueryRequest):
 
 # ── Chat Request Payload ──
 class ChatRequest(BaseModel):
-    message: str
+    message: Optional[str] = ""
     regenerate: Optional[bool] = False
     images: Optional[List[str]] = None
     enable_memory: Optional[bool] = True
@@ -4333,6 +4348,50 @@ async def chat_with_document(request: ChatRequest):
                                         "callable": _make_lcp_wrapper(fn_obj)
                                     }
                         else:
+                            # Helper function to safely execute standard tools
+                            def _make_safe_standard_tool_wrapper(tname, t_spec):
+                                def _safe_execute(**kw):
+                                    lollms_client = kw.get("lollms_client_instance") or client
+                                    if not lollms_client or not getattr(lollms_client, "tools", None):
+                                        # Fallback: if client.tools is None, try to execute the tool in-process directly from its file!
+                                        py_file_path = t_spec.get("_python_file_path")
+                                        if py_file_path and Path(py_file_path).exists():
+                                            import importlib.util
+                                            import sys
+                                            try:
+                                                m_name = f"lollms_client.fallback_tools.{tname}"
+                                                if m_name in sys.modules:
+                                                    del sys.modules[m_name]
+                                                spec = importlib.util.spec_from_file_location(m_name, str(py_file_path))
+                                                if spec and spec.loader:
+                                                    mod = importlib.util.module_from_spec(spec)
+                                                    spec.loader.exec_module(mod)
+                                                    fn = getattr(mod, f"tool_{tname}", getattr(mod, "execute", None))
+                                                    if fn:
+                                                        # Align arguments
+                                                        import inspect
+                                                        target_sig = inspect.signature(fn)
+                                                        filtered = {k: v for k, v in kw.items() if k in target_sig.parameters}
+                                                        if "discussion_instance" in target_sig.parameters:
+                                                            filtered["discussion_instance"] = kw.get("discussion_instance", discussion)
+                                                        if "lollms_client_instance" in target_sig.parameters:
+                                                            filtered["lollms_client_instance"] = lollms_client
+                                                        return fn(**filtered)
+                                            except Exception as fallback_err:
+                                                return {"error": f"Lollms client tools binding is not active, and fallback in-process execution failed: {fallback_err}", "success": False}
+                                        return {"error": f"Lollms client tools binding is not active or configured. Please set the tools binding to 'lcp' in settings (⚙️).", "success": False}
+
+                                    # Normal active client.tools path
+                                    clean_kw = {k: v for k, v in kw.items() if k not in ("lollms_client_instance", "discussion_instance")}
+                                    return lollms_client.tools.execute_tool(
+                                        tname, 
+                                        clean_kw, 
+                                        lollms_client_instance=lollms_client, 
+                                        discussion_instance=kw.get("discussion_instance", discussion),
+                                        discussion=kw.get("discussion_instance", discussion)
+                                    )
+                                return _safe_execute
+
                             # Wrap standard discovered tool callable
                             active_tools[t_name] = {
                                 "name": t_name,
@@ -4346,13 +4405,7 @@ async def chat_with_document(request: ChatRequest):
                                     }
                                     for p_name, p_info in t["input_schema"].get("properties", {}).items()
                                 ],
-                                "callable": lambda tname=t_name, **kw: client.tools.execute_tool(
-                                    tname, 
-                                    {k: v for k, v in kw.items() if k not in ("lollms_client_instance", "discussion_instance")}, 
-                                    lollms_client_instance=kw.get("lollms_client_instance", client), 
-                                    discussion_instance=kw.get("discussion_instance", discussion),
-                                    discussion=kw.get("discussion_instance", discussion)
-                                )
+                                "callable": _make_safe_standard_tool_wrapper(t_name, t)
                             }
 
                 try:

@@ -36,21 +36,77 @@ def init_tool_library() -> None:
 
 
 def _get_workspace_dir() -> Path:
-    """Returns the primary active workspace directory containing all user artifacts."""
+    """Returns the primary active workspace directory dynamically from the running server process."""
+    from ascii_colors import ASCIIColors
+    import sys
     workspace_dir = Path("./data_workspace")
     try:
-        from lollms_client.app.server import APP_WORKSPACE_DIR
-        if APP_WORKSPACE_DIR is not None:
-            workspace_dir = APP_WORKSPACE_DIR
-    except ImportError:
-        pass
+        # Query sys.modules dynamically to avoid stale direct-import reference copies
+        if "lollms_client.app.server" in sys.modules:
+            server_mod = sys.modules["lollms_client.app.server"]
+            active_ws = getattr(server_mod, "APP_WORKSPACE_DIR", None)
+            if active_ws is not None:
+                workspace_dir = active_ws
+                ASCIIColors.cyan(f"[SemanticDataEngineer] Successfully resolved active workspace: '{workspace_dir.resolve()}'")
+            else:
+                ASCIIColors.warning(f"[SemanticDataEngineer] server.APP_WORKSPACE_DIR is None. Defaulting to: '{workspace_dir.resolve()}'")
+        else:
+            ASCIIColors.warning(f"[SemanticDataEngineer] lollms_client.app.server is not loaded in sys.modules. Defaulting to: '{workspace_dir.resolve()}'")
+    except Exception as e:
+        ASCIIColors.warning(f"[SemanticDataEngineer] Dynamic workspace resolution failed: {e}. Defaulting to: '{workspace_dir.resolve()}'")
     return workspace_dir
 
 
-def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Tuple[Any, str]:
-    """Load a CSV, Excel, or SQLite file into a Pandas DataFrame with automatic BOM and delimiter resolution."""
+def _load_data_source(file_path: Path, table_name: Optional[str] = None, discussion_instance: Optional[Any] = None) -> Tuple[Any, str]:
+    """Load a CSV, Excel, or SQLite file into a Pandas DataFrame with automatic BOM, delimiter, and self-healing restoration."""
     import pandas as pd
     import numpy as np
+    from ascii_colors import ASCIIColors
+
+    resolved_path = file_path.resolve()
+
+    # ── 🛡️ SELF-HEALING FILE RESTORATION PROTOCOL ──
+    # If the file is missing from the physical workspace disk folder, but exists
+    # as a record inside the SQLite discussion artifacts, restore/write it back instantly!
+    if not resolved_path.exists() and discussion_instance:
+        try:
+            # Strip extension to find the clean artifact title key
+            art_title = file_path.name
+            ext = file_path.suffix.lower()
+            if art_title.lower().endswith(ext):
+                art_title = art_title[:-len(ext)]
+
+            art = discussion_instance.artefacts.get(art_title)
+            if not art:
+                # Fuzzy fallback matching
+                for item in discussion_instance.artefacts.list():
+                    if art_title in item["title"]:
+                        art = item
+                        break
+
+            if art and art.get("content"):
+                resolved_path.parent.mkdir(parents=True, exist_ok=True)
+                resolved_path.write_text(art["content"], encoding="utf-8")
+
+                # Also write to active unversioned path for general consistency
+                active_path = resolved_path.parent.parent / file_path.name
+                try:
+                    active_path.parent.mkdir(parents=True, exist_ok=True)
+                    active_path.write_text(art["content"], encoding="utf-8")
+                except Exception:
+                    pass
+
+                ASCIIColors.success(f"✓ [Self-Healing] Restored missing workspace file '{file_path.name}' directly from the database record!")
+        except Exception as restore_err:
+            ASCIIColors.warning(f"Self-healing file restoration failed: {restore_err}")
+
+    ASCIIColors.cyan(f"[SemanticDataEngineer] Loading data source from: '{resolved_path}'")
+    ASCIIColors.cyan(f"  - File Exists: {resolved_path.exists()}")
+    if resolved_path.exists():
+        ASCIIColors.cyan(f"  - File Size  : {resolved_path.stat().st_size:,} bytes")
+    else:
+        ASCIIColors.error(f"  - File Missing! Crucial Error: Database path does not exist on disk.")
+
     ext = file_path.suffix.lower()
 
     if ext in (".db", ".sqlite", ".sqlite3"):
@@ -63,29 +119,47 @@ def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Tupl
                 conn.close()
                 raise ValueError("No tables found in SQLite database.")
             table_name = tables[0]
+        ASCIIColors.cyan(f"  - Querying SQLite Table: '{table_name}'")
         df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
         conn.close()
+        ASCIIColors.cyan(f"  - Parsed Columns: {list(df.columns)}")
         return df, table_name
     elif ext in (".xlsx", ".xls"):
         xl = pd.ExcelFile(str(file_path))
         sheet = table_name or xl.sheet_names[0]
+        ASCIIColors.cyan(f"  - Querying Excel Sheet: '{sheet}' (Available Sheets: {xl.sheet_names})")
         df = pd.read_excel(str(file_path), sheet_name=sheet)
+        ASCIIColors.cyan(f"  - Parsed Columns: {list(df.columns)}")
         return df, sheet
     else:
         # Read the first line using utf-8-sig to safely detect the delimiter
         try:
             first_line = file_path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()[0]
-        except Exception:
+            ASCIIColors.cyan(f"  - Raw Header Line Preview: {repr(first_line)}")
+        except Exception as ex:
             first_line = ""
-            
+            ASCIIColors.warning(f"  - Delimiter reader warning: {ex}")
+
+        # Robust multi-character/multi-delimiter heuristic detection
         sep = ","
-        if ";" in first_line and "," not in first_line:
-            sep = ";"
+        if ";" in first_line:
+            # Count separator occurrences to find the dominant delimiter
+            semicolon_count = first_line.count(";")
+            comma_count = first_line.count(",")
+            if semicolon_count > comma_count:
+                sep = ";"
+            else:
+                sep = ","
         elif "\t" in first_line:
             sep = "\t"
 
-        # Load using utf-8-sig to automatically strip any leading \ufeff BOM characters
+        ASCIIColors.cyan(f"  - Resolved Delimiter Separator: {repr(sep)}")
         df = pd.read_csv(str(file_path), sep=sep, encoding="utf-8-sig")
+
+        # Clean column headers of BOM sequences or stray quotation marks
+        df.columns = [c.strip().strip("'\"").replace('\ufeff', '') for c in df.columns]
+
+        ASCIIColors.cyan(f"  - Parsed Columns after normalization: {list(df.columns)}")
         return df, file_path.stem
 
 
@@ -772,10 +846,18 @@ def tool_generate_advanced_visualization(
     # Verify columns exist
     if x_column not in df.columns:
         return {"success": False, "error": f"X column '{x_column}' not found."}
-    for col in y_columns:
-        if col not in df.columns:
+    if isinstance(y_columns,list):
+        for col in y_columns:
+            if col not in df.columns:
+                return {"success": False, "error": f"Y column '{col}' not found."}
+    else:
+        if y_columns not in df.columns:
             return {"success": False, "error": f"Y column '{col}' not found."}
+        else:
+            y_columns= [y_columns]
 
+    if isinstance(colors, str): 
+        colors=[colors]
     palette = colors or ["#4f46e5", "#10b981", "#f59e0b", "#f43f5e", "#8b5cf6", "#06b6d4"]
     plot_filename = f"adv_plot_{uuid.uuid4().hex[:6]}.png"
     plot_path = workspace_dir / plot_filename
@@ -794,7 +876,7 @@ def tool_generate_advanced_visualization(
         ax.spines['left'].set_color('#334155')
         ax.spines['right'].set_color('#334155')
         ax.tick_params(colors='#94a3b8', labelsize=10)
-        ax.grid(True, color='rgba(255,255,255,0.05)', linestyle='--')
+        ax.grid(True, linestyle='--')
 
         chart_title = title or f"Analysis: {resolved_table}"
         ax.set_title(chart_title, color='#f59e0b', fontsize=13, fontweight='bold', pad=12)

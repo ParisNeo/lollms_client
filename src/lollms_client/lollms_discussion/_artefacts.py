@@ -466,12 +466,29 @@ class ArtefactManager:
             versioned_path = disc_ver_dir / f"{name_part}_v{version}{ext_part}"
 
             if isinstance(content, str):
-                for p in (primary_path, working_path, versioned_path):
+                # Do not overwrite binary database or spreadsheet files with text schemas
+                if atype == "data" and (file_ext or ext_part) in (".db", ".sqlite", ".sqlite3", ".xlsx", ".xls"):
                     try:
-                        p.parent.mkdir(parents=True, exist_ok=True)
-                        p.write_text(content, encoding="utf-8", errors="ignore")
-                    except Exception as p_err:
+                        # Copy the versioned physical data file to the unversioned path if it exists
+                        versioned_path_candidate = disc_ver_dir / f"{name_part}_v{version}{ext_part}"
+                        if not versioned_path_candidate.exists():
+                            versioned_path_candidate = workspace_dir / f"{name_part}_v{version}{ext_part}"
+
+                        if versioned_path_candidate.exists():
+                            import shutil
+                            for p in (primary_path, working_path):
+                                if versioned_path_candidate.resolve() != p.resolve():
+                                    p.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy(str(versioned_path_candidate), str(p))
+                    except Exception as copy_err:
                         pass
+                else:
+                    for p in (primary_path, working_path, versioned_path):
+                        try:
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            p.write_text(content, encoding="utf-8", errors="ignore")
+                        except Exception as p_err:
+                            pass
                 ASCIIColors.success(f"[Workspace Sync] Synchronized file '{filename}' (v{version}) directly to primary workspace.")
         except Exception as e:
             ASCIIColors.warning(f"Failed to sync artifact '{title}' to disk workspace: {e}")
@@ -1455,6 +1472,29 @@ class ArtefactManager:
                     changed = True
         if changed:
             self._save_all(artefacts)
+            active_art = self.get(title, version)
+            if active_art:
+                self._sync_to_disk_workspace(
+                    title=active_art["title"],
+                    content=active_art["content"],
+                    version=active_art["version"],
+                    atype=active_art["type"],
+                    language=active_art.get("language"),
+                    file_ext=active_art.get("file_ext")
+                )
+
+    def sync_all_active_to_disk(self):
+        """Ensures a physical copy of all active/loaded artifacts exists in the workspace."""
+        active_arts = self.list(active_only=True)
+        for art in active_arts:
+            self._sync_to_disk_workspace(
+                title=art["title"],
+                content=art["content"],
+                version=art["version"],
+                atype=art["type"],
+                language=art.get("language"),
+                file_ext=art.get("file_ext")
+            )
 
     def deactivate(self, title: str, version: Optional[int] = None):
         self._set_active(title, version, False)
@@ -1477,6 +1517,17 @@ class ArtefactManager:
                 changed = True
         if changed:
             self._save_all(artefacts)
+            if state:
+                active_art = self.get(title, version)
+                if active_art:
+                    self._sync_to_disk_workspace(
+                        title=active_art["title"],
+                        content=active_art["content"],
+                        version=active_art["version"],
+                        atype=active_art["type"],
+                        language=active_art.get("language"),
+                        file_ext=active_art.get("file_ext")
+                    )
 
     def set_visibility(self, title: str, visibility: str, version: Optional[int] = None) -> bool:
         """Sets the exact visibility tier of an artifact."""
@@ -1580,7 +1631,11 @@ class ArtefactManager:
                     summary_text = seq_summaries.get(item['title'], "Detailed summary not available.")
                     full_visible_parts.append(f"{header}\n[SEQUENTIAL COMPRESSED DATA DUE TO BUDGET CONSTRAINTS]:\n{summary_text}")
                 else:
-                    if atype == ArtefactType.CODE or (lang and not _ARTEFACT_IMAGE_TAG_RE.search(content_text)):
+                    if atype == ArtefactType.DATA:
+                        # Expose the schema/description for data files to the LLM instead of raw rows
+                        schema_desc = item.get("description") or content_text
+                        full_visible_parts.append(f"{header}\n{schema_desc}")
+                    elif atype == ArtefactType.CODE or (lang and not _ARTEFACT_IMAGE_TAG_RE.search(content_text)):
                         full_visible_parts.append(f"{header}\n{fence}\n{content_text}\n```")
                     else:
                         full_visible_parts.append(f"{header}\n{content_text}")

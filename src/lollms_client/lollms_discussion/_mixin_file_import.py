@@ -1162,48 +1162,47 @@ class FileImportMixin:
                         "warnings": warnings,
                     }
 
-        # ── data mode (Single File) ──────────────────────────────────────────
-        if mode == IMPORT_MODE_DATA:
-            is_data_file = ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".ttl", ".rdf", ".xml")
-            if not is_data_file:
-                warnings.append(f"data mode requested but '{ext}' is not a CSV or Excel file.")
-                mode = IMPORT_MODE_TEXT
-            else:
+            # ── data mode (Single File) ──────────────────────────────────────────
+            if mode == IMPORT_MODE_DATA:
                 _progress("Analyzing structured data file...")
-                text, images_data = _parse_data_file(path, title, version=1, progress_cb=progress_cb)
+                # 1. Parse and extract the Markdown schema description
+                schema_text, images_data = _parse_data_file(path, title, version=1, progress_cb=progress_cb)
+
+                # 2. Extract the actual raw content (verbatim rows) for CSV/TSV
+                if ext in (".csv", ".tsv"):
+                    raw_content = _extract_text_file(path)
+                else:
+                    raw_content = schema_text  # Fallback for binary databases/spreadsheets
 
                 # Append description if provided (before the schema content)
+                full_description = schema_text
                 if description and description.strip():
-                    text = f"## Description\n{description.strip()}\n\n{text}"
+                    full_description = f"## Description\n{description.strip()}\n\n{schema_text}"
 
                 atype = ArtefactType.DATA
 
                 existing = self.artefacts.get(title)
                 if existing is None:
-                    # Store description in metadata for future reference
-                    extra_meta = {}
-                    if description and description.strip():
-                        extra_meta["description"] = description.strip()
-
                     art = self.artefacts.add(
                         title=title,
                         artefact_type=atype,
-                        content=text,
+                        content=raw_content,
                         active=activate,
                         file_ext=ext,
                         version=1,
                         read_only=True, # Default newly imported data files to read-only
-                        **extra_meta
+                        description=full_description
                     )
                 else:
                     art = self.artefacts.update(
                         title=title,
-                        new_content=text,
+                        new_content=raw_content,
                         new_type=atype,
                         active=activate,
                         file_ext=ext,
                         version=1,
-                        read_only=True # Default newly imported data files to read-only
+                        read_only=True, # Default newly imported data files to read-only
+                        description=full_description
                     )
                 _progress("Data analysis complete.")
                 return {

@@ -87,7 +87,13 @@ class CoreMixin:
         self._validate_and_set_active_branch()
         self.get_discussion_images()
 
-    # ---------------------------------------------------------------- factories
+        # Automatically synchronize all active artifacts' physical files on startup
+        try:
+            self.artefacts.sync_all_active_to_disk()
+        except Exception as sync_err:
+            pass
+
+# ---------------------------------------------------------------- factories
 
     @classmethod
     def from_messages(cls, messages, lollms_client, db_manager=None, **kwargs):
