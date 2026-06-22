@@ -647,9 +647,9 @@ class ChatMixin:
         enable_image_generation: bool = True,
         enable_image_editing:    bool = True,
         auto_activate_artefacts: bool = True,
-        enable_inline_widgets:        bool = True,
+        enable_inline_widgets:        bool = False,
         enable_notes:                 bool = True,
-        enable_skills:                bool = False,
+        enable_skills:                bool = True,
         enable_forms:                 bool = True,
         enable_books:                 bool = False,
         enable_presentations:         bool = False,
@@ -661,9 +661,9 @@ class ChatMixin:
         enable_deep_memory_pulling:   bool = True,
         prehydrate_rag:               bool = True,
         max_reasoning_steps:          int = 20,
-        enable_in_message_status:     bool = True,
-        enable_sub_agents:            bool = True,  # Enable spinoff agents as executable tools
-        verbose_traceback:            bool = True,  # Disclose full sanitised traceback to the LLM
+        enable_in_message_status:     bool = False,
+        enable_sub_agents:            bool = False,  # Enable spinoff agents as executable tools
+        verbose_traceback:            bool = False,  # Disclose full sanitised traceback to the LLM
         sandbox_cwd:                  Optional[str] = None, # Custom relative sandbox run directory
         tolerance_level:              Optional[str] = "strict",
         **kwargs
@@ -1043,6 +1043,7 @@ class ChatMixin:
                         except Exception as e:
                             self.failure_memory.record_failure(tool_name, tool_params, str(e))
                             result_str = f"Error executing tool '{tool_name}': {e}"
+                            clean_result_str = f"Error executing tool '{tool_name}': {e}"
                             status_done_line = f"* Execution crashed.\n"
                             details_block = f'<details class="proc-error-details"><summary>Crash Details</summary><pre>{html.escape(str(e))}</pre></details>\n'
 
