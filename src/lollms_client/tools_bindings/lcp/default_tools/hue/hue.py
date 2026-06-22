@@ -1,5 +1,5 @@
 import requests
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # hue.py
 # Lollms local LCP tool
@@ -81,7 +81,9 @@ def tool_hue(
     action: str = "list",
     light_id: str = "",
     state: str = "",
-    value: Any = None
+    value: Any = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Control and query Hue smart lighting devices on the local network.
