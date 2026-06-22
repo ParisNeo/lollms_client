@@ -102,6 +102,7 @@ class OpenAIBinding(LollmsLLMBinding):
         self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
         self.certificate_file_path=kwargs.get("certificate_file_path", None)
         self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
+        self.is_vllm = kwargs.get("is_vllm", False)
 
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
