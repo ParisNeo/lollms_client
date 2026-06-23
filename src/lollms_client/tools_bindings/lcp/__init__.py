@@ -1,5 +1,5 @@
-# lollms_client/tools_bindings/lcp/__init__.py
 import sys
+import os
 import importlib.util
 import ast
 import re
@@ -9,33 +9,23 @@ from typing import Optional, List, Dict, Any, Union, Callable
 from lollms_client.lollms_tools_binding import LollmsToolBinding
 from ascii_colors import ASCIIColors, trace_exception
 
-# This variable is used by the LollmsTOOLBindingManager to identify the binding class.
 BindingName = "LCPBinding"
 
 class LCPBinding(LollmsToolBinding):
     """
     Local LollmsCommunicationProtocol (LCP) Binding.
-
-    This binding discovers and executes tools defined locally across multiple folders
-    and direct Python file paths. It uses Python's standard Abstract Syntax Tree (AST) 
-    to dynamically parse function annotations and docstrings, removing the need for 
-    separate JSON schemas.
+    
+    PHILOSOPHY:
+    - Tools are agnostic Python scripts.
+    - Tools do NOT know about discussions, artifacts, or clients.
+    - Tools operate on files in the current working directory.
+    - The Binding handles environment setup (CWD, sync) transparently.
     """
 
-    def __init__(self,
-                 **kwargs: Any
-                 ):
-        """
-        Initialize the LCPBinding.
-
-        Args:
-            tools_folders (List[str|Path], optional): List of folders containing tools.
-            tool_files (List[str|Path], optional): List of direct Python tool files.
-            tools_folder_path (str|Path, optional): Legacy fallback single folder.
-        """
+    def __init__(self, **kwargs: Any):
         super().__init__(binding_name="LCP")
         
-        # 1. Resolve Multi-Folder Config (with legacy fallback)
+        # Resolve Multi-Folder Config
         self.tools_folders: List[Path] = []
         folders_input = kwargs.get("tools_folders") or kwargs.get("tools_folder_path")
         if folders_input:
@@ -45,10 +35,9 @@ class LCPBinding(LollmsToolBinding):
                 for f in folders_input:
                     self.tools_folders.append(Path(f))
         else:
-            # Default fallback to default_tools subdirectory
             self.tools_folders.append(Path(__file__).parent / "default_tools")
 
-        # 2. Resolve Direct Tool Files
+        # Resolve Direct Tool Files
         self.tool_files: List[Path] = []
         files_input = kwargs.get("tool_files")
         if files_input:
@@ -63,19 +52,14 @@ class LCPBinding(LollmsToolBinding):
 
     @property
     def tools_folder_path(self) -> Optional[Path]:
-        """Backward-compatibility shim. Returns the primary tools folder."""
         return self.tools_folders[0] if self.tools_folders else None
 
     def _parse_tool_via_ast(self, py_file_path: Path) -> Optional[Dict[str, Any]]:
-        """
-        Inspects a Python tool file and extracts its name, description, and input_schema
-        directly from its function signature and docstrings using Abstract Syntax Trees.
-        """
+        """Extracts name, description, and schema from tool_ functions using AST."""
         try:
             code_text = py_file_path.read_text(encoding="utf-8")
             tree = ast.parse(code_text)
             
-            # Find the main entry point function in deterministic source order
             def _iter_functions_ordered(node):
                 for child in ast.iter_child_nodes(node):
                     if isinstance(child, ast.FunctionDef):
@@ -85,59 +69,45 @@ class LCPBinding(LollmsToolBinding):
 
             entry_fn = None
             for node in _iter_functions_ordered(tree):
-                if node.name.startswith("tool_") or node.name == "execute":
+                if node.name.startswith("tool_"):
                     entry_fn = node
                     break
 
             if not entry_fn:
                 return None
 
-            # Extract Description from Docstring
             docstring = ast.get_docstring(entry_fn) or ""
             description = docstring.strip().split("\n\n")[0].strip() if docstring else "No description provided."
 
-            # Parse parameter descriptions from docstring to enrich explicit arguments
             doc_params = {}
             if docstring:
                 for line in docstring.splitlines():
                     m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line.strip())
                     if m:
-                        p_name = m.group(1).strip()
-                        p_desc = m.group(3).strip()
-                        doc_params[p_name] = p_desc
+                        doc_params[m.group(1).strip()] = m.group(3).strip()
 
-            # Extract Parameters from Function Arguments
             properties = {}
             required = []
-
             args_list = entry_fn.args.args
             defaults_list = entry_fn.args.defaults
-
-            # Align defaults with arguments
             defaults_offset = len(args_list) - len(defaults_list) if defaults_list else len(args_list)
 
             for idx, arg in enumerate(args_list):
                 arg_name = arg.arg
-                # Exclude standard context parameters
-                if arg_name in ("lollms_client_instance", "client", "discussion_instance", "discussion", "args", "params"):
+                # NO EXCLUSIONS: We trust the tool builder to define clean signatures
+                # Only exclude *args/**kwargs
+                if arg.arg in ("args", "kwargs"):
                     continue
 
-                # Extract Type from Annotation
-                arg_type = "string" # default
+                arg_type = "string"
                 if arg.annotation:
                     anno_str = ast.unparse(arg.annotation).strip().lower()
-                    if "int" in anno_str:
-                        arg_type = "integer"
-                    elif "float" in anno_str or "number" in anno_str:
-                        arg_type = "number"
-                    elif "bool" in anno_str:
-                        arg_type = "boolean"
-                    elif "list" in anno_str or "array" in anno_str:
-                        arg_type = "array"
-                    elif "dict" in anno_str or "object" in anno_str:
-                        arg_type = "object"
+                    if "int" in anno_str: arg_type = "integer"
+                    elif "float" in anno_str or "number" in anno_str: arg_type = "number"
+                    elif "bool" in anno_str: arg_type = "boolean"
+                    elif "list" in anno_str or "array" in anno_str: arg_type = "array"
+                    elif "dict" in anno_str or "object" in anno_str: arg_type = "object"
 
-                # Extract Default value if present
                 has_default = idx >= defaults_offset
                 default_val = None
                 if has_default and defaults_list:
@@ -148,48 +118,33 @@ class LCPBinding(LollmsToolBinding):
                         default_val = ast.unparse(default_node).strip("'\"")
 
                 desc = doc_params.get(arg_name, f"Parameter '{arg_name}'")
-                properties[arg_name] = {
-                    "type": arg_type,
-                    "description": desc
-                }
-
+                properties[arg_name] = {"type": arg_type, "description": desc}
                 if has_default:
                     properties[arg_name]["default"] = default_val
                 else:
                     required.append(arg_name)
 
-            # Docstring Fallback: If the function takes a generic dict (args/params), parse parameters from the docstring
+            # Fallback to docstring if no annotations
             if not properties and docstring:
-                lines = docstring.splitlines()
-                for line in lines:
-                    line_stripped = line.strip()
-                    m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line_stripped)
+                for line in docstring.splitlines():
+                    m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line.strip())
                     if m:
                         p_name = m.group(1).strip()
                         p_type_raw = (m.group(2) or "string").lower().strip()
                         p_desc = m.group(3).strip()
-
-                        # Skip keywords or headings
-                        if p_name.lower() in ("args", "parameters", "returns", "example", "usage", "note", "class", "def", "raises"):
-                            continue
-
+                        if p_name.lower() in ("args", "parameters", "returns", "example"): continue
+                        
                         p_type = "string"
                         if "int" in p_type_raw: p_type = "integer"
-                        elif "float" in p_type_raw or "number" in p_type_raw: p_type = "number"
+                        elif "float" in p_type_raw: p_type = "number"
                         elif "bool" in p_type_raw: p_type = "boolean"
-                        elif "list" in p_type_raw or "array" in p_type_raw: p_type = "array"
-                        elif "dict" in p_type_raw or "object" in p_type_raw: p_type = "object"
-
-                        properties[p_name] = {
-                            "type": p_type,
-                            "description": p_desc
-                        }
+                        
+                        properties[p_name] = {"type": p_type, "description": p_desc}
                         if "optional" not in p_type_raw and "default" not in p_type_raw:
                             required.append(p_name)
                             
-            tool_name = py_file_path.stem
             return {
-                "name": tool_name,
+                "name": py_file_path.stem,
                 "description": description,
                 "input_schema": {
                     "type": "object",
@@ -198,255 +153,281 @@ class LCPBinding(LollmsToolBinding):
                 }
             }
         except Exception as e:
-            ASCIIColors.warning(f"Failed to AST-parse tool '{py_file_path.name}': {e}")
+            ASCIIColors.warning(f"AST parse failed for '{py_file_path.name}': {e}")
             return None
 
     def _load_tool_file(self, py_file: Path) -> bool:
-        """Helper to parse a Python tool file and append its definition."""
         tool_name = py_file.stem
-        
-        # Check if already discovered to avoid duplicates across multi-folder scans
         if any(t.get("name") == tool_name for t in self.discovered_tools):
             return False
 
-        tool_def = None
-
-        # Attempt AST-based dynamic schema extraction
-        try:
-            tool_def = self._parse_tool_via_ast(py_file)
-        except Exception as e:
-            ASCIIColors.warning(f"AST-parsing failed for '{tool_name}': {e}")
-
+        tool_def = self._parse_tool_via_ast(py_file)
         if tool_def:
             tool_def['_python_file_path'] = str(py_file.resolve())
             self.discovered_tools.append(tool_def)
             ASCIIColors.green(f"Discovered LCP tool: {tool_name} ✓")
             return True
-        else:
-            ASCIIColors.warning(f"Skipping tool '{tool_name}': Could not compile a valid schema from AST.")
-            return False
+        return False
 
     def _discover_local_tools(self):
-        """Scans the configured tools folders and direct files for valid Python tools using AST parsing."""
         self.discovered_tools = []
-        
-        # 1. Scan configured directories
         for folder in self.tools_folders:
-            if not folder or not folder.is_dir():
-                continue
-            ASCIIColors.info(f"Discovering local LCP tools in directory: {folder}")
+            if not folder or not folder.is_dir(): continue
+            ASCIIColors.info(f"Discovering LCP tools in: {folder}")
             for item in folder.iterdir():
                 py_file = None
                 if item.is_dir():
                     py_file = item / f"{item.name}.py"
                 elif item.suffix == ".py" and item.stem != "__init__":
                     py_file = item
-
                 if py_file and py_file.exists():
                     self._load_tool_file(py_file)
 
-        # 2. Load direct tool files
-        if self.tool_files:
-            ASCIIColors.info(f"Loading direct LCP tool files: {len(self.tool_files)} file(s)")
-            for py_file in self.tool_files:
-                if py_file and py_file.exists() and py_file.suffix == ".py":
-                    self._load_tool_file(py_file)
-
-        ASCIIColors.info(f"Discovery complete. Found {len(self.discovered_tools)} local LCP tools.")
-
+        for py_file in self.tool_files:
+            if py_file and py_file.exists() and py_file.suffix == ".py":
+                self._load_tool_file(py_file)
+        
+        ASCIIColors.info(f"Discovery complete. Found {len(self.discovered_tools)} tools.")
 
     def discover_tools(self, specific_tool_names: Optional[List[str]] = None, **kwargs) -> List[Dict[str, Any]]:
-        """
-        Discover available local tools.
-
-        Args:
-            specific_tool_names (Optional[List[str]]): If provided, filter discovery
-                                                       to only these tool names.
-            **kwargs: Can include 'force_refresh' to clear cache and re-scan.
-
-        Returns:
-            List[Dict[str, Any]]: A list of discovered tool definitions.
-        """
-        if not self.tools_folders and not self.tool_files:
-            return []
-
-        # Only re-scan if explicitly forced or if our cache is empty
         if kwargs.get("force_refresh", False) or not self.discovered_tools:
              self._discover_local_tools()
-
         if specific_tool_names:
-            return [tool for tool in self.discovered_tools if tool.get("name") in specific_tool_names]
+            return [t for t in self.discovered_tools if t.get("name") in specific_tool_names]
         return self.discovered_tools
 
     def list_tools(self, **kwargs) -> List[Dict[str, Any]]:
-        """
-        Return a list of tools formatted for consumption by the discussion chat module.
-        This implementation simply forwards to ``discover_tools``.
-        """
         return self.discover_tools(**kwargs)
 
-    def execute_tool(self,
-                     tool_name: str,
-                     params: Dict[str, Any],
-                     lollms_client_instance: Optional[Any] = None,
-                     **kwargs) -> Dict[str, Any]:
+    def execute_tool(self, tool_name: str, params: Dict[str, Any], discussion_instance=None, **kwargs) -> Dict[str, Any]:
         """
-        Execute a locally defined Python tool.
-
-        Args:
-            tool_name (str): The name of the tool to execute.
-            params (Dict[str, Any]): Parameters for the tool.
-            lollms_client_instance (Optional[Any]): The LollmsClient instance, if available.
-            **kwargs: Can include 'discussion' or 'discussion_instance'
+        Executes a tool in an isolated environment where:
+        1. CWD = Workspace Directory (so artifacts appear as local files)
+        2. No discussion/client instances are passed to the tool
+        3. Tools operate on files using simple relative paths (e.g., "file.cir")
+        4. AFTER execution: Sync any file changes back to artifacts automatically
         """
         tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
-
         if not tool_def:
-            return {"error": f"Local tool '{tool_name}' not found or not discovered.", "status_code": 404}
-        
-        python_file_path_str = tool_def.get('_python_file_path')
-        if not python_file_path_str:
-            return {"error": f"Python implementation path missing for tool '{tool_name}'.", "status_code": 500}
-        
-        python_file_path = Path(python_file_path_str)
+            return {"error": f"Tool '{tool_name}' not found.", "status_code": 404}
 
-        # Ingest Schema Defaults for Omitted Parameters
+        python_file_path = Path(tool_def.get('_python_file_path'))
+
+        # Ingest Schema Defaults
         input_schema = tool_def.get("input_schema", {})
-        properties = input_schema.get("properties", {})
-        for prop_name, prop_info in properties.items():
+        for prop_name, prop_info in input_schema.get("properties", {}).items():
             if prop_name not in params and isinstance(prop_info, dict) and "default" in prop_info:
                 params[prop_name] = prop_info["default"]
 
         try:
-            module_name = f"lollms_client.tools_bindings.lcp.tools.{tool_name}" 
-            
-            # Unregister module from sys.cache to force recompilation and load latest disk changes
+            module_name = f"lollms_client.tools_bindings.lcp.tools.{tool_name}"
             if module_name in sys.modules:
                 del sys.modules[module_name]
 
             spec = importlib.util.spec_from_file_location(module_name, str(python_file_path))
-            
             if not spec or not spec.loader:
-                return {"error": f"Could not create module spec for tool '{tool_name}'.", "status_code": 500}
+                return {"error": f"Spec creation failed for '{tool_name}'.", "status_code": 500}
 
             tool_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(tool_module)
 
-            # Adaptive Entry Point Locator
-            # Supports tool_[name], execute, and legacy formats
             execute_function = None
-            possible_names = [f"tool_{tool_name}", "execute", f"tool_{tool_name.replace('-', '_')}"]
-            for name in possible_names:
+            for name in [f"tool_{tool_name}", "execute"]:
                 if hasattr(tool_module, name):
                     execute_function = getattr(tool_module, name)
                     break
-            
+
             if not execute_function:
-                # Fallback: scan for any callable starting with "tool_"
                 for attr_name in dir(tool_module):
                     if attr_name.startswith("tool_") and callable(getattr(tool_module, attr_name)):
                         execute_function = getattr(tool_module, attr_name)
                         break
 
             if not execute_function:
-                return {
-                    "error": f"Tool '{tool_name}' Python file does not have a valid entry point (expected 'tool_{tool_name}' or 'execute').",
-                    "status_code": 500
-                }
-            
-            # Inspect signature to align arguments dynamically
-            import inspect
-            sig = inspect.signature(execute_function)
-            
-            exec_params = {}
-            if 'params' in sig.parameters:
-                exec_params['params'] = params
-            elif 'args' in sig.parameters:
-                exec_params['args'] = params
-            elif 'args' not in sig.parameters and 'params' not in sig.parameters:
-                # Flat mapping for functions taking explicit parameters
-                exec_params = params.copy()
-            
-            # Pass client context
-            if 'lollms_client_instance' in sig.parameters:
-                exec_params['lollms_client_instance'] = lollms_client_instance
-            elif 'client' in sig.parameters:
-                exec_params['client'] = lollms_client_instance
+                return {"error": f"No entry point found in '{tool_name}'.", "status_code": 500}
 
-            # Pass discussion context
-            disc = kwargs.get("discussion") or kwargs.get("discussion_instance")
-            if 'discussion_instance' in sig.parameters:
-                exec_params['discussion_instance'] = disc
-            elif 'discussion' in sig.parameters:
-                exec_params['discussion'] = disc
-            
-            ASCIIColors.info(f"Executing local tool '{tool_name}' with arguments: {list(exec_params.keys())}")
-            result = execute_function(**exec_params)
-            
-            return {"output": result, "status_code": 200}
+            # ── ENVIRONMENT PREPARATION (Agnostic Workspace Injection) ──
+            # 1. Get Workspace Directory
+            workspace_dir = Path("./data_workspace")
+            try:
+                from lollms_client.app.server import get_discussion_workspace
+                workspace_dir = get_discussion_workspace()
+            except ImportError:
+                pass
+
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            workspace_dir_str = str(workspace_dir.resolve())
+
+            # 2. Save Current CWD and Environment
+            old_cwd = os.getcwd()
+            old_pythonpath = os.environ.get("PYTHONPATH", "")
+            old_path = os.environ.get("PATH", "")
+
+            # 3. Snapshot workspace files BEFORE execution
+            files_before = set()
+            if workspace_dir.exists():
+                for f in workspace_dir.rglob("*"):
+                    if f.is_file():
+                        files_before.add(f.relative_to(workspace_dir))
+
+            # CRITICAL: Log the CWD BEFORE changing it
+            ASCIIColors.info(f"[LCP Tool '{tool_name}'] CWD BEFORE change: {os.getcwd()}")
+            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Target workspace: {workspace_dir_str}")
+
+            try:
+                # 4. Change CWD to Workspace
+                # This ensures tools see artifacts as simple files in "." or "./subfolder"
+                os.chdir(workspace_dir_str)
+
+                # CRITICAL: Verify CWD changed successfully
+                current_cwd = os.getcwd()
+                ASCIIColors.info(f"[LCP Tool '{tool_name}'] CWD AFTER change: {current_cwd}")
+
+                if current_cwd != workspace_dir_str:
+                    ASCIIColors.error(f"[LCP Tool '{tool_name}'] CRITICAL: CWD change FAILED! Expected '{workspace_dir_str}' but got '{current_cwd}'")
+                    return {"error": f"Working directory change failed. Expected {workspace_dir_str} but got {current_cwd}", "status_code": 500}
+
+                ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✓ CWD successfully set to: {os.getcwd()}")
+
+                # List files in current directory to verify artifact visibility
+                current_files = os.listdir(".")
+                ASCIIColors.info(f"[LCP Tool '{tool_name}'] Files visible in CWD: {current_files}")
+
+                # 5. Add workspace to sys.path for imports
+                if workspace_dir_str not in sys.path:
+                    sys.path.insert(0, workspace_dir_str)
+
+                # 6. Add workspace to PYTHONPATH environment variable
+                if workspace_dir_str not in old_pythonpath:
+                    new_pythonpath = f"{workspace_dir_str}{os.pathsep}{old_pythonpath}" if old_pythonpath else workspace_dir_str
+                    os.environ["PYTHONPATH"] = new_pythonpath
+
+                # 7. Add workspace to PATH environment variable for executables
+                if workspace_dir_str not in old_path:
+                    new_path = f"{workspace_dir_str}{os.pathsep}{old_path}"
+                    os.environ["PATH"] = new_path
+
+                ASCIIColors.info(f"[LCP Tool '{tool_name}'] Environment configured for agnostic file access")
+                ASCIIColors.info(f"[LCP Tool '{tool_name}'] PYTHONPATH={os.environ.get('PYTHONPATH', '')}")
+
+                # 8. Execute with CLEAN params (NO discussion_instance, NO client)
+                # Tools can now access files using simple paths like "file.cir" or "./subdir/file.txt"
+                result = execute_function(**params)
+
+                # ── POST-EXECUTION: Sync File Changes to Artifacts ──
+                # 9. Snapshot workspace files AFTER execution
+                files_after = set()
+                if workspace_dir.exists():
+                    for f in workspace_dir.rglob("*"):
+                        if f.is_file():
+                            files_after.add(f.relative_to(workspace_dir))
+
+                # 10. Detect NEW files
+                new_files = files_after - files_before
+                for rel_path in new_files:
+                    file_path = workspace_dir / rel_path
+                    try:
+                        content = file_path.read_text(encoding="utf-8", errors="ignore")
+                        file_name = rel_path.name
+                        file_ext = file_path.suffix.lower()
+
+                        # Determine artifact type based on extension
+                        atype = "document"
+                        if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
+                            atype = "code"
+                        elif file_ext in (".csv", ".db", ".sqlite", ".xlsx", ".xls"):
+                            atype = "data"
+                        elif file_ext in (".md", ".txt"):
+                            atype = "document"
+                        elif file_ext in (".json", ".yaml", ".yml"):
+                            atype = "document"
+
+                        # Check if artifact already exists
+                        existing_art = discussion_instance.artefacts.get(file_name) if discussion_instance else None
+
+                        if existing_art:
+                            # Update existing artifact version
+                            discussion_instance.artefacts.update(
+                                title=file_name,
+                                new_content=content,
+                                new_type=atype,
+                                active=True,
+                                commit_message=f"Updated by tool '{tool_name}'"
+                            )
+                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] Updated artifact '{file_name}' to new version")
+                        else:
+                            # Create new artifact
+                            discussion_instance.artefacts.add(
+                                title=file_name,
+                                artefact_type=atype,
+                                content=content,
+                                active=True,
+                                commit_message=f"Created by tool '{tool_name}'"
+                            )
+                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] Created new artifact '{file_name}'")
+                    except Exception as sync_err:
+                        ASCIIColors.warning(f"[LCP Tool '{tool_name}'] Failed to sync file '{rel_path}' to artifact: {sync_err}")
+
+                # 11. Detect MODIFIED files (check mtimes)
+                modified_files = files_after & files_before
+                for rel_path in modified_files:
+                    file_path = workspace_dir / rel_path
+                    try:
+                        # Check if file was modified by comparing mtime
+                        import time
+                        mtime = file_path.stat().st_mtime
+                        file_name = rel_path.name
+
+                        existing_art = discussion_instance.artefacts.get(file_name) if discussion_instance else None
+                        if existing_art:
+                            # Read content and check if it changed
+                            content = file_path.read_text(encoding="utf-8", errors="ignore")
+                            if content != existing_art.get("content", ""):
+                                # Content changed, update artifact
+                                file_ext = file_path.suffix.lower()
+                                atype = existing_art.get("type", "document")
+                                if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
+                                    atype = "code"
+                                elif file_ext in (".csv", ".db", ".sqlite", ".xlsx", ".xls"):
+                                    atype = "data"
+
+                                discussion_instance.artefacts.update(
+                                    title=file_name,
+                                    new_content=content,
+                                    new_type=atype,
+                                    active=True,
+                                    commit_message=f"Modified by tool '{tool_name}'"
+                                )
+                                ASCIIColors.success(f"[LCP Tool '{tool_name}'] Modified artifact '{file_name}' detected and updated")
+                    except Exception as sync_err:
+                        ASCIIColors.warning(f"[LCP Tool '{tool_name}'] Failed to check modified file '{rel_path}': {sync_err}")
+
+                return {"output": result, "status_code": 200}
+
+            finally:
+                # 12. Restore CWD and Environment
+                try:
+                    os.chdir(old_cwd)
+                    ASCIIColors.info(f"[LCP Tool '{tool_name}'] CWD restored to: {os.getcwd()}")
+                except Exception:
+                    pass
+
+                try:
+                    if old_pythonpath:
+                        os.environ["PYTHONPATH"] = old_pythonpath
+                    elif "PYTHONPATH" in os.environ:
+                        del os.environ["PYTHONPATH"]
+                except Exception:
+                    pass
+
+                try:
+                    if old_path:
+                        os.environ["PATH"] = old_path
+                    elif "PATH" in os.environ:
+                        del os.environ["PATH"]
+                except Exception:
+                    pass
 
         except Exception as e:
             trace_exception(e)
-            return {"error": f"Error executing tool '{tool_name}': {str(e)}", "status_code": 500}
-
-
-# --- Example Usage (for testing within this file) ---
-if __name__ == '__main__':
-    ASCIIColors.magenta("--- LCPBinding Test ---")
-
-    # Create a temporary tools directory for testing
-    test_tools_base_dir = Path(__file__).parent.parent.parent / "temp_mcp_tools_for_test" # Place it outside the package
-    test_tools_base_dir.mkdir(parents=True, exist_ok=True)
-
-    # Define a sample tool: get_weather
-    tool1_dir = test_tools_base_dir / "get_weather"
-    tool1_dir.mkdir(exist_ok=True)
-
-    # Python code for get_weather
-    get_weather_py = """
-import random
-def tool_get_weather(city: str, unit: str = "celsius") -> dict:
-    \"\"\"
-    Fetches the current weather for a given city.
-    
-    Args:
-        city (str): The city name.
-        unit (str, optional): Temperature unit (celsius or fahrenheit). Defaults to 'celsius'.
-    \"\"\"
-    if not city:
-        return {"error": "City not provided"}
-        
-    conditions = ["sunny", "cloudy", "rainy", "snowy"]
-    temp = random.randint(-10 if unit == "celsius" else 14, 35 if unit == "celsius" else 95)
-    
-    return {
-        "temperature": temp,
-        "condition": random.choice(conditions),
-        "unit": unit
-    }
-"""
-    with open(tool1_dir / "get_weather.py", "w") as f:
-        f.write(get_weather_py)
-
-    local_mcp_binding = LCPBinding(binding_name="lcp_test", tools_folders=[test_tools_base_dir])
-
-    ASCIIColors.cyan("\n1. Discovering all tools...")
-    all_tools = local_mcp_binding.discover_tools()
-    if all_tools:
-        ASCIIColors.green(f"Discovered {len(all_tools)} tools:")
-        for tool in all_tools:
-            print(f"  - Name: {tool.get('name')}, Description: {tool.get('description')}")
-            print(f"    Schema properties: {list(tool.get('input_schema', {}).get('properties', {}).keys())}")
-            assert "_python_file_path" in tool # Internal check
-    else:
-        ASCIIColors.warning("No tools discovered.")
-
-    # Cleanup
-    import shutil
-    try:
-        shutil.rmtree(test_tools_base_dir)
-        ASCIIColors.info(f"Cleaned up temporary tools directory: {test_tools_base_dir}")
-    except Exception as e_clean:
-        ASCIIColors.error(f"Could not clean up temporary tools directory: {e_clean}")
-
-    ASCIIColors.magenta("\n--- LCPBinding Test Finished ---")
+            return {"error": f"Error executing '{tool_name}': {str(e)}", "status_code": 500}
