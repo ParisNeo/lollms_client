@@ -984,11 +984,65 @@ class ChatMixin:
                         try:
                             # Always pass the active discussion and client instances as context keywords
                             if active_tools and tool_name in active_tools:
-                                tool_res = active_tools[tool_name]["callable"](
-                                    lollms_client_instance=self.lollmsClient,
-                                    discussion_instance=self,
-                                    **tool_params
-                                )
+                                # CRITICAL: Sync all active artifacts to disk BEFORE tool execution
+                                # This ensures any artifact referenced by the tool exists in the workspace
+                                try:
+                                    sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
+                                    ASCIIColors.info(f"[ChatMixin] Pre-tool sync: All active artifacts synced to workspace before executing '{tool_name}'")
+                                    ASCIIColors.info(f"[ChatMixin] Synced files: {sync_files}")
+                                except Exception as sync_err:
+                                    ASCIIColors.warning(f"[ChatMixin] Pre-tool sync failed: {sync_err}")
+
+                                # CRITICAL: Set CWD to workspace before executing ANY tool
+                                # This ensures tools can find artifact files using simple relative paths
+                                import os
+                                from pathlib import Path
+                                old_cwd = os.getcwd()
+
+                                workspace_dir = Path("./data_workspace")
+                                try:
+                                    from lollms_client.app.server import APP_WORKSPACE_DIR
+                                    if APP_WORKSPACE_DIR is not None:
+                                        workspace_dir = APP_WORKSPACE_DIR
+                                except ImportError:
+                                    pass
+
+                                workspace_dir_str = str(workspace_dir.resolve())
+
+                                try:
+                                    os.chdir(workspace_dir_str)
+                                    ASCIIColors.success(f"[ChatMixin] ✓ CWD changed to workspace: {os.getcwd()}")
+                                    ASCIIColors.info(f"[ChatMixin] Files in workspace: {os.listdir('.')}")
+
+                                    # CRITICAL: Strip path prefixes from tool parameters
+                                    # Tools expect simple filenames like "rlc_circuit.cir", not "workspace/rlc_circuit.cir"
+                                    sanitized_params = {}
+                                    for key, value in tool_params.items():
+                                        if isinstance(value, str):
+                                            # Strip common path prefixes that tools don't need
+                                            sanitized_value = value
+                                            for prefix in ["workspace/", "data_workspace/", "./workspace/", "./data_workspace/"]:
+                                                if sanitized_value.lower().startswith(prefix):
+                                                    sanitized_value = sanitized_value[len(prefix):]
+                                                    ASCIIColors.info(f"[ChatMixin] Stripped path prefix from parameter '{key}': '{value}' -> '{sanitized_value}'")
+                                                    break
+                                            sanitized_params[key] = sanitized_value
+                                        else:
+                                            sanitized_params[key] = value
+
+                                    # Pass discussion_instance so LCP binding can sync file changes back to artifacts
+                                    tool_res = active_tools[tool_name]["callable"](
+                                        lollms_client_instance=self.lollmsClient,
+                                        discussion_instance=self,
+                                        **sanitized_params
+                                    )
+                                finally:
+                                    # Restore CWD after tool execution
+                                    try:
+                                        os.chdir(old_cwd)
+                                        ASCIIColors.info(f"[ChatMixin] CWD restored to: {os.getcwd()}")
+                                    except Exception:
+                                        pass
                             else:
                                 tool_res = self.lollmsClient.tools.execute_tool(
                                     tool_name, 
