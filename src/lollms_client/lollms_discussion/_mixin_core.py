@@ -90,8 +90,9 @@ class CoreMixin:
         # Automatically synchronize all active artifacts' physical files on startup
         try:
             self.artefacts.sync_all_active_to_disk()
+            ASCIIColors.success("[CoreMixin] All active artifacts synchronized to workspace on discussion load")
         except Exception as sync_err:
-            pass
+            ASCIIColors.warning(f"[CoreMixin] Failed to sync active artifacts on startup: {sync_err}")
 
 # ---------------------------------------------------------------- factories
 
