@@ -68,9 +68,7 @@ def tool_execute_multi_file_service(
     frontend_file: str = "index.html",
     backend_port: int = 8000,
     frontend_port: int = 8080,
-    uvicorn_app_import: str = "main:app",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    uvicorn_app_import: str = "main:app"
 ) -> dict:
     """
     Launches a Python web server (FastAPI/Uvicorn) in the background,
