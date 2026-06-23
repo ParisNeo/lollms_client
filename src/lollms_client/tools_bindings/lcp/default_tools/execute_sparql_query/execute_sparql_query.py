@@ -34,9 +34,7 @@ def _get_workspace_dir() -> Path:
 
 def tool_execute_sparql_query(
     file_name: str,
-    sparql_query: str,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    sparql_query: str
 ) -> dict:
     """
     Parses a Turtle (.ttl) file from the workspace and executes a SPARQL 1.1 query.
