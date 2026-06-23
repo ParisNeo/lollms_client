@@ -185,9 +185,7 @@ def _save_data_source(df: Any, file_path: Path, table_name: str) -> None:
 
 def tool_get_table_schema(
     file_name: str,
-    table_name: Optional[str] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    table_name: Optional[str] = None
 ) -> dict:
     """
     Retrieves the exact column names, data types, row counts, and null counts of a dataset.
@@ -232,14 +230,12 @@ def tool_filter_and_slice_data(
     file_name: str,
     table_name: Optional[str] = None,
     filter_column: Optional[str] = None,
-    operator: Optional[str] = "==",  # "==", "!=", ">", "<", ">=", "<=", "contains"
+    operator: Optional[str] = "==",
     filter_value: Optional[str] = None,
     columns_to_keep: Optional[List[str]] = None,
     limit: int = 50,
     save_as_new_artifact: bool = False,
-    output_artifact_title: Optional[str] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    output_artifact_title: Optional[str] = None
 ) -> dict:
     """
     Filters and slices a dataset without writing Python code, optionally saving the output as a new version or artifact.
@@ -348,9 +344,7 @@ def tool_get_unique_values(
     file_name: str,
     column_name: str,
     table_name: Optional[str] = None,
-    limit: int = 100,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    limit: int = 100
 ) -> dict:
     """
     Returns unique elements and category frequency counts from a column.
@@ -400,9 +394,7 @@ def tool_compute_column_aggregations(
     metric_column: str,
     group_by_column: Optional[str] = None,
     table_name: Optional[str] = None,
-    operation: str = "mean",  # "sum", "mean", "min", "max", "count"
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    operation: str = "mean"
 ) -> dict:
     """
     Computes mathematical aggregations on a numerical column (sum, mean, min, max, count), optionally grouping by another column.
@@ -476,9 +468,7 @@ def tool_update_cell_value(
     row_match_column: str = "",
     row_match_value: str = "",
     column_to_update: str = "",
-    new_value: str = "",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    new_value: str = ""
 ) -> dict:
     """
     Surgically updates a cell value in a spreadsheet or database row without code execution.
@@ -559,9 +549,7 @@ def tool_update_cell_value(
 def tool_insert_new_row(
     file_name: str,
     row_data: Dict[str, Any],
-    table_name: Optional[str] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    table_name: Optional[str] = None
 ) -> dict:
     """
     Inserts a new row/record into a spreadsheet or SQLite table.
@@ -631,9 +619,7 @@ def tool_delete_rows_by_criteria(
     file_name: str,
     match_column: str,
     match_value: str,
-    table_name: Optional[str] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    table_name: Optional[str] = None
 ) -> dict:
     """
     Deletes all rows matching a specific column value.
@@ -696,9 +682,7 @@ def tool_delete_rows_by_criteria(
 
 def tool_query_database_sql(
     file_name: str,
-    sql_query: str,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    sql_query: str
 ) -> dict:
     """
     Executes standard SQL queries directly against SQLite database files or local CSV/Excel table models.
@@ -815,15 +799,13 @@ def tool_query_database_sql(
 def tool_generate_advanced_visualization(
     file_name: str,
     x_column: str,
-    y_columns: List[str],  # Supports multiple columns/series
+    y_columns: List[str],
     table_name: Optional[str] = None,
-    plot_type: str = "line",  # "line", "bar", "stacked_bar", "scatter", "pie"
+    plot_type: str = "line",
     title: Optional[str] = None,
     x_label: Optional[str] = None,
     y_label: Optional[str] = None,
-    colors: Optional[List[str]] = None,  # Custom palette list,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    colors: Optional[List[str]] = None
 ) -> dict:
     """
     Generates advanced multi-series charts (multi-line, stacked bar, scatter, pie) in high-quality dark mode.
@@ -969,13 +951,11 @@ def tool_generate_advanced_visualization(
 def tool_compute_statistics_and_plot(
     file_name: str,
     table_name: Optional[str] = None,
-    plot_type: str = "bar",  # "bar", "line", "scatter", "histogram"
+    plot_type: str = "bar",
     x_column: Optional[str] = None,
     y_column: Optional[str] = None,
     title: Optional[str] = None,
-    color: str = "#4f46e5",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    color: str = "#4f46e5"
 ) -> dict:
     """
     Computes numerical statistics (mean, variance, standard deviation, null counts)
@@ -1100,9 +1080,7 @@ def tool_compute_statistics_and_plot(
 # ── 6. BOOTSTRAP TBOX MACRO ─────────────────────────────────────────────────
 
 def tool_bootstrap_tbox_from_database(
-    file_name: str,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    file_name: str
 ) -> dict:
     """
     Scans a database file (SQLite, Excel, CSV) and bootstraps a clean ontological schema (TBox).
@@ -1186,9 +1164,7 @@ def tool_bootstrap_tbox_from_database(
 
 def tool_convert_to_abox(
     file_name: str,
-    tbox_file_name: str,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    tbox_file_name: str
 ) -> dict:
     """
     Reads a database, parses rows based on a TBox schema, and compiles them into
