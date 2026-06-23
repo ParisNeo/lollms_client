@@ -454,7 +454,11 @@ class ArtefactManager:
             disc_ws_dir.mkdir(parents=True, exist_ok=True)
             disc_ver_dir.mkdir(parents=True, exist_ok=True)
 
-            filename = self._get_filename_with_ext(title, atype, language, file_ext)
+            # CRITICAL: Strip any path prefixes from title to ensure file is saved in workspace root
+            # This prevents issues like "workspace/rlc_circuit.cir" being saved as a nested path
+            clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
+
+            filename = self._get_filename_with_ext(clean_title, atype, language, file_ext)
 
             # Ensure any nested directory structures are created
             primary_path = workspace_dir / filename
@@ -490,6 +494,13 @@ class ArtefactManager:
                         except Exception as p_err:
                             pass
                 ASCIIColors.success(f"[Workspace Sync] Synchronized file '{filename}' (v{version}) directly to primary workspace.")
+
+            # CRITICAL: After syncing, verify the file exists and log its presence
+            if primary_path.exists():
+                ASCIIColors.success(f"[Workspace Sync] ✓ Verified: {primary_path.name} exists in workspace at {primary_path.resolve()}")
+            else:
+                ASCIIColors.error(f"[Workspace Sync] ✗ FAILED: {primary_path.name} was NOT written to workspace! Expected at: {primary_path.resolve()}")
+
         except Exception as e:
             ASCIIColors.warning(f"Failed to sync artifact '{title}' to disk workspace: {e}")
 
@@ -584,8 +595,27 @@ class ArtefactManager:
         artefacts.append(new_artefact)
         self._save_all(artefacts)
 
-        # Sync to disk workspace
+        # Sync to disk workspace IMMEDIATELY so tools can access the file
         self._sync_to_disk_workspace(title, content, version, artefact_type, language, extra_data.get("file_ext"))
+
+        # Verify the file was actually written
+        from pathlib import Path
+        workspace_dir = Path("./data_workspace")
+        try:
+            from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+            if awd is not None:
+                workspace_dir = awd
+        except ImportError:
+            pass
+
+        filename = self._get_filename_with_ext(title, artefact_type, language, extra_data.get("file_ext"))
+        expected_path = workspace_dir / filename
+
+        if expected_path.exists():
+            ASCIIColors.success(f"[ArtefactManager.add] Verified artifact file exists on disk: {expected_path}")
+        else:
+            ASCIIColors.error(f"[ArtefactManager.add] WARNING: Artifact file was NOT written to disk! Expected: {expected_path}")
+
         return new_artefact
 
     def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -1486,7 +1516,60 @@ class ArtefactManager:
     def sync_all_active_to_disk(self):
         """Ensures a physical copy of all active/loaded artifacts exists in the workspace."""
         active_arts = self.list(active_only=True)
+        if not active_arts:
+            ASCIIColors.info("[ArtefactManager] No active artifacts to sync")
+            return
+
+        # Get workspace directory path for logging
+        workspace_dir = Path("./data_workspace")
+        try:
+            from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+            if awd is not None:
+                workspace_dir = awd
+        except ImportError:
+            pass
+
+        workspace_dir = workspace_dir.resolve()
+
+        ASCIIColors.info(f"[ArtefactManager] ════════════════════════════════════════════════════")
+        ASCIIColors.info(f"[ArtefactManager] SYNCING ARTIFACTS TO DISK")
+        ASCIIColors.info(f"[ArtefactManager] ════════════════════════════════════════════════════")
+        ASCIIColors.info(f"[ArtefactManager] Workspace directory: {workspace_dir}")
+        ASCIIColors.info(f"[ArtefactManager] Artifacts to sync ({len(active_arts)}): {[a['title'] for a in active_arts]}")
+
+        synced_files = []
         for art in active_arts:
+            ASCIIColors.info(f"[ArtefactManager] ── Syncing: {art['title']} (type={art.get('type')}, ext={art.get('file_ext', 'N/A')})")
+
+            # For DATA type artifacts, we need to sync the actual data file, not just the schema
+            if art.get("type") == "data":
+                # Try to find and copy the actual data file from versions folder
+                file_ext = art.get("file_ext", "")
+                version = art.get("version", 1)
+                title = art["title"]
+
+                # Check for versioned data file
+                versioned_data = workspace_dir / "versions" / f"{title}_v{version}{file_ext}"
+                if versioned_data.exists():
+                    # Copy to workspace root so tools can find it
+                    dest = workspace_dir / f"{title}{file_ext}"
+                    import shutil
+                    shutil.copy(str(versioned_data), str(dest))
+                    ASCIIColors.success(f"[ArtefactManager] ✓ Synced data file: {title}{file_ext}")
+                    synced_files.append(str(dest.resolve()))
+                else:
+                    # Try unversioned copy
+                    unversioned = workspace_dir / f"{title}{file_ext}"
+                    if unversioned.exists():
+                        ASCIIColors.info(f"[ArtefactManager] ✓ Found unversioned data file: {title}{file_ext}")
+                        synced_files.append(str(unversioned.resolve()))
+                    else:
+                        ASCIIColors.warning(f"[ArtefactManager] ✗ Data file not found for {title}{file_ext}")
+                        # Check if content exists in artifact record
+                        if art.get("content"):
+                            ASCIIColors.info(f"[ArtefactManager]   → Artifact has content ({len(art['content'])} chars), will sync as text file")
+
+            # Sync the artifact content (for code, documents, etc.)
             self._sync_to_disk_workspace(
                 title=art["title"],
                 content=art["content"],
@@ -1495,6 +1578,37 @@ class ArtefactManager:
                 language=art.get("language"),
                 file_ext=art.get("file_ext")
             )
+
+            # Track synced file
+            filename = self._get_filename_with_ext(art["title"], art["type"], art.get("language"), art.get("file_ext"))
+            expected_path = workspace_dir / filename
+            if expected_path.exists():
+                synced_files.append(str(expected_path.resolve()))
+
+        # Final verification: list all files in workspace
+        ASCIIColors.info(f"[ArtefactManager] ────────────────────────────────────────────────────")
+        if workspace_dir.exists():
+            workspace_files = list(workspace_dir.iterdir())
+            subdirs = {}
+            for item in workspace_dir.iterdir():
+                if item.is_dir():
+                    subfiles = list(item.iterdir())
+                    if subfiles:
+                        subdirs[item.name] = [f.name for f in subfiles]
+
+            ASCIIColors.success(f"[ArtefactManager] ✓ Workspace directory: {workspace_dir}")
+            ASCIIColors.success(f"[ArtefactManager] ✓ Workspace ROOT files ({len(workspace_files)}): {[f.name for f in workspace_files]}")
+            if subdirs:
+                for subdir, files in subdirs.items():
+                    ASCIIColors.success(f"[ArtefactManager]   Subdir '{subdir}/' ({len(files)} files): {files}")
+
+            # CRITICAL: Log the EXACT paths where artifacts were written
+            ASCIIColors.success(f"[ArtefactManager] ✓ SYNCED FILES ({len(synced_files)}):")
+            for f in synced_files:
+                ASCIIColors.success(f"[ArtefactManager]     → {f}")
+        ASCIIColors.info(f"[ArtefactManager] ════════════════════════════════════════════════════")
+
+        return workspace_dir, synced_files
 
     def deactivate(self, title: str, version: Optional[int] = None):
         self._set_active(title, version, False)
