@@ -1032,8 +1032,6 @@ class ChatMixin:
 
                                     # Pass discussion_instance so LCP binding can sync file changes back to artifacts
                                     tool_res = active_tools[tool_name]["callable"](
-                                        lollms_client_instance=self.lollmsClient,
-                                        discussion_instance=self,
                                         **sanitized_params
                                     )
                                 finally:

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from enum import Enum
 from typing import List, Optional, Callable, Union, Dict, Any
-
+import ascii_colors as logging
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE, ELF_COMPLETION_FORMAT
 from lollms_client.lollms_utilities import robust_json_parser, build_image_dicts, dict_to_markdown
@@ -23,6 +23,7 @@ from lollms_client.lollms_stt_binding import LollmsSTTBinding, LollmsSTTBindingM
 from lollms_client.lollms_ttv_binding import LollmsTTVBinding, LollmsTTVBindingManager
 from lollms_client.lollms_ttm_binding import LollmsTTMBinding, LollmsTTMBindingManager
 from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
+from lollms_client.lollms_agent import ToolsManager
 
 from lollms_client.lollms_discussion import LollmsDiscussion
 
@@ -73,13 +74,6 @@ class LollmsClient():
         """
 
         self.debug = debug
-        if not self.debug:
-            import logging
-            logging.getLogger("ASCIIColors").setLevel(logging.WARNING)
-            from ascii_colors import ASCIIColors
-            for method_name in ["info", "success", "cyan", "blue", "green", "panel"]:
-                if hasattr(ASCIIColors, method_name):
-                    setattr(ASCIIColors, method_name, lambda *args, **kwargs: None)
 
         self.cooperative_vram_management = cooperative_vram_management
         if callback: callback("🚀 Initializing **Lollms Client**...", MSG_TYPE.MSG_TYPE_INIT_PROGRESS, {})
@@ -417,8 +411,6 @@ class LollmsClient():
                 "rounds": int,             # Number of agentic rounds
             }
         """
-        from ascii_colors import ASCIIColors
-        from lollms_client.lollms_agent import ToolsManager
 
         if self.llm is None:
             raise RuntimeError("LLM binding not initialized.")
