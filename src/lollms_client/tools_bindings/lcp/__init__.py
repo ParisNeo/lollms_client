@@ -1,5 +1,6 @@
 import sys
 import os
+import io
 import importlib.util
 import ast
 import re
@@ -205,7 +206,7 @@ class LCPBinding(LollmsToolBinding):
         1. CWD = Workspace Directory (so artifacts appear as local files)
         2. No discussion/client instances are passed to the tool
         3. Tools operate on files using simple relative paths (e.g., "file.cir")
-        4. AFTER execution: Sync any file changes back to artifacts automatically
+        4. AFTER execution: Automatically detect file changes and sync to artifacts
         """
         tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
         if not tool_def:
@@ -263,76 +264,109 @@ class LCPBinding(LollmsToolBinding):
             old_pythonpath = os.environ.get("PYTHONPATH", "")
             old_path = os.environ.get("PATH", "")
 
-            # 3. Snapshot workspace files BEFORE execution
-            files_before = set()
+            # 3. Snapshot workspace files BEFORE execution (Store content hash to detect changes reliably)
+            files_before = {}
             if workspace_dir.exists():
                 for f in workspace_dir.rglob("*"):
                     if f.is_file():
-                        files_before.add(f.relative_to(workspace_dir))
+                        rel_path = f.relative_to(workspace_dir)
+                        try:
+                            # Store content hash and mtime
+                            content = f.read_text(encoding="utf-8", errors="ignore")
+                            files_before[rel_path] = {
+                                "hash": hash(content),
+                                "mtime": f.stat().st_mtime,
+                                "path": f
+                            }
+                        except Exception:
+                            # Skip binary files or unreadable files
+                            files_before[rel_path] = {
+                                "hash": None,
+                                "mtime": f.stat().st_mtime,
+                                "path": f
+                            }
 
-            # CRITICAL: Log the CWD BEFORE changing it
-            ASCIIColors.info(f"[LCP Tool '{tool_name}'] CWD BEFORE change: {os.getcwd()}")
-            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Target workspace: {workspace_dir_str}")
+            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Snapshot taken: {len(files_before)} files before execution.")
 
             try:
                 # 4. Change CWD to Workspace
-                # This ensures tools see artifacts as simple files in "." or "./subfolder"
                 os.chdir(workspace_dir_str)
 
-                # CRITICAL: Verify CWD changed successfully
                 current_cwd = os.getcwd()
-                ASCIIColors.info(f"[LCP Tool '{tool_name}'] CWD AFTER change: {current_cwd}")
-
                 if current_cwd != workspace_dir_str:
-                    ASCIIColors.error(f"[LCP Tool '{tool_name}'] CRITICAL: CWD change FAILED! Expected '{workspace_dir_str}' but got '{current_cwd}'")
-                    return {"error": f"Working directory change failed. Expected {workspace_dir_str} but got {current_cwd}", "status_code": 500}
+                    ASCIIColors.error(f"[LCP Tool '{tool_name}'] CRITICAL: CWD change FAILED!")
+                    return {"error": f"Working directory change failed.", "status_code": 500}
 
-                ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✓ CWD successfully set to: {os.getcwd()}")
+                ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✓ CWD set to: {os.getcwd()}")
 
-                # List files in current directory to verify artifact visibility
-                current_files = os.listdir(".")
-                ASCIIColors.info(f"[LCP Tool '{tool_name}'] Files visible in CWD: {current_files}")
-
-                # 5. Add workspace to sys.path for imports
+                # 5. Add workspace to sys.path and Environment
                 if workspace_dir_str not in sys.path:
                     sys.path.insert(0, workspace_dir_str)
-
-                # 6. Add workspace to PYTHONPATH environment variable
                 if workspace_dir_str not in old_pythonpath:
-                    new_pythonpath = f"{workspace_dir_str}{os.pathsep}{old_pythonpath}" if old_pythonpath else workspace_dir_str
-                    os.environ["PYTHONPATH"] = new_pythonpath
-
-                # 7. Add workspace to PATH environment variable for executables
+                    os.environ["PYTHONPATH"] = f"{workspace_dir_str}{os.pathsep}{old_pythonpath}" if old_pythonpath else workspace_dir_str
                 if workspace_dir_str not in old_path:
-                    new_path = f"{workspace_dir_str}{os.pathsep}{old_path}"
-                    os.environ["PATH"] = new_path
+                    os.environ["PATH"] = f"{workspace_dir_str}{os.pathsep}{old_path}"
 
-                ASCIIColors.info(f"[LCP Tool '{tool_name}'] Environment configured for agnostic file access")
-                ASCIIColors.info(f"[LCP Tool '{tool_name}'] PYTHONPATH={os.environ.get('PYTHONPATH', '')}")
+                # 6. Capture stdout/stderr
+                captured_stdout = io.StringIO()
+                captured_stderr = io.StringIO()
+                old_sys_stdout = sys.stdout
+                old_sys_stderr = sys.stderr
 
-                # 8. Execute with CLEAN params (NO discussion_instance, NO client)
-                # Tools can now access files using simple paths like "file.cir" or "./subdir/file.txt"
-                # We strictly pass only the parameters defined in the tool's signature.
-                result = execute_function(**params)
+                try:
+                    sys.stdout = captured_stdout
+                    sys.stderr = captured_stderr
 
-                # ── POST-EXECUTION: Sync File Changes to Artifacts ──
-                # 9. Snapshot workspace files AFTER execution
-                files_after = set()
+                    # Execute with CLEAN params
+                    result = execute_function(**params)
+                finally:
+                    sys.stdout = old_sys_stdout
+                    sys.stderr = old_sys_stderr
+                    # Forward prints
+                    if captured_stdout.getvalue():
+                        old_sys_stdout.write(f"[LCP Tool '{tool_name}' STDOUT]:\n{captured_stdout.getvalue()}")
+                        old_sys_stdout.flush()
+                    if captured_stderr.getvalue():
+                        old_sys_stdout.write(f"[LCP Tool '{tool_name}' STDERR]:\n{captured_stderr.getvalue()}")
+                        old_sys_stdout.flush()
+
+                # ── POST-EXECUTION: AUTOMATIC ARTIFACT SYNC ──
+                # 7. Snapshot workspace files AFTER execution
+                files_after = {}
                 if workspace_dir.exists():
                     for f in workspace_dir.rglob("*"):
                         if f.is_file():
-                            files_after.add(f.relative_to(workspace_dir))
+                            rel_path = f.relative_to(workspace_dir)
+                            try:
+                                content = f.read_text(encoding="utf-8", errors="ignore")
+                                files_after[rel_path] = {
+                                    "hash": hash(content),
+                                    "mtime": f.stat().st_mtime,
+                                    "path": f,
+                                    "content": content
+                                }
+                            except Exception:
+                                files_after[rel_path] = {
+                                    "hash": None,
+                                    "mtime": f.stat().st_mtime,
+                                    "path": f,
+                                    "content": None
+                                }
 
-                # 10. Detect NEW files
-                new_files = files_after - files_before
-                for rel_path in new_files:
-                    file_path = workspace_dir / rel_path
-                    try:
-                        content = file_path.read_text(encoding="utf-8", errors="ignore")
+                if not discussion_instance:
+                    ASCIIColors.warning("[LCP Tool] No discussion_instance provided. Skipping artifact sync.")
+                else:
+                    # 8. Detect NEW files
+                    new_files = set(files_after.keys()) - set(files_before.keys())
+                    for rel_path in new_files:
+                        file_info = files_after[rel_path]
+                        if file_info["content"] is None:
+                            continue # Skip binary/unreadable
+
                         file_name = rel_path.name
-                        file_ext = file_path.suffix.lower()
+                        file_ext = rel_path.suffix.lower()
 
-                        # Determine artifact type based on extension
+                        # Determine artifact type
                         atype = "document"
                         if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
                             atype = "code"
@@ -342,50 +376,49 @@ class LCPBinding(LollmsToolBinding):
                             atype = "document"
                         elif file_ext in (".json", ".yaml", ".yml"):
                             atype = "document"
+                        elif file_ext in (".png", ".jpg", ".jpeg", ".gif"):
+                            atype = "image"
 
-                        # Check if artifact already exists
-                        existing_art = discussion_instance.artefacts.get(file_name) if discussion_instance else None
+                        # Check if artifact already exists (fuzzy match)
+                        existing_art = discussion_instance.artefacts.get(file_name)
 
                         if existing_art:
-                            # Update existing artifact version
+                            # Should not happen for "new" files, but handle case where file was deleted from disk but exists in artifacts
+                            ASCIIColors.info(f"[LCP Tool] File '{file_name}' reappeared on disk. Updating artifact.")
                             discussion_instance.artefacts.update(
                                 title=file_name,
-                                new_content=content,
+                                new_content=file_info["content"],
                                 new_type=atype,
                                 active=True,
-                                commit_message=f"Updated by tool '{tool_name}'"
+                                commit_message=f"Restored by tool '{tool_name}'"
                             )
-                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] Updated artifact '{file_name}' to new version")
                         else:
-                            # Create new artifact
+                            # Create NEW artifact
                             discussion_instance.artefacts.add(
                                 title=file_name,
                                 artefact_type=atype,
-                                content=content,
+                                content=file_info["content"],
                                 active=True,
                                 commit_message=f"Created by tool '{tool_name}'"
                             )
-                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] Created new artifact '{file_name}'")
-                    except Exception as sync_err:
-                        ASCIIColors.warning(f"[LCP Tool '{tool_name}'] Failed to sync file '{rel_path}' to artifact: {sync_err}")
+                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Created NEW artifact: '{file_name}'")
 
-                # 11. Detect MODIFIED files (check mtimes)
-                modified_files = files_after & files_before
-                for rel_path in modified_files:
-                    file_path = workspace_dir / rel_path
-                    try:
-                        # Check if file was modified by comparing mtime
-                        import time
-                        mtime = file_path.stat().st_mtime
-                        file_name = rel_path.name
+                    # 9. Detect MODIFIED files
+                    common_files = set(files_after.keys()) & set(files_before.keys())
+                    for rel_path in common_files:
+                        before_info = files_before[rel_path]
+                        after_info = files_after[rel_path]
 
-                        existing_art = discussion_instance.artefacts.get(file_name) if discussion_instance else None
-                        if existing_art:
-                            # Read content and check if it changed
-                            content = file_path.read_text(encoding="utf-8", errors="ignore")
-                            if content != existing_art.get("content", ""):
-                                # Content changed, update artifact
-                                file_ext = file_path.suffix.lower()
+                        # Check if content hash changed
+                        if before_info["hash"] != after_info["hash"]:
+                            if after_info["content"] is None:
+                                continue # Skip binary/unreadable
+
+                            file_name = rel_path.name
+                            existing_art = discussion_instance.artefacts.get(file_name)
+
+                            if existing_art:
+                                file_ext = rel_path.suffix.lower()
                                 atype = existing_art.get("type", "document")
                                 if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
                                     atype = "code"
@@ -394,38 +427,41 @@ class LCPBinding(LollmsToolBinding):
 
                                 discussion_instance.artefacts.update(
                                     title=file_name,
-                                    new_content=content,
+                                    new_content=after_info["content"],
                                     new_type=atype,
                                     active=True,
                                     commit_message=f"Modified by tool '{tool_name}'"
                                 )
-                                ASCIIColors.success(f"[LCP Tool '{tool_name}'] Modified artifact '{file_name}' detected and updated")
-                    except Exception as sync_err:
-                        ASCIIColors.warning(f"[LCP Tool '{tool_name}'] Failed to check modified file '{rel_path}': {sync_err}")
+                                ASCIIColors.success(f"[LCP Tool '{tool_name}'] 🔄 Updated artifact '{file_name}' (v{existing_art.get('version', 1)+1})")
+                            else:
+                                # File existed on disk before but not in artifacts? Sync it now.
+                                ASCIIColors.warning(f"[LCP Tool] File '{file_name}' modified on disk but no artifact found. Creating one.")
+                                file_ext = rel_path.suffix.lower()
+                                atype = "code" if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir") else "document"
+                                discussion_instance.artefacts.add(
+                                    title=file_name,
+                                    artefact_type=atype,
+                                    content=after_info["content"],
+                                    active=True,
+                                    commit_message=f"Synced by tool '{tool_name}'"
+                                )
 
                 return {"output": result, "status_code": 200}
 
             finally:
-                # 12. Restore CWD and Environment
+                # 10. Restore CWD and Environment
                 try:
                     os.chdir(old_cwd)
-                    ASCIIColors.info(f"[LCP Tool '{tool_name}'] CWD restored to: {os.getcwd()}")
                 except Exception:
                     pass
-
                 try:
-                    if old_pythonpath:
-                        os.environ["PYTHONPATH"] = old_pythonpath
-                    elif "PYTHONPATH" in os.environ:
-                        del os.environ["PYTHONPATH"]
+                    if old_pythonpath: os.environ["PYTHONPATH"] = old_pythonpath
+                    elif "PYTHONPATH" in os.environ: del os.environ["PYTHONPATH"]
                 except Exception:
                     pass
-
                 try:
-                    if old_path:
-                        os.environ["PATH"] = old_path
-                    elif "PATH" in os.environ:
-                        del os.environ["PATH"]
+                    if old_path: os.environ["PATH"] = old_path
+                    elif "PATH" in os.environ: del os.environ["PATH"]
                 except Exception:
                     pass
 
