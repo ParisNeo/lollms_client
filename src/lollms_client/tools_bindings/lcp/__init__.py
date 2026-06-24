@@ -203,10 +203,10 @@ class LCPBinding(LollmsToolBinding):
     def execute_tool(self, tool_name: str, params: Dict[str, Any], discussion_instance=None, **kwargs) -> Dict[str, Any]:
         """
         Executes a tool in an isolated environment where:
-        1. CWD = Workspace Directory (so artifacts appear as local files)
-        2. No discussion/client instances are passed to the tool
+        1. CWD = DISCUSSION-SPECIFIC Workspace Directory
+        2. No discussion/client instances are passed to the tool (agnostic)
         3. Tools operate on files using simple relative paths (e.g., "file.cir")
-        4. AFTER execution: Automatically detect file changes and sync to artifacts
+        4. AFTER execution: Automatically detect ALL new/modified files and sync to discussion artifacts
         """
         tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
         if not tool_def:
@@ -247,14 +247,21 @@ class LCPBinding(LollmsToolBinding):
             if not execute_function:
                 return {"error": f"No entry point found in '{tool_name}'.", "status_code": 500}
 
-            # ── ENVIRONMENT PREPARATION (Agnostic Workspace Injection) ──
-            # 1. Get Workspace Directory
-            workspace_dir = Path("./data_workspace")
+            # ── ENVIRONMENT PREPARATION (Discussion-Isolated Workspace) ──
+            # 1. Get DISCUSSION-SPECIFIC Workspace Directory
+            base_workspace_dir = Path("./data_workspace")
             try:
-                from lollms_client.app.server import get_discussion_workspace
-                workspace_dir = get_discussion_workspace()
+                from lollms_client.app.server import APP_WORKSPACE_DIR
+                if APP_WORKSPACE_DIR is not None:
+                    base_workspace_dir = APP_WORKSPACE_DIR
             except ImportError:
                 pass
+
+            # CRITICAL FIX: Use discussion-specific folder if discussion_instance is provided
+            if discussion_instance:
+                workspace_dir = base_workspace_dir / "discussions" / discussion_instance.id
+            else:
+                workspace_dir = base_workspace_dir
 
             workspace_dir.mkdir(parents=True, exist_ok=True)
             workspace_dir_str = str(workspace_dir.resolve())
@@ -286,10 +293,10 @@ class LCPBinding(LollmsToolBinding):
                                 "path": f
                             }
 
-            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Snapshot taken: {len(files_before)} files before execution.")
+            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Snapshot taken: {len(files_before)} files before execution in {workspace_dir}")
 
             try:
-                # 4. Change CWD to Workspace
+                # 4. Change CWD to DISCUSSION Workspace
                 os.chdir(workspace_dir_str)
 
                 current_cwd = os.getcwd()
@@ -358,32 +365,99 @@ class LCPBinding(LollmsToolBinding):
                 else:
                     # 8. Detect NEW files
                     new_files = set(files_after.keys()) - set(files_before.keys())
+                    ASCIIColors.info(f"[LCP Tool '{tool_name}'] Detected {len(new_files)} NEW files: {[str(f) for f in new_files]}")
+
                     for rel_path in new_files:
                         file_info = files_after[rel_path]
-                        if file_info["content"] is None:
-                            continue # Skip binary/unreadable
-
                         file_name = rel_path.name
                         file_ext = rel_path.suffix.lower()
+                        file_path = file_info["path"]
+                        file_size = file_path.stat().st_size
 
-                        # Determine artifact type
+                        # 1. Determine Artifact Type based on Extension
                         atype = "document"
-                        if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
+                        if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
                             atype = "code"
-                        elif file_ext in (".csv", ".db", ".sqlite", ".xlsx", ".xls"):
+                        elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
                             atype = "data"
-                        elif file_ext in (".md", ".txt"):
+                        elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
                             atype = "document"
-                        elif file_ext in (".json", ".yaml", ".yml"):
-                            atype = "document"
-                        elif file_ext in (".png", ".jpg", ".jpeg", ".gif"):
+                        elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
                             atype = "image"
+                        elif file_ext in (".pdf", ".docx", ".zip", ".tar", ".gz"):
+                            atype = "document" # Treat as downloadable document
 
-                        # Check if artifact already exists (fuzzy match)
+                        # 2. Decide if we should read content or create a placeholder
+                        # Explicit Binary Extensions (Databases, Images, Archives)
+                        EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
+                                                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
+                                                ".zip", ".tar", ".gz", ".pdf", ".docx"}
+
+                        should_read_content = True
+                        content_placeholder = None
+
+                        if file_ext in EXPLICIT_BINARY_EXTS:
+                            should_read_content = False
+                            content_placeholder = (
+                                f"### Data File Generated: `{file_name}`\n\n"
+                                f"This file was created by the tool `{tool_name}`.\n"
+                                f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
+                                f"- **Size**: {file_size:,} bytes\n"
+                                f"- **Location**: `{file_path.resolve()}`\n\n"
+                                f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
+                            )
+                        elif file_info["content"] is None:
+                            # Failed to read text? Check if it's actually binary via null-byte heuristic
+                            try:
+                                with open(file_path, 'rb') as f:
+                                    chunk = f.read(1024)
+                                    if b'\x00' in chunk:
+                                        should_read_content = False
+                                        content_placeholder = (
+                                            f"### Binary File Detected: `{file_name}`\n\n"
+                                            f"This file appears to be binary (contains null bytes).\n"
+                                            f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
+                                            f"- **Size**: {file_size:,} bytes\n"
+                                            f"- **Location**: `{file_path.resolve()}`\n\n"
+                                            f"> **Action**: Download from Workspace Artifacts panel."
+                                        )
+                                    else:
+                                        # It's text but read_text failed (encoding issue). Force read with ignore.
+                                        ASCIIColors.warning(f"[LCP Tool] File '{file_name}' read failed initially, forcing text read with encoding ignore.")
+                                        forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
+                                        file_info["content"] = forced_content
+                                        should_read_content = True
+                            except Exception as e:
+                                ASCIIColors.error(f"[LCP Tool] Unable to inspect file '{file_name}': {e}")
+                                should_read_content = False
+                                content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
+
+                        # 3. Register Artifact
+                        if not should_read_content and content_placeholder:
+                            # Register Placeholder for Binary Files
+                            existing_art = discussion_instance.artefacts.get(file_name)
+                            if existing_art:
+                                discussion_instance.artefacts.update(
+                                    title=file_name,
+                                    new_content=content_placeholder,
+                                    new_type=atype,
+                                    active=True,
+                                    commit_message=f"Updated binary file reference by tool '{tool_name}'"
+                                )
+                            else:
+                                discussion_instance.artefacts.add(
+                                    title=file_name,
+                                    artefact_type=atype,
+                                    content=content_placeholder,
+                                    active=True,
+                                    commit_message=f"Created by tool '{tool_name}'"
+                                )
+                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
+                            continue
+
+                        # Handle Text/Readable Files (Existing Logic)
                         existing_art = discussion_instance.artefacts.get(file_name)
-
                         if existing_art:
-                            # Should not happen for "new" files, but handle case where file was deleted from disk but exists in artifacts
                             ASCIIColors.info(f"[LCP Tool] File '{file_name}' reappeared on disk. Updating artifact.")
                             discussion_instance.artefacts.update(
                                 title=file_name,
@@ -394,6 +468,7 @@ class LCPBinding(LollmsToolBinding):
                             )
                         else:
                             # Create NEW artifact
+                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Creating NEW artifact from file: '{file_name}'")
                             discussion_instance.artefacts.add(
                                 title=file_name,
                                 artefact_type=atype,
@@ -408,17 +483,51 @@ class LCPBinding(LollmsToolBinding):
                     for rel_path in common_files:
                         before_info = files_before[rel_path]
                         after_info = files_after[rel_path]
+                        file_name = rel_path.name
+                        file_ext = rel_path.suffix.lower()
+                        file_path = after_info["path"]
 
-                        # Check if content hash changed
-                        if before_info["hash"] != after_info["hash"]:
+                        # Check if content hash changed OR if file became unreadable/readable
+                        content_changed = before_info["hash"] != after_info["hash"]
+                        became_binary = before_info["content"] is not None and after_info["content"] is None
+                        became_text = before_info["content"] is None and after_info["content"] is not None
+
+                        if content_changed or became_binary or became_text:
+                            # Handle Binary/Unreadable Modified Files
                             if after_info["content"] is None:
-                                continue # Skip binary/unreadable
+                                ASCIIColors.info(f"[LCP Tool] Detected modified binary file '{file_name}'. Updating placeholder artifact.")
+                                content_placeholder = (
+                                    f"### Binary File Modified: `{file_name}`\n\n"
+                                    f"This file was updated by the tool `{tool_name}`.\n"
+                                    f"- **Type**: {file_ext.upper()} Binary/Data\n"
+                                    f"- **Location**: `{file_path.resolve()}`\n"
+                                    f"- **Size**: {file_path.stat().st_size:,} bytes\n\n"
+                                    f"You can download or view this file directly from the Workspace Artifacts panel."
+                                )
 
-                            file_name = rel_path.name
+                                existing_art = discussion_instance.artefacts.get(file_name)
+                                if existing_art:
+                                    discussion_instance.artefacts.update(
+                                        title=file_name,
+                                        new_content=content_placeholder,
+                                        new_type=atype,
+                                        active=True,
+                                        commit_message=f"Modified binary file by tool '{tool_name}'"
+                                    )
+                                else:
+                                    discussion_instance.artefacts.add(
+                                        title=file_name,
+                                        artefact_type=atype,
+                                        content=content_placeholder,
+                                        active=True,
+                                        commit_message=f"Synced binary file by tool '{tool_name}'"
+                                    )
+                                ASCIIColors.success(f"[LCP Tool '{tool_name}'] 🔄 Updated binary file reference: '{file_name}'")
+                                continue
+
+                            # Handle Text/Readable Modified Files
                             existing_art = discussion_instance.artefacts.get(file_name)
-
                             if existing_art:
-                                file_ext = rel_path.suffix.lower()
                                 atype = existing_art.get("type", "document")
                                 if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
                                     atype = "code"
@@ -436,7 +545,6 @@ class LCPBinding(LollmsToolBinding):
                             else:
                                 # File existed on disk before but not in artifacts? Sync it now.
                                 ASCIIColors.warning(f"[LCP Tool] File '{file_name}' modified on disk but no artifact found. Creating one.")
-                                file_ext = rel_path.suffix.lower()
                                 atype = "code" if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir") else "document"
                                 discussion_instance.artefacts.add(
                                     title=file_name,
