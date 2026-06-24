@@ -312,6 +312,7 @@ class LCPBinding(LollmsToolBinding):
 
                 # 8. Execute with CLEAN params (NO discussion_instance, NO client)
                 # Tools can now access files using simple paths like "file.cir" or "./subdir/file.txt"
+                # We strictly pass only the parameters defined in the tool's signature.
                 result = execute_function(**params)
 
                 # ── POST-EXECUTION: Sync File Changes to Artifacts ──
