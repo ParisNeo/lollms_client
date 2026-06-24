@@ -435,71 +435,85 @@ class ArtefactManager:
                 ext = type_map.get(atype, ".txt")
         return f"{title}{ext}"
 
-    def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None):
-        """Saves artifact content to the discussion's isolated virtual workspace on disk."""
+    def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None):
+        """
+        Saves artifact to the discussion's ISOLATED workspace folder on disk.
+
+        ARCHITECTURAL RULE: Dual-Stream Storage
+        - physical_data (bytes): The raw binary/text file for tools to execute against (CSV, DB, PNG, etc.).
+        - content (str): The logical representation for the LLM context (Schema, Stats, Description).
+
+        If physical_data is provided, it takes precedence for disk writing.
+        If physical_data is None, we fall back to writing 'content' (for code/text files).
+        """
         try:
             from pathlib import Path
-            workspace_dir = Path("./data_workspace")
+            base_workspace_dir = Path("./data_workspace")
             try:
                 from lollms_client.app.server import APP_WORKSPACE_DIR as awd
                 if awd is not None:
-                    workspace_dir = awd
+                    base_workspace_dir = awd
             except ImportError:
                 pass
 
             disc_id = self._discussion.id
-            disc_ws_dir = workspace_dir  # Save directly to primary workspace so tools can read other artifacts easily!
+            # CRITICAL FIX: Each discussion gets its own isolated folder
+            disc_ws_dir = base_workspace_dir / "discussions" / disc_id
             disc_ver_dir = disc_ws_dir / "versions"
 
+            # Create isolated discussion workspace
             disc_ws_dir.mkdir(parents=True, exist_ok=True)
             disc_ver_dir.mkdir(parents=True, exist_ok=True)
 
-            # CRITICAL: Strip any path prefixes from title to ensure file is saved in workspace root
-            # This prevents issues like "workspace/rlc_circuit.cir" being saved as a nested path
+            # CRITICAL: Strip any path prefixes from title to ensure file is saved in discussion workspace root
             clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
 
             filename = self._get_filename_with_ext(clean_title, atype, language, file_ext)
 
-            # Ensure any nested directory structures are created
-            primary_path = workspace_dir / filename
-            working_path = disc_ws_dir / filename
+            # Paths are now relative to the DISCUSSION workspace
+            primary_path = disc_ws_dir / filename
+            versioned_path = disc_ver_dir / f"{filename.replace('/', '_').replace('._', '_')}_v{version}"
+            if '.' in filename:
+                name_part, ext_part = os.path.splitext(filename)
+                versioned_path = disc_ver_dir / f"{name_part.replace('/', '_')}_v{version}{ext_part}"
 
-            # Map versioned files safely into versions/ folder, keeping names clean
-            safe_ver_name = filename.replace("/", "_")
-            name_part, ext_part = os.path.splitext(safe_ver_name)
-            versioned_path = disc_ver_dir / f"{name_part}_v{version}{ext_part}"
+            # ── DUAL-STREAM WRITE LOGIC ────────────────────────────────────────
+            wrote_file = False
 
-            if isinstance(content, str):
-                # Do not overwrite binary database or spreadsheet files with text schemas
-                if atype == "data" and (file_ext or ext_part) in (".db", ".sqlite", ".sqlite3", ".xlsx", ".xls"):
+            # 1. Attempt to write Physical Data (Binary or Raw Text)
+            if physical_data is not None:
+                try:
+                    # Write binary data directly
+                    primary_path.write_bytes(physical_data)
+                    versioned_path.write_bytes(physical_data)
+                    wrote_file = True
+                    ASCIIColors.success(f"[Workspace Sync] Synchronized BINARY '{filename}' (v{version}) to discussion '{disc_id}' workspace.")
+                except Exception as bin_err:
+                    ASCIIColors.warning(f"Failed to write binary data for '{filename}': {bin_err}")
+
+            # 2. Fallback to Logical Content (for Code/Text files where Physical == Logical)
+            if not wrote_file and isinstance(content, str):
+                # Skip writing if content looks like a schema description (not raw data)
+                is_schema_only = (len(content) < 500 and not content.strip().startswith("Format:")) or \
+                                 (atype == "data" and content.strip().startswith("# Data Interface:"))
+
+                if not is_schema_only:
                     try:
-                        # Copy the versioned physical data file to the unversioned path if it exists
-                        versioned_path_candidate = disc_ver_dir / f"{name_part}_v{version}{ext_part}"
-                        if not versioned_path_candidate.exists():
-                            versioned_path_candidate = workspace_dir / f"{name_part}_v{version}{ext_part}"
-
-                        if versioned_path_candidate.exists():
-                            import shutil
-                            for p in (primary_path, working_path):
-                                if versioned_path_candidate.resolve() != p.resolve():
-                                    p.parent.mkdir(parents=True, exist_ok=True)
-                                    shutil.copy(str(versioned_path_candidate), str(p))
-                    except Exception as copy_err:
-                        pass
+                        primary_path.write_text(content, encoding="utf-8", errors="ignore")
+                        versioned_path.write_text(content, encoding="utf-8", errors="ignore")
+                        wrote_file = True
+                        ASCIIColors.success(f"[Workspace Sync] Synchronized TEXT '{filename}' (v{version}) to discussion '{disc_id}' workspace.")
+                    except Exception as txt_err:
+                        ASCIIColors.warning(f"Failed to write text content for '{filename}': {txt_err}")
                 else:
-                    for p in (primary_path, working_path, versioned_path):
-                        try:
-                            p.parent.mkdir(parents=True, exist_ok=True)
-                            p.write_text(content, encoding="utf-8", errors="ignore")
-                        except Exception as p_err:
-                            pass
-                ASCIIColors.success(f"[Workspace Sync] Synchronized file '{filename}' (v{version}) directly to primary workspace.")
+                    ASCIIColors.info(f"[Workspace Sync] Skipped writing '{filename}' to disk (Schema-only content detected).")
 
-            # CRITICAL: After syncing, verify the file exists and log its presence
+            # CRITICAL: Verify the file exists in the DISCUSSION folder
             if primary_path.exists():
-                ASCIIColors.success(f"[Workspace Sync] ✓ Verified: {primary_path.name} exists in workspace at {primary_path.resolve()}")
+                ASCIIColors.success(f"[Workspace Sync] ✓ Verified: {primary_path.name} exists at {primary_path.resolve()}")
             else:
-                ASCIIColors.error(f"[Workspace Sync] ✗ FAILED: {primary_path.name} was NOT written to workspace! Expected at: {primary_path.resolve()}")
+                if not is_schema_only:
+                    ASCIIColors.error(f"[Workspace Sync] ✗ FAILED: {primary_path.name} was NOT written! Expected at: {primary_path.resolve()}")
 
         except Exception as e:
             ASCIIColors.warning(f"Failed to sync artifact '{title}' to disk workspace: {e}")
@@ -538,8 +552,17 @@ class ArtefactManager:
         visibility:        Optional[str] = None,
         commit_message:    Optional[str] = None,
         version_tags:      Optional[List[str]] = None,
+        physical_data:     Optional[bytes] = None,  # NEW: Raw binary/text for disk
         **extra_data
     ) -> Dict[str, Any]:
+        """
+        Adds a new artifact to the discussion.
+
+        ARCHITECTURAL RULE: Dual-Stream Storage
+        - content (str): The logical representation for the LLM context (Schema, Stats, Description).
+        - physical_data (bytes): The raw binary/text file for tools to execute against (CSV, DB, PNG, etc.).
+          If None, defaults to encoding 'content' as UTF-8 bytes.
+        """
         if artefact_type not in ArtefactType.ALL:
             raise ValueError(
                 f"Unknown artefact type '{artefact_type}'. "
@@ -595,8 +618,29 @@ class ArtefactManager:
         artefacts.append(new_artefact)
         self._save_all(artefacts)
 
-        # Sync to disk workspace IMMEDIATELY so tools can access the file
-        self._sync_to_disk_workspace(title, content, version, artefact_type, language, extra_data.get("file_ext"))
+        # ── DUAL-STREAM SYNC PROTOCOL ─────────────────────────────────────────
+        # 1. Determine Physical Data to Write
+        final_physical_data = physical_data
+
+        # If no physical data provided, but content exists and is not a schema description
+        if final_physical_data is None and content:
+            # For Code/Text files, Physical == Logical
+            if artefact_type not in (ArtefactType.DATA, ArtefactType.IMAGE):
+                final_physical_data = content.encode('utf-8', errors='ignore')
+            # For Data files, if content looks like raw data (not schema), encode it
+            elif artefact_type == ArtefactType.DATA and not content.strip().startswith("# Data Interface:"):
+                final_physical_data = content.encode('utf-8', errors='ignore')
+
+        # 2. Sync to disk workspace IMMEDIATELY so tools can access the file
+        self._sync_to_disk_workspace(
+            title, 
+            content, 
+            version, 
+            artefact_type, 
+            language, 
+            extra_data.get("file_ext"),
+            physical_data=final_physical_data
+        )
 
         # Verify the file was actually written
         from pathlib import Path
@@ -609,12 +653,15 @@ class ArtefactManager:
             pass
 
         filename = self._get_filename_with_ext(title, artefact_type, language, extra_data.get("file_ext"))
-        expected_path = workspace_dir / filename
+        expected_path = workspace_dir / "discussions" / self._discussion.id / filename
 
         if expected_path.exists():
             ASCIIColors.success(f"[ArtefactManager.add] Verified artifact file exists on disk: {expected_path}")
         else:
-            ASCIIColors.error(f"[ArtefactManager.add] WARNING: Artifact file was NOT written to disk! Expected: {expected_path}")
+            if artefact_type != ArtefactType.DATA or not content.strip().startswith("# Data Interface:"):
+                ASCIIColors.error(f"[ArtefactManager.add] WARNING: Artifact file was NOT written to disk! Expected: {expected_path}")
+            else:
+                ASCIIColors.info(f"[ArtefactManager.add] Skipped disk write for schema-only data artifact '{title}'.")
 
         return new_artefact
 
@@ -1514,25 +1561,29 @@ class ArtefactManager:
                 )
 
     def sync_all_active_to_disk(self):
-        """Ensures a physical copy of all active/loaded artifacts exists in the workspace."""
+        """Ensures a physical copy of all active/loaded artifacts exists in the DISCUSSION-ISOLATED workspace."""
         active_arts = self.list(active_only=True)
         if not active_arts:
             ASCIIColors.info("[ArtefactManager] No active artifacts to sync")
             return
 
-        # Get workspace directory path for logging
-        workspace_dir = Path("./data_workspace")
+        # CRITICAL FIX: Resolve the DISCUSSION-SPECIFIC workspace directory
+        base_workspace_dir = Path("./data_workspace")
         try:
             from lollms_client.app.server import APP_WORKSPACE_DIR as awd
             if awd is not None:
-                workspace_dir = awd
+                base_workspace_dir = awd
         except ImportError:
             pass
+
+        disc_id = self._discussion.id
+        workspace_dir = base_workspace_dir / "discussions" / disc_id
+        workspace_dir.mkdir(parents=True, exist_ok=True)
 
         workspace_dir = workspace_dir.resolve()
 
         ASCIIColors.info(f"[ArtefactManager] ════════════════════════════════════════════════════")
-        ASCIIColors.info(f"[ArtefactManager] SYNCING ARTIFACTS TO DISK")
+        ASCIIColors.info(f"[ArtefactManager] SYNCING ARTIFACTS TO DISK (Discussion: {disc_id})")
         ASCIIColors.info(f"[ArtefactManager] ════════════════════════════════════════════════════")
         ASCIIColors.info(f"[ArtefactManager] Workspace directory: {workspace_dir}")
         ASCIIColors.info(f"[ArtefactManager] Artifacts to sync ({len(active_arts)}): {[a['title'] for a in active_arts]}")
@@ -1541,35 +1592,32 @@ class ArtefactManager:
         for art in active_arts:
             ASCIIColors.info(f"[ArtefactManager] ── Syncing: {art['title']} (type={art.get('type')}, ext={art.get('file_ext', 'N/A')})")
 
-            # For DATA type artifacts, we need to sync the actual data file, not just the schema
+            # For DATA type artifacts, sync the actual file from versions folder within discussion workspace
             if art.get("type") == "data":
-                # Try to find and copy the actual data file from versions folder
                 file_ext = art.get("file_ext", "")
                 version = art.get("version", 1)
                 title = art["title"]
 
-                # Check for versioned data file
+                # Check for versioned data file in discussion versions folder
                 versioned_data = workspace_dir / "versions" / f"{title}_v{version}{file_ext}"
                 if versioned_data.exists():
-                    # Copy to workspace root so tools can find it
                     dest = workspace_dir / f"{title}{file_ext}"
                     import shutil
                     shutil.copy(str(versioned_data), str(dest))
                     ASCIIColors.success(f"[ArtefactManager] ✓ Synced data file: {title}{file_ext}")
                     synced_files.append(str(dest.resolve()))
                 else:
-                    # Try unversioned copy
+                    # Try unversioned copy in discussion workspace
                     unversioned = workspace_dir / f"{title}{file_ext}"
                     if unversioned.exists():
                         ASCIIColors.info(f"[ArtefactManager] ✓ Found unversioned data file: {title}{file_ext}")
                         synced_files.append(str(unversioned.resolve()))
                     else:
                         ASCIIColors.warning(f"[ArtefactManager] ✗ Data file not found for {title}{file_ext}")
-                        # Check if content exists in artifact record
                         if art.get("content"):
-                            ASCIIColors.info(f"[ArtefactManager]   → Artifact has content ({len(art['content'])} chars), will sync as text file")
+                            ASCIIColors.info(f"[ArtefactManager]   → Artifact has content, will sync as text file")
 
-            # Sync the artifact content (for code, documents, etc.)
+            # Sync the artifact content (for code, documents, etc.) to discussion workspace
             self._sync_to_disk_workspace(
                 title=art["title"],
                 content=art["content"],
@@ -1579,13 +1627,13 @@ class ArtefactManager:
                 file_ext=art.get("file_ext")
             )
 
-            # Track synced file
+            # Track synced file (now in discussion folder)
             filename = self._get_filename_with_ext(art["title"], art["type"], art.get("language"), art.get("file_ext"))
             expected_path = workspace_dir / filename
             if expected_path.exists():
                 synced_files.append(str(expected_path.resolve()))
 
-        # Final verification: list all files in workspace
+        # Final verification: list all files in DISCUSSION workspace
         ASCIIColors.info(f"[ArtefactManager] ────────────────────────────────────────────────────")
         if workspace_dir.exists():
             workspace_files = list(workspace_dir.iterdir())
@@ -1602,7 +1650,6 @@ class ArtefactManager:
                 for subdir, files in subdirs.items():
                     ASCIIColors.success(f"[ArtefactManager]   Subdir '{subdir}/' ({len(files)} files): {files}")
 
-            # CRITICAL: Log the EXACT paths where artifacts were written
             ASCIIColors.success(f"[ArtefactManager] ✓ SYNCED FILES ({len(synced_files)}):")
             for f in synced_files:
                 ASCIIColors.success(f"[ArtefactManager]     → {f}")
@@ -2623,6 +2670,93 @@ class ArtefactManager:
             "companion_images_versions": [{k: v for k, v in ver.items() if k != "id"} for ver in sorted_comp_versions],
             "exported_at": datetime.utcnow().isoformat()
         }
+
+    def import_file(self, file_path: Union[str, Path], title: Optional[str] = None, active: bool = True) -> Dict[str, Any]:
+        """
+        HIGH-LEVEL API: Imports a file from disk into the discussion as a typed artifact.
+
+        ARCHITECTURAL RULE: The library handles ALL dual-stream complexity.
+        The caller simply provides a path. The library:
+        1. Detects type (Code, Data, Image, Document).
+        2. Reads Physical Bytes (for tools/disk).
+        3. Generates Logical Schema/Content (for LLM context).
+        4. Registers the artifact with both streams.
+
+        Args:
+            file_path: Path to the file on disk.
+            title: Optional custom title. Defaults to filename.
+            active: Whether to activate the artifact immediately.
+
+        Returns:
+            The created artifact dictionary.
+        """
+        from pathlib import Path as PathLib
+        path = PathLib(file_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        if title is None:
+            title = path.stem
+
+        ext = path.suffix.lower()
+
+        # 1. Determine Artifact Type
+        artefact_type = ArtefactType.DOCUMENT
+        if ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".sqlconn", ".ttl", ".rdf", ".parquet"):
+            artefact_type = ArtefactType.DATA
+        elif ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+            artefact_type = ArtefactType.CODE
+        elif ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+            artefact_type = ArtefactType.IMAGE
+        elif ext in (".md", ".txt", ".log", ".json", ".yaml", ".yml", ".xml"):
+            artefact_type = ArtefactType.DOCUMENT
+
+        # 2. Prepare Physical Data (Bytes)
+        try:
+            physical_data = path.read_bytes()
+        except Exception as e:
+            ASCIIColors.error(f"Failed to read physical bytes for {title}: {e}")
+            physical_data = None
+
+        # 3. Prepare Logical Content (Schema/Text)
+        content = ""
+        if artefact_type == ArtefactType.DATA:
+            # Use internal parser to generate schema/stats
+            try:
+                from ._data_files import _parse_data_file
+                schema_result = _parse_data_file(path, title, version=1)
+                # Handle both 2-tuple (old) and 3-tuple (new) returns
+                if len(schema_result) == 3:
+                    content, _, _ = schema_result
+                else:
+                    content, _ = schema_result
+            except Exception as e:
+                content = f"# Data Interface: {title}\n⚠️ Failed to parse schema: {e}"
+        elif artefact_type == ArtefactType.IMAGE:
+            content = f"### Image: `{title}{ext}`\n\n<artefact_image id=\"{title}{ext}::0\" />"
+        elif artefact_type in (ArtefactType.CODE, ArtefactType.DOCUMENT):
+            try:
+                content = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception as e:
+                content = f"⚠️ Failed to read text content: {e}"
+
+        # 4. Register with Dual-Stream
+        art = self.add(
+            title=title + ext,
+            artefact_type=artefact_type,
+            content=content,
+            language=ext.replace(".", "") if artefact_type == ArtefactType.CODE else None,
+            active=active,
+            file_ext=ext,
+            physical_data=physical_data
+        )
+
+        # Commit discussion if attached
+        if self._discussion:
+            self._discussion.commit()
+
+        return art
 
     def import_artefact(self, artefact_data: Dict[str, Any], activate: bool = True) -> Optional[Dict[str, Any]]:
         """
