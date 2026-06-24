@@ -306,26 +306,19 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
         ASCIIColors.error(f"Failed to parse structured data file: {e}")
         schema_parts.append(f"⚠️ Failed to extract full structure: {e}")
 
-    # Copy the raw file to the data workspace so our execution tools can find it
-    workspace_dir = Path("./data_workspace")
-    try:
-        from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-        if awd is not None:
-            workspace_dir = awd
-    except ImportError:
-        pass
+    # ── DUAL-STREAM PROTOCOL FOR DATA FILES ───────────────────────────────────
+    # 1. Logical Content (for LLM Context): The schema/stats generated above.
+    # 2. Physical Content (for Tools): The raw binary file copied from source.
 
-    workspace_dir.mkdir(exist_ok=True)
-    # Save with unique title and version suffix
-    shutil_dest = workspace_dir / f"{art_title}_v{version}{ext}"
-    shutil_active = workspace_dir / f"{art_title}{ext}"
-    import shutil
-    if path.resolve() != shutil_dest.resolve():
-        shutil.copy(str(path), str(shutil_dest))
+    # Read the raw binary data from the source file
     try:
-        shutil.copy(str(path), str(shutil_active))
+        raw_physical_data = path.read_bytes()
     except Exception as e:
-        ASCIIColors.warning(f"Failed to copy active unversioned file: {e}")
-    ASCIIColors.info(f"Raw data file saved to workspace: {shutil_dest}")
+        ASCIIColors.error(f"Failed to read raw binary data from {path}: {e}")
+        raw_physical_data = None
 
-    return "\n\n".join(schema_parts), []
+    # Return both: Schema for context, Raw Bytes for disk storage
+    # CALLER NOTE: The return tuple is now (schema_text, empty_list, raw_bytes)
+    # You MUST unpack this as: schema, _, physical_data = _parse_data_file(...)
+    # Then pass physical_data to artefacts.add(physical_data=physical_data)
+    return "\n\n".join(schema_parts), [], raw_physical_data
