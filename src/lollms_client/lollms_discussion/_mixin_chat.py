@@ -993,25 +993,28 @@ class ChatMixin:
                                 except Exception as sync_err:
                                     ASCIIColors.warning(f"[ChatMixin] Pre-tool sync failed: {sync_err}")
 
-                                # CRITICAL: Set CWD to workspace before executing ANY tool
+                                # CRITICAL: Set CWD to DISCUSSION-SPECIFIC workspace before executing ANY tool
                                 # This ensures tools can find artifact files using simple relative paths
                                 import os
                                 from pathlib import Path
                                 old_cwd = os.getcwd()
 
-                                workspace_dir = Path("./data_workspace")
+                                # Get the SAME discussion-specific path that sync_all_active_to_disk() uses
+                                base_workspace_dir = Path("./data_workspace")
                                 try:
                                     from lollms_client.app.server import APP_WORKSPACE_DIR
                                     if APP_WORKSPACE_DIR is not None:
-                                        workspace_dir = APP_WORKSPACE_DIR
+                                        base_workspace_dir = APP_WORKSPACE_DIR
                                 except ImportError:
                                     pass
 
+                                # CRITICAL FIX: Use discussion-specific folder
+                                workspace_dir = base_workspace_dir / "discussions" / self.id
                                 workspace_dir_str = str(workspace_dir.resolve())
 
                                 try:
                                     os.chdir(workspace_dir_str)
-                                    ASCIIColors.success(f"[ChatMixin] ✓ CWD changed to workspace: {os.getcwd()}")
+                                    ASCIIColors.success(f"[ChatMixin] ✓ CWD changed to discussion workspace: {os.getcwd()}")
                                     ASCIIColors.info(f"[ChatMixin] Files in workspace: {os.listdir('.')}")
 
                                     # CRITICAL: Strip path prefixes from tool parameters
