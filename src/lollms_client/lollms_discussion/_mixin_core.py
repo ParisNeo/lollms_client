@@ -4,9 +4,10 @@
 
 import re
 import uuid
+from pathlib import Path
 from datetime import datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Union, Optional
 
 from sqlalchemy.orm.exc import NoResultFound
 from ascii_colors import ASCIIColors, trace_exception
@@ -82,17 +83,6 @@ class CoreMixin:
 
         # ── Memory system ─────────────────────────────────────────────────
         self._init_memory(memory_manager)
-
-        self._rebuild_message_index()
-        self._validate_and_set_active_branch()
-        self.get_discussion_images()
-
-        # Automatically synchronize all active artifacts' physical files on startup
-        try:
-            self.artefacts.sync_all_active_to_disk()
-            ASCIIColors.success("[CoreMixin] All active artifacts synchronized to workspace on discussion load")
-        except Exception as sync_err:
-            ASCIIColors.warning(f"[CoreMixin] Failed to sync active artifacts on startup: {sync_err}")
 
 # ---------------------------------------------------------------- factories
 
@@ -186,27 +176,58 @@ class CoreMixin:
     # ------------------------------------------------- message index helpers
 
     def _rebuild_message_index(self):
-        if self._is_db_backed and self._session and self._session.is_active \
-                and self._db_discussion in self._session:
-            try:
-                # Flush pending unsaved additions to the transaction so they survive refresh
-                self._session.flush()
-            except Exception:
-                pass
+        """
+        Rebuilds the local message index from the database.
+        GUARANTEE: Ensures self._message_index is always a valid dict (never None).
+        """
+        # Initialize as empty dict first to prevent NoneType errors
+        self._message_index = {}
 
-            try:
-                self._session.refresh(self._db_discussion, ['messages'])
-            except Exception as e:
-                # If transaction is in a pending rollback state, clear it and retry refresh
-                if "pendingrollback" in str(e).lower() or "rollback" in str(e).lower():
-                    try:
-                        self._session.rollback()
-                        self._session.refresh(self._db_discussion, ['messages'])
-                    except Exception as retry_err:
-                        ASCIIColors.error(f"Failed to refresh messages after rollback: {retry_err}")
-                else:
-                    ASCIIColors.error(f"Database refresh error: {e}")
-        self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
+        if not self._is_db_backed:
+            # In-memory mode: build from proxy list
+            if hasattr(self._db_discussion, 'messages'):
+                self._message_index = {msg.id: msg for msg in self._db_discussion.messages}
+            return
+
+        # Database mode: requires valid session
+        if not (self._session and self._session.is_active):
+            ASCIIColors.warning("[MessageIndex] Session is inactive. Cannot rebuild index.")
+            return
+
+        try:
+            # Flush pending unsaved additions to the transaction so they survive refresh
+            self._session.flush()
+        except Exception:
+            pass
+
+        try:
+            # Check if db_discussion is still bound to session
+            if self._db_discussion not in self._session:
+                ASCIIColors.warning("[MessageIndex] Discussion object detached from session. Re-merging...")
+                self._db_discussion = self._session.merge(self._db_discussion)
+
+            self._session.refresh(self._db_discussion, ['messages'])
+        except Exception as e:
+            # If transaction is in a pending rollback state, clear it and retry refresh
+            error_str = str(e).lower()
+            if "pendingrollback" in error_str or "rollback" in error_str:
+                try:
+                    ASCIIColors.warning("[MessageIndex] Rolling back pending transaction...")
+                    self._session.rollback()
+                    self._db_discussion = self._session.merge(self._db_discussion)
+                    self._session.refresh(self._db_discussion, ['messages'])
+                except Exception as retry_err:
+                    ASCIIColors.error(f"Failed to refresh messages after rollback: {retry_err}")
+            else:
+                ASCIIColors.error(f"Database refresh error: {e}")
+
+        # Safely build index from whatever messages are accessible
+        try:
+            msgs = getattr(self._db_discussion, 'messages', [])
+            self._message_index = {msg.id: msg for msg in msgs}
+        except Exception as idx_err:
+            ASCIIColors.error(f"Failed to build message index from ORM objects: {idx_err}")
+            self._message_index = {}  # Ensure it's never None
 
     def _find_deepest_leaf(self, start_id):
         if not self._message_index:
@@ -334,6 +355,16 @@ class CoreMixin:
     # -------------------------------------------------------- message CRUD
 
     def add_message(self, **kwargs) -> LollmsMessage:
+        # 🛡️ DEFENSIVE CHECK: Ensure message index is valid before proceeding
+        if self._message_index is None:
+            ASCIIColors.warning("[add_message] Message index is None. Rebuilding...")
+            self._rebuild_message_index()
+
+        # Fallback if rebuild failed
+        if self._message_index is None:
+            ASCIIColors.error("[add_message] CRITICAL: Failed to initialize message index. Forcing empty dict.")
+            object.__setattr__(self, '_message_index', {})
+
         msg_id = kwargs.get('id', str(uuid.uuid4()))
         parent_id = kwargs.get('parent_id', self.active_branch_id)
         if 'images' in kwargs and kwargs['images'] and 'active_images' not in kwargs:
@@ -360,7 +391,7 @@ class CoreMixin:
             filtered_data = {k: v for k, v in message_data.items() if k in valid_keys}
             new_msg_orm = self.db_manager.MessageModel(**filtered_data)
             self._db_discussion.messages.append(new_msg_orm)
-            if new_msg_orm not in self._session:
+            if self._session and new_msg_orm not in self._session:
                 self._session.add(new_msg_orm)
         else:
             new_msg_orm = SimpleNamespace(**message_data)
@@ -378,7 +409,17 @@ class CoreMixin:
                 wrapped_msg.metadata = meta
                 wrapped_msg._sync_active_images_flags()
         self.active_branch_id = msg_id
-        self._message_index[msg_id] = new_msg_orm
+
+        # Safe assignment to index
+        try:
+            self._message_index[msg_id] = new_msg_orm
+        except Exception as idx_err:
+            ASCIIColors.error(f"[add_message] Failed to update message index: {idx_err}")
+            # Rebuild index as last resort
+            self._rebuild_message_index()
+            if self._message_index:
+                self._message_index[msg_id] = new_msg_orm
+
         self.touch()
         return wrapped_msg
 
