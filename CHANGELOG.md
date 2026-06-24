@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-24 08:15]
+
+- refactor(client): remove loggers from public api exports
+
 ## [2026-06-22 22:22]
 
 - chore: bump version to 1.15.3
