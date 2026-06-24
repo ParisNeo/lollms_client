@@ -1165,8 +1165,17 @@ class FileImportMixin:
             # ── data mode (Single File) ──────────────────────────────────────────
             if mode == IMPORT_MODE_DATA:
                 _progress("Analyzing structured data file...")
+
+                # 🛡️ TITLE NORMALIZATION PROTOCOL
+                # Ensure 'title' does not already contain the extension to prevent "file.csv.csv" duplicates.
+                # We strip the extension if it matches the file's actual extension.
+                clean_title = title
+                if clean_title.lower().endswith(ext) and len(clean_title) > len(ext):
+                    clean_title = clean_title[:-len(ext)]
+                    _progress(f"Normalized title '{title}' -> '{clean_title}' to prevent extension duplication.")
+
                 # 1. Parse and extract the Markdown schema description
-                schema_text, images_data = _parse_data_file(path, title, version=1, progress_cb=progress_cb)
+                schema_text, images_data = _parse_data_file(path, clean_title, version=1, progress_cb=progress_cb)
 
                 # 2. Extract the actual raw content (verbatim rows) for CSV/TSV
                 if ext in (".csv", ".tsv"):
@@ -1181,10 +1190,11 @@ class FileImportMixin:
 
                 atype = ArtefactType.DATA
 
-                existing = self.artefacts.get(title)
+                # Use clean_title for lookup and registration
+                existing = self.artefacts.get(clean_title)
                 if existing is None:
                     art = self.artefacts.add(
-                        title=title,
+                        title=clean_title,
                         artefact_type=atype,
                         content=raw_content,
                         active=activate,
@@ -1195,7 +1205,7 @@ class FileImportMixin:
                     )
                 else:
                     art = self.artefacts.update(
-                        title=title,
+                        title=clean_title,
                         new_content=raw_content,
                         new_type=atype,
                         active=activate,
@@ -1205,6 +1215,8 @@ class FileImportMixin:
                         description=full_description
                     )
                 _progress("Data analysis complete.")
+
+                # 🛑 CRITICAL EXIT: Prevent fall-through to generic text processing
                 return {
                     "text_artefact": art,
                     "image_artefact": None,
