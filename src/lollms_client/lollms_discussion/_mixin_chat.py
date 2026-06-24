@@ -972,7 +972,7 @@ class ChatMixin:
                         )
                         # Write the error notice to the UI before terminating
                         status_err_line = f"* Tool call blocked to prevent loop.\n"
-                        details_block = f'<details class="proc-error-details"><summary>Loop Intercepted</summary><pre>{result_str}</pre></details>\n'
+                        details_block = f"Loop Intercepted:\n{result_str}\n"
                         tool_close_tag = f"{status_err_line}{details_block}</processing>\n\n"
                         ai_msg.content += tool_close_tag
                         _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -1059,7 +1059,7 @@ class ChatMixin:
 
                                     # Write error block
                                     status_done_line = f"* Completed execution with errors.\n"
-                                    details_block = f'<details class="proc-error-details"><summary>Error Logs</summary><pre>{html.escape(error_msg)}</pre></details>\n'
+                                    details_block = f"Error Logs:\n{error_msg}\n"
                                 else:
                                     # ── Stash the full raw output for the UI; build a sanitized
                                     #    version (no base64 blobs, prefers prompt_injection) to
@@ -1078,27 +1078,27 @@ class ChatMixin:
 
                                     # Write success block
                                     status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
-                                    safe_output = html.escape(full_dump[:2000] + ("..." if len(full_dump) > 2000 else ""))
-                                    details_block = f'<details class="proc-success-details"><summary>Output Logs</summary><pre>{safe_output}</pre></details>\n'
+                                    safe_output = full_dump[:2000] + ("..." if len(full_dump) > 2000 else "")
+                                    details_block = f"Output Logs:\n{safe_output}\n"
                             else:
                                 result_str = str(tool_res)
                                 if "error" in result_str.lower() or "fail" in result_str.lower():
                                     self.failure_memory.record_failure(tool_name, tool_params, result_str)
                                     clean_result_str = result_str  # Errors are already concise and safe
                                     status_done_line = f"* Completed execution with errors.\n"
-                                    details_block = f'<details class="proc-error-details"><summary>Error Logs</summary><pre>{html.escape(result_str)}</pre></details>\n'
+                                    details_block = f"Error Logs:\n{result_str}\n"
                                 else:
                                     status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
                                     clean_result_str = _sanitize_tool_result(tool_res)
-                                    safe_output = html.escape(result_str[:2000] + ("..." if len(result_str) > 2000 else ""))
-                                    details_block = f'<details class="proc-success-details"><summary>Output Logs</summary><pre>{safe_output}</pre></details>\n'
+                                    safe_output = result_str[:2000] + ("..." if len(result_str) > 2000 else "")
+                                    details_block = f"Output Logs:\n{safe_output}\n"
                         except Exception as e:
                             trace_exception(e)
                             self.failure_memory.record_failure(tool_name, tool_params, str(e))
                             result_str = f"Error executing tool '{tool_name}': {e}"
                             clean_result_str = f"Error executing tool '{tool_name}': {e}"
                             status_done_line = f"* Execution crashed.\n"
-                            details_block = f'<details class="proc-error-details"><summary>Crash Details</summary><pre>{html.escape(str(e))}</pre></details>\n'
+                            details_block = f"Crash Details:\n{str(e)}\n"
 
                     tool_close_tag = f"{status_done_line}{details_block}</processing>\n\n"
                     ai_msg.content += tool_close_tag
@@ -1106,10 +1106,11 @@ class ChatMixin:
 
                     # Track the tool call and result in this turn's metadata
                     # (use clean_result_str to keep metadata bloat-free of base64)
+                    tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
                     tool_calls_this_turn.append({
                         "name": tool_name,
                         "params": tool_params,
-                        "result": {"output": clean_result_str, "success": "Error" not in clean_result_str}
+                        "result": {"output": clean_result_str, "success": tool_success}
                     })
 
                     # ── HIGH-FIDELITY CONTEXT PRESERVATION ──
@@ -1137,21 +1138,44 @@ class ChatMixin:
                     #    contain multi-kilobyte base64 blobs. Feeding those blobs
                     #    back to the LLM causes tool-stutter loops where the model
                     #    re-invokes the same tool on the data it just produced.
-                    user_part = (
-                        f'<tool_result name="{tool_name}">\n'
-                        f"{clean_result_str}\n"
-                        f"</tool_result>\n\n"
-                        f"Please analyze the tool output above and proceed with your response. "
-                        f"If the tool already produced a file (image, plot, document, etc.), "
-                        f"reference it in your final answer and STOP — do not call the same tool again."
-                    )
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=user_part
-                    ))
 
-                    # Append spacing so the next turn's stream flows continuously in the same bubble
-                    ai_msg.content += "\n\n"
+                    if tool_success:
+                        user_part = (
+                            f'<tool_result name="{tool_name}">\n'
+                            f"{clean_result_str}\n"
+                            f"</tool_result>\n\n"
+                            f"Please analyze the tool output above and proceed with your response. "
+                            f"If the tool already produced a file (image, plot, document, etc.), "
+                            f"reference it in your final answer and STOP — do not call the same tool again."
+                        )
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=user_part
+                        ))
+                        # Append spacing so the next turn's stream flows continuously in the same bubble
+                        ai_msg.content += "\n\n"
+                    else:
+                        # Tool Failed: Inject a system instruction asking the LLM to explain politely
+                        # instead of abruptly stopping. This allows the LLM to generate a user-facing
+                        # error message before the loop terminates.
+                        user_part = (
+                            f'<tool_result name="{tool_name}">\n'
+                            f"{clean_result_str}\n"
+                            f"</tool_result>\n\n"
+                            f"⚠️ **Tool Execution Failed.**\n"
+                            f"The tool '{tool_name}' encountered an error. Please politely inform the user that the operation could not be completed, "
+                            f"briefly explain the likely cause based on the error log above, and suggest a possible workaround or alternative approach. "
+                            f"Do not attempt to call the tool again with the same parameters."
+                        )
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=user_part
+                        ))
+                        # Append spacing so the next turn's stream flows continuously
+                        ai_msg.content += "\n\n"
+
+                        # Break the loop after injecting the error prompt so the LLM can generate the explanation
+                        break
                 else:
                     break
             else:
