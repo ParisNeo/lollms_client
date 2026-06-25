@@ -1350,7 +1350,7 @@ class LollmsMemoryManager:
 def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalizes parameter structures for robust duplicate and loop detection.
-    Strips internal thoughts, maps synonymous keys, and sorts alphabetically.
+    Strips internal thoughts, maps synonymous keys, coerces types, and sorts alphabetically.
     """
     if not isinstance(params, dict):
         return {}
@@ -1364,12 +1364,18 @@ def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
     # 2. Map synonymous path keys to 'path' and normalize backslashes/dots
     normalized = {}
     for k, v in stripped.items():
+        # Normalize path-like keys
         if k in ("file_path", "filepath", "target", "path"):
             normalized["path"] = str(v).replace("\\", "/").lstrip("./") if v else v
+        # Coerce common types to ensure consistent hashing (e.g., "100" -> 100)
+        elif isinstance(v, str) and v.isdigit():
+            normalized[k] = int(v)
+        elif isinstance(v, str) and v.lower() in ("true", "false"):
+            normalized[k] = v.lower() == "true"
         else:
             normalized[k] = v
 
-    # 3. Sort keys alphabetically
+    # 3. Sort keys alphabetically for deterministic hashing
     return {k: normalized[k] for k in sorted(normalized.keys())}
 
 
@@ -1472,7 +1478,7 @@ class FailureMemory:
 def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalizes parameter structures for robust duplicate and loop detection.
-    Strips internal thoughts, maps synonymous keys, and sorts alphabetically.
+    Strips internal thoughts, maps synonymous keys, coerces types, and sorts alphabetically.
     """
     if not isinstance(params, dict):
         return {}
@@ -1486,12 +1492,18 @@ def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
     # 2. Map synonymous path keys to 'path' and normalize backslashes/dots
     normalized = {}
     for k, v in stripped.items():
+        # Normalize path-like keys
         if k in ("file_path", "filepath", "target", "path"):
             normalized["path"] = str(v).replace("\\", "/").lstrip("./") if v else v
+        # Coerce common types to ensure consistent hashing (e.g., "100" -> 100)
+        elif isinstance(v, str) and v.isdigit():
+            normalized[k] = int(v)
+        elif isinstance(v, str) and v.lower() in ("true", "false"):
+            normalized[k] = v.lower() == "true"
         else:
             normalized[k] = v
 
-    # 3. Sort keys alphabetically
+    # 3. Sort keys alphabetically for deterministic hashing
     return {k: normalized[k] for k in sorted(normalized.keys())}
 
 
