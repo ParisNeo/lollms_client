@@ -905,13 +905,17 @@ class FileImportMixin:
                     import sqlite3
                     from collections import defaultdict
 
-                    workspace_dir = Path("./data_workspace")
-                    try:
-                        from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-                        if awd is not None:
-                            workspace_dir = awd
-                    except ImportError:
-                        pass
+                    # Use custom workspace_path if provided, otherwise default to ./data_workspace
+                    workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+
+                    # Try to override with server's APP_WORKSPACE_DIR only if no custom workspace_path was set
+                    if not self._discussion.workspace_path:
+                        try:
+                            from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                            if awd is not None:
+                                workspace_dir = awd
+                        except ImportError:
+                            pass
                     workspace_dir.mkdir(exist_ok=True)
 
                     # Schema fingerprinting with normalized column names for better grouping
@@ -1166,22 +1170,42 @@ class FileImportMixin:
             if mode == IMPORT_MODE_DATA:
                 _progress("Analyzing structured data file...")
 
-                # 🛡️ TITLE NORMALIZATION PROTOCOL
-                # Ensure 'title' does not already contain the extension to prevent "file.csv.csv" duplicates.
-                # We strip the extension if it matches the file's actual extension.
+                # 🛡️ TITLE NORMALIZATION PROTOCOL (ENFORCED)
+                # CRITICAL: The Artifact Title MUST match the Physical Filename exactly (including extension).
+                # Tools rely on this exact string match to find files on disk.
                 clean_title = title
-                if clean_title.lower().endswith(ext) and len(clean_title) > len(ext):
+
+                # ONLY strip if it's a doubled extension (e.g. "file.csv.csv" -> "file.csv")
+                double_ext = ext + ext
+                if clean_title.lower().endswith(double_ext):
                     clean_title = clean_title[:-len(ext)]
-                    _progress(f"Normalized title '{title}' -> '{clean_title}' to prevent extension duplication.")
+                    _progress(f"Normalized title '{title}' -> '{clean_title}' to remove double extension.")
+                # DO NOT add extension if missing here, because 'title' comes from filename.stem by default.
+                # The 'title' variable at this point is already path.stem (no extension).
+                # We MUST append it now to ensure Artifact Title == Filename.
+                if not clean_title.lower().endswith(ext):
+                    clean_title = f"{clean_title}{ext}"
 
-                # 1. Parse and extract the Markdown schema description
-                schema_text, images_data = _parse_data_file(path, clean_title, version=1, progress_cb=progress_cb)
+                _progress(f"Final artifact title (with extension): '{clean_title}'")
 
-                # 2. Extract the actual raw content (verbatim rows) for CSV/TSV
-                if ext in (".csv", ".tsv"):
-                    raw_content = _extract_text_file(path)
+                # 1. Parse and extract the Markdown schema description (This becomes the .lam Logical Twin)
+                # _parse_data_file returns: (schema_text, images_list, raw_physical_bytes)
+                # We pass clean_title (with extension) so the schema header matches the artifact name
+                parse_result = _parse_data_file(path, clean_title, version=1, progress_cb=progress_cb)
+
+                # Handle both 2-tuple (old) and 3-tuple (new) returns from _parse_data_file
+                if len(parse_result) == 3:
+                    schema_text, _, raw_physical_bytes = parse_result
                 else:
-                    raw_content = schema_text  # Fallback for binary databases/spreadsheets
+                    schema_text, _ = parse_result
+                    raw_physical_bytes = None
+
+                # Fallback: If _parse_data_file didn't return raw bytes, read them ourselves
+                if raw_physical_bytes is None:
+                    try:
+                        raw_physical_bytes = path.read_bytes()
+                    except Exception as e:
+                        _progress(f"Warning: Could not read raw bytes: {e}")
 
                 # Append description if provided (before the schema content)
                 full_description = schema_text
@@ -1190,29 +1214,32 @@ class FileImportMixin:
 
                 atype = ArtefactType.DATA
 
-                # Use clean_title for lookup and registration
+                # Use clean_title (with extension) for lookup and registration
                 existing = self.artefacts.get(clean_title)
+
+                # 🛑 CRITICAL FIX: Pass schema_text as 'logical_content' and raw bytes as 'physical_data'
+                # This ensures the .lam file contains the rich schema, not the placeholder.
                 if existing is None:
                     art = self.artefacts.add(
                         title=clean_title,
                         artefact_type=atype,
-                        content=raw_content,
+                        content=full_description,       # Fallback content (usually schema)
                         active=activate,
                         file_ext=ext,
                         version=1,
-                        read_only=True, # Default newly imported data files to read-only
-                        description=full_description
+                        read_only=True,
+                        physical_data=raw_physical_bytes, # The raw CSV/DB bytes for tools
+                        logical_content=full_description    # The rich schema for the LLM (.lam)
                     )
                 else:
                     art = self.artefacts.update(
                         title=clean_title,
-                        new_content=raw_content,
+                        new_content=full_description,
                         new_type=atype,
                         active=activate,
                         file_ext=ext,
                         version=1,
-                        read_only=True, # Default newly imported data files to read-only
-                        description=full_description
+                        read_only=True,
                     )
                 _progress("Data analysis complete.")
 
