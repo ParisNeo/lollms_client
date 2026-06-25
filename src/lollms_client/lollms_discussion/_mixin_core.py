@@ -41,6 +41,7 @@ class CoreMixin:
         max_context_size: Optional[int] = None,
         memory_manager=None,
         internet_config: Optional[Dict[str, Any]] = None,
+        workspace_path: Optional[str] = None,
     ):
         object.__setattr__(self, 'lollmsClient', lollmsClient)
         object.__setattr__(self, 'db_manager', db_manager)
@@ -55,6 +56,9 @@ class CoreMixin:
         object.__setattr__(self, '_messages_to_delete_from_db', set())
         object.__setattr__(self, '_is_db_backed', db_manager is not None)
         object.__setattr__(self, 'internet_config', internet_config or {})
+
+        # Store custom workspace path (parent folder for all discussions)
+        object.__setattr__(self, 'workspace_path', workspace_path)
 
         if self._is_db_backed:
             if not db_discussion_obj and not discussion_id:
