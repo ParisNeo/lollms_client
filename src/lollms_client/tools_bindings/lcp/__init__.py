@@ -55,12 +55,15 @@ class LCPBinding(LollmsToolBinding):
     def tools_folder_path(self) -> Optional[Path]:
         return self.tools_folders[0] if self.tools_folders else None
 
-    def _parse_tool_via_ast(self, py_file_path: Path) -> Optional[Dict[str, Any]]:
-        """Extracts name, description, and schema from tool_ functions using AST."""
+    def _parse_tool_via_ast(self, py_file_path: Path) -> List[Dict[str, Any]]:
+        """
+        Extracts name, description, and schema from ALL tool_ functions in a file using AST.
+        Returns a LIST of tool definitions to support Multi-Tool Files.
+        """
         try:
             code_text = py_file_path.read_text(encoding="utf-8")
             tree = ast.parse(code_text)
-            
+
             def _iter_functions_ordered(node):
                 for child in ast.iter_child_nodes(node):
                     if isinstance(child, ast.FunctionDef):
@@ -68,127 +71,205 @@ class LCPBinding(LollmsToolBinding):
                     else:
                         yield from _iter_functions_ordered(child)
 
-            entry_fn = None
+            tools = []
             for node in _iter_functions_ordered(tree):
                 if node.name.startswith("tool_"):
-                    entry_fn = node
-                    break
+                    tool_def = self._extract_single_tool_schema(node, py_file_path.stem)
+                    if tool_def:
+                        tools.append(tool_def)
 
-            if not entry_fn:
-                return None
-
-            docstring = ast.get_docstring(entry_fn) or ""
-            description = docstring.strip().split("\n\n")[0].strip() if docstring else "No description provided."
-
-            doc_params = {}
-            if docstring:
-                for line in docstring.splitlines():
-                    m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line.strip())
-                    if m:
-                        doc_params[m.group(1).strip()] = m.group(3).strip()
-
-            properties = {}
-            required = []
-            args_list = entry_fn.args.args
-            defaults_list = entry_fn.args.defaults
-            defaults_offset = len(args_list) - len(defaults_list) if defaults_list else len(args_list)
-
-            for idx, arg in enumerate(args_list):
-                arg_name = arg.arg
-                # NO EXCLUSIONS: We trust the tool builder to define clean signatures
-                # Only exclude *args/**kwargs
-                if arg.arg in ("args", "kwargs"):
-                    continue
-
-                arg_type = "string"
-                if arg.annotation:
-                    anno_str = ast.unparse(arg.annotation).strip().lower()
-                    if "int" in anno_str: arg_type = "integer"
-                    elif "float" in anno_str or "number" in anno_str: arg_type = "number"
-                    elif "bool" in anno_str: arg_type = "boolean"
-                    elif "list" in anno_str or "array" in anno_str: arg_type = "array"
-                    elif "dict" in anno_str or "object" in anno_str: arg_type = "object"
-
-                has_default = idx >= defaults_offset
-                default_val = None
-                if has_default and defaults_list:
-                    default_node = defaults_list[idx - defaults_offset]
-                    try:
-                        default_val = ast.literal_eval(default_node)
-                    except:
-                        default_val = ast.unparse(default_node).strip("'\"")
-
-                desc = doc_params.get(arg_name, f"Parameter '{arg_name}'")
-                properties[arg_name] = {"type": arg_type, "description": desc}
-                if has_default:
-                    properties[arg_name]["default"] = default_val
-                else:
-                    required.append(arg_name)
-
-            # Fallback to docstring if no annotations
-            if not properties and docstring:
-                for line in docstring.splitlines():
-                    m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line.strip())
-                    if m:
-                        p_name = m.group(1).strip()
-                        p_type_raw = (m.group(2) or "string").lower().strip()
-                        p_desc = m.group(3).strip()
-                        if p_name.lower() in ("args", "parameters", "returns", "example"): continue
-                        
-                        p_type = "string"
-                        if "int" in p_type_raw: p_type = "integer"
-                        elif "float" in p_type_raw: p_type = "number"
-                        elif "bool" in p_type_raw: p_type = "boolean"
-                        
-                        properties[p_name] = {"type": p_type, "description": p_desc}
-                        if "optional" not in p_type_raw and "default" not in p_type_raw:
-                            required.append(p_name)
-                            
-            return {
-                "name": py_file_path.stem,
-                "description": description,
-                "input_schema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required
-                }
-            }
+            return tools if tools else None
         except Exception as e:
             ASCIIColors.warning(f"AST parse failed for '{py_file_path.name}': {e}")
             return None
 
+    def _extract_single_tool_schema(self, func_node: ast.FunctionDef, file_stem: str) -> Optional[Dict[str, Any]]:
+        """Helper to extract schema for a single function."""
+        tool_name = func_node.name
+        docstring = ast.get_docstring(func_node) or ""
+        description = docstring.strip().split("\n\n")[0].strip() if docstring else "No description provided."
+
+        doc_params = {}
+        if docstring:
+            for line in docstring.splitlines():
+                m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line.strip())
+                if m:
+                    doc_params[m.group(1).strip()] = m.group(3).strip()
+
+        properties = {}
+        required = []
+        args_list = func_node.args.args
+        defaults_list = func_node.args.defaults
+        defaults_offset = len(args_list) - len(defaults_list) if defaults_list else len(args_list)
+
+        for idx, arg in enumerate(args_list):
+            arg_name = arg.arg
+            if arg.arg in ("args", "kwargs", "discussion_instance", "lollms_client_instance"):
+                continue
+
+            arg_type = "string"
+            if arg.annotation:
+                anno_str = ast.unparse(arg.annotation).strip().lower()
+                if "int" in anno_str: arg_type = "integer"
+                elif "float" in anno_str or "number" in anno_str: arg_type = "number"
+                elif "bool" in anno_str: arg_type = "boolean"
+                elif "list" in anno_str or "array" in anno_str: arg_type = "array"
+                elif "dict" in anno_str or "object" in anno_str: arg_type = "object"
+
+            has_default = idx >= defaults_offset
+            default_val = None
+            if has_default and defaults_list:
+                default_node = defaults_list[idx - defaults_offset]
+                try:
+                    default_val = ast.literal_eval(default_node)
+                except:
+                    default_val = ast.unparse(default_node).strip("'\"")
+
+            desc = doc_params.get(arg_name, f"Parameter '{arg_name}'")
+            properties[arg_name] = {"type": arg_type, "description": desc}
+            if has_default:
+                properties[arg_name]["default"] = default_val
+            else:
+                required.append(arg_name)
+
+        # Fallback to docstring if no annotations
+        if not properties and docstring:
+            for line in docstring.splitlines():
+                m = re.match(r'^(?:[-\*\d\.]+\s*)?([a-zA-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*[:\-]\s*(.+)', line.strip())
+                if m:
+                    p_name = m.group(1).strip()
+                    p_type_raw = (m.group(2) or "string").lower().strip()
+                    p_desc = m.group(3).strip()
+                    if p_name.lower() in ("args", "parameters", "returns", "example"): continue
+
+                    p_type = "string"
+                    if "int" in p_type_raw: p_type = "integer"
+                    elif "float" in p_type_raw: p_type = "number"
+                    elif "bool" in p_type_raw: p_type = "boolean"
+
+                    properties[p_name] = {"type": p_type, "description": p_desc}
+                    if "optional" not in p_type_raw and "default" not in p_type_raw:
+                        required.append(p_name)
+
+        return {
+            "name": tool_name,
+            "description": description,
+            "input_schema": {
+                "type": "object",
+                "properties": properties,
+                "required": required
+            },
+            "_python_file_path": str(Path(__file__).parent / "default_tools" / file_stem / f"{file_stem}.py") # Store path for execution
+        }
+
     def _load_tool_file(self, py_file: Path) -> bool:
-        tool_name = py_file.stem
-        if any(t.get("name") == tool_name for t in self.discovered_tools):
+        file_stem = py_file.stem
+        ASCIIColors.info(f"[LCP Discovery] Scanning file for tools: {py_file.name}")
+
+        tool_defs = self._parse_tool_via_ast(py_file)
+        if not tool_defs:
+            ASCIIColors.red(f"[LCP Discovery] ❌ No tool_ functions found in '{file_stem}'")
             return False
 
-        tool_def = self._parse_tool_via_ast(py_file)
-        if tool_def:
+        count = 0
+        for tool_def in tool_defs:
+            tool_name = tool_def.get("name")
+            # Ensure path is absolute and correct
             tool_def['_python_file_path'] = str(py_file.resolve())
+
+            if any(t.get("name") == tool_name for t in self.discovered_tools):
+                ASCIIColors.yellow(f"[LCP Discovery] Skipping '{tool_name}' (already registered)")
+                continue
+
             self.discovered_tools.append(tool_def)
-            ASCIIColors.green(f"Discovered LCP tool: {tool_name} ✓")
+            ASCIIColors.green(f"[LCP Discovery] ✅ Registered tool: {tool_name}")
+            count += 1
+
+        if count > 0:
+            ASCIIColors.success(f"[LCP Discovery] 📦 Loaded {count} tools from '{file_stem}'")
             return True
         return False
 
+    def mount_tool_library(self, library_name: str) -> bool:
+        """
+        Dynamically mounts a tool library from the default_tools directory at runtime.
+        This allows the system to auto-load specialized tools (e.g., semantic_data_engineer)
+        when context conditions are met (e.g., data files detected).
+
+        Args:
+            library_name: The name of the folder inside default_tools (e.g., 'semantic_data_engineer').
+
+        Returns:
+            True if successfully mounted and discovered, False otherwise.
+        """
+        base_dir = Path(__file__).parent / "default_tools"
+        lib_path = base_dir / library_name
+
+        if not lib_path.exists() or not lib_path.is_dir():
+            ASCIIColors.warning(f"[LCP Mount] Library '{library_name}' not found at {lib_path}")
+            return False
+
+        if lib_path in self.tools_folders:
+            ASCIIColors.info(f"[LCP Mount] Library '{library_name}' already mounted.")
+            return True
+
+        ASCIIColors.cyan(f"[LCP Mount] Mounting library '{library_name}' from {lib_path}...")
+        self.tools_folders.append(lib_path)
+
+        # Trigger discovery for this specific new folder only (optimization)
+        # But for safety and simplicity, we re-scan all (fast enough for <50 tools)
+        self._discover_local_tools()
+
+        # Verify if tools were actually added
+        # FIX: Use string comparison or .is_relative_to() instead of 'in' with Path objects
+        lib_path_str = str(lib_path.resolve())
+        new_tools = []
+        for t in self.discovered_tools:
+            file_path_str = str(Path(t.get('_python_file_path', '')).resolve())
+            if file_path_str.startswith(lib_path_str):
+                new_tools.append(t)
+
+        if new_tools:
+            ASCIIColors.success(f"[LCP Mount] ✅ Successfully mounted '{library_name}': {len(new_tools)} tools registered.")
+            return True
+        else:
+            ASCIIColors.warning(f"[LCP Mount] ⚠️ Library '{library_name}' mounted but no tools discovered.")
+            return False
+
     def _discover_local_tools(self):
         self.discovered_tools = []
+        ASCIIColors.info(f"[LCP Discovery] Starting discovery scan...")
+        ASCIIColors.info(f"[LCP Discovery] Configured Tools Folders: {self.tools_folders}")
+        ASCIIColors.info(f"[LCP Discovery] Configured Tool Files: {self.tool_files}")
+
         for folder in self.tools_folders:
-            if not folder or not folder.is_dir(): continue
-            ASCIIColors.info(f"Discovering LCP tools in: {folder}")
+            if not folder or not folder.is_dir(): 
+                ASCIIColors.warning(f"[LCP Discovery] Folder does not exist: {folder}")
+                continue
+            ASCIIColors.info(f"[LCP Discovery] 📂 Scanning directory: {folder}")
+
             for item in folder.iterdir():
                 py_file = None
                 if item.is_dir():
                     py_file = item / f"{item.name}.py"
+                    ASCIIColors.info(f"[LCP Discovery]   Checking folder: {item.name} -> Expected: {py_file.name}")
                 elif item.suffix == ".py" and item.stem != "__init__":
                     py_file = item
+                    ASCIIColors.info(f"[LCP Discovery]   Checking file: {item.name}")
+
                 if py_file and py_file.exists():
                     self._load_tool_file(py_file)
+                elif py_file:
+                    ASCIIColors.warning(f"[LCP Discovery]   File missing: {py_file}")
 
         for py_file in self.tool_files:
             if py_file and py_file.exists() and py_file.suffix == ".py":
                 self._load_tool_file(py_file)
-        
-        ASCIIColors.info(f"Discovery complete. Found {len(self.discovered_tools)} tools.")
+            elif py_file:
+                ASCIIColors.warning(f"[LCP Discovery] Explicit tool file missing: {py_file}")
+
+        ASCIIColors.info(f"[LCP Discovery] 🏁 Discovery complete. Total tools found: {len(self.discovered_tools)}")
+        ASCIIColors.info(f"[LCP Discovery] Tool List: {[t['name'] for t in self.discovered_tools]}")
 
     def discover_tools(self, specific_tool_names: Optional[List[str]] = None, **kwargs) -> List[Dict[str, Any]]:
         if kwargs.get("force_refresh", False) or not self.discovered_tools:
@@ -202,11 +283,7 @@ class LCPBinding(LollmsToolBinding):
 
     def execute_tool(self, tool_name: str, params: Dict[str, Any], discussion_instance=None, **kwargs) -> Dict[str, Any]:
         """
-        Executes a tool in an isolated environment where:
-        1. CWD = DISCUSSION-SPECIFIC Workspace Directory
-        2. No discussion/client instances are passed to the tool (agnostic)
-        3. Tools operate on files using simple relative paths (e.g., "file.cir")
-        4. AFTER execution: Automatically detect ALL new/modified files and sync to discussion artifacts
+        Executes a specific tool function from a potentially multi-tool file.
         """
         tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
         if not tool_def:
@@ -221,7 +298,7 @@ class LCPBinding(LollmsToolBinding):
                 params[prop_name] = prop_info["default"]
 
         try:
-            module_name = f"lollms_client.tools_bindings.lcp.tools.{tool_name}"
+            module_name = f"lollms_client.tools_bindings.lcp.{python_file_path.stem}"
             if module_name in sys.modules:
                 del sys.modules[module_name]
 
@@ -232,87 +309,59 @@ class LCPBinding(LollmsToolBinding):
             tool_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(tool_module)
 
-            execute_function = None
-            for name in [f"tool_{tool_name}", "execute"]:
-                if hasattr(tool_module, name):
-                    execute_function = getattr(tool_module, name)
-                    break
+            # CRITICAL FIX: Execute the EXACT function name requested (e.g., tool_get_table_schema)
+            # Do not search for generic entry points.
+            if not hasattr(tool_module, tool_name):
+                return {"error": f"Function '{tool_name}' not found in module '{module_name}'.", "status_code": 500}
 
-            if not execute_function:
-                for attr_name in dir(tool_module):
-                    if attr_name.startswith("tool_") and callable(getattr(tool_module, attr_name)):
-                        execute_function = getattr(tool_module, attr_name)
-                        break
-
-            if not execute_function:
-                return {"error": f"No entry point found in '{tool_name}'.", "status_code": 500}
+            execute_function = getattr(tool_module, tool_name)
 
             # ── ENVIRONMENT PREPARATION (Discussion-Isolated Workspace) ──
-            # 1. Get DISCUSSION-SPECIFIC Workspace Directory
-            base_workspace_dir = Path("./data_workspace")
-            try:
-                from lollms_client.app.server import APP_WORKSPACE_DIR
-                if APP_WORKSPACE_DIR is not None:
-                    base_workspace_dir = APP_WORKSPACE_DIR
-            except ImportError:
-                pass
+            # ARCHITECTURAL RULE: CWD is managed by the caller (ChatMixin).
+            # Tools operate on files in the CURRENT WORKING DIRECTORY.
+            # We trust that the caller has already set CWD to the discussion workspace.
 
-            # CRITICAL FIX: Use discussion-specific folder if discussion_instance is provided
-            if discussion_instance:
-                workspace_dir = base_workspace_dir / "discussions" / discussion_instance.id
-            else:
-                workspace_dir = base_workspace_dir
+            # Verify we're in the correct workspace (defensive check)
+            import os
+            current_cwd = Path(os.getcwd()).resolve()
+            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Executing in CWD: {current_cwd}")
 
-            workspace_dir.mkdir(parents=True, exist_ok=True)
-            workspace_dir_str = str(workspace_dir.resolve())
-
-            # 2. Save Current CWD and Environment
-            old_cwd = os.getcwd()
-            old_pythonpath = os.environ.get("PYTHONPATH", "")
-            old_path = os.environ.get("PATH", "")
-
-            # 3. Snapshot workspace files BEFORE execution (Store content hash to detect changes reliably)
+            # Snapshot workspace files BEFORE execution (Store content hash to detect changes reliably)
             files_before = {}
-            if workspace_dir.exists():
-                for f in workspace_dir.rglob("*"):
+            if current_cwd.exists():
+                for f in current_cwd.rglob("*"):
                     if f.is_file():
-                        rel_path = f.relative_to(workspace_dir)
+                        rel_path = f.relative_to(current_cwd)
                         try:
                             # Store content hash and mtime
                             content = f.read_text(encoding="utf-8", errors="ignore")
                             files_before[rel_path] = {
                                 "hash": hash(content),
                                 "mtime": f.stat().st_mtime,
-                                "path": f
+                                "path": f,
+                                "content": content
                             }
                         except Exception:
                             # Skip binary files or unreadable files
                             files_before[rel_path] = {
                                 "hash": None,
                                 "mtime": f.stat().st_mtime,
-                                "path": f
+                                "path": f,
+                                "content": None
                             }
 
-            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Snapshot taken: {len(files_before)} files before execution in {workspace_dir}")
+            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Snapshot taken: {len(files_before)} files before execution")
 
-            try:
-                # 4. Change CWD to DISCUSSION Workspace
-                os.chdir(workspace_dir_str)
-
-                current_cwd = os.getcwd()
-                if current_cwd != workspace_dir_str:
-                    ASCIIColors.error(f"[LCP Tool '{tool_name}'] CRITICAL: CWD change FAILED!")
-                    return {"error": f"Working directory change failed.", "status_code": 500}
-
-                ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✓ CWD set to: {os.getcwd()}")
-
-                # 5. Add workspace to sys.path and Environment
-                if workspace_dir_str not in sys.path:
-                    sys.path.insert(0, workspace_dir_str)
-                if workspace_dir_str not in old_pythonpath:
-                    os.environ["PYTHONPATH"] = f"{workspace_dir_str}{os.pathsep}{old_pythonpath}" if old_pythonpath else workspace_dir_str
-                if workspace_dir_str not in old_path:
-                    os.environ["PATH"] = f"{workspace_dir_str}{os.pathsep}{old_path}"
+            # Add workspace to sys.path and Environment
+            current_cwd_str = str(current_cwd)
+            if current_cwd_str not in sys.path:
+                sys.path.insert(0, current_cwd_str)
+            old_pythonpath = os.environ.get("PYTHONPATH", "")
+            old_path = os.environ.get("PATH", "")
+            if current_cwd_str not in old_pythonpath:
+                os.environ["PYTHONPATH"] = f"{current_cwd_str}{os.pathsep}{old_pythonpath}" if old_pythonpath else current_cwd_str
+            if current_cwd_str not in old_path:
+                os.environ["PATH"] = f"{current_cwd_str}{os.pathsep}{old_path}"
 
                 # 6. Capture stdout/stderr
                 captured_stdout = io.StringIO()
@@ -325,6 +374,8 @@ class LCPBinding(LollmsToolBinding):
                     sys.stderr = captured_stderr
 
                     # Execute with CLEAN params
+                    # Tools are agnostic. They operate on files in CWD.
+                    # No discussion_instance or lollms_client_instance is passed.
                     result = execute_function(**params)
                 finally:
                     sys.stdout = old_sys_stdout
@@ -340,10 +391,10 @@ class LCPBinding(LollmsToolBinding):
                 # ── POST-EXECUTION: AUTOMATIC ARTIFACT SYNC ──
                 # 7. Snapshot workspace files AFTER execution
                 files_after = {}
-                if workspace_dir.exists():
-                    for f in workspace_dir.rglob("*"):
+                if current_cwd.exists():
+                    for f in current_cwd.rglob("*"):
                         if f.is_file():
-                            rel_path = f.relative_to(workspace_dir)
+                            rel_path = f.relative_to(current_cwd)
                             try:
                                 content = f.read_text(encoding="utf-8", errors="ignore")
                                 files_after[rel_path] = {
@@ -385,10 +436,9 @@ class LCPBinding(LollmsToolBinding):
                         elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
                             atype = "image"
                         elif file_ext in (".pdf", ".docx", ".zip", ".tar", ".gz"):
-                            atype = "document" # Treat as downloadable document
+                            atype = "document"
 
                         # 2. Decide if we should read content or create a placeholder
-                        # Explicit Binary Extensions (Databases, Images, Archives)
                         EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
                                                 ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
                                                 ".zip", ".tar", ".gz", ".pdf", ".docx"}
@@ -407,7 +457,6 @@ class LCPBinding(LollmsToolBinding):
                                 f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
                             )
                         elif file_info["content"] is None:
-                            # Failed to read text? Check if it's actually binary via null-byte heuristic
                             try:
                                 with open(file_path, 'rb') as f:
                                     chunk = f.read(1024)
@@ -422,7 +471,6 @@ class LCPBinding(LollmsToolBinding):
                                             f"> **Action**: Download from Workspace Artifacts panel."
                                         )
                                     else:
-                                        # It's text but read_text failed (encoding issue). Force read with ignore.
                                         ASCIIColors.warning(f"[LCP Tool] File '{file_name}' read failed initially, forcing text read with encoding ignore.")
                                         forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
                                         file_info["content"] = forced_content
@@ -434,7 +482,6 @@ class LCPBinding(LollmsToolBinding):
 
                         # 3. Register Artifact
                         if not should_read_content and content_placeholder:
-                            # Register Placeholder for Binary Files
                             existing_art = discussion_instance.artefacts.get(file_name)
                             if existing_art:
                                 discussion_instance.artefacts.update(
@@ -455,7 +502,7 @@ class LCPBinding(LollmsToolBinding):
                             ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
                             continue
 
-                        # Handle Text/Readable Files (Existing Logic)
+                        # Handle Text/Readable Files
                         existing_art = discussion_instance.artefacts.get(file_name)
                         if existing_art:
                             ASCIIColors.info(f"[LCP Tool] File '{file_name}' reappeared on disk. Updating artifact.")
@@ -467,7 +514,6 @@ class LCPBinding(LollmsToolBinding):
                                 commit_message=f"Restored by tool '{tool_name}'"
                             )
                         else:
-                            # Create NEW artifact
                             ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Creating NEW artifact from file: '{file_name}'")
                             discussion_instance.artefacts.add(
                                 title=file_name,
@@ -487,13 +533,11 @@ class LCPBinding(LollmsToolBinding):
                         file_ext = rel_path.suffix.lower()
                         file_path = after_info["path"]
 
-                        # Check if content hash changed OR if file became unreadable/readable
-                        content_changed = before_info["hash"] != after_info["hash"]
-                        became_binary = before_info["content"] is not None and after_info["content"] is None
-                        became_text = before_info["content"] is None and after_info["content"] is not None
+                        content_changed = before_info.get("hash") != after_info.get("hash")
+                        became_binary = before_info.get("content") is not None and after_info.get("content") is None
+                        became_text = before_info.get("content") is None and after_info.get("content") is not None
 
                         if content_changed or became_binary or became_text:
-                            # Handle Binary/Unreadable Modified Files
                             if after_info["content"] is None:
                                 ASCIIColors.info(f"[LCP Tool] Detected modified binary file '{file_name}'. Updating placeholder artifact.")
                                 content_placeholder = (
@@ -543,7 +587,6 @@ class LCPBinding(LollmsToolBinding):
                                 )
                                 ASCIIColors.success(f"[LCP Tool '{tool_name}'] 🔄 Updated artifact '{file_name}' (v{existing_art.get('version', 1)+1})")
                             else:
-                                # File existed on disk before but not in artifacts? Sync it now.
                                 ASCIIColors.warning(f"[LCP Tool] File '{file_name}' modified on disk but no artifact found. Creating one.")
                                 atype = "code" if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir") else "document"
                                 discussion_instance.artefacts.add(
@@ -555,23 +598,6 @@ class LCPBinding(LollmsToolBinding):
                                 )
 
                 return {"output": result, "status_code": 200}
-
-            finally:
-                # 10. Restore CWD and Environment
-                try:
-                    os.chdir(old_cwd)
-                except Exception:
-                    pass
-                try:
-                    if old_pythonpath: os.environ["PYTHONPATH"] = old_pythonpath
-                    elif "PYTHONPATH" in os.environ: del os.environ["PYTHONPATH"]
-                except Exception:
-                    pass
-                try:
-                    if old_path: os.environ["PATH"] = old_path
-                    elif "PATH" in os.environ: del os.environ["PATH"]
-                except Exception:
-                    pass
 
         except Exception as e:
             trace_exception(e)
