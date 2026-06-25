@@ -416,7 +416,30 @@ class _StreamState:
         # 2. Tools Execution Trigger
         elif tag_name in ("tool_call", "tool"):
             self.tool_trigger = True
-            self.tool_json_data = body
+
+            # ── ROBUST JSON PARSING & NORMALIZATION ──
+            # LLMs often hallucinate flat structures: {"name": "tool", "arg": "val"}
+            # instead of nested: {"name": "tool", "parameters": {"arg": "val"}}
+            # We normalize this here to prevent execution failures.
+            try:
+                raw_data = json.loads(body)
+                if isinstance(raw_data, dict):
+                    # If "parameters" key is missing, assume the WHOLE dict (minus "name") is the parameters
+                    if "parameters" not in raw_data:
+                        tool_name = raw_data.get("name", "")
+                        # Extract all other keys as parameters
+                        params = {k: v for k, v in raw_data.items() if k != "name"}
+                        # Reconstruct normalized structure
+                        normalized_data = {"name": tool_name, "parameters": params}
+                        self.tool_json_data = json.dumps(normalized_data)
+                        ASCIIColors.info(f"[StreamState] Normalized flat tool call structure for '{tool_name}'.")
+                    else:
+                        self.tool_json_data = body
+                else:
+                    self.tool_json_data = body
+            except json.JSONDecodeError:
+                self.tool_json_data = body
+
             # Halt generation instantly so the executor can take over the loop
             return False
 
@@ -507,6 +530,49 @@ class _StreamState:
 
 class ChatMixin:
     """ChatMixin: orchestrates RAG, tiered memory, and alternating tool rounds."""
+
+    def __init__(self, *args, **kwargs):
+        """Initialize ChatMixin with sequential cancellation support."""
+        # Simple boolean flag for sequential control
+        object.__setattr__(self, '_cancel_flag', False)
+        super().__init__(*args, **kwargs)
+
+        # 🛑 CRITICAL FIX: Initialize FailureMemory IMMEDIATELY on discussion object
+        # This ensures it exists BEFORE the first chat() call
+        from .lollms_memory import FailureMemory
+        object.__setattr__(self, '_failure_memory', FailureMemory())
+
+    def cancel_generation(self) -> bool:
+        """
+        Signals the active generation loop to stop gracefully.
+        Also propagates cancellation to the underlying LollmsClient if available.
+        """
+        object.__setattr__(self, '_cancel_flag', True)
+        ASCIIColors.error(f"[ChatMixin] 🚨 CANCEL REQUESTED for discussion {self.id}")
+
+        # Propagate to client immediately to stop low-level streaming
+        if hasattr(self, 'lollmsClient') and self.lollmsClient:
+            try:
+                if hasattr(self.lollmsClient, 'cancel'):
+                    self.lollmsClient.cancel()
+                elif hasattr(self.lollmsClient, 'llm') and hasattr(self.lollmsClient.llm, 'cancel'):
+                    self.lollmsClient.llm.cancel()
+            except Exception as e:
+                ASCIIColors.warning(f"[ChatMixin] Failed to propagate cancel to client: {e}")
+        return True
+
+    def is_generation_cancelled(self) -> bool:
+        """
+        Checks if cancellation has been requested.
+
+        Returns:
+            bool: True if cancellation is active, False otherwise.
+        """
+        return getattr(self, '_cancel_flag', False)
+
+    def reset_cancel_state(self) -> None:
+        """Resets the cancellation flag for a new generation turn."""
+        object.__setattr__(self, '_cancel_flag', False)
 
     def _get_pending_forms(self) -> Dict[str, Dict]:
         if not hasattr(self, '_pending_forms_store'):
@@ -674,6 +740,10 @@ class ChatMixin:
         # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
         if not hasattr(self, "tolerance_level") or tolerance_level:
             object.__setattr__(self, "tolerance_level", tolerance_level or "strict")
+
+        # Reset cancellation flag at the start of each chat turn
+        self.reset_cancel_state()
+
         self.scratchpad = ""
         callback = kwargs.get("streaming_callback")
         temperature = kwargs.get("temperature")
@@ -824,9 +894,74 @@ class ChatMixin:
         if data_zones:
             full_system_prompt += "\n" + "\n\n".join(data_zones)
 
-        # ── 7. Tool calling registry ──
+        # ── 7. Tool calling registry & Dynamic Library Mounting ──
         active_tools = dict(tools or {})
-        
+
+        # ── DYNAMIC TOOL MOUNTING PROTOCOL ──
+        # Automatically mount specialized tool libraries based on workspace context
+        lcp_binding = getattr(self.lollmsClient, "tools", None)
+
+        # 1. Data Tools Auto-Load
+        # If enable_data_tools is True (or not explicitly disabled) AND data files exist in workspace
+        enable_data_tools = kwargs.get("enable_data_tools", True)
+
+        # Check workspace for data files FIRST (before checking if LCP binding exists)
+        from pathlib import Path
+        workspace_dir = Path("./data_workspace")
+        try:
+            from lollms_client.app.server import APP_WORKSPACE_DIR
+            if APP_WORKSPACE_DIR is not None:
+                workspace_dir = APP_WORKSPACE_DIR
+        except ImportError:
+            pass
+
+        # Check discussion-specific workspace first
+        disc_ws = workspace_dir / "discussions" / self.id
+        if disc_ws.exists():
+            workspace_dir = disc_ws
+
+        data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
+        has_data_files = any(f.suffix.lower() in data_extensions for f in workspace_dir.rglob("*") if f.is_file())
+
+        # CRITICAL FIX: If data files exist but LCP binding is None, INSTANTIATE it on-the-fly!
+        if has_data_files and (lcp_binding is None):
+            ASCIIColors.cyan(f"[ChatMixin] 📊 Data files detected but LCP binding not loaded. Instantiating LCP binding dynamically...")
+            try:
+                from lollms_client.tools_bindings.lcp import LCPBinding
+
+                # Create LCP binding instance with default tools folder
+                lcp_binding = LCPBinding(
+                    tools_folders=[Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"]
+                )
+
+                # Attach it to the client for future use
+                self.lollmsClient.tools = lcp_binding
+                ASCIIColors.success(f"[ChatMixin] ✅ LCP binding instantiated and attached to client.")
+            except Exception as inst_err:
+                ASCIIColors.error(f"[ChatMixin] ❌ Failed to instantiate LCP binding: {inst_err}")
+                import traceback
+                trace = traceback.format_exc()
+                ASCIIColors.error(f"[ChatMixin] Stack trace:\n{trace}")
+                lcp_binding = None
+
+        # Now proceed with tool mounting if LCP binding exists
+        if enable_data_tools and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            if has_data_files:
+                ASCIIColors.cyan(f"[ChatMixin] Data files detected in workspace. Auto-mounting 'semantic_data_engineer' library...")
+                lcp_binding.mount_tool_library("semantic_data_engineer")
+            else:
+                ASCIIColors.info(f"[ChatMixin] No data files found in workspace. Skipping data tools mount.")
+
+        # 2. Merge LCP Tools into Active Toolset
+        # If LCP binding exists, merge all discovered tools (including newly mounted ones)
+        if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
+            try:
+                lcp_tools = lcp_binding.to_chat_tool_specs()
+                active_tools.update(lcp_tools)
+                ASCIIColors.success(f"[ChatMixin] Loaded {len(lcp_tools)} LCP tools (including auto-mounted libraries).")
+            except Exception as e:
+                ASCIIColors.warning(f"[ChatMixin] Failed to load LCP tools: {e}")
+
         # Optionally merge spinoff agents as dynamic local tools
         if enable_sub_agents:
             spinoff_tools = self._get_spinoff_agent_tools(full_system_prompt, images or [], **kwargs)
@@ -856,9 +991,14 @@ class ChatMixin:
         tool_calls_this_turn = []
         round_count = 0
 
-        # Initialize the transient in-process FailureMemory tracker
-        if not hasattr(self, "failure_memory") or not self.failure_memory:
-            object.__setattr__(self, "failure_memory", FailureMemory())
+        # Track the last executed tool to prevent immediate repetition loops (Success Loops)
+        last_executed_tool_signature = None
+
+        # Initialize the persistent in-process FailureMemory tracker on the discussion object (self)
+        # This ensures failure history survives across chat turns even if the mixin is re-initialized.
+        # We use object.__setattr__ to bypass the DB proxy and store it directly in memory.
+        if not hasattr(self, "_failure_memory") or not self._failure_memory:
+            object.__setattr__(self, "_failure_memory", FailureMemory())
 
         # Initialize the single, clean database assistant message ONCE before entering the loop
         ASCIIColors.info("[Trace] Initializing database assistant message stub...")
@@ -873,7 +1013,16 @@ class ChatMixin:
         if callback:
             callback(ai_msg.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"message_id": ai_msg.id})
 
+        # Track if we exited due to cancellation
+        was_cancelled = False
+
         while round_count < max_reasoning_steps:
+            # Check cancellation at the start of each reasoning round
+            if self.is_generation_cancelled():
+                ASCIIColors.error(f"[ChatMixin] 🛑 GENERATION HALTED at start of round {round_count}")
+                was_cancelled = True
+                break
+
             round_count += 1
             ASCIIColors.info(f"[Trace] Loop round {round_count}/{max_reasoning_steps} starting...")
 
@@ -914,6 +1063,10 @@ class ChatMixin:
             )
 
             def _inline_relay(chunk, msg_type=None, meta=None):
+                # Check cancellation on EVERY token chunk
+                if self.is_generation_cancelled():
+                    return False  # Signal to stop generation
+
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
@@ -927,14 +1080,28 @@ class ChatMixin:
 
             ASCIIColors.info(f"[Trace] Forwarding payload to LLM generate_from_messages (thinking={kwargs.get('think', False)})...")
             # Execute generation turn (streams and appends to the existing ai_msg.content directly)
-            self.lollmsClient.generate_from_messages(
-                messages=messages_list,
-                images=images,
-                stream=True,
-                temperature=temperature,
-                streaming_callback=_inline_relay,
-                **gen_kwargs
-            )
+            try:
+                self.lollmsClient.generate_from_messages(
+                    messages=messages_list,
+                    images=images,
+                    stream=True,
+                    temperature=temperature,
+                    streaming_callback=_inline_relay,
+                    **gen_kwargs
+                )
+            except Exception as gen_err:
+                if self.is_generation_cancelled():
+                    ASCIIColors.info(f"[ChatMixin] Generation interrupted by cancellation: {gen_err}")
+                    was_cancelled = True
+                    break
+                else:
+                    raise
+
+            # Check cancellation after generation completes
+            if self.is_generation_cancelled():
+                ASCIIColors.warning(f"[ChatMixin] Generation cancelled after round {round_count}")
+                was_cancelled = True
+                break
 
             ASCIIColors.info("[Trace] Generation complete. Flushing remaining buffers...")
             ss.flush_remaining_buffer()
@@ -946,12 +1113,11 @@ class ChatMixin:
                         call_data = json.loads(tool_call_json_str)
                     except Exception:
                         call_data = {}
-                    
+
                     tool_name = call_data.get("name", "")
                     tool_params = call_data.get("parameters", {})
 
                     # ── Live UI Tool Call Feedback Injection ──
-                    # Open a processing block directly in the message stream to notify the user immediately
                     import html
                     escaped_params = html.escape(json.dumps(tool_params))
                     tool_open_tag = f'\n<processing type="tool_call" title="Tool Execution: {tool_name}" params="{escaped_params}">\n'
@@ -963,44 +1129,79 @@ class ChatMixin:
                     _cb(callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                     # ── REFLEXIVE LOOP DETECTION (FailureMemory) ──
-                    if self.failure_memory.has_previous_failure(tool_name, tool_params):
+                    failure_memory = getattr(self, "_failure_memory", None)
+
+                    if failure_memory and failure_memory.has_previous_failure(tool_name, tool_params):
                         ASCIIColors.error(f"[FailureMemory] Intercepted repetitive execution loop for tool '{tool_name}'!")
+
+                        if self.is_generation_cancelled():
+                            was_cancelled = True
+                            break
+
                         result_str = (
                             f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round of this conversation. "
                             f"To prevent an infinite loop, execution was blocked. You must modify your parameters, inspect the data schemas, "
                             f"or try a different approach instead of repeating the failing call."
                         )
-                        # Write the error notice to the UI before terminating
                         status_err_line = f"* Tool call blocked to prevent loop.\n"
                         details_block = f"Loop Intercepted:\n{result_str}\n"
                         tool_close_tag = f"{status_err_line}{details_block}</processing>\n\n"
                         ai_msg.content += tool_close_tag
                         _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                        
-                        # Instantly terminate the generation loop to stop empty accordion spams!
                         break
-                    else:
-                        # Execute the tool safely
-                        try:
-                            # Always pass the active discussion and client instances as context keywords
-                            if active_tools and tool_name in active_tools:
-                                # CRITICAL: Sync all active artifacts to disk BEFORE tool execution
-                                # This ensures any artifact referenced by the tool exists in the workspace
-                                try:
-                                    sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
-                                    ASCIIColors.info(f"[ChatMixin] Pre-tool sync: All active artifacts synced to workspace before executing '{tool_name}'")
-                                    ASCIIColors.info(f"[ChatMixin] Synced files: {sync_files}")
-                                except Exception as sync_err:
-                                    ASCIIColors.warning(f"[ChatMixin] Pre-tool sync failed: {sync_err}")
 
-                                # CRITICAL: Set CWD to DISCUSSION-SPECIFIC workspace before executing ANY tool
-                                # This ensures tools can find artifact files using simple relative paths
-                                import os
-                                from pathlib import Path
-                                old_cwd = os.getcwd()
+                    # Execute the tool sequentially
+                    try:
+                        # ── 🛑 REPETITIVE SUCCESS LOOP GUARD ────────────────────────
+                        # Check if we just executed this exact tool in the previous round
+                        # If so, force break to prevent infinite success loops
+                        if tool_calls_this_turn:
+                            last_call = tool_calls_this_turn[-1]
+                            if last_call["name"] == tool_name and last_call["params"] == tool_params:
+                                ASCIIColors.error(f"[ChatMixin] 🛑 LOOP DETECTED: Tool '{tool_name}' called twice in a row with same params!")
+                                tool_res = {
+                                    "success": False,
+                                    "error": f"Repetitive tool call detected. You already called '{tool_name}' with these parameters in the previous turn. The output was already provided to you. Do not call it again.",
+                                    "prompt_injection": f"\n\n🛑 **STOP.** You are calling '{tool_name}' again with the exact same parameters. This is a loop. The data from the previous execution is already in your context. Analyze it and move on."
+                                }
+                                # Force break after this fake failure
+                                force_break_after_tool = True
+                            else:
+                                force_break_after_tool = False
+                        else:
+                            force_break_after_tool = False
 
-                                # Get the SAME discussion-specific path that sync_all_active_to_disk() uses
+                        if force_break_after_tool:
+                            # Use the fake error result prepared above
+                            pass
+                        # Check cancellation BEFORE executing tool
+                        elif self.is_generation_cancelled():
+                            ASCIIColors.warning(f"[ChatMixin] 🛑 Generation cancelled BEFORE tool execution '{tool_name}'. Aborting call.")
+                            tool_res = {
+                                "success": False, 
+                                "error": "Execution aborted by user cancellation.",
+                                "prompt_injection": "\n\n⚠️ **Execution Aborted.**\nThe user cancelled the generation. Do not attempt to call tools again."
+                            }
+                        elif active_tools and tool_name in active_tools:
+                            # Sync all active artifacts to disk BEFORE tool execution
+                            try:
+                                sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
+                                ASCIIColors.info(f"[ChatMixin] Pre-tool sync: All active artifacts synced to workspace before executing '{tool_name}'")
+                            except Exception as sync_err:
+                                ASCIIColors.warning(f"[ChatMixin] Pre-tool sync failed: {sync_err}")
+
+                            import os
+                            from pathlib import Path
+                            old_cwd = os.getcwd()
+
+                            # 🛑 CRITICAL FIX: Resolve workspace path EXACTLY like artefacts.sync_all_active_to_disk() does
+                            # This ensures tool CWD matches the sync destination perfectly
+                            # Check truthiness of workspace_path, not just existence (hasattr returns True even if None)
+                            if hasattr(self, 'workspace_path') and self.workspace_path:
+                                base_workspace_dir = Path(self.workspace_path)
+                            else:
                                 base_workspace_dir = Path("./data_workspace")
+                                # Try to override with server's APP_WORKSPACE_DIR only if no custom workspace_path was set
                                 try:
                                     from lollms_client.app.server import APP_WORKSPACE_DIR
                                     if APP_WORKSPACE_DIR is not None:
@@ -1008,107 +1209,115 @@ class ChatMixin:
                                 except ImportError:
                                     pass
 
-                                # CRITICAL FIX: Use discussion-specific folder
-                                workspace_dir = base_workspace_dir / "discussions" / self.id
-                                workspace_dir_str = str(workspace_dir.resolve())
+                            # Discussion-isolated workspace
+                            workspace_dir = base_workspace_dir / self.id
+                            workspace_dir_str = str(workspace_dir.resolve())
 
-                                try:
-                                    os.chdir(workspace_dir_str)
-                                    ASCIIColors.success(f"[ChatMixin] ✓ CWD changed to discussion workspace: {os.getcwd()}")
-                                    ASCIIColors.info(f"[ChatMixin] Files in workspace: {os.listdir('.')}")
+                            try:
+                                os.chdir(workspace_dir_str)
+                                ASCIIColors.info(f"[ChatMixin] Files in workspace: {os.listdir('.')}")
 
-                                    # CRITICAL: Strip path prefixes from tool parameters
-                                    # Tools expect simple filenames like "rlc_circuit.cir", not "workspace/rlc_circuit.cir"
-                                    sanitized_params = {}
-                                    for key, value in tool_params.items():
-                                        if isinstance(value, str):
-                                            # Strip common path prefixes that tools don't need
-                                            sanitized_value = value
-                                            for prefix in ["workspace/", "data_workspace/", "./workspace/", "./data_workspace/"]:
-                                                if sanitized_value.lower().startswith(prefix):
-                                                    sanitized_value = sanitized_value[len(prefix):]
-                                                    ASCIIColors.info(f"[ChatMixin] Stripped path prefix from parameter '{key}': '{value}' -> '{sanitized_value}'")
-                                                    break
-                                            sanitized_params[key] = sanitized_value
-                                        else:
-                                            sanitized_params[key] = value
+                                # 🛑 CRITICAL FIX: Strip path prefixes from tool parameters
+                                # LLMs often hallucinate full paths like "workspace/file.csv" or "data_workspace/file.csv"
+                                # We must normalize these to simple filenames for the tool to find them
+                                sanitized_params = {}
+                                for key, value in tool_params.items():
+                                    if isinstance(value, str):
+                                        sanitized_value = value
+                                        # Strip common workspace prefixes
+                                        for prefix in ["workspace/", "data_workspace/", "./workspace/", "./data_workspace/"]:
+                                            if sanitized_value.lower().startswith(prefix):
+                                                sanitized_value = sanitized_value[len(prefix):]
+                                                break
+                                        # Also strip discussion ID prefix if present
+                                        if sanitized_value.lower().startswith(self.id.lower() + "/"):
+                                            sanitized_value = sanitized_value[len(self.id) + 1:]
+                                        sanitized_params[key] = sanitized_value
+                                    else:
+                                        sanitized_params[key] = value
 
-                                    # Pass discussion_instance so LCP binding can sync file changes back to artifacts
-                                    tool_res = active_tools[tool_name]["callable"](
-                                        **sanitized_params
-                                    )
-                                finally:
-                                    # Restore CWD after tool execution
-                                    try:
-                                        os.chdir(old_cwd)
-                                        ASCIIColors.info(f"[ChatMixin] CWD restored to: {os.getcwd()}")
-                                    except Exception:
-                                        pass
-                            else:
-                                tool_res = self.lollmsClient.tools.execute_tool(
-                                    tool_name, 
-                                    tool_params, 
-                                    lollms_client_instance=self.lollmsClient, 
-                                    discussion_instance=self,
-                                    discussion=self
-                                )
+                                ASCIIColors.info(f"[ChatMixin] Sanitized tool params: {sanitized_params}")
 
-                            if isinstance(tool_res, dict):
-                                if not tool_res.get("success", True):
-                                    error_msg = tool_res.get("error", "Unknown tool error")
-                                    self.failure_memory.record_failure(tool_name, tool_params, error_msg)
+                                # 🛑 SEQUENTIAL EXECUTION: Run tool directly in main thread
+                                # CRITICAL: CWD management is delegated to LCP Binding execute_tool()
+                                # The LCP binding will set CWD to the discussion-isolated workspace internally.
+                                # We do NOT change CWD here to avoid double-changedirectory conflicts.
+                                call_kwargs = dict(sanitized_params)
+
+                                # Execute directly (no thread) - LCP handles CWD internally
+                                tool_res = active_tools[tool_name]["callable"](**call_kwargs)
+
+                            finally:
+                                # No CWD restoration needed - ChatMixin never changed it
+                                # LCP Binding handles its own CWD cleanup internally
+                                pass
+                        else:
+                            tool_res = self.lollmsClient.tools.execute_tool(
+                                tool_name, 
+                                tool_params, 
+                                lollms_client_instance=self.lollmsClient, 
+                                discussion_instance=self,
+                                discussion=self
+                            )
+
+                        if isinstance(tool_res, dict):
+                            if not tool_res.get("success", True):
+                                error_msg = tool_res.get("error", "Unknown tool error")
+                                if failure_memory:
+                                    failure_memory.record_failure(tool_name, tool_params, error_msg)
+
+                                if failure_memory and failure_memory.has_previous_failure(tool_name, tool_params):
+                                    ASCIIColors.error(f"[FailureMemory] 🛑 Intercepted repetitive execution loop for tool '{tool_name}'! Breaking loop immediately.")
+                                    result_str = f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round. Execution blocked to prevent infinite loop."
+                                    clean_result_str = result_str
+                                    status_done_line = f"* Tool call blocked to prevent loop.\n"
+                                    details_block = f"Loop Intercepted:\n{result_str}\n"
+                                    tool_close_tag = f"{status_done_line}{details_block}</processing>\n\n"
+                                    ai_msg.content += tool_close_tag
+                                    _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                                    break
+                                else:
                                     result_str = f"Error executing tool '{tool_name}': {error_msg}"
-                                    clean_result_str = result_str  # Errors are already concise and safe to feed back
-
-                                    # Write error block
+                                    clean_result_str = result_str
                                     status_done_line = f"* Completed execution with errors.\n"
                                     details_block = f"Error Logs:\n{error_msg}\n"
-                                else:
-                                    # ── Stash the full raw output for the UI; build a sanitized
-                                    #    version (no base64 blobs, prefers prompt_injection) to
-                                    #    feed back to the LLM. This prevents the tool-stutter
-                                    #    loop where the model re-invokes the same tool on the
-                                    #    raw base64 data it just received.
-                                    raw_output = tool_res.get("output", tool_res)
-                                    if isinstance(raw_output, (dict, list)):
-                                        full_dump = json.dumps(raw_output, indent=2, default=str)
-                                    else:
-                                        full_dump = str(raw_output)
-                                    result_str = full_dump
-                                    clean_result_str = _sanitize_tool_result(tool_res)
-                                    # Trigger evolutionary reflection on successful recovery
-                                    self._trigger_evolutionary_reflection(tool_name, tool_params, clean_result_str)
-
-                                    # Write success block
-                                    status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
-                                    safe_output = full_dump[:2000] + ("..." if len(full_dump) > 2000 else "")
-                                    details_block = f"Output Logs:\n{safe_output}\n"
                             else:
-                                result_str = str(tool_res)
-                                if "error" in result_str.lower() or "fail" in result_str.lower():
-                                    self.failure_memory.record_failure(tool_name, tool_params, result_str)
-                                    clean_result_str = result_str  # Errors are already concise and safe
-                                    status_done_line = f"* Completed execution with errors.\n"
-                                    details_block = f"Error Logs:\n{result_str}\n"
+                                raw_output = tool_res.get("output", tool_res)
+                                if isinstance(raw_output, (dict, list)):
+                                    full_dump = json.dumps(raw_output, indent=2, default=str)
                                 else:
-                                    status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
-                                    clean_result_str = _sanitize_tool_result(tool_res)
-                                    safe_output = result_str[:2000] + ("..." if len(result_str) > 2000 else "")
-                                    details_block = f"Output Logs:\n{safe_output}\n"
-                        except Exception as e:
-                            trace_exception(e)
-                            self.failure_memory.record_failure(tool_name, tool_params, str(e))
-                            result_str = f"Error executing tool '{tool_name}': {e}"
-                            clean_result_str = f"Error executing tool '{tool_name}': {e}"
-                            status_done_line = f"* Execution crashed.\n"
-                            details_block = f"Crash Details:\n{str(e)}\n"
+                                    full_dump = str(raw_output)
+                                result_str = full_dump
+                                clean_result_str = _sanitize_tool_result(tool_res)
+                                self._trigger_evolutionary_reflection(tool_name, tool_params, clean_result_str)
+                                status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
+                                safe_output = full_dump[:2000] + ("..." if len(full_dump) > 2000 else "")
+                                details_block = f"Output Logs:\n{safe_output}\n"
+                        else:
+                            result_str = str(tool_res)
+                            if "error" in result_str.lower() or "fail" in result_str.lower():
+                                self.failure_memory.record_failure(tool_name, tool_params, result_str)
+                                clean_result_str = result_str
+                                status_done_line = f"* Completed execution with errors.\n"
+                                details_block = f"Error Logs:\n{result_str}\n"
+                            else:
+                                status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
+                                clean_result_str = _sanitize_tool_result(tool_res)
+                                safe_output = result_str[:2000] + ("..." if len(result_str) > 2000 else "")
+                                details_block = f"Output Logs:\n{safe_output}\n"
+                    except Exception as e:
+                        trace_exception(e)
+                        if failure_memory:
+                            failure_memory.record_failure(tool_name, tool_params, str(e))
+                        result_str = f"Error executing tool '{tool_name}': {e}"
+                        clean_result_str = f"Error executing tool '{tool_name}': {e}"
+                        status_done_line = f"* Execution crashed.\n"
+                        details_block = f"Crash Details:\n{str(e)}\n"
 
                     tool_close_tag = f"{status_done_line}{details_block}</processing>\n\n"
                     ai_msg.content += tool_close_tag
                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                    # Track the tool call and result in this turn's metadata
-                    # (use clean_result_str to keep metadata bloat-free of base64)
                     tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
                     tool_calls_this_turn.append({
                         "name": tool_name,
@@ -1116,75 +1325,97 @@ class ChatMixin:
                         "result": {"output": clean_result_str, "success": tool_success}
                     })
 
-                    # ── HIGH-FIDELITY CONTEXT PRESERVATION ──
-                    # To prevent the model from falling into "dumb next-word prediction" auto-complete loops,
-                    # we must feed it the exact, raw sequence of its own previous actions.
                     raw_round_text = ss.get_clean_text_so_far()
-
-                    # Find the newly added text segment of this round
                     if virtual_history:
-                        # Strip previous virtual history content to get only this round's raw output
                         for prev_m in virtual_history:
                             if prev_m.sender_type == "assistant":
                                 raw_round_text = raw_round_text.replace(prev_m.content, "")
 
                     raw_round_clean = re.sub(r'<processing.*?>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-                    # 1. Append the raw assistant turn (with unstripped <tool_call> tags) to virtual history
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
                         content=raw_round_clean
                     ))
 
-                    # 2. Append the SANITIZED tool result to virtual history.
-                    #    We deliberately do NOT use `result_str` here, which may
-                    #    contain multi-kilobyte base64 blobs. Feeding those blobs
-                    #    back to the LLM causes tool-stutter loops where the model
-                    #    re-invokes the same tool on the data it just produced.
+                    # ── 🛑 SUCCESS LOOP DETECTION & PREVENTION ─────────────────────
+                    # Check if the LAST assistant message in history was a tool call to the SAME tool
+                    # This prevents the LLM from getting stuck in a "success loop"
+                    last_assistant_msg = virtual_history[-2] if len(virtual_history) >= 2 else None
+                    if last_assistant_msg and last_assistant_msg.sender_type == "assistant":
+                        # Check if the previous round also called this tool (simple heuristic)
+                        # We can't easily check previous tool calls without parsing, so we rely on the virtual user prompt below
 
-                    if tool_success:
-                        user_part = (
-                            f'<tool_result name="{tool_name}">\n'
-                            f"{clean_result_str}\n"
-                            f"</tool_result>\n\n"
-                            f"Please analyze the tool output above and proceed with your response. "
-                            f"If the tool already produced a file (image, plot, document, etc.), "
-                            f"reference it in your final answer and STOP — do not call the same tool again."
-                        )
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=user_part
-                        ))
-                        # Append spacing so the next turn's stream flows continuously in the same bubble
-                        ai_msg.content += "\n\n"
-                    else:
-                        # Tool Failed: Inject a system instruction asking the LLM to explain politely
-                        # instead of abruptly stopping. This allows the LLM to generate a user-facing
-                        # error message before the loop terminates.
-                        user_part = (
-                            f'<tool_result name="{tool_name}">\n'
-                            f"{clean_result_str}\n"
-                            f"</tool_result>\n\n"
-                            f"⚠️ **Tool Execution Failed.**\n"
-                            f"The tool '{tool_name}' encountered an error. Please politely inform the user that the operation could not be completed, "
-                            f"briefly explain the likely cause based on the error log above, and suggest a possible workaround or alternative approach. "
-                            f"Do not attempt to call the tool again with the same parameters."
-                        )
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=user_part
-                        ))
-                        # Append spacing so the next turn's stream flows continuously
-                        ai_msg.content += "\n\n"
+                        if tool_success:
+                            # CRITICAL: Strengthened prompt to prevent re-execution
+                            user_part = (
+                                f"=== 🛑 TOOL EXECUTION COMPLETE: {tool_name} ===\n"
+                                f"The tool has successfully executed. DO NOT call '{tool_name}' again.\n\n"
+                                f"<tool_result name=\"{tool_name}\">\n"
+                                f"{clean_result_str}\n"
+                                f"</tool_result>\n\n"
+                                f"🚨 CRITICAL INSTRUCTION:\n"
+                                f"1. Analyze the output above.\n"
+                                f"2. If the task is complete, respond to the user naturally.\n"
+                                f"3. If you need to do something else, call a DIFFERENT tool.\n"
+                                f"4. UNDER NO CIRCUMSTANCES call '{tool_name}' again with the same parameters.\n"
+                                f"   The data is already retrieved. Proceed to the next step."
+                            )
 
-                        # Break the loop after injecting the error prompt so the LLM can generate the explanation
-                        break
+                            # Log for debugging
+                            ASCIIColors.cyan(f"[ChatMixin] Injecting virtual user prompt after successful tool '{tool_name}':\n{user_part[:200]}...")
+
+                            virtual_history.append(SimpleNamespace(
+                                sender_type="user",
+                                content=user_part
+                            ))
+                            ai_msg.content += "\n\n"
+                        else:
+                            user_part = (
+                                f'<tool_result name="{tool_name}">\n'
+                                f"{clean_result_str}\n"
+                                f"</tool_result>\n\n"
+                                f"⚠️ **Tool Execution Failed.**\n"
+                                f"The tool '{tool_name}' encountered an error. Please politely inform the user that the operation could not be completed, "
+                                f"briefly explain the likely cause based on the error log above, and suggest a possible workaround or alternative approach. "
+                                f"Do not attempt to call the tool again with the same parameters."
+                            )
+                            virtual_history.append(SimpleNamespace(
+                                sender_type="user",
+                                content=user_part
+                            ))
+                            ai_msg.content += "\n\n"
+                            # If this was a forced break due to loop detection, ensure we exit
+                            if 'force_break_after_tool' in locals() and force_break_after_tool:
+                                break
+                            break
                 else:
                     break
             else:
                 break
 
         # ── 11. Final Post-Processing & Database Commit ──
+
+        # Handle cancellation cleanup
+        if was_cancelled:
+            ASCIIColors.info(f"[ChatMixin] Wrapping up cancelled generation for discussion {self.id}")
+            if ai_msg.content.strip():
+                ai_msg.content += "\n\n[Generation cancelled by user]"
+            else:
+                ai_msg.content = "[Generation cancelled by user]"
+            ai_msg.metadata = {
+                "mode": "cancelled",
+                "tool_calls": tool_calls_this_turn,
+                "artefacts_modified": [a.get("title") for a in ss.affected_artefacts],
+                "cancelled": True
+            }
+        else:
+            ai_msg.metadata = {
+                "mode": "agentic" if tool_calls_this_turn else "direct",
+                "tool_calls": tool_calls_this_turn,
+                "artefacts_modified": [a.get("title") for a in ss.affected_artefacts]
+            }
+
         if remove_thinking_blocks:
             ai_msg.content = self.lollmsClient.remove_thinking_blocks(ai_msg.content)
 
@@ -1226,7 +1457,8 @@ class ChatMixin:
             "sources": [],
             "artefacts": ss.affected_artefacts,
             "memory_report": mem_report,
-            "dream_report": dream_report
+            "dream_report": dream_report,
+            "was_cancelled": was_cancelled
         }
 
 
