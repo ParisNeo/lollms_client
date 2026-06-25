@@ -111,10 +111,21 @@ def _dataframe_to_markdown(df: Any) -> str:
 
 
 def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, List[Tuple[str, str]]]:
-    _ensure_installed("sqlalchemy")
-    _ensure_installed("pandas")
-    _ensure_installed("openpyxl")
-    import pandas as pd
+    """
+    Parses a data file (CSV, Excel, SQLite, etc.) and returns a rich Markdown schema (.lam content)
+    along with the raw physical bytes for tool execution.
+    """
+    # 🛑 CRITICAL: Force install dependencies BEFORE any import attempts
+    try:
+        _ensure_installed("pandas")
+        _ensure_installed("openpyxl")
+        _ensure_installed("sqlalchemy")
+        import pandas as pd
+        ASCIIColors.success(f"[DataFiles] ✅ Pandas/OpenPyXL successfully loaded for schema extraction.")
+    except Exception as install_err:
+        ASCIIColors.error(f"[DataFiles] ❌ CRITICAL: Failed to install/load pandas: {install_err}")
+        # Fallback to minimal schema if pandas completely fails
+        return f"# Data Interface: {art_title}\n\n⚠️ **Critical Error**: Pandas library unavailable. Cannot extract schema.", [], None
 
     ext = path.suffix.lower()
     schema_parts = [f"# Data Interface: {art_title}\n"]
@@ -123,18 +134,17 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
         if ext == ".sqlconn":
             if progress_cb: progress_cb("Reading SQL connection details...")
             engine, dialect = _get_sqlalchemy_engine_from_file(path)
-            
+
             from sqlalchemy import inspect, text
             inspector = inspect(engine)
             tables = inspector.get_table_names()
             schema_parts.append(f"Format: Remote Relational Database ({dialect}) | Total Tables: {len(tables)}\n")
-            
+
             for idx, table in enumerate(tables):
                 if progress_cb: progress_cb(f"Inspecting table '{table}' ({idx+1}/{len(tables)})...")
                 columns = inspector.get_columns(table)
                 pk_cols = inspector.get_pk_constraint(table).get("constrained_columns", [])
-                
-                # Fetch row count
+
                 row_count = 0
                 try:
                     with engine.connect() as connection:
@@ -151,7 +161,6 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                     nullable_marker = " (NULLABLE)" if col.get("nullable", True) else ""
                     schema_parts.append(f"  • {col['name']} ({col['type']}){pk_marker}{nullable_marker}")
 
-                # Fetch a preview
                 try:
                     query_str = f'SELECT * FROM "{table}" LIMIT 3' if dialect != "mysql" else f'SELECT * FROM `{table}` LIMIT 3'
                     raw_conn = engine.raw_connection()
@@ -165,25 +174,23 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                     schema_parts.append(f"  (Failed to read table preview: {ex})")
 
                 schema_parts.append("\n---\n")
-            
+
             engine.dispose()
+
         elif ext in (".db", ".sqlite", ".sqlite3"):
             if progress_cb: progress_cb("Connecting to SQLite database...")
             import sqlite3
             conn = sqlite3.connect(str(path))
             cursor = conn.cursor()
 
-            # List all tables in the database
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
             tables = [row[0] for row in cursor.fetchall()]
             schema_parts.append(f"Format: SQLite Relational Database (.db) | Total Tables: {len(tables)}\n")
 
             for idx, table in enumerate(tables):
                 if progress_cb: progress_cb(f"Analyzing table '{table}' ({idx+1}/{len(tables)})...")
-                # Get table schema (columns and types) - quote table name to handle special chars
                 cursor.execute(f'PRAGMA table_info("{table}");')
                 columns_info = cursor.fetchall()
-                # Get exact row count - quote table name
                 cursor.execute(f'SELECT COUNT(*) FROM "{table}";')
                 row_count = cursor.fetchone()[0]
 
@@ -194,7 +201,6 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                     pk_marker = " — PRIMARY KEY" if col[5] else ""
                     schema_parts.append(f"  • {col[1]} ({col[2] or 'ANY'}){pk_marker}")
 
-                # Fetch a quick markdown preview using pandas - quote table name
                 try:
                     df = pd.read_sql_query(f'SELECT * FROM "{table}" LIMIT 3;', conn)
                     schema_parts.append("### Preview (First 3 Rows):")
@@ -268,43 +274,54 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                 schema_parts.append("\n---\n")
 
         else:
-            if progress_cb: progress_cb("Reading CSV headers...")
+            # DEFAULT CASE: CSV, TSV, or unknown text-based data
+            if progress_cb: progress_cb(f"Reading CSV/Text data (Separator detection)...")
             sep = ","
             if ext in (".tsv", ".tab"):
                 sep = "\t"
             else:
                 try:
-                    with open(path, "r", encoding="utf-8", errors="replace") as f:
-                        line = f.readline()
-                        if ";" in line: sep = ";"
-                        elif "\t" in line: sep = "\t"
-                except Exception:
-                    pass
+                    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                        first_line = f.readline()
+                        if ";" in first_line and first_line.count(";") > first_line.count(","):
+                            sep = ";"
+                        elif "\t" in first_line:
+                            sep = "\t"
+                        else:
+                            sep = ","
+                    ASCIIColors.info(f"[DataFiles] Detected separator: {repr(sep)}")
+                except Exception as det_err:
+                    ASCIIColors.warning(f"[DataFiles] Separator detection failed: {det_err}. Defaulting to comma.")
 
-            df = pd.read_csv(str(path), sep=sep, nrows=5)
-            full_df = pd.read_csv(str(path), sep=sep)
-            row_count = len(full_df)
+            # Read with pandas
+            try:
+                df = pd.read_csv(str(path), sep=sep, nrows=5, encoding="utf-8-sig")
+                full_df = pd.read_csv(str(path), sep=sep, encoding="utf-8-sig")
+                row_count = len(full_df)
 
-            schema_parts.append(f"Format: CSV (.csv) | Separator: {repr(sep)}\n")
-            schema_parts.append(f"- Total Rows: {row_count:,} | Columns: {len(df.columns)}")
-            schema_parts.append("### Columns & Types:")
-            for col in full_df.columns:
-                dtype = str(full_df[col].dtype)
-                nulls = int(full_df[col].isnull().sum())
-                schema_parts.append(f"  • {col} ({dtype}) — {nulls} missing values")
+                schema_parts.append(f"Format: CSV (.csv) | Separator: {repr(sep)}\n")
+                schema_parts.append(f"- Total Rows: {row_count:,} | Columns: {len(df.columns)}")
+                schema_parts.append("### Columns & Types:")
+                for col in full_df.columns:
+                    dtype = str(full_df[col].dtype)
+                    nulls = int(full_df[col].isnull().sum())
+                    schema_parts.append(f"  • {col} ({dtype}) — {nulls} missing values")
 
-            numeric_cols = full_df.select_dtypes(include=["number"]).columns
-            if not numeric_cols.empty:
-                schema_parts.append("### Numeric Column Statistics:")
-                stats_df = full_df[numeric_cols].describe().loc[["min", "max", "mean"]]
-                schema_parts.append(stats_df.to_markdown())
+                numeric_cols = full_df.select_dtypes(include=["number"]).columns
+                if not numeric_cols.empty:
+                    schema_parts.append("### Numeric Column Statistics:")
+                    stats_df = full_df[numeric_cols].describe().loc[["min", "max", "mean"]]
+                    schema_parts.append(stats_df.to_markdown())
 
-            schema_parts.append("### Preview (First 3 Rows):")
-            schema_parts.append(df.head(3).to_markdown(index=False))
+                schema_parts.append("### Preview (First 3 Rows):")
+                schema_parts.append(df.head(3).to_markdown(index=False))
+            except Exception as csv_err:
+                ASCIIColors.error(f"[DataFiles] CSV parsing failed: {csv_err}")
+                schema_parts.append(f"\n⚠️ **Parsing Error**: Could not read as CSV.\nError: {csv_err}")
 
     except Exception as e:
         ASCIIColors.error(f"Failed to parse structured data file: {e}")
-        schema_parts.append(f"⚠️ Failed to extract full structure: {e}")
+        schema_parts.append(f"\n⚠️ **Critical Failure**: {e}")
 
     # ── DUAL-STREAM PROTOCOL FOR DATA FILES ───────────────────────────────────
     # 1. Logical Content (for LLM Context): The schema/stats generated above.
@@ -313,12 +330,12 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
     # Read the raw binary data from the source file
     try:
         raw_physical_data = path.read_bytes()
+        ASCIIColors.info(f"[DataFiles] Read {len(raw_physical_data):,} bytes of raw physical data from {path.name}")
     except Exception as e:
         ASCIIColors.error(f"Failed to read raw binary data from {path}: {e}")
         raw_physical_data = None
 
     # Return both: Schema for context, Raw Bytes for disk storage
-    # CALLER NOTE: The return tuple is now (schema_text, empty_list, raw_bytes)
-    # You MUST unpack this as: schema, _, physical_data = _parse_data_file(...)
-    # Then pass physical_data to artefacts.add(physical_data=physical_data)
-    return "\n\n".join(schema_parts), [], raw_physical_data
+    final_schema = "\n\n".join(schema_parts)
+    ASCIIColors.success(f"[DataFiles] ✅ Schema generated successfully ({len(final_schema)} chars).")
+    return final_schema, [], raw_physical_data
