@@ -36,25 +36,54 @@ def init_tool_library() -> None:
 
 
 def _get_workspace_dir() -> Path:
-    """Returns the primary active workspace directory dynamically from the running server process."""
+    """
+    Returns the CURRENT WORKING DIRECTORY.
+
+    ARCHITECTURAL RULE: Tools are AGNOSTIC. They do NOT know about discussions.
+    The LCP Binding sets the CWD to the discussion-isolated workspace BEFORE execution.
+    Therefore, the tool simply operates on "." (current directory).
+    """
     from ascii_colors import ASCIIColors
-    import sys
-    workspace_dir = Path("./data_workspace")
-    try:
-        # Query sys.modules dynamically to avoid stale direct-import reference copies
-        if "lollms_client.app.server" in sys.modules:
-            server_mod = sys.modules["lollms_client.app.server"]
-            active_ws = getattr(server_mod, "APP_WORKSPACE_DIR", None)
-            if active_ws is not None:
-                workspace_dir = active_ws
-                ASCIIColors.cyan(f"[SemanticDataEngineer] Successfully resolved active workspace: '{workspace_dir.resolve()}'")
-            else:
-                ASCIIColors.warning(f"[SemanticDataEngineer] server.APP_WORKSPACE_DIR is None. Defaulting to: '{workspace_dir.resolve()}'")
-        else:
-            ASCIIColors.warning(f"[SemanticDataEngineer] lollms_client.app.server is not loaded in sys.modules. Defaulting to: '{workspace_dir.resolve()}'")
-    except Exception as e:
-        ASCIIColors.warning(f"[SemanticDataEngineer] Dynamic workspace resolution failed: {e}. Defaulting to: '{workspace_dir.resolve()}'")
+    import os
+
+    workspace_dir = Path(os.getcwd()).resolve()
+    ASCIIColors.success(f"[SemanticDataEngineer] 🎯 Operating in CWD: '{workspace_dir}'")
     return workspace_dir
+
+
+def _find_file_fuzzy(file_name: str, workspace_dir: Path) -> Optional[Path]:
+    """
+    Attempts to locate a file even if the extension is missing or path is slightly off.
+    1. Tries exact match.
+    2. Tries adding common extensions (.csv, .db, .sqlite, .xlsx) IF file_name has no dot.
+    3. Searches for ANY file in workspace/versions that STARTS WITH the file_name.
+    """
+    # 1. Exact Match
+    exact_path = workspace_dir / file_name
+    if exact_path.exists():
+        return exact_path
+
+    # 2. Try Common Extensions (Only if no extension provided)
+    if "." not in file_name:
+        for ext in [".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls"]:
+            candidate = workspace_dir / f"{file_name}{ext}"
+            if candidate.exists():
+                return candidate
+
+    # 3. Aggressive Prefix Match (Workspace & Versions)
+    # This handles cases where LLM sends "Conta_..." but file is "Conta_....csv"
+    for search_dir in [workspace_dir, workspace_dir / "versions"]:
+        if search_dir.exists():
+            for f in search_dir.iterdir():
+                if f.is_file():
+                    # Check if file starts with the provided name (case-insensitive)
+                    if f.name.lower().startswith(file_name.lower()):
+                        return f
+                    # Also check without extension (e.g. "data" matches "data.csv")
+                    if f.stem.lower() == file_name.lower():
+                        return f
+
+    return None
 
 
 def _load_data_source(file_path: Path, table_name: Optional[str] = None, discussion_instance: Optional[Any] = None) -> Tuple[Any, str]:
@@ -194,15 +223,31 @@ def tool_get_table_schema(
         file_name (str): Filename of the target CSV, Excel, or SQLite file in the workspace.
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
-    file_path = (workspace_dir / file_name).resolve()
 
-    if not file_path.exists():
-        return {"success": False, "error": f"File '{file_name}' not found."}
+    # 🛡️ FUZZY FILE RESOLUTION
+    file_path = _find_file_fuzzy(file_name, workspace_dir)
+
+    if not file_path:
+        # 🛑 BREAK LOOP: List available files to help LLM correct itself
+        available_files = [f.name for f in workspace_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
+        if versions_dir := (workspace_dir / "versions"):
+            if versions_dir.exists():
+                available_files.extend([f"versions/{f.name}" for f in versions_dir.iterdir() if f.is_file()])
+
+        return {
+            "success": False, 
+            "error": f"File '{file_name}' not found.",
+            "prompt_injection": f"\n\n⚠️ **File Not Found.**\nI looked for '{file_name}' but it doesn't exist in the workspace.\n\n**Available Files:**\n{', '.join(available_files[:10])}\n\n**Action:** Check the artifact title or file extension. Did you mean one of the files above?"
+        }
 
     try:
+        # discussion_instance is now injected by the Binding wrapper, not the tool signature
+        # We access it via the global context or wrapper injection if needed for self-healing
+        # For now, we rely on the file existing on disk (synced by binding before call)
         df, resolved_table = _load_data_source(file_path, table_name)
-        
+
         schema = {}
         for col in df.columns:
             schema[col] = {
@@ -213,12 +258,12 @@ def tool_get_table_schema(
 
         return {
             "success": True,
-            "file_name": file_name,
+            "file_name": file_path.name,
             "table_name": resolved_table,
             "total_rows": len(df),
             "columns_count": len(df.columns),
             "schema": schema,
-            "output": f"Dataset '{file_name}' (table '{resolved_table}') has {len(df):,} rows and {len(df.columns)} columns."
+            "output": f"Dataset '{file_path.name}' (table '{resolved_table}') has {len(df):,} rows and {len(df.columns)} columns."
         }
     except Exception as e:
         return {"success": False, "error": f"Failed to retrieve schema: {e}"}
@@ -252,11 +297,19 @@ def tool_filter_and_slice_data(
         output_artifact_title (str, optional): Title of the new artifact if save_as_new_artifact is True.
     """
     import pandas as pd
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
-    file_path = (workspace_dir / file_name).resolve()
 
-    if not file_path.exists():
-        return {"success": False, "error": f"File '{file_name}' not found."}
+    # 🛡️ FUZZY FILE RESOLUTION
+    file_path = _find_file_fuzzy(file_name, workspace_dir)
+
+    if not file_path:
+        available_files = [f.name for f in workspace_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
+        return {
+            "success": False, 
+            "error": f"File '{file_name}' not found.",
+            "prompt_injection": f"\n\n⚠️ **File Not Found.**\nI looked for '{file_name}' but it doesn't exist.\n\n**Available Files:**\n{', '.join(available_files[:10])}\n\n**Action:** Retry with the correct filename from the list above."
+        }
 
     try:
         df, resolved_table = _load_data_source(file_path, table_name)
@@ -355,6 +408,7 @@ def tool_get_unique_values(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
         limit (integer, optional): Maximum unique items to list. Defaults to 100.
     """
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -406,6 +460,7 @@ def tool_compute_column_aggregations(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
         operation (str, optional): Aggregation operation: 'sum', 'mean', 'min', 'max', 'count'. Defaults to 'mean'.
     """
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -482,6 +537,7 @@ def tool_update_cell_value(
         new_value (str): The new value to set.
     """
     import pandas as pd
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -560,6 +616,7 @@ def tool_insert_new_row(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
     import pandas as pd
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -630,6 +687,7 @@ def tool_delete_rows_by_criteria(
         match_value (str): Value to match in that column.
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -692,6 +750,7 @@ def tool_query_database_sql(
         sql_query (str): Valid SQLite standard SQL query to execute.
     """
     import pandas as pd
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -827,6 +886,7 @@ def tool_generate_advanced_visualization(
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -976,6 +1036,7 @@ def tool_compute_statistics_and_plot(
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -1090,6 +1151,7 @@ def tool_bootstrap_tbox_from_database(
         file_name (str): The filename of the DB, CSV, or Excel file in the workspace.
     """
     import pandas as pd
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     file_path = (workspace_dir / file_name).resolve()
 
@@ -1175,6 +1237,7 @@ def tool_convert_to_abox(
         tbox_file_name (str): Filename of the TBox schema file (bootstrapped or custom).
     """
     import pandas as pd
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
     db_file_path = (workspace_dir / file_name).resolve()
     tbox_path = (workspace_dir / tbox_file_name).resolve()
