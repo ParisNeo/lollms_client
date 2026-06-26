@@ -1905,10 +1905,46 @@ document.addEventListener("DOMContentLoaded", () => {
                 const art = await artRes.json();
                 rawView.value = art.content;
             } else if (isDataArtifact) {
-                await renderSpreadsheetGridInTab(title, version, renderedView);
-
-                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
+                // Render Dual-Stream status dashboard above spreadsheet grid
+                const selectedVer = version || 1;
+                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${selectedVer}`);
                 const art = await artRes.json();
+
+                // Create the wrapper layout for the Dual-Stream metadata panel
+                renderedView.innerHTML = `
+                    <div class="dual-stream-dashboard" style="background: rgba(15, 23, 42, 0.4); border: 1px solid var(--border-color); border-radius: 8px; padding: 14px; margin-bottom: 16px; display: flex; flex-direction: column; gap: 10px; font-size: 12px; line-height: 1.5; color: var(--text-primary);">
+                        <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-color); padding-bottom: 6px;">
+                            <span style="font-weight: bold; color: var(--accent-color); text-transform: uppercase; letter-spacing: 0.05em; display: flex; align-items: center; gap: 6px;">
+                                📦 Dual-Stream Storage (.lam Protocol)
+                            </span>
+                            <span class="level-tag working" style="font-size: 9px; padding: 2px 6px; font-weight: bold;">LCP Active</span>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+                            <div style="border-right: 1px solid var(--border-color); padding-right: 12px;">
+                                <strong style="color: #38bdf8;">🧠 Logical Twin (.lam / TBox Concept)</strong>
+                                <p style="color: var(--text-secondary); font-size: 11px; margin-top: 4px;">Injected into active LLM context as schema metadata to guide reasoning.</p>
+                                <ul style="list-style: none; margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-family: monospace; font-size: 11px;">
+                                    <li>• File Title: <span style="color: #e0e0e0;">${title}</span></li>
+                                    <li>• Logic Size: <span style="color: #e0e0e0;">${(art.content || "").length.toLocaleString()} characters</span></li>
+                                    <li>• Active Version: <span style="color: #e0e0e0;">v${selectedVer}</span></li>
+                                </ul>
+                            </div>
+                            <div>
+                                <strong style="color: var(--success-color);">💻 Physical Twin (Data Source)</strong>
+                                <p style="color: var(--text-secondary); font-size: 11px; margin-top: 4px;">Stored on disk. Directly accessible by local LCP script environments.</p>
+                                <ul style="list-style: none; margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-family: monospace; font-size: 11px;">
+                                    <li>• Physical Path: <span style="color: #e0e0e0;">data_workspace/discussions/${art.discussion_id}/${title}</span></li>
+                                    <li>• File Extension: <span style="color: #e0e0e0;">${art.file_ext || ".csv"}</span></li>
+                                    <li>• Write Status: <span style="color: ${art.read_only ? '#ef4444' : 'var(--success-color)'}; font-weight: bold;">${art.read_only ? '🔒 Read-Only' : '✏️ Writable (RW)'}</span></li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="grid-container-${safeId}"></div>
+                `;
+
+                const gridTarget = document.getElementById(`grid-container-${safeId}`);
+                await renderSpreadsheetGridInTab(title, version, gridTarget);
                 rawView.value = art.content;
             } else if (activeType === "tool") {
                 // Renders the Full Interactive LCP Tool Builder Workspace inside Rendered View!
@@ -6526,7 +6562,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     </div>
                     <!-- Toggle buttons -->
                     <button class="btn btn-secondary toggle-sql-btn" id="btn-toggle-sql-${safeTitle}" style="width: auto; padding: 8px 14px; font-size: 11.5px; font-weight: bold; border-radius: 6px; background-color: var(--border-color); color: var(--text-primary);">💻 Raw SQL Sandbox</button>
-                    <button class="btn btn-primary toggle-ai-btn" id="btn-toggle-ai-${safeTitle}" style="width: auto; padding: 8px 14px; font-size: 11.5px; font-weight: bold; border-radius: 6px; background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg);">🤖 Ask AI Assistant</button>
+                    <button class="btn btn-primary toggle-ai-btn" id="btn-toggle-ai-${safeTitle}" style="width: auto; padding: 8px 14px; font-size: 11.5px; font-weight: bold; border-radius: 6px; background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg);">🤖 Ask AI (LCP Macro)</button>
                 </div>
 
                 <!-- 2. Hidden SQL Sandbox Panel -->
@@ -6540,7 +6576,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
                 <!-- 3. Hidden AI Query Panel -->
                 <div id="ai-panel-${safeTitle}" style="display: none; flex-direction: column; gap: 8px; border-top: 1px solid var(--border-color); padding-top: 10px; margin-top: 4px;">
-                    <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary); text-transform: uppercase;">🤖 Ask AI Natural Language Question</label>
+                    <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary); text-transform: uppercase;">🤖 Ask AI Natural Language Question (LCP Macro)</label>
                     <div style="display: flex; gap: 10px;">
                         <input type="text" id="ai-question-${safeTitle}" placeholder="e.g. How many Gold members signup in 2024?" style="flex: 1; padding: 8px 12px; background-color: var(--bg-app); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; outline: none; font-size: 12.5px;" />
                         <input type="submit" class="btn btn-primary" id="btn-run-ai-${safeTitle}" style="width: auto; padding: 8px 16px; font-size: 12px; font-weight: bold; background-color: var(--chat-user-bg); color: white; border-color: var(--chat-user-bg);" value="Ask AI" />

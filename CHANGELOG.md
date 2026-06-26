@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-26 12:48]
+
+- refactor: update chat mixin and semantic data engineer tools
+
 ## [2026-06-24 08:15]
 
 - refactor(client): remove loggers from public api exports

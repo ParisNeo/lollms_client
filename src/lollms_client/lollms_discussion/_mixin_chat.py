@@ -348,19 +348,13 @@ class _StreamState:
                 # But we MUST NOT re-scan the accumulated part as "new content" for other patterns
                 return True
 
-        # 2. CRITICAL FIX: Only parse NEW content added since last feed call
+        # 2. CRITICAL FIX: Only parse content added in the active round
         # This prevents re-parsing old tool calls from previous reasoning rounds
         content = self.ai_message.content[self.content_offset:]
-
-        # Update offset for next feed call
-        self.content_offset = len(self.ai_message.content)
 
         # If no new content to parse, exit early
         if not content.strip():
             return True
-
-        # 🛑 SCIENTIFIC DEBUG: Log raw content being scanned
-        ASCIIColors.cyan(f"[StreamState.DEBUG] Scanning NEW content ({len(content)} chars): {repr(content[:100])}...")
 
         # 3. Stateless Thoughts Detection
         last_open_think = content.rfind("<think>")
@@ -368,7 +362,6 @@ class _StreamState:
         is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
 
         if is_inside_thoughts:
-            ASCIIColors.yellow("[StreamState.DEBUG] Inside thoughts block. Skipping parse.")
             return True
 
         # 3. Protect Active Unclosed Artifact Blocks from Tag Interception
@@ -392,7 +385,6 @@ class _StreamState:
         )
 
         xml_matches = list(xml_pattern.finditer(safe_content))
-        ASCIIColors.cyan(f"[StreamState.DEBUG] Found {len(xml_matches)} XML-style matches.")
 
         for match in xml_matches:
             full_match_text = match.group(0)
@@ -438,7 +430,6 @@ class _StreamState:
                 self._tool_buffer = safe_content[start_idx:]
                 # Do NOT return yet, let the rest of the chunk be processed if needed (though unlikely)
 
-        ASCIIColors.cyan("[StreamState.DEBUG] No tool calls detected. Continuing generation.")
         return True
 
     def _dispatch_closed_tag(self, tag_name: str, attrs_str: str, body: str, full_match_text: str) -> bool:
@@ -1087,9 +1078,10 @@ class ChatMixin:
         ASCIIColors.info("[Trace] Retrieving conversation branch...")
         current_branch_tip = branch_tip_id or self.active_branch_id
         branch = self.get_branch(current_branch_tip)
-        
+
         # Build virtual history list for generate_from_messages
         virtual_history = [m for m in branch if m.id != user_msg.id]
+        virtual_history.append(user_msg)
 
         tool_calls_this_turn = []
         round_count = 0
@@ -1147,10 +1139,6 @@ class ChatMixin:
                     "role": "user" if m.sender_type == "user" else "assistant",
                     "content": m.content
                 })
-            messages_list.append({
-                "role": "user",
-                "content": user_message
-            })
 
             # CRITICAL FIX: Track content offset to prevent re-parsing old tool calls
             current_content_length = len(ai_msg.content)
@@ -1448,18 +1436,30 @@ class ChatMixin:
                     # ── 🛑 SUCCESS LOOP DETECTION & PREVENTION ─────────────────────
                     # Check if the LAST assistant message in history was a tool call to the SAME tool
                     # This prevents the LLM from getting stuck in a "success loop"
-                    last_assistant_msg = virtual_history[-2] if len(virtual_history) >= 2 else None
+                    last_assistant_msg = virtual_history[-3] if len(virtual_history) >= 3 else None
                     if last_assistant_msg and last_assistant_msg.sender_type == "assistant":
                         # Check if the previous round also called this tool (simple heuristic)
                         # We can't easily check previous tool calls without parsing, so we rely on the virtual user prompt below
 
                         if tool_success:
+                            # Extract explicit filename if returned in the result dictionary
+                            real_filename_instr = ""
+                            if isinstance(tool_res, dict) and tool_res.get("plot_filename"):
+                                p_fn = tool_res["plot_filename"]
+                                real_filename_instr = (
+                                    f"🚨 **ACTUAL GENERATED FILE NAME**: `{p_fn}`\n"
+                                    f"   You must reference this exact file in your final answer using:\n"
+                                    f"   `<artefact_image id=\"{p_fn}::0\" />` or `<img src=\"/api/workspace_files/{p_fn}\" />`\n"
+                                    f"   Do NOT hallucinate or guess any other file name (such as 'sales_over_time.png'). Only use `{p_fn}`.\n\n"
+                                )
+
                             # 🛑 CRITICAL FIX: EXPLICITLY LABEL OUTPUT AS "NOT A TOOL CALL"
                             # We must prevent the LLM from misinterpreting JSON results as new tool calls
                             user_part = (
                                 f"=== ✅ TOOL RESULT (NOT A TOOL CALL): {tool_name} ===\n"
                                 f"⚠️ **WARNING**: The JSON below is the **RESULT** of your previous tool call. "
                                 f"It is **NOT** a new tool call request. Do **NOT** re-execute it.\n\n"
+                                f"{real_filename_instr}"
                                 f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n"
                                 f"{clean_result_str}\n"
                                 f"</tool_result>\n\n"
@@ -1531,6 +1531,32 @@ class ChatMixin:
 
         if remove_thinking_blocks:
             ai_msg.content = self.lollmsClient.remove_thinking_blocks(ai_msg.content)
+
+        # ── 🛡️ AUTO-CORRECT HALLUCINATED FILENAMES ──
+        # Scan through the tool executions of this turn and fix any mismatched filenames
+        for tc in tool_calls_this_turn:
+            if tc.get("result") and tc["result"].get("success"):
+                out_str = str(tc["result"].get("output", ""))
+                # Locate real plot filename inside the output logs
+                match_fn = re.search(r'plot_filename":\s*"([^"]+)"', out_str) or re.search(r'plot_filename:\s*(\S+)', out_str)
+                if match_fn:
+                    real_fn = match_fn.group(1).strip().strip("'\"")
+                    # Dynamically replace hallucinated filenames (like sales_over_time, plot.png) inside image/artifact tags
+                    ai_msg.content = re.sub(
+                        r'(src|id)=["\'](?:[^"\']*/)?(?:sales_over_time|plot|chart|visualization)\.(?:png|jpg|jpeg)(?:::\d+)?["\']',
+                        f'\\1="{real_fn}::0"',
+                        ai_msg.content,
+                        flags=re.IGNORECASE
+                    )
+                    # Also replace plain markdown/HTML source references if outputted as plain text
+                    ai_msg.content = re.sub(
+                        r'src=["\'](?:/api/workspace_files/)?(?:sales_over_time|plot|chart|visualization)\.png["\']',
+                        f'src="/api/workspace_files/{real_fn}"',
+                        ai_msg.content,
+                        flags=re.IGNORECASE
+                    )
+                    ai_msg.content = ai_msg.content.replace("sales_over_time.png", real_fn)
+                    ASCIIColors.success(f"[Self-Healing] Corrected hallucinated filename reference to '{real_fn}' inside response!")
 
         # Process memories
         mem_cleaned, mem_report = self._process_memory_tags(ai_msg.content, _mm, callback)

@@ -214,7 +214,9 @@ def _save_data_source(df: Any, file_path: Path, table_name: str) -> None:
 
 def tool_get_table_schema(
     file_name: str,
-    table_name: Optional[str] = None
+    table_name: Optional[str] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Retrieves the exact column names, data types, row counts, and null counts of a dataset.
@@ -222,6 +224,8 @@ def tool_get_table_schema(
     Args:
         file_name (str): Filename of the target CSV, Excel, or SQLite file in the workspace.
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
+        discussion_instance (Any, optional): Active discussion session instance. Defaults to None.
+        lollms_client_instance (Any, optional): Active client instance. Defaults to None.
     """
     # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
     workspace_dir = _get_workspace_dir()
@@ -243,10 +247,6 @@ def tool_get_table_schema(
         }
 
     try:
-        # 🛑 CRITICAL FIX: Ensure discussion_instance is available for self-healing
-        # It's passed via kwargs by LCP binding execute_tool wrapper
-        discussion_instance = kwargs.get("discussion_instance")
-
         df, resolved_table = _load_data_source(file_path, table_name, discussion_instance)
 
         schema = {}

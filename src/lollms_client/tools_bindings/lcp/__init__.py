@@ -484,7 +484,7 @@ class LCPBinding(LollmsToolBinding):
                         if not should_read_content and content_placeholder:
                             existing_art = discussion_instance.artefacts.get(file_name)
                             if existing_art:
-                                discussion_instance.artefacts.update(
+                                art = discussion_instance.artefacts.update(
                                     title=file_name,
                                     new_content=content_placeholder,
                                     new_type=atype,
@@ -492,7 +492,7 @@ class LCPBinding(LollmsToolBinding):
                                     commit_message=f"Updated binary file reference by tool '{tool_name}'"
                                 )
                             else:
-                                discussion_instance.artefacts.add(
+                                art = discussion_instance.artefacts.add(
                                     title=file_name,
                                     artefact_type=atype,
                                     content=content_placeholder,
@@ -500,13 +500,23 @@ class LCPBinding(LollmsToolBinding):
                                     commit_message=f"Created by tool '{tool_name}'"
                                 )
                             ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
+
+                            # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
+                            if discussion_instance.active_branch_id:
+                                ai_msg = discussion_instance.get_message(discussion_instance.active_branch_id)
+                                if ai_msg:
+                                    if atype == "image":
+                                        ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                    else:
+                                        ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                    discussion_instance.commit()
                             continue
 
                         # Handle Text/Readable Files
                         existing_art = discussion_instance.artefacts.get(file_name)
                         if existing_art:
                             ASCIIColors.info(f"[LCP Tool] File '{file_name}' reappeared on disk. Updating artifact.")
-                            discussion_instance.artefacts.update(
+                            art = discussion_instance.artefacts.update(
                                 title=file_name,
                                 new_content=file_info["content"],
                                 new_type=atype,
@@ -515,7 +525,7 @@ class LCPBinding(LollmsToolBinding):
                             )
                         else:
                             ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Creating NEW artifact from file: '{file_name}'")
-                            discussion_instance.artefacts.add(
+                            art = discussion_instance.artefacts.add(
                                 title=file_name,
                                 artefact_type=atype,
                                 content=file_info["content"],
@@ -523,6 +533,16 @@ class LCPBinding(LollmsToolBinding):
                                 commit_message=f"Created by tool '{tool_name}'"
                             )
                             ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Created NEW artifact: '{file_name}'")
+
+                        # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
+                        if discussion_instance.active_branch_id:
+                            ai_msg = discussion_instance.get_message(discussion_instance.active_branch_id)
+                            if ai_msg:
+                                if atype == "image":
+                                    ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                else:
+                                    ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                discussion_instance.commit()
 
                     # 9. Detect MODIFIED files
                     common_files = set(files_after.keys()) & set(files_before.keys())
@@ -551,7 +571,7 @@ class LCPBinding(LollmsToolBinding):
 
                                 existing_art = discussion_instance.artefacts.get(file_name)
                                 if existing_art:
-                                    discussion_instance.artefacts.update(
+                                    art = discussion_instance.artefacts.update(
                                         title=file_name,
                                         new_content=content_placeholder,
                                         new_type=atype,
@@ -559,7 +579,7 @@ class LCPBinding(LollmsToolBinding):
                                         commit_message=f"Modified binary file by tool '{tool_name}'"
                                     )
                                 else:
-                                    discussion_instance.artefacts.add(
+                                    art = discussion_instance.artefacts.add(
                                         title=file_name,
                                         artefact_type=atype,
                                         content=content_placeholder,
@@ -567,6 +587,16 @@ class LCPBinding(LollmsToolBinding):
                                         commit_message=f"Synced binary file by tool '{tool_name}'"
                                     )
                                 ASCIIColors.success(f"[LCP Tool '{tool_name}'] 🔄 Updated binary file reference: '{file_name}'")
+
+                                # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
+                                if discussion_instance.active_branch_id:
+                                    ai_msg = discussion_instance.get_message(discussion_instance.active_branch_id)
+                                    if ai_msg:
+                                        if atype == "image":
+                                            ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                        else:
+                                            ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                        discussion_instance.commit()
                                 continue
 
                             # Handle Text/Readable Modified Files
@@ -578,7 +608,7 @@ class LCPBinding(LollmsToolBinding):
                                 elif file_ext in (".csv", ".db", ".sqlite", ".xlsx", ".xls"):
                                     atype = "data"
 
-                                discussion_instance.artefacts.update(
+                                art = discussion_instance.artefacts.update(
                                     title=file_name,
                                     new_content=after_info["content"],
                                     new_type=atype,
@@ -589,13 +619,23 @@ class LCPBinding(LollmsToolBinding):
                             else:
                                 ASCIIColors.warning(f"[LCP Tool] File '{file_name}' modified on disk but no artifact found. Creating one.")
                                 atype = "code" if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir") else "document"
-                                discussion_instance.artefacts.add(
+                                art = discussion_instance.artefacts.add(
                                     title=file_name,
                                     artefact_type=atype,
                                     content=after_info["content"],
                                     active=True,
                                     commit_message=f"Synced by tool '{tool_name}'"
                                 )
+
+                            # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
+                            if discussion_instance.active_branch_id:
+                                ai_msg = discussion_instance.get_message(discussion_instance.active_branch_id)
+                                if ai_msg:
+                                    if atype == "image":
+                                        ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                    else:
+                                        ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                    discussion_instance.commit()
 
                 return {"output": result, "status_code": 200}
 
