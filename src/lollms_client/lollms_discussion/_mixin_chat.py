@@ -265,6 +265,9 @@ class _StreamState:
     The exact second an XML tag is closed, it intercepts the accumulated block,
     builds the artifact/resource on disk, and rewrites the database message 
     content to cleanly strip the raw block and replace it with a success card.
+
+    CRITICAL FIX: Now tracks content offset to only parse NEW tokens added during
+    the current reasoning round, preventing re-parsing of old tool calls from previous rounds.
     """
     def __init__(
         self,
@@ -278,6 +281,7 @@ class _StreamState:
         auto_activate_artefacts: bool = True,
         enable_artefacts: bool = True,
         enable_in_message_status: bool = True,
+        content_offset: int = 0,  # Track where to start parsing from
     ):
         self.discussion = discussion
         self.callback = callback
@@ -285,6 +289,7 @@ class _StreamState:
         self.enable_artefacts = enable_artefacts
         self.enable_in_message_status = enable_in_message_status
         self.auto_activate = auto_activate_artefacts
+        self.content_offset = content_offset  # Only parse content after this offset
 
         self.enable_notes = enable_notes if enable_artefacts else False
         self.enable_skills = enable_skills if enable_artefacts else False
@@ -296,6 +301,10 @@ class _StreamState:
         self.affected_artefacts = []
         self.processed_tags = set()  # prevent double-processing same matched block
 
+        # 🛑 CRITICAL FIX: Accumulation buffer for multi-chunk tool calls
+        self._is_accumulating_tool = False
+        self._tool_buffer = ""
+
     def feed(self, chunk: str) -> bool:
         if not isinstance(chunk, str) or not chunk:
             return True
@@ -304,55 +313,132 @@ class _StreamState:
         self.ai_message.content += chunk
         _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
 
-        # 2. Stateless Thoughts Detection
-        content = self.ai_message.content
+        # ── 🛑 CRITICAL FIX: Tool Call Accumulation Mode ─────────────────────
+        # If we are already inside a tool call, JUST accumulate. Do NOT scan.
+        if self._is_accumulating_tool:
+            self._tool_buffer += chunk
+
+            # Check for END tag in the accumulated buffer
+            if '</tool_call>' in self._tool_buffer:
+                # Find the position of the closing tag
+                end_idx = self._tool_buffer.find('</tool_call>')
+                full_tool_call = self._tool_buffer[:end_idx + len('</tool_call>')]
+
+                # Extract JSON body (strip <tool_call> and </tool_call>)
+                json_body = full_tool_call.strip().lstrip('<tool_call>').rstrip('</tool_call>').strip()
+
+                ASCIIColors.magenta(f"[StreamState.DEBUG] 🎯 TOOL CALL COMPLETE! Accumulated {len(self._tool_buffer)} chars.")
+                ASCIIColors.magenta(f"[StreamState.DEBUG] Raw JSON Body: {repr(json_body[:200])}")
+
+                # Reset accumulation state
+                self._is_accumulating_tool = False
+                self._tool_buffer = ""
+
+                # Dispatch the tool call
+                keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
+                if not keep_generating:
+                    ASCIIColors.red("[StreamState.DEBUG] HALTING generation due to JSON tool call.")
+                    return False
+
+                # Update offset to skip past the processed tool call
+                self.content_offset = len(self.ai_message.content)
+                return True
+            else:
+                # Still accumulating, don't update offset yet (we want to keep scanning for the end tag)
+                # But we MUST NOT re-scan the accumulated part as "new content" for other patterns
+                return True
+
+        # 2. CRITICAL FIX: Only parse NEW content added since last feed call
+        # This prevents re-parsing old tool calls from previous reasoning rounds
+        content = self.ai_message.content[self.content_offset:]
+
+        # Update offset for next feed call
+        self.content_offset = len(self.ai_message.content)
+
+        # If no new content to parse, exit early
+        if not content.strip():
+            return True
+
+        # 🛑 SCIENTIFIC DEBUG: Log raw content being scanned
+        ASCIIColors.cyan(f"[StreamState.DEBUG] Scanning NEW content ({len(content)} chars): {repr(content[:100])}...")
+
+        # 3. Stateless Thoughts Detection
         last_open_think = content.rfind("<think>")
         last_close_think = content.rfind("</think>")
         is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
 
         if is_inside_thoughts:
+            ASCIIColors.yellow("[StreamState.DEBUG] Inside thoughts block. Skipping parse.")
             return True
 
         # 3. Protect Active Unclosed Artifact Blocks from Tag Interception
-        # If the LLM is actively outputting inside an open <artifact> or <note> block,
-        # we must STRICTLY disable secondary tag parsing. This prevents aider symbols
-        # like "<<<<<<< SEARCH" from triggering false-positive tag parsing!
         last_open_art = max(content.rfind("<artifact"), content.rfind("<artefact"))
         last_close_art = max(content.rfind("</artifact>"), content.rfind("</artefact>"))
         is_inside_artifact = (last_open_art != -1) and (last_open_art > last_close_art)
 
         if is_inside_artifact:
-            # We are currently streaming inside an open artifact block — do not trigger secondary parses
-            # until the closing tag is typed
             if not content.endswith("</artifact>") and not content.endswith("</artefact>"):
+                ASCIIColors.yellow("[StreamState.DEBUG] Inside unclosed artifact block. Skipping parse.")
                 return True
 
         # 4. Create a safe content copy by removing all closed and unclosed thinking blocks
         safe_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
         safe_content = re.sub(r'<think>.*$', '', safe_content, flags=re.DOTALL | re.IGNORECASE)
 
-        # Scan for closed tags of interest only within the safe non-thinking content
-        pattern = re.compile(
-            r'<(artifact|artefact|note|skill|tool_call|tool|add_files_to_context)\b([^>]*?)>(.*?)</\1>',
+        # ── Pattern 1: Standard XML-style tags (<tool>...</tool>) ────────────
+        xml_pattern = re.compile(
+            r'<(artifact|artefact|note|skill|tool_call|tool)\b([^>]*?)>(.*?)</\1>',
             re.DOTALL | re.IGNORECASE
         )
-        
-        for match in pattern.finditer(safe_content):
+
+        xml_matches = list(xml_pattern.finditer(safe_content))
+        ASCIIColors.cyan(f"[StreamState.DEBUG] Found {len(xml_matches)} XML-style matches.")
+
+        for match in xml_matches:
             full_match_text = match.group(0)
             if full_match_text in self.processed_tags:
                 continue
 
-            # Tag is fully closed outside of thoughts! Process immediately
             self.processed_tags.add(full_match_text)
-            
             tag_name = match.group(1).lower()
             attrs_str = match.group(2)
             body = match.group(3).strip()
 
+            ASCIIColors.green(f"[StreamState.DEBUG] Dispatching XML tag: {tag_name}")
             keep_generating = self._dispatch_closed_tag(tag_name, attrs_str, body, full_match_text)
             if not keep_generating:
+                ASCIIColors.red("[StreamState.DEBUG] HALTING generation due to XML tool call.")
                 return False
 
+        # ── Pattern 2: LLM JSON-style tool calls (<tool_call>...</tool_call>) ───────────
+        # 🛑 CRITICAL FIX: Detect START tag to enter Accumulation Mode
+        if '<tool_call>' in safe_content:
+            start_idx = safe_content.find('<tool_call>')
+            # Check if there's a closing tag in the SAME chunk (rare but possible for tiny tools)
+            end_idx = safe_content.find('</tool_call>', start_idx)
+
+            if end_idx != -1:
+                # Complete tool call in one chunk! Process immediately.
+                full_tool_call = safe_content[start_idx:end_idx + len('</tool_call>')]
+                json_body = full_tool_call.strip().lstrip('<tool_call>').rstrip('</tool_call>').strip()
+
+                ASCIIColors.magenta(f"[StreamState.DEBUG] 🎯 Single-chunk tool call detected!")
+                ASCIIColors.magenta(f"[StreamState.DEBUG] Raw JSON Body: {repr(json_body[:200])}")
+
+                self.processed_tags.add(full_tool_call)
+                keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
+                if not keep_generating:
+                    ASCIIColors.red("[StreamState.DEBUG] HALTING generation due to JSON tool call.")
+                    return False
+            else:
+                # 🛑 START TAG FOUND, BUT NO END TAG YET → ENTER ACCUMULATION MODE
+                ASCIIColors.yellow(f"[StreamState.DEBUG] 🚀 START of tool call detected. Entering ACCUMULATION MODE.")
+                self._is_accumulating_tool = True
+                # Initialize buffer with whatever content is after <tool_call>
+                self._tool_buffer = safe_content[start_idx:]
+                # Do NOT return yet, let the rest of the chunk be processed if needed (though unlikely)
+
+        ASCIIColors.cyan("[StreamState.DEBUG] No tool calls detected. Continuing generation.")
         return True
 
     def _dispatch_closed_tag(self, tag_name: str, attrs_str: str, body: str, full_match_text: str) -> bool:
@@ -417,28 +503,42 @@ class _StreamState:
         elif tag_name in ("tool_call", "tool"):
             self.tool_trigger = True
 
-            # ── ROBUST JSON PARSING & NORMALIZATION ──
+            # ── ROBUST JSON PARSING & NORMALIZATION (CRITICAL FIX) ──
             # LLMs often hallucinate flat structures: {"name": "tool", "arg": "val"}
             # instead of nested: {"name": "tool", "parameters": {"arg": "val"}}
-            # We normalize this here to prevent execution failures.
+            # We MUST normalize this here to prevent execution failures.
             try:
                 raw_data = json.loads(body)
                 if isinstance(raw_data, dict):
-                    # If "parameters" key is missing, assume the WHOLE dict (minus "name") is the parameters
-                    if "parameters" not in raw_data:
-                        tool_name = raw_data.get("name", "")
-                        # Extract all other keys as parameters
+                    # ALWAYS normalize to nested structure for consistency
+                    tool_name = raw_data.get("name", "")
+
+                    # Check if already nested
+                    if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                        # Already in correct format
+                        self.tool_json_data = body
+                    else:
+                        # FLAT structure detected - MUST normalize
+                        # Extract all keys EXCEPT "name" as parameters
                         params = {k: v for k, v in raw_data.items() if k != "name"}
-                        # Reconstruct normalized structure
+
+                        # Reconstruct normalized nested structure
                         normalized_data = {"name": tool_name, "parameters": params}
                         self.tool_json_data = json.dumps(normalized_data)
-                        ASCIIColors.info(f"[StreamState] Normalized flat tool call structure for '{tool_name}'.")
-                    else:
-                        self.tool_json_data = body
+
+                        ASCIIColors.cyan(
+                            f"[StreamState] 🔄 Normalized FLAT tool call → NESTED structure for '{tool_name}':\n"
+                            f"  Original keys: {list(raw_data.keys())}\n"
+                            f"  Normalized params: {list(params.keys())}"
+                        )
                 else:
+                    # Not a dict, pass through as-is (will fail later, but that's expected)
                     self.tool_json_data = body
-            except json.JSONDecodeError:
+                    ASCIIColors.warning(f"[StreamState] Tool call body is not a dict: {type(raw_data)}")
+            except json.JSONDecodeError as je:
+                # JSON parsing failed - pass through raw body
                 self.tool_json_data = body
+                ASCIIColors.error(f"[StreamState] JSON decode failed for tool call: {je}")
 
             # Halt generation instantly so the executor can take over the loop
             return False
@@ -807,13 +907,16 @@ class ChatMixin:
             "```\n"
             "Never output raw code or markup directly in conversational text without these code blocks.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
-            "When a tool successfully returns a file (image, plot, screenshot, PDF, audio, etc.), "
+            "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON output (e.g., {\"success\": true, \"output\": ...}), "
+            "this is a **RESULT**, NOT a new tool call. Do **NOT** re-execute or re-emit the same tool call.\n"
+            "2. **One Call Per Task**: Once a tool executes successfully, the data is retrieved. Your job is to **ANALYZE** and **ANSWER**, not to call the tool again.\n"
+            "3. **Loop Prevention**: Repeating a successful tool call with identical parameters is a **CRITICAL ERROR**. "
+            "The system will block duplicate calls. If you see a tool result, move on to the next step.\n"
+            "4. **File Outputs**: When a tool successfully returns a file (image, plot, screenshot, PDF, audio, etc.), "
             "the file is ALREADY saved to the workspace by the tool. Do NOT call the same tool "
             "again with the same parameters to regenerate it. Instead, reference the produced "
             "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
-            "for images) and STOP generating. Repeating a successful tool call wastes tokens and "
-            "may trigger anti-loop protection. The tool's response already contains the exact "
-            "filename and URL you need to reference it.\n"
+            "for images) and STOP generating.\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
             "If you decide to output a thought process enclosed in <think>...</think> tags, "
             "you MUST output all functional XML tags (such as <artifact>, <tool_call>, or <mem_new>) "
@@ -1049,6 +1152,9 @@ class ChatMixin:
                 "content": user_message
             })
 
+            # CRITICAL FIX: Track content offset to prevent re-parsing old tool calls
+            current_content_length = len(ai_msg.content)
+
             ss = _StreamState(
                 discussion=self,
                 callback=callback,
@@ -1059,7 +1165,8 @@ class ChatMixin:
                 enable_forms=enable_forms,
                 auto_activate_artefacts=auto_activate_artefacts,
                 enable_artefacts=enable_artefacts,
-                enable_in_message_status=enable_in_message_status
+                enable_in_message_status=enable_in_message_status,
+                content_offset=current_content_length  # Start parsing from current position
             )
 
             def _inline_relay(chunk, msg_type=None, meta=None):
@@ -1347,19 +1454,25 @@ class ChatMixin:
                         # We can't easily check previous tool calls without parsing, so we rely on the virtual user prompt below
 
                         if tool_success:
-                            # CRITICAL: Strengthened prompt to prevent re-execution
+                            # 🛑 CRITICAL FIX: EXPLICITLY LABEL OUTPUT AS "NOT A TOOL CALL"
+                            # We must prevent the LLM from misinterpreting JSON results as new tool calls
                             user_part = (
-                                f"=== 🛑 TOOL EXECUTION COMPLETE: {tool_name} ===\n"
-                                f"The tool has successfully executed. DO NOT call '{tool_name}' again.\n\n"
-                                f"<tool_result name=\"{tool_name}\">\n"
+                                f"=== ✅ TOOL RESULT (NOT A TOOL CALL): {tool_name} ===\n"
+                                f"⚠️ **WARNING**: The JSON below is the **RESULT** of your previous tool call. "
+                                f"It is **NOT** a new tool call request. Do **NOT** re-execute it.\n\n"
+                                f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n"
                                 f"{clean_result_str}\n"
                                 f"</tool_result>\n\n"
-                                f"🚨 CRITICAL INSTRUCTION:\n"
-                                f"1. Analyze the output above.\n"
-                                f"2. If the task is complete, respond to the user naturally.\n"
-                                f"3. If you need to do something else, call a DIFFERENT tool.\n"
-                                f"4. UNDER NO CIRCUMSTANCES call '{tool_name}' again with the same parameters.\n"
-                                f"   The data is already retrieved. Proceed to the next step."
+                                f"🚨 **MANDATORY NEXT STEPS**:\n"
+                                f"1. ✅ **ACKNOWLEDGE** the data above is already retrieved.\n"
+                                f"2. 🧠 **ANALYZE** the result: What does it tell you?\n"
+                                f"3. 💬 **RESPOND** to the user's original question using this data.\n"
+                                f"4. 🚫 **FORBIDDEN**: Do **NOT** call '{tool_name}' again with these parameters.\n"
+                                f"   The tool already ran successfully. Calling it again is a **LOOP ERROR**.\n"
+                                f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n\n"
+                                f"### Example of CORRECT behavior:\n"
+                                f"❌ WRONG: <tool_call>{{\"name\": \"{tool_name}\", ...}}</tool_call>  (LOOP!)\n"
+                                f"✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
                             )
 
                             # Log for debugging
