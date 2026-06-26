@@ -243,10 +243,11 @@ def tool_get_table_schema(
         }
 
     try:
-        # discussion_instance is now injected by the Binding wrapper, not the tool signature
-        # We access it via the global context or wrapper injection if needed for self-healing
-        # For now, we rely on the file existing on disk (synced by binding before call)
-        df, resolved_table = _load_data_source(file_path, table_name)
+        # 🛑 CRITICAL FIX: Ensure discussion_instance is available for self-healing
+        # It's passed via kwargs by LCP binding execute_tool wrapper
+        discussion_instance = kwargs.get("discussion_instance")
+
+        df, resolved_table = _load_data_source(file_path, table_name, discussion_instance)
 
         schema = {}
         for col in df.columns:
@@ -470,7 +471,7 @@ def tool_compute_column_aggregations(
     try:
         import pandas as pd
         df, _ = _load_data_source(file_path, table_name)
-        
+
         if metric_column not in df.columns:
             return {"success": False, "error": f"Metric column '{metric_column}' not found."}
 
@@ -480,7 +481,7 @@ def tool_compute_column_aggregations(
         if group_by_column:
             if group_by_column not in df.columns:
                 return {"success": False, "error": f"Group By column '{group_by_column}' not found."}
-            
+
             # Apply group by operation
             grouped = df.groupby(group_by_column)[metric_column]
             if op == "sum": res_df = grouped.sum()
@@ -513,6 +514,87 @@ def tool_compute_column_aggregations(
         }
     except Exception as e:
         return {"success": False, "error": f"Aggregation failed: {e}"}
+
+
+# ── 6. SECURE RELATIONAL QUERY TOOL (SQL) ───────────────────────────────────
+
+def tool_query_database_sql(
+    file_name: str,
+    sql_query: str
+) -> dict:
+    """
+    PRIMARY DATA RETRIEVAL TOOL: Executes standard SQL queries directly against SQLite database files or local CSV/Excel table models.
+
+    This is the definitive method for recovering specific information from the database to answer user questions.
+    Use this tool to filter, join, aggregate, or slice data using precise SQL syntax when you need to enhance your 
+    understanding of the dataset or retrieve exact values to respond to user inquiries.
+
+    Args:
+        file_name (str): Filename of the .db, .sqlite, .csv, or .xlsx file in the workspace.
+        sql_query (str): Valid SQLite standard SQL query to execute (SELECT, JOIN, GROUP BY, etc.).
+    """
+    import pandas as pd
+    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
+    workspace_dir = _get_workspace_dir()
+    file_path = (workspace_dir / file_name).resolve()
+
+    if not file_path.exists():
+        available_files = [f.name for f in workspace_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
+        return {
+            "success": False, 
+            "error": f"File '{file_name}' not found.",
+            "prompt_injection": f"\n\n⚠️ **File Not Found.**\nI looked for '{file_name}' but it doesn't exist.\n\n**Available Files:**\n{', '.join(available_files[:10])}\n\n**Action:** Retry with the correct filename from the list above."
+        }
+
+    ext = file_path.suffix.lower()
+
+    # Establish connection
+    try:
+        conn = sqlite3.connect(":memory:")
+        if ext in (".db", ".sqlite", ".sqlite3"):
+            disk_conn = sqlite3.connect(str(file_path))
+            disk_conn.backup(conn)
+            disk_conn.close()
+        elif ext in (".xlsx", ".xls"):
+            xl = pd.ExcelFile(str(file_path))
+            for sheet_name in xl.sheet_names:
+                table_name = sheet_name.replace(" ", "_")
+                df = pd.read_excel(str(file_path), sheet_name=sheet_name)
+                df.to_sql(table_name, conn, index=False, if_exists="replace")
+        else:
+            sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
+            df = pd.read_csv(str(file_path), sep=sep)
+            df.to_sql(file_path.stem.replace(" ", "_"), conn, index=False, if_exists="replace")
+    except Exception as conn_err:
+        return {"success": False, "error": f"Failed to assemble SQL connection: {conn_err}"}
+
+    # Execute SQL
+    try:
+        # Check if write query (updates/deletes/inserts)
+        clean_query = sql_query.strip()
+        clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
+        clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
+        is_select = clean_query.lower().startswith("select")
+
+        if is_select:
+            df_res = pd.read_sql_query(sql_query, conn)
+            conn.close()
+
+            from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+            md_table = _dataframe_to_markdown(df_res)
+            return {
+                "success": True,
+                "rows_count": len(df_res),
+                "output": f"SQL Query returned {len(df_res)} row(s):\n\n{md_table}",
+                "prompt_injection": f"\n\n✅ **Data Retrieved Successfully.**\nExecuted SQL query on `{file_name}`.\nFound {len(df_res)} matching records.\n\nUse the table below to answer the user's specific question:\n\n{md_table}"
+            }
+        else:
+            conn.close()
+            return {"success": False, "error": "Write queries (INSERT/UPDATE/DELETE) are blocked for safety. Use dedicated editing tools instead."}
+
+    except Exception as query_err:
+        conn.close()
+        return {"success": False, "error": f"SQL query failed: {query_err}"}
 
 
 # ── 5. SAFE INTERACTIVE DATA EDITING TOOLS ──────────────────────────────────
@@ -1080,7 +1162,7 @@ def tool_compute_statistics_and_plot(
         ax.spines['left'].set_color('#334155')
         ax.spines['right'].set_color('#334155')
         ax.tick_params(colors='#94a3b8', labelsize=10)
-        ax.grid(True, color='rgba(255,255,255,0.05)', linestyle='--')
+        ax.grid(True, color='#ffffff', alpha=0.05, linestyle='--')
 
         plot_title = title or f"{plot_type.capitalize()} Plot: {resolved_table}"
         ax.set_title(plot_title, color='#f59e0b', fontsize=12, fontweight='bold', pad=10)
