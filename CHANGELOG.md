@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-28 22:30]
+
+- feat(discussion): refine artefact visibility defaults and clean up tool call blocks
+
 ## [2026-06-28 21:46]
 
 - fix(ui, artefacts, chat): stop thinking timer on close and improve vision hydration

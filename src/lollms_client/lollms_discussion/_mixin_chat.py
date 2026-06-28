@@ -1258,6 +1258,11 @@ class ChatMixin:
                     tool_params = call_data.get("parameters", {})
 
                     # ── Live UI Tool Call Feedback Injection ──
+                    # Clean up the raw <tool_call> block from the message content to prevent duplicate blocks
+                    if tool_call_json_str in ai_msg.content:
+                        ai_msg.content = ai_msg.content.replace(f"<tool_call>{tool_call_json_str}</tool_call>", "")
+                        ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
+
                     import html
                     escaped_params = html.escape(json.dumps(tool_params))
                     tool_open_tag = f'\n<processing type="tool_call" title="Tool Execution: {tool_name}" params="{escaped_params}">\n'

@@ -597,12 +597,17 @@ class ArtefactManager:
                 a['visibility'] = ArtefactVisibility.HIDDEN
 
         # Determine visibility based on active flag / fallback parameters
+        # Default to HIDDEN to unclutter the context window unless explicitly activated
         resolved_visibility = visibility
         if not resolved_visibility:
             if active is not None:
                 resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
             else:
-                resolved_visibility = ArtefactVisibility.FULL  # default to active/full
+                # Data type schemas (.lam) must be visible by default so the LLM doesn't have to query them
+                if artefact_type == ArtefactType.DATA:
+                    resolved_visibility = ArtefactVisibility.FULL
+                else:
+                    resolved_visibility = ArtefactVisibility.HIDDEN  # default to hidden
 
         imgs  = images or []
         mtypes = image_media_types or []
