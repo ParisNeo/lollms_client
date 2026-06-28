@@ -8253,6 +8253,13 @@ function resolveProcessingTags(content, msgId = null) {
         const timerHtml = isClosed ? "" : ` <span class="active-thinking-timer" style="font-size: 11.5px; opacity: 0.8; font-weight: bold; margin-left: 4px;">(0.0s)</span> <span class="spinner inline" style="margin-left: 6px;"></span>`;
         const headerText = isClosed ? "💭 Thought Process / Reasoning" : "💭 Thinking...";
 
+        // ── SCIENTIFIC RESOLUTION: Stop the background stopwatch immediately when </think> is closed ──
+        if (isClosed && thinkingTimerId) {
+            clearInterval(thinkingTimerId);
+            thinkingTimerId = null;
+            thinkingStartTime = null;
+        }
+
         return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.15); display: block;"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;"><span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span><span>${headerText}${timerHtml}</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
     });
 

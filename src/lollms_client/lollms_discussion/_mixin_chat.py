@@ -1154,7 +1154,19 @@ class ChatMixin:
                     "content": m.content
                 })
 
-            # ── 🔬 SCIENTIFIC DEBUGGING: EXPORTED PROMPT TRACE ──
+            # ── 🎨 DYNAMIC VISION HYDRATION ──
+            # Retrieve all images generated or modified during previous rounds of this turn
+            # and append their base64 pixels to the active vision context so the LLM can "see" them!
+            round_images = list(images) if images else []
+            affected_arts = getattr(self, "_affected_artefacts_this_turn", [])
+            for art in affected_arts:
+                if art.get("type") == "image" and art.get("images"):
+                    for img_b64 in art["images"]:
+                        if img_b64 not in round_images:
+                            round_images.append(img_b64)
+                            ASCIIColors.success(f"[Vision Sync] Hydrated LLM context with generated plot: '{art['title']}'")
+
+            # ── 🔬 SCIENTIFIC DEBUG: EXPORTED PROMPT TRACE ──
             # Print the exact payload that is being forwarded to the LLM for inspection
             ASCIIColors.cyan("\n" + "="*80)
             ASCIIColors.cyan(f"📝 [SCIENTIFIC DEBUG] EXPORTED LLM PAYLOAD - ROUND {round_count} START")
@@ -1211,7 +1223,7 @@ class ChatMixin:
             try:
                 self.lollmsClient.generate_from_messages(
                     messages=messages_list,
-                    images=images,
+                    images=round_images if round_images else None,
                     stream=True,
                     temperature=temperature,
                     streaming_callback=_inline_relay,

@@ -489,18 +489,15 @@ class ArtefactManager:
                     ASCIIColors.warning(f"Failed to write physical data for '{filename}': {bin_err}")
 
             # Fallback: If no physical_data but content is raw text (Code/Doc), treat content as physical
-            if not wrote_physical and isinstance(content, str):
-                is_schema_only = (atype == "data" and content.strip().startswith("# Data Interface:")) or \
-                                 (len(content) < 500 and not content.strip().startswith("Format:"))
-
-                if not is_schema_only:
-                    try:
-                        primary_path.write_text(content, encoding="utf-8", errors="ignore")
-                        versioned_path.write_text(content, encoding="utf-8", errors="ignore")
-                        wrote_physical = True
-                        ASCIIColors.success(f"[Dual-Stream] ✈️ Synced TEXT '{filename}' (v{version}) to workspace_data & versions.")
-                    except Exception as txt_err:
-                        ASCIIColors.warning(f"Failed to write text content for '{filename}': {txt_err}")
+            # 🛡️ SOVEREIGN PHYSICAL GAURD: Image/Data placeholder descriptions must NEVER be written as physical text files
+            if not wrote_physical and isinstance(content, str) and atype not in (ArtefactType.IMAGE, ArtefactType.DATA):
+                try:
+                    primary_path.write_text(content, encoding="utf-8", errors="ignore")
+                    versioned_path.write_text(content, encoding="utf-8", errors="ignore")
+                    wrote_physical = True
+                    ASCIIColors.success(f"[Dual-Stream] ✈️ Synced TEXT '{filename}' (v{version}) to workspace_data & versions.")
+                except Exception as txt_err:
+                    ASCIIColors.warning(f"Failed to write text content for '{filename}': {txt_err}")
 
             # ── 2. WRITE LOGICAL TWIN (.lam For LLM) ───────────────────────────
             # We ALWAYS write the .lam if provided, regardless of physical success
