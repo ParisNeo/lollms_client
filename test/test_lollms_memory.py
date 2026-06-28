@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from lollms_client.lollms_discussion.lollms_memory import LollmsMemoryManager, MemoryConfig, _MemoryRecord
+from lollms_client.lollms_memory.lollms_memory import LollmsMemoryManager, MemoryConfig, _MemoryRecord
 from ascii_colors import ASCIIColors
 
 

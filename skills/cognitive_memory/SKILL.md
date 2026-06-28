@@ -31,7 +31,7 @@ When `enable_deep_memory_pulling=True` is active, the memory manager automatical
 - **Dream Cycle**: Triggered programmatically or automatically. Active memories with a positive `use_count` are reinforced, after which their usage count is decremented back to `0` to allow decay again if left unused. Archived memories below `forget_threshold` are permanently forgotten.
 
 ```python
-from lollms_client.lollms_discussion.lollms_memory import LollmsMemoryManager, MemoryConfig
+from lollms_client.lollms_memory import LollmsMemoryManager, MemoryConfig
 
 memory_config = MemoryConfig(
     working_token_budget=512,

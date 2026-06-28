@@ -2,7 +2,7 @@ import unittest
 import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
-from lollms_client.lollms_discussion.lollms_memory import LollmsMemoryManager, MemoryConfig
+from lollms_client.lollms_memory.lollms_memory import LollmsMemoryManager, MemoryConfig
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager
 
 class DummyClient:
@@ -66,7 +66,7 @@ class TestLollmsEpisodicMemory(unittest.TestCase):
 
         # Space them out explicitly in the SQLite database to guarantee order
         with self.memory_manager._session() as s:
-            from lollms_client.lollms_discussion.lollms_memory import _MemoryRecord
+            from lollms_client.lollms_memory.lollms_memory import _MemoryRecord
             rec1 = s.query(_MemoryRecord).filter_by(id=m1["id"]).one()
             rec2 = s.query(_MemoryRecord).filter_by(id=m2["id"]).one()
             rec1.created_at = datetime.utcnow() - timedelta(seconds=5)

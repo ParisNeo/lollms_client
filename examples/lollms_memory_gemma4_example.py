@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from lollms_client import LollmsClient
 from lollms_client.lollms_discussion import LollmsDiscussion
-from lollms_client.lollms_discussion.lollms_memory import LollmsMemoryManager, MemoryConfig, _MemoryRecord
+from lollms_client.lollms_memory.lollms_memory import LollmsMemoryManager, MemoryConfig, _MemoryRecord
 from ascii_colors import ASCIIColors
 
 

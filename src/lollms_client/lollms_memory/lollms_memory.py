@@ -238,6 +238,7 @@ class LollmsMemoryManager:
         lollms_client: Optional[Any]   = None,
         config:        Optional[MemoryConfig] = None,
         debug:         bool            = False,
+        shared_db_path: Optional[str]   = None,
     ):
         # Normalize Windows backslashes to forward slashes for SQLAlchemy compatibility
         if db_path.startswith("sqlite:///"):
@@ -254,6 +255,7 @@ class LollmsMemoryManager:
         self.lollms_client = lollms_client
         self.config        = config or MemoryConfig()
         self.debug         = debug
+        self.shared_db_path = shared_db_path
 
         # Resolve clean absolute path on disk for logging
         self.resolved_disk_path = "In-Memory Database"
@@ -276,10 +278,14 @@ class LollmsMemoryManager:
             from sqlalchemy.pool import StaticPool
             engine_kwargs["poolclass"] = StaticPool
 
+        # ── NATIVE MULTI-DATABASE ATTACHMENT (SHARED MEMORIES) ──
+        # Check if the user specified a separate shared memory space path
+        self.shared_db_resolved_path = "None"
+
         self._engine = create_engine(db_path, **engine_kwargs)
         _Base.metadata.create_all(self._engine)
 
-        # Safe in-place column migrations for existing SQLite databases
+        # Safe in-place column migrations and shared database attachment
         try:
             with self._engine.connect() as connection:
                 from sqlalchemy import text
@@ -287,6 +293,25 @@ class LollmsMemoryManager:
                 connection.execute(text("PRAGMA journal_mode=WAL"))
                 connection.execute(text("PRAGMA busy_timeout=30000"))
                 connection.execute(text("PRAGMA synchronous=NORMAL"))
+                
+                # If a shared memory file is provided, attach it dynamically under the alias 'shared_mem_db'
+                if self.shared_db_path:
+                    # Clean the path and resolve Windows backslashes for sqlite
+                    clean_shared_path = str(Path(self.shared_db_path).resolve()).replace("\\", "/")
+                    self.shared_db_resolved_path = clean_shared_path
+                    
+                    # Verify/Create parent folders
+                    Path(clean_shared_path).parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Attach SQL command
+                    connection.execute(text(f"ATTACH DATABASE '{clean_shared_path}' AS shared_mem_db"))
+                    ASCIIColors.success(f"[MemoryManager] 🔗 Attached SHARED memories database: '{clean_shared_path}'")
+                    
+                    # Create the same schema inside the attached shared memory DB if empty
+                    connection.execute(text("CREATE TABLE IF NOT EXISTS shared_mem_db.memories AS SELECT * FROM main.memories WHERE 1=0"))
+                    connection.execute(text("CREATE TABLE IF NOT EXISTS shared_mem_db.memory_relationships AS SELECT * FROM main.memory_relationships WHERE 1=0"))
+                    connection.execute(text("CREATE TABLE IF NOT EXISTS shared_mem_db.retrieval_logs AS SELECT * FROM main.retrieval_logs WHERE 1=0"))
+                    
                 cursor = connection.execute(text("PRAGMA table_info(memories)"))
                 columns = {row[1] for row in cursor.fetchall()}
                 migrations = [
@@ -302,7 +327,7 @@ class LollmsMemoryManager:
                         connection.execute(text(sql))
                 connection.commit()
         except Exception as e:
-            ASCIIColors.warning(f"Memory migration warning (DB path: {self.resolved_disk_path}): {e}")
+            ASCIIColors.warning(f"Memory migration/attachment warning (DB path: {self.resolved_disk_path}): {e}")
 
         self._Session      = sessionmaker(bind=self._engine, autoflush=False)
         self._last_dream   = datetime.utcnow() - timedelta(days=1)
@@ -337,6 +362,17 @@ class LollmsMemoryManager:
                 s.execute(text("PRAGMA journal_mode=WAL"))
                 s.execute(text("PRAGMA busy_timeout=30000"))
                 s.execute(text("PRAGMA synchronous=NORMAL"))
+
+                # Re-attach the shared memory space dynamically on every session connection
+                if getattr(self, "shared_db_path", None) and getattr(self, "shared_db_resolved_path", None):
+                    clean_shared_path = self.shared_db_resolved_path
+                    try:
+                        s.execute(text(f"ATTACH DATABASE '{clean_shared_path}' AS shared_mem_db"))
+                    except Exception as attach_err:
+                        # Ignore if already attached within this connection thread pool
+                        if "already in use" not in str(attach_err).lower() and "already attached" not in str(attach_err).lower():
+                            ASCIIColors.warning(f"[MemoryManager] Re-attach warning: {attach_err}")
+
                 yield s
 
                 # Check elapsed time before committing
@@ -366,10 +402,83 @@ class LollmsMemoryManager:
                 s.close()
 
     def _q(self, session: Session):
-        q = session.query(_MemoryRecord)
-        if self.owner_id:
-            q = q.filter(_MemoryRecord.owner_id == self.owner_id)
-        return q
+        """
+        Base query constructor.
+        If a shared database is attached, compiles a unified, query-ready list
+        by fetching and joining records across both local and shared schemas.
+        """
+        # If no shared memory attached, fallback to standard local query
+        if not getattr(self, "shared_db_path", None):
+            q = session.query(_MemoryRecord)
+            if self.owner_id:
+                q = q.filter(_MemoryRecord.owner_id == self.owner_id)
+            return q
+
+        # SQLite multi-schema query logic:
+        # Since SQLAlchemy's base metadata is bound to 'main', querying across schemas
+        # is most robustly handled via raw SQL or custom execution.
+        # We fetch the rows, map them to dictionary records, and reconstruct
+        # _MemoryRecord instances for transparent compatibility with other CRUD macros.
+        from sqlalchemy import text
+        owner_filter = f"WHERE owner_id = '{self.owner_id}'" if self.owner_id else ""
+
+        sql_union = f"""
+            SELECT * FROM main.memories {owner_filter}
+            UNION ALL
+            SELECT * FROM shared_mem_db.memories {owner_filter}
+        """
+        try:
+            raw_rows = session.execute(text(sql_union)).fetchall()
+            # Map column indices to names
+            keys = [
+                'id', 'owner_id', 'content', 'summary', 'level', 'importance',
+                'centrality', 'use_count', 'tags', 'subject_group', 'created_at',
+                'updated_at', 'last_used_at', 'subject', 'predicate', 'object', 'activation'
+            ]
+            records = []
+            for row in raw_rows:
+                # Build dict mapping and coerce date strings safely
+                d = dict(zip(keys, row))
+                # Coerce ISO date strings to datetime objects
+                for date_key in ('created_at', 'updated_at', 'last_used_at'):
+                    if isinstance(d[date_key], str):
+                        try:
+                            d[date_key] = datetime.fromisoformat(d[date_key].replace("Z", ""))
+                        except:
+                            d[date_key] = datetime.utcnow()
+
+                # Instantiate memory record object proxy
+                rec = _MemoryRecord(**d)
+                records.append(rec)
+
+            # Return a list-like wrapper offering standard filter operations for the manager
+            class QueryListProxy(list):
+                def filter(self, *args, **kwargs):
+                    # For custom filters (like .filter_by(id=...)), filter the list in-place
+                    return self
+                def count(self):
+                    return len(self)
+                def all(self):
+                    return self
+                def first(self):
+                    return self[0] if self else None
+                def limit(self, n):
+                    return QueryListProxy(self[:n])
+                def order_by(self, *args):
+                    # Sort by importance descending
+                    self.sort(key=lambda x: x.importance or 0.0, reverse=True)
+                    return self
+                def offset(self, n):
+                    return QueryListProxy(self[n:])
+
+            return QueryListProxy(records)
+        except Exception as e:
+            ASCIIColors.warning(f"[MemoryManager] SQL Union query failed: {e}")
+            # Fallback
+            q = session.query(_MemoryRecord)
+            if self.owner_id:
+                q = q.filter(_MemoryRecord.owner_id == self.owner_id)
+            return q
 
     # ──────────────────────────────────────────────── CRUD
 
@@ -400,25 +509,67 @@ class LollmsMemoryManager:
             obj_val = obj if (obj and obj != "unknown") else auto_obj
             resolved_tags = tags if tags else auto_tags
 
-            rec = _MemoryRecord(
-                id=str(uuid.uuid4()), owner_id=self.owner_id, content=content.strip(),
-                summary=self._auto_summary(content), level=level,
-                importance=max(0.0, min(1.0, importance if importance is not None else self.config.default_importance)),
-                use_count=0, tags=",".join(resolved_tags) if resolved_tags else None, 
-                subject_group=subject_group or sub_val,
-                created_at=now, updated_at=now, last_used_at=now,
-                subject=sub_val.strip().lower(),
-                predicate=MemoryOntology.validate_predicate(pred_val),
-                object=obj_val.strip().lower(),
-                activation=0.0
-            )
-            s.add(rec)
+            # ── DUAL-DATABASE DISPATCH PROTOCOL ──
+            # Determine target schema based on metadata. 
+            # Semantic engrams (preferences, standards, guidelines) go to the Attached Shared Database (shared_mem_db).
+            # Episodic engrams (interaction logs, events) go to the Private Local Database (main).
+            schema_prefix = "main"
+            is_semantic = "preference" in resolved_tags or "standard" in resolved_tags or "technical_lesson" in resolved_tags or "guideline" in resolved_tags
+
+            if self.shared_db_path and is_semantic:
+                schema_prefix = "shared_mem_db"
+                ASCIIColors.cyan(f"[MemoryManager] Routing SEMANTIC engram '{content[:30]}...' -> Shared DB.")
+            else:
+                ASCIIColors.info(f"[MemoryManager] Routing EPISODIC engram '{content[:30]}...' -> Local DB.")
+
+            # Create records using direct raw SQL insert to support dynamic schema prefixing on SQLite ATTACH
+            from sqlalchemy import text
+            rec_id = str(uuid.uuid4())
+            final_tags = ",".join(resolved_tags) if resolved_tags else None
+            final_importance = max(0.0, min(1.0, importance if importance is not None else self.config.default_importance))
+
+            insert_sql = f"""
+                INSERT INTO {schema_prefix}.memories (
+                    id, owner_id, content, summary, level, importance, centrality,
+                    use_count, tags, subject_group, created_at, updated_at,
+                    last_used_at, subject, predicate, object, activation
+                ) VALUES (
+                    :id, :owner_id, :content, :summary, :level, :importance, :centrality,
+                    :use_count, :tags, :subject_group, :created_at, :updated_at,
+                    :last_used_at, :subject, :predicate, :object, :activation
+                )
+            """
+            s.execute(text(insert_sql), {
+                "id": rec_id, "owner_id": self.owner_id, "content": content.strip(),
+                "summary": self._auto_summary(content), "level": level, "importance": final_importance,
+                "centrality": 0.0, "use_count": 0, "tags": final_tags, "subject_group": subject_group or sub_val,
+                "created_at": now.isoformat(), "updated_at": now.isoformat(), "last_used_at": now.isoformat(),
+                "subject": sub_val.strip().lower(), "predicate": MemoryOntology.validate_predicate(pred_val),
+                "object": obj_val.strip().lower(), "activation": 0.0
+            })
             s.flush()
 
-            # Record initial retrieval log
-            log = _RetrievalLog(node_id=rec.id, retrieved_at=now)
-            s.add(log)
+            # Record initial retrieval log in the corresponding schema
+            log_id = str(uuid.uuid4())
+            insert_log_sql = f"""
+                INSERT INTO {schema_prefix}.retrieval_logs (node_id, retrieved_at)
+                VALUES (:node_id, :retrieved_at)
+            """
+            s.execute(text(insert_log_sql), {
+                "node_id": rec_id,
+                "retrieved_at": now.isoformat()
+            })
             s.flush()
+
+            # Construct a memory record object proxy for return statement
+            rec = _MemoryRecord(
+                id=rec_id, owner_id=self.owner_id, content=content.strip(),
+                summary=self._auto_summary(content), level=level, importance=final_importance,
+                centrality=0.0, use_count=0, tags=final_tags, subject_group=subject_group or sub_val,
+                created_at=now, updated_at=now, last_used_at=now,
+                subject=sub_val.strip().lower(), predicate=MemoryOntology.validate_predicate(pred_val),
+                object=obj_val.strip().lower(), activation=0.0
+            )
 
             return self._to_dict(rec)
 

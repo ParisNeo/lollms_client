@@ -62,7 +62,7 @@ import sys
 
 from lollms_client import LollmsClient
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager
-from lollms_client.lollms_discussion.lollms_memory import LollmsMemoryManager
+from lollms_client.lollms_memory import LollmsMemoryManager
 from lollms_client.lollms_types import MSG_TYPE
 from ascii_colors import ASCIIColors, trace_exception
 from datetime import datetime
@@ -150,27 +150,34 @@ def _is_safe_path(base_dir: Path, target_path: Path) -> bool:
 
 
 def get_discussion_workspace():
+    """
+    Returns the pristine, discussion-isolated workspace folder on disk (Physical Twin directory).
+    All files visible to the local LCP tools and scripts reside strictly inside this folder.
+    """
     if discussion:
-        p = APP_WORKSPACE_DIR / "discussions" / discussion.id
+        # Route strictly to the discussion's local workspace_data subfolder
+        p = Path(discussion.workspace_path) / "workspace_data"
         p.mkdir(parents=True, exist_ok=True)
         return p
-    return APP_WORKSPACE_DIR
+    return APP_WORKSPACE_DIR / "workspace_data"
 
 
 def initialize_workspace_state(workspace_name: str):
-    """Dynamically switch active project workspace databases, files, and clients in-process."""
+    """Dynamically switch active project workspace databases, files, and clients in-process with pristine isolation."""
     global CURRENT_WORKSPACE_DIR, APP_DATA_DIR, APP_WORKSPACE_DIR, db_mgr, discussion, client, LLM_MODEL_NAME, needs_configuration
 
     workspace_name_clean = "".join(c for c in workspace_name if c.isalnum() or c in ("-", "_")).strip().lower() or "default"
 
+    # Base workspace container path
     CURRENT_WORKSPACE_DIR = APP_DIR / "workspaces" / workspace_name_clean
-    APP_DATA_DIR = CURRENT_WORKSPACE_DIR / "data"
-    APP_WORKSPACE_DIR = CURRENT_WORKSPACE_DIR / "data_workspace"
 
-    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # ── CLEAN STRUCTURAL DESIGN ──
+    # Each discussion (such as the default viewer_session) resides inside its own dedicated directory
+    # containing its private SQLite database and subfolders for workspace files and versioned artifacts.
+    APP_WORKSPACE_DIR = CURRENT_WORKSPACE_DIR / "viewer_session"
     APP_WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
-    db_path = APP_DATA_DIR / "multimodal_viewer.db"
+    db_path = APP_WORKSPACE_DIR / "discussion.db"
     db_mgr = LollmsDataManager(f"sqlite:///{db_path}")
 
     cfg = load_app_config()
@@ -226,23 +233,37 @@ def initialize_workspace_state(workspace_name: str):
     # Load or create persistent discussion session
     internet_cfg = cfg.get("internet_config") or {}
     if db_mgr.discussion_exists("viewer_session"):
-        discussion = db_mgr.get_discussion(client, "viewer_session", autosave=True, internet_config=internet_cfg)
+        discussion = db_mgr.get_discussion(client, "viewer_session", autosave=True, internet_config=internet_cfg, workspace_path=str(APP_WORKSPACE_DIR))
     else:
         discussion = LollmsDiscussion.create_new(
             lollms_client=client,
             db_manager=db_mgr,
             id="viewer_session",
             autosave=True,
-            internet_config=internet_cfg
+            internet_config=internet_cfg,
+            workspace_path=str(APP_WORKSPACE_DIR)
         )
 
     if active_personality_prompt:
         discussion.system_prompt = active_personality_prompt
 
-    # Attach persistent multi-level memory manager so <mem_new> tags survive across turns
-    mem_db_path = APP_DATA_DIR / "memories.db"
+    # ── SHARED SEMANTIC MEMORIES INITIALIZATION ──
+    # Check if a custom shared memory space has been configured (e.g., 'group_A', 'group_B')
+    shared_group = cfg.get("shared_memory_group", "global_memories").strip().lower()
+    shared_memories_dir = CURRENT_WORKSPACE_DIR / "shared_memories"
+    shared_memories_dir.mkdir(parents=True, exist_ok=True)
+
+    shared_mem_db_path = shared_memories_dir / f"memories_{shared_group}.db"
+
+    # Attach persistent multi-level memory manager inside the discussion's isolated folder
+    # with the linked shared memory db file attached as an external schema
+    mem_db_path = APP_WORKSPACE_DIR / "memories.db"
     mem_db_path.parent.mkdir(parents=True, exist_ok=True)
-    discussion._init_memory(LollmsMemoryManager(f"sqlite:///{mem_db_path}"))
+
+    discussion._init_memory(LollmsMemoryManager(
+        db_path=f"sqlite:///{mem_db_path}",
+        shared_db_path=str(shared_mem_db_path)
+    ))
 
     # Update active discussion's context size budget
     if hasattr(client, "get_ctx_size"):
@@ -473,6 +494,7 @@ class ApplySettingsRequest(BaseModel):
     stt_binding_config: Optional[Dict[str, Any]] = None
     personality_name: Optional[str] = None
     internet_config: Optional[Dict[str, Any]] = None
+    shared_memory_group: Optional[str] = "global_memories"
 
 
 def check_ollama(host: str, model: str) -> bool:
@@ -527,15 +549,14 @@ if not _is_testing:
     _active_ws = _cfg.get("active_workspace", "default")
     initialize_workspace_state(_active_ws)
 
-    # Attach persistent multi-level memory manager so <mem_new> tags survive across turns
-    mem_db_path = APP_DATA_DIR / "memories.db"
+    # Attach persistent multi-level memory manager inside the discussion's isolated folder
+    mem_db_path = APP_WORKSPACE_DIR / "memories.db"
     mem_db_path.parent.mkdir(parents=True, exist_ok=True)
     discussion._init_memory(LollmsMemoryManager(f"sqlite:///{mem_db_path}"))
 else:
     # Set default safe fallback paths for test imports
     CURRENT_WORKSPACE_DIR = APP_DIR / "workspaces" / "default"
-    APP_DATA_DIR = CURRENT_WORKSPACE_DIR / "data"
-    APP_WORKSPACE_DIR = CURRENT_WORKSPACE_DIR / "data_workspace"
+    APP_WORKSPACE_DIR = CURRENT_WORKSPACE_DIR / "viewer_session"
 
 
 @app.post("/api/data/import_sql_connection")
@@ -719,14 +740,18 @@ async def get_binary_image(title: str, index: int, version: Optional[int] = None
 
 @app.get("/api/workspace_files/{filename}")
 async def get_workspace_file_endpoint(filename: str):
-    """Dynamic serve active workspace data files for HTML widget rendering."""
+    """Dynamic serve active workspace data files for HTML widget rendering from the isolated workspace_data/ subfolder."""
     disc_ws = get_discussion_workspace()
     if not disc_ws:
         raise HTTPException(status_code=400, detail="No active workspace directory.")
 
+    # Route strictly to workspace_data subfolder
+    ws_data_dir = disc_ws / "workspace_data"
+    ws_data_dir.mkdir(parents=True, exist_ok=True)
+
     # Sanitize and guard against Directory Traversal
-    file_path = (disc_ws / filename).resolve()
-    if not _is_safe_path(disc_ws, file_path):
+    file_path = (ws_data_dir / filename).resolve()
+    if not _is_safe_path(ws_data_dir, file_path):
         raise HTTPException(status_code=403, detail="Access Denied: Path traversal detected.")
 
     if not file_path.exists() or not file_path.is_file():
@@ -1764,7 +1789,7 @@ async def get_memory_graph_endpoint():
 
         # Fetch all relationships from database
         with discussion.memory_manager._session() as s:
-            from lollms_client.lollms_discussion.lollms_memory import _MemoryRelationship
+            from lollms_client.lollms_memory.lollms_memory import _MemoryRelationship
             rels = s.query(_MemoryRelationship).all()
             relationships = [discussion.memory_manager._rel_to_dict(r) for r in rels]
 
@@ -2317,7 +2342,8 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
             "stt_binding_name": payload.stt_binding_name,
             "stt_binding_config": payload.stt_binding_config,
             "personality_name": payload.personality_name,
-            "internet_config": payload.internet_config or {}
+            "internet_config": payload.internet_config or {},
+            "shared_memory_group": payload.shared_memory_group or "global_memories"
         })
 
         # Update active discussion's internet_config
@@ -2855,11 +2881,19 @@ async def get_data_grid(title: str, version: Optional[int] = None):
     if base_title.lower().endswith(ext.lower()):
         base_title = base_title[:-len(ext)]
 
+    # Resolve custom isolated subfolders
+    ws_data_dir = workspace_dir / "workspace_data"
+    meta_dir = workspace_dir / "artefacts_metadata"
+    ws_data_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, base_title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")))
+
     # Check multiple possible file paths for data_bundle imports
     possible_paths = [
-        workspace_dir / f"{base_title}_consolidated.db",  # Folder bundle consolidation
-        workspace_dir / "versions" / f"{base_title}_v{current_version}{ext}",  # Standard versioned
-        workspace_dir / f"{base_title}{ext}",  # Unversioned fallback
+        ws_data_dir / f"{base_title}_consolidated.db",  # Folder bundle consolidation
+        meta_dir / art_id / f"{base_title}_v{current_version}{ext}",  # Standard versioned
+        ws_data_dir / f"{base_title}{ext}",  # Unversioned fallback
     ]
 
     file_path = None
@@ -2870,7 +2904,7 @@ async def get_data_grid(title: str, version: Optional[int] = None):
 
     if not file_path:
         # Default destination path to restore to if recovered
-        file_path = workspace_dir / "versions" / f"{base_title}_v{current_version}{ext}"
+        file_path = meta_dir / art_id / f"{base_title}_v{current_version}{ext}"
 
         # Fallback scan: check other workspaces and the global data_workspace
         found_path = None
@@ -2893,9 +2927,9 @@ async def get_data_grid(title: str, version: Optional[int] = None):
         if found_path:
             import shutil
             try:
-                workspace_dir.mkdir(parents=True, exist_ok=True)
+                ws_data_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy(str(found_path), str(file_path))
-                unversioned_path = workspace_dir / f"{base_title}{ext}"
+                unversioned_path = ws_data_dir / f"{base_title}{ext}"
                 try:
                     shutil.copy(str(found_path), str(unversioned_path))
                 except Exception:
@@ -2906,7 +2940,7 @@ async def get_data_grid(title: str, version: Optional[int] = None):
 
     if not file_path or not file_path.exists():
         # Assign a fallback destination path in the current active workspace
-        file_path = workspace_dir / "versions" / f"{base_title}_v{current_version}{ext}"
+        file_path = meta_dir / art_id / f"{base_title}_v{current_version}{ext}"
 
         # Fallback scan: check other workspaces and the global data_workspace
         found_path = None
@@ -2929,9 +2963,9 @@ async def get_data_grid(title: str, version: Optional[int] = None):
         if found_path:
             import shutil
             try:
-                workspace_dir.mkdir(parents=True, exist_ok=True)
+                ws_data_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy(str(found_path), str(file_path))
-                unversioned_path = workspace_dir / f"{base_title}{ext}"
+                unversioned_path = ws_data_dir / f"{base_title}{ext}"
                 try:
                     shutil.copy(str(found_path), str(unversioned_path))
                 except Exception:
@@ -2945,14 +2979,14 @@ async def get_data_grid(title: str, version: Optional[int] = None):
     # in the SQLite artifact version record, write it back to disk instantly so the renderer never fails.
     if not file_path or not file_path.exists():
         try:
-            workspace_dir.mkdir(parents=True, exist_ok=True)
+            ws_data_dir.mkdir(parents=True, exist_ok=True)
             # Establish versioned path
-            file_path = workspace_dir / "versions" / f"{base_title}_v{current_version}{ext}"
+            file_path = meta_dir / art_id / f"{base_title}_v{current_version}{ext}"
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(active.get("content", ""), encoding="utf-8")
 
             # Write unversioned copy to active folder too
-            unversioned_path = workspace_dir / f"{base_title}{ext}"
+            unversioned_path = ws_data_dir / f"{base_title}{ext}"
             unversioned_path.write_text(active.get("content", ""), encoding="utf-8")
 
             ASCIIColors.success(f"✓ [Self-Healing] Restored missing data file on disk from SQLite artifact record: {file_path.name}")

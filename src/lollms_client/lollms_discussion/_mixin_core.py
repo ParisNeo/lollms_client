@@ -44,7 +44,6 @@ class CoreMixin:
         workspace_path: Optional[str] = None,
     ):
         object.__setattr__(self, 'lollmsClient', lollmsClient)
-        object.__setattr__(self, 'db_manager', db_manager)
         object.__setattr__(self, 'autosave', autosave)
         object.__setattr__(self, 'max_context_size', max_context_size)
         object.__setattr__(self, 'scratchpad', "")
@@ -54,14 +53,47 @@ class CoreMixin:
         object.__setattr__(self, '_db_lock', threading.Lock())
         object.__setattr__(self, '_message_index', None)
         object.__setattr__(self, '_messages_to_delete_from_db', set())
-        object.__setattr__(self, '_is_db_backed', db_manager is not None)
         object.__setattr__(self, 'internet_config', internet_config or {})
 
-        # Store custom workspace path (parent folder for all discussions)
-        object.__setattr__(self, 'workspace_path', workspace_path)
+        # Resolve clean isolated directory paths
+        resolved_id = discussion_id or (db_discussion_obj.id if db_discussion_obj else "viewer_session")
+
+        # ── NATIVE AUTO-INGESTION & CLEAN ISOLATION DIRECTORIES ──
+        if workspace_path:
+            parent_dir = Path(workspace_path)
+            # If path ends with a workspace directory but lacks the specific discussion folder, append it
+            if parent_dir.name != resolved_id and (parent_dir / resolved_id).parent.exists():
+                parent_dir = parent_dir / resolved_id
+
+            parent_dir.mkdir(parents=True, exist_ok=True)
+
+            # Subfolder 1: workspace_data (Contains physical twins for tools)
+            ws_data_dir = parent_dir / "workspace_data"
+            ws_data_dir.mkdir(parents=True, exist_ok=True)
+
+            # Subfolder 2: artefacts_metadata (Contains versioned .lam and raw code files)
+            metadata_dir = parent_dir / "artefacts_metadata"
+            metadata_dir.mkdir(parents=True, exist_ok=True)
+
+            object.__setattr__(self, 'workspace_path', str(parent_dir.resolve()))
+            object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
+            object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir.resolve()))
+
+            # Self-healing auto DB instantiation if db_manager is omitted
+            if not db_manager:
+                from ._db import LollmsDataManager
+                db_file_path = parent_dir / "discussion.db"
+                db_manager = LollmsDataManager(f"sqlite:///{db_file_path}")
+        else:
+            object.__setattr__(self, 'workspace_path', None)
+            object.__setattr__(self, 'workspace_data_path', None)
+            object.__setattr__(self, 'artefacts_metadata_path', None)
+
+        object.__setattr__(self, 'db_manager', db_manager)
+        object.__setattr__(self, '_is_db_backed', db_manager is not None)
 
         if self._is_db_backed:
-            if not db_discussion_obj and not discussion_id:
+            if not db_discussion_obj and not resolved_id:
                 raise ValueError("Either discussion_id or db_discussion_obj must be provided.")
             self._session = db_manager.get_session()
             if db_discussion_obj:
@@ -69,12 +101,12 @@ class CoreMixin:
             else:
                 try:
                     self._db_discussion = self._session.query(
-                        db_manager.DiscussionModel).filter_by(id=discussion_id).one()
+                        db_manager.DiscussionModel).filter_by(id=resolved_id).one()
                 except NoResultFound:
                     self._session.close()
-                    raise ValueError(f"No discussion found with ID: {discussion_id}")
+                    raise ValueError(f"No discussion found with ID: {resolved_id}")
         else:
-            self._create_in_memory_proxy(id=discussion_id)
+            self._create_in_memory_proxy(id=resolved_id)
 
         object.__setattr__(self, '_system_prompt',
                            getattr(self._db_discussion, 'system_prompt', None))
@@ -111,7 +143,8 @@ class CoreMixin:
         init_args = {
             'autosave': kwargs.pop('autosave', False),
             'max_context_size': kwargs.pop('max_context_size', None),
-            'internet_config': kwargs.pop('internet_config', None)
+            'internet_config': kwargs.pop('internet_config', None),
+            'workspace_path': kwargs.pop('workspace_path', None)
         }
         if db_manager:
             with db_manager.get_session() as session:

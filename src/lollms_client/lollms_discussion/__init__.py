@@ -31,7 +31,6 @@ from ._mixin_memory import MemoryMixin
 from ._mixin_file_import import FileImportMixin
 from ._mixin_internet_import import InternetImportMixin
 from ._mixin_export import ExportMixin
-from .lollms_memory import FailureMemory
 
 class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixin, MemoryMixin, FileImportMixin, InternetImportMixin, ExportMixin):
     """
@@ -41,7 +40,7 @@ class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixi
     ─────────────
     Attach a LollmsMemoryManager to enable multi-level persistent memory:
 
-        from lollms_client.lollms_discussion.lollms_memory import LollmsMemoryManager, MemoryConfig
+        from lollms_client.lollms_memory import LollmsMemoryManager, MemoryConfig
 
         mem = LollmsMemoryManager(
             db_path="sqlite:///memories.db",
@@ -113,6 +112,5 @@ __all__ = [
     "MemoryMixin",
     "FileImportMixin",
     "InternetImportMixin",
-    "ExportMixin",
-    "FailureMemory"
+    "ExportMixin"
 ]

@@ -9,10 +9,10 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import re
 from ascii_colors import ASCIIColors
 from datetime import datetime
-from .lollms_memory import FailureMemory
+from lollms_client.lollms_memory import FailureMemory
 
 if TYPE_CHECKING:
-    from .lollms_memory import LollmsMemoryManager
+    from lollms_client.lollms_memory import LollmsMemoryManager
 
 class MemoryMixin:
     """Adds multi-level persistent memory to LollmsDiscussion."""

@@ -16,7 +16,7 @@ from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE
 from ._message import LollmsMessage
 from ._artefacts import ArtefactType, make_image_id
-from .lollms_memory import FailureMemory
+from lollms_client.lollms_memory import FailureMemory
 # ── Cancellation state & limits ──────────────────────────────────────────────
 _MAX_BRACKET_BUF = 256
 
@@ -371,7 +371,6 @@ class _StreamState:
 
         if is_inside_artifact:
             if not content.endswith("</artifact>") and not content.endswith("</artefact>"):
-                ASCIIColors.yellow("[StreamState.DEBUG] Inside unclosed artifact block. Skipping parse.")
                 return True
 
         # 4. Create a safe content copy by removing all closed and unclosed thinking blocks
@@ -397,10 +396,14 @@ class _StreamState:
             body = match.group(3).strip()
 
             ASCIIColors.green(f"[StreamState.DEBUG] Dispatching XML tag: {tag_name}")
-            keep_generating = self._dispatch_closed_tag(tag_name, attrs_str, body, full_match_text)
-            if not keep_generating:
-                ASCIIColors.red("[StreamState.DEBUG] HALTING generation due to XML tool call.")
-                return False
+            try:
+                keep_generating = self._dispatch_closed_tag(tag_name, attrs_str, body, full_match_text)
+                if not keep_generating:
+                    ASCIIColors.red("[StreamState.DEBUG] HALTING generation due to XML tool call.")
+                    return False
+            except Exception as dispatch_err:
+                trace_exception(dispatch_err)
+                ASCIIColors.error(f"[StreamState] XML dispatch failed for tag '{tag_name}': {dispatch_err}")
 
         # ── Pattern 2: LLM JSON-style tool calls (<tool_call>...</tool_call>) ───────────
         # 🛑 CRITICAL FIX: Detect START tag to enter Accumulation Mode
@@ -630,7 +633,7 @@ class ChatMixin:
 
         # 🛑 CRITICAL FIX: Initialize FailureMemory IMMEDIATELY on discussion object
         # This ensures it exists BEFORE the first chat() call
-        from .lollms_memory import FailureMemory
+        from ..lollms_memory.lollms_memory import FailureMemory
         object.__setattr__(self, '_failure_memory', FailureMemory())
 
     def cancel_generation(self) -> bool:
@@ -831,6 +834,17 @@ class ChatMixin:
         # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
         if not hasattr(self, "tolerance_level") or tolerance_level:
             object.__setattr__(self, "tolerance_level", tolerance_level or "strict")
+
+        # Initialize list to collect all created/modified artifacts during this turn safely
+        object.__setattr__(self, "_affected_artefacts_this_turn", [])
+
+        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
+        # This prevents stale failures from previous conversation turns from blocking tool execution
+        if not hasattr(self, "_failure_memory") or not self._failure_memory:
+            object.__setattr__(self, "_failure_memory", FailureMemory())
+        else:
+            self._failure_memory.failures = []
+            ASCIIColors.info("[FailureMemory] Cleared historical failure logs for the new chat turn.")
 
         # Reset cancellation flag at the start of each chat turn
         self.reset_cancel_state()
@@ -1140,6 +1154,25 @@ class ChatMixin:
                     "content": m.content
                 })
 
+            # ── 🔬 SCIENTIFIC DEBUGGING: EXPORTED PROMPT TRACE ──
+            # Print the exact payload that is being forwarded to the LLM for inspection
+            ASCIIColors.cyan("\n" + "="*80)
+            ASCIIColors.cyan(f"📝 [SCIENTIFIC DEBUG] EXPORTED LLM PAYLOAD - ROUND {round_count} START")
+            ASCIIColors.cyan("="*80)
+            for idx, msg in enumerate(messages_list):
+                role = msg["role"]
+                # Safeguard: Print truncated preview if the context is too large
+                content_preview = msg["content"]
+                if len(content_preview) > 1500:
+                    content_preview = content_preview[:1500] + "\n... [TRUNCATED FOR CONSOLE BREVITY]"
+                ASCIIColors.yellow(f"\n[{idx}] Role: '{role}'")
+                ASCIIColors.white("-" * 40)
+                ASCIIColors.white(content_preview)
+                ASCIIColors.white("-" * 40)
+            ASCIIColors.cyan("="*80)
+            ASCIIColors.cyan(f"📝 [SCIENTIFIC DEBUG] END OF PAYLOAD - ROUND {round_count}")
+            ASCIIColors.cyan("="*80 + "\n")
+
             # CRITICAL FIX: Track content offset to prevent re-parsing old tool calls
             current_content_length = len(ai_msg.content)
 
@@ -1289,14 +1322,12 @@ class ChatMixin:
                             from pathlib import Path
                             old_cwd = os.getcwd()
 
-                            # 🛑 CRITICAL FIX: Resolve workspace path EXACTLY like artefacts.sync_all_active_to_disk() does
-                            # This ensures tool CWD matches the sync destination perfectly
-                            # Check truthiness of workspace_path, not just existence (hasattr returns True even if None)
+                            # 🛑 CRITICAL RESOLUTION: Dynamically resolve active workspace from discussion instance path
                             if hasattr(self, 'workspace_path') and self.workspace_path:
                                 base_workspace_dir = Path(self.workspace_path)
                             else:
                                 base_workspace_dir = Path("./data_workspace")
-                                # Try to override with server's APP_WORKSPACE_DIR only if no custom workspace_path was set
+                                # Fallback to server APP_WORKSPACE_DIR if workspace_path is not bound
                                 try:
                                     from lollms_client.app.server import APP_WORKSPACE_DIR
                                     if APP_WORKSPACE_DIR is not None:
@@ -1304,8 +1335,13 @@ class ChatMixin:
                                 except ImportError:
                                     pass
 
-                            # Discussion-isolated workspace
-                            workspace_dir = base_workspace_dir / self.id
+                            # 🛑 CRITICAL RESOLUTION: Direct tool CWD to the isolated workspace_data/ subfolder
+                            if hasattr(self, "workspace_data_path") and self.workspace_data_path:
+                                workspace_dir = Path(self.workspace_data_path)
+                            else:
+                                workspace_dir = base_workspace_dir / self.id / "workspace_data"
+
+                            workspace_dir.mkdir(parents=True, exist_ok=True)
                             workspace_dir_str = str(workspace_dir.resolve())
 
                             try:
@@ -1338,6 +1374,10 @@ class ChatMixin:
                                 # The LCP binding will set CWD to the discussion-isolated workspace internally.
                                 # We do NOT change CWD here to avoid double-changedirectory conflicts.
                                 call_kwargs = dict(sanitized_params)
+
+                                # Inject active session instances into the tool execution call
+                                call_kwargs["discussion_instance"] = self
+                                call_kwargs["lollms_client_instance"] = self.lollmsClient
 
                                 # Execute directly (no thread) - LCP handles CWD internally
                                 tool_res = active_tools[tool_name]["callable"](**call_kwargs)
@@ -1500,11 +1540,16 @@ class ChatMixin:
                             ai_msg.content += "\n\n"
                             # If this was a forced break due to loop detection, ensure we exit
                             if 'force_break_after_tool' in locals() and force_break_after_tool:
+                                ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
                                 break
-                            break
+
+                            # Let the loop continue to the next round so the LLM can see the results!
+                            ASCIIColors.success(f"[ChatMixin] Tool executed successfully. Continuing to round {round_count + 1}...")
                 else:
+                    ASCIIColors.warning("[ChatMixin] No valid tool JSON. Breaking loop.")
                     break
             else:
+                ASCIIColors.warning("[ChatMixin] No tool trigger detected. Breaking loop (Final Answer reached).")
                 break
 
         # ── 11. Final Post-Processing & Database Commit ──

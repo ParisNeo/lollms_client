@@ -941,8 +941,9 @@ document.addEventListener("DOMContentLoaded", () => {
     chatHistory.addEventListener("toggle", (e) => {
         const details = e.target.closest(".inline-proc-accordion, .folder-tree-details, .proc-params-details");
         if (details && details.id) {
-            window.accordionOpenStates[details.id] = details.hasAttribute("open");
-            console.log(`[Toggle Delegator] Recorded '${details.id}' open=${details.hasAttribute("open")}`);
+            // Read the DOM property directly rather than hasAttribute to guarantee accuracy during transition states
+            window.accordionOpenStates[details.id] = details.open;
+            console.log(`[Toggle Delegator] Recorded '${details.id}' open=${details.open}`);
         }
     }, true); // Use capture phase because 'toggle' does not bubble
 
@@ -1901,13 +1902,15 @@ document.addEventListener("DOMContentLoaded", () => {
                     </div>
                 `;
 
-                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${version}`);
+                const versionParam = (version !== undefined && version !== null) ? `?version=${version}` : "";
+                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}${versionParam}`);
                 const art = await artRes.json();
                 rawView.value = art.content;
             } else if (isDataArtifact) {
                 // Render Dual-Stream status dashboard above spreadsheet grid
                 const selectedVer = version || 1;
-                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}?version=${selectedVer}`);
+                const versionParam = (selectedVer !== undefined && selectedVer !== null) ? `?version=${selectedVer}` : "";
+                const artRes = await fetch(`/api/artifacts/${encodeURIComponent(title)}${versionParam}`);
                 const art = await artRes.json();
 
                 // Create the wrapper layout for the Dual-Stream metadata panel
@@ -6516,7 +6519,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 }
             });
             if (wasActive) {
-                showThinkingIndicator(activeText);
+                showThinkingIndicator();
             }
             scrollToBottom(true);
         } catch (err) {
@@ -6856,7 +6859,7 @@ document.addEventListener("DOMContentLoaded", () => {
             toolCallCount++;
 
             const hasState = window.accordionOpenStates[stateKey] !== undefined;
-            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : "open";
+            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ""; // Collapse by default
 
             // Generate the finished details block as the original string to replace back
             const accordionHtml = `
@@ -6953,11 +6956,11 @@ document.addEventListener("DOMContentLoaded", () => {
         restoredHTML = restoredHTML.replace(/<think>([\s\S]*?)<\/think>/gi, (match, bodyText) => {
             const stateKey = `${msgId || 'temp'}-think`;
             const hasState = window.accordionOpenStates[stateKey] !== undefined;
-            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : "open";
+            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ""; // Collapse by default
             return `
                 <details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.25); display: block; margin: 12px 0;">
                     <summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
-                        <span class="chevron">▶</span>
+                        <span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
                         <span>💭 Thought Process / Reasoning</span>
                     </summary>
                     <div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;">
@@ -7453,43 +7456,22 @@ document.addEventListener("DOMContentLoaded", () => {
     let thinkingStartTime = null;
 
     function showThinkingIndicator(statusText = "Lollms is thinking...") {
-        let indicator = document.getElementById("thinking-indicator");
         thinkingStartTime = Date.now();
         
-        if (!indicator) {
-            indicator = document.createElement("div");
-            indicator.id = "thinking-indicator";
-            indicator.className = "typing-indicator";
-            indicator.innerHTML = `
-                <span class="typing-dot"></span>
-                <span class="typing-dot"></span>
-                <span class="typing-dot"></span>
-                <span class="thinking-text" style="font-size: 11.5px; font-weight: bold; color: var(--text-secondary); margin-left: 8px;">${statusText} (0.0s)</span>
-            `;
-        }
-
-        chatHistory.appendChild(indicator);
-        indicator.classList.add("active");
-        scrollToBottom(true);
-
         // Clear any stale timer
         if (thinkingTimerId) clearInterval(thinkingTimerId);
 
-        // Start live thinking stopwatch
+        // Start live thinking stopwatch targeting the active thought panel's header
         thinkingTimerId = setInterval(() => {
-            const textEl = indicator.querySelector(".thinking-text");
-            if (textEl && thinkingStartTime) {
+            const timerEl = document.querySelector(".active-thinking-timer");
+            if (timerEl && thinkingStartTime) {
                 const elapsed = ((Date.now() - thinkingStartTime) / 1000).toFixed(1);
-                textEl.textContent = `${statusText} (${elapsed}s)`;
+                timerEl.textContent = `(${elapsed}s)`;
             }
         }, 100);
     }
 
     function hideThinkingIndicator() {
-        const indicator = document.getElementById("thinking-indicator");
-        if (indicator) {
-            indicator.remove();
-        }
         if (thinkingTimerId) {
             clearInterval(thinkingTimerId);
             thinkingTimerId = null;
@@ -8252,20 +8234,26 @@ document.addEventListener("DOMContentLoaded", () => {
  */
 function resolveProcessingTags(content, msgId = null) {
     if (!content) return "";
-    
+
     const stableMsgId = msgId || "temp";
 
     // ── Render <think> tags elegantly with stable state-retention ──
     const thinkPattern = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
     content = content.replace(thinkPattern, (match, bodyText) => {
         const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
-        
-        // Check our global state-retention map first. If not yet clicked, check the global default toggle.
-        const stateKey = `${stableMsgId}-think`;
-        const hasState = window.accordionOpenStates[stateKey] !== undefined;
-        const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ((window.funcStates && window.funcStates["think"]) ? "open" : "open"); // Default to open so user sees progress, but respects manual collapse
 
-        return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.15); display: block;"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;"><span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span><span>💭 Thought Process / Reasoning</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
+        const stateKey = `${stableMsgId}-think`;
+        const isClosed = match.toLowerCase().endsWith("</think>");
+
+        // If the thoughts are still actively streaming, keep them open so the user can see progress!
+        const hasState = window.accordionOpenStates[stateKey] !== undefined;
+        const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : (isClosed ? "" : "open");
+
+        // Embed live-ticking timer if active
+        const timerHtml = isClosed ? "" : ` <span class="active-thinking-timer" style="font-size: 11.5px; opacity: 0.8; font-weight: bold; margin-left: 4px;">(0.0s)</span> <span class="spinner inline" style="margin-left: 6px;"></span>`;
+        const headerText = isClosed ? "💭 Thought Process / Reasoning" : "💭 Thinking...";
+
+        return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.15); display: block;"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;"><span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span><span>${headerText}${timerHtml}</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
     });
 
     const procPattern = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;
@@ -8278,13 +8266,13 @@ function resolveProcessingTags(content, msgId = null) {
         const titleText = procTitle.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
 
         const isClosed = match.toLowerCase().endsWith("</processing>");
-        
+
         const stateKey = `${stableMsgId}-proc-${procCount}`;
         procCount++;
-        
-        // Defaults processing boxes to open so users see updates, but respects manual close clicks
+
+        // Defaults processing boxes to collapsed
         const hasState = window.accordionOpenStates[stateKey] !== undefined;
-        const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : "open";
+        const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ""; // Collapse by default
 
         // Extract multiline <details> blocks to placeholders so we don't chop them up with split('\n')
         const detailsMap = new Map();
@@ -8319,26 +8307,99 @@ function resolveProcessingTags(content, msgId = null) {
         }
 
         if (isClosed) {
-            let statusItems = lines.map(line => {
-                const clean = line.replace(/^\*\s*/, "").trim();
-                if (!clean) return "";
+            let statusItems = "";
+            let jsonOutputBlock = "";
+            let parsedJsonData = null;
 
-                // Restore complete <details> block if this is a placeholder
-                if (detailsMap.has(clean)) {
-                    return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
+            // Attempt to capture, parse, and isolate JSON output block inside log lines
+            const fullBody = lines.join("\n");
+            const jsonMatch = fullBody.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                try {
+                    parsedJsonData = JSON.parse(jsonMatch[0].trim());
+                    // Extract and strip JSON block from the standard text lines
+                    const beforeJson = fullBody.split(jsonMatch[0])[0] || "";
+                    const afterJson = fullBody.split(jsonMatch[0])[1] || "";
+
+                    const cleanLinesBefore = beforeJson.trim().split("\n").filter(l => l.trim() && !l.trim().startsWith("{"));
+                    const cleanLinesAfter = afterJson.trim().split("\n").filter(l => l.trim() && !l.trim().endsWith("}"));
+
+                    statusItems = [...cleanLinesBefore, ...cleanLinesAfter].map(line => {
+                        const clean = line.replace(/^\*\s*/, "").trim();
+                        if (!clean || clean === "Output Logs:") return "";
+                        if (detailsMap.has(clean)) return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
+                        return `<div class="proc-item complete">✓ ${clean}</div>`;
+                    }).filter(x => x !== "").join("");
+                } catch(e) {
+                    parsedJsonData = null;
                 }
+            }
 
-                if (clean.startsWith("<details>")) {
-                    return `<div class="proc-item-no-bullet">${clean}</div>`;
-                }
-                return `<div class="proc-item complete">✓ ${clean}</div>`;
-            }).filter(x => x !== "").join("");
+            if (!parsedJsonData) {
+                // Fallback standard line-by-line renderer
+                statusItems = lines.map(line => {
+                    const clean = line.replace(/^\*\s*/, "").trim();
+                    if (!clean || clean === "Output Logs:") return "";
+                    if (detailsMap.has(clean)) return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
+                    if (clean.startsWith("<details>")) return `<div class="proc-item-no-bullet">${clean}</div>`;
+                    return `<div class="proc-item complete">✓ ${clean}</div>`;
+                }).filter(x => x !== "").join("");
+            }
 
-                if (paramsHtml) {
-                    statusItems = paramsHtml + statusItems;
-                }
+            // ── Format Output Parameters like Input ones ──
+            if (parsedJsonData) {
+                let plotImageHtml = "";
+                const formattedRows = Object.entries(parsedJsonData).map(([key, val]) => {
+                    // Check if value is a massive base64 image string (plot_b64, image_b64)
+                    const isBase64Key = key.toLowerCase().includes("b64") || key.toLowerCase().includes("image");
+                    const isB64String = typeof val === "string" && val.length > 300 && (val.startsWith("iVBOR") || val.startsWith("data:"));
 
-                return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
+                    if (isBase64Key || isB64String) {
+                        const cleanB64 = val.startsWith("data:") ? val : `data:image/png;base64,${val.replace(/\s+/g, '')}`;
+                        plotImageHtml = `
+                            <div class="proc-item-no-bullet" style="margin-top: 10px; width: 100%; display: flex; flex-direction: column; gap: 4px;">
+                                <span style="font-size: 11px; font-weight: bold; color: var(--accent-color); text-transform: uppercase;">📊 Rendered Visualization Output</span>
+                                <img src="${cleanB64}" class="query-plot-img" style="display: block; max-width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--border-color); box-shadow: var(--shadow-lg); margin-top: 4px;" />
+                            </div>
+                        `;
+                        // Omit the massive raw base64 string spam from the grid list
+                        return `
+                            <div class="proc-item-no-bullet" style="display: flex; flex-direction: column; gap: 2px;">
+                                <span style="font-weight: bold; color: var(--success-color); display: flex; align-items: center; gap: 4px;">✓ ${key}:</span>
+                                <code style="font-family: monospace; background-color: #020617; padding: 2px 6px; border-radius: 4px; color: var(--text-secondary); font-size: 11.5px; display: inline-block; width: max-content;">[base64 image data truncated & rendered below]</code>
+                            </div>
+                        `;
+                    }
+
+                    // Format standard primitive keys using input parameters style
+                    const displayValue = typeof val === "object" ? JSON.stringify(val) : val;
+                    return `
+                        <div class="proc-item-no-bullet" style="display: flex; flex-direction: column; gap: 2px;">
+                            <span style="font-weight: bold; color: var(--success-color); display: flex; align-items: center; gap: 4px;">✓ ${key}:</span>
+                            <code style="font-family: monospace; background-color: #020617; padding: 2px 6px; border-radius: 4px; color: #cbd5e1; font-size: 11.5px; display: inline-block; width: max-content;">${displayValue}</code>
+                        </div>
+                    `;
+                }).join("");
+
+                jsonOutputBlock = `
+                    <div class="proc-item-no-bullet" style="margin-top: 10px; border-top: 1px dashed var(--border-color); padding-top: 10px; width: 100%;">
+                        <span style="font-size: 11px; font-weight: bold; color: var(--success-color); text-transform: uppercase; display: block; margin-bottom: 8px;">📊 Output Parameters / Return Value</span>
+                        <div style="display: flex; flex-direction: column; gap: 8px; padding-left: 10px; border-left: 2px solid var(--success-color);">
+                            ${formattedRows}
+                        </div>
+                        ${plotImageHtml}
+                    </div>
+                `;
+            }
+
+            if (paramsHtml) {
+                statusItems = paramsHtml + statusItems;
+            }
+            if (jsonOutputBlock) {
+                statusItems = statusItems + jsonOutputBlock;
+            }
+
+            return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
 <summary class="proc-accordion-header complete" style="cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
 <span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
 <span>✅ ${titleText} (Complete)</span>
@@ -8347,27 +8408,20 @@ function resolveProcessingTags(content, msgId = null) {
 ${statusItems}
 </div>
 </details>`;
-            } else {
-                let statusItems = lines.map(line => {
-                    const clean = line.replace(/^\*\s*/, "").trim();
-                    if (!clean) return "";
+        } else {
+            let statusItems = lines.map(line => {
+                const clean = line.replace(/^\*\s*/, "").trim();
+                if (!clean || clean === "Output Logs:") return "";
+                if (detailsMap.has(clean)) return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
+                if (clean.startsWith("<details>")) return `<div class="proc-item-no-bullet">${clean}</div>`;
+                return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
+            }).filter(x => x !== "").join("");
 
-                    // Restore complete <details> block if this is a placeholder
-                    if (detailsMap.has(clean)) {
-                        return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
-                    }
+            if (paramsHtml) {
+                statusItems = paramsHtml + statusItems;
+            }
 
-                    if (clean.startsWith("<details>")) {
-                        return `<div class="proc-item-no-bullet">${clean}</div>`;
-                    }
-                    return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
-                }).filter(x => x !== "").join("");
-
-                if (paramsHtml) {
-                    statusItems = paramsHtml + statusItems;
-                }
-
-                return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
+            return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
 <summary class="proc-accordion-header" style="cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
 <span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
 <span>⚙️ ${titleText}...</span>
@@ -8377,7 +8431,7 @@ ${statusItems}
 ${statusItems}
 </div>
 </details>`;
-            }
+        }
     });
 }
 

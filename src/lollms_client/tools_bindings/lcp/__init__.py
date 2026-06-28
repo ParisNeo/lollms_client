@@ -285,6 +285,18 @@ class LCPBinding(LollmsToolBinding):
         """
         Executes a specific tool function from a potentially multi-tool file.
         """
+        # 🔬 SCIENTIFIC DEBUG TRACE
+        ASCIIColors.cyan("\n" + "="*80)
+        ASCIIColors.cyan(f"🔍 [LCP execute_tool DEBUG] Calling: '{tool_name}'")
+        ASCIIColors.cyan(f"  • Raw params dictionary keys: {list(params.keys()) if isinstance(params, dict) else type(params).__name__}")
+        ASCIIColors.cyan(f"  • Direct discussion_instance type: {type(discussion_instance).__name__}")
+        ASCIIColors.cyan(f"  • kwargs keys: {list(kwargs.keys())}")
+        ASCIIColors.cyan("="*80 + "\n")
+
+        # Recover discussion_instance and lollms_client_instance if passed inside the params dictionary by the closure
+        discussion_instance = discussion_instance or params.get("discussion_instance") or params.get("discussion")
+        lollms_client_instance = kwargs.get("lollms_client_instance") or params.get("lollms_client_instance") or params.get("client")
+
         tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
         if not tool_def:
             return {"error": f"Tool '{tool_name}' not found.", "status_code": 404}
@@ -374,9 +386,28 @@ class LCPBinding(LollmsToolBinding):
                     sys.stderr = captured_stderr
 
                     # Execute with CLEAN params
-                    # Tools are agnostic. They operate on files in CWD.
-                    # No discussion_instance or lollms_client_instance is passed.
-                    result = execute_function(**params)
+                    # Only pass parameters that are explicitly accepted by the tool signature, OR are generic *args/**kwargs
+                    import inspect
+                    sig = inspect.signature(execute_function)
+                    clean_params = {}
+                    for k, v in params.items():
+                        if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                            clean_params[k] = v
+                        elif k in ("discussion_instance", "lollms_client_instance", "discussion", "client"):
+                            continue
+
+                    # Inject orchestrator context parameters if explicitly requested by the tool signature
+                    if "discussion_instance" in sig.parameters and "discussion_instance" not in clean_params:
+                        clean_params["discussion_instance"] = discussion_instance
+                    elif "discussion" in sig.parameters and "discussion" not in clean_params:
+                        clean_params["discussion"] = discussion_instance
+
+                    if "lollms_client_instance" in sig.parameters and "lollms_client_instance" not in clean_params:
+                        clean_params["lollms_client_instance"] = lollms_client_instance
+                    elif "client" in sig.parameters and "client" not in clean_params:
+                        clean_params["client"] = lollms_client_instance
+
+                    result = execute_function(**clean_params)
                 finally:
                     sys.stdout = old_sys_stdout
                     sys.stderr = old_sys_stderr
@@ -453,7 +484,7 @@ class LCPBinding(LollmsToolBinding):
                                 f"This file was created by the tool `{tool_name}`.\n"
                                 f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
                                 f"- **Size**: {file_size:,} bytes\n"
-                                f"- **Location**: `{file_path.resolve()}`\n\n"
+                                f"- **Location**: `./{file_name}`\n\n"
                                 f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
                             )
                         elif file_info["content"] is None:
@@ -467,7 +498,7 @@ class LCPBinding(LollmsToolBinding):
                                             f"This file appears to be binary (contains null bytes).\n"
                                             f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
                                             f"- **Size**: {file_size:,} bytes\n"
-                                            f"- **Location**: `{file_path.resolve()}`\n\n"
+                                            f"- **Location**: `./{file_name}`\n\n"
                                             f"> **Action**: Download from Workspace Artifacts panel."
                                         )
                                     else:
@@ -564,7 +595,7 @@ class LCPBinding(LollmsToolBinding):
                                     f"### Binary File Modified: `{file_name}`\n\n"
                                     f"This file was updated by the tool `{tool_name}`.\n"
                                     f"- **Type**: {file_ext.upper()} Binary/Data\n"
-                                    f"- **Location**: `{file_path.resolve()}`\n"
+                                    f"- **Location**: `./{file_name}`\n"
                                     f"- **Size**: {file_path.stat().st_size:,} bytes\n\n"
                                     f"You can download or view this file directly from the Workspace Artifacts panel."
                                 )

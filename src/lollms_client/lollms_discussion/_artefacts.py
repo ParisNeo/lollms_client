@@ -441,47 +441,41 @@ class ArtefactManager:
 
         ARCHITECTURAL RULE: Dual-Stream Storage (.lam Protocol)
         - physical_data (bytes): The raw binary/text file for tools to execute against (CSV, DB, PNG, etc.).
-          Saved to: versions/{title}_v{N}.{ext} AND workspace/{title}.{ext}
+          Saved to: workspace_data/{title}.{ext}
         - logical_content (str): The .lam metadata (Schema, Stats, Description) for the LLM context.
-          Saved to: versions/{title}_v{N}.lam (NEVER copied to workspace)
-        - content (str): Fallback for simple text/code files where Physical == Logical.
-
-        Priority:
-        1. If physical_data is provided -> Write Physical Twin.
-        2. If logical_content is provided -> Write Logical Twin (.lam) in versions/ ONLY.
-        3. If neither -> Fallback to 'content' for simple text files.
+          Saved to: artefacts_metadata/{uuid}/{title}.lam (NEVER copied to workspace_data)
         """
         try:
-            from pathlib import Path
-            # Use custom workspace_path if provided, otherwise default to ./data_workspace
-            base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-            
-            # Try to override with server's APP_WORKSPACE_DIR only if no custom workspace_path was set
-            if not self._discussion.workspace_path:
-                try:
-                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-                    if awd is not None:
-                        base_workspace_dir = awd
-                except ImportError:
-                    pass
+            # Resolve directories dynamically from the structured core discussion attributes
+            if getattr(self._discussion, "workspace_data_path", None):
+                ws_data_dir = Path(self._discussion.workspace_data_path)
+                meta_dir = Path(self._discussion.artefacts_metadata_path)
+            else:
+                # Standalone fallback if called outside server context
+                base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+                disc_id = self._discussion.id
+                disc_ws_dir = base_workspace_dir / disc_id
+                ws_data_dir = disc_ws_dir / "workspace_data"
+                meta_dir = disc_ws_dir / "artefacts_metadata"
 
-            disc_id = self._discussion.id
-            disc_ws_dir = base_workspace_dir / disc_id
-            disc_ver_dir = disc_ws_dir / "versions"
-
-            disc_ws_dir.mkdir(parents=True, exist_ok=True)
-            disc_ver_dir.mkdir(parents=True, exist_ok=True)
+            ws_data_dir.mkdir(parents=True, exist_ok=True)
+            meta_dir.mkdir(parents=True, exist_ok=True)
 
             clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
             filename = self._get_filename_with_ext(clean_title, atype, language, file_ext)
             name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
 
-            primary_path = disc_ws_dir / filename
-            versioned_path = disc_ver_dir / f"{name_part.replace('/', '_')}_v{version}{ext_part}"
+            # Recover or generate a stable UUID for this specific artifact to prevent version collisions
+            art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_title))
+            art_meta_dir = meta_dir / art_id
+            art_meta_dir.mkdir(parents=True, exist_ok=True)
+
+            primary_path = ws_data_dir / filename
+            versioned_path = art_meta_dir / f"{name_part}_v{version}{ext_part}"
 
             # .lam paths (Logical Twin)
-            lam_filename = f"{name_part.replace('/', '_')}_v{version}.lam"
-            lam_path = disc_ver_dir / lam_filename
+            lam_filename = f"{name_part}.lam"
+            lam_path = art_meta_dir / lam_filename
 
             # ── 1. WRITE PHYSICAL TWIN (For Tools) ─────────────────────────────
             wrote_physical = False
@@ -490,7 +484,7 @@ class ArtefactManager:
                     primary_path.write_bytes(physical_data)
                     versioned_path.write_bytes(physical_data)
                     wrote_physical = True
-                    ASCIIColors.success(f"[Dual-Stream] ✈️ Synced PHYSICAL '{filename}' (v{version}) to workspace & versions.")
+                    ASCIIColors.success(f"[Dual-Stream] ✈️ Synced PHYSICAL '{filename}' (v{version}) to workspace_data & versions.")
                 except Exception as bin_err:
                     ASCIIColors.warning(f"Failed to write physical data for '{filename}': {bin_err}")
 
@@ -504,7 +498,7 @@ class ArtefactManager:
                         primary_path.write_text(content, encoding="utf-8", errors="ignore")
                         versioned_path.write_text(content, encoding="utf-8", errors="ignore")
                         wrote_physical = True
-                        ASCIIColors.success(f"[Dual-Stream] ✈️ Synced TEXT '{filename}' (v{version}) to workspace & versions.")
+                        ASCIIColors.success(f"[Dual-Stream] ✈️ Synced TEXT '{filename}' (v{version}) to workspace_data & versions.")
                     except Exception as txt_err:
                         ASCIIColors.warning(f"Failed to write text content for '{filename}': {txt_err}")
 
@@ -513,12 +507,12 @@ class ArtefactManager:
             if logical_content:
                 try:
                     lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
-                    ASCIIColors.cyan(f"[Dual-Stream] 🧠 Saved LOGICAL '{lam_filename}' to versions/ (Hidden from workspace).")
+                    ASCIIColors.cyan(f"[Dual-Stream] 🧠 Saved LOGICAL '{lam_filename}' to artefacts_metadata (Hidden from tools).")
                 except Exception as lam_err:
                     ASCIIColors.warning(f"Failed to write logical .lam for '{title}': {lam_err}")
             elif wrote_physical and atype in (ArtefactType.DATA, ArtefactType.IMAGE, ArtefactType.DOCUMENT):
                 # Auto-generate a minimal .lam if missing for binary types
-                minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: versions/{name_part}_v{version}{ext_part}\n\n> **Note**: No logical summary generated. This is a raw binary/text file."
+                minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: workspace_data/{filename}\n\n> **Note**: No logical summary generated. This is a raw binary/text file."
                 try:
                     lam_path.write_text(minimal_lam, encoding="utf-8", errors="ignore")
                     ASCIIColors.info(f"[Dual-Stream] 🧠 Generated minimal LOGICAL '{lam_filename}'.")
@@ -581,6 +575,17 @@ class ArtefactManager:
         - logical_content (str): The .lam metadata (Schema, Stats) for the LLM.
           If provided, this is injected into context INSTEAD of 'content'.
         """
+        # 🛡️ SOVEREIGN TYPE-SAFETY OVERRIDE: Prevent LLM from misclassifying text/code files as structured binary datasets
+        file_ext = extra_data.get("file_ext") or Path(title).suffix
+        file_ext_clean = (file_ext or "").lower()
+        if file_ext_clean == ".sql" or title.lower().endswith(".sql"):
+            artefact_type = ArtefactType.CODE
+            language = "sql"
+        elif file_ext_clean in (".py", ".js", ".ts", ".html", ".css", ".sh", ".bash") or any(title.lower().endswith(ext) for ext in (".py", ".js", ".ts", ".html", ".css", ".sh", ".bash")):
+            artefact_type = ArtefactType.CODE
+            if not language:
+                language = file_ext_clean.replace(".", "")
+
         if artefact_type not in ArtefactType.ALL:
             raise ValueError(
                 f"Unknown artefact type '{artefact_type}'. "
@@ -660,9 +665,6 @@ class ArtefactManager:
             physical_data=final_physical_data,
             logical_content=logical_content  # Pass the .lam content
         )
-
-        # Verify the file was actually written
-        from pathlib import Path
         # Use custom workspace_path if provided, otherwise default to ./data_workspace
         workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
 
@@ -799,7 +801,6 @@ class ArtefactManager:
             ASCIIColors.info(f"Renaming artefact '{title}' → '{new_title}'")
             try:
                 # Remove unversioned copy of old file from working directory
-                from pathlib import Path
                 workspace_dir = Path("./data_workspace")
                 try:
                     from lollms_client.app.server import APP_WORKSPACE_DIR as awd
@@ -1288,7 +1289,6 @@ class ArtefactManager:
         art = self.get(title, version)
         if art:
             try:
-                from pathlib import Path
                 # Use custom workspace_path if provided, otherwise default to ./data_workspace
                 workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
 
@@ -1632,18 +1632,19 @@ class ArtefactManager:
                 file_ext = art.get("file_ext", "")
                 version = art.get("version", 1)
                 title = art["title"]
+                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")))
 
                 # Check for versioned data file in discussion versions folder
-                versioned_data = workspace_dir / "versions" / f"{title}_v{version}{file_ext}"
+                versioned_data = workspace_dir / "artefacts_metadata" / art_id / f"{title.replace('.csv','')}_v{version}{file_ext}"
                 if versioned_data.exists():
-                    dest = workspace_dir / f"{title}{file_ext}"
+                    dest = workspace_dir / "workspace_data" / f"{title}{file_ext}"
                     import shutil
                     shutil.copy(str(versioned_data), str(dest))
                     ASCIIColors.success(f"[ArtefactManager] ✓ Synced data file: {title}{file_ext}")
                     synced_files.append(str(dest.resolve()))
                 else:
-                    # Try unversioned copy in discussion workspace
-                    unversioned = workspace_dir / f"{title}{file_ext}"
+                    # Try unversioned copy in discussion workspace_data
+                    unversioned = workspace_dir / "workspace_data" / f"{title}{file_ext}"
                     if unversioned.exists():
                         ASCIIColors.info(f"[ArtefactManager] ✓ Found unversioned data file: {title}{file_ext}")
                         synced_files.append(str(unversioned.resolve()))
@@ -2740,8 +2741,7 @@ class ArtefactManager:
         Returns:
             The created artifact dictionary.
         """
-        from pathlib import Path as PathLib
-        path = PathLib(file_path)
+        path = Path(file_path)
 
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")

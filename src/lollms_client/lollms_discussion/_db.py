@@ -149,7 +149,16 @@ class LollmsDataManager:
             from sqlalchemy.pool import StaticPool
             engine_kwargs["poolclass"] = StaticPool
         self.engine = create_engine(db_path, **engine_kwargs)
-        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+
+        # ── 🛡️ PREVENT DETACHED INSTANCE ERRORS ──
+        # Disable expire_on_commit so that all attributes (id, metadata, system_prompt)
+        # remain fully loaded in-memory after committing and closing the session.
+        self.SessionLocal = sessionmaker(
+            autocommit=False, 
+            autoflush=False, 
+            bind=self.engine,
+            expire_on_commit=False
+        )
         self.create_and_migrate_tables()
 
     def discussion_exists(self, discussion_id: str) -> bool:
