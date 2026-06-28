@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from ascii_colors import ASCIIColors, trace_exception
 
 from lollms_client.lollms_utilities import build_image_dicts
-from ._artefacts import ArtefactType
+from lollms_client.lollms_artefact import ArtefactType
 import ascii_colors as logging
 
 # Create module-level loggers for easy access
@@ -829,13 +829,14 @@ class UtilsMixin:
 
         for art in active_artefacts:
             atype = art.get('type', 'document')
-            content = art.get('content', '').strip()
+            # Extract logical .lam content for data/structured files to ensure token audits align with LLM vision
+            content = self.artefacts._get_lam_content(art).strip()
             if not content and not art.get('url'):
                 continue
 
             art_tokens = art.get("token_count")
-            if art_tokens is None:
-                # Fallback if cache is missing (first run / legacy database)
+            # Always recalculate or use cached .lam tokens for data artifacts
+            if art_tokens is None or atype == ArtefactType.DATA:
                 lang = art.get('language') or ''
                 header = f"###[{atype.capitalize()}] {art['title']} (v{art['version']})\n"
                 fence = f"```{lang}\n{content}\n```" if content else ""

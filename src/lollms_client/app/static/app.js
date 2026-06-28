@@ -2176,7 +2176,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     // Mask <lollms_inline>
                     const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
                     maskedText = maskedText.replace(inlinePattern, (match) => {
-                        const id = `__WIDGET_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+                        const id = `WIDGETPLACEHOLDER${Math.random().toString(36).substr(2, 9)}XYZ`;
                         placeholders[id] = match;
                         return id;
                     });
@@ -2184,7 +2184,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     // Mask <lollms_form>
                     const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
                     maskedText = maskedText.replace(formPattern, (match) => {
-                        const id = `__FORM_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
+                        const id = `FORMPLACEHOLDER${Math.random().toString(36).substr(2, 9)}XYZ`;
                         placeholders[id] = match;
                         return id;
                     });
@@ -6792,55 +6792,215 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!text) return "";
         let cleanedText = runMarkdownCleanup(text);
 
+        const stableMsgId = msgId || "temp";
+        let placeholderCounter = 0;
         const placeholders = {};
+        function addPlaceholder(originalHtml) {
+            // Use strictly alphanumeric IDs to prevent Markdown compilers from parsing underscores or asterisks
+            const id = `SPECIALTAGPLACEHOLDER${placeholderCounter++}XYZ`;
+            placeholders[id] = originalHtml;
+            return id;
+        }
 
-        // Render unclosed streaming tags nicely as subtle, non-flickering, code-like blocks with an active loading indicator at the bottom
+        // Mask <artifact> or <artefact> unclosed tags first
         cleanedText = cleanedText.replace(/<(artifact|artefact)\s+([^>]*?)>([\s\S]*?)$/gi, (match, tag, attrsStr, innerBody) => {
             const attrs = {};
             attrsStr.replace(/(\w+)=["\']([^"\']*)["\']/g, (m, k, v) => attrs[k] = v);
             const title = attrs.name || attrs.title || "Resource";
             const type = attrs.type || "document";
 
-            // Mask this HTML component immediately to prevent markdown parser from escaping its tags
-            const uniqueId = `UNCLOSED_ART_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
             const html = `
                 <div class="failed-image-card" style="border-color: var(--accent-color); background-color: rgba(245, 158, 11, 0.02); margin: 12px 0; border: 1px solid var(--border-color); border-radius: 8px; padding: 16px;">
                     <div class="failed-image-header" style="color: var(--accent-color); font-weight: bold; margin-bottom: 8px; font-size: 11px; text-transform: uppercase;">⏳ Building ${type.toUpperCase()}: ${title}...</div>
                     <pre style="background-color: #020617; border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 11.5px; color: #cbd5e1; white-space: pre-wrap; margin: 0; line-height: 1.5; max-height: 240px; overflow-y: auto;">${innerBody}</pre>
                 </div>
             `;
-            placeholders[uniqueId] = html;
-            return uniqueId;
+            return addPlaceholder(html);
         });
 
-        const processedText = resolveProcessingTags(cleanedText, msgId);
+        // Mask <think> blocks (closed or unclosed)
+        const thinkRegex = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
+        cleanedText = cleanedText.replace(thinkRegex, (match, bodyText) => {
+            const isClosed = match.toLowerCase().endsWith("</think>");
+            const stateKey = `${stableMsgId}-think`;
+            const hasState = window.accordionOpenStates[stateKey] !== undefined;
+            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : (isClosed ? "" : "open");
 
-        let maskedText = processedText;
+            const timerHtml = isClosed ? "" : ` <span class="active-thinking-timer" style="font-size: 11.5px; opacity: 0.8; font-weight: bold; margin-left: 4px;">(0.0s)</span> <span class="spinner inline" style="margin-left: 6px;"></span>`;
+            const headerText = isClosed ? "💭 Thought Process / Reasoning" : "💭 Thinking...";
 
-        // 1. Mask <lollms_inline> with unique cryptographic placeholder tokens to avoid collisions
-        const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
-        maskedText = maskedText.replace(inlinePattern, (match) => {
-            const uniqueId = `WIDGET_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-            placeholders[uniqueId] = match;
-            return uniqueId;
+            const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
+
+            if (isClosed && thinkingTimerId) {
+                clearInterval(thinkingTimerId);
+                thinkingTimerId = null;
+                thinkingStartTime = null;
+            }
+
+            const html = `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.15); display: block;"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;"><span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span><span>${headerText}${timerHtml}</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
+            return addPlaceholder(html);
         });
 
-        // 2. Mask <lollms_form> with unique cryptographic placeholder tokens
-        const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
-        maskedText = maskedText.replace(formPattern, (match) => {
-            const uniqueId = `FORM_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-            placeholders[uniqueId] = match;
-            return uniqueId;
+        // Mask <processing> blocks (closed or unclosed)
+        const procRegex = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;
+        cleanedText = cleanedText.replace(procRegex, (match, attrsStr, bodyText) => {
+            const attrs = {};
+            attrsStr.replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => attrs[k] = v);
+
+            const procTitle = attrs.title || attrs.tool || attrs.type || "Task";
+            const titleText = procTitle.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
+
+            const isClosed = match.toLowerCase().endsWith("</processing>");
+            const stateKey = `${stableMsgId}-proc-${placeholderCounter}`;
+            const hasState = window.accordionOpenStates[stateKey] !== undefined;
+            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ""; // Collapse by default
+
+            const lines = bodyText.trim().split("\n");
+            let paramsHtml = "";
+            if (attrs.params) {
+                try {
+                    const unescapedParams = attrs.params.replace(/&quot;/g, '"');
+                    const parsedParams = JSON.parse(unescapedParams);
+                    const paramEntries = Object.entries(parsedParams).map(([key, val]) => {
+                        if (key === "code" && typeof val === "string") {
+                            return `<strong>💻 Python Code:</strong><pre style="background-color:#020617; border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-top:4px; font-family:monospace; white-space:pre-wrap; color:#cbd5e1;">${val}</pre>`;
+                        }
+                        return `<strong>⚙️ ${key}:</strong> <code style="font-family:monospace; background-color:#020617; padding:2px 4px; border-radius:4px; color:#cbd5e1;">${JSON.stringify(val)}</code>`;
+                    }).join("<br/>");
+
+                    if (paramEntries) {
+                        paramsHtml = `<div class="proc-item-no-bullet"><details class="proc-params-details" style="margin-top:6px; outline:none;"><summary style="cursor:pointer; font-weight:bold; outline:none; user-select:none;">🔧 Tool Parameters / Arguments</summary><div style="margin-top:8px; font-size:11.5px; line-height:1.5;">${paramEntries}</div></details></div>`;
+                    }
+                } catch(e) {
+                    console.error("Failed to parse tool parameters for display:", e);
+                }
+            }
+
+            let statusItems = "";
+            let jsonOutputBlock = "";
+            if (isClosed) {
+                let parsedJsonData = null;
+                const fullBody = lines.join("\n");
+                const jsonMatch = fullBody.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                    try {
+                        parsedJsonData = JSON.parse(jsonMatch[0].trim());
+                        const beforeJson = fullBody.split(jsonMatch[0])[0] || "";
+                        const afterJson = fullBody.split(jsonMatch[0])[1] || "";
+                        const cleanLinesBefore = beforeJson.trim().split("\n").filter(l => l.trim() && !l.trim().startsWith("{"));
+                        const cleanLinesAfter = afterJson.trim().split("\n").filter(l => l.trim() && !l.trim().endsWith("}"));
+                        statusItems = [...cleanLinesBefore, ...cleanLinesAfter].map(line => {
+                            const clean = line.replace(/^\*\s*/, "").trim();
+                            if (!clean || clean === "Output Logs:") return "";
+                            return `<div class="proc-item complete">✓ ${clean}</div>`;
+                        }).filter(x => x !== "").join("");
+                    } catch(e) {
+                        parsedJsonData = null;
+                    }
+                }
+
+                if (!parsedJsonData) {
+                    statusItems = lines.map(line => {
+                        const clean = line.replace(/^\*\s*/, "").trim();
+                        if (!clean || clean === "Output Logs:") return "";
+                        return `<div class="proc-item complete">✓ ${clean}</div>`;
+                    }).filter(x => x !== "").join("");
+                }
+
+                if (parsedJsonData) {
+                    let plotImageHtml = "";
+                    const formattedRows = Object.entries(parsedJsonData).map(([key, val]) => {
+                        const isBase64Key = key.toLowerCase().includes("b64") || key.toLowerCase().includes("image");
+                        const isB64String = typeof val === "string" && val.length > 300 && (val.startsWith("iVBOR") || val.startsWith("data:"));
+
+                        if (isBase64Key || isB64String) {
+                            const cleanB64 = val.startsWith("data:") ? val : `data:image/png;base64,${val.replace(/\s+/g, '')}`;
+                            plotImageHtml = `
+                                <div class="proc-item-no-bullet" style="margin-top: 10px; width: 100%; display: flex; flex-direction: column; gap: 4px;">
+                                    <span style="font-size: 11px; font-weight: bold; color: var(--accent-color); text-transform: uppercase;">📊 Rendered Visualization Output</span>
+                                    <img src="${cleanB64}" class="query-plot-img" style="display: block; max-width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--border-color); box-shadow: var(--shadow-lg); margin-top: 4px;" />
+                                </div>
+                            `;
+                            return `
+                                <div class="proc-item-no-bullet" style="display: flex; flex-direction: column; gap: 2px;">
+                                    <span style="font-weight: bold; color: var(--success-color); display: flex; align-items: center; gap: 4px;">✓ ${key}:</span>
+                                    <code style="font-family: monospace; background-color: #020617; padding: 2px 6px; border-radius: 4px; color: var(--text-secondary); font-size: 11.5px; display: inline-block; width: max-content;">[base64 image data truncated & rendered below]</code>
+                                </div>
+                            `;
+                        }
+
+                        const displayValue = typeof val === "object" ? JSON.stringify(val) : val;
+                        return `
+                            <div class="proc-item-no-bullet" style="display: flex; flex-direction: column; gap: 2px;">
+                                <span style="font-weight: bold; color: var(--success-color); display: flex; align-items: center; gap: 4px;">✓ ${key}:</span>
+                                <code style="font-family: monospace; background-color: #020617; padding: 2px 6px; border-radius: 4px; color: #cbd5e1; font-size: 11.5px; display: inline-block; width: max-content;">${displayValue}</code>
+                            </div>
+                        `;
+                    }).join("");
+
+                    jsonOutputBlock = `
+                        <div class="proc-item-no-bullet" style="margin-top: 10px; border-top: 1px dashed var(--border-color); padding-top: 10px; width: 100%;">
+                            <span style="font-size: 11px; font-weight: bold; color: var(--success-color); text-transform: uppercase; display: block; margin-bottom: 8px;">📊 Output Parameters / Return Value</span>
+                            <div style="display: flex; flex-direction: column; gap: 8px; padding-left: 10px; border-left: 2px solid var(--success-color);">
+                                ${formattedRows}
+                            </div>
+                            ${plotImageHtml}
+                        </div>
+                    `;
+                }
+
+                if (paramsHtml) {
+                    statusItems = paramsHtml + statusItems;
+                }
+                if (jsonOutputBlock) {
+                    statusItems = statusItems + jsonOutputBlock;
+                }
+
+                const html = `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
+                    <summary class="proc-accordion-header complete" style="cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
+                    <span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
+                    <span>✅ ${titleText} (Complete)</span>
+                    </summary>
+                    <div class="proc-accordion-content" style="background-color: #020617; padding: 12px 14px;">
+                    ${statusItems}
+                    </div>
+                    </details>`;
+                return addPlaceholder(html);
+            } else {
+                let statusItems = lines.map(line => {
+                    const clean = line.replace(/^\*\s*/, "").strip ? line.replace(/^\*\s*/, "").strip() : line.replace(/^\*\s*/, "").trim();
+                    if (!clean || clean === "Output Logs:") return "";
+                    return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
+                }).filter(x => x !== "").join("");
+
+                if (paramsHtml) {
+                    statusItems = paramsHtml + statusItems;
+                }
+
+                const html = `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
+                    <summary class="proc-accordion-header" style="cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
+                    <span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
+                    <span>⚙️ ${titleText}...</span>
+                    <span class="spinner inline"></span>
+                    </summary>
+                    <div class="proc-accordion-content" style="background-color: #020617; padding: 12px 14px;">
+                    ${statusItems}
+                    </div>
+                    </details>`;
+                return addPlaceholder(html);
+            }
         });
 
-        // 3. Mask <tool_call> with unique cryptographic placeholder tokens BEFORE markdown compile steps
-        const toolCallPattern = /<tool_call>(.*?)<\/tool_call>/gi;
-        let toolCallCount = 0;
-        maskedText = maskedText.replace(toolCallPattern, (match, bodyText) => {
+        // Mask <tool_call> blocks (closed or unclosed)
+        const toolCallRegex = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/gi;
+        cleanedText = cleanedText.replace(toolCallRegex, (match, bodyText) => {
+            const isClosed = match.toLowerCase().endsWith("</tool_call>");
             let toolName = "Unknown Tool";
             let paramsHtml = "";
+            const trimmedBody = bodyText.trim();
+            
             try {
-                const data = JSON.parse(bodyText.trim());
+                const data = JSON.parse(trimmedBody);
                 toolName = data.name || "Unknown Tool";
                 if (data.parameters) {
                     paramsHtml = Object.entries(data.parameters).map(([k, v]) => {
@@ -6848,57 +7008,63 @@ document.addEventListener("DOMContentLoaded", () => {
                     }).join("<br/>");
                 }
             } catch (e) {
-                const nameMatch = bodyText.match(/"name"\s*:\s*"([^"]+)"/);
+                const nameMatch = trimmedBody.match(/"name"\s*:\s*"([^"]+)"/);
                 if (nameMatch) {
                     toolName = nameMatch[1];
+                } else {
+                    toolName = "Executing Tool...";
                 }
-                paramsHtml = `<pre style="color: #94a3b8; font-size: 11px; font-family: monospace; white-space: pre-wrap; margin-top: 4px;">${bodyText.trim()}</pre>`;
+                paramsHtml = `<pre style="color: #94a3b8; font-size: 11px; font-family: monospace; white-space: pre-wrap; margin-top: 4px;">${trimmedBody}</pre>`;
             }
 
-            const stateKey = `${msgId || 'temp'}-tool-call-${toolCallCount}`;
-            toolCallCount++;
-
+            const stateKey = `${stableMsgId}-tool-call-${placeholderCounter}`;
             const hasState = window.accordionOpenStates[stateKey] !== undefined;
-            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ""; // Collapse by default
+            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : "open"; // Keep open by default while running
 
-            // Generate the finished details block as the original string to replace back
+            const timerHtml = isClosed ? "" : ` <span class="active-thinking-timer" style="font-size: 11.5px; opacity: 0.8; font-weight: bold; margin-left: 4px;">(0.0s)</span> <span class="spinner inline" style="margin-left: 6px;"></span>`;
+            const headerText = isClosed ? `🛠️ Tool Execution: ${toolName}` : `🛠️ Invoking Tool: ${toolName}...`;
+
             const accordionHtml = `
                 <details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(245, 158, 11, 0.25); display: block; margin: 12px 0;">
                     <summary class="proc-accordion-header" style="color: #f59e0b; background-color: rgba(245, 158, 11, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px; font-weight: bold;">
                         <span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
-                        <span>🛠️ Tool Execution: ${toolName}</span>
+                        <span>${headerText}${timerHtml}</span>
                     </summary>
                     <div class="proc-accordion-content" style="background-color: #020617; padding: 12px 14px; font-family: sans-serif; font-size: 12.5px; line-height: 1.5; color: var(--text-primary);">
                         ${paramsHtml || "No parameters provided."}
                     </div>
                 </details>
             `;
-
-            const uniqueId = `TOOLCALL_${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-            placeholders[uniqueId] = accordionHtml;
-            return uniqueId;
+            return addPlaceholder(accordionHtml);
         });
 
-        // 4. Parse Markdown using marked.js
-        const parsedMarkdown = marked.parse(maskedText);
+        // Mask <lollms_inline>
+        const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
+        cleanedText = cleanedText.replace(inlinePattern, (match) => {
+            return addPlaceholder(match);
+        });
 
-        // 4. Restore the masked XML blocks back into the compiled HTML output
+        // Mask <lollms_form>
+        const formPattern = /<lollms_form\s*([^>]*)>([\s\S]*?)<\/lollms_form>/gi;
+        cleanedText = cleanedText.replace(formPattern, (match) => {
+            return addPlaceholder(match);
+        });
+
+        // Now parse the unmasked plain markdown text!
+        const parsedMarkdown = marked.parse(cleanedText);
+
+        // Restore the masked placeholders back into the generated HTML!
         let restoredHTML = parsedMarkdown;
         for (const [id, original] of Object.entries(placeholders)) {
-            // Fuzzy Match: Check if the placeholder is nested ANYWHERE inside a markdown code block (<pre><code...>...ID...</code></pre>)
             const wrappedPattern = new RegExp(`<pre>\\s*<code[^>]*>[\\s\\S]*?(${id})[\\s\\S]*?</code>\\s*</pre>`, "gi");
             if (wrappedPattern.test(restoredHTML)) {
-                // De-wrap completely: replace the entire code block with the native, functional XML block
                 restoredHTML = restoredHTML.replace(wrappedPattern, original);
             } else {
                 restoredHTML = restoredHTML.split(id).join(original);
             }
         }
 
-        // Clean up any unclosed or orphaned trailing details/summary tags safely
-        restoredHTML = restoredHTML.replace(/<\/details>\s*<\/details>/g, "</details>");
-
-        // 5. Intercept and replace the stable Lollms Artifact Anchors with beautiful, non-flickering UI File Cards
+        // Apply remaining shims (like artifact stripped labels or image links)
         const strippedPattern = /<lollms_artifact\s+([^>]*?)(?:\/>|>)/gi;
         restoredHTML = restoredHTML.replace(strippedPattern, (match, attrsStr) => {
             const attrs = {};
@@ -6949,24 +7115,6 @@ document.addEventListener("DOMContentLoaded", () => {
                         <button class="btn btn-secondary select-workspace-art" onclick="window.selectArtifactGlobal('${encodeURIComponent(artTitle)}')" style="width: auto; padding: 4px 10px; font-size: 11px; margin: 0; border-radius: 4px; font-weight: bold; background-color: var(--border-color); color: var(--text-primary);">👁️ View File</button>
                     </div>
                 </div>
-            `;
-        });
-
-        // 6. Support double-bracket or unclosed think tag fallbacks cleanly
-        restoredHTML = restoredHTML.replace(/<think>([\s\S]*?)<\/think>/gi, (match, bodyText) => {
-            const stateKey = `${msgId || 'temp'}-think`;
-            const hasState = window.accordionOpenStates[stateKey] !== undefined;
-            const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ""; // Collapse by default
-            return `
-                <details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.25); display: block; margin: 12px 0;">
-                    <summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
-                        <span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
-                        <span>💭 Thought Process / Reasoning</span>
-                    </summary>
-                    <div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;">
-                        <pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${bodyText.trim()}</pre>
-                    </div>
-                </details>
             `;
         });
 
@@ -8105,6 +8253,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 filename = fileMatch[1];
             }
 
+            // Get raw code content before clearing
+            const codeText = codeEl.textContent.trim();
+
             // Create beautiful header bar
             const header = document.createElement("div");
             header.className = "code-utility-header";
@@ -8116,16 +8267,43 @@ document.addEventListener("DOMContentLoaded", () => {
                 </div>
             `;
 
-            pre.prepend(header);
+            // Clear pre/code content and setup CodeMirror container
+            pre.innerHTML = "";
+            pre.appendChild(header);
+
+            const cmContainer = document.createElement("div");
+            cmContainer.className = "cm-chat-code-container";
+            pre.appendChild(cmContainer);
+
+            // Instantiate CodeMirror in-place
+            const modeMap = {
+                "python": "python",
+                "xml": "xml",
+                "javascript": "javascript",
+                "js": "javascript",
+                "json": "javascript",
+                "css": "css",
+                "html": "htmlmixed"
+            };
+            const activeMode = modeMap[lang.toLowerCase()] || "text/plain";
+
+            const cm = CodeMirror(cmContainer, {
+                value: codeText,
+                mode: activeMode,
+                theme: "dracula",
+                lineNumbers: true,
+                readOnly: true,
+                lineWrapping: true,
+                tabSize: 4,
+            });
+
+            // Refresh the editor instance to ensure accurate line-height measurement
+            setTimeout(() => cm.refresh(), 50);
 
             // Bind Copy Click
             const copyBtn = header.querySelector(".copy-code-btn");
             copyBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
-
-                // Get clean raw text (excluding utility header text)
-                const codeText = codeEl.textContent;
-
                 navigator.clipboard.writeText(codeText).then(() => {
                     copyBtn.textContent = "✓ Copied!";
                     showNotification(`✓ Code copied to clipboard!`, "success", 2000);
@@ -8138,12 +8316,8 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             // Bind Download Click
-            const downloadBtn = header.querySelector(".btn-version-action") || header.querySelector(".download-art-btn") || header.querySelector(".btn") || header.querySelector(".code-editor-scroll-container") || header.querySelector(".code-run-output") || header.querySelector("button");
-            const finalDownloadBtn = header.querySelector(".btn-primary") || header.querySelector(".btn-secondary") || header.querySelector(".btn") || header.querySelector("button") || downloadBtn;
-
-            header.querySelector(".btn-primary, .btn-secondary, .btn, button, .code-action-btn:last-child").addEventListener("click", (e) => {
+            header.querySelector(".download-code-btn").addEventListener("click", (e) => {
                 e.stopPropagation();
-                const codeText = codeEl.textContent;
                 const blob = new Blob([codeText], { type: "text/plain" });
                 triggerBlobDownload(blob, filename);
                 showNotification(`✓ File '${filename}' downloaded!`, "success", 2000);
@@ -8230,216 +8404,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
 /**
  * Resolves closed and unclosed <processing> tags into collapsible timeline panels.
- * Run BEFORE marked.parse to prevent markdown list item corruption on nested lines.
+ * Deprecated alias, handled directly inside formatMessageContent via masking to prevent markdown mangling.
  */
 function resolveProcessingTags(content, msgId = null) {
-    if (!content) return "";
-
-    const stableMsgId = msgId || "temp";
-
-    // ── Render <think> tags elegantly with stable state-retention ──
-    const thinkPattern = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
-    content = content.replace(thinkPattern, (match, bodyText) => {
-        const escaped = bodyText.replace(/</g, "&lt;").replace(/>/g, "&gt;").trim();
-
-        const stateKey = `${stableMsgId}-think`;
-        const isClosed = match.toLowerCase().endsWith("</think>");
-
-        // If the thoughts are still actively streaming, keep them open so the user can see progress!
-        const hasState = window.accordionOpenStates[stateKey] !== undefined;
-        const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : (isClosed ? "" : "open");
-
-        // Embed live-ticking timer if active
-        const timerHtml = isClosed ? "" : ` <span class="active-thinking-timer" style="font-size: 11.5px; opacity: 0.8; font-weight: bold; margin-left: 4px;">(0.0s)</span> <span class="spinner inline" style="margin-left: 6px;"></span>`;
-        const headerText = isClosed ? "💭 Thought Process / Reasoning" : "💭 Thinking...";
-
-        // ── SCIENTIFIC RESOLUTION: Stop the background stopwatch immediately when </think> is closed ──
-        if (isClosed && thinkingTimerId) {
-            clearInterval(thinkingTimerId);
-            thinkingTimerId = null;
-            thinkingStartTime = null;
-        }
-
-        return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen} style="border-color: rgba(147, 51, 234, 0.15); display: block;"><summary class="proc-accordion-header" style="color: #c084fc; background-color: rgba(147, 51, 234, 0.05); cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;"><span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span><span>${headerText}${timerHtml}</span></summary><div class="proc-accordion-content" style="background-color: #020617; border-color: rgba(147, 51, 234, 0.15); padding: 12px 14px;"><pre style="color: #cbd5e1; font-family: inherit; font-size: 11.5px; white-space: pre-wrap; line-height: 1.5; margin: 0; padding: 0;">${escaped}</pre></div></details>`;
-    });
-
-    const procPattern = /<processing\s*([^>]*)>([\s\S]*?)(?:<\/processing>|$)/gi;
-    let procCount = 0;
-    return content.replace(procPattern, (match, attrsStr, bodyText) => {
-        const attrs = {};
-        attrsStr.replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => attrs[k] = v);
-
-        const procTitle = attrs.title || attrs.tool || attrs.type || "Task";
-        const titleText = procTitle.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
-
-        const isClosed = match.toLowerCase().endsWith("</processing>");
-
-        const stateKey = `${stableMsgId}-proc-${procCount}`;
-        procCount++;
-
-        // Defaults processing boxes to collapsed
-        const hasState = window.accordionOpenStates[stateKey] !== undefined;
-        const isOpen = hasState ? (window.accordionOpenStates[stateKey] ? "open" : "") : ""; // Collapse by default
-
-        // Extract multiline <details> blocks to placeholders so we don't chop them up with split('\n')
-        const detailsMap = new Map();
-        let tempBody = bodyText;
-        const detailsRegex = /<details[\s\S]*?<\/details>/gi;
-        tempBody = tempBody.replace(detailsRegex, (detailsMatch) => {
-            const id = `__DETAILS_PLACEHOLDER_${Math.random().toString(36).substr(2, 9)}__`;
-            detailsMap.set(id, detailsMatch);
-            return id;
-        });
-
-        const lines = tempBody.trim().split("\n");
-
-        let paramsHtml = "";
-        if (attrs.params) {
-            try {
-                const unescapedParams = attrs.params.replace(/&quot;/g, '"');
-                const parsedParams = JSON.parse(unescapedParams);
-                const paramEntries = Object.entries(parsedParams).map(([key, val]) => {
-                    if (key === "code" && typeof val === "string") {
-                        return `<strong>💻 Python Code:</strong><pre style="background-color:#020617; border:1px solid var(--border-color); border-radius:6px; padding:10px; margin-top:4px; font-family:monospace; white-space:pre-wrap; color:#cbd5e1;">${val}</pre>`;
-                    }
-                    return `<strong>⚙️ ${key}:</strong> <code style="font-family:monospace; background-color:#020617; padding:2px 4px; border-radius:4px; color:#cbd5e1;">${JSON.stringify(val)}</code>`;
-                }).join("<br/>");
-
-                if (paramEntries) {
-                    paramsHtml = `<div class="proc-item-no-bullet"><details class="proc-params-details" style="margin-top:6px; outline:none;"><summary style="cursor:pointer; font-weight:bold; outline:none; user-select:none;">🔧 Tool Parameters / Arguments</summary><div style="margin-top:8px; font-size:11.5px; line-height:1.5;">${paramEntries}</div></details></div>`;
-                }
-            } catch(e) {
-                console.error("Failed to parse tool parameters for display:", e);
-            }
-        }
-
-        if (isClosed) {
-            let statusItems = "";
-            let jsonOutputBlock = "";
-            let parsedJsonData = null;
-
-            // Attempt to capture, parse, and isolate JSON output block inside log lines
-            const fullBody = lines.join("\n");
-            const jsonMatch = fullBody.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                try {
-                    parsedJsonData = JSON.parse(jsonMatch[0].trim());
-                    // Extract and strip JSON block from the standard text lines
-                    const beforeJson = fullBody.split(jsonMatch[0])[0] || "";
-                    const afterJson = fullBody.split(jsonMatch[0])[1] || "";
-
-                    const cleanLinesBefore = beforeJson.trim().split("\n").filter(l => l.trim() && !l.trim().startsWith("{"));
-                    const cleanLinesAfter = afterJson.trim().split("\n").filter(l => l.trim() && !l.trim().endsWith("}"));
-
-                    statusItems = [...cleanLinesBefore, ...cleanLinesAfter].map(line => {
-                        const clean = line.replace(/^\*\s*/, "").trim();
-                        if (!clean || clean === "Output Logs:") return "";
-                        if (detailsMap.has(clean)) return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
-                        return `<div class="proc-item complete">✓ ${clean}</div>`;
-                    }).filter(x => x !== "").join("");
-                } catch(e) {
-                    parsedJsonData = null;
-                }
-            }
-
-            if (!parsedJsonData) {
-                // Fallback standard line-by-line renderer
-                statusItems = lines.map(line => {
-                    const clean = line.replace(/^\*\s*/, "").trim();
-                    if (!clean || clean === "Output Logs:") return "";
-                    if (detailsMap.has(clean)) return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
-                    if (clean.startsWith("<details>")) return `<div class="proc-item-no-bullet">${clean}</div>`;
-                    return `<div class="proc-item complete">✓ ${clean}</div>`;
-                }).filter(x => x !== "").join("");
-            }
-
-            // ── Format Output Parameters like Input ones ──
-            if (parsedJsonData) {
-                let plotImageHtml = "";
-                const formattedRows = Object.entries(parsedJsonData).map(([key, val]) => {
-                    // Check if value is a massive base64 image string (plot_b64, image_b64)
-                    const isBase64Key = key.toLowerCase().includes("b64") || key.toLowerCase().includes("image");
-                    const isB64String = typeof val === "string" && val.length > 300 && (val.startsWith("iVBOR") || val.startsWith("data:"));
-
-                    if (isBase64Key || isB64String) {
-                        const cleanB64 = val.startsWith("data:") ? val : `data:image/png;base64,${val.replace(/\s+/g, '')}`;
-                        plotImageHtml = `
-                            <div class="proc-item-no-bullet" style="margin-top: 10px; width: 100%; display: flex; flex-direction: column; gap: 4px;">
-                                <span style="font-size: 11px; font-weight: bold; color: var(--accent-color); text-transform: uppercase;">📊 Rendered Visualization Output</span>
-                                <img src="${cleanB64}" class="query-plot-img" style="display: block; max-width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--border-color); box-shadow: var(--shadow-lg); margin-top: 4px;" />
-                            </div>
-                        `;
-                        // Omit the massive raw base64 string spam from the grid list
-                        return `
-                            <div class="proc-item-no-bullet" style="display: flex; flex-direction: column; gap: 2px;">
-                                <span style="font-weight: bold; color: var(--success-color); display: flex; align-items: center; gap: 4px;">✓ ${key}:</span>
-                                <code style="font-family: monospace; background-color: #020617; padding: 2px 6px; border-radius: 4px; color: var(--text-secondary); font-size: 11.5px; display: inline-block; width: max-content;">[base64 image data truncated & rendered below]</code>
-                            </div>
-                        `;
-                    }
-
-                    // Format standard primitive keys using input parameters style
-                    const displayValue = typeof val === "object" ? JSON.stringify(val) : val;
-                    return `
-                        <div class="proc-item-no-bullet" style="display: flex; flex-direction: column; gap: 2px;">
-                            <span style="font-weight: bold; color: var(--success-color); display: flex; align-items: center; gap: 4px;">✓ ${key}:</span>
-                            <code style="font-family: monospace; background-color: #020617; padding: 2px 6px; border-radius: 4px; color: #cbd5e1; font-size: 11.5px; display: inline-block; width: max-content;">${displayValue}</code>
-                        </div>
-                    `;
-                }).join("");
-
-                jsonOutputBlock = `
-                    <div class="proc-item-no-bullet" style="margin-top: 10px; border-top: 1px dashed var(--border-color); padding-top: 10px; width: 100%;">
-                        <span style="font-size: 11px; font-weight: bold; color: var(--success-color); text-transform: uppercase; display: block; margin-bottom: 8px;">📊 Output Parameters / Return Value</span>
-                        <div style="display: flex; flex-direction: column; gap: 8px; padding-left: 10px; border-left: 2px solid var(--success-color);">
-                            ${formattedRows}
-                        </div>
-                        ${plotImageHtml}
-                    </div>
-                `;
-            }
-
-            if (paramsHtml) {
-                statusItems = paramsHtml + statusItems;
-            }
-            if (jsonOutputBlock) {
-                statusItems = statusItems + jsonOutputBlock;
-            }
-
-            return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
-<summary class="proc-accordion-header complete" style="cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
-<span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
-<span>✅ ${titleText} (Complete)</span>
-</summary>
-<div class="proc-accordion-content" style="background-color: #020617; padding: 12px 14px;">
-${statusItems}
-</div>
-</details>`;
-        } else {
-            let statusItems = lines.map(line => {
-                const clean = line.replace(/^\*\s*/, "").trim();
-                if (!clean || clean === "Output Logs:") return "";
-                if (detailsMap.has(clean)) return `<div class="proc-item-no-bullet">${detailsMap.get(clean)}</div>`;
-                if (clean.startsWith("<details>")) return `<div class="proc-item-no-bullet">${clean}</div>`;
-                return `<div class="proc-item">⤷ ⏳ ${clean}</div>`;
-            }).filter(x => x !== "").join("");
-
-            if (paramsHtml) {
-                statusItems = paramsHtml + statusItems;
-            }
-
-            return `<details class="inline-proc-accordion" id="${stateKey}" ${isOpen}>
-<summary class="proc-accordion-header" style="cursor: pointer; outline: none; display: flex; align-items: center; gap: 8px;">
-<span class="chevron" style="transition: transform 0.2s; display: inline-block;">▶</span>
-<span>⚙️ ${titleText}...</span>
-<span class="spinner inline"></span>
-</summary>
-<div class="proc-accordion-content" style="background-color: #020617; padding: 12px 14px;">
-${statusItems}
-</div>
-</details>`;
-        }
-    });
+    return content;
 }
 
 /**

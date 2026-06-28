@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-28 23:39]
+
+- refactor(discussion): reorganize discussion mixins and cleanup artefacts logic
+
 ## [2026-06-28 22:30]
 
 - feat(discussion): refine artefact visibility defaults and clean up tool call blocks

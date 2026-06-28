@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 import shutil
 
-from lollms_client.lollms_discussion._data_files import _parse_data_file
+from lollms_client.lollms_artefact.data_files import _parse_data_file
 
 class TestLollmsDataFiles(unittest.TestCase):
     def setUp(self):

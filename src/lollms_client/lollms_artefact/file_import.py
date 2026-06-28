@@ -68,8 +68,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors
 
-from ._artefacts import ArtefactType, make_image_id
-from ._data_files import _parse_data_file
+from .lollms_artefact import ArtefactType, make_image_id
+from .data_files import _parse_data_file
 
 if TYPE_CHECKING:
     from lollms_discussion import LollmsDiscussion

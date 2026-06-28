@@ -349,7 +349,7 @@ def tool_filter_and_slice_data(
         total_matching_rows = len(df)
         preview_df = df.head(limit)
         
-        from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+        from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
         markdown_table = _dataframe_to_markdown(preview_df)
 
         # Handle file persistence & new artifact registration
@@ -426,7 +426,7 @@ def tool_get_unique_values(
         for val, count in counts.items():
             unique_list.append({"value": str(val), "count": int(count)})
 
-        from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+        from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
         import pandas as pd
         counts_df = pd.DataFrame(unique_list)
         md_table = _dataframe_to_markdown(counts_df)
@@ -502,7 +502,7 @@ def tool_compute_column_aggregations(
 
             res_df = pd.DataFrame([{"operation": op, "column": metric_column, "result": float(val)}])
 
-        from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+        from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
         md_table = _dataframe_to_markdown(res_df)
 
         return {
@@ -580,7 +580,7 @@ def tool_query_database_sql(
             df_res = pd.read_sql_query(sql_query, conn)
             conn.close()
 
-            from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+            from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
             md_table = _dataframe_to_markdown(df_res)
             return {
                 "success": True,
@@ -873,7 +873,7 @@ def tool_query_database_sql(
             df_res = pd.read_sql_query(sql_query, conn)
             conn.close()
 
-            from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+            from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
             md_table = _dataframe_to_markdown(df_res)
             return {
                 "success": True,

@@ -595,7 +595,7 @@ async def import_sql_connection_endpoint(payload: SQLConnectionImportRequest):
             json.dump(conn_info, f, indent=2)
 
         # 3. Test Connection and Extract Schema
-        from lollms_client.lollms_discussion._data_files import _parse_data_file
+        from lollms_client.lollms_artefact.data_files import _parse_data_file
         schema, _ = _parse_data_file(file_path, title_clean, version=1)
 
         # Append description if provided
@@ -924,7 +924,7 @@ async def raw_sql_query_endpoint(title: str, payload: RawSQLQueryRequest):
             raise FileNotFoundError(f"Raw data file is missing.")
 
         if ext == ".sqlconn":
-            from lollms_client.lollms_discussion._data_files import _get_sqlalchemy_engine_from_file
+            from lollms_client.lollms_artefact.data_files import _get_sqlalchemy_engine_from_file
             from sqlalchemy import text
             engine, dialect = _get_sqlalchemy_engine_from_file(file_path)
 
@@ -1105,7 +1105,7 @@ async def ai_data_query_endpoint(title: str, payload: AIDataQueryRequest):
             raise FileNotFoundError(f"Raw data file is missing.")
 
         if ext == ".sqlconn":
-            from lollms_client.lollms_discussion._data_files import _get_sqlalchemy_engine_from_file
+            from lollms_client.lollms_artefact.data_files import _get_sqlalchemy_engine_from_file
             from sqlalchemy import text
             engine, dialect = _get_sqlalchemy_engine_from_file(file_path)
 
@@ -2999,7 +2999,7 @@ async def get_data_grid(title: str, version: Optional[int] = None):
     import pandas as pd
     try:
         if ext == ".sqlconn":
-            from lollms_client.lollms_discussion._data_files import _get_sqlalchemy_engine_from_file
+            from lollms_client.lollms_artefact.data_files import _get_sqlalchemy_engine_from_file
             from sqlalchemy import inspect
             engine, dialect = _get_sqlalchemy_engine_from_file(file_path)
             inspector = inspect(engine)

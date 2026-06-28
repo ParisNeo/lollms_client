@@ -44,7 +44,7 @@ def tool_execute_sparql_query(
         sparql_query (str): The valid SPARQL 1.1 query to execute (SELECT, ASK, CONSTRUCT).
     """
     import rdflib
-    from lollms_client.lollms_discussion._data_files import _dataframe_to_markdown
+    from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
     import pandas as pd
 
     workspace_dir = _get_workspace_dir()

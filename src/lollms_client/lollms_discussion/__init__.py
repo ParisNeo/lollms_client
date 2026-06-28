@@ -20,7 +20,17 @@
 
 from ._db        import EncryptedString, create_dynamic_models, LollmsDataManager
 from ._message   import LollmsMessage
-from ._artefacts import ArtefactType, ArtefactManager
+
+# Import artefacts subsystem components from the new sibling package
+from lollms_client.lollms_artefact import (
+    ArtefactType,
+    ArtefactVisibility,
+    ArtefactStatus,
+    ArtefactManager,
+    FileImportMixin,
+    InternetImportMixin,
+    ExportMixin
+)
 
 from ._mixin_core   import CoreMixin
 from ._mixin_prompt import PromptMixin
@@ -28,9 +38,6 @@ from ._mixin_chat   import ChatMixin
 from ._mixin_utils  import UtilsMixin
 from ._mixin_branch import BranchMixin, BranchInfo, MessageNode
 from ._mixin_memory import MemoryMixin
-from ._mixin_file_import import FileImportMixin
-from ._mixin_internet_import import InternetImportMixin
-from ._mixin_export import ExportMixin
 
 class LollmsDiscussion(CoreMixin, PromptMixin, ChatMixin, UtilsMixin, BranchMixin, MemoryMixin, FileImportMixin, InternetImportMixin, ExportMixin):
     """

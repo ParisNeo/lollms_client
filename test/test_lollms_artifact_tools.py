@@ -216,7 +216,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
             json.dump(conn_info, f, indent=2)
 
         # 3. Test schema parsing on .sqlconn file
-        from lollms_client.lollms_discussion._data_files import _parse_data_file
+        from lollms_client.lollms_artefact.data_files import _parse_data_file
         schema, _ = _parse_data_file(sqlconn_path, "my_external_db", version=1)
 
         self.assertIn("Format: Remote Relational Database (sqlite)", schema)

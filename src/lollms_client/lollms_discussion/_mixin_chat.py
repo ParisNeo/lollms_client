@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE
 from ._message import LollmsMessage
-from ._artefacts import ArtefactType, make_image_id
+from lollms_client.lollms_artefact import ArtefactType, make_image_id
 from lollms_client.lollms_memory import FailureMemory
 # ── Cancellation state & limits ──────────────────────────────────────────────
 _MAX_BRACKET_BUF = 256
@@ -1396,8 +1396,309 @@ class ChatMixin:
                                 call_kwargs["discussion_instance"] = self
                                 call_kwargs["lollms_client_instance"] = self.lollmsClient
 
+                                # ── Take BEFORE Snapshot ──
+                                files_before = {}
+                                current_cwd = Path(workspace_dir_str)
+                                if current_cwd.exists():
+                                    for f in current_cwd.rglob("*"):
+                                        if f.is_file():
+                                            try:
+                                                rel_path = f.relative_to(current_cwd)
+                                                content = f.read_text(encoding="utf-8", errors="ignore")
+                                                files_before[rel_path] = {
+                                                    "hash": hash(content),
+                                                    "mtime": f.stat().st_mtime,
+                                                    "path": f,
+                                                    "content": content
+                                                }
+                                            except Exception:
+                                                try:
+                                                    rel_path = f.relative_to(current_cwd)
+                                                    files_before[rel_path] = {
+                                                        "hash": None,
+                                                        "mtime": f.stat().st_mtime,
+                                                        "path": f,
+                                                        "content": None
+                                                    }
+                                                except Exception:
+                                                    pass
+
                                 # Execute directly (no thread) - LCP handles CWD internally
                                 tool_res = active_tools[tool_name]["callable"](**call_kwargs)
+
+                                # ── Take AFTER Snapshot and Auto-Sync Artifacts ──
+                                files_after = {}
+                                if current_cwd.exists():
+                                    for f in current_cwd.rglob("*"):
+                                        if f.is_file():
+                                            try:
+                                                rel_path = f.relative_to(current_cwd)
+                                                content = f.read_text(encoding="utf-8", errors="ignore")
+                                                files_after[rel_path] = {
+                                                    "hash": hash(content),
+                                                    "mtime": f.stat().st_mtime,
+                                                    "path": f,
+                                                    "content": content
+                                                }
+                                            except Exception:
+                                                try:
+                                                    rel_path = f.relative_to(current_cwd)
+                                                    files_after[rel_path] = {
+                                                        "hash": None,
+                                                        "mtime": f.stat().st_mtime,
+                                                        "path": f,
+                                                        "content": None
+                                                    }
+                                                except Exception:
+                                                    pass
+
+                                # Detect NEW/MODIFIED files
+                                new_files = set(files_after.keys()) - set(files_before.keys())
+                                ASCIIColors.info(f"[ChatMixin active_tools '{tool_name}'] Detected {len(new_files)} NEW files: {[str(f) for f in new_files]}")
+
+                                for rel_path in new_files:
+                                    file_info = files_after[rel_path]
+                                    file_name = rel_path.name
+                                    file_ext = rel_path.suffix.lower()
+                                    file_path = file_info["path"]
+                                    file_size = file_path.stat().st_size
+
+                                    # Determine Type
+                                    atype = "document"
+                                    if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+                                        atype = "code"
+                                    elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
+                                        atype = "data"
+                                    elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
+                                        atype = "document"
+                                    elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+                                        atype = "image"
+
+                                    # Check if Binary
+                                    EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
+                                                            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
+                                                            ".zip", ".tar", ".gz", ".pdf", ".docx"}
+
+                                    should_read_content = True
+                                    content_placeholder = None
+
+                                    if file_ext in EXPLICIT_BINARY_EXTS:
+                                        should_read_content = False
+                                        content_placeholder = (
+                                            f"### Data File Generated: `{file_name}`\n\n"
+                                            f"This file was created by the tool `{tool_name}`.\n"
+                                            f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
+                                            f"- **Size**: {file_size:,} bytes\n"
+                                            f"- **Location**: `./{file_name}`\n\n"
+                                            f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
+                                        )
+                                    elif file_info["content"] is None:
+                                        try:
+                                            with open(file_path, 'rb') as f:
+                                                chunk = f.read(1024)
+                                                if b'\x00' in chunk:
+                                                    should_read_content = False
+                                                    content_placeholder = (
+                                                        f"### Binary File Detected: `{file_name}`\n\n"
+                                                        f"This file appears to be binary (contains null bytes).\n"
+                                                        f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
+                                                        f"- **Size**: {file_size:,} bytes\n"
+                                                        f"- **Location**: `./{file_name}`\n\n"
+                                                        f"> **Action**: Download from Workspace Artifacts panel."
+                                                    )
+                                                else:
+                                                    forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
+                                                    file_info["content"] = forced_content
+                                                    should_read_content = True
+                                        except Exception as e:
+                                            should_read_content = False
+                                            content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
+
+                                    # Register
+                                    if not should_read_content and content_placeholder:
+                                        existing_art = self.artefacts.get(file_name)
+                                        if existing_art:
+                                            art = self.artefacts.update(
+                                                title=file_name,
+                                                new_content=content_placeholder,
+                                                new_type=atype,
+                                                active=True,
+                                                commit_message=f"Updated binary file reference by tool '{tool_name}'"
+                                            )
+                                        else:
+                                            art = self.artefacts.add(
+                                                title=file_name,
+                                                artefact_type=atype,
+                                                content=content_placeholder,
+                                                active=True,
+                                                commit_message=f"Created by tool '{tool_name}'"
+                                            )
+                                        ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
+                                        self.commit()
+
+                                        # Hydrate active turn list so we can pass base64 pixels to vision
+                                        if atype == "image" and file_info["content"] is None:
+                                            try:
+                                                import base64
+                                                raw_img = file_path.read_bytes()
+                                                img_b64 = base64.b64encode(raw_img).decode('utf-8')
+                                                self.artefacts.update(
+                                                    title=file_name,
+                                                    new_images=[img_b64],
+                                                    new_image_media_types=[f"image/{file_ext[1:]}"]
+                                                )
+                                                self.commit()
+                                                self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
+                                            except Exception as img_err:
+                                                ASCIIColors.warning(f"Failed to read image b64: {img_err}")
+
+                                        if self.active_branch_id:
+                                            ai_msg = self.get_message(self.active_branch_id)
+                                            if ai_msg:
+                                                if atype == "image":
+                                                    ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                                else:
+                                                    ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                                self.commit()
+                                        continue
+
+                                    # Handle Text/Readable Files
+                                    existing_art = self.artefacts.get(file_name)
+                                    if existing_art:
+                                        art = self.artefacts.update(
+                                            title=file_name,
+                                            new_content=file_info["content"],
+                                            new_type=atype,
+                                            active=True,
+                                            commit_message=f"Restored by tool '{tool_name}'"
+                                        )
+                                    else:
+                                        art = self.artefacts.add(
+                                            title=file_name,
+                                            artefact_type=atype,
+                                            content=file_info["content"],
+                                            active=True,
+                                            commit_message=f"Created by tool '{tool_name}'"
+                                        )
+                                    ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] ✨ Created NEW artifact from file: '{file_name}'")
+                                    self.commit()
+
+                                    if self.active_branch_id:
+                                        ai_msg = self.get_message(self.active_branch_id)
+                                        if ai_msg:
+                                            if atype == "image":
+                                                ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                            else:
+                                                ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                            self.commit()
+
+                                # Detect MODIFIED files
+                                common_files = set(files_after.keys()) & set(files_before.keys())
+                                for rel_path in common_files:
+                                    before_info = files_before[rel_path]
+                                    after_info = files_after[rel_path]
+                                    file_name = rel_path.name
+                                    file_ext = rel_path.suffix.lower()
+                                    file_path = after_info["path"]
+
+                                    content_changed = before_info.get("hash") != after_info.get("hash")
+                                    became_binary = before_info.get("content") is not None and after_info.get("content") is None
+                                    became_text = before_info.get("content") is None and after_info.get("content") is not None
+
+                                    if content_changed or became_binary or became_text:
+                                        if after_info["content"] is None:
+                                            content_placeholder = (
+                                                f"### Binary File Modified: `{file_name}`\n\n"
+                                                f"This file was updated by the tool `{tool_name}`.\n"
+                                                f"- **Type**: {file_ext.upper()} Binary/Data\n"
+                                                f"- **Location**: `./{file_name}`\n"
+                                                f"- **Size**: {file_path.stat().st_size:,} bytes\n\n"
+                                                f"You can download or view this file directly from the Workspace Artifacts panel."
+                                            )
+
+                                            existing_art = self.artefacts.get(file_name)
+                                            if existing_art:
+                                                art = self.artefacts.update(
+                                                    title=file_name,
+                                                    new_content=content_placeholder,
+                                                    new_type=atype,
+                                                    active=True,
+                                                    commit_message=f"Modified binary file by tool '{tool_name}'"
+                                                )
+                                            else:
+                                                art = self.artefacts.add(
+                                                    title=file_name,
+                                                    artefact_type=atype,
+                                                    content=content_placeholder,
+                                                    active=True,
+                                                    commit_message=f"Synced binary file by tool '{tool_name}'"
+                                                )
+                                            ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated binary file reference: '{file_name}'")
+                                            self.commit()
+
+                                            # Hydrate active turn list so we can pass base64 pixels to vision
+                                            if atype == "image":
+                                                try:
+                                                    import base64
+                                                    raw_img = file_path.read_bytes()
+                                                    img_b64 = base64.b64encode(raw_img).decode('utf-8')
+                                                    self.artefacts.update(
+                                                        title=file_name,
+                                                        new_images=[img_b64],
+                                                        new_image_media_types=[f"image/{file_ext[1:]}"]
+                                                    )
+                                                    self.commit()
+                                                    self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
+                                                except Exception as img_err:
+                                                    ASCIIColors.warning(f"Failed to read image b64: {img_err}")
+
+                                            if self.active_branch_id:
+                                                ai_msg = self.get_message(self.active_branch_id)
+                                                if ai_msg:
+                                                    if atype == "image":
+                                                        ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                                    else:
+                                                        ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                                    self.commit()
+                                            continue
+
+                                        # Handle Text/Readable Modified Files
+                                        existing_art = self.artefacts.get(file_name)
+                                        if existing_art:
+                                            atype = existing_art.get("type", "document")
+                                            if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
+                                                atype = "code"
+                                            elif file_ext in (".csv", ".db", ".sqlite", ".xlsx", ".xls"):
+                                                atype = "data"
+
+                                            art = self.artefacts.update(
+                                                title=file_name,
+                                                new_content=after_info["content"],
+                                                new_type=atype,
+                                                active=True,
+                                                commit_message=f"Modified by tool '{tool_name}'"
+                                            )
+                                            ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated artifact '{file_name}' (v{existing_art.get('version', 1)+1})")
+                                            self.commit()
+                                        else:
+                                            atype = "code" if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir") else "document"
+                                            art = self.artefacts.add(
+                                                title=file_name,
+                                                artefact_type=atype,
+                                                content=after_info["content"],
+                                                active=True,
+                                                commit_message=f"Synced by tool '{tool_name}'"
+                                            )
+                                            self.commit()
+
+                                        if self.active_branch_id:
+                                            ai_msg = self.get_message(self.active_branch_id)
+                                            if ai_msg:
+                                                if atype == "image":
+                                                    ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                                else:
+                                                    ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                                self.commit()
 
                             finally:
                                 # No CWD restoration needed - ChatMixin never changed it
@@ -1494,74 +1795,72 @@ class ChatMixin:
                     # Check if the LAST assistant message in history was a tool call to the SAME tool
                     # This prevents the LLM from getting stuck in a "success loop"
                     last_assistant_msg = virtual_history[-3] if len(virtual_history) >= 3 else None
-                    if last_assistant_msg and last_assistant_msg.sender_type == "assistant":
-                        # Check if the previous round also called this tool (simple heuristic)
-                        # We can't easily check previous tool calls without parsing, so we rely on the virtual user prompt below
 
-                        if tool_success:
-                            # Extract explicit filename if returned in the result dictionary
-                            real_filename_instr = ""
-                            if isinstance(tool_res, dict) and tool_res.get("plot_filename"):
-                                p_fn = tool_res["plot_filename"]
-                                real_filename_instr = (
-                                    f"🚨 **ACTUAL GENERATED FILE NAME**: `{p_fn}`\n"
-                                    f"   You must reference this exact file in your final answer using:\n"
-                                    f"   `<artefact_image id=\"{p_fn}::0\" />` or `<img src=\"/api/workspace_files/{p_fn}\" />`\n"
-                                    f"   Do NOT hallucinate or guess any other file name (such as 'sales_over_time.png'). Only use `{p_fn}`.\n\n"
-                                )
-
-                            # 🛑 CRITICAL FIX: EXPLICITLY LABEL OUTPUT AS "NOT A TOOL CALL"
-                            # We must prevent the LLM from misinterpreting JSON results as new tool calls
-                            user_part = (
-                                f"=== ✅ TOOL RESULT (NOT A TOOL CALL): {tool_name} ===\n"
-                                f"⚠️ **WARNING**: The JSON below is the **RESULT** of your previous tool call. "
-                                f"It is **NOT** a new tool call request. Do **NOT** re-execute it.\n\n"
-                                f"{real_filename_instr}"
-                                f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n"
-                                f"{clean_result_str}\n"
-                                f"</tool_result>\n\n"
-                                f"🚨 **MANDATORY NEXT STEPS**:\n"
-                                f"1. ✅ **ACKNOWLEDGE** the data above is already retrieved.\n"
-                                f"2. 🧠 **ANALYZE** the result: What does it tell you?\n"
-                                f"3. 💬 **RESPOND** to the user's original question using this data.\n"
-                                f"4. 🚫 **FORBIDDEN**: Do **NOT** call '{tool_name}' again with these parameters.\n"
-                                f"   The tool already ran successfully. Calling it again is a **LOOP ERROR**.\n"
-                                f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n\n"
-                                f"### Example of CORRECT behavior:\n"
-                                f"❌ WRONG: <tool_call>{{\"name\": \"{tool_name}\", ...}}</tool_call>  (LOOP!)\n"
-                                f"✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
+                    # Always append the tool result to the conversational history so the LLM can see the output
+                    if tool_success:
+                        # Extract explicit filename if returned in the result dictionary
+                        real_filename_instr = ""
+                        if isinstance(tool_res, dict) and tool_res.get("plot_filename"):
+                            p_fn = tool_res["plot_filename"]
+                            real_filename_instr = (
+                                f"🚨 **ACTUAL GENERATED FILE NAME**: `{p_fn}`\n"
+                                f"   You must reference this exact file in your final answer using:\n"
+                                f"   `<artefact_image id=\"{p_fn}::0\" />` or `<img src=\"/api/workspace_files/{p_fn}\" />`\n"
+                                f"   Do NOT hallucinate or guess any other file name (such as 'sales_over_time.png'). Only use `{p_fn}`.\n\n"
                             )
 
-                            # Log for debugging
-                            ASCIIColors.cyan(f"[ChatMixin] Injecting virtual user prompt after successful tool '{tool_name}':\n{user_part[:200]}...")
+                        # 🛑 CRITICAL FIX: EXPLICITLY LABEL OUTPUT AS "NOT A TOOL CALL"
+                        # We must prevent the LLM from misinterpreting JSON results as new tool calls
+                        user_part = (
+                            f"=== ✅ TOOL RESULT (NOT A TOOL CALL): {tool_name} ===\n"
+                            f"⚠️ **WARNING**: The JSON below is the **RESULT** of your previous tool call. "
+                            f"It is **NOT** a new tool call request. Do **NOT** re-execute it.\n\n"
+                            f"{real_filename_instr}"
+                            f"<tool_result name=\"{tool_name}\" status=\"SUCCESS\">\n"
+                            f"{clean_result_str}\n"
+                            f"</tool_result>\n\n"
+                            f"🚨 **MANDATORY NEXT STEPS**:\n"
+                            f"1. ✅ **ACKNOWLEDGE** the data above is already retrieved.\n"
+                            f"2. 🧠 **ANALYZE** the result: What does it tell you?\n"
+                            f"3. 💬 **RESPOND** to the user's original question using this data.\n"
+                            f"4. 🚫 **FORBIDDEN**: Do **NOT** call '{tool_name}' again with these parameters.\n"
+                            f"   The tool already ran successfully. Calling it again is a **LOOP ERROR**.\n"
+                            f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n\n"
+                            f"### Example of CORRECT behavior:\n"
+                            f"❌ WRONG: <tool_call>{{\"name\": \"{tool_name}\", ...}}</tool_call>  (LOOP!)\n"
+                            f"✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
+                        )
 
-                            virtual_history.append(SimpleNamespace(
-                                sender_type="user",
-                                content=user_part
-                            ))
-                            ai_msg.content += "\n\n"
-                        else:
-                            user_part = (
-                                f'<tool_result name="{tool_name}">\n'
-                                f"{clean_result_str}\n"
-                                f"</tool_result>\n\n"
-                                f"⚠️ **Tool Execution Failed.**\n"
-                                f"The tool '{tool_name}' encountered an error. Please politely inform the user that the operation could not be completed, "
-                                f"briefly explain the likely cause based on the error log above, and suggest a possible workaround or alternative approach. "
-                                f"Do not attempt to call the tool again with the same parameters."
-                            )
-                            virtual_history.append(SimpleNamespace(
-                                sender_type="user",
-                                content=user_part
-                            ))
-                            ai_msg.content += "\n\n"
-                            # If this was a forced break due to loop detection, ensure we exit
-                            if 'force_break_after_tool' in locals() and force_break_after_tool:
-                                ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
-                                break
+                        # Log for debugging
+                        ASCIIColors.cyan(f"[ChatMixin] Injecting virtual user prompt after successful tool '{tool_name}':\n{user_part[:200]}...")
 
-                            # Let the loop continue to the next round so the LLM can see the results!
-                            ASCIIColors.success(f"[ChatMixin] Tool executed successfully. Continuing to round {round_count + 1}...")
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=user_part
+                        ))
+                        ai_msg.content += "\n\n"
+                    else:
+                        user_part = (
+                            f'<tool_result name="{tool_name}">\n'
+                            f"{clean_result_str}\n"
+                            f"</tool_result>\n\n"
+                            f"⚠️ **Tool Execution Failed.**\n"
+                            f"The tool '{tool_name}' encountered an error. Please politely inform the user that the operation could not be completed, "
+                            f"briefly explain the likely cause based on the error log above, and suggest a possible workaround or alternative approach. "
+                            f"Do not attempt to call the tool again with the same parameters."
+                        )
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=user_part
+                        ))
+                        ai_msg.content += "\n\n"
+                        # If this was a forced break due to loop detection, ensure we exit
+                        if 'force_break_after_tool' in locals() and force_break_after_tool:
+                            ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
+                            break
+
+                    # Let the loop continue to the next round so the LLM can see the results!
+                    ASCIIColors.success(f"[ChatMixin] Tool executed successfully. Continuing to round {round_count + 1}...")
                 else:
                     ASCIIColors.warning("[ChatMixin] No valid tool JSON. Breaking loop.")
                     break

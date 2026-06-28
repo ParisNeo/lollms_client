@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, Union, Optional
 from sqlalchemy.orm.exc import NoResultFound
 from ascii_colors import ASCIIColors, trace_exception
 
-from ._artefacts import ArtefactManager, ArtefactType
+from lollms_client.lollms_artefact import ArtefactManager, ArtefactType
 from ._message import LollmsMessage
 
 if TYPE_CHECKING:

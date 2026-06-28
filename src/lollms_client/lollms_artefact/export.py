@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors, trace_exception
-from ._artefacts import ArtefactType
+from .lollms_artefact import ArtefactType
 
 def _parse_html_slides(html_content: str) -> List[Dict[str, Any]]:
     import pipmaster as pm
@@ -773,92 +773,92 @@ class ExportMixin:
                 pass
 
         return buffer.getvalue()
-def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
-    import base64
-    parts = image_id.split("::")
-    if len(parts) < 2:
+    def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
+        import base64
+        parts = image_id.split("::")
+        if len(parts) < 2:
+            return None
+        try:
+            img_index = int(parts[-1])
+        except ValueError:
+            return None
+        title = "::".join(parts[:-1])
+
+        # Check both main and companion
+        main_art = self.artefacts.get(title)
+        comp_art = self.artefacts.get(f"{title}::images")
+
+        target_art = None
+        target_index = None
+
+        if comp_art and img_index < len(comp_art.get("images", [])):
+            target_art = comp_art
+            target_index = img_index
+        elif main_art and img_index < len(main_art.get("images", [])):
+            target_art = main_art
+            target_index = img_index
+
+        if target_art:
+            imgs = target_art.get("images", [])
+            if 0 <= target_index < len(imgs):
+                b64_str = imgs[target_index]
+                if b64_str:
+                    if ";base64," in b64_str:
+                        b64_str = b64_str.split(";base64,")[1]
+                    return base64.b64decode(b64_str)
         return None
-    try:
-        img_index = int(parts[-1])
-    except ValueError:
-        return None
-    title = "::".join(parts[:-1])
 
-    # Check both main and companion
-    main_art = self.artefacts.get(title)
-    comp_art = self.artefacts.get(f"{title}::images")
+    def _export_as_zip(self, art: Dict[str, Any]) -> bytes:
+        import zipfile
+        import io
+        import base64
 
-    target_art = None
-    target_index = None
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+            content = art.get("content", "")
+            title = art["title"]
 
-    if comp_art and img_index < len(comp_art.get("images", [])):
-        target_art = comp_art
-        target_index = img_index
-    elif main_art and img_index < len(main_art.get("images", [])):
-        target_art = main_art
-        target_index = img_index
+            # 1. Parse and extract all embedded image anchors
+            img_pattern = re.compile(r'<artefact_image\s+id=["\']([^"\']+)["\']', re.IGNORECASE)
+            image_ids = img_pattern.findall(content)
 
-    if target_art:
-        imgs = target_art.get("images", [])
-        if 0 <= target_index < len(imgs):
-            b64_str = imgs[target_index]
-            if b64_str:
-                if ";base64," in b64_str:
-                    b64_str = b64_str.split(";base64,")[1]
-                return base64.b64decode(b64_str)
-    return None
+            # Track replaced image paths to update HTML refs
+            replacements = {}
+            for img_id in image_ids:
+                if "::" in img_id:
+                    img_bytes = self._get_image_bytes_by_id(img_id)
+                    if img_bytes:
+                        parts = img_id.split("::")
+                        img_index = int(parts[-1])
+                        img_title = "::".join(parts[:-1])
+                        # Save image to zip under images/
+                        safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{img_title}_{img_index}.png")
+                        zip_image_path = f"images/{safe_filename}"
+                        z.writestr(zip_image_path, img_bytes)
+                        replacements[img_id] = zip_image_path
 
-def _export_as_zip(self, art: Dict[str, Any]) -> bytes:
-    import zipfile
-    import io
-    import base64
+            # 2. Update all <artefact_image> XML tags with relative <img> links in the zip's HTML index
+            updated_content = content
+            for img_id, rel_path in replacements.items():
+                tag_pattern = re.compile(rf'<artefact_image\s+id=["\']{re.escape(img_id)}["\']\s*(?:\/>|>)', re.IGNORECASE)
+                updated_content = tag_pattern.sub(f'<img src="{rel_path}" style="width:100%; height:100%; object-fit:cover;" />', updated_content)
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        content = art.get("content", "")
-        title = art["title"]
+            # Write the main index file to the zip
+            index_filename = f"{title}.html" if not title.endswith(".html") else title
+            z.writestr(index_filename, updated_content.encode("utf-8"))
 
-        # 1. Parse and extract all embedded image anchors
-        img_pattern = re.compile(r'<artefact_image\s+id=["\']([^"\']+)["\']', re.IGNORECASE)
-        image_ids = img_pattern.findall(content)
+            # 3. Search and bundle any sister/companion files (e.g., CSS/JS artifacts)
+            related = self.artefacts.list()
+            for r in related:
+                r_title = r["title"]
+                if r_title != title and (r_title.startswith(title.split(".")[0]) or r_title == f"{title}::images"):
+                    if r_title == f"{title}::images":
+                        continue  # Images already processed individually
+                    r_content = r.get("content", "")
+                    if r_content:
+                        z.writestr(r_title, r_content.encode("utf-8"))
 
-        # Track replaced image paths to update HTML refs
-        replacements = {}
-        for img_id in image_ids:
-            if "::" in img_id:
-                img_bytes = self._get_image_bytes_by_id(img_id)
-                if img_bytes:
-                    parts = img_id.split("::")
-                    img_index = int(parts[-1])
-                    img_title = "::".join(parts[:-1])
-                    # Save image to zip under images/
-                    safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{img_title}_{img_index}.png")
-                    zip_image_path = f"images/{safe_filename}"
-                    z.writestr(zip_image_path, img_bytes)
-                    replacements[img_id] = zip_image_path
-
-        # 2. Update all <artefact_image> XML tags with relative <img> links in the zip's HTML index
-        updated_content = content
-        for img_id, rel_path in replacements.items():
-            tag_pattern = re.compile(rf'<artefact_image\s+id=["\']{re.escape(img_id)}["\']\s*(?:\/>|>)', re.IGNORECASE)
-            updated_content = tag_pattern.sub(f'<img src="{rel_path}" style="width:100%; height:100%; object-fit:cover;" />', updated_content)
-
-        # Write the main index file to the zip
-        index_filename = f"{title}.html" if not title.endswith(".html") else title
-        z.writestr(index_filename, updated_content.encode("utf-8"))
-
-        # 3. Search and bundle any sister/companion files (e.g., CSS/JS artifacts)
-        related = self.artefacts.list()
-        for r in related:
-            r_title = r["title"]
-            if r_title != title and (r_title.startswith(title.split(".")[0]) or r_title == f"{title}::images"):
-                if r_title == f"{title}::images":
-                    continue  # Images already processed individually
-                r_content = r.get("content", "")
-                if r_content:
-                    z.writestr(r_title, r_content.encode("utf-8"))
-
-    return buffer.getvalue()
+        return buffer.getvalue()
 
     def _get_image_bytes_by_id(self, image_id: str) -> Optional[bytes]:
         import base64

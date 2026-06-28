@@ -14,7 +14,7 @@ import uuid
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors
-from ._artefacts import ArtefactType
+from lollms_client.lollms_artefact import ArtefactType
 
 if TYPE_CHECKING:
     from ._message import LollmsMessage

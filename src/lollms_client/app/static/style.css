@@ -1799,6 +1799,24 @@ select option {
     border-color: var(--success-color);
 }
 
+/* CM Chat Code Block styling */
+.cm-chat-code-container {
+    width: 100%;
+    background-color: #020617;
+    border-radius: 0 0 8px 8px;
+    overflow: hidden;
+}
+
+.cm-chat-code-container .CodeMirror {
+    background-color: #020617 !important;
+    font-family: 'Fira Code', 'Courier New', Courier, monospace;
+    font-size: 12.5px;
+    border: none !important;
+    height: auto !important;
+    min-height: 40px;
+    padding: 8px;
+}
+
 /* Custom Scrollbars */
 ::-webkit-scrollbar {
     width: 8px;
