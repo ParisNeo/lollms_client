@@ -64,7 +64,6 @@ class MemoryMixin:
                     predicate="IMPLEMENTS",
                     obj="recovery_pattern"
                 )
-                ASCIIColors.success(f"[FailureMemory] Promoted successful recovery lesson to long-term memory: '{lesson[:60]}...'")
                 # Clear failures for this tool once reflected to prevent duplicate reflections
                 self.failure_memory.failures = [f for f in self.failure_memory.failures if f["tool_name"] != tool_name]
         except Exception as e:
@@ -125,7 +124,6 @@ class MemoryMixin:
         import time
         start_time = time.time()
         try:
-            # Enforce strict 5-second budget for all pre-turn operations combined
             mm.apply_decay()
             if time.time() - start_time > 4.0:
                 raise TimeoutError("Memory operations exceeded pre-turn safety budget.")
@@ -137,8 +135,8 @@ class MemoryMixin:
                 raise TimeoutError("Memory operations exceeded pre-turn safety budget.")
 
             mm.enforce_budget(token_counter=token_counter)
-        except Exception as e:
-            ASCIIColors.warning(f"[Memory] Pre-turn memory operations bypassed: {e}")
+        except Exception:
+            pass
 
     def _build_memory_system_instructions(self, mm: Optional['LollmsMemoryManager']) -> str:
         return mm.build_system_instructions() if mm else ""
@@ -207,8 +205,6 @@ class MemoryMixin:
         from lollms_client.lollms_types import MSG_TYPE
         cleaned, report = mm.process_llm_output(text)
         if any(report.values()):
-            count = sum(len(v) for v in report.values() if isinstance(v, list))
-            ASCIIColors.cyan(f"[Memory] Turn processed — operations: {count}")
             if callback:
                 try: callback(json.dumps(report, default=str), MSG_TYPE.MSG_TYPE_INFO, {"type": "memory_update", "report": report})
                 except Exception: pass
