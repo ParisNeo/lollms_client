@@ -89,7 +89,6 @@ def _sanitize_tool_result(
     """
     Converts an arbitrary tool execution result into a clean, LLM-friendly
     text representation.
-
     Rules
     -----
     1.  If ``tool_res`` (or its LCP-wrapped ``output`` inner dict) exposes a
@@ -110,7 +109,6 @@ def _sanitize_tool_result(
     """
 
     def _find_prompt_injection(obj: Any, depth: int = 0) -> Optional[str]:
-        """Recursively hunt for a non-empty prompt_injection string anywhere in the tree."""
         if depth > 4:
             return None
         if isinstance(obj, dict):
@@ -162,10 +160,8 @@ def _sanitize_tool_result(
             return walked
         return str(obj)
 
-    # 1. Prefer the tool's hand-crafted prompt_injection when available (searches the whole tree)
     pinj = _find_prompt_injection(tool_res)
     if pinj:
-        # Look for success status somewhere in the result
         success = True
         inner = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
         if isinstance(inner, dict):
@@ -173,7 +169,6 @@ def _sanitize_tool_result(
         success_status = "✓ Success" if success else "⚠ Partial Success"
         return f"{success_status}\n{pinj}"
 
-    # 2. Otherwise, walk the result and strip blobs
     sanitized = _walk(tool_res)
     try:
         text = json.dumps(sanitized, indent=2, default=str, ensure_ascii=False)
@@ -261,13 +256,6 @@ def _build_handle_instructions(branch_messages: List) -> str:
 class _StreamState:
     """
     A high-performance, non-blocking transactional stream parser.
-    Streams all code, text, and XML tags directly to the client with ZERO latency.
-    The exact second an XML tag is closed, it intercepts the accumulated block,
-    builds the artifact/resource on disk, and rewrites the database message 
-    content to cleanly strip the raw block and replace it with a success card.
-
-    CRITICAL FIX: Now tracks content offset to only parse NEW tokens added during
-    the current reasoning round, preventing re-parsing of old tool calls from previous rounds.
     """
     def __init__(
         self,
@@ -281,7 +269,7 @@ class _StreamState:
         auto_activate_artefacts: bool = True,
         enable_artefacts: bool = True,
         enable_in_message_status: bool = True,
-        content_offset: int = 0,  # Track where to start parsing from
+        content_offset: int = 0,
     ):
         self.discussion = discussion
         self.callback = callback
@@ -289,7 +277,7 @@ class _StreamState:
         self.enable_artefacts = enable_artefacts
         self.enable_in_message_status = enable_in_message_status
         self.auto_activate = auto_activate_artefacts
-        self.content_offset = content_offset  # Only parse content after this offset
+        self.content_offset = content_offset
 
         self.enable_notes = enable_notes if enable_artefacts else False
         self.enable_skills = enable_skills if enable_artefacts else False
@@ -299,9 +287,8 @@ class _StreamState:
         self.tool_trigger = False
         self.tool_json_data = ""
         self.affected_artefacts = []
-        self.processed_tags = set()  # prevent double-processing same matched block
+        self.processed_tags = set()
 
-        # 🛑 CRITICAL FIX: Accumulation buffer for multi-chunk tool calls
         self._is_accumulating_tool = False
         self._tool_buffer = ""
 
@@ -309,54 +296,34 @@ class _StreamState:
         if not isinstance(chunk, str) or not chunk:
             return True
 
-        # 1. Zero-latency stream passthrough: user sees everything in real-time
         self.ai_message.content += chunk
         _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
 
-        # ── 🛑 CRITICAL FIX: Tool Call Accumulation Mode ─────────────────────
-        # If we are already inside a tool call, JUST accumulate. Do NOT scan.
         if self._is_accumulating_tool:
             self._tool_buffer += chunk
 
-            # Check for END tag in the accumulated buffer
             if '</tool_call>' in self._tool_buffer:
-                # Find the position of the closing tag
                 end_idx = self._tool_buffer.find('</tool_call>')
                 full_tool_call = self._tool_buffer[:end_idx + len('</tool_call>')]
-
-                # Extract JSON body (strip <tool_call> and </tool_call>)
                 json_body = full_tool_call.strip().lstrip('<tool_call>').rstrip('</tool_call>').strip()
 
-                ASCIIColors.magenta(f"[StreamState.DEBUG] 🎯 TOOL CALL COMPLETE! Accumulated {len(self._tool_buffer)} chars.")
-                ASCIIColors.magenta(f"[StreamState.DEBUG] Raw JSON Body: {repr(json_body[:200])}")
-
-                # Reset accumulation state
                 self._is_accumulating_tool = False
                 self._tool_buffer = ""
 
-                # Dispatch the tool call
                 keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
                 if not keep_generating:
-                    ASCIIColors.red("[StreamState.DEBUG] HALTING generation due to JSON tool call.")
                     return False
 
-                # Update offset to skip past the processed tool call
                 self.content_offset = len(self.ai_message.content)
                 return True
             else:
-                # Still accumulating, don't update offset yet (we want to keep scanning for the end tag)
-                # But we MUST NOT re-scan the accumulated part as "new content" for other patterns
                 return True
 
-        # 2. CRITICAL FIX: Only parse content added in the active round
-        # This prevents re-parsing old tool calls from previous reasoning rounds
         content = self.ai_message.content[self.content_offset:]
 
-        # If no new content to parse, exit early
         if not content.strip():
             return True
 
-        # 3. Stateless Thoughts Detection
         last_open_think = content.rfind("<think>")
         last_close_think = content.rfind("</think>")
         is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
@@ -364,7 +331,6 @@ class _StreamState:
         if is_inside_thoughts:
             return True
 
-        # 3. Protect Active Unclosed Artifact Blocks from Tag Interception
         last_open_art = max(content.rfind("<artifact"), content.rfind("<artefact"))
         last_close_art = max(content.rfind("</artifact>"), content.rfind("</artefact>"))
         is_inside_artifact = (last_open_art != -1) and (last_open_art > last_close_art)
@@ -373,11 +339,9 @@ class _StreamState:
             if not content.endswith("</artifact>") and not content.endswith("</artefact>"):
                 return True
 
-        # 4. Create a safe content copy by removing all closed and unclosed thinking blocks
         safe_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
         safe_content = re.sub(r'<think>.*$', '', safe_content, flags=re.DOTALL | re.IGNORECASE)
 
-        # ── Pattern 1: Standard XML-style tags (<tool>...</tool>) ────────────
         xml_pattern = re.compile(
             r'<(artifact|artefact|note|skill|tool_call|tool)\b([^>]*?)>(.*?)</\1>',
             re.DOTALL | re.IGNORECASE
@@ -395,43 +359,29 @@ class _StreamState:
             attrs_str = match.group(2)
             body = match.group(3).strip()
 
-            ASCIIColors.green(f"[StreamState.DEBUG] Dispatching XML tag: {tag_name}")
             try:
                 keep_generating = self._dispatch_closed_tag(tag_name, attrs_str, body, full_match_text)
                 if not keep_generating:
-                    ASCIIColors.red("[StreamState.DEBUG] HALTING generation due to XML tool call.")
                     return False
             except Exception as dispatch_err:
                 trace_exception(dispatch_err)
                 ASCIIColors.error(f"[StreamState] XML dispatch failed for tag '{tag_name}': {dispatch_err}")
 
-        # ── Pattern 2: LLM JSON-style tool calls (<tool_call>...</tool_call>) ───────────
-        # 🛑 CRITICAL FIX: Detect START tag to enter Accumulation Mode
         if '<tool_call>' in safe_content:
             start_idx = safe_content.find('<tool_call>')
-            # Check if there's a closing tag in the SAME chunk (rare but possible for tiny tools)
             end_idx = safe_content.find('</tool_call>', start_idx)
 
             if end_idx != -1:
-                # Complete tool call in one chunk! Process immediately.
                 full_tool_call = safe_content[start_idx:end_idx + len('</tool_call>')]
                 json_body = full_tool_call.strip().lstrip('<tool_call>').rstrip('</tool_call>').strip()
-
-                ASCIIColors.magenta(f"[StreamState.DEBUG] 🎯 Single-chunk tool call detected!")
-                ASCIIColors.magenta(f"[StreamState.DEBUG] Raw JSON Body: {repr(json_body[:200])}")
 
                 self.processed_tags.add(full_tool_call)
                 keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
                 if not keep_generating:
-                    ASCIIColors.red("[StreamState.DEBUG] HALTING generation due to JSON tool call.")
                     return False
             else:
-                # 🛑 START TAG FOUND, BUT NO END TAG YET → ENTER ACCUMULATION MODE
-                ASCIIColors.yellow(f"[StreamState.DEBUG] 🚀 START of tool call detected. Entering ACCUMULATION MODE.")
                 self._is_accumulating_tool = True
-                # Initialize buffer with whatever content is after <tool_call>
                 self._tool_buffer = safe_content[start_idx:]
-                # Do NOT return yet, let the rest of the chunk be processed if needed (though unlikely)
 
         return True
 
@@ -477,7 +427,6 @@ class _StreamState:
 
             if art:
                 self.affected_artefacts.append(art)
-                _cb(self.callback, f"Artifact '{title}' successfully updated.", MSG_TYPE.MSG_TYPE_INFO)
 
             # ── SWIFT REPLACEMENT PROTOCOL ──
             # Strips the full raw XML from the message body and replaces it with the placeholder
@@ -509,30 +458,16 @@ class _StreamState:
 
                     # Check if already nested
                     if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
-                        # Already in correct format
                         self.tool_json_data = body
                     else:
-                        # FLAT structure detected - MUST normalize
-                        # Extract all keys EXCEPT "name" as parameters
                         params = {k: v for k, v in raw_data.items() if k != "name"}
-
-                        # Reconstruct normalized nested structure
                         normalized_data = {"name": tool_name, "parameters": params}
                         self.tool_json_data = json.dumps(normalized_data)
-
-                        ASCIIColors.cyan(
-                            f"[StreamState] 🔄 Normalized FLAT tool call → NESTED structure for '{tool_name}':\n"
-                            f"  Original keys: {list(raw_data.keys())}\n"
-                            f"  Normalized params: {list(params.keys())}"
-                        )
                 else:
-                    # Not a dict, pass through as-is (will fail later, but that's expected)
                     self.tool_json_data = body
-                    ASCIIColors.warning(f"[StreamState] Tool call body is not a dict: {type(raw_data)}")
             except json.JSONDecodeError as je:
-                # JSON parsing failed - pass through raw body
                 self.tool_json_data = body
-                ASCIIColors.error(f"[StreamState] JSON decode failed for tool call: {je}")
+                ASCIIColors.error(f"[StreamState] JSON decode failed: {je}")
 
             # Halt generation instantly so the executor can take over the loop
             return False
@@ -593,8 +528,6 @@ class _StreamState:
 
             if unlocked_files:
                 self.discussion.commit()
-                status_text = f"Unlocked and fully loaded {len(unlocked_files)} file(s) into context: " + ", ".join([f"'{f}'" for f in unlocked_files])
-                ASCIIColors.success(f"[Context Unlock] {status_text}")
 
             placeholder = f"\n[unlocked and loaded context files: {', '.join(unlocked_files)}]\n"
             self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
@@ -639,10 +572,8 @@ class ChatMixin:
     def cancel_generation(self) -> bool:
         """
         Signals the active generation loop to stop gracefully.
-        Also propagates cancellation to the underlying LollmsClient if available.
         """
         object.__setattr__(self, '_cancel_flag', True)
-        ASCIIColors.error(f"[ChatMixin] 🚨 CANCEL REQUESTED for discussion {self.id}")
 
         # Propagate to client immediately to stop low-level streaming
         if hasattr(self, 'lollmsClient') and self.lollmsClient:
@@ -651,8 +582,8 @@ class ChatMixin:
                     self.lollmsClient.cancel()
                 elif hasattr(self.lollmsClient, 'llm') and hasattr(self.lollmsClient.llm, 'cancel'):
                     self.lollmsClient.llm.cancel()
-            except Exception as e:
-                ASCIIColors.warning(f"[ChatMixin] Failed to propagate cancel to client: {e}")
+            except Exception:
+                pass
         return True
 
     def is_generation_cancelled(self) -> bool:
@@ -839,12 +770,10 @@ class ChatMixin:
         object.__setattr__(self, "_affected_artefacts_this_turn", [])
 
         # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
-        # This prevents stale failures from previous conversation turns from blocking tool execution
         if not hasattr(self, "_failure_memory") or not self._failure_memory:
             object.__setattr__(self, "_failure_memory", FailureMemory())
         else:
             self._failure_memory.failures = []
-            ASCIIColors.info("[FailureMemory] Cleared historical failure logs for the new chat turn.")
 
         # Reset cancellation flag at the start of each chat turn
         self.reset_cancel_state()
@@ -859,26 +788,22 @@ class ChatMixin:
 
         if _mm:
             try:
-                ASCIIColors.info("[Trace] Applying memory decay...")
                 _mm.apply_decay()
-            except Exception as e:
-                ASCIIColors.warning(f"[Memory] Decay update deferred due to database lock: {e}")
+            except Exception:
+                pass
 
             if user_message and enable_deep_memory_pulling:
                 try:
-                    ASCIIColors.info("[Trace] Executing auto_pull_deep_memories...")
                     _mm.auto_pull_deep_memories(user_message)
-                except Exception as e:
-                    ASCIIColors.warning(f"[Memory] Associative pull deferred due to database lock: {e}")
+                except Exception as ex:
+                    trace_exception(ex)
 
             try:
-                ASCIIColors.info("[Trace] Enforcing memory budget...")
                 _mm.enforce_budget(token_counter=_counter)
-            except Exception as e:
-                ASCIIColors.warning(f"[Memory] Budget enforcement deferred due to database lock: {e}")
+            except Exception as ex:
+                trace_exception(ex)
 
         # ── 2. Add or Retrieve User Message ──
-        ASCIIColors.info("[Trace] Registering/Retrieving user message...")
         user_msg = None
         if add_user_message:
             user_msg = self.add_message(
@@ -1033,7 +958,6 @@ class ChatMixin:
 
         # CRITICAL FIX: If data files exist but LCP binding is None, INSTANTIATE it on-the-fly!
         if has_data_files and (lcp_binding is None):
-            ASCIIColors.cyan(f"[ChatMixin] 📊 Data files detected but LCP binding not loaded. Instantiating LCP binding dynamically...")
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
 
@@ -1044,21 +968,14 @@ class ChatMixin:
 
                 # Attach it to the client for future use
                 self.lollmsClient.tools = lcp_binding
-                ASCIIColors.success(f"[ChatMixin] ✅ LCP binding instantiated and attached to client.")
-            except Exception as inst_err:
-                ASCIIColors.error(f"[ChatMixin] ❌ Failed to instantiate LCP binding: {inst_err}")
-                import traceback
-                trace = traceback.format_exc()
-                ASCIIColors.error(f"[ChatMixin] Stack trace:\n{trace}")
+            except Exception as ex:
+                trace_exception(ex)
                 lcp_binding = None
 
         # Now proceed with tool mounting if LCP binding exists
         if enable_data_tools and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             if has_data_files:
-                ASCIIColors.cyan(f"[ChatMixin] Data files detected in workspace. Auto-mounting 'semantic_data_engineer' library...")
                 lcp_binding.mount_tool_library("semantic_data_engineer")
-            else:
-                ASCIIColors.info(f"[ChatMixin] No data files found in workspace. Skipping data tools mount.")
 
         # 2. Merge LCP Tools into Active Toolset
         # If LCP binding exists, merge all discovered tools (including newly mounted ones)
@@ -1066,9 +983,8 @@ class ChatMixin:
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs()
                 active_tools.update(lcp_tools)
-                ASCIIColors.success(f"[ChatMixin] Loaded {len(lcp_tools)} LCP tools (including auto-mounted libraries).")
-            except Exception as e:
-                ASCIIColors.warning(f"[ChatMixin] Failed to load LCP tools: {e}")
+            except Exception as ex:
+                trace_exception(ex)
 
         # Optionally merge spinoff agents as dynamic local tools
         if enable_sub_agents:
@@ -1103,14 +1019,10 @@ class ChatMixin:
         # Track the last executed tool to prevent immediate repetition loops (Success Loops)
         last_executed_tool_signature = None
 
-        # Initialize the persistent in-process FailureMemory tracker on the discussion object (self)
-        # This ensures failure history survives across chat turns even if the mixin is re-initialized.
-        # We use object.__setattr__ to bypass the DB proxy and store it directly in memory.
         if not hasattr(self, "_failure_memory") or not self._failure_memory:
             object.__setattr__(self, "_failure_memory", FailureMemory())
 
         # Initialize the single, clean database assistant message ONCE before entering the loop
-        ASCIIColors.info("[Trace] Initializing database assistant message stub...")
         ai_msg = self.add_message(
             sender=personality.name if personality else self.lollmsClient.ai_name,
             sender_type="assistant",
@@ -1128,12 +1040,10 @@ class ChatMixin:
         while round_count < max_reasoning_steps:
             # Check cancellation at the start of each reasoning round
             if self.is_generation_cancelled():
-                ASCIIColors.error(f"[ChatMixin] 🛑 GENERATION HALTED at start of round {round_count}")
                 was_cancelled = True
                 break
 
             round_count += 1
-            ASCIIColors.info(f"[Trace] Loop round {round_count}/{max_reasoning_steps} starting...")
 
             # Guarantee a clean, un-canceled state before launching each independent generation round
             if self.lollmsClient and getattr(self.lollmsClient, "llm", None):
@@ -1167,23 +1077,7 @@ class ChatMixin:
                             ASCIIColors.success(f"[Vision Sync] Hydrated LLM context with generated plot: '{art['title']}'")
 
             # ── 🔬 SCIENTIFIC DEBUG: EXPORTED PROMPT TRACE ──
-            # Print the exact payload that is being forwarded to the LLM for inspection
-            ASCIIColors.cyan("\n" + "="*80)
-            ASCIIColors.cyan(f"📝 [SCIENTIFIC DEBUG] EXPORTED LLM PAYLOAD - ROUND {round_count} START")
-            ASCIIColors.cyan("="*80)
-            for idx, msg in enumerate(messages_list):
-                role = msg["role"]
-                # Safeguard: Print truncated preview if the context is too large
-                content_preview = msg["content"]
-                if len(content_preview) > 1500:
-                    content_preview = content_preview[:1500] + "\n... [TRUNCATED FOR CONSOLE BREVITY]"
-                ASCIIColors.yellow(f"\n[{idx}] Role: '{role}'")
-                ASCIIColors.white("-" * 40)
-                ASCIIColors.white(content_preview)
-                ASCIIColors.white("-" * 40)
-            ASCIIColors.cyan("="*80)
-            ASCIIColors.cyan(f"📝 [SCIENTIFIC DEBUG] END OF PAYLOAD - ROUND {round_count}")
-            ASCIIColors.cyan("="*80 + "\n")
+            # (Logging removed per user request)
 
             # CRITICAL FIX: Track content offset to prevent re-parsing old tool calls
             current_content_length = len(ai_msg.content)
@@ -1218,7 +1112,6 @@ class ChatMixin:
             # Sanitize kwargs to prevent duplicate argument passing
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "stream")}
 
-            ASCIIColors.info(f"[Trace] Forwarding payload to LLM generate_from_messages (thinking={kwargs.get('think', False)})...")
             # Execute generation turn (streams and appends to the existing ai_msg.content directly)
             try:
                 self.lollmsClient.generate_from_messages(
@@ -1231,7 +1124,6 @@ class ChatMixin:
                 )
             except Exception as gen_err:
                 if self.is_generation_cancelled():
-                    ASCIIColors.info(f"[ChatMixin] Generation interrupted by cancellation: {gen_err}")
                     was_cancelled = True
                     break
                 else:
@@ -1239,11 +1131,9 @@ class ChatMixin:
 
             # Check cancellation after generation completes
             if self.is_generation_cancelled():
-                ASCIIColors.warning(f"[ChatMixin] Generation cancelled after round {round_count}")
                 was_cancelled = True
                 break
 
-            ASCIIColors.info("[Trace] Generation complete. Flushing remaining buffers...")
             ss.flush_remaining_buffer()
 
             if ss.tool_trigger:
@@ -1258,7 +1148,6 @@ class ChatMixin:
                     tool_params = call_data.get("parameters", {})
 
                     # ── Live UI Tool Call Feedback Injection ──
-                    # Clean up the raw <tool_call> block from the message content to prevent duplicate blocks
                     if tool_call_json_str in ai_msg.content:
                         ai_msg.content = ai_msg.content.replace(f"<tool_call>{tool_call_json_str}</tool_call>", "")
                         ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
@@ -1277,11 +1166,12 @@ class ChatMixin:
                     failure_memory = getattr(self, "_failure_memory", None)
 
                     if failure_memory and failure_memory.has_previous_failure(tool_name, tool_params):
-                        ASCIIColors.error(f"[FailureMemory] Intercepted repetitive execution loop for tool '{tool_name}'!")
+                        # Intercepted repetitive execution loop (logging removed)
 
                         if self.is_generation_cancelled():
                             was_cancelled = True
                             break
+
 
                         result_str = (
                             f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round of this conversation. "
@@ -1303,7 +1193,7 @@ class ChatMixin:
                         if tool_calls_this_turn:
                             last_call = tool_calls_this_turn[-1]
                             if last_call["name"] == tool_name and last_call["params"] == tool_params:
-                                ASCIIColors.error(f"[ChatMixin] 🛑 LOOP DETECTED: Tool '{tool_name}' called twice in a row with same params!")
+                                # LOOP DETECTED (logging removed)
                                 tool_res = {
                                     "success": False,
                                     "error": f"Repetitive tool call detected. You already called '{tool_name}' with these parameters in the previous turn. The output was already provided to you. Do not call it again.",
@@ -1321,7 +1211,7 @@ class ChatMixin:
                             pass
                         # Check cancellation BEFORE executing tool
                         elif self.is_generation_cancelled():
-                            ASCIIColors.warning(f"[ChatMixin] 🛑 Generation cancelled BEFORE tool execution '{tool_name}'. Aborting call.")
+                            # Generation cancelled (logging removed)
                             tool_res = {
                                 "success": False, 
                                 "error": "Execution aborted by user cancellation.",
@@ -1331,9 +1221,8 @@ class ChatMixin:
                             # Sync all active artifacts to disk BEFORE tool execution
                             try:
                                 sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
-                                ASCIIColors.info(f"[ChatMixin] Pre-tool sync: All active artifacts synced to workspace before executing '{tool_name}'")
-                            except Exception as sync_err:
-                                ASCIIColors.warning(f"[ChatMixin] Pre-tool sync failed: {sync_err}")
+                            except Exception as ex:
+                                trace_exception(ex)
 
                             import os
                             from pathlib import Path
@@ -1363,7 +1252,6 @@ class ChatMixin:
 
                             try:
                                 os.chdir(workspace_dir_str)
-                                ASCIIColors.info(f"[ChatMixin] Files in workspace: {os.listdir('.')}")
 
                                 # 🛑 CRITICAL FIX: Strip path prefixes from tool parameters
                                 # LLMs often hallucinate full paths like "workspace/file.csv" or "data_workspace/file.csv"
@@ -1372,12 +1260,10 @@ class ChatMixin:
                                 for key, value in tool_params.items():
                                     if isinstance(value, str):
                                         sanitized_value = value
-                                        # Strip common workspace prefixes
                                         for prefix in ["workspace/", "data_workspace/", "./workspace/", "./data_workspace/"]:
                                             if sanitized_value.lower().startswith(prefix):
                                                 sanitized_value = sanitized_value[len(prefix):]
                                                 break
-                                        # Also strip discussion ID prefix if present
                                         if sanitized_value.lower().startswith(self.id.lower() + "/"):
                                             sanitized_value = sanitized_value[len(self.id) + 1:]
                                         sanitized_params[key] = sanitized_value
@@ -1454,11 +1340,6 @@ class ChatMixin:
 
                                 # Detect NEW files
                                 new_files = set(files_after.keys()) - set(files_before.keys())
-                                ASCIIColors.info(f"[ChatMixin active_tools '{tool_name}'] Detected {len(new_files)} NEW files: {[str(f) for f in new_files]}")
-
-                                # Detect NEW files
-                                new_files = set(files_after.keys()) - set(files_before.keys())
-                                ASCIIColors.info(f"[ChatMixin active_tools '{tool_name}'] Detected {len(new_files)} NEW files: {[str(f) for f in new_files]}")
 
                                 for rel_path in new_files:
                                     file_info = files_after[rel_path]
@@ -1539,7 +1420,7 @@ class ChatMixin:
                                                 visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                                 commit_message=f"Created by tool '{tool_name}'"
                                             )
-                                        ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
+                                        # Registered file (placeholder) (logging removed)
                                         self.commit()
                                         
                                         # Hydrate active turn list so we can pass base64 pixels to vision
@@ -1556,11 +1437,11 @@ class ChatMixin:
                                                 )
                                                 self.commit()
                                                 self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
-                                            except Exception as img_err:
-                                                ASCIIColors.warning(f"Failed to read image b64: {img_err}")
-                                        
-                                        if self.active_branch_id:
-                                            ai_msg = self.get_message(self.active_branch_id)
+                                            except Exception as ex:
+                                                trace_exception(ex)
+
+                                            if self.active_branch_id:
+                                                ai_msg = self.get_message(self.active_branch_id)
                                             if ai_msg:
                                                 tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
                                                 if tag not in ai_msg.content:
@@ -1588,7 +1469,7 @@ class ChatMixin:
                                             visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                             commit_message=f"Created by tool '{tool_name}'"
                                         )
-                                    ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] ✨ Created NEW artifact from file: '{file_name}'")
+                                    # Created NEW artifact from file (logging removed)
                                     self.commit()
 
                                     if self.active_branch_id:
@@ -1689,7 +1570,7 @@ class ChatMixin:
                                                     visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                                     commit_message=f"Created by tool '{tool_name}'"
                                                 )
-                                            ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated file reference (placeholder): '{file_name}'")
+                                            # Updated file reference (placeholder) (logging removed)
                                             self.commit()
                                             
                                             # Hydrate active turn list so we can pass base64 pixels to vision
@@ -1703,12 +1584,12 @@ class ChatMixin:
                                                         new_images=[img_b64],
                                                         new_image_media_types=[f"image/{file_ext[1:]}"],
                                                         bump_version=True # Increment version on modification
-                                                    )
+                                                        )
                                                     self.commit()
                                                     self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
-                                                except Exception as img_err:
-                                                    ASCIIColors.warning(f"Failed to read image b64: {img_err}")
-                                            
+                                                except Exception as ex:
+                                                    trace_exception(ex)
+
                                             if self.active_branch_id:
                                                 ai_msg = self.get_message(self.active_branch_id)
                                                 if ai_msg:
@@ -1738,7 +1619,7 @@ class ChatMixin:
                                                 visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                                 commit_message=f"Created by tool '{tool_name}'"
                                             )
-                                        ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated artifact from modified file: '{file_name}'")
+                                        # Updated artifact from modified file (logging removed)
                                         self.commit()
 
                                         if self.active_branch_id:
@@ -1768,7 +1649,6 @@ class ChatMixin:
                                     failure_memory.record_failure(tool_name, tool_params, error_msg)
 
                                 if failure_memory and failure_memory.has_previous_failure(tool_name, tool_params):
-                                    ASCIIColors.error(f"[FailureMemory] 🛑 Intercepted repetitive execution loop for tool '{tool_name}'! Breaking loop immediately.")
                                     result_str = f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round. Execution blocked to prevent infinite loop."
                                     clean_result_str = result_str
                                     status_done_line = f"* Tool call blocked to prevent loop.\n"
@@ -1879,8 +1759,7 @@ class ChatMixin:
                             f"✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
                         )
 
-                        # Log for debugging
-                        ASCIIColors.cyan(f"[ChatMixin] Injecting virtual user prompt after successful tool '{tool_name}':\n{user_part[:200]}...")
+                        # Log for debugging (removed per user request)
 
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
@@ -1906,21 +1785,15 @@ class ChatMixin:
                         if 'force_break_after_tool' in locals() and force_break_after_tool:
                             ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
                             break
-
-                    # Let the loop continue to the next round so the LLM can see the results!
-                    ASCIIColors.success(f"[ChatMixin] Tool executed successfully. Continuing to round {round_count + 1}...")
                 else:
-                    ASCIIColors.warning("[ChatMixin] No valid tool JSON. Breaking loop.")
                     break
             else:
-                ASCIIColors.warning("[ChatMixin] No tool trigger detected. Breaking loop (Final Answer reached).")
                 break
 
         # ── 11. Final Post-Processing & Database Commit ──
 
         # Handle cancellation cleanup
         if was_cancelled:
-            ASCIIColors.info(f"[ChatMixin] Wrapping up cancelled generation for discussion {self.id}")
             if ai_msg.content.strip():
                 ai_msg.content += "\n\n[Generation cancelled by user]"
             else:
@@ -1965,7 +1838,6 @@ class ChatMixin:
                         flags=re.IGNORECASE
                     )
                     ai_msg.content = ai_msg.content.replace("sales_over_time.png", real_fn)
-                    ASCIIColors.success(f"[Self-Healing] Corrected hallucinated filename reference to '{real_fn}' inside response!")
 
         # Process memories
         mem_cleaned, mem_report = self._process_memory_tags(ai_msg.content, _mm, callback)
@@ -1975,8 +1847,8 @@ class ChatMixin:
         if _mm:
             try:
                 self._save_episodic_memory_turn(user_message, ai_msg.content, _mm)
-            except Exception as e:
-                ASCIIColors.warning(f"[Memory] Episodic save deferred: {e}")
+            except Exception as ex:
+                trace_exception(ex)
 
         # Update metadata for alternating exports
         ai_msg.metadata = {
@@ -1990,8 +1862,8 @@ class ChatMixin:
         if enable_auto_dream and _mm is not None:
             try:
                 dream_report = _mm.dream(self.lollmsClient)
-            except Exception as e:
-                ASCIIColors.warning(f"[Memory] Auto-dream deferred: {e}")
+            except Exception as ex:
+                trace_exception(ex)
 
         if self._is_db_backed and self.autosave:
             self.commit()
@@ -2053,8 +1925,8 @@ def _parse_form_xml(tag_attrs_str: str, body: str) -> Optional[Dict[str, Any]]:
                 if "fields" not in form:
                     form["fields"] = []
                 return form
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as ex:
+            trace_exception(ex)
 
     field_pattern = re.compile(
         r'<(?:field|section)\s([^/]*?)(?:/\s*>|>.*?</(?:field|section)>)',
