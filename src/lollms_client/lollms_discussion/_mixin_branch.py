@@ -293,7 +293,6 @@ class BranchMixin:
         """
         self._rebuild_message_index()
         if leaf_id not in self._message_index:
-            ASCIIColors.warning(f"[BranchMixin] switch_branch: '{leaf_id}' not found.")
             return False
         self.active_branch_id = leaf_id
         self.touch()
@@ -364,7 +363,6 @@ class BranchMixin:
         """
         if message_id not in self._message_index:
             raise ValueError(f"fork_from: message '{message_id}' not found.")
-
         meta: Dict[str, Any] = extra_msg_kwargs.pop('metadata', {}) or {}
         if label:
             meta['branch_label'] = label
@@ -474,7 +472,6 @@ class BranchMixin:
         """
         self._rebuild_message_index()
         if message_id not in self._message_index:
-            ASCIIColors.warning(f"[BranchMixin] prune_branch: '{message_id}' not found.")
             return 0
 
         # Collect all descendants via BFS
@@ -491,8 +488,6 @@ class BranchMixin:
 
         for mid in to_del:
             self.remove_message(mid)
-
-        ASCIIColors.info(f"[BranchMixin] Pruned {len(to_del)} message(s).")
 
         if self.active_branch_id in to_del:
             self._validate_and_set_active_branch()
@@ -548,7 +543,6 @@ class BranchMixin:
         # Find messages in source NOT already in target
         unique_source = [mid for mid in source_path if mid not in target_path]
         if not unique_source:
-            ASCIIColors.warning("[BranchMixin] merge_branches: branches are identical.")
             return LollmsMessage(self, self._message_index[target_leaf])
 
         current_parent = target_leaf
@@ -582,10 +576,6 @@ class BranchMixin:
             current_parent = new_msg.id
             last_msg = new_msg
 
-        ASCIIColors.info(
-            f"[BranchMixin] Merged {len(unique_source)} message(s) from "
-            f"'{source_leaf_id[:8]}…' onto '{target_leaf[:8]}…'."
-        )
         return last_msg
 
     # ================================================================ labelling
