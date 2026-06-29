@@ -68,24 +68,10 @@ class UtilsMixin:
         branch_tip_id = branch_tip_id or self.active_branch_id
 
         # --- Diagnostic Input Logging ---
-        ASCIIColors.cyan(f"\n📊 [EXPORT DIAGNOSTIC START] Format: {format_type} | Tip ID: {branch_tip_id}")
-        ASCIIColors.cyan(f"  • Discussion ID: {self.id}")
-        disc_images = self.get_discussion_images()
-        ASCIIColors.cyan(f"  • Discussion-level images: {len(disc_images)}")
-        active_arts = self.artefacts.list(active_only=True)
-        ASCIIColors.cyan(f"  • Active Artifacts: {[a['title'] for a in active_arts]}")
-        art_context_images = self.artefacts.get_context_images()
-        ASCIIColors.cyan(f"  • Active Artifact context images: {len(art_context_images)} -> {[img['id'] for img in art_context_images]}")
 
         if not branch_tip_id and format_type in ["lollms_text","openai_chat","ollama_chat","markdown"]:
-            ASCIIColors.warning("  • [EXPORT DIAGNOSTIC] Branch tip ID is empty! Returning empty container.")
             return "" if format_type in ["lollms_text","markdown"] else []
         branch = self.get_branch(branch_tip_id)
-
-        ASCIIColors.cyan(f"  • Branch message count: {len(branch)}")
-        for idx, m in enumerate(branch):
-            m_imgs = m.get_active_images() if hasattr(m, "get_active_images") else getattr(m, "images", [])
-            ASCIIColors.cyan(f"    - [{idx}] ID: {m.id} | Sender: {m.sender} | Role: {m.sender_type} | Content: {repr((m.content or '')[:40])} | Images: {len(m_imgs) if m_imgs else 0}")
 
         # Exclude the last message from the branch if it's an assistant message
         # This prevents empty assistant messages (e.g., from fast path) from being
@@ -450,21 +436,9 @@ class UtilsMixin:
             res_val = "\n".join(messages) if format_type == "markdown" else messages
             ASCIIColors.success(f"📊 [EXPORT DIAGNOSTIC END] Markdown final length: {len(res_val)} chars")
         elif format_type == "lollms_text":
-            # lollms_text returns early inside its branch, but we log the output count for clarity
             pass
         else:
-            ASCIIColors.success(f"📊 [EXPORT DIAGNOSTIC END] {format_type} output message count: {len(messages)}")
-            for idx, msg in enumerate(messages):
-                role = msg.get("role")
-                content = msg.get("content")
-                has_images = "images" in msg or (isinstance(content, list) and any(part.get("type") == "image_url" for part in content))
-                img_info = ""
-                if "images" in msg:
-                    img_info += f" | images_list: {len(msg['images'])}"
-                if isinstance(content, list):
-                    img_parts = sum(1 for part in content if part.get("type") == "image_url")
-                    img_info += f" | image_url_parts: {img_parts}"
-                ASCIIColors.success(f"    - [{idx}] role: {role} | content_type: {type(content).__name__}{img_info}")
+            pass
 
         return "\n".join(messages) if format_type == "markdown" else messages
 
@@ -485,18 +459,6 @@ class UtilsMixin:
             return messages
 
         # ── DEBUG LOGGING: Log message roles before normalization ───────────
-        ASCIIColors.cyan("[OpenAI Export] BEFORE normalization:")
-        for i, msg in enumerate(messages):
-            role = msg.get("role", "unknown")
-            content_preview = ""
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_parts = [item.get("text", "")[:50] for item in content if item.get("type") == "text"]
-                content_preview = " | ".join(text_parts)[:100]
-            else:
-                content_preview = str(content)[:100]
-            ASCIIColors.cyan(f"  [{i}] role={role} | content_len={len(content_preview)} | preview={content_preview!r}")
-        ASCIIColors.cyan(f"[OpenAI Export] Total messages before: {len(messages)}")
 
         normalized = []
         system_content_parts = []
