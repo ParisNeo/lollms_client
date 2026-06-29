@@ -13,7 +13,7 @@ from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBind
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
 from lollms_client.lollms_bindings_utils import list_bindings, get_binding_desc
 
-__version__ = "1.15.5" # Updated version
+__version__ = "1.15.6" # Updated version
 
 # Optionally, you could define __all__ if you want to be explicit about exports
 __all__ = [

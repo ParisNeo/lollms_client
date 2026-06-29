@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-29 01:16]
+
+- chore: bump version to 1.15.6 and update prompt rules and memory exports
+
 ## [2026-06-29 00:47]
 
 - chore: bump version to 1.15.5
