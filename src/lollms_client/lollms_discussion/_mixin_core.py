@@ -619,5 +619,17 @@ class CoreMixin:
     # -------------------------------------------------------- property
 
     @property
+    def widget_css(self) -> Optional[str]:
+        meta = self.metadata or {}
+        return meta.get("widget_css")
+
+    @widget_css.setter
+    def widget_css(self, value: Optional[str]):
+        meta = dict(self.metadata or {})
+        meta["widget_css"] = value
+        self.metadata = meta
+        self.touch()
+
+    @property
     def system_prompt(self):
         return self._system_prompt

@@ -860,9 +860,21 @@ class UtilsMixin:
 
         # Assembled System Context (including headers)
         full_data_zone = self.get_full_data_zone()
-        full_sys_content = f"{system_prompt_text}\n\n{full_data_zone}\n\n{pruning_block}".strip()
+
+        # Append active memory context block if available so that system_context tokens include them
+        mem_block = ""
+        _mm = getattr(self, "memory_manager", None)
+        if _mm:
+            mem_block = self._build_memory_context_block(_mm, token_counter=tokenizer)
+
+        full_sys_content = f"{system_prompt_text}\n\n{full_data_zone}".strip()
+        if mem_block:
+            full_sys_content += "\n\n=== ACTIVE MEMORIES ===\n" + mem_block
+        if pruning_block:
+            full_sys_content += "\n\n" + pruning_block
+
         sys_block_formatted = f"!@>system:\n{full_sys_content}\n"
-        
+
         sys_tokens = _get_cached_tokens(sys_block_formatted, "full_system_context")
         result["zones"]["system_context"] = {
             "tokens": sys_tokens,

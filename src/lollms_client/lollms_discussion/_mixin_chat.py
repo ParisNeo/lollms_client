@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_types import MSG_TYPE
 from ._message import LollmsMessage
-from lollms_client.lollms_artefact import ArtefactType, make_image_id
+from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactVisibility, ArtefactStatus
 from lollms_client.lollms_memory import FailureMemory
 # ── Cancellation state & limits ──────────────────────────────────────────────
 _MAX_BRACKET_BUF = 256
@@ -1456,6 +1456,10 @@ class ChatMixin:
                                 new_files = set(files_after.keys()) - set(files_before.keys())
                                 ASCIIColors.info(f"[ChatMixin active_tools '{tool_name}'] Detected {len(new_files)} NEW files: {[str(f) for f in new_files]}")
 
+                                # Detect NEW files
+                                new_files = set(files_after.keys()) - set(files_before.keys())
+                                ASCIIColors.info(f"[ChatMixin active_tools '{tool_name}'] Detected {len(new_files)} NEW files: {[str(f) for f in new_files]}")
+
                                 for rel_path in new_files:
                                     file_info = files_after[rel_path]
                                     file_name = rel_path.name
@@ -1514,7 +1518,7 @@ class ChatMixin:
                                             should_read_content = False
                                             content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
 
-                                    # Register
+                                    # Register as tree_unlockable and inactive by default
                                     if not should_read_content and content_placeholder:
                                         existing_art = self.artefacts.get(file_name)
                                         if existing_art:
@@ -1522,7 +1526,8 @@ class ChatMixin:
                                                 title=file_name,
                                                 new_content=content_placeholder,
                                                 new_type=atype,
-                                                active=True,
+                                                active=False,
+                                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                                 commit_message=f"Updated binary file reference by tool '{tool_name}'"
                                             )
                                         else:
@@ -1530,7 +1535,8 @@ class ChatMixin:
                                                 title=file_name,
                                                 artefact_type=atype,
                                                 content=content_placeholder,
-                                                active=True,
+                                                active=False,
+                                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                                 commit_message=f"Created by tool '{tool_name}'"
                                             )
                                         ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
@@ -1569,7 +1575,8 @@ class ChatMixin:
                                             title=file_name,
                                             new_content=file_info["content"],
                                             new_type=atype,
-                                            active=True,
+                                            active=False,
+                                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                             commit_message=f"Restored by tool '{tool_name}'"
                                         )
                                     else:
@@ -1577,7 +1584,8 @@ class ChatMixin:
                                             title=file_name,
                                             artefact_type=atype,
                                             content=file_info["content"],
-                                            active=True,
+                                            active=False,
+                                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                             commit_message=f"Created by tool '{tool_name}'"
                                         )
                                     ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] ✨ Created NEW artifact from file: '{file_name}'")
@@ -1663,7 +1671,11 @@ class ChatMixin:
                                                     title=file_name,
                                                     new_content=content_placeholder,
                                                     new_type=atype,
-                                                    active=True,
+                                                    new_images=img_b64 if img_b64 else None,
+                                                    new_image_media_types=img_mtypes if img_mtypes else None,
+                                                    active=False,
+                                                    visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                                    bump_version=True,
                                                     commit_message=f"Updated binary file reference by tool '{tool_name}'"
                                                 )
                                             else:
@@ -1671,7 +1683,10 @@ class ChatMixin:
                                                     title=file_name,
                                                     artefact_type=atype,
                                                     content=content_placeholder,
-                                                    active=True,
+                                                    images=img_b64 if img_b64 else None,
+                                                    image_media_types=img_mtypes if img_mtypes else None,
+                                                    active=False,
+                                                    visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                                     commit_message=f"Created by tool '{tool_name}'"
                                                 )
                                             ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated file reference (placeholder): '{file_name}'")
@@ -1710,7 +1725,8 @@ class ChatMixin:
                                                 title=file_name,
                                                 new_content=after_info["content"],
                                                 new_type=atype,
-                                                active=True,
+                                                active=False,
+                                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                                 commit_message=f"Modified by tool '{tool_name}'"
                                             )
                                         else:
@@ -1718,7 +1734,8 @@ class ChatMixin:
                                                 title=file_name,
                                                 artefact_type=atype,
                                                 content=after_info["content"],
-                                                active=True,
+                                                active=False,
+                                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                                                 commit_message=f"Created by tool '{tool_name}'"
                                             )
                                         ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated artifact from modified file: '{file_name}'")
@@ -1731,7 +1748,6 @@ class ChatMixin:
                                                 if tag not in ai_msg.content:
                                                     ai_msg.content += f'\n\n{tag}\n'
                                                 self.commit()
-
                             finally:
                                 # No CWD restoration needed - ChatMixin never changed it
                                 # LCP Binding handles its own CWD cleanup internally

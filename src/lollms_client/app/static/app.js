@@ -1648,7 +1648,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (type === "image") {
                     // Direct binary download for the currently selected version of the image
                     const selectedVer = parseInt(vSelect.value, 10) || 1;
-                    const imgIndex = selectedVer - 1; // 0-based index
+                    const imgIndex = 0; // 0-based index
                     const a = document.createElement("a");
                     a.href = `/api/images/${encodeURIComponent(cleanTitle)}/${imgIndex}`;
                     a.download = `${cleanTitle}_v${selectedVer}.png`;
@@ -1886,7 +1886,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (activeType === "image") {
                 // Direct high-fidelity binary image preview in Rendered View
                 const selectedVer = version || 1;
-                const imgIndex = selectedVer - 1; // 0-based
+                const imgIndex = 0; // Each version of an image artifact contains its own standalone image at index 0
                 renderedView.style.height = "100%";
                 renderedView.style.overflow = "auto";
                 renderedView.style.display = "flex";
@@ -5079,6 +5079,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 scholar_api_key: document.getElementById("settings-scholar-api-key").value.trim()
             };
             payload["internet_config"] = internetConfig;
+            payload["widget_css"] = document.getElementById("settings-widget-css").value.trim();
 
             try {
                 const res = await fetch("/api/settings", {
@@ -5321,6 +5322,10 @@ document.addEventListener("DOMContentLoaded", () => {
             document.getElementById("settings-scopus-inst-token").value = internetConfig.scopus_inst_token || "";
             document.getElementById("settings-orbit-api-key").value = internetConfig.orbit_api_key || "";
             document.getElementById("settings-scholar-api-key").value = internetConfig.scholar_api_key || "";
+
+            // Populate Widget CSS
+            document.getElementById("settings-widget-css").value = data.widget_css || "";
+            window.widget_css = data.widget_css || null;
 
             // First, load all binding options
             await fetchBindings();
@@ -8155,7 +8160,6 @@ document.addEventListener("DOMContentLoaded", () => {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
-                            content: currentProse,
                             metadata: { ttft: ttft }
                         })
                     }).catch(() => {});
@@ -8511,7 +8515,7 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
     });
 
     // ── 🗛️ Parse and resolve <lollms_inline> tags into an interactive iframe card ──
-    const inlinePattern = /<lollms_inline\s+([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
+    const inlinePattern = /<lollms_inline\s*([^>]*)>([\s\S]*?)<\/lollms_inline>/gi;
     content = content.replace(inlinePattern, (match, attrsStr, bodyText) => {
         const attrs = {};
         attrsStr.replace(/(\w+)=["']([^"']*)["']/g, (m, k, v) => attrs[k] = v);
@@ -8526,20 +8530,67 @@ function resolveImageAnchors(content, title, msgId = null, version = null, msgOb
             cleanedBody = codeBlockMatch[1].trim();
         }
 
-        // Add base-href mapping inside inline widgets so they can also run relative fetches
-        if (!cleanedBody.includes("<base ")) {
-            cleanedBody = cleanedBody.replace("<head>", "<head><base href=\"/api/workspace_files/\">");
-        }
+        // Retrieve the custom widget CSS or use our sober default CSS
+        const css_text = window.widget_css || `
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background-color: #0f172a;
+                color: #f8fafc;
+                margin: 0;
+                padding: 16px;
+                box-sizing: border-box;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                overflow: hidden;
+            }
+            button {
+                background-color: #4f46e5;
+                color: #ffffff;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-size: 13.5px;
+                font-weight: 600;
+                cursor: pointer;
+            }
+            button:hover { background-color: #4338ca; }
+        `;
+
+        // Wrap the simplified bodyText (div and script) inside a secure, valid HTML5 boilerplate with parent-shielding mitigation
+        const completeHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <base href="/api/workspace_files/">
+    <script>
+        // Security Shield: Neutralize access to parent/top window objects and cookies
+        Object.defineProperty(window, 'parent', { value: null, writable: false, configurable: false });
+        Object.defineProperty(window, 'top', { value: null, writable: false, configurable: false });
+        Object.defineProperty(document, 'cookie', { value: '', writable: false, configurable: false });
+    </script>
+    <style>
+        ${css_text}
+    </style>
+</head>
+<body>
+    ${cleanedBody}
+</body>
+</html>
+        `.trim();
 
         const widgetId = `inline-widget-${Math.random().toString(36).substr(2, 9)}`;
-        const blob = new Blob([cleanedBody], { type: "text/html" });
+        const blob = new Blob([completeHtml], { type: "text/html" });
         const iframeUrl = URL.createObjectURL(blob);
 
         // Inject content via srcdoc and enable same-origin access for fetching
         setTimeout(() => {
             const iframe = document.getElementById(`iframe-widget-el-${widgetId}`);
             if (iframe) {
-                iframe.srcdoc = cleanedBody;
+                iframe.srcdoc = completeHtml;
             }
         }, 100);
 

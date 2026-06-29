@@ -637,61 +637,68 @@ RULES:
         return "\n".join(lines)
 
     def _build_inline_widget_instructions(self) -> str:
+        # Retrieve the custom widget CSS or use a modern, sober dark-mode default
+        css_text = getattr(self, "widget_css", None) or (
+            "body {\n"
+            "  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif;\n"
+            "  background-color: #0f172a;\n"
+            "  color: #f8fafc;\n"
+            "  margin: 0;\n"
+            "  padding: 16px;\n"
+            "  box-sizing: border-box;\n"
+            "  display: flex;\n"
+            "  flex-direction: column;\n"
+            "  align-items: center;\n"
+            "  justify-content: center;\n"
+            "  min-height: 100vh;\n"
+            "  overflow: hidden;\n"
+            "}\n"
+            "button {\n"
+            "  background-color: #4f46e5;\n"
+            "  color: #ffffff;\n"
+            "  border: none;\n"
+            "  padding: 8px 16px;\n"
+            "  border-radius: 6px;\n"
+            "  font-weight: 600;\n"
+            "  cursor: pointer;\n"
+            "}\n"
+            "button:hover { background-color: #4338ca; }"
+        )
+
         lines = [
             "",
             "=== INTERACTIVE WIDGET SYSTEM ===",
+            "You can embed live, interactive HTML/JS widgets directly in your replies.",
             "",
-            "You can embed live, interactive HTML widgets directly in your replies.",
+            "🚨 CRITICAL CHANGE — SIMPLIFIED TAG CONTENTS (MANDATORY):",
+            "  • Do NOT write a complete HTML document (no <!DOCTYPE html>, no <html>, <head>, or <body> tags).",
+            "  • Start directly with a container <div> tag, e.g.:",
+            "    <lollms_inline type=\"html\" title=\"Widget Title\">",
+            "    <div id=\"widget-container\">",
+            "      <!-- Your interactive HTML elements go here -->",
+            "    </div>",
+            "    <script>",
+            "      // Your Javascript code for animations, controls, and interaction",
+            "    </script>",
+            "    </lollms_inline>",
             "",
-            "🚨 CRITICAL PRIORITY DIRECTIVE — FAVOR ARTIFACTS OVER WIDGETS:",
-            "  • You MUST always favor creating persistent <artifact> files over inline <lollms_inline> widgets.",
-            "  • Widgets are strictly reserved for short, isolated, inline visual demonstrations (e.g. demonstrating a math formula, an algorithm tree, or a single color picker).",
-            "  • You are STRICTLY FORBIDDEN from using <lollms_inline> to build games, tools, or functional software applications. All runnable games (like Pong, Snake) and software apps MUST be implemented as <artifact> files.",
+            "🚨 CSS STYLING RULES:",
+            "  • The container is automatically loaded inside an iframe wrapped with this pre-defined CSS stylesheet:",
+            f"```css\n{css_text}\n```",
+            "  • Do NOT include large style blocks inside your output. Rely on classes and elements already styled by the rules above.",
             "",
-            "❌ DO NOT use widgets for:",
-            "  • Simple static explanations or text content",
-            "  • Displaying code (use <artifact> or markdown code blocks instead)",
+            "🚨 JAVASCRIPT & SECURITY RULES:",
+            "  • For code, you can use <script> tags. To make sure it is secure:",
+            "    - Do NOT attempt to access the parent window or document objects (no window.parent, window.top, or top.document).",
+            "    - Do NOT write or read cookies, localStorage, or sessionStorage.",
+            "    - Only perform relative fetches to `/api/workspace_files/filename.csv` to load datasets.",
             "",
-            "Tag syntax:",
-            '<lollms_inline type="html" title="Clear descriptive title">',
-            "<!DOCTYPE html>",
-            "<html>...(complete self-contained HTML document)...</html>",
-            "</lollms_inline>",
-            "",
-            "Rules:",
-            "  • Content MUST be a valid, complete HTML5 document",
-            "  • Only HTML + CSS + JavaScript — no Python, SQL, etc.",
-            "  • Never wrap the HTML inside ```html code fences",
-            "  • Always add explanatory text before or after the widget",
-            "  • If the user explicitly requests a 'widget' (e.g., 'create a watch widget'),",
-            "    you MUST use the <lollms_inline> tag directly to render it inline in the chat.",
-            "    DO NOT create a new file or code <artifact> for it.",
-            "  • DATA ACCESS (CRITICAL): To prevent context window bloat and truncation, you MUST NEVER manually write or embed large JSON payloads or raw data blocks inside your HTML code.",
-            "    Instead, use your Python data query tool to aggregate and save your findings as clean, lightweight CSV files (e.g., 'category_performance.csv') in the workspace directory.",
-            "    Your HTML widget can then fetch these files dynamically during live preview and offline standalone exports using this standard template:",
-            "      <!-- Include PapaParse via CDN for robust CSV parsing -->",
-            "      <script src=\"https://cdn.jsdelivr.net/npm/papaparse@5/papaparse.min.js\"></script>",
-            "      <script>",
-            "        const isLivePreview = window.location.port === '9680' || window.location.hostname === 'localhost';",
-            "        const dataPath = isLivePreview ? '/api/workspace_files/category_performance.csv' : 'category_performance.csv';",
-            "        ",
-            "        fetch(dataPath)",
-            "          .then(res => {",
-            "            if (!res.ok) throw new Error('Data file not found');",
-            "            return res.text();",
-            "          })",
-            "          .then(csvText => {",
-            "            const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });",
-            "            const data = parsed.data;",
-            "            // Render your charts or interactive tables using the 'data' array...",
-            "          })",
-            "          .catch(err => console.error('Failed to load dataset:', err));",
-            "      </script>",
-            "",
-            "Supported types: html (default), react, svg",
-            "",
+            "💡 DESIGN HINTS FOR BEAUTIFUL ANIMATIONS:",
+            "  - To build fluid animations, use CSS transitions, keyframes, or requestAnimationFrame in Javascript.",
+            "  - Utilize simple state variables to track button clicks, toggles, or slider values.",
+            "  - Example: Create a ticking clock, an animated sorting algorithm, or an interactive data chart.",
             "=== END INTERACTIVE WIDGET SYSTEM ===",
-            "",
+            ""
         ]
         return "\n".join(lines)
 

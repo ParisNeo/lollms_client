@@ -518,6 +518,7 @@ class ApplySettingsRequest(BaseModel):
     personality_name: Optional[str] = None
     internet_config: Optional[Dict[str, Any]] = None
     shared_memory_group: Optional[str] = "global_memories"
+    widget_css: Optional[str] = None
 
 
 def check_ollama(host: str, model: str) -> bool:
@@ -2312,7 +2313,8 @@ async def get_settings_endpoint():
         "tti_bindings_configs": cfg.get("tti_bindings_configs", {}),
         "stt_bindings_configs": cfg.get("stt_bindings_configs", {}),
         "personality_name": cfg.get("personality_name", ""),
-        "internet_config": cfg.get("internet_config", {})
+        "internet_config": cfg.get("internet_config", {}),
+        "widget_css": discussion.widget_css if discussion else None
     }
 
 
@@ -2368,9 +2370,11 @@ async def apply_settings_endpoint(payload: ApplySettingsRequest):
             "shared_memory_group": payload.shared_memory_group or "global_memories"
         })
 
-        # Update active discussion's internet_config
+        # Update active discussion's internet_config and widget_css
         if discussion:
             object.__setattr__(discussion, 'internet_config', payload.internet_config or {})
+            if payload.widget_css is not None:
+                discussion.widget_css = payload.widget_css
 
         # Save to historical maps for all-bindings hot retention
         llm_configs = current_config.setdefault("llm_bindings_configs", {})
@@ -4570,7 +4574,7 @@ async def export_artifact_endpoint(title: str, format: str, version: Optional[in
 # ── 💬 Message Actions & History Endpoints ──
 
 class EditMessageRequest(BaseModel):
-    content: str
+    content: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
 
 
@@ -4582,7 +4586,8 @@ async def edit_session_message_endpoint(message_id: str, payload: EditMessageReq
         if not msg:
             raise HTTPException(status_code=404, detail="Message not found.")
 
-        msg.content = payload.content.strip()
+        if payload.content is not None:
+            msg.content = payload.content.strip()
         if payload.metadata is not None:
             msg.metadata = {**(msg.metadata or {}), **payload.metadata}
         discussion.touch()
