@@ -399,7 +399,6 @@ class CoreMixin:
 
         # Fallback if rebuild failed
         if self._message_index is None:
-            ASCIIColors.error("[add_message] CRITICAL: Failed to initialize message index. Forcing empty dict.")
             object.__setattr__(self, '_message_index', {})
 
         msg_id = kwargs.get('id', str(uuid.uuid4()))
@@ -450,8 +449,7 @@ class CoreMixin:
         # Safe assignment to index
         try:
             self._message_index[msg_id] = new_msg_orm
-        except Exception as idx_err:
-            ASCIIColors.error(f"[add_message] Failed to update message index: {idx_err}")
+        except Exception:
             # Rebuild index as last resort
             self._rebuild_message_index()
             if self._message_index:
