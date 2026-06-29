@@ -201,7 +201,6 @@ class LollmsDataManager:
                 ]
                 for col, sql in migrations:
                     if col not in columns:
-                        ASCIIColors.info(f"  -> Upgrading 'discussions' table: Adding '{col}' column.")
                         connection.execute(text(sql))
                 if 'data_zone' in columns:
                     connection.execute(text("ALTER TABLE discussions DROP COLUMN data_zone"))
