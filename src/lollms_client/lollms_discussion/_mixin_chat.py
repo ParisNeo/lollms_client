@@ -1452,7 +1452,7 @@ class ChatMixin:
                                                 except Exception:
                                                     pass
 
-                                # Detect NEW/MODIFIED files
+                                # Detect NEW files
                                 new_files = set(files_after.keys()) - set(files_before.keys())
                                 ASCIIColors.info(f"[ChatMixin active_tools '{tool_name}'] Detected {len(new_files)} NEW files: {[str(f) for f in new_files]}")
 
@@ -1463,7 +1463,7 @@ class ChatMixin:
                                     file_path = file_info["path"]
                                     file_size = file_path.stat().st_size
 
-                                    # Determine Type
+                                    # Determine type
                                     atype = "document"
                                     if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
                                         atype = "code"
@@ -1492,7 +1492,7 @@ class ChatMixin:
                                             f"- **Location**: `./{file_name}`\n\n"
                                             f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
                                         )
-                                    elif file_info["content"] is None:
+                                    else:
                                         try:
                                             with open(file_path, 'rb') as f:
                                                 chunk = f.read(1024)
@@ -1535,9 +1535,9 @@ class ChatMixin:
                                             )
                                         ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
                                         self.commit()
-
+                                        
                                         # Hydrate active turn list so we can pass base64 pixels to vision
-                                        if atype == "image" and file_info["content"] is None:
+                                        if atype == "image":
                                             try:
                                                 import base64
                                                 raw_img = file_path.read_bytes()
@@ -1545,20 +1545,20 @@ class ChatMixin:
                                                 self.artefacts.update(
                                                     title=file_name,
                                                     new_images=[img_b64],
-                                                    new_image_media_types=[f"image/{file_ext[1:]}"]
+                                                    new_image_media_types=[f"image/{file_ext[1:]}"],
+                                                    bump_version=False # In-place update so version remains v1
                                                 )
                                                 self.commit()
                                                 self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
                                             except Exception as img_err:
                                                 ASCIIColors.warning(f"Failed to read image b64: {img_err}")
-
+                                        
                                         if self.active_branch_id:
                                             ai_msg = self.get_message(self.active_branch_id)
                                             if ai_msg:
-                                                if atype == "image":
-                                                    ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
-                                                else:
-                                                    ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                                tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                                                if tag not in ai_msg.content:
+                                                    ai_msg.content += f'\n\n{tag}\n'
                                                 self.commit()
                                         continue
 
@@ -1586,10 +1586,9 @@ class ChatMixin:
                                     if self.active_branch_id:
                                         ai_msg = self.get_message(self.active_branch_id)
                                         if ai_msg:
-                                            if atype == "image":
-                                                ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
-                                            else:
-                                                ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                            tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                                            if tag not in ai_msg.content:
+                                                ai_msg.content += f'\n\n{tag}\n'
                                             self.commit()
 
                                 # Detect MODIFIED files
@@ -1601,21 +1600,63 @@ class ChatMixin:
                                     file_ext = rel_path.suffix.lower()
                                     file_path = after_info["path"]
 
+                                    mtime_changed = before_info["mtime"] != after_info["mtime"]
                                     content_changed = before_info.get("hash") != after_info.get("hash")
-                                    became_binary = before_info.get("content") is not None and after_info.get("content") is None
-                                    became_text = before_info.get("content") is None and after_info.get("content") is not None
 
-                                    if content_changed or became_binary or became_text:
-                                        if after_info["content"] is None:
+                                    if mtime_changed or content_changed:
+                                        # File was modified!
+                                        atype = "document"
+                                        if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+                                            atype = "code"
+                                        elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
+                                            atype = "data"
+                                        elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
+                                            atype = "document"
+                                        elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+                                            atype = "image"
+
+                                        # Check if Binary
+                                        EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
+                                                                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
+                                                                ".zip", ".tar", ".gz", ".pdf", ".docx"}
+
+                                        should_read_content = True
+                                        content_placeholder = None
+
+                                        if file_ext in EXPLICIT_BINARY_EXTS:
+                                            should_read_content = False
                                             content_placeholder = (
-                                                f"### Binary File Modified: `{file_name}`\n\n"
-                                                f"This file was updated by the tool `{tool_name}`.\n"
-                                                f"- **Type**: {file_ext.upper()} Binary/Data\n"
-                                                f"- **Location**: `./{file_name}`\n"
-                                                f"- **Size**: {file_path.stat().st_size:,} bytes\n\n"
-                                                f"You can download or view this file directly from the Workspace Artifacts panel."
+                                                f"### Data File Modified: `{file_name}`\n\n"
+                                                f"This file was modified by the tool `{tool_name}`.\n"
+                                                f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
+                                                f"- **Size**: {file_size:,} bytes\n"
+                                                f"- **Location**: `./{file_name}`\n\n"
+                                                f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
                                             )
+                                        else:
+                                            try:
+                                                with open(file_path, 'rb') as f:
+                                                    chunk = f.read(1024)
+                                                    if b'\x00' in chunk:
+                                                        should_read_content = False
+                                                        content_placeholder = (
+                                                            f"### Binary File Modified: `{file_name}`\n\n"
+                                                            f"This file was modified by the tool `{tool_name}`.\n"
+                                                            f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
+                                                            f"- **Size**: {file_size:,} bytes\n"
+                                                            f"- **Location**: `./{file_name}`\n\n"
+                                                            f"> **Action**: Download from Workspace Artifacts panel."
+                                                        )
+                                                    else:
+                                                        forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
+                                                        after_info["content"] = forced_content
+                                                        should_read_content = True
+                                            except Exception as e:
+                                                should_read_content = False
+                                                content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
 
+                                        # Register/Update
+                                        if not should_read_content and content_placeholder:
                                             existing_art = self.artefacts.get(file_name)
                                             if existing_art:
                                                 art = self.artefacts.update(
@@ -1623,7 +1664,7 @@ class ChatMixin:
                                                     new_content=content_placeholder,
                                                     new_type=atype,
                                                     active=True,
-                                                    commit_message=f"Modified binary file by tool '{tool_name}'"
+                                                    commit_message=f"Updated binary file reference by tool '{tool_name}'"
                                                 )
                                             else:
                                                 art = self.artefacts.add(
@@ -1631,11 +1672,11 @@ class ChatMixin:
                                                     artefact_type=atype,
                                                     content=content_placeholder,
                                                     active=True,
-                                                    commit_message=f"Synced binary file by tool '{tool_name}'"
+                                                    commit_message=f"Created by tool '{tool_name}'"
                                                 )
-                                            ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated binary file reference: '{file_name}'")
+                                            ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated file reference (placeholder): '{file_name}'")
                                             self.commit()
-
+                                            
                                             # Hydrate active turn list so we can pass base64 pixels to vision
                                             if atype == "image":
                                                 try:
@@ -1645,32 +1686,26 @@ class ChatMixin:
                                                     self.artefacts.update(
                                                         title=file_name,
                                                         new_images=[img_b64],
-                                                        new_image_media_types=[f"image/{file_ext[1:]}"]
+                                                        new_image_media_types=[f"image/{file_ext[1:]}"],
+                                                        bump_version=True # Increment version on modification
                                                     )
                                                     self.commit()
                                                     self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
                                                 except Exception as img_err:
                                                     ASCIIColors.warning(f"Failed to read image b64: {img_err}")
-
+                                            
                                             if self.active_branch_id:
                                                 ai_msg = self.get_message(self.active_branch_id)
                                                 if ai_msg:
-                                                    if atype == "image":
-                                                        ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
-                                                    else:
-                                                        ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                                    tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                                                    if tag not in ai_msg.content:
+                                                        ai_msg.content += f'\n\n{tag}\n'
                                                     self.commit()
                                             continue
 
-                                        # Handle Text/Readable Modified Files
+                                        # Handle Text/Readable Files
                                         existing_art = self.artefacts.get(file_name)
                                         if existing_art:
-                                            atype = existing_art.get("type", "document")
-                                            if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
-                                                atype = "code"
-                                            elif file_ext in (".csv", ".db", ".sqlite", ".xlsx", ".xls"):
-                                                atype = "data"
-
                                             art = self.artefacts.update(
                                                 title=file_name,
                                                 new_content=after_info["content"],
@@ -1678,26 +1713,23 @@ class ChatMixin:
                                                 active=True,
                                                 commit_message=f"Modified by tool '{tool_name}'"
                                             )
-                                            ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated artifact '{file_name}' (v{existing_art.get('version', 1)+1})")
-                                            self.commit()
                                         else:
-                                            atype = "code" if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir") else "document"
                                             art = self.artefacts.add(
                                                 title=file_name,
                                                 artefact_type=atype,
                                                 content=after_info["content"],
                                                 active=True,
-                                                commit_message=f"Synced by tool '{tool_name}'"
+                                                commit_message=f"Created by tool '{tool_name}'"
                                             )
-                                            self.commit()
+                                        ASCIIColors.success(f"[ChatMixin active_tools '{tool_name}'] 🔄 Updated artifact from modified file: '{file_name}'")
+                                        self.commit()
 
                                         if self.active_branch_id:
                                             ai_msg = self.get_message(self.active_branch_id)
                                             if ai_msg:
-                                                if atype == "image":
-                                                    ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
-                                                else:
-                                                    ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                                tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                                                if tag not in ai_msg.content:
+                                                    ai_msg.content += f'\n\n{tag}\n'
                                                 self.commit()
 
                             finally:

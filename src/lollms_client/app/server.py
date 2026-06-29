@@ -230,6 +230,29 @@ def initialize_workspace_state(workspace_name: str):
         needs_configuration = True
         client = DummyClient()
 
+    # ── SELF-HEALING WORKSPACE DATA DIRECTORY CLEANUP ──
+    # Clean up any rogue system/database files accidentally copied into the workspace_data folder
+    ws_data_dir = APP_WORKSPACE_DIR / "workspace_data"
+    if ws_data_dir.exists() and ws_data_dir.is_dir():
+        import shutil
+        for item in list(ws_data_dir.iterdir()):
+            if item.is_file():
+                # Purge copied databases, transaction files, and backups
+                if item.name.endswith((".db", ".db-shm", ".db-wal")) or item.name in ("discussion.db", "memories.db"):
+                    try:
+                        item.unlink()
+                        ASCIIColors.success(f"[Cleanup] Purged rogue system file from data folder: {item.name}")
+                    except Exception:
+                        pass
+            elif item.is_dir():
+                # Purge nested loop directories like workspace_data/workspace_data
+                if item.name in ("workspace_data", "data_workspace"):
+                    try:
+                        shutil.rmtree(str(item))
+                        ASCIIColors.success(f"[Cleanup] Purged rogue nested directory: {item.name}")
+                    except Exception:
+                        pass
+
     # Load or create persistent discussion session
     internet_cfg = cfg.get("internet_config") or {}
     if db_mgr.discussion_exists("viewer_session"):
@@ -745,9 +768,8 @@ async def get_workspace_file_endpoint(filename: str):
     if not disc_ws:
         raise HTTPException(status_code=400, detail="No active workspace directory.")
 
-    # Route strictly to workspace_data subfolder
-    ws_data_dir = disc_ws / "workspace_data"
-    ws_data_dir.mkdir(parents=True, exist_ok=True)
+    # Route strictly to the clean workspace data directory
+    ws_data_dir = disc_ws
 
     # Sanitize and guard against Directory Traversal
     file_path = (ws_data_dir / filename).resolve()
@@ -869,8 +891,8 @@ async def import_folder_endpoint(payload: ImportFolderRequest):
     import_thread.start()
     import_thread.join()  # Wait for completion
 
-    # Check if the consolidated DB file exists
-    db_file_path = APP_WORKSPACE_DIR / f"{title}_consolidated.db"
+    # Check if the consolidated DB file exists inside workspace_data
+    db_file_path = get_discussion_workspace() / f"{title}_consolidated.db"
     if not db_file_path.exists():
         return {
             "success": False,
@@ -3432,10 +3454,9 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
         # Ensure active unversioned copies exist for all data artifacts in the workspace
         if discussion and disc_ws:
             try:
-                # Scan only safe local workspace directories to prevent copying project-root source files
+                # Resolve global data_workspace absolutely to prevent relative confusion during CWD shifts
                 possible_dirs = [
-                    APP_WORKSPACE_DIR,
-                    Path("./data_workspace")
+                    PROJECT_ROOT / "data_workspace"
                 ]
 
                 ASCIIColors.info(f"=== [Sandbox Sync Debug] Active Sandbox Directory: {disc_ws.resolve()} ===")
@@ -3452,7 +3473,8 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
 
                         # 1. Mirror all flat files from source directory directly into active discussion sandbox
                         for item in src_dir.iterdir():
-                            if item.is_file():
+                            # Strictly exclude internal database and transaction files from the sandbox copier
+                            if item.is_file() and not item.name.endswith((".db", ".db-shm", ".db-wal")):
                                 dest_file = disc_ws / item.name
                                 if item.resolve() != dest_file.resolve():
                                     dest_file.parent.mkdir(parents=True, exist_ok=True)
