@@ -289,6 +289,10 @@ class _StreamState:
         self.affected_artefacts = []
         self.processed_tags = set()
 
+        # Track context unlock requests to force continuation round
+        self.context_unlock_requested = False
+        self.context_unlocked_files: List[str] = []
+
         self._is_accumulating_tool = False
         self._tool_buffer = ""
 
@@ -429,8 +433,10 @@ class _StreamState:
                 self.affected_artefacts.append(art)
 
             # ── SWIFT REPLACEMENT PROTOCOL ──
-            # Strips the full raw XML from the message body and replaces it with the placeholder
-            placeholder = f"\n[content stripped, refer to the '{title}' artefact for details]\n"
+            # Strips the full raw XML from the message body and replaces it with an unmistakable SYSTEM marker
+            # This prevents the LLM from mimicking the placeholder in future turns
+            # NOTE: The triple-bracket format is NEVER used in valid XML, making it impossible to confuse with functional tags
+            placeholder = f"\n[🔒SYSTEM_ARTIFACT_CREATED:{title}|{atype}]\n"
             self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
 
             # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
@@ -483,7 +489,8 @@ class _StreamState:
             if art:
                 self.affected_artefacts.append(art)
 
-            placeholder = f"\n[content stripped, refer to the '{title}' note for details]\n"
+            # Use distinctive SYSTEM marker that cannot be mimicked
+            placeholder = f"\n[🔒SYSTEM_NOTE_CREATED:{title}]\n"
             self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
             _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
@@ -505,7 +512,8 @@ class _StreamState:
             if art:
                 self.affected_artefacts.append(art)
 
-            placeholder = f"\n[content stripped, refer to the '{title}' skill for details]\n"
+            # Use distinctive SYSTEM marker that cannot be mimicked
+            placeholder = f"\n[🔒SYSTEM_SKILL_CREATED:{title}]\n"
             self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
             _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
@@ -515,23 +523,44 @@ class _StreamState:
             return True
 
         # 5. Multi-tier Context Unlocks
+        # 5. Multi-tier Context Unlocks
         elif tag_name == "add_files_to_context":
             from ._artefacts import ArtefactVisibility
             targets = [t.strip() for t in body.splitlines() if t.strip()]
             unlocked_files = []
+            already_visible = []
+            not_found = []
 
             for t_file in targets:
                 art = self.discussion.artefacts.get(t_file)
-                if art:
+                if not art:
+                    not_found.append(t_file)
+                elif art.get("visibility") == ArtefactVisibility.FULL:
+                    # Already fully loaded - skip redundant operation
+                    already_visible.append(t_file)
+                else:
                     self.discussion.artefacts.set_visibility(t_file, ArtefactVisibility.FULL)
                     unlocked_files.append(t_file)
 
             if unlocked_files:
                 self.discussion.commit()
+                # Mark that we need a continuation round after this generation
+                self.context_unlock_requested = True
+                self.context_unlocked_files.extend(unlocked_files)
 
-            placeholder = f"\n[unlocked and loaded context files: {', '.join(unlocked_files)}]\n"
+            # Build informative feedback - distinguish between newly unlocked and already visible
+            feedback_parts = []
+            if unlocked_files:
+                feedback_parts.append(f"✅ Loaded: {', '.join(unlocked_files)}")
+            if already_visible:
+                feedback_parts.append(f"⚠️ Already in context: {', '.join(already_visible)}")
+            if not_found:
+                feedback_parts.append(f"❌ Not found: {', '.join(not_found)}")
+            
+            # Use a distinctive SYSTEM marker that cannot be mimicked
+            placeholder = f"\n\n[SYSTEM: Context updated — {'; '.join(feedback_parts)}]\n\n"
             self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_CHUNK)
+            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
             return True
 
         return True
@@ -830,7 +859,7 @@ class ChatMixin:
             "Never fabricate facts. Say 'I don't know' when uncertain.\n"
             "\n=== CODE & STRUCTURED FORMATTING RULES (MANDATORY) ===\n"
             "ALWAYS wrap any code, scripts, configurations, or structured formats "
-            "(such as HTML, CSS, Python, SQL, XML, JSON, YAML, Turtle, etc.) inside standard "
+            "(such as HTML, CSS, Python, SQL, XML, JSON, YAML, etc.) inside standard "
             "markdown code blocks specifying the correct language identifier, e.g.:\n"
             "```python\n"
             "# python code here\n"
@@ -852,6 +881,10 @@ class ChatMixin:
             "you MUST output all functional XML tags (such as <artifact>, <tool_call>, or <mem_new>) "
             "on a NEW LINE strictly AFTER the closing </think> tag. "
             "NEVER place functional tags inside the <think> reasoning block.\n"
+            "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
+            "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
+            "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool_call>`. Do NOT mimic the placeholder markers from past messages.\n"
+            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool_call>`, `<tool_result>`) MUST NEVER appear inside <think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
         )
 
         extra_instructions = ""
@@ -1788,6 +1821,33 @@ class ChatMixin:
                 else:
                     break
             else:
+                # ── 🔄 FORCE CONTINUATION AFTER CONTEXT UNLOCK ─────────────────
+                # If the model requested files to be loaded, force at least one more round
+                # so it can immediately use the newly available context
+                if ss.context_unlock_requested and not was_cancelled:
+                    ASCIIColors.info(f"[ChatMixin] Context unlock detected ({ss.context_unlocked_files}), forcing continuation round...")
+
+                    # Inject a system prompt confirming the unlock and inviting continuation
+                    unlock_files_str = ', '.join(ss.context_unlocked_files)
+                    continuation_prompt = (
+                        f"\n\n[SYSTEM: The following files have been loaded into context: {unlock_files_str}. "
+                        f"You can now read their full content and use them. Please continue your task.]\n\n"
+                    )
+
+                    # Append to AI message content (will be visible in next round's history)
+                    ai_msg.content += continuation_prompt
+                    _cb(callback, continuation_prompt, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    # Add a user message to force the loop to continue
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=f"[SYSTEM: Files {unlock_files_str} are now available. Continue.]"
+                    ))
+
+                    # Reset the flag and continue the loop
+                    ss.context_unlock_requested = False
+                    continue  # Jump to next reasoning round immediately
+
                 break
 
         # ── 11. Final Post-Processing & Database Commit ──
