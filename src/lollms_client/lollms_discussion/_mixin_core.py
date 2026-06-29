@@ -631,3 +631,15 @@ class CoreMixin:
     @property
     def system_prompt(self):
         return self._system_prompt
+
+    def get_workspace_path(self) -> Optional[str]:
+        """
+        Returns the absolute path to the discussion's isolated workspace directory.
+
+        This method provides backward compatibility for frontend code expecting
+        a method call rather than direct attribute access.
+
+        Returns:
+            str | None: The resolved workspace path, or None if not configured.
+        """
+        return getattr(self, 'workspace_path', None)
