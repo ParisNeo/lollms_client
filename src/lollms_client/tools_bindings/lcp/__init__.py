@@ -164,7 +164,6 @@ class LCPBinding(LollmsToolBinding):
 
     def _load_tool_file(self, py_file: Path) -> bool:
         file_stem = py_file.stem
-        ASCIIColors.info(f"[LCP Discovery] Scanning file for tools: {py_file.name}")
 
         tool_defs = self._parse_tool_via_ast(py_file)
         if not tool_defs:
@@ -182,7 +181,6 @@ class LCPBinding(LollmsToolBinding):
                 continue
 
             self.discovered_tools.append(tool_def)
-            ASCIIColors.green(f"[LCP Discovery] ✅ Registered tool: {tool_name}")
             count += 1
 
         if count > 0:
@@ -213,7 +211,6 @@ class LCPBinding(LollmsToolBinding):
             ASCIIColors.info(f"[LCP Mount] Library '{library_name}' already mounted.")
             return True
 
-        ASCIIColors.cyan(f"[LCP Mount] Mounting library '{library_name}' from {lib_path}...")
         self.tools_folders.append(lib_path)
 
         # Trigger discovery for this specific new folder only (optimization)
@@ -238,24 +235,18 @@ class LCPBinding(LollmsToolBinding):
 
     def _discover_local_tools(self):
         self.discovered_tools = []
-        ASCIIColors.info(f"[LCP Discovery] Starting discovery scan...")
-        ASCIIColors.info(f"[LCP Discovery] Configured Tools Folders: {self.tools_folders}")
-        ASCIIColors.info(f"[LCP Discovery] Configured Tool Files: {self.tool_files}")
 
         for folder in self.tools_folders:
             if not folder or not folder.is_dir(): 
                 ASCIIColors.warning(f"[LCP Discovery] Folder does not exist: {folder}")
                 continue
-            ASCIIColors.info(f"[LCP Discovery] 📂 Scanning directory: {folder}")
 
             for item in folder.iterdir():
                 py_file = None
                 if item.is_dir():
                     py_file = item / f"{item.name}.py"
-                    ASCIIColors.info(f"[LCP Discovery]   Checking folder: {item.name} -> Expected: {py_file.name}")
                 elif item.suffix == ".py" and item.stem != "__init__":
                     py_file = item
-                    ASCIIColors.info(f"[LCP Discovery]   Checking file: {item.name}")
 
                 if py_file and py_file.exists():
                     self._load_tool_file(py_file)
@@ -267,9 +258,6 @@ class LCPBinding(LollmsToolBinding):
                 self._load_tool_file(py_file)
             elif py_file:
                 ASCIIColors.warning(f"[LCP Discovery] Explicit tool file missing: {py_file}")
-
-        ASCIIColors.info(f"[LCP Discovery] 🏁 Discovery complete. Total tools found: {len(self.discovered_tools)}")
-        ASCIIColors.info(f"[LCP Discovery] Tool List: {[t['name'] for t in self.discovered_tools]}")
 
     def discover_tools(self, specific_tool_names: Optional[List[str]] = None, **kwargs) -> List[Dict[str, Any]]:
         if kwargs.get("force_refresh", False) or not self.discovered_tools:
@@ -336,7 +324,6 @@ class LCPBinding(LollmsToolBinding):
             # Verify we're in the correct workspace (defensive check)
             import os
             current_cwd = Path(os.getcwd()).resolve()
-            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Executing in CWD: {current_cwd}")
 
             # Snapshot workspace files BEFORE execution (Store content hash to detect changes reliably)
             files_before = {}
@@ -361,8 +348,6 @@ class LCPBinding(LollmsToolBinding):
                                 "path": f,
                                 "content": None
                             }
-
-            ASCIIColors.info(f"[LCP Tool '{tool_name}'] Snapshot taken: {len(files_before)} files before execution")
 
             # Add workspace to sys.path and Environment
             current_cwd_str = str(current_cwd)
@@ -447,7 +432,6 @@ class LCPBinding(LollmsToolBinding):
                 else:
                     # 8. Detect NEW files
                     new_files = set(files_after.keys()) - set(files_before.keys())
-                    ASCIIColors.info(f"[LCP Tool '{tool_name}'] Detected {len(new_files)} NEW files: {[str(f) for f in new_files]}")
 
                     for rel_path in new_files:
                         file_info = files_after[rel_path]
