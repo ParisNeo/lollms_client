@@ -7,8 +7,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
-
-from ascii_colors import ASCIIColors
+from ascii_colors import ASCIIColors, trace_exception
 
 class ArtefactVisibility:
     """Visibility tiers for context optimization."""
@@ -390,24 +389,22 @@ class ArtefactManager:
                     primary_path.write_bytes(physical_data)
                     versioned_path.write_bytes(physical_data)
                     wrote_physical = True
-                    ASCIIColors.success(f"[Dual-Stream] ✈️ Synced PHYSICAL '{filename}' (v{version}) to workspace_data.")
-                except Exception as bin_err:
-                    ASCIIColors.warning(f"Failed to write physical data for '{filename}': {bin_err}")
+                except Exception as e:
+                    trace_exception(e)
 
             if not wrote_physical and isinstance(content, str) and atype not in (ArtefactType.IMAGE, ArtefactType.DATA):
                 try:
                     primary_path.write_text(content, encoding="utf-8", errors="ignore")
                     versioned_path.write_text(content, encoding="utf-8", errors="ignore")
                     wrote_physical = True
-                    ASCIIColors.success(f"[Dual-Stream] ✈️ Synced TEXT '{filename}' (v{version}) to workspace_data.")
-                except Exception as txt_err:
-                    ASCIIColors.warning(f"Failed to write text content for '{filename}': {txt_err}")
+                except Exception as e:
+                    trace_exception(e)
 
             if logical_content:
                 try:
                     lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
-                except Exception as lam_err:
-                    ASCIIColors.warning(f"Failed to write logical .lam for '{title}': {lam_err}")
+                except Exception as e:
+                    trace_exception(e)
             elif wrote_physical and atype in (ArtefactType.DATA, ArtefactType.IMAGE, ArtefactType.DOCUMENT):
                 minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: workspace_data/{filename}\n\n"
                 try:
@@ -627,7 +624,7 @@ class ArtefactManager:
                 if old_path.exists():
                     old_path.unlink()
             except Exception as e:
-                ASCIIColors.warning(f"Failed to clear old renamed file: {e}")
+                trace_exception(e)
 
         use_content = new_content if new_content is not None else latest.get('content', '')
         if new_title and new_title != title:
@@ -1013,7 +1010,7 @@ class ArtefactManager:
                         continue
                     file_path.unlink()
                 except Exception as e:
-                    ASCIIColors.error(f"Failed to delete file {file_path}: {e}")
+                    trace_exception(e)
 
         except Exception as e:
             ASCIIColors.warning(f"Error during cleanup for '{title}': {e}")
@@ -1409,7 +1406,6 @@ class ArtefactManager:
     @staticmethod
     def apply_aider_patch(original: str, patch_block: str) -> str:
         import re as _re
-        ASCIIColors.panel(patch_block, "applying the patch")
 
         SEARCH_RE  = _re.compile(r'^<{6,8}(?:\s*\w+)?\s*$',  _re.IGNORECASE)
         SEP_RE     = _re.compile(r'^={5,}\s*$')
@@ -1532,7 +1528,6 @@ class ArtefactManager:
             # Pass 1: Exact
             if s_text in result:
                 result = result.replace(s_text, r_text, 1)
-                ASCIIColors.success(f"  [Patch] {label} Pass 1: exact match")
                 continue
 
             # Pass 2: Trailing-space
@@ -1543,7 +1538,6 @@ class ArtefactManager:
                     post = res_lines[i + n_s:]
                     result = '\n'.join(pre + [r_text] + post)
                     match_found = True
-                    ASCIIColors.success(f"  [Patch] {label} Pass 2: trailing space match")
                     break
 
             if match_found:
@@ -1566,7 +1560,6 @@ class ArtefactManager:
             if best_i >= 0:
                 result = _apply_at(res_lines, best_i, n_s, r_text)
                 match_found = True
-                ASCIIColors.warning(f"  [Patch] {label} Pass 3: indentation match")
 
             if match_found:
                 continue
@@ -1590,7 +1583,6 @@ class ArtefactManager:
             if best_i >= 0:
                 result = _apply_at(res_lines, best_i, n_s, r_text)
                 match_found = True
-                ASCIIColors.warning(f"  [Patch] {label} Pass C1: comment match")
 
             if match_found:
                 continue
@@ -1626,7 +1618,6 @@ class ArtefactManager:
             if best_i >= 0:
                 result = _apply_at(res_lines, best_orig_start, best_orig_end - best_orig_start, r_text)
                 match_found = True
-                ASCIIColors.warning(f"  [Patch] {label} Pass C2: blank match")
 
             if match_found:
                 continue
@@ -1650,7 +1641,6 @@ class ArtefactManager:
                 if core_search and core_search in result:
                     result = result.replace(core_search, core_replace, 1)
                     match_found = True
-                    ASCIIColors.success(f"  [Patch] {label} Pass D: core-delta match")
 
             if match_found:
                 continue
