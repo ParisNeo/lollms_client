@@ -6996,10 +6996,10 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         });
 
-        // Mask <tool_call> blocks (closed or unclosed)
-        const toolCallRegex = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/gi;
+        // Mask <tool> blocks (closed or unclosed)
+        const toolCallRegex = /<tool>([\s\S]*?)(?:<\/tool>|$)/gi;
         cleanedText = cleanedText.replace(toolCallRegex, (match, bodyText) => {
-            const isClosed = match.toLowerCase().endsWith("</tool_call>");
+            const isClosed = match.toLowerCase().endsWith("</tool>");
             let toolName = "Unknown Tool";
             let paramsHtml = "";
             const trimmedBody = bodyText.trim();
