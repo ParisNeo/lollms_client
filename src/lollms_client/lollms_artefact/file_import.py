@@ -1525,6 +1525,11 @@ class FileImportMixin:
         language = _detect_language(path)
 
         existing = self.artefacts.get(title)
+
+        # Explicitly force visibility to FULL when import is set to activate,
+        # ensuring the LLM instantly sees the document content.
+        visibility_value = ArtefactVisibility.FULL if activate else ArtefactVisibility.HIDDEN
+
         if existing is None:
             art = self.artefacts.add(
                 title         = title,
@@ -1532,6 +1537,7 @@ class FileImportMixin:
                 content       = text,
                 language      = language,
                 active        = activate,
+                visibility    = visibility_value,
                 **extra_data
             )
             ASCIIColors.success(f"[FileImport] Created artefact '{title}' of type '{atype}'")
@@ -1542,6 +1548,7 @@ class FileImportMixin:
                 new_type    = atype,
                 language    = language,
                 active      = activate,
+                visibility    = visibility_value,
                 **extra_data
             )
             ASCIIColors.success(
