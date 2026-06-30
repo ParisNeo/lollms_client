@@ -1,0 +1,27 @@
+title: SGLang
+author: ParisNeo
+creation_date: 2026-06-30
+last_update_date: 2026-06-30
+description: A binding for SGLang (Structured Generation Language) API server, providing high-performance inference, support for local/remote SGLang servers, and standard OpenAI compatible endpoints.
+global_input_parameters:
+  - name: host_address
+    type: str
+    description: "The base URL of the SGLang server (e.g., 'http://localhost:30000/v1')."
+    mandatory: true
+    default: "http://localhost:30000/v1"
+  - name: service_key
+    type: str
+    description: "The API key if SGLang server is configured with authentication (otherwise leave EMPTY)."
+    mandatory: false
+    default: "EMPTY"
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify the SSL certificate of the SGLang server. Defaults to true."
+    mandatory: false
+    default: true
+model_input_parameters:
+  - name: model_name
+    type: str
+    description: "The name of the model to use from the SGLang server."
+    mandatory: true
+    default: "default"
