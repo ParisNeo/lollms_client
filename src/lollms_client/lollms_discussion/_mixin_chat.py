@@ -1432,7 +1432,7 @@ class ChatMixin:
                                             should_read_content = False
                                             content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
 
-                                    # Register as tree_unlockable and inactive by default
+                                    # Register as tree_unlockable or fully active based on type
                                     if not should_read_content and content_placeholder:
                                         existing_art = self.artefacts.get(file_name)
                                         if existing_art:
@@ -1440,8 +1440,8 @@ class ChatMixin:
                                                 title=file_name,
                                                 new_content=content_placeholder,
                                                 new_type=atype,
-                                                active=False,
-                                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                                active=True,
+                                                visibility=ArtefactVisibility.FULL,
                                                 commit_message=f"Updated binary file reference by tool '{tool_name}'"
                                             )
                                         else:
@@ -1449,8 +1449,8 @@ class ChatMixin:
                                                 title=file_name,
                                                 artefact_type=atype,
                                                 content=content_placeholder,
-                                                active=False,
-                                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                                active=True,
+                                                visibility=ArtefactVisibility.FULL,
                                                 commit_message=f"Created by tool '{tool_name}'"
                                             )
                                         # Registered file (placeholder) (logging removed)
@@ -1482,15 +1482,15 @@ class ChatMixin:
                                                 self.commit()
                                         continue
 
-                                    # Handle Text/Readable Files
+                                    # Handle Text/Readable Files (Default to Fully Active & Visible)
                                     existing_art = self.artefacts.get(file_name)
                                     if existing_art:
                                         art = self.artefacts.update(
                                             title=file_name,
                                             new_content=file_info["content"],
                                             new_type=atype,
-                                            active=False,
-                                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                            active=True,
+                                            visibility=ArtefactVisibility.FULL,
                                             commit_message=f"Restored by tool '{tool_name}'"
                                         )
                                     else:
@@ -1498,8 +1498,8 @@ class ChatMixin:
                                             title=file_name,
                                             artefact_type=atype,
                                             content=file_info["content"],
-                                            active=False,
-                                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                            active=True,
+                                            visibility=ArtefactVisibility.FULL,
                                             commit_message=f"Created by tool '{tool_name}'"
                                         )
                                     # Created NEW artifact from file (logging removed)
@@ -1587,8 +1587,8 @@ class ChatMixin:
                                                     new_type=atype,
                                                     new_images=img_b64 if img_b64 else None,
                                                     new_image_media_types=img_mtypes if img_mtypes else None,
-                                                    active=False,
-                                                    visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                                    active=True,
+                                                    visibility=ArtefactVisibility.FULL,
                                                     bump_version=True,
                                                     commit_message=f"Updated binary file reference by tool '{tool_name}'"
                                                 )
@@ -1599,8 +1599,8 @@ class ChatMixin:
                                                     content=content_placeholder,
                                                     images=img_b64 if img_b64 else None,
                                                     image_media_types=img_mtypes if img_mtypes else None,
-                                                    active=False,
-                                                    visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                                    active=True,
+                                                    visibility=ArtefactVisibility.FULL,
                                                     commit_message=f"Created by tool '{tool_name}'"
                                                 )
                                             # Updated file reference (placeholder) (logging removed)
@@ -1632,15 +1632,15 @@ class ChatMixin:
                                                     self.commit()
                                             continue
 
-                                        # Handle Text/Readable Files
+                                        # Handle Text/Readable Files (Default to Fully Active & Visible)
                                         existing_art = self.artefacts.get(file_name)
                                         if existing_art:
                                             art = self.artefacts.update(
                                                 title=file_name,
                                                 new_content=after_info["content"],
                                                 new_type=atype,
-                                                active=False,
-                                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                                active=True,
+                                                visibility=ArtefactVisibility.FULL,
                                                 commit_message=f"Modified by tool '{tool_name}'"
                                             )
                                         else:
@@ -1648,8 +1648,8 @@ class ChatMixin:
                                                 title=file_name,
                                                 artefact_type=atype,
                                                 content=after_info["content"],
-                                                active=False,
-                                                visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                                                active=True,
+                                                visibility=ArtefactVisibility.FULL,
                                                 commit_message=f"Created by tool '{tool_name}'"
                                             )
                                         # Updated artifact from modified file (logging removed)

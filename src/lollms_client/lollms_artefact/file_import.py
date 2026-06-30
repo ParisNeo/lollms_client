@@ -68,7 +68,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors
 
-from .lollms_artefact import ArtefactType, make_image_id
+from .lollms_artefact import ArtefactType, make_image_id, ArtefactVisibility
 from .data_files import _parse_data_file
 
 if TYPE_CHECKING:
@@ -1383,6 +1383,9 @@ class FileImportMixin:
         extract_embedded = (mode == IMPORT_MODE_TEXT_EMBEDDED_IMAGES)
         text:   str                    = ""
         images_data: List[Tuple[str, str]] = []
+
+        # Force activate to be True so text files are automatically fully loaded
+        activate = True
 
         if is_plain_text:
             _progress("Reading text file…")

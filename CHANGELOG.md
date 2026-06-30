@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-06-30 11:26]
+
+- refactor: minor updates to file import and chat mixin
+
 ## [2026-06-30 00:32]
 
 - feat(llm_bindings): add sglang support
