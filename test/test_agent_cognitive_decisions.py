@@ -142,7 +142,7 @@ class MockGemmaAgentClient:
                 "df = pd.read_csv('sales_database.csv')\n"
                 "print(df.loc[df['revenue'].idxmax()][['product_name', 'revenue']].to_dict())\n"
                 "</artifact>\n"
-                '<tool_call>{"name": "execute_python_data_query", "parameters": {"code": "query.py"}}</tool_call>'
+                '<tool>{"name": "execute_python_data_query", "parameters": {"code": "query.py"}}</tool>'
             )
             if callback:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
