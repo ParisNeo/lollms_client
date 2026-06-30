@@ -1028,7 +1028,20 @@ class ChatMixin:
         if active_tools:
             tools_prompt = "\n=== TOOLS AVAILABLE ===\n"
             tools_prompt += "To use a tool, you MUST emit a single <tool_call> tag on a new line with the tool parameters as a JSON object, and then stop generating. Do NOT write prose before or after the tag.\n"
-            tools_prompt += "Exact syntax:\n<tool_call>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}</tool_call>\n\n"
+            tools_prompt += (
+                "\n=== TOOL CALLING DISCIPLINE (CRITICAL — READ BEFORE CALLING TOOLS) ===\n"
+                "1. **EXACT CLOSING TAG**: The closing tag is  `</tool_call>` . You MUST NOT write  `` `` ``  or any other variation.\n"
+                "2. **NEW LINE ONLY**: The <tool_call> tag MUST start on a brand new line. It MUST NEVER be placed inline inside conversational prose.\n"
+                "3. **NO PROSE AROUND IT**: Do NOT write introductory text (e.g., 'Let me try...') before the tag, and do NOT write text after it on the same line.\n\n"
+                "❌ WRONG (inline + wrong closing tag):\n"
+                "Sure! Let's test the tool: <tool_call>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool_call>\n\n"
+                "❌ WRONG (wrong closing tag):\n"
+                "<tool_call>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool_call>\n\n"
+                "✅ CORRECT (new line + exact closing tag ``)`):\n"
+                "<tool_call>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool_call>\n"
+                "=== END TOOL CALLING DISCIPLINE ===\n"
+            )
+            tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool_call>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}`)`\n\n"
             tools_prompt += "Available tools:\n"
             for t_name, t_spec in active_tools.items():
                 desc = t_spec.get("description", "")
