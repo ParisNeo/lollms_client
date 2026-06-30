@@ -166,6 +166,12 @@ class CoreMixin:
         return self.get_branch(leaf_id)
 
     def __getattr__(self, name):
+        # CRITICAL GUARD: Never proxy private/internal attributes to the ORM.
+        # If an underscore-prefixed attribute is missing from __dict__, raise immediately.
+        # This prevents infinite recursion and confusing 'object has no attribute' errors.
+        if name.startswith('_'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
         if name == 'metadata':
             return getattr(self._db_discussion, 'discussion_metadata', None)
         if name == 'messages':
