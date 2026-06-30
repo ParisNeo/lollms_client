@@ -905,17 +905,20 @@ class FileImportMixin:
                     import sqlite3
                     from collections import defaultdict
 
-                    # Use custom workspace_path if provided, otherwise default to ./data_workspace
-                    workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+                    # FIX: FileImportMixin is mixed into LollmsDiscussion, so `self` IS the discussion.
+                    # We access workspace_path directly via `self`, with a fallback to `self._discussion`
+                    # in case this mixin is ever used standalone on an ArtefactManager.
+                    _disc = self if hasattr(self, 'workspace_path') else getattr(self, '_discussion', None)
+                    workspace_dir = Path(_disc.workspace_path) if _disc and _disc.workspace_path else Path("./data_workspace")
 
                     # Try to override with server's APP_WORKSPACE_DIR only if no custom workspace_path was set
-                    if not self._discussion.workspace_path:
-                        try:
-                            from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-                            if awd is not None:
-                                workspace_dir = awd
-                        except ImportError:
-                            pass
+                    if not (_disc and _disc.workspace_path):
+                       try:
+                           from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                           if awd is not None:
+                               workspace_dir = awd
+                       except ImportError:
+                           pass
                     workspace_dir.mkdir(exist_ok=True)
 
                     # Schema fingerprinting with normalized column names for better grouping
