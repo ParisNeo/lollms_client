@@ -21,7 +21,7 @@ from lollms_client.lollms_memory import FailureMemory
 _MAX_BRACKET_BUF = 256
 
 _TAG_STARTS = [
-    "<tool_call>", "<tool>",
+    "<tool>",
     "<think>", "<think ",
     "<artifact", "<artefact",
     "<generate_image", "<edit_image",
@@ -306,10 +306,10 @@ class _StreamState:
         if self._is_accumulating_tool:
             self._tool_buffer += chunk
 
-            if '</tool_call>' in self._tool_buffer:
-                end_idx = self._tool_buffer.find('</tool_call>')
-                full_tool_call = self._tool_buffer[:end_idx + len('</tool_call>')]
-                json_body = full_tool_call.strip().lstrip('<tool_call>').rstrip('</tool_call>').strip()
+            if '</tool>' in self._tool_buffer:
+                end_idx = self._tool_buffer.find('</tool>')
+                full_tool_call = self._tool_buffer[:end_idx + len('</tool>')]
+                json_body = full_tool_call.strip().lstrip('<tool>').rstrip('</tool>').strip()
 
                 self._is_accumulating_tool = False
                 self._tool_buffer = ""
@@ -347,7 +347,7 @@ class _StreamState:
         safe_content = re.sub(r'<think>.*$', '', safe_content, flags=re.DOTALL | re.IGNORECASE)
 
         xml_pattern = re.compile(
-            r'<(artifact|artefact|note|skill|tool_call|tool)\b([^>]*?)>(.*?)</\1>',
+            r'<(artifact|artefact|note|skill|tool)\b([^>]*?)>(.*?)</\1>',
             re.DOTALL | re.IGNORECASE
         )
 
@@ -371,13 +371,13 @@ class _StreamState:
                 trace_exception(dispatch_err)
                 ASCIIColors.error(f"[StreamState] XML dispatch failed for tag '{tag_name}': {dispatch_err}")
 
-        if '<tool_call>' in safe_content:
-            start_idx = safe_content.find('<tool_call>')
-            end_idx = safe_content.find('</tool_call>', start_idx)
+        if '<tool>' in safe_content:
+            start_idx = safe_content.find('<tool>')
+            end_idx = safe_content.find('</tool>', start_idx)
 
             if end_idx != -1:
-                full_tool_call = safe_content[start_idx:end_idx + len('</tool_call>')]
-                json_body = full_tool_call.strip().lstrip('<tool_call>').rstrip('</tool_call>').strip()
+                full_tool_call = safe_content[start_idx:end_idx + len('</tool>')]
+                json_body = full_tool_call.strip().lstrip('<tool>').rstrip('</tool>').strip()
 
                 self.processed_tags.add(full_tool_call)
                 keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
@@ -449,7 +449,7 @@ class _StreamState:
             return True
 
         # 2. Tools Execution Trigger
-        elif tag_name in ("tool_call", "tool"):
+        elif tag_name in ("tool", "tool"):
             self.tool_trigger = True
 
             # ── ROBUST JSON PARSING & NORMALIZATION (CRITICAL FIX) ──
@@ -878,13 +878,13 @@ class ChatMixin:
             "for images) and STOP generating.\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
             "If you decide to output a thought process enclosed in <think>...</think> tags, "
-            "you MUST output all functional XML tags (such as <artifact>, <tool_call>, or <mem_new>) "
+            "you MUST output all functional XML tags (such as <artifact>, <tool>, or <mem_new>) "
             "on a NEW LINE strictly AFTER the closing </think> tag. "
             "NEVER place functional tags inside the <think> reasoning block.\n"
             "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
             "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
-            "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool_call>`. Do NOT mimic the placeholder markers from past messages.\n"
-            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool_call>`, `<tool_result>`) MUST NEVER appear inside <think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
+            "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
+            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside <think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
         )
 
         extra_instructions = ""
@@ -1027,21 +1027,21 @@ class ChatMixin:
         tools_prompt = ""
         if active_tools:
             tools_prompt = "\n=== TOOLS AVAILABLE ===\n"
-            tools_prompt += "To use a tool, you MUST emit a single <tool_call> tag on a new line with the tool parameters as a JSON object, and then stop generating. Do NOT write prose before or after the tag.\n"
+            tools_prompt += "To use a tool, you MUST emit a single <tool> tag on a new line with the tool parameters as a JSON object, and then stop generating. Do NOT write prose before or after the tag.\n"
             tools_prompt += (
                 "\n=== TOOL CALLING DISCIPLINE (CRITICAL — READ BEFORE CALLING TOOLS) ===\n"
-                "1. **EXACT CLOSING TAG**: The closing tag is  `</tool_call>` . You MUST NOT write  `` `` ``  or any other variation.\n"
-                "2. **NEW LINE ONLY**: The <tool_call> tag MUST start on a brand new line. It MUST NEVER be placed inline inside conversational prose.\n"
+                "1. **EXACT CLOSING TAG**: The closing tag is  `</tool>` . You MUST NOT write  `` `` ``  or any other variation.\n"
+                "2. **NEW LINE ONLY**: The <tool> tag MUST start on a brand new line. It MUST NEVER be placed inline inside conversational prose.\n"
                 "3. **NO PROSE AROUND IT**: Do NOT write introductory text (e.g., 'Let me try...') before the tag, and do NOT write text after it on the same line.\n\n"
                 "❌ WRONG (inline + wrong closing tag):\n"
-                "Sure! Let's test the tool: <tool_call>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool_call>\n\n"
+                "Sure! Let's test the tool: <tool>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool>\n\n"
                 "❌ WRONG (wrong closing tag):\n"
-                "<tool_call>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool_call>\n\n"
+                "<tool>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool>\n\n"
                 "✅ CORRECT (new line + exact closing tag ``)`):\n"
-                "<tool_call>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool_call>\n"
+                "<tool>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool>\n"
                 "=== END TOOL CALLING DISCIPLINE ===\n"
             )
-            tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool_call>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}`)`\n\n"
+            tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}`)`\n\n"
             tools_prompt += "Available tools:\n"
             for t_name, t_spec in active_tools.items():
                 desc = t_spec.get("description", "")
@@ -1195,12 +1195,12 @@ class ChatMixin:
 
                     # ── Live UI Tool Call Feedback Injection ──
                     if tool_call_json_str in ai_msg.content:
-                        ai_msg.content = ai_msg.content.replace(f"<tool_call>{tool_call_json_str}</tool_call>", "")
+                        ai_msg.content = ai_msg.content.replace(f"<tool>{tool_call_json_str}</tool>", "")
                         ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
 
                     import html
                     escaped_params = html.escape(json.dumps(tool_params))
-                    tool_open_tag = f'\n<processing type="tool_call" title="Tool Execution: {tool_name}" params="{escaped_params}">\n'
+                    tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {tool_name}" params="{escaped_params}">\n'
                     ai_msg.content += tool_open_tag
                     _cb(callback, tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
@@ -1801,7 +1801,7 @@ class ChatMixin:
                             f"   The tool already ran successfully. Calling it again is a **LOOP ERROR**.\n"
                             f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n\n"
                             f"### Example of CORRECT behavior:\n"
-                            f"❌ WRONG: <tool_call>{{\"name\": \"{tool_name}\", ...}}</tool_call>  (LOOP!)\n"
+                            f"❌ WRONG: <tool>{{\"name\": \"{tool_name}\", ...}}</tool>  (LOOP!)\n"
                             f"✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
                         )
 
