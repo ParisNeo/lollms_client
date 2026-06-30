@@ -200,7 +200,7 @@ class UtilsMixin:
                 tool_calls = msg.metadata.get("tool_calls", []) if (msg.metadata and isinstance(msg.metadata, dict)) else []
                 if msg.sender_type == "assistant" and tool_calls:
                     raw_content = getattr(msg, "raw_content", "") or msg.content or ""
-                    parts = re.split(r'(<(?:tool|tool_call)>.*?</(?:tool|tool_call)>)', raw_content, flags=re.DOTALL | re.IGNORECASE)
+                    parts = re.split(r'(<(?:tool)>.*?</(?:tool)>)', raw_content, flags=re.DOTALL | re.IGNORECASE)
                     num_calls = min(len(parts) // 2, len(tool_calls))
                     
                     expanded_parts = []
@@ -321,7 +321,7 @@ class UtilsMixin:
             tool_calls = msg.metadata.get("tool_calls", []) if (msg.metadata and isinstance(msg.metadata, dict)) else []
             if msg.sender_type == "assistant" and tool_calls:
                 raw_content = getattr(msg, "raw_content", "") or msg.content or ""
-                parts = re.split(r'(<(?:tool|tool_call)>.*?</(?:tool|tool_call)>)', raw_content, flags=re.DOTALL | re.IGNORECASE)
+                parts = re.split(r'(<(?:tool)>.*?</(?:tool)>)', raw_content, flags=re.DOTALL | re.IGNORECASE)
                 num_calls = min(len(parts) // 2, len(tool_calls))
                 
                 for i in range(num_calls):
