@@ -555,27 +555,19 @@ class Agent:
             tool_descriptions.append(f"- {name}({param_str}): {desc}")
 
         tool_header = (
-            "╔══════════════════════════════════════════════════════════════════╗\n"
-            "║  TOOL USE — MANDATORY FORMAT                                     ║\n"
-            "╠══════════════════════════════════════════════════════════════════╣\n"
-            "║  You have external tools. To use one you MUST use EXACTLY this  ║\n"
-            "║  format — copy the pattern below character-for-character:        ║\n"
-            "║                                                                  ║\n"
-            "║    <tool_call>{\"name\": \"tool_name\",                              ║\n"
-            "║                \"parameters\": {\"key\": \"value\"}}</tool_call>       ║\n"
-            "║                                                                  ║\n"
-            "║  CRITICAL:                                                       ║\n"
-            "║    • The ENTIRE tool call must be wrapped in <tool_call> tags    ║\n"
-            "║    • NO markdown code fences (no ```json)                        ║\n"
-            "║    • NO raw JSON without the XML wrapper                         ║\n"
-            "║    • NO explanations before or after the tool call               ║\n"
-            "║    • ONLY the <tool_call> line when calling a tool               ║\n"
-            "║                                                                  ║\n"
-            "║  Rules:                                                          ║\n"
-            "║    • One tool call per response turn.                            ║\n"
-            "║    • After calling ALL needed tools, write your final answer.    ║\n"
-            "║    • If the user explicitly asks you to use a tool, USE IT.      ║\n"
-            "╚══════════════════════════════════════════════════════════════════╝\n\n"
+            "=== TOOL USE — MANDATORY FORMAT ===\n"
+            "You have external tools. To use one you MUST use EXACTLY this format:\n"
+            "<tool>{\"name\": \"tool_name\", \"parameters\": {\"key\": \"value\"}}</tool>\n\n"
+            "CRITICAL RULES:\n"
+            "1. The ENTIRE tool call must be wrapped in <tool> tags.\n"
+            "2. NO markdown code fences (no ```json).\n"
+            "3. NO raw JSON without the XML wrapper.\n"
+            "4. NO explanations before or after the tool call.\n"
+            "5. ONLY output the <tool> line when calling a tool.\n"
+            "6. One tool call per response turn.\n"
+            "7. After calling ALL needed tools, write your final answer.\n"
+            "8. If the user explicitly asks you to use a tool, USE IT.\n"
+            "=== END TOOL USE RULES ===\n\n"
             "TOOLS AVAILABLE:\n"
         )
 
@@ -628,9 +620,9 @@ class Agent:
                 raw_response = str(raw_response) if raw_response is not None else ""
 
             # ── 5. Parse tool calls ─────────────────────────────────────────
-            # Primary: XML-wrapped tool calls <tool_call>...</tool_call>
+            # Primary: XML-wrapped tool calls <tool>...</tool>
             tool_call_pattern = re.compile(
-                r'<tool_call>(.*?)</tool_call>',
+                r'<tool>(.*?)</tool>',
                 re.DOTALL | re.IGNORECASE,
             )
             matches = list(tool_call_pattern.finditer(raw_response))
@@ -664,7 +656,7 @@ class Agent:
                     json_start = json_match.start()
                     visible_response = raw_response[:json_start].strip()
                     ASCIIColors.warning(
-                        f"Model emitted raw JSON tool call (missing <tool_call> tags). "
+                        f"Model emitted raw JSON tool call (missing <tool> tags). "
                         f"Tool: {json_match.group(1)}"
                     )
 
