@@ -172,7 +172,7 @@ The `generate_with_tools` method enables LLMs to act as agents that can discover
 **Key Features:**
 - **File-based tools**: Load tools from lollms-format Python scripts (`tool_*.py` with docstring-described arguments)
 - **Inline tools**: Pass tool dicts directly with `{"name": ..., "callable": ..., "parameters": [...]}`
-- **Automatic execution**: The agentic loop parses `<tool_call>` tags, executes tools, and feeds results back
+- **Automatic execution**: The agentic loop parses `<tool>` tags, executes tools, and feeds results back
 - **Multi-step reasoning**: The model can chain multiple tool calls across rounds to solve complex tasks
 
 **Tool Format (lollms scripts):**
@@ -1298,11 +1298,11 @@ if __name__ == "__main__":
 
 **How Multi-Step Reasoning Works:**
 
-1. **Round 1**: The agent receives the query and decides to search arXiv for recent papers on LLM reasoning. It emits a `<tool_call>` for `tool_search_papers`.
+1. **Round 1**: The agent receives the query and decides to search arXiv for recent papers on LLM reasoning. It emits a `<tool>` for `tool_search_papers`.
 
 2. **Tool Execution**: The arXiv tool executes and returns 3 recent papers with abstracts.
 
-3. **Round 2**: The agent sees the arXiv results and decides it needs background on chain-of-thought reasoning. It emits a `<tool_call>` for `tool_search_wikipedia`.
+3. **Round 2**: The agent sees the arXiv results and decides it needs background on chain-of-thought reasoning. It emits a `<tool>` for `tool_search_wikipedia`.
 
 4. **Tool Execution**: The Wikipedia tool returns foundational concepts and explanations.
 
