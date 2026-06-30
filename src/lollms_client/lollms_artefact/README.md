@@ -1,26 +1,27 @@
-# 📦 lollms_artefact: Dynamic Dual-Stream Artefact Subsystem
+# 📦 lollms_artefact: Dynamic Artefact & Context Subsystem
 
-The `lollms_artefact` package implements the core versioning, lifecycle management, and file-tracking layers for Lollms. It introduces a **Dual-Stream Storage** architecture designed to bridge the gap between large physical data files on disk and the context window limitations of Large Language Models.
+The `lollms_artefact` package implements the core versioning, lifecycle management, and file-tracking layers for Lollms. It introduces a **Hybrid Storage Architecture** designed to bridge the gap between large physical data files on disk and the context window limitations of Large Language Models.
 
 ---
 
-## 🏛️ 1. The Dual-Stream Philosophy (.lam Protocol)
+## 🏛️ 1. The Hybrid Storage Philosophy
 
 Conversational AI agents often experience a conflict between model attention and tool execution:
-- **Language Models** require high-level summaries, database schemas, column definitions, and file layouts to plan queries and reason logically without wasting thousands of tokens on raw data.
+- **Language Models** require high-level summaries, database schemas, and text content to plan queries and reason logically without wasting thousands of tokens on raw binary data.
 - **Local Tools** (Python scripts, SQL queries, executors) require the exact, unmodified physical bytes to perform computations and write outputs.
 
-To solve this, the subsystem splits every created or imported data artifact into two distinct streams:
+To solve this, the subsystem uses two distinct storage strategies depending on the file type:
 
-### A. The Physical Twin
-* **Location**: Saved on the local file system at `workspace_data/{title}.{ext}` (and versioned inside `artefacts_metadata/{id}/{name}_v{version}{ext}`).
-* **Content**: The raw, unmodified bytes of the file (e.g., raw CSV rows, SQLite database binary, or Python source code).
-* **Consumer**: Programmatic local tools and sandbox scripts executing in the workspace.
+### A. Single-Stream (Text, Code, Documents)
+For text-based files (`.py`, `.md`, `.pdf`, `.docx`, `.txt`), the system uses a **Single-Stream** approach:
+* **Storage**: The extracted text content is stored directly in the artefact's `content` field and written to `workspace_data/{title}.{ext}`.
+* **Context Injection**: The LLM context zone reads directly from the `content` field. The LLM sees the full, verbatim text of the file.
+* **No `.lam` files**: Text files do NOT generate Logical Artefact Metadata (`.lam`) files. We do not separate the content from the metadata.
 
-### B. The Logical Twin (`.lam` Metadata File)
-* **Location**: Saved inside `artefacts_metadata/{id}/{name}.lam`.
-* **Content**: A high-density, text-based abstraction of the file's structure. For a spreadsheet, this includes column names, inferred data types, non-null counts, and a few sample row values.
-* **Consumer**: The Large Language Model. This metadata is what is actually injected into the active prompt context zone and evaluated by the token budget calculator.
+### B. Dual-Stream (.lam Protocol for Binary & Structured Data)
+For structured data files (`.csv`, `.db`, `.sqlite`, `.xlsx`), the system uses a **Dual-Stream** approach:
+* **Physical Twin**: Saved on the local file system at `workspace_data/{title}.{ext}`. Contains the raw bytes (e.g., raw CSV rows, SQLite binary). Consumed by local tools.
+* **Logical Twin (`.lam`)**: Saved inside `artefacts_metadata/{id}/{name}.lam`. Contains a high-density, text-based abstraction of the file's structure (column names, inferred data types, sample values). Consumed by the LLM context zone.
 
 ---
 
@@ -30,7 +31,7 @@ To maintain clean and token-efficient context budgets, every registered artifact
 
 | Visibility Tier | Symbol | Prompt Context Behavior |
 | :--- | :--- | :--- |
-| **`FULL`** | `[C]` | The logical `.lam` content of the file is fully injected verbatim into the active context zone. |
+| **`FULL`** | `[C]` | The content (for text) or `.lam` schema (for data) is fully injected verbatim into the active context zone. |
 | **`METADATA`** | `[M]` | Only the basic metadata (such as filename, size, and type) is injected, withholding the full schema description. |
 | **`TREE_UNLOCKABLE`**| `[U]` | The file is listed only in the directory index. It is excluded from the active context but can be loaded dynamically. |
 | **`LOCKED`** | `[L]` | The file is completely excluded from the conversation context and cannot be loaded. |
@@ -65,7 +66,7 @@ The `ArtefactManager` interacts directly with `LollmsDiscussion` to orchestrate 
 During local tool execution, the active directory is snapshotted immediately before and after the run. If a tool writes a new file (such as a Matplotlib chart PNG) or modifies an existing dataset:
 1. The new file is automatically detected on disk.
 2. Its file type is classified, and the raw bytes are saved as a physical twin.
-3. A logical twin (`.lam`) or image reference is compiled.
+3. A logical twin (`.lam`) or image reference is compiled (if applicable).
 4. The artifact is committed to the database, incrementing its version.
 5. The corresponding reference tags are appended to the conversational message stream.
 
