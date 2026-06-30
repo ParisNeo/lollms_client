@@ -60,7 +60,7 @@ branch-aware object** that:
 - saves structured notes and reusable skills as first-class typed artefacts,
 - embeds live interactive teaching widgets directly inside chat messages,
 - routes RAG queries through preflight retrieval and agentic tool calls,
-- executes inline `<tool_call>` tags in a streaming loop with anti-duplication guards,
+- executes inline `<tool>` tags in a streaming loop with anti-duplication guards,
 - compresses history automatically when the context window gets full,
 - fires real-time artefact create/update events to the UI as each XML tag is processed,
 - orchestrates multi-agent swarm sessions where specialised agents brainstorm, critique, collaborate on artefacts, play games, and run simulations.
@@ -880,7 +880,7 @@ print(f"Branch B has {len(diff['only_in_b'])} unique messages")
 During each round of the agentic loop, two **temporary** messages are inserted into the
 branch so the model can see its own prior tool calls and their results:
 
-1. `assistant` — the raw LLM output including the `<tool_call>` tag.
+1. `assistant` — the raw LLM output including the `<tool>` tag.
 2. `user/system` — a `<tool_result name="...">...</tool_result>` block.
 
 These are deleted from the branch immediately after the loop exits. The persisted
@@ -1738,7 +1738,7 @@ Format:
 
 ### 10.1 Mechanics
 
-The LLM calls tools by emitting `<tool_call>` JSON tags mid-stream. The framework
+The LLM calls tools by emitting `<tool>` JSON tags mid-stream. The framework
 detects these, pauses generation, dispatches the tool, appends the result to
 `self.scratchpad`, and resumes. Loop runs up to `max_reasoning_steps` times.
 
