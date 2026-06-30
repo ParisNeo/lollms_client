@@ -218,7 +218,7 @@ The following diagram outlines the logical flow of a single `chat()` call:
 If agent mode is triggered, the orchestrator begins a multi-round loop (capped at `max_reasoning_steps`):
 1. **Goal Extraction (Round 1)**: The model is called with a strict JSON schema to analyze the user's intent and extract 1–3 concrete objectives (e.g., `["search_topic", "create_artifact"]`).
 2. **THINK Phase**: The model generates a structured action plan conforming to a JSON schema, choosing exactly one action:
-   * `tool_call`: Execute a registered tool.
+   * `tool`: Execute a registered tool.
    * `artifact_action`: Create, modify, or patch an artifact.
    * `complete`: All objectives are met, transition to final answer.
 3. **ACT Phase**:
@@ -231,10 +231,10 @@ If agent mode is triggered, the orchestrator begins a multi-round loop (capped a
 ## 4. Multi-Round Tool Execution & Error Recovery
 
 ### Tool Call Parsing & Execution
-The system parses `<tool_call>` XML tags containing structured JSON in this format:
+The system parses `<tool>` XML tags containing structured JSON in this format:
 
 ```xml
-<tool_call>{"name": "search_web_duckduckgo", "parameters": {"query": "LoLLMS architecture"}}</tool_call>
+<tool>{"name": "search_web_duckduckgo", "parameters": {"query": "LoLLMS architecture"}}</tool>
 ```
 
 To prevent repetitive execution, a semantic and parameter-based duplicate check is applied:
