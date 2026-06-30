@@ -167,7 +167,7 @@ The `chat()` method is not a simple API call; it is an **Agentic State Machine**
     *   Memory Handles.
 3.  **Reasoning Loop** (Max 20 steps):
     *   **LLM Generation**: Streams tokens to `_StreamState`.
-    *   **Stream Parsing**: Intercepts closed XML tags (`<artifact>`, `<tool_call>`) instantly.
+    *   **Stream Parsing**: Intercepts closed XML tags (`<artifact>`, `<tool>`) instantly.
     *   **Tool Execution**:
         *   **CWD Switch**: Changes OS Current Working Directory to `data_workspace/discussions/{id}/`.
         *   **Sync**: Ensures all active artifacts exist on disk.
