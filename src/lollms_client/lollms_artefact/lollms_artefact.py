@@ -405,7 +405,7 @@ class ArtefactManager:
                     lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
                 except Exception as e:
                     trace_exception(e)
-            elif wrote_physical and atype in (ArtefactType.DATA, ArtefactType.IMAGE, ArtefactType.DOCUMENT):
+            elif wrote_physical and atype in (ArtefactType.DATA, ArtefactType.IMAGE):
                 minimal_lam = f"# Artefact Metadata: {filename}\n- **Type**: {atype}\n- **Version**: {version}\n- **Physical Path**: workspace_data/{filename}\n\n"
                 try:
                     lam_path.write_text(minimal_lam, encoding="utf-8", errors="ignore")
@@ -1303,7 +1303,13 @@ class ArtefactManager:
                     display_title = f"{display_title}{item['file_ext']}"
 
             if v_tier == ArtefactVisibility.FULL:
-                content_text = self._get_lam_content(item).strip()
+                # FIX: For text-based artifacts (code, document), use the content field directly.
+                # Only use the .lam logical twin for DATA artifacts (where content is a schema).
+                if item.get("type") == ArtefactType.DATA:
+                    content_text = self._get_lam_content(item).strip()
+                else:
+                    content_text = (item.get("content") or "").strip()
+
                 if not content_text:
                     continue
 
