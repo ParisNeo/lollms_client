@@ -501,6 +501,8 @@ class CoreMixin:
         return [LollmsMessage(self, orm) for orm in reversed(branch_orms)]
 
     def get_message(self, message_id):
+        if self._message_index is None:
+            self._rebuild_message_index()
         db_message = self._message_index.get(message_id)
         if db_message:
             return LollmsMessage(self, db_message)
