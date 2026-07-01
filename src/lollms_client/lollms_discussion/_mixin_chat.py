@@ -106,6 +106,8 @@ def _sanitize_tool_result(
     5.  Lists are capped at 50 entries and walked recursively.
     6.  The result is always returned as a plain ``str`` (JSON-serialised
         when the input was structured).
+    7.  🛑 CRITICAL FIX: If the tool returns {"success": True, "output": <content>},
+        extract the <content> directly rather than showing the LLM the wrapper dict.
     """
 
     def _find_prompt_injection(obj: Any, depth: int = 0) -> Optional[str]:
@@ -169,7 +171,37 @@ def _sanitize_tool_result(
         success_status = "✓ Success" if success else "⚠ Partial Success"
         return f"{success_status}\n{pinj}"
 
-    sanitized = _walk(tool_res)
+    # 🛑 CRITICAL FIX: Unwrap the tool result to get the actual content
+    # Tools return {"success": True, "output": <content>}, but the LLM needs to see <content>, not the wrapper.
+    unwrapped = tool_res
+    if isinstance(tool_res, dict):
+        if "output" in tool_res:
+            unwrapped = tool_res["output"]
+            # If output is still a dict with nested content, unwrap one more level
+            if isinstance(unwrapped, dict):
+                for key in ("content", "text", "result", "data", "page_content", "summary"):
+                    if key in unwrapped:
+                        unwrapped = unwrapped[key]
+                        break
+        elif "content" in tool_res:
+            unwrapped = tool_res["content"]
+        elif "result" in tool_res:
+            unwrapped = tool_res["result"]
+        elif "data" in tool_res:
+            unwrapped = tool_res["data"]
+
+    # Handle None explicitly
+    if unwrapped is None:
+        return "Tool executed successfully but returned no output content."
+
+    sanitized = _walk(unwrapped)
+
+    # If sanitized is already a string (from unwrapping), return it directly
+    if isinstance(sanitized, str):
+        if len(sanitized) > max_chars:
+            return sanitized[:max_chars] + f"\n... [truncated, {len(sanitized) - max_chars} more chars]"
+        return sanitized
+
     try:
         text = json.dumps(sanitized, indent=2, default=str, ensure_ascii=False)
     except Exception:
@@ -1709,11 +1741,32 @@ class ChatMixin:
                                     status_done_line = f"* Completed execution with errors.\n"
                                     details_block = f"Error Logs:\n{error_msg}\n"
                             else:
+                                # 🛑 CRITICAL FIX: Robust output extraction
+                                # The tool result might be {"success": True, "output": "content"}
+                                # OR {"success": True, "output": {"content": "..."}}
+                                # OR just the raw content itself.
                                 raw_output = tool_res.get("output", tool_res)
-                                if isinstance(raw_output, (dict, list)):
-                                    full_dump = json.dumps(raw_output, indent=2, default=str)
+
+                                # Handle nested output dictionaries (common in MCP tools)
+                                if isinstance(raw_output, dict):
+                                    # If output is a dict, try to extract the most relevant field
+                                    if "content" in raw_output:
+                                        raw_output = raw_output["content"]
+                                    elif "text" in raw_output:
+                                        raw_output = raw_output["text"]
+                                    elif "result" in raw_output:
+                                        raw_output = raw_output["result"]
+                                    elif "data" in raw_output:
+                                        raw_output = raw_output["data"]
+                                    else:
+                                        # Fall back to JSON dump of the whole dict
+                                        raw_output = json.dumps(raw_output, indent=2, default=str, ensure_ascii=False)
+                                elif isinstance(raw_output, list):
+                                    raw_output = json.dumps(raw_output, indent=2, default=str, ensure_ascii=False)
                                 else:
-                                    full_dump = str(raw_output)
+                                    raw_output = str(raw_output) if raw_output is not None else "No output returned."
+
+                                full_dump = raw_output
                                 result_str = full_dump
                                 clean_result_str = _sanitize_tool_result(tool_res)
                                 self._trigger_evolutionary_reflection(tool_name, tool_params, clean_result_str)
@@ -1721,9 +1774,10 @@ class ChatMixin:
                                 safe_output = full_dump[:2000] + ("..." if len(full_dump) > 2000 else "")
                                 details_block = f"Output Logs:\n{safe_output}\n"
                         else:
-                            result_str = str(tool_res)
+                            result_str = str(tool_res) if tool_res is not None else "No output returned."
                             if "error" in result_str.lower() or "fail" in result_str.lower():
-                                self.failure_memory.record_failure(tool_name, tool_params, result_str)
+                                if failure_memory:
+                                    failure_memory.record_failure(tool_name, tool_params, result_str)
                                 clean_result_str = result_str
                                 status_done_line = f"* Completed execution with errors.\n"
                                 details_block = f"Error Logs:\n{result_str}\n"
@@ -1759,6 +1813,14 @@ class ChatMixin:
                                 raw_round_text = raw_round_text.replace(prev_m.content, "")
 
                     raw_round_clean = re.sub(r'<processing.*?>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+                    # 🛑 CRITICAL FIX: Ensure strict user/assistant alternation.
+                    # If the assistant text is empty (all content was inside <processing>),
+                    # use a minimal placeholder so the chat template doesn't break.
+                    # An empty "" assistant message causes llama.cpp Jinja templates to
+                    # produce no output on the next generation round.
+                    if not raw_round_clean:
+                        raw_round_clean = "[Processing complete. Awaiting tool result.]"
 
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
@@ -1805,13 +1867,14 @@ class ChatMixin:
                             f"✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
                         )
 
-                        # Log for debugging (removed per user request)
-
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
                             content=user_part
                         ))
                         ai_msg.content += "\n\n"
+                        # 🛑 CRITICAL: Force the loop to continue so the LLM generates a final answer
+                        # The tool succeeded — the LLM MUST now read the result and respond to the user.
+                        continue
                     else:
                         user_part = (
                             f'<tool_result name="{tool_name}">\n'
@@ -1831,6 +1894,8 @@ class ChatMixin:
                         if 'force_break_after_tool' in locals() and force_break_after_tool:
                             ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
                             break
+                        # 🛑 CRITICAL: Also continue on failure so the LLM can inform the user
+                        continue
                 else:
                     break
             else:
