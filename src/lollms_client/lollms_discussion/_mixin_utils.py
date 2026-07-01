@@ -123,11 +123,10 @@ class UtilsMixin:
                 tag_name = match.group(1).lower()
                 attrs = _parse_attrs(match.group(2))
                 title = attrs.get("name") or attrs.get("title") or "artifact"
-                type_label = "note" if tag_name == "note" else ("skill" if tag_name == "skill" else "artefact")
+                type_label = "note" if tag_name == "note" else ("skill" if tag_name == "skill" else attrs.get("type", "code"))
                 # Export as a stable, lightweight Lollms Artifact Anchor tag so the LLM retains situational awareness
                 # CRITICAL: Use unmistakable SYSTEM marker with special Unicode and DISTINCT syntax to prevent mimicry
-                # NOTE: The triple angle bracket  is NEVER used in valid XML, making it impossible to confuse with functional tags
-                return f'\n[🔒SYSTEM_ARTIFACT_ANCHOR:{title}|{type_label}|v1]\n'
+                return f'\n[🔒SYSTEM_ARTIFACT_CREATED:{title}|{type_label}]\n'
 
             content = pattern.sub(_strip_tag_to_placeholder, content)
 
