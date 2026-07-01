@@ -30,6 +30,12 @@ LCP is a lightweight, zero-dependency local tool execution framework for Lollms.
 ### 6. Context Awareness
 Tools can optionally receive the active `LollmsClient` instance and `LollmsDiscussion` session state directly via keyword arguments (`lollms_client_instance`, `discussion_instance`).
 
+### 7. Dynamic Tool Generation from Artefacts
+**LLM-Authored Tools.** LCP integrates seamlessly with the Artefact system. If the LLM generates a `type="tool"` artefact, LCP can dynamically compile and register it in memory.
+*   **`register_tool_from_code(tool_name_prefix, code)`**: Executes raw Python code in an isolated module namespace, extracts `tool_*` functions via AST, and registers them as active tools.
+*   **`unregister_tools_by_prefix(tool_name_prefix)`**: Cleanly removes dynamically generated tools when the artefact is updated or deleted.
+*   **Security Gate**: This feature is disabled by default. The host application must explicitly pass `allow_dynamic_tools=True` to `discussion.chat()` to permit the LLM to execute its own code.
+
 ---
 
 ## 🛠️ How to Write an LCP Tool
@@ -180,3 +186,10 @@ default_tools/
     *   LCP detects the new file and syncs it as an Artifact.
 6.  **Response:** The tool returns `prompt_injection`, instructing the LLM: "Here is the filtered CSV. Reference it in your answer."
 7.  **Final Answer:** LLM presents the result to the user seamlessly.
+
+### Dynamic Tool Lifecycle (LLM-Authored Tools)
+1.  **Generation:** LLM outputs `<artifact type="tool" name="my_tool">def tool_run(): ...</artifact>`.
+2.  **Security Gate:** `ArtefactManager` checks `discussion.allow_dynamic_tools`. If `False`, the process stops here (file is saved but not executed).
+3.  **Registration:** If `True`, `LCPBinding.register_tool_from_code("my_tool", code)` is called. The code is executed in an isolated module namespace.
+4.  **Invocation:** The LLM can immediately call `<tool>{"name": "tool_my_tool", "parameters": {...}}</tool>`.
+5.  **Cleanup:** If the artefact is updated or deleted, `LCPBinding.unregister_tools_by_prefix("my_tool")` is called to remove the old executable function.
