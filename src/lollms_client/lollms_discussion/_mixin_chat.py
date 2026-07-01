@@ -32,6 +32,23 @@ _HEARTBEAT_MESSAGES = [
     "🔧 Refining details...",
 ]
 
+# Type-specific initial messages for artifact processing blocks
+_ARTEFACT_TYPE_MESSAGES = {
+    "code": "💻 Writing code...",
+    "python": "🐍 Writing Python script...",
+    "javascript": "🟨 Writing JavaScript...",
+    "html": "🌐 Building HTML structure...",
+    "css": "🎨 Styling with CSS...",
+    "data": "📊 Analyzing data structure...",
+    "document": "📄 Drafting document...",
+    "markdown": "📝 Writing Markdown...",
+    "image": "🖼️ Preparing image generation...",
+    "presentation": "📽️ Building presentation slide...",
+    "note": "🗒️ Saving note...",
+    "skill": "🧠 Compiling skill...",
+    "tool": "🛠️ Forging tool...",
+}
+
 # ── Fast Artefact Replicas (Defaults) ────────────────────────────────────────
 _DEFAULT_FAST_REPLICAS = [
     "* Artifact created instantly (empty body intercepted).\n",
@@ -599,8 +616,6 @@ class _StreamState:
                     full_match_text = opening_tag + body_content + closing_tag
 
                     # Always dispatch the real body content to create the artifact.
-                    # The instant-close "replica" messages were causing the actual
-                    # content to be lost and replaced with generic placeholders.
                     if full_match_text not in self.processed_tags:
                         self.processed_tags.add(full_match_text)
                         self._dispatch_closed_tag(
@@ -610,15 +625,7 @@ class _StreamState:
                             full_match_text
                         )
 
-                    # 🛑 CRITICAL FIX: Preserve the raw artifact body inside the processing tags
-                    # in ai_message.content so the frontend can render it.
-                    # The export() method in _mixin_utils.py will strip the <processing> tags
-                    # for the LLM context to prevent mimicry.
-                    preserved_content = f'{opening_tag}{body_content}{closing_tag}'
-                    self.ai_message.content += preserved_content
-                    _cb(self.callback, preserved_content, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-                    # Close the processing block cleanly
+                    # Close the processing block cleanly.
                     proc_close_tag = f'\n</processing>\n'
                     self.ai_message.content += proc_close_tag
                     _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -661,6 +668,9 @@ class _StreamState:
                         attrs_str = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
                         title = "artifact"
                         lang = None
+                        attrs = {}
+                        for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                            attrs[m.group(1).lower()] = m.group(2)
                         m_title = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
                         if m_title: title = m_title.group(1)
                         m_lang = re.search(r'language=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
@@ -677,6 +687,10 @@ class _StreamState:
                         # Start the artifact buffer with the opening tag
                         self._artefact_buffer = attrs_str
 
+                        # Determine the type-specific opening message
+                        atype = attrs.get("type", "code").lower()
+                        opening_status = _ARTEFACT_TYPE_MESSAGES.get(atype, "✨ Starting artifact...")
+
                         # Fire the opening processing tag to the UI and save it
                         proc_tag = f'\n<processing type="artefact" title="{title}" language="{lang or ""}">\n'
                         self.ai_message.content += proc_tag
@@ -685,8 +699,10 @@ class _StreamState:
                         # Start the heartbeat in case the artifact body is slow/empty
                         self._start_artefact_heartbeat()
 
-                        opening_status = f'Starting artifact...\n'
-                        _cb(self.callback, opening_status, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        # Emit the type-aware initial status message
+                        status_line = f'{opening_status}\n'
+                        self.ai_message.content += status_line
+                        _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                         # Check if the closing tag also arrived in this same chunk
                         remaining_content = self._pending_buffer[end_of_tag_idx+1:]
@@ -704,8 +720,6 @@ class _StreamState:
                             full_match_text = attrs_str + body_content + closing_tag
 
                             # Always dispatch the real body content to create the artifact.
-                            # The instant-close "replica" messages were causing the actual
-                            # content to be lost and replaced with generic placeholders.
                             if full_match_text not in self.processed_tags:
                                 self.processed_tags.add(full_match_text)
                                 self._dispatch_closed_tag(
@@ -715,15 +729,7 @@ class _StreamState:
                                     full_match_text
                                 )
 
-                            # 🛑 CRITICAL FIX: Preserve the raw artifact body inside the processing tags
-                            # in ai_message.content so the frontend can render it.
-                            # The export() method in _mixin_utils.py will strip the <processing> tags
-                            # for the LLM context to prevent mimicry.
-                            preserved_content = f'{attrs_str}{body_content}{closing_tag}'
-                            self.ai_message.content += preserved_content
-                            _cb(self.callback, preserved_content, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-                            # Close the processing block cleanly
+                            # Close the processing block cleanly.
                             proc_close_tag = f'\n</processing>\n'
                             self.ai_message.content += proc_close_tag
                             _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -1223,6 +1229,7 @@ class ChatMixin:
         forward_artefact_chunks:      bool = False,  # Forward sparse artefact structural events to UI
         fast_artefact_replicas:       Optional[List[str]] = None,  # Custom messages for instant/empty artefacts
         tolerance_level:              Optional[str] = "strict",
+        allow_dynamic_tools:          bool = False,  # 🛡️ Security gate for LLM-generated tool execution
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -1231,6 +1238,10 @@ class ChatMixin:
         # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
         if not hasattr(self, "tolerance_level") or tolerance_level:
             object.__setattr__(self, "tolerance_level", tolerance_level or "strict")
+
+        # 🛡️ SECURITY: Store the dynamic tool execution flag.
+        # If False, the ArtefactManager will NOT register type="tool" artefacts as executable LCP tools.
+        object.__setattr__(self, "allow_dynamic_tools", allow_dynamic_tools)
 
         # Initialize list to collect all created/modified artifacts during this turn safely
         object.__setattr__(self, "_affected_artefacts_this_turn", [])
@@ -1977,6 +1988,10 @@ class ChatMixin:
                                     mtime_changed = before_info["mtime"] != after_info["mtime"]
                                     content_changed = before_info.get("hash") != after_info.get("hash")
 
+                                    # Initialize image metadata variables for this iteration
+                                    img_b64 = None
+                                    img_mtypes = None
+
                                     if mtime_changed or content_changed:
                                         # File was modified!
                                         atype = "document"
@@ -2031,14 +2046,24 @@ class ChatMixin:
 
                                         # Register/Update
                                         if not should_read_content and content_placeholder:
+                                            # Hydrate image metadata if this is an image-type file
+                                            if atype == "image":
+                                                try:
+                                                    import base64 as _b64_mod
+                                                    raw_img = file_path.read_bytes()
+                                                    img_b64 = _b64_mod.b64encode(raw_img).decode('utf-8')
+                                                    img_mtypes = [f"image/{file_ext[1:]}"]
+                                                except Exception as ex:
+                                                    trace_exception(ex)
+
                                             existing_art = self.artefacts.get(file_name)
                                             if existing_art:
                                                 art = self.artefacts.update(
                                                     title=file_name,
                                                     new_content=content_placeholder,
                                                     new_type=atype,
-                                                    new_images=img_b64 if img_b64 else None,
-                                                    new_image_media_types=img_mtypes if img_mtypes else None,
+                                                    new_images=img_b64,
+                                                    new_image_media_types=img_mtypes,
                                                     active=True,
                                                     visibility=ArtefactVisibility.FULL,
                                                     bump_version=True,
@@ -2049,8 +2074,8 @@ class ChatMixin:
                                                     title=file_name,
                                                     artefact_type=atype,
                                                     content=content_placeholder,
-                                                    images=img_b64 if img_b64 else None,
-                                                    image_media_types=img_mtypes if img_mtypes else None,
+                                                    images=img_b64,
+                                                    image_media_types=img_mtypes,
                                                     active=True,
                                                     visibility=ArtefactVisibility.FULL,
                                                     commit_message=f"Created by tool '{tool_name}'"
