@@ -1,27 +1,123 @@
 title: OpenAI
 author: ParisNeo
 creation_date: 2025-08-13
-last_update_date: 2025-08-13
-description: A binding for the official OpenAI API, providing access to models like GPT-4o, GPT-4, and GPT-3.5.
+last_update_date: 2026-07-01
+description: >
+  A binding for the OpenAI Chat Completions and Completions APIs.
+  The OpenAI API has become the de-facto industry standard for LLM
+  inference, and this binding can be used against any service that
+  exposes an OpenAI-compatible endpoint. This includes official OpenAI,
+  local inference servers, and third-party cloud providers.
+  For LoLLMS servers, it is strongly recommended to use the dedicated
+  `lollms` binding instead, which exposes the full set of LoLLMS-native
+  features (artefacts, discussions, personality loading, etc.) beyond
+  the common OpenAI subset.
 global_input_parameters:
   - name: service_key
     type: str
-    description: "The API key for the OpenAI service. Can also be set via the OPENAI_API_KEY environment variable."
+    description: "The API key for the target service. Can also be set via the OPENAI_API_KEY environment variable for official OpenAI. Leave empty for local servers that do not require authentication."
     mandatory: false
     default: ""
   - name: host_address
     type: str
-    description: "The base URL for the OpenAI API. Useful for proxies or custom endpoints. Defaults to the official OpenAI URL."
+    description: "The base URL of the OpenAI-compatible endpoint. Leave empty/None to use the official OpenAI endpoint. Set to a custom URL (e.g. http://localhost:1234/v1) for third-party or local backends."
     mandatory: false
     default: ""
   - name: is_vllm
     type: bool
-    description: "If true, the server is a vllm server."
+    description: "If true, the server is a vLLM instance. Enables vLLM-specific chat_template_kwargs (e.g. enable_thinking) so reasoning/thinking models like Qwen3 are handled correctly."
     mandatory: false
     default: false
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify SSL certificates on HTTPS connections. Set to false for self-hosted servers with self-signed certificates."
+    mandatory: false
+    default: true
+  - name: certificate_file_path
+    type: str
+    description: "Path to a CA certificate file to use for SSL verification when verify_ssl_certificate is true and a custom CA is required."
+    mandatory: false
+    default: null
+  - name: default_completion_format
+    type: str
+    description: "The default completion format to use. 'Chat' for chat.completions endpoint, 'Completion' for the legacy completions endpoint."
+    mandatory: false
+    default: "Chat"
 model_input_parameters:
   - name: model_name
     type: str
-    description: "The name of the OpenAI model to use (e.g., 'gpt-4o')."
+    description: "The name of the model to use, as exposed by the target service (e.g. 'gpt-4o' on OpenAI, 'llama-3.1-8b-instruct' on a local server, 'Qwen/Qwen3-32B' on vLLM)."
     mandatory: true
     default: "gpt-4o"
+compatible_backends:
+  official:
+    - name: OpenAI
+      url: https://platform.openai.com/
+      note: "Official OpenAI service. Supports GPT-4o, GPT-4.1, o-series reasoning models, and embeddings."
+  local_servers:
+    - name: vLLM
+      url: https://github.com/vllm-project/vllm
+      note: "High-throughput local inference. Set is_vllm=true to enable thinking models support. Exposes /v1 OpenAI-compatible endpoints."
+    - name: llama.cpp server
+      url: https://github.com/ggerganov/llama.cpp
+      note: "Lightweight GGUF inference server with an OpenAI-compatible /v1 endpoint. Also available via the dedicated llama_cpp_server binding for native features."
+    - name: Ollama
+      url: https://ollama.com/
+      note: "Popular local model runner with an OpenAI-compatible endpoint at /v1. Also available via the dedicated ollama binding."
+    - name: LM Studio
+      url: https://lmstudio.ai/
+      note: "Desktop application for running local models with an OpenAI-compatible server. Point host_address to its local URL."
+    - name: LocalAI
+      url: https://localai.io/
+      note: "Self-hosted drop-in replacement for OpenAI supporting multiple backends and modalities."
+    - name: text-generation-webui (OpenAI extension)
+      url: https://github.com/oobabooga/text-generation-webui
+      note: "Web UI with an optional OpenAI-compatible extension server."
+    - name: OpenLLM
+      url: https://github.com/bentoml/OpenLLM
+      note: "BentoML-based model serving with OpenAI API compatibility. Also available via the dedicated openllm binding."
+    - name: TensorRT-LLM
+      url: https://github.com/NVIDIA/TensorRT-LLM
+      note: "NVIDIA-optimized inference with an OpenAI-compatible server. Also available via the dedicated tensor_rt binding."
+    - name: SGLang
+      url: https://github.com/sgl-project/sglang
+      note: "Fast structured generation server with OpenAI API compatibility. Also available via the dedicated sglang binding."
+  cloud_providers:
+    - name: Azure OpenAI
+      url: https://azure.microsoft.com/products/ai-services/openai-service
+      note: "Microsoft-hosted OpenAI. A dedicated azure_openai binding exists with Azure-specific authentication."
+    - name: OpenRouter
+      url: https://openrouter.ai/
+      note: "Unified gateway to many models. A dedicated open_router binding exists."
+    - name: Groq
+      url: https://groq.com/
+      note: "Ultra-fast LPU inference. A dedicated groq binding exists."
+    - name: Mistral La Plateforme
+      url: https://platform.mistral.ai/
+      note: "Mistral AI cloud. A dedicated mistral binding exists."
+    - name: Together AI
+      url: https://www.together.ai/
+      note: "OpenAI-compatible hosted inference for open models."
+    - name: DeepSeek
+      url: https://platform.deepseek.com/
+      note: "DeepSeek models served via an OpenAI-compatible API."
+    - name: Moonshot (Kimi)
+      url: https://platform.moonshot.cn/
+      note: "Moonshot AI Kimi models with OpenAI-compatible endpoints."
+    - name: Zhipu AI
+      url: https://open.bigmodel.cn/
+      note: "GLM models with OpenAI-compatible API."
+    - name: Novita AI
+      url: https://novita.ai/
+      note: "Hosted model inference. A dedicated novita_ai binding exists."
+    - name: Hugging Face Inference API
+      url: https://huggingface.co/inference-api
+      note: "HF TGI exposes an OpenAI-compatible endpoint. A dedicated hugging_face_inference_api binding exists."
+    - name: LiteLLM
+      url: https://github.com/BerriAI/litellm
+      note: "Proxy that translates OpenAI calls to 100+ providers. A dedicated litellm binding exists."
+advisory:
+  - "When targeting LoLLMS WebUI or a LoLLMS LCP server, prefer the dedicated `lollms` or `lollms_webui` binding to access native artefacts, discussions, and personality features not exposed via the OpenAI subset."
+  - "When targeting Ollama, llama.cpp server, vLLM, or Groq, dedicated bindings exist that may expose backend-specific features. Use this binding only when you need a single uniform interface across providers."
+  - "Set is_vllm=true when connecting to a vLLM server so reasoning/thinking models (e.g. Qwen3) are handled correctly via chat_template_kwargs."
+  - "Self-hosted servers with self-signed certificates require verify_ssl_certificate=false or a custom certificate_file_path."

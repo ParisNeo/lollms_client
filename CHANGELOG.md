@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-01 20:34]
+
+- feat(openai): update binding implementation and expand description metadata
+
 ## [2026-06-30 11:26]
 
 - refactor: minor updates to file import and chat mixin

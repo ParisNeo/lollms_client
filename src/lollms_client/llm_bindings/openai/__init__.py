@@ -309,6 +309,9 @@ class OpenAIBinding(LollmsLLMBinding):
                         if count >= (n_predict or float("inf")):
                             break
 
+                        if not resp.choices:
+                            continue
+
                         delta = resp.choices[0].delta
                         reasoning = extract_reasoning(delta)
                         content = getattr(delta, "content", None)
@@ -393,6 +396,8 @@ class OpenAIBinding(LollmsLLMBinding):
                     for resp in completion:
                         if count >= (n_predict or float("inf")):
                             break
+                        if not resp.choices:
+                            continue
                         word = getattr(resp.choices[0], "text", "") or ""
                         if word:
                             output += word
@@ -553,6 +558,8 @@ class OpenAIBinding(LollmsLLMBinding):
                 in_reasoning = False
 
                 for chunk in completion:
+                    if not chunk.choices:
+                        continue
                     delta = chunk.choices[0].delta
                     reasoning = extract_reasoning(delta)
                     content = getattr(delta, "content", None)
