@@ -1,6 +1,8 @@
 import sys
 import os
 import io
+import types
+import uuid
 import importlib.util
 import ast
 import re
@@ -49,6 +51,7 @@ class LCPBinding(LollmsToolBinding):
                     self.tool_files.append(Path(f))
 
         self.discovered_tools: List[Dict[str, Any]] = []
+        self._dynamic_tool_modules: Dict[str, types.ModuleType] = {}
         self._discover_local_tools()
 
     @property
@@ -269,6 +272,61 @@ class LCPBinding(LollmsToolBinding):
     def list_tools(self, **kwargs) -> List[Dict[str, Any]]:
         return self.discover_tools(**kwargs)
 
+    def register_tool_from_code(self, tool_name_prefix: str, code: str) -> bool:
+        """
+        Dynamically registers a tool from raw Python code in memory.
+        Used for LLM-generated tool artifacts.
+        """
+        try:
+            module_name = f"dynamic_tool_{tool_name_prefix}_{uuid.uuid4().hex[:8]}"
+            module = types.ModuleType(module_name)
+            
+            # Execute code in the module's namespace
+            exec(compile(code, "<dynamic_tool>", "exec"), module.__dict__)
+            
+            # Find tool_ functions
+            tree = ast.parse(code)
+            registered_count = 0
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name.startswith("tool_"):
+                    tool_name = node.name
+                    
+                    # Remove old version if exists
+                    self.discovered_tools = [t for t in self.discovered_tools if t.get("name") != tool_name]
+                    
+                    # Extract schema
+                    tool_def = self._extract_single_tool_schema(node, tool_name_prefix)
+                    if tool_def:
+                        # Store the module and function reference for execution
+                        tool_def["_dynamic_module"] = module
+                        tool_def["_python_file_path"] = None  # Mark as dynamic
+                        self.discovered_tools.append(tool_def)
+                        registered_count += 1
+                        ASCIIColors.success(f"[LCP Dynamic] Registered tool '{tool_name}' from artefact '{tool_name_prefix}'")
+            
+            return registered_count > 0
+            
+        except Exception as e:
+            ASCIIColors.error(f"[LCP Dynamic] Failed to register tool from code: {e}")
+            trace_exception(e)
+            return False
+
+    def unregister_tools_by_prefix(self, tool_name_prefix: str) -> int:
+        """
+        Removes dynamically registered tools matching a prefix.
+        Returns the count of removed tools.
+        """
+        initial_count = len(self.discovered_tools)
+        self.discovered_tools = [
+            t for t in self.discovered_tools 
+            if not (t.get("name", "").startswith(f"tool_{tool_name_prefix}") or t.get("name", "") == tool_name_prefix)
+        ]
+        removed = initial_count - len(self.discovered_tools)
+        if removed > 0:
+            ASCIIColors.info(f"[LCP Dynamic] Unregistered {removed} tool(s) for prefix '{tool_name_prefix}'")
+        return removed
+
     def execute_tool(self, tool_name: str, params: Dict[str, Any], discussion_instance=None, **kwargs) -> Dict[str, Any]:
         """
         Executes a specific tool function from a potentially multi-tool file.
@@ -289,7 +347,7 @@ class LCPBinding(LollmsToolBinding):
         if not tool_def:
             return {"error": f"Tool '{tool_name}' not found.", "status_code": 404}
 
-        python_file_path = Path(tool_def.get('_python_file_path'))
+        python_file_path = Path(tool_def.get('_python_file_path')) if tool_def.get('_python_file_path') else None
 
         # Ingest Schema Defaults
         input_schema = tool_def.get("input_schema", {})
@@ -298,21 +356,27 @@ class LCPBinding(LollmsToolBinding):
                 params[prop_name] = prop_info["default"]
 
         try:
-            module_name = f"lollms_client.tools_bindings.lcp.{python_file_path.stem}"
-            if module_name in sys.modules:
-                del sys.modules[module_name]
+            if python_file_path:
+                module_name = f"lollms_client.tools_bindings.lcp.{python_file_path.stem}"
+                if module_name in sys.modules:
+                    del sys.modules[module_name]
 
-            spec = importlib.util.spec_from_file_location(module_name, str(python_file_path))
-            if not spec or not spec.loader:
-                return {"error": f"Spec creation failed for '{tool_name}'.", "status_code": 500}
+                spec = importlib.util.spec_from_file_location(module_name, str(python_file_path))
+                if not spec or not spec.loader:
+                    return {"error": f"Spec creation failed for '{tool_name}'.", "status_code": 500}
 
-            tool_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(tool_module)
+                tool_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(tool_module)
+            else:
+                # Use the dynamically loaded module
+                tool_module = tool_def.get("_dynamic_module")
+                if not tool_module:
+                    return {"error": f"Dynamic module missing for '{tool_name}'.", "status_code": 500}
 
             # CRITICAL FIX: Execute the EXACT function name requested (e.g., tool_get_table_schema)
             # Do not search for generic entry points.
             if not hasattr(tool_module, tool_name):
-                return {"error": f"Function '{tool_name}' not found in module '{module_name}'.", "status_code": 500}
+                return {"error": f"Function '{tool_name}' not found in module.", "status_code": 500}
 
             execute_function = getattr(tool_module, tool_name)
 
