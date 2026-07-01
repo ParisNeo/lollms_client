@@ -113,7 +113,7 @@ class UtilsMixin:
                 return {m.group(1): m.group(2)
                         for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
-            # ── SINGLE SOURCE OF TRUTH CONTEXT DOCTRINE ──
+            # ──             # ── SINGLE SOURCE OF TRUTH CONTEXT DOCTRINE ──
             # To prevent massive token duplication and bloat in the context window,
             # we must NEVER export the full verbatim content of artifacts/notes/skills inside past messages.
             # We strip any complete XML blocks and replace them with their lightweight placeholders during export.
@@ -131,11 +131,35 @@ class UtilsMixin:
             content = pattern.sub(_strip_tag_to_placeholder, content)
 
             if msg.sender_type == 'assistant':
-                # Strip completed/closed processing blocks
+                # Strip completed/closed processing blocks and replace with artifact anchors
+                # to preserve context for the LLM without leaking raw execution logs.
+                def _strip_processing_block(match: re.Match) -> str:
+                    block_content = match.group(0)
+                    # Find all created artifacts inside this processing block to build the anchor
+                    inner_arts = re.findall(
+                        r'title=["\']([^"\']*)["\'].*?type=["\']([^"\']*)["\']',
+                        block_content,
+                        re.IGNORECASE
+                    )
+                    if not inner_arts:
+                        inner_arts = re.findall(
+                            r'title=["\']([^"\']*)["\']',
+                            block_content,
+                            re.IGNORECASE
+                        )
+                        inner_arts = [(t, "document") for t in inner_arts]
+
+                    anchors = "\n".join(
+                        f"[🔒SYSTEM_ARTIFACT_CREATED:{t}|{ty}]"
+                        for t, ty in inner_arts
+                    )
+                    return f"\n{anchors}\n" if anchors else ""
+
                 content = re.sub(
-                    r'<processing.*?>.*?</processing>',
-                    '',
-                    content, flags=re.DOTALL | re.IGNORECASE
+                    r'<processing[^>]*>.*?</processing>',
+                    _strip_processing_block,
+                    content,
+                    flags=re.DOTALL | re.IGNORECASE
                 )
                 # Strip any unclosed processing tags
                 content = re.sub(
@@ -1145,6 +1169,7 @@ class UtilsMixin:
                                   content=content, version=version, **extra_data)
 
     def clone_without_messages(self):
+        from . import LollmsDiscussion
         return LollmsDiscussion.create_new(
             lollms_client=self.lollmsClient, db_manager=self.db_manager,
             system_prompt=self.system_prompt,
