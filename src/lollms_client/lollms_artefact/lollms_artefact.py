@@ -4,7 +4,6 @@
 import re
 import uuid
 import os
-import ast
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -90,6 +89,7 @@ _ARTEFACT_IMAGE_TAG_RE = re.compile(
 def _extract_code_signatures(content: str, language: Optional[str]) -> str:
     lang = (language or "").lower()
     if lang == "python" or "def " in content or "class " in content:
+        import ast
         try:
             tree = ast.parse(content)
             sigs = []
@@ -429,52 +429,6 @@ class ArtefactManager:
                 seen[t] = v
         return list(seen.keys())
 
-    def _register_tool_artefact(self, art: Dict[str, Any]):
-        """Registers or updates a tool artefact in the active LCP binding."""
-
-        # 🛡️ SECURITY GATE: Check if dynamic tool registration is explicitly allowed for this session.
-        # Defaults to False (disabled) if the attribute was never set by the chat loop.
-        if not getattr(self._discussion, 'allow_dynamic_tools', False):
-            ASCIIColors.warning(f"[ArtefactManager] 🛡️ Dynamic tool registration is DISABLED. Tool artefact '{art.get('title')}' was not executed.")
-            return
-
-        lc = getattr(self._discussion, 'lollmsClient', None)
-        if not lc or not getattr(lc, 'tools', None):
-            return
-
-        lcp_binding = lc.tools
-        if not hasattr(lcp_binding, 'register_tool_from_code'):
-            return
-
-        title = art.get("title", "untitled")
-        content = art.get("content", "")
-
-        # If it's a tool artefact, parse and register it
-        if art.get("type") == ArtefactType.TOOL and content:
-            try:
-                # Extract code from markdown if present
-                code_match = re.search(r'```python\n(.*?)```', content, re.DOTALL)
-                code = code_match.group(1) if code_match else content
-
-                # Unregister old version first
-                lcp_binding.unregister_tools_by_prefix(title)
-
-                # Register new version
-                lcp_binding.register_tool_from_code(title, code)
-                ASCIIColors.success(f"[ArtefactManager] 🛠️ Registered tool artefact '{title}' as executable LCP tool")
-            except Exception as e:
-                ASCIIColors.warning(f"[ArtefactManager] Failed to register tool artefact '{title}': {e}")
-
-    def _unregister_tool_artefact(self, title: str):
-        """Removes a tool artefact from the active LCP binding."""
-        lc = getattr(self._discussion, 'lollmsClient', None)
-        if not lc or not getattr(lc, 'tools', None):
-            return
-            
-        lcp_binding = lc.tools
-        if hasattr(lcp_binding, 'unregister_tools_by_prefix'):
-            lcp_binding.unregister_tools_by_prefix(title)
-
     def add(
         self,
         title:             str,
@@ -564,14 +518,9 @@ class ArtefactManager:
 
         self._sync_to_disk_workspace(
             title, content, version, artefact_type, language, extra_data.get("file_ext"),
-            physical_data=physical_data,
+            physical_data=final_physical_data if 'final_physical_data' in locals() else physical_data,
             logical_content=logical_content
         )
-        
-        # 🛠️ DYNAMIC TOOL REGISTRATION
-        if artefact_type == ArtefactType.TOOL:
-            self._register_tool_artefact(new_artefact)
-            
         return new_artefact
 
     def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -702,11 +651,6 @@ class ArtefactManager:
             version_tags      = version_tags if version_tags is not None else latest.get('version_tags', []),
             **merged_extra,
         )
-        
-        # 🛠️ DYNAMIC TOOL REGISTRATION (Update)
-        if result and result.get("type") == ArtefactType.TOOL:
-            self._register_tool_artefact(result)
-            
         return result
 
     def revert(self, title: str, target_version: Union[int, str]) -> Dict[str, Any]:
@@ -1015,9 +959,6 @@ class ArtefactManager:
         removed = initial - len(artefacts)
         if removed:
             self._save_all(artefacts)
-            # 🛠️ DYNAMIC TOOL UNREGISTRATION
-            if art and art.get("type") == ArtefactType.TOOL:
-                self._unregister_tool_artefact(title)
         return removed
 
     def _cleanup_data_artefact_files(self, title: str, version: Optional[int] = None):
@@ -1076,13 +1017,9 @@ class ArtefactManager:
 
     def remove_by_id(self, artefact_id: str) -> bool:
         artefacts = self._get_all_raw()
-        art_to_remove = next((a for a in artefacts if a.get('id') == artefact_id), None)
         new_list = [a for a in artefacts if a.get('id') != artefact_id]
         if len(new_list) < len(artefacts):
             self._save_all(new_list)
-            # 🛠️ DYNAMIC TOOL UNREGISTRATION
-            if art_to_remove and art_to_remove.get("type") == ArtefactType.TOOL:
-                self._unregister_tool_artefact(art_to_remove.get("title", ""))
             return True
         return False
 
@@ -1182,9 +1119,6 @@ class ArtefactManager:
                     language=active_art.get("language"),
                     file_ext=active_art.get("file_ext")
                 )
-                # 🛠️ DYNAMIC TOOL REGISTRATION (Activate)
-                if active_art.get("type") == ArtefactType.TOOL:
-                    self._register_tool_artefact(active_art)
 
     def sync_all_active_to_disk(self):
         active_arts = self.list(active_only=True)
@@ -1271,9 +1205,6 @@ class ArtefactManager:
                         language=active_art.get("language"),
                         file_ext=active_art.get("file_ext")
                     )
-                    # 🛠️ DYNAMIC TOOL REGISTRATION (_set_active)
-                    if active_art.get("type") == ArtefactType.TOOL:
-                        self._register_tool_artefact(active_art)
 
     def set_visibility(self, title: str, visibility: str, version: Optional[int] = None) -> bool:
         if visibility not in (ArtefactVisibility.HIDDEN, ArtefactVisibility.TREE_LOCKED, ArtefactVisibility.TREE_UNLOCKABLE, ArtefactVisibility.METADATA, ArtefactVisibility.FULL):
@@ -1770,8 +1701,6 @@ class ArtefactManager:
             version     = int(version_str) if version_str.isdigit() else 1
             is_ephemeral = attrs.pop('ephemeral', 'false').lower() in ('true', '1', 'yes')
             status      = attrs.pop('status', ArtefactStatus.STABLE)
-            commit_message = attrs.pop('commit_message', None)
-            version_tags   = attrs.pop('version_tags', None)
 
             if atype not in ArtefactType.ALL:
                 if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite"):
