@@ -10,6 +10,8 @@ import re
 import json
 import uuid
 import os
+import threading
+import random
 from typing import Any, Dict, List, Optional, Tuple, Callable, Union
 from types import SimpleNamespace
 from ascii_colors import ASCIIColors, trace_exception
@@ -19,6 +21,24 @@ from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactV
 from lollms_client.lollms_memory import FailureMemory
 # ── Cancellation state & limits ──────────────────────────────────────────────
 _MAX_BRACKET_BUF = 256
+
+# ── Heartbeat Cheering Messages ──────────────────────────────────────────────
+_HEARTBEAT_MESSAGES = [
+    "✍️ Writing content...",
+    "🧠 Thinking...",
+    "⏳ Still working...",
+    "🏗️ Building structure...",
+    "✨ Crafting artifact...",
+    "🔧 Refining details...",
+]
+
+# ── Fast Artefact Replicas (Defaults) ────────────────────────────────────────
+_DEFAULT_FAST_REPLICAS = [
+    "* Artifact created instantly (empty body intercepted).\n",
+    "* That was fast! Artifact created with an empty body.\n",
+    "* Instant artifact creation detected. No content was intercepted.\n",
+    "* Done in a flash! The artifact was created too quickly to capture content.\n",
+]
 
 _TAG_STARTS = [
     "<tool>",
@@ -72,6 +92,136 @@ _BINARY_BLOB_KEYS = {
 }
 
 _MAX_TOOL_RESULT_CHARS = 4000
+
+
+# ── Structural Analyzer for Sparse Artefact Forwarding ─────────────────────
+
+import time as _time
+
+def _analyze_artefact_structure(buffer: str, language: Optional[str]) -> Optional[Dict[str, str]]:
+   """
+   Analyzes a partial code/markdown buffer to detect structural boundaries.
+   Returns a metadata dict if a new boundary is found, else None.
+   """
+   if not buffer:
+       return None
+
+   # 1. Markdown Analysis (sections)
+   if language in ("markdown", "md"):
+       # Match level 1 and 2 headers
+       match = re.search(r'^#{1,2}\s+(.+)$', buffer, re.MULTILINE)
+       if match:
+           header_text = match.group(1).strip()
+           return {
+               "status": f"Writing section: {header_text}",
+               "detail": header_text
+           }
+       return None
+
+   # 2. Python Analysis
+   if language == "python":
+       # Match class or function definitions at the start of a line
+       match = re.search(r'^(class|def|async\s+def)\s+([a-zA-Z_][a-zA-Z0-9_]*)', buffer, re.MULTILINE)
+       if match:
+           kind = match.group(1).replace("async ", "")
+           name = match.group(2)
+           return {
+               "status": f"Defining {kind} {name}",
+               "detail": f"{kind} {name}"
+           }
+       return None
+
+   # 3. JavaScript/TypeScript Analysis
+   if language in ("javascript", "js", "typescript", "ts"):
+       # Match class, function, or arrow functions
+       match = re.search(r'^(export\s+)?(class|function|const|let)\s+([a-zA-Z_][a-zA-Z0-9_]*)', buffer, re.MULTILINE)
+       if match:
+           kind = match.group(2)
+           name = match.group(3)
+           return {
+               "status": f"Defining {kind} {name}",
+               "detail": f"{kind} {name}"
+           }
+       return None
+
+   # 4. HTML/CSS Analysis
+   if language in ("html", "css"):
+       if language == "html":
+           match = re.search(r'<(section|div|nav|footer|header|main|article)\s+[^>]*class="[^"]*"', buffer, re.IGNORECASE)
+           if match:
+               tag = match.group(1)
+               return {"status": f"Building <{tag}> block", "detail": tag}
+       else:
+           match = re.search(r'^\.([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{', buffer, re.MULTILINE)
+           if match:
+               cls = match.group(1)
+               return {"status": f"Styling .{cls}", "detail": cls}
+       return None
+
+   # Fallback: Generic code block detection (first line)
+   lines = buffer.strip().splitlines()
+   if lines and len(buffer) > 50:
+       first_line = lines[0].strip()
+       if first_line and not first_line.startswith("#") and not first_line.startswith("//"):
+           return {"status": f"Processing: {first_line[:40]}...", "detail": first_line[:40]}
+
+   return None
+
+
+class _ArtefactStreamTracker:
+   """Tracks the state of an artifact being built for sparse chunk forwarding."""
+   def __init__(self):
+       self.is_inside_artefact = False
+       self.current_buffer = ""
+       self.last_event_detail = None
+       self.last_event_time = 0.0
+       self.current_title = None
+       self.current_language = None
+
+   def reset(self):
+       self.is_inside_artefact = False
+       self.current_buffer = ""
+       self.last_event_detail = None
+       self.last_event_time = 0.0
+       self.current_title = None
+       self.current_language = None
+
+   def open(self, title: str, language: Optional[str]):
+       self.is_inside_artefact = True
+       self.current_title = title
+       self.current_language = language
+       self.current_buffer = ""
+       self.last_event_detail = None
+       self.last_event_time = 0.0
+
+   def feed(self, chunk: str) -> Optional[Dict[str, str]]:
+       """Feeds a chunk and returns event metadata if a new boundary is crossed."""
+       if not self.is_inside_artefact:
+           return None
+
+       self.current_buffer += chunk
+
+       # Throttle analysis to prevent performance hit on every token.
+       # Reduced to 30ms (from 100ms) so fast local LLMs don't miss boundaries.
+       now = _time.time()
+       if now - self.last_event_time < 0.03:
+           return None
+
+       # CRITICAL FIX: Always re-analyze the full buffer, not just the chunk.
+       # This ensures boundaries that arrived during the throttle window are detected.
+       analysis = _analyze_artefact_structure(self.current_buffer, self.current_language)
+       if analysis and analysis.get("detail") != self.last_event_detail:
+           self.last_event_detail = analysis.get("detail")
+           self.last_event_time = now
+           return {
+               "title": self.current_title,
+               "status": analysis.get("status", "Building..."),
+               "language": self.current_language
+           }
+       return None
+
+   def close(self):
+       self.reset()
 
 
 def _is_large_base64(v: str) -> bool:
@@ -292,6 +442,7 @@ class _StreamState:
     def __init__(
         self,
         discussion: 'LollmsDiscussion',
+       forward_artefact_chunks: bool,
         callback: Optional[Callable],
         ai_message: Any,
         enable_notes: bool = True,
@@ -302,6 +453,7 @@ class _StreamState:
         enable_artefacts: bool = True,
         enable_in_message_status: bool = True,
         content_offset: int = 0,
+        fast_artefact_replicas: Optional[List[str]] = None,
     ):
         self.discussion = discussion
         self.callback = callback
@@ -319,6 +471,11 @@ class _StreamState:
         self.tool_trigger = False
         self.tool_json_data = ""
         self.affected_artefacts = []
+
+        # Sparse artefact forwarding tracker
+        self.forward_artefact_chunks = forward_artefact_chunks
+        self.artefact_tracker = _ArtefactStreamTracker()
+
         self.processed_tags = set()
 
         # Track context unlock requests to force continuation round
@@ -327,110 +484,352 @@ class _StreamState:
 
         self._is_accumulating_tool = False
         self._tool_buffer = ""
+        self._artefact_buffer = ""  # Dedicated buffer for raw artifact content
+        self._artefact_open_tag = "" # Stores the exact opening tag (e.g., <artifact name="x">)
+        self._pending_buffer = ""   # Shadow buffer to safely catch partial tags
+
+        # Heartbeat control for empty/slow artifacts
+        self._artefact_heartbeat_thread: Optional[threading.Thread] = None
+        self._artefact_heartbeat_stop = threading.Event()
+        self._artefact_heartbeat_active = False
+        self._artefact_received_content = False
+
+        # Fast artefact replicas (user-provided or default)
+        self._fast_artefact_replicas = fast_artefact_replicas if fast_artefact_replicas else _DEFAULT_FAST_REPLICAS
+
+
+    def _start_artefact_heartbeat(self):
+        """Starts a background thread that emits cheering messages every 15s if no content arrives."""
+        if self._artefact_heartbeat_thread is not None:
+            return
+
+        self._artefact_heartbeat_stop.clear()
+        self._artefact_heartbeat_active = True
+        self._artefact_received_content = False
+
+        def _heartbeat_loop():
+            interval = 15.0
+            while not self._artefact_heartbeat_stop.wait(interval):
+                if not self._artefact_received_content:
+                    msg = random.choice(_HEARTBEAT_MESSAGES)
+                    try:
+                        # CRITICAL FIX: Do NOT use was_processed=True here.
+                        # That flag causes _inline_relay to silently drop the message.
+                        # Use a distinct meta key so the UI can style it if desired.
+                        _cb(self.callback, f"\n{msg}\n", MSG_TYPE.MSG_TYPE_CHUNK, {"is_heartbeat": True})
+                    except Exception:
+                        pass
+
+        self._artefact_heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        self._artefact_heartbeat_thread.start()
+
+    def _stop_artefact_heartbeat(self):
+        """Stops the heartbeat thread safely."""
+        if self._artefact_heartbeat_thread is not None:
+            self._artefact_heartbeat_stop.set()
+            if threading.current_thread() != self._artefact_heartbeat_thread:
+                self._artefact_heartbeat_thread.join(timeout=1.0)
+            self._artefact_heartbeat_thread = None
+            self._artefact_heartbeat_active = False
 
     def feed(self, chunk: str) -> bool:
         if not isinstance(chunk, str) or not chunk:
             return True
 
-        self.ai_message.content += chunk
-        _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_CHUNK)
+        # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
+        self._pending_buffer += chunk
 
+        # ── Tool Accumulation & Interception ──
         if self._is_accumulating_tool:
-            self._tool_buffer += chunk
-
-            if '</tool>' in self._tool_buffer:
-                end_idx = self._tool_buffer.find('</tool>')
-                full_tool_call = self._tool_buffer[:end_idx + len('</tool>')]
+            if '</tool>' in self._pending_buffer:
+                end_idx = self._pending_buffer.find('</tool>')
+                full_tool_call = self._tool_buffer + self._pending_buffer[:end_idx + len('</tool>')]
                 json_body = full_tool_call.strip().lstrip('<tool>').rstrip('</tool>').strip()
 
                 self._is_accumulating_tool = False
                 self._tool_buffer = ""
 
+                # Keep any text after the tool call in the pending buffer
+                self._pending_buffer = self._pending_buffer[end_idx + len('</tool>'):]
+
                 keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
                 if not keep_generating:
                     return False
-
-                self.content_offset = len(self.ai_message.content)
-                return True
             else:
-                return True
-
-        content = self.ai_message.content[self.content_offset:]
-
-        if not content.strip():
+                self._tool_buffer += self._pending_buffer
+                self._pending_buffer = ""
             return True
 
-        last_open_think = content.rfind("<think>")
-        last_close_think = content.rfind("</think>")
+        # ── Tag Detection (Buffering) ──
+        last_open_think = self._pending_buffer.rfind("<tool_call>")
+        last_close_think = self._pending_buffer.rfind("```")
         is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
 
-        if is_inside_thoughts:
-            return True
+        # ── Handle <artifact> Streaming (State-Driven Dual-Stream) ──
+        if not is_inside_thoughts:
+            # State 1: We are already inside an artifact (tracker is active)
+            if self.artefact_tracker.is_inside_artefact:
+                # Track if we received actual content (for heartbeat suppression)
+                if self._pending_buffer.strip():
+                    self._artefact_received_content = True
 
-        last_open_art = max(content.rfind("<artifact"), content.rfind("<artefact"))
-        last_close_art = max(content.rfind("</artifact>"), content.rfind("</artefact>"))
-        is_inside_artifact = (last_open_art != -1) and (last_open_art > last_close_art)
+                self._artefact_buffer += self._pending_buffer
+                self._pending_buffer = "" # Consume the buffer into the artifact
 
-        if is_inside_artifact:
-            if not content.endswith("</artifact>") and not content.endswith("</artefact>"):
+                # Check if the closing tag arrived (robust string search)
+                lower_buffer = self._artefact_buffer.lower()
+                close_idx = lower_buffer.find("</artifact>")
+                if close_idx == -1:
+                    close_idx = lower_buffer.find("</artefact>")
+
+                if close_idx != -1:
+                    self._stop_artefact_heartbeat()
+                    self.artefact_tracker.close()
+
+                    # Extract the full artifact block cleanly
+                    # Find the opening tag first
+                    open_idx = lower_buffer.find("<artifact")
+                    if open_idx == -1:
+                        open_idx = lower_buffer.find("<artefact")
+
+                    end_of_open_tag = self._artefact_buffer.find(">", open_idx)
+                    opening_tag = self._artefact_buffer[open_idx:end_of_open_tag+1]
+                    body_content = self._artefact_buffer[end_of_open_tag+1:close_idx]
+                    closing_tag = self._artefact_buffer[close_idx:close_idx+len("</artifact>")]
+                    full_match_text = opening_tag + body_content + closing_tag
+
+                    # Always dispatch the real body content to create the artifact.
+                    # The instant-close "replica" messages were causing the actual
+                    # content to be lost and replaced with generic placeholders.
+                    if full_match_text not in self.processed_tags:
+                        self.processed_tags.add(full_match_text)
+                        self._dispatch_closed_tag(
+                            "artifact", 
+                            opening_tag, 
+                            body_content.strip(), 
+                            full_match_text
+                        )
+
+                    # 🛑 CRITICAL FIX: Preserve the raw artifact body inside the processing tags
+                    # in ai_message.content so the frontend can render it.
+                    # The export() method in _mixin_utils.py will strip the <processing> tags
+                    # for the LLM context to prevent mimicry.
+                    preserved_content = f'{opening_tag}{body_content}{closing_tag}'
+                    self.ai_message.content += preserved_content
+                    _cb(self.callback, preserved_content, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    # Close the processing block cleanly
+                    proc_close_tag = f'\n</processing>\n'
+                    self.ai_message.content += proc_close_tag
+                    _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                    # Keep any text that came after the closing tag
+                    self._pending_buffer = self._artefact_buffer[close_idx+len(closing_tag):]
+                    self._artefact_buffer = ""
+                else:
+                    # Still in the middle of the artifact body. Suppress raw output from main stream.
+
+                    # CRITICAL FIX: Always emit lightweight structural status events,
+                    # regardless of forward_artefact_chunks. The forward_artefact_chunks
+                    # flag only controls whether raw code chunks (high bandwidth) are forwarded.
+                    # The status tags are tiny and should always fire.
+                    event_meta = self.artefact_tracker.feed(chunk)
+                    if event_meta:
+                        # If forward_artefact_chunks is True, also forward the raw chunk
+                        if self.forward_artefact_chunks:
+                            _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, event_meta)
+                        status_tag = f'{event_meta["status"]}\n'
+                        _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 return True
 
-        safe_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
-        safe_content = re.sub(r'<think>.*$', '', safe_content, flags=re.DOTALL | re.IGNORECASE)
-
-        xml_pattern = re.compile(
-            r'<(artifact|artefact|note|skill|tool)\b([^>]*?)>(.*?)</\1>',
-            re.DOTALL | re.IGNORECASE
-        )
-
-        xml_matches = list(xml_pattern.finditer(safe_content))
-
-        for match in xml_matches:
-            full_match_text = match.group(0)
-            if full_match_text in self.processed_tags:
-                continue
-
-            self.processed_tags.add(full_match_text)
-            tag_name = match.group(1).lower()
-            attrs_str = match.group(2)
-            body = match.group(3).strip()
-
-            try:
-                keep_generating = self._dispatch_closed_tag(tag_name, attrs_str, body, full_match_text)
-                if not keep_generating:
-                    return False
-            except Exception as dispatch_err:
-                trace_exception(dispatch_err)
-                ASCIIColors.error(f"[StreamState] XML dispatch failed for tag '{tag_name}': {dispatch_err}")
-
-        if '<tool>' in safe_content:
-            start_idx = safe_content.find('<tool>')
-            end_idx = safe_content.find('</tool>', start_idx)
-
-            if end_idx != -1:
-                full_tool_call = safe_content[start_idx:end_idx + len('</tool>')]
-                json_body = full_tool_call.strip().lstrip('<tool>').rstrip('</tool>').strip()
-
-                self.processed_tags.add(full_tool_call)
-                keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
-                if not keep_generating:
-                    return False
+            # State 2: We are not inside an artifact, check if we are entering one
             else:
+                # Look for the start of an artifact tag (case-insensitive)
+                lower_buffer = self._pending_buffer.lower()
+                open_idx = lower_buffer.find("<artifact")
+                if open_idx == -1:
+                    open_idx = lower_buffer.find("<artefact")
+
+                if open_idx != -1:
+                    tag_start_idx = open_idx
+
+                    # Check if we have the full opening tag
+                    end_of_tag_idx = self._pending_buffer.find(">", tag_start_idx)
+
+                    if end_of_tag_idx != -1:
+                        # We have the full opening tag!
+                        attrs_str = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
+                        title = "artifact"
+                        lang = None
+                        m_title = re.search(r'(?:name|title)=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
+                        if m_title: title = m_title.group(1)
+                        m_lang = re.search(r'language=["\']([^"\']*)["\']', attrs_str, re.IGNORECASE)
+                        if m_lang: lang = m_lang.group(1)
+
+                        self.artefact_tracker.open(title, lang)
+
+                        # Forward the text BEFORE the tag to the UI and save it
+                        text_before_tag = self._pending_buffer[:tag_start_idx]
+                        if text_before_tag:
+                            self.ai_message.content += text_before_tag
+                            _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                        # Start the artifact buffer with the opening tag
+                        self._artefact_buffer = attrs_str
+
+                        # Fire the opening processing tag to the UI and save it
+                        proc_tag = f'\n<processing type="artefact" title="{title}" language="{lang or ""}">\n'
+                        self.ai_message.content += proc_tag
+                        _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        # Start the heartbeat in case the artifact body is slow/empty
+                        self._start_artefact_heartbeat()
+
+                        opening_status = f'Starting artifact...\n'
+                        _cb(self.callback, opening_status, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        # Check if the closing tag also arrived in this same chunk
+                        remaining_content = self._pending_buffer[end_of_tag_idx+1:]
+                        close_idx = remaining_content.lower().find("</artifact>")
+                        if close_idx == -1:
+                            close_idx = remaining_content.lower().find("</artefact>")
+
+                        if close_idx != -1:
+                            self._stop_artefact_heartbeat()
+                            self.artefact_tracker.close()
+
+                            # Extract the body cleanly
+                            body_content = remaining_content[:close_idx]
+                            closing_tag = remaining_content[close_idx:close_idx+len("</artifact>")]
+                            full_match_text = attrs_str + body_content + closing_tag
+
+                            # Always dispatch the real body content to create the artifact.
+                            # The instant-close "replica" messages were causing the actual
+                            # content to be lost and replaced with generic placeholders.
+                            if full_match_text not in self.processed_tags:
+                                self.processed_tags.add(full_match_text)
+                                self._dispatch_closed_tag(
+                                    "artifact", 
+                                    attrs_str, 
+                                    body_content.strip(), 
+                                    full_match_text
+                                )
+
+                            # 🛑 CRITICAL FIX: Preserve the raw artifact body inside the processing tags
+                            # in ai_message.content so the frontend can render it.
+                            # The export() method in _mixin_utils.py will strip the <processing> tags
+                            # for the LLM context to prevent mimicry.
+                            preserved_content = f'{attrs_str}{body_content}{closing_tag}'
+                            self.ai_message.content += preserved_content
+                            _cb(self.callback, preserved_content, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            # Close the processing block cleanly
+                            proc_close_tag = f'\n</processing>\n'
+                            self.ai_message.content += proc_close_tag
+                            _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            self._artefact_buffer = ""
+                            # Keep any text after the closing tag in the pending buffer
+                            self._pending_buffer = remaining_content[close_idx+len(closing_tag):]
+                        else:
+                            # We are inside the artifact, waiting for the rest.
+                            self._artefact_buffer += remaining_content
+                            self._pending_buffer = ""
+
+                        return True
+                    else:
+                        # Partial tag detected (e.g., "<art"). 
+                        # Forward text before the partial tag to the UI and save it.
+                        text_before_partial = self._pending_buffer[:tag_start_idx]
+                        if text_before_partial:
+                            self.ai_message.content += text_before_partial
+                            _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                        # Hold the partial tag in the pending buffer for the next chunk
+                        self._pending_buffer = self._pending_buffer[tag_start_idx:]
+                        return True
+
+        # ── Handle <tool> Streaming ──
+        if not is_inside_thoughts:
+            open_tool_match = re.search(r'<tool>', self._pending_buffer, re.IGNORECASE)
+            if open_tool_match:
+                tag_start_idx = open_tool_match.start()
+
+                # Forward text before the tool tag to the UI and save it
+                text_before_tag = self._pending_buffer[:tag_start_idx]
+                if text_before_tag:
+                    self.ai_message.content += text_before_tag
+                    _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
+
                 self._is_accumulating_tool = True
-                self._tool_buffer = safe_content[start_idx:]
+                self._tool_buffer = self._pending_buffer[tag_start_idx:]
+                self._pending_buffer = ""
 
+                proc_tag = f'\n<processing type="tool" title="Tool Execution Pending">\n'
+                self.ai_message.content += proc_tag
+                _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                return True
+
+        # ── Default Forwarding ──
+        # Robust partial tag detection: Check if the buffer ends with a prefix of any known tag.
+        # This prevents raw XML from leaking when the LLM streams tokens with trailing spaces or partial attributes.
+        def _ends_with_partial_tag(buffer: str) -> int:
+            """Returns the start index of the partial tag if found, else -1."""
+            tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<generate_image", "<edit_image"]
+            for tag in tags_to_check:
+                # Check if the buffer ends with a substring of the tag (e.g., "<art", "<artifact ")
+                for i in range(1, len(tag) + 1):
+                    if buffer.endswith(tag[:i]):
+                        # Found a partial match. Return the start index.
+                        return len(buffer) - i
+
+            # Fallback: Check for partial tags with trailing spaces or partial attribute names
+            # e.g., "<artifact " or "<artifact n" or "<tool "
+            for tag in tags_to_check:
+                # Check if the buffer contains the tag followed by spaces/attributes but no closing '>'
+                idx = buffer.rfind(tag)
+                if idx != -1 and ">" not in buffer[idx:]:
+                    # The tag started but hasn't closed yet. Hold it.
+                    return idx
+
+            return -1
+
+        partial_idx = _ends_with_partial_tag(self._pending_buffer)
+        if partial_idx != -1:
+            # Forward text before the partial tag to the UI and save it
+            text_before_partial = self._pending_buffer[:partial_idx]
+            if text_before_partial:
+                self.ai_message.content += text_before_partial
+                _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
+
+            # Hold the partial tag in the pending buffer for the next chunk
+            self._pending_buffer = self._pending_buffer[partial_idx:]
+            return True
+
+        # No partial tags, forward everything and save it
+        self.ai_message.content += self._pending_buffer
+        _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+        self._pending_buffer = ""
         return True
-
     def _dispatch_closed_tag(self, tag_name: str, attrs_str: str, body: str, full_match_text: str) -> bool:
-        attrs = {}
-        for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
-            attrs[m.group(1).lower()] = m.group(2)
+        # If attrs_str starts with '<', it's the full opening tag. Extract attrs from it.
+        if attrs_str.startswith('<'):
+            attrs = {}
+            for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                attrs[m.group(1).lower()] = m.group(2)
+            tag_name = re.match(r'<(\w+)', attrs_str).group(1).lower()
+        else:
+            attrs = {}
+            for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
+                attrs[m.group(1).lower()] = m.group(2)
 
         # 1. Artifact Creation & Patching
         if tag_name in ("artifact", "artefact"):
             if not self.enable_artefacts:
                 return True
             title = attrs.get("name") or attrs.get("title") or f"artifact_{uuid.uuid4().hex[:8]}"
+
             atype = attrs.get("type", "document")
             lang = attrs.get("language")
             is_ephemeral = attrs.get("ephemeral", "false").lower() in ("true", "1", "yes")
@@ -464,15 +863,14 @@ class _StreamState:
             if art:
                 self.affected_artefacts.append(art)
 
-            # ── SWIFT REPLACEMENT PROTOCOL ──
-            # Strips the full raw XML from the message body and replaces it with an unmistakable SYSTEM marker
-            # This prevents the LLM from mimicking the placeholder in future turns
-            # NOTE: The triple-bracket format is NEVER used in valid XML, making it impossible to confuse with functional tags
-            placeholder = f"\n[🔒SYSTEM_ARTIFACT_CREATED:{title}|{atype}]\n"
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
+            # ── CRITICAL: DO NOT MUTATE ai_message.content ──
+            # The raw <artifact> XML is preserved in the message content.
+            # The export() method in _mixin_utils.py will handle replacing it
+            # with the [🔒SYSTEM_ARTIFACT_CREATED:title|type] marker when building
+            # history for the LLM. This prevents the marker from leaking into the live UI.
 
             # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_updated" if not is_new else "artifact_created",
                 "title": title,
                 "version": art.get("version", 1) if art else 1,
@@ -521,10 +919,8 @@ class _StreamState:
             if art:
                 self.affected_artefacts.append(art)
 
-            # Use distinctive SYSTEM marker that cannot be mimicked
-            placeholder = f"\n[🔒SYSTEM_NOTE_CREATED:{title}]\n"
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+            # Preserve raw XML in content. Export will handle the placeholder.
+            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
                 "title": title,
                 "art_type": "note"
@@ -544,10 +940,8 @@ class _StreamState:
             if art:
                 self.affected_artefacts.append(art)
 
-            # Use distinctive SYSTEM marker that cannot be mimicked
-            placeholder = f"\n[🔒SYSTEM_SKILL_CREATED:{title}]\n"
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+            # Preserve raw XML in content. Export will handle the placeholder.
+            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
                 "title": title,
                 "art_type": "skill"
@@ -605,8 +999,20 @@ class _StreamState:
         return True
 
     def flush_remaining_buffer(self):
-        """No buffered tokens to flush because we have zero-latency passthrough."""
-        pass
+        """Flushes any safe text remaining in the shadow buffer at the end of generation."""
+        # CRITICAL: Stop heartbeat if artifact was never closed
+        self._stop_artefact_heartbeat()
+
+        if self._pending_buffer:
+            # If we are still inside an artifact for some reason (unclosed tag), dump it to the UI
+            if self.artefact_tracker.is_inside_artefact:
+                self.ai_message.content += self._pending_buffer
+                _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+            else:
+                # Otherwise, it's just trailing text or a partial tag that never completed
+                self.ai_message.content += self._pending_buffer
+                _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+            self._pending_buffer = ""
 
     def get_tool_call_json(self) -> Optional[str]:
         return self.tool_json_data if self.tool_trigger else None
@@ -805,7 +1211,6 @@ class ChatMixin:
         enable_forms:                 bool = True,
         enable_books:                 bool = False,
         enable_presentations:         bool = False,
-        enable_silent_artefact_explanation: bool = True,
         memory_manager=None,
         enable_artefacts:             bool = True,
         enable_memory:                bool = True,
@@ -815,8 +1220,8 @@ class ChatMixin:
         max_reasoning_steps:          int = 20,
         enable_in_message_status:     bool = False,
         enable_sub_agents:            bool = False,  # Enable spinoff agents as executable tools
-        verbose_traceback:            bool = False,  # Disclose full sanitised traceback to the LLM
-        sandbox_cwd:                  Optional[str] = None, # Custom relative sandbox run directory
+        forward_artefact_chunks:      bool = False,  # Forward sparse artefact structural events to UI
+        fast_artefact_replicas:       Optional[List[str]] = None,  # Custom messages for instant/empty artefacts
         tolerance_level:              Optional[str] = "strict",
         **kwargs
     ) -> Dict[str, Any]:
@@ -1163,6 +1568,7 @@ class ChatMixin:
             ss = _StreamState(
                 discussion=self,
                 callback=callback,
+                forward_artefact_chunks=forward_artefact_chunks,
                 ai_message=ai_msg,
                 enable_notes=enable_notes,
                 enable_skills=enable_skills,
@@ -1171,6 +1577,7 @@ class ChatMixin:
                 auto_activate_artefacts=auto_activate_artefacts,
                 enable_artefacts=enable_artefacts,
                 enable_in_message_status=enable_in_message_status,
+                fast_artefact_replicas=fast_artefact_replicas,
                 content_offset=current_content_length  # Start parsing from current position
             )
 
@@ -1951,6 +2358,10 @@ class ChatMixin:
 
         if remove_thinking_blocks:
             ai_msg.content = self.lollmsClient.remove_thinking_blocks(ai_msg.content)
+
+        # The Dual-Stream Buffer architecture now ensures raw <artifact> XML 
+        # never enters ai_msg.content in the first place, so no post-generation
+        # regex cleanup is required.
 
         # ── 🛡️ AUTO-CORRECT HALLUCINATED FILENAMES ──
         # Scan through the tool executions of this turn and fix any mismatched filenames
