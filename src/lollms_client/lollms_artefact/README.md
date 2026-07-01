@@ -80,8 +80,25 @@ The chat interface interprets custom tags inserted into the message history:
 
 ---
 
-## 🛠️ 4. Class Reference
+## 🛠️ 4. Dynamic Tool Artefacts (`type="tool"`)
 
-* **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`).
-* **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, and manages version history squashing.
+The artefact system natively supports the LLM generating its own executable tools. When the LLM creates an artefact with `type="tool"`, the `ArtefactManager` attempts to register it dynamically.
+
+### Security Gate
+To prevent untrusted LLMs from executing arbitrary code, dynamic tool registration is gated by the `allow_dynamic_tools` flag on the active `LollmsDiscussion` instance.
+*   If `allow_dynamic_tools` is `False` (the default), the tool artefact is saved as a standard code file but is **NOT** parsed or executed.
+*   If `allow_dynamic_tools` is `True`, the manager extracts the Python code and passes it to the active `LCPBinding` for immediate AST parsing and module execution.
+
+### Lifecycle
+1.  **Create**: LLM outputs `<artifact type="tool" name="my_tool">def tool_run(): ...</artifact>`.
+2.  **Gate Check**: `ArtefactManager._register_tool_artefact()` checks `discussion.allow_dynamic_tools`.
+3.  **Register**: If allowed, `LCPBinding.register_tool_from_code("my_tool", code)` is called.
+4.  **Execute**: The tool `tool_my_tool` is now available in the active session registry.
+
+---
+
+## 🛠️ 5. Class Reference
+
+* **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`).
+* **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, manages version history squashing, and gates dynamic tool registration.
 * **`FileImportMixin`**: Contains multi-modal parser subroutines for importing PDFs, Word documents, PowerPoint presentations, and audio files.
