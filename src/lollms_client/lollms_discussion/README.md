@@ -47,13 +47,145 @@ data_workspace/
 
 ---
 
-## 🛑 2. Cancellation & Interrupt Protocol
+## 🧬 2. The Chat Loop & Tool Orchestration (`ChatMixin`)
 
-The `ChatMixin` implements a **Thread-Safe Cancellation Protocol** using `threading.Event`. This ensures that long-running agentic loops, heavy tool executions, or streaming generations can be interrupted instantly without leaving the database or workspace in an inconsistent state.
+The `chat()` method is not a simple API call; it is an **Agentic State Machine**. It handles pre-hydration, multi-step reasoning, tool execution, and self-healing file restoration.
+
+### Execution Workflow
+
+```mermaid
+flowchart TD
+    A[Start chat] --> B[Pre-Hydration]
+    B --> C[Memory Decay & RAG Injection]
+    C --> D[Dynamic Tool Mounting]
+    D --> E[Context Assembly]
+    E --> F[Reasoning Loop]
+    
+    subgraph F [Reasoning Loop Max 20 Steps]
+        direction TB
+        F1[LLM Generation] --> F2{Tool Call?}
+        F2 -- Yes --> F3[Execute Tool]
+        F3 --> F4[Sync Files to Artefacts]
+        F4 --> F5[Feedback to LLM]
+        F5 --> F1
+        F2 -- No --> F6[Final Answer]
+    end
+    
+    F --> G[Post-Processing]
+    G --> H[Memory Saving]
+    H --> I[Commit to DB]
+```
+
+### Detailed Phase Breakdown
+
+1.  **Pre-Hydration**:
+    * Memory Decay & Associative Pull (SQLite).
+    * RAG Injection (if personality has data).
+    * **Dynamic Tool Mounting**: If data files exist in workspace, `semantic_data_engineer` is auto-mounted.
+2.  **Context Assembly**:
+    * System Prompt + Rules.
+    * **Active Artefacts**: Injects `.lam` content (Logical Twins) for all active files.
+    * Memory Handles.
+3.  **Reasoning Loop** (Max 20 steps):
+    * **LLM Generation**: Streams tokens to `_StreamState`.
+    * **Stream Parsing**: Intercepts closed XML tags (`<artifact>`, `<tool>`) instantly.
+    * **Tool Execution**:
+        * **CWD Switch**: Changes OS Current Working Directory to `data_workspace/discussions/{id}/`.
+        * **Sync**: Ensures all active artifacts exist on disk.
+        * **Run**: Executes Python function.
+        * **Post-Scan**: Detects NEW files created by tool → Auto-registers as Artefacts.
+    * **Feedback**: Sanitizes tool output (strips base64 blobs) and feeds back to LLM.
+4.  **Termination**: Commits DB, resets cancellation flags.
+
+### Processing Block Status Metadata
+
+When the LLM triggers a tool call or builds an artifact, the system intercepts the action and wraps it in a `<processing>` block in the live chat stream. Upon completion of the action, the system injects an HTML comment metadata tag immediately after the closing `</processing>` tag to indicate the outcome.
+
+This metadata is **not** meant to be read by the LLM, but rather by the **frontend rendering engine**. It allows the UI to definitively know whether an operation succeeded or failed when the block closes, enabling accurate visual styling (e.g., green for success, red for failure).
+
+*   **Tool Calls**:
+    *   `<!-- status:success -->`: The tool executed successfully.
+    *   `<!-- status:failure -->`: The tool encountered an error, crashed, or was blocked by the loop interceptor.
+*   **Artefact Building**:
+    *   `<!-- status:finished -->`: The artifact was fully received and registered in the workspace.
+
+**Example Stream Output:**
+```xml
+<processing type="tool" title="Tool Execution: tool_execute_sql_query">
+* Calling local tool system for 'tool_execute_sql_query'...
+* Completed execution of 'tool_execute_sql_query' successfully.
+Output Logs:
+| id | name |
+|----|------|
+| 1  | Foo  |
+</processing>
+<!-- status:success -->
+```
+
+### The `chat()` Method API
+
+```python
+def chat(
+    self,
+    user_message: str,
+    personality=None,
+    branch_tip_id=None,
+    tools=None,
+    add_user_message: bool = True,
+    images=None,
+    # ... (see full signature in code)
+) -> Dict[str, Any]:
+```
+
+**Key Parameters:**
+*   `user_message` (`str`): The input text from the user.
+*   `tools` (`Optional[Dict]`): A dictionary of tool specifications. If `None`, the system relies on LCP auto-discovery.
+*   `images` (`Optional[List[str]]`): List of base64 encoded images for vision models.
+*   `enable_artefacts` (`bool`): Master switch for the artifact creation system.
+*   `allow_dynamic_tools` (`bool`): **Security Gate**. If `True`, allows the LLM to write and execute its own Python tools on the fly.
+*   `max_reasoning_steps` (`int`): Limit for the agentic loop to prevent infinite cycles.
+
+**Return Dictionary:**
+```python
+{
+    "user_message": LollmsMessage,
+    "ai_message": LollmsMessage,
+    "sources": List[Dict],           # RAG sources
+    "artefacts": List[Dict],         # Artifacts created/modified this turn
+    "memory_report": Dict,           # Memory operations report
+    "dream_report": Optional[Dict],  # Auto-dream consolidation report
+    "was_cancelled": bool            # Cancellation status
+}
+```
+
+---
+
+## 🛠️ 3. Dynamic Tool Generation & Execution Protocol
+
+The system allows the LLM to write, compile, and execute its own custom tools on the fly as standard `type="tool"` Artefacts. This bridges the gap between code generation and agentic action.
+
+### The Flow
+1.  **Generation**: The LLM writes a Python script containing a `tool_*` function and outputs it inside an `<artifact type="tool" name="my_tool">` XML block.
+2.  **Interception**: The `ArtefactManager` intercepts the creation event and checks if the artefact type is `TOOL`.
+3.  **Security Gate**: The manager checks the `allow_dynamic_tools` flag on the active discussion session. If `False` (the default), the file is saved as a standard code artefact but is **NOT** executed.
+4.  **Registration**: If enabled, `ArtefactManager` passes the raw code to `LCPBinding.register_tool_from_code()`. The binding parses the AST, executes the code in an isolated module namespace, and registers the `tool_*` functions into the active tool registry.
+5.  **Execution**: The LLM can immediately call `<tool>{"name": "tool_my_tool", "parameters": {...}}</tool>` in the same or subsequent turns.
+
+### Security & Control
+Because allowing an LLM to write and execute arbitrary code is inherently dangerous, this feature is strictly gated:
+*   **`allow_dynamic_tools=False`**: By default, the chat loop sets this to `False`. The LLM can write the tool file, but it remains inert text.
+*   **Opt-In Execution**: The host application must explicitly pass `allow_dynamic_tools=True` to `discussion.chat()` to enable dynamic execution.
+*   **Visibility Rules**: Even when disabled, the tool artefact remains in the workspace, subject to standard `[U]`, `[C]`, `[L]` visibility tiers. The user can inspect the code the LLM wrote.
+
+---
+
+## 🛑 4. Cancellation & Interrupt Protocol
+
+The `ChatMixin` implements a **Thread-Safe Cancellation Protocol** using a simple boolean flag. This ensures that long-running agentic loops, heavy tool executions, or streaming generations can be interrupted instantly without leaving the database or workspace in an inconsistent state.
 
 ### How It Works
 1.  **Signal**: The user (or UI) calls `discussion.cancel_generation()`.
-2.  **Propagation**: This sets a internal `_cancel_event` flag.
+2.  **Propagation**: This sets a internal `_cancel_flag` boolean and propagates to the LLM binding to stop low-level streaming.
 3.  **Observation**: The agentic loop checks this flag at **four critical safe points**:
     *   **Start of Reasoning Round**: Before sending a new prompt to the LLM.
     *   **During Streaming**: Inside the token streaming callback (every chunk).
@@ -98,90 +230,19 @@ discussion.chat(user_message="New question...") # Works normally
 
 ---
 
-## 🛠️ 3. Developer Guide: Accessing Artefact Data
-
-### A. How to Recover the `.lam` (Logical) Content
-The `.lam` content is what the LLM "sees" in its context. It is stored in the `content` field of the artefact dictionary **IF** the artefact was created with `logical_content` or is a Data type.
-
-```python
-# Get the artefact record
-art = discussion.artefacts.get("my_dataset")
-
-# Access Logical Content (The .lam schema)
-logical_schema = art["content"] 
-print(logical_schema) 
-# Output: "# Data Interface: my_dataset\nFormat: CSV\nColumns: id, name, value..."
-```
-
-### B. How to Recover the Physical File (Raw Bytes)
-To get the actual file for processing (e.g., to load into Pandas directly without re-parsing), you must access the **Discussion-Isolated Workspace**.
-
-**CRITICAL**: Do not use absolute paths from the artefact dict. Use the discussion's workspace resolver.
-
-```python
-from pathlib import Path
-
-# 1. Resolve the Discussion-Specific Workspace
-base_ws = Path("./data_workspace")
-# If running inside server, APP_WORKSPACE_DIR overrides this
-try:
-    from lollms_client.app.server import APP_WORKSPACE_DIR
-    if APP_WORKSPACE_DIR: base_ws = APP_WORKSPACE_DIR
-except ImportError: pass
-
-disc_ws = base_ws / "discussions" / discussion.id
-
-# 2. Construct Path to Physical Twin
-file_ext = art.get("file_ext", ".txt")
-physical_path = disc_ws / f"{art['title']}{file_ext}"
-
-# 3. Read Raw Bytes
-if physical_path.exists():
-    raw_bytes = physical_path.read_bytes()
-    # OR for text files
-    raw_text = physical_path.read_text(encoding="utf-8")
-```
-
-### C. The Self-Healing Protocol
-The `semantic_data_engineer` and `FileImportMixin` implement **Self-Healing**.
-If a tool requests a file (e.g., `data.csv`) that is missing from the `workspace/` folder but exists in the `versions/` folder (or database), the system **automatically restores it** before execution.
-
-*   **Trigger**: `FileNotFoundError` during tool prep.
-*   **Action**: Copy `versions/{title}_v{latest}.{ext}` → `workspace/{title}.{ext}`.
-*   **Result**: Tools never fail due to missing workspace files if the artefact exists in memory.
-
----
-
-## 🧬 5. The Chat Loop & Tool Orchestration (`ChatMixin`)
-
-The `chat()` method is not a simple API call; it is an **Agentic State Machine**.
-
-### Execution Flow
-1.  **Pre-Hydration**:
-    *   Memory Decay & Associative Pull (SQLite).
-    *   RAG Injection (if personality has data).
-    *   **Dynamic Tool Mounting**: If data files exist in workspace, `semantic_data_engineer` is auto-mounted.
-2.  **Context Assembly**:
-    *   System Prompt + Rules.
-    *   **Active Artefacts**: Injects `.lam` content (Logical Twins) for all active files.
-    *   Memory Handles.
-3.  **Reasoning Loop** (Max 20 steps):
-    *   **LLM Generation**: Streams tokens to `_StreamState`.
-    *   **Stream Parsing**: Intercepts closed XML tags (`<artifact>`, `<tool>`) instantly.
-    *   **Tool Execution**:
-        *   **CWD Switch**: Changes OS Current Working Directory to `data_workspace/discussions/{id}/`.
-        *   **Sync**: Ensures all active artifacts exist on disk.
-        *   **Run**: Executes Python function.
-        *   **Post-Scan**: Detects NEW files created by tool → Auto-registers as Artefacts.
-    *   **Feedback**: Sanitizes tool output (strips base64 blobs) and feeds back to LLM.
-4.  **Termination**: Commits DB, resets cancellation flags.
-
----
-
 ## 🌿 5. Branching & Versioning
 
-### Message Branching
 Messages are not a linear list. They are a **Directed Acyclic Graph (DAG)**.
+
+### Message Branching
+```mermaid
+graph LR
+    Root[Root Message] --> User1[User Msg 1]
+    User1 --> AI1a[AI Reply 1a]
+    User1 --> AI1b[AI Reply 1b - Regenerated]
+    AI1a --> User2[User Msg 2]
+    AI1b --> User3[User Msg 3]
+```
 *   **`active_branch_id`**: Points to the leaf node of the current conversation path.
 *   **`get_branch(leaf_id)`**: Recursively walks parents to root, returning a chronological list.
 *   **`regenerate_branch`**: Deletes the current AI leaf and restarts the loop from the user parent.
@@ -195,7 +256,7 @@ Every update to an artefact creates a new version (Git-like).
 
 ---
 
-## 📥 7. File Import Modes (`FileImportMixin`)
+## 📥 6. File Import Modes (`FileImportMixin`)
 
 The `import_file` method supports sophisticated ingestion strategies:
 
