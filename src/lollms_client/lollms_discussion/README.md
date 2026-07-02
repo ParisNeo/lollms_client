@@ -342,6 +342,29 @@ else:
     print("Artifact not found or workspace not configured.")
 ```
 
+### 🔄 Post-Execution Sync: How It Works
+
+When you execute a script manually (or via an external tool), it may generate new files (e.g., `plot.png`, `results.db`, `output.csv`) or modify existing ones in the `workspace_data/` directory. The LLM and the UI are unaware of these changes until you synchronize the workspace.
+
+The `sync_workspace_to_artefacts()` method performs a **bidirectional synchronization**:
+
+1. **Workspace → Database (Upsert)**: It scans the `workspace_data/` directory. If it finds a file that isn't registered as an artefact, it creates it. If a file has been modified, it updates the artefact content and bumps its version.
+2. **Database → Workspace (Heal)**: It ensures all active text-based artefacts in the database exist on disk. If a file was accidentally deleted, it restores it from the database.
+
+This ensures the LLM's context window (the `.lam` schemas and code contents) perfectly matches the physical state of the workspace. **Always call this method after any external execution.**
+
+#### API Reference
+
+*   `discussion.get_workspace_data_path() -> str | None`
+    Returns the absolute path to the `workspace_data/` subfolder for this discussion. Returns `None` if the discussion was created without a workspace.
+
+*   `discussion.get_active_file_path(file_name: str, create_if_missing: bool = True) -> str | None`
+    Safely resolves the absolute path of a file inside the discussion's `workspace_data/` subfolder. If `create_if_missing` is True, it ensures the directory exists before returning the path (preventing `NoneType.mkdir` errors).
+
+*   `discussion.sync_workspace_to_artefacts() -> Dict[str, int]`
+    Synchronizes the physical `workspace_data/` folder with the Artefact database. 
+    Returns a report dictionary: `{"new_artefacts": int, "updated_artefacts": int, "restored_files": int}`.
+
 
 ## 🎛️ 7. Interactive Widgets (`<lollms_inline>`)
 
