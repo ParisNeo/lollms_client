@@ -558,16 +558,22 @@ class _StreamState:
 
         # ── Tool Accumulation & Interception ──
         if self._is_accumulating_tool:
-            if '</tool>' in self._pending_buffer:
-                end_idx = self._pending_buffer.find('</tool>')
-                full_tool_call = self._tool_buffer + self._pending_buffer[:end_idx + len('</tool>')]
-                json_body = full_tool_call.strip().lstrip('<tool>').rstrip('</tool>').strip()
+            # Use regex to be tolerant of whitespace or slight malformations in the closing tag (e.g., </tool >)
+            close_match = re.search(r'</tool>\s*', self._pending_buffer, re.IGNORECASE)
+            if close_match:
+                end_idx = close_match.start()
+                end_len = len(close_match.group(0))
+
+                full_tool_call = self._tool_buffer + self._pending_buffer[:end_idx + end_len]
+                # Robustly extract JSON body without relying on exact lstrip/rstrip of tags
+                json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
+                json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
 
                 self._is_accumulating_tool = False
                 self._tool_buffer = ""
 
                 # Keep any text after the tool call in the pending buffer
-                self._pending_buffer = self._pending_buffer[end_idx + len('</tool>'):]
+                self._pending_buffer = self._pending_buffer[end_idx + end_len:]
 
                 keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
                 if not keep_generating:
@@ -771,9 +777,9 @@ class _StreamState:
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
 
-                proc_tag = f'\n<processing type="tool" title="Tool Execution Pending">\n'
-                self.ai_message.content += proc_tag
-                _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                # CRITICAL FIX: Do NOT emit a <processing> block here.
+                # The ChatMixin will handle the execution UI block once the tool call is parsed.
+                # Emitting it here causes a duplicate/empty processing block in the UI.
 
                 return True
 
@@ -1008,6 +1014,24 @@ class _StreamState:
         """Flushes any safe text remaining in the shadow buffer at the end of generation."""
         # CRITICAL: Stop heartbeat if artifact was never closed
         self._stop_artefact_heartbeat()
+
+        # ── CRITICAL FIX: Force-dispatch incomplete tool calls ──
+        # If the LLM finishes generation while we are still accumulating a tool call 
+        # (e.g., it omitted the closing </tool> tag or hit a stop token), we must 
+        # synthesize the closing tag and dispatch it so tool_trigger is set to True.
+        if self._is_accumulating_tool:
+            # Combine buffers to capture any partial JSON that arrived in the last chunk
+            full_tool_call = self._tool_buffer + self._pending_buffer
+            json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
+            json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
+
+            self._is_accumulating_tool = False
+            self._pending_buffer = ""
+            self._tool_buffer = ""
+
+            # Dispatch the tool call silently. The ChatMixin will handle the UI processing block.
+            self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
+            return  # Exit early; the tool call has been dispatched
 
         if self._pending_buffer:
             # If we are still inside an artifact for some reason (unclosed tag), dump it to the UI
@@ -1716,7 +1740,13 @@ class ChatMixin:
                         elif active_tools and tool_name in active_tools:
                             # Sync all active artifacts to disk BEFORE tool execution
                             try:
-                                sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
+                                sync_result = self.artefacts.sync_all_active_to_disk()
+                                if isinstance(sync_result, tuple) and len(sync_result) == 2:
+                                    sync_ws, sync_files = sync_result
+                                else:
+                                    # Handle cases where sync_all_active_to_disk returns None 
+                                    # (e.g., when there are no active artifacts to sync)
+                                    sync_ws, sync_files = None, []
                             except Exception as ex:
                                 trace_exception(ex)
 
@@ -2176,25 +2206,31 @@ class ChatMixin:
                                 # 🛑 CRITICAL FIX: Robust output extraction
                                 # The tool result might be {"success": True, "output": "content"}
                                 # OR {"success": True, "output": {"content": "..."}}
+                                # OR {"success": True, "page_content": "..."}
                                 # OR just the raw content itself.
                                 raw_output = tool_res.get("output", tool_res)
 
-                                # Handle nested output dictionaries (common in MCP tools)
+                                # Handle nested output dictionaries (common in MCP/external tools)
                                 if isinstance(raw_output, dict):
                                     # If output is a dict, try to extract the most relevant field
-                                    if "content" in raw_output:
-                                        raw_output = raw_output["content"]
-                                    elif "text" in raw_output:
-                                        raw_output = raw_output["text"]
-                                    elif "result" in raw_output:
-                                        raw_output = raw_output["result"]
-                                    elif "data" in raw_output:
-                                        raw_output = raw_output["data"]
+                                    # Expanded key list to catch Wikipedia/external tool patterns
+                                    extracted = None
+                                    for key in ("content", "text", "result", "data", "page_content", "summary", "extract", "html", "body", "query", "pages"):
+                                        if key in raw_output:
+                                            extracted = raw_output[key]
+                                            break
+                                    
+                                    if extracted is not None:
+                                        raw_output = extracted
                                     else:
                                         # Fall back to JSON dump of the whole dict
                                         raw_output = json.dumps(raw_output, indent=2, default=str, ensure_ascii=False)
                                 elif isinstance(raw_output, list):
                                     raw_output = json.dumps(raw_output, indent=2, default=str, ensure_ascii=False)
+                                elif raw_output is None and isinstance(tool_res, dict) and len(tool_res) > 1:
+                                    # CRITICAL: If 'output' was explicitly None but the tool returned
+                                    # other metadata (success, error, etc.), dump the whole dict.
+                                    raw_output = json.dumps(tool_res, indent=2, default=str, ensure_ascii=False)
                                 else:
                                     raw_output = str(raw_output) if raw_output is not None else "No output returned."
 
@@ -2203,6 +2239,9 @@ class ChatMixin:
                                 clean_result_str = _sanitize_tool_result(tool_res)
                                 self._trigger_evolutionary_reflection(tool_name, tool_params, clean_result_str)
                                 status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
+                                # 🛡️ CRITICAL FIX: Guard against NoneType output from tools
+                                if full_dump is None:
+                                    full_dump = "Tool executed successfully but returned no output content."
                                 safe_output = full_dump[:2000] + ("..." if len(full_dump) > 2000 else "")
                                 details_block = f"Output Logs:\n{safe_output}\n"
                         else:
