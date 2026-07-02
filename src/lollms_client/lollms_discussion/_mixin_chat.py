@@ -643,8 +643,8 @@ class _StreamState:
                             full_match_text
                         )
 
-                    # Close the processing block cleanly.
-                    proc_close_tag = f'\n</processing>\n'
+                    # Close the processing block cleanly with status metadata INSIDE the block.
+                    proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
                     self.ai_message.content += proc_close_tag
                     _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
@@ -747,10 +747,12 @@ class _StreamState:
                                     full_match_text
                                 )
 
-                            # Close the processing block cleanly.
+                            # Close the processing block cleanly with status metadata.
                             proc_close_tag = f'\n</processing>\n'
-                            self.ai_message.content += proc_close_tag
+                            status_comment = f'<!-- status:finished -->\n'
+                            self.ai_message.content += proc_close_tag + status_comment
                             _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            _cb(self.callback, status_comment, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                             self._artefact_buffer = ""
                             # Keep any text after the closing tag in the pending buffer
@@ -1780,67 +1782,20 @@ class ChatMixin:
                     tool_name = call_data.get("name", "")
                     tool_params = call_data.get("parameters", {})
 
-                    # ── 🛑 CRITICAL FIX: ZOMBIE TOOL CALL INTERCEPTION ──
-                    # If the LLM generates a substantial final answer (conversational gist)
-                    # and THEN emits a tool call, it is a "Zombie Call". The LLM has already
-                    # answered the user. Executing the tool again is useless and triggers
-                    # the loop guard. We must intercept and terminate the turn immediately.
-                    raw_round_text = ss.get_clean_text_so_far()
-
-                    # Isolate just this round's conversational text (before the tool tag)
-                    round_conversational_text = raw_round_text
-                    if f"<tool>{tool_call_json_str}</tool>" in round_conversational_text:
-                        round_conversational_text = round_conversational_text.split(f"<tool>{tool_call_json_str}</tool>")[0]
-                    elif tool_call_json_str in round_conversational_text:
-                        round_conversational_text = round_conversational_text.split(tool_call_json_str)[0]
-
-                    # Clean any processing blocks from the gist
-                    round_conversational_clean = re.sub(r'<processing.*?>.*?</processing>', '', round_conversational_text, flags=re.DOTALL | re.IGNORECASE).strip()
-
-                    # If we have a substantial final answer, treat this as a zombie call
-                    if len(round_conversational_clean) > 100:
-                        ASCIIColors.warning(f"[ChatMixin] 🧟 ZOMBIE TOOL CALL INTERCEPTED. LLM generated final answer ({len(round_conversational_clean)} chars) then emitted tool '{tool_name}'. Terminating turn.")
-
-                        # 1. Accumulate the final conversational text into the gist
-                        conversational_gist += round_conversational_clean
-
-                        # 2. Strip the zombie tool tag from the UI buffer
-                        if tool_call_json_str in ai_msg.content:
-                            ai_msg.content = ai_msg.content.replace(f"<tool>{tool_call_json_str}</tool>", "")
-                            ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
-
-                        # 3. Set the final ai_msg.content to the clean gist
-                        ai_msg.content = conversational_gist.strip()
-
-                        # 4. Break the loop immediately
-                        break
-
                     # ── 🛑 ARCHITECTURAL FIX: VIRTUAL HISTORY SEPARATION ──
                     # 1. Append the RAW assistant text (including <tool> tag) to virtual_history.
                     # 2. Strip the <tool> tag from the UI buffer (ai_msg.content).
-                    # 3. Accumulate conversational gist for the final DB message.
-
-                    raw_round_text = ss.get_clean_text_so_far()
-
-                    # Isolate just this round's conversational text (before the tool tag)
-                    round_conversational_text = raw_round_text
-                    if f"<tool>{tool_call_json_str}</tool>" in round_conversational_text:
-                        round_conversational_text = round_conversational_text.split(f"<tool>{tool_call_json_str}</tool>")[0]
-                    elif tool_call_json_str in round_conversational_text:
-                        round_conversational_text = round_conversational_text.split(tool_call_json_str)[0]
-
-                    # Clean any processing blocks from the conversational gist
-                    round_conversational_clean = re.sub(r'<processing.*?>.*?</processing>', '', round_conversational_text, flags=re.DOTALL | re.IGNORECASE).strip()
-                    if round_conversational_clean:
-                        conversational_gist += round_conversational_clean + "\n\n"
-
                     # 1. Append RAW assistant text to virtual_history (preserves KV-cache)
+                    raw_round_text = ss.get_clean_text_so_far()
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
                         content=raw_round_text
                     ))
 
-                    # 2. Strip tool tag from UI buffer and open processing block
+                    # 2. Strip ONLY the raw <tool> JSON tag from the UI/DB buffer (ai_msg.content).
+                    # 🛑 CRITICAL: Do NOT strip <processing> blocks here. They are part of the 
+                    # execution log and must remain in the final saved message. The export() 
+                    # method will sanitize them when building context for the LLM.
                     if tool_call_json_str in ai_msg.content:
                         ai_msg.content = ai_msg.content.replace(f"<tool>{tool_call_json_str}</tool>", "")
                         ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
@@ -1865,7 +1820,6 @@ class ChatMixin:
                             was_cancelled = True
                             break
 
-
                         result_str = (
                             f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round of this conversation. "
                             f"To prevent an infinite loop, execution was blocked. You must modify your parameters, inspect the data schemas, "
@@ -1873,7 +1827,7 @@ class ChatMixin:
                         )
                         status_err_line = f"* Tool call blocked to prevent loop.\n"
                         details_block = f"Loop Intercepted:\n{result_str}\n"
-                        tool_close_tag = f"{status_err_line}{details_block}</processing>\n\n"
+                        tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
                         ai_msg.content += tool_close_tag
                         _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                         break
@@ -2379,7 +2333,7 @@ class ChatMixin:
                                     clean_result_str = result_str
                                     status_done_line = f"* Tool call blocked to prevent loop.\n"
                                     details_block = f"Loop Intercepted:\n{result_str}\n"
-                                    tool_close_tag = f"{status_done_line}{details_block}</processing>\n\n"
+                                    tool_close_tag = f"{status_done_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
                                     ai_msg.content += tool_close_tag
                                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                                     break
@@ -2452,7 +2406,10 @@ class ChatMixin:
                         status_done_line = f"* Execution crashed.\n"
                         details_block = f"Crash Details:\n{str(e)}\n"
 
-                    tool_close_tag = f"{status_done_line}{details_block}</processing>\n\n"
+                    # Determine the status comment based on the execution outcome
+                    is_failure = "Error" in clean_result_str or "failed" in clean_result_str.lower() or "crashed" in status_done_line.lower()
+                    status_meta = "failure" if is_failure else "success"
+                    tool_close_tag = f"{status_done_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n"
                     ai_msg.content += tool_close_tag
                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
@@ -2604,14 +2561,12 @@ class ChatMixin:
                     continue  # Jump to next reasoning round immediately
 
                 # ── 🛑 FINALIZE: No tool call, no intent, no unlock. This is the final answer. ──
-                # Accumulate the final conversational text into the gist.
-                raw_round_text = ss.get_clean_text_so_far()
-                round_conversational_clean = re.sub(r'<processing.*?>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE).strip()
-                if round_conversational_clean:
-                    conversational_gist += round_conversational_clean
-
-                # Set the final ai_msg.content to the clean gist (stripped of all tool tags and processing blocks)
-                ai_msg.content = conversational_gist.strip()
+                # 🛑 CRITICAL ARCHITECTURAL FIX: Do NOT overwrite ai_msg.content with a sanitized gist.
+                # The `_StreamState` already accumulated conversational text and <processing> blocks
+                # safely into `ai_msg.content` during the stream. We must preserve this exact buffer
+                # so the execution logs remain visible in the final saved message.
+                # The `export()` method will handle stripping <processing> blocks when building 
+                # context for the LLM to prevent context bloat.
                 break
 
         # ── 11. Final Post-Processing & Database Commit ──
