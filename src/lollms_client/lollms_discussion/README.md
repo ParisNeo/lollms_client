@@ -279,6 +279,58 @@ When importing a folder as `data_bundle`:
 
 ---
 
+### 📂 Accessing the Workspace & Executing Artifacts Externally
+
+If your host application needs to execute or read an artifact (e.g., a Python script) directly **without** invoking the LLM agentic loop (`discussion.chat()`), you must resolve the file's absolute path safely.
+
+**CRITICAL**: Never assume the workspace path exists. Always use the built-in getters to handle path resolution and directory creation automatically.
+
+#### API Reference
+
+*   `discussion.get_workspace_path() -> str | None`
+    Returns the root workspace directory path for this discussion. Returns `None` if the discussion was created without a `workspace_path`.
+
+*   `discussion.get_active_file_path(file_name: str, create_if_missing: bool = True) -> str | None`
+    Safely resolves the absolute path of a file inside the discussion's `workspace_data` subfolder. If `create_if_missing` is True, it ensures the directory exists before returning the path (preventing `NoneType.mkdir` errors).
+
+*   `discussion.sync_workspace_to_artefacts() -> Dict[str, int]`
+    Synchronizes the physical `workspace_data` folder with the Artefact database. It scans the folder for new/modified files and registers them, and restores any missing files from the DB. **Always call this after executing scripts externally via `subprocess.run`.**
+
+#### Example: Executing a Python Artifact Directly
+
+🚨 **CRITICAL ARCHITECTURAL RULE**: When executing scripts externally via `subprocess`, you **MUST** set the `cwd` (Current Working Directory) to `discussion.get_workspace_data_path()`. 
+If you omit this, the subprocess will inherit the host application's working directory, and the script will crash with `FileNotFoundError` when trying to open relative paths like `"sample_sales_data.csv"`.
+
+```python
+from pathlib import Path
+import subprocess
+
+# 1. Get the absolute paths safely
+script_path = discussion.get_active_file_path("my_script.py")
+ws_data_path = discussion.get_workspace_data_path()
+
+if script_path and Path(script_path).exists():
+    # 2. Execute it using the host environment
+    print(f"Executing {script_path}...")
+    result = subprocess.run(
+        ["python", script_path], 
+        capture_output=True, 
+        text=True,
+        cwd=ws_data_path  # 🛡️ MANDATORY: Set CWD to workspace_data so relative paths resolve correctly!
+    )
+    print("Output:", result.stdout)
+    print("Errors:", result.stderr)
+    
+    # 3. 🔄 SYNC THE WORKSPACE BACK TO THE ARTEFACT SYSTEM
+    # This detects any new files (e.g., output.csv, plot.png) created by the script
+    # and registers them as artifacts so the UI and LLM can see them.
+    sync_report = discussion.sync_workspace_to_artefacts()
+    print(f"Sync complete: {sync_report}")
+else:
+    print("Artifact not found or workspace not configured.")
+```
+
+
 ## 🛡️ 7. Security & Integrity Rules
 
 1.  **Path Sovereignty**: Tools **cannot** access files outside `data_workspace/discussions/{id}/`. The CWD switch enforces this at the OS level.
