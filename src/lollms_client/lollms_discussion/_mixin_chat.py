@@ -79,7 +79,9 @@ _SECONDARY_TAG_MAP = {
     "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
     "<think>":        ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
     "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
-    "<add_files_to_context": ("context_unlock",      MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</add_files_to_context>"),
+    "<unlock_file":   ("context_unlock",      MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</unlock_file>"),
+    "<lock_file":     ("context_lock",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</lock_file>"),
+    "<hide_file":     ("context_hide",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</hide_file>"),
 }
 
 
@@ -974,45 +976,63 @@ class _StreamState:
             })
             return True
 
-        # 5. Multi-tier Context Unlocks
-        # 5. Multi-tier Context Unlocks
-        elif tag_name == "add_files_to_context":
-            from ._artefacts import ArtefactVisibility
+        # 5. Multi-tier Context Visibility Management
+        elif tag_name in ("unlock_file", "lock_file", "hide_file"):
+            from lollms_client.lollms_artefact import ArtefactVisibility
+
+            # Map tag name to target visibility state
+            target_visibility = ArtefactVisibility.FULL
+            action_verb = "Unlocking"
+            if tag_name == "lock_file":
+                target_visibility = ArtefactVisibility.TREE_LOCKED
+                action_verb = "Locking"
+            elif tag_name == "hide_file":
+                target_visibility = ArtefactVisibility.HIDDEN
+                action_verb = "Hiding"
+
             targets = [t.strip() for t in body.splitlines() if t.strip()]
-            unlocked_files = []
-            already_visible = []
+
+            processed_files = []
+            already_in_state = []
             not_found = []
 
             for t_file in targets:
                 art = self.discussion.artefacts.get(t_file)
                 if not art:
                     not_found.append(t_file)
-                elif art.get("visibility") == ArtefactVisibility.FULL:
-                    # Already fully loaded - skip redundant operation
-                    already_visible.append(t_file)
+                elif art.get("visibility") == target_visibility:
+                    already_in_state.append(t_file)
                 else:
-                    self.discussion.artefacts.set_visibility(t_file, ArtefactVisibility.FULL)
-                    unlocked_files.append(t_file)
+                    self.discussion.artefacts.set_visibility(t_file, target_visibility)
+                    processed_files.append(t_file)
 
-            if unlocked_files:
+            if processed_files:
                 self.discussion.commit()
-                # Mark that we need a continuation round after this generation
-                self.context_unlock_requested = True
-                self.context_unlocked_files.extend(unlocked_files)
+                # If we unlocked files, mark that we need a continuation round
+                if target_visibility == ArtefactVisibility.FULL:
+                    self.context_unlock_requested = True
+                    self.context_unlocked_files.extend(processed_files)
 
-            # Build informative feedback - distinguish between newly unlocked and already visible
-            feedback_parts = []
-            if unlocked_files:
-                feedback_parts.append(f"✅ Loaded: {', '.join(unlocked_files)}")
-            if already_visible:
-                feedback_parts.append(f"⚠️ Already in context: {', '.join(already_visible)}")
+            # Build UI feedback inside a processing block
+            status_parts = []
+            if processed_files:
+                status_parts.append(f"✅ {action_verb}: {', '.join(processed_files)}")
+            if already_in_state:
+                status_parts.append(f"⚠️ Already in target state: {', '.join(already_in_state)}")
             if not_found:
-                feedback_parts.append(f"❌ Not found: {', '.join(not_found)}")
-            
-            # Use a distinctive SYSTEM marker that cannot be mimicked
-            placeholder = f"\n\n[SYSTEM: Context updated — {'; '.join(feedback_parts)}]\n\n"
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, placeholder)
-            _cb(self.callback, placeholder, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                status_parts.append(f"❌ Not found: {', '.join(not_found)}")
+
+            status_line = f"* {action_verb} context files...\n"
+            details_block = f"Context Update:\n{'; '.join(status_parts)}\n"
+            status_meta = "failure" if not_found and not processed_files else "success"
+
+            proc_open = f'\n<processing type="context_update" title="Context Visibility Manager">\n'
+            proc_close = f'{status_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n'
+
+            # Replace the raw XML tag in the AI message with the processing block
+            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_open + proc_close)
+            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
             return True
 
         return True
@@ -1877,7 +1897,7 @@ class ChatMixin:
                                 "error": "Execution aborted by user cancellation.",
                                 "prompt_injection": "\n\n⚠️ **Execution Aborted.**\nThe user cancelled the generation. Do not attempt to call tools again."
                             }
-                        elif active_tools and tool_name in active_tools:
+                        elif active_tools and tool_name in active_tools and "callable" in active_tools[tool_name]:
                             # Sync all active artifacts to disk BEFORE tool execution
                             try:
                                 sync_result = self.artefacts.sync_all_active_to_disk()
@@ -2313,7 +2333,7 @@ class ChatMixin:
                                 # No CWD restoration needed - ChatMixin never changed it
                                 # LCP Binding handles its own CWD cleanup internally
                                 pass
-                        else:
+                        elif hasattr(self.lollmsClient, "tools") and self.lollmsClient.tools is not None:
                             tool_res = self.lollmsClient.tools.execute_tool(
                                 tool_name, 
                                 tool_params, 
@@ -2321,9 +2341,20 @@ class ChatMixin:
                                 discussion_instance=self,
                                 discussion=self
                             )
+                        else:
+                            tool_res = {
+                                "success": False,
+                                "error": f"Tool '{tool_name}' has no callable and no LCP tools binding is available on the client.",
+                                "status_code": 404
+                            }
 
                         if isinstance(tool_res, dict):
-                            if not tool_res.get("success", True):
+                            # 🛑 CRITICAL FIX: Detect failure from LCP binding (status_code 404 or explicit error key)
+                            # before checking the success flag, as LCP errors may omit the success key.
+                            is_lcp_error = tool_res.get("status_code") and tool_res.get("status_code") != 200
+                            has_error_key = "error" in tool_res and not tool_res.get("success", True)
+
+                            if not tool_res.get("success", True) or is_lcp_error or has_error_key:
                                 error_msg = tool_res.get("error", "Unknown tool error")
                                 if failure_memory:
                                     failure_memory.record_failure(tool_name, tool_params, error_msg)
@@ -2407,7 +2438,14 @@ class ChatMixin:
                         details_block = f"Crash Details:\n{str(e)}\n"
 
                     # Determine the status comment based on the execution outcome
-                    is_failure = "Error" in clean_result_str or "failed" in clean_result_str.lower() or "crashed" in status_done_line.lower()
+                    # 🛑 CRITICAL FIX: Also check the raw tool_res dict for explicit failure signals
+                    is_failure = (
+                        "Error" in clean_result_str or 
+                        "failed" in clean_result_str.lower() or 
+                        "crashed" in status_done_line.lower() or
+                        (isinstance(tool_res, dict) and tool_res.get("success") is False) or
+                        (isinstance(tool_res, dict) and tool_res.get("status_code", 200) != 200)
+                    )
                     status_meta = "failure" if is_failure else "success"
                     tool_close_tag = f"{status_done_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n"
                     ai_msg.content += tool_close_tag
