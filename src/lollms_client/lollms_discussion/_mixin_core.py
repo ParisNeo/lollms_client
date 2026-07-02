@@ -59,35 +59,45 @@ class CoreMixin:
         resolved_id = discussion_id or (db_discussion_obj.id if db_discussion_obj else "viewer_session")
 
         # ── NATIVE AUTO-INGESTION & CLEAN ISOLATION DIRECTORIES ──
+        # 🛡️ STRICT PATH SOVEREIGNTY PROTOCOL:
+        # If workspace_path is provided by the host application, use it EXACTLY as-is.
+        # The host application is sovereign over its filesystem structure.
+        # Do NOT append 'discussions/' or the discussion ID if the user explicitly provided a path.
         if workspace_path:
             parent_dir = Path(workspace_path)
-            # If path ends with a workspace directory but lacks the specific discussion folder, append it
-            if parent_dir.name != resolved_id and (parent_dir / resolved_id).parent.exists():
-                parent_dir = parent_dir / resolved_id
-
-            parent_dir.mkdir(parents=True, exist_ok=True)
-
-            # Subfolder 1: workspace_data (Contains physical twins for tools)
-            ws_data_dir = parent_dir / "workspace_data"
-            ws_data_dir.mkdir(parents=True, exist_ok=True)
-
-            # Subfolder 2: artefacts_metadata (Contains versioned .lam and raw code files)
-            metadata_dir = parent_dir / "artefacts_metadata"
-            metadata_dir.mkdir(parents=True, exist_ok=True)
-
-            object.__setattr__(self, 'workspace_path', str(parent_dir.resolve()))
-            object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
-            object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir.resolve()))
-
-            # Self-healing auto DB instantiation if db_manager is omitted
-            if not db_manager:
-                from ._db import LollmsDataManager
-                db_file_path = parent_dir / "discussion.db"
-                db_manager = LollmsDataManager(f"sqlite:///{db_file_path}")
         else:
-            object.__setattr__(self, 'workspace_path', None)
-            object.__setattr__(self, 'workspace_data_path', None)
-            object.__setattr__(self, 'artefacts_metadata_path', None)
+            # 🛡️ FAIL-SAFE FALLBACK: If no workspace_path is provided, auto-generate
+            # a safe, isolated default directory to prevent NoneType crashes and 
+            # ensure tools/viewers can always read/write artifacts.
+            parent_dir = Path("./data_workspace") / "discussions" / resolved_id
+
+        parent_dir.mkdir(parents=True, exist_ok=True)
+
+        # 🛡️ CRITICAL FIX: PATH IDEMPOLENCE
+        # Prevent path duplication (e.g., .../workspace_data/workspace_data/)
+        # If the host app passes a path that ALREADY contains the subfolders, 
+        # we must NOT append them again. This prevents WinError 267 during subprocess CWD resolution.
+        ws_data_dir = parent_dir
+        if not parent_dir.name.lower() == "workspace_data":
+            ws_data_dir = parent_dir / "workspace_data"
+        ws_data_dir.mkdir(parents=True, exist_ok=True)
+
+        metadata_dir = parent_dir
+        if not parent_dir.name.lower() == "artefacts_metadata":
+            # Ensure we don't duplicate if parent is already named artefacts_metadata
+            if ws_data_dir.parent != parent_dir or parent_dir.name.lower() != "artefacts_metadata":
+                metadata_dir = parent_dir / "artefacts_metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+
+        object.__setattr__(self, 'workspace_path', str(parent_dir.resolve()))
+        object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
+        object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir.resolve()))
+
+        # Self-healing auto DB instantiation if db_manager is omitted
+        if not db_manager:
+            from ._db import LollmsDataManager
+            db_file_path = parent_dir / "discussion.db"
+            db_manager = LollmsDataManager(f"sqlite:///{db_file_path}")
 
         object.__setattr__(self, 'db_manager', db_manager)
         object.__setattr__(self, '_is_db_backed', db_manager is not None)
@@ -651,3 +661,174 @@ class CoreMixin:
             str | None: The resolved workspace path, or None if not configured.
         """
         return getattr(self, 'workspace_path', None)
+
+    def get_active_file_path(self, file_name: str, create_if_missing: bool = True) -> Optional[str]:
+        """
+        Safely resolves the absolute path of a file inside the discussion's workspace_data directory.
+        This is the recommended way to locate a file for direct execution or viewing without relying
+        on the LLM agentic loop.
+
+        Args:
+            file_name (str): The name of the file (e.g., "script.py").
+            create_if_missing (bool): If True, creates the workspace directory tree if it doesn't exist.
+
+        Returns:
+            str | None: The absolute path to the file, or None if no workspace is configured.
+        """
+        ws_data_path = getattr(self, 'workspace_data_path', None)
+        if not ws_data_path:
+            return None
+
+        file_path = Path(ws_data_path) / file_name
+
+        if create_if_missing:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        return str(file_path.resolve())
+
+    def sync_workspace_to_artefacts(self) -> Dict[str, int]:
+        """
+        Performs a comprehensive bidirectional synchronization between the physical 
+        workspace_data directory and the LollmsDiscussion Artefact database.
+
+        1. Workspace -> DB: Scans the folder. Registers new files as artefacts and 
+           updates DB content if the file on disk is newer.
+        2. DB -> Workspace: Ensures all active text-based artefacts in the DB exist 
+           on disk, writing them out if they are missing.
+
+        Use this after executing scripts externally via subprocess.run to guarantee
+        the UI and LLM context accurately reflect all file changes.
+
+        Returns:
+            Dict[str, int]: A report containing counts of synced items:
+            {"new_artefacts": int, "updated_artefacts": int, "restored_files": int}
+        """
+        from lollms_client.lollms_artefact import ArtefactVisibility
+        import os
+
+        ws_data_path = getattr(self, 'workspace_data_path', None)
+        if not ws_data_path:
+            return {"new_artefacts": 0, "updated_artefacts": 0, "restored_files": 0}
+
+        workspace_dir = Path(ws_data_path)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        report = {"new_artefacts": 0, "updated_artefacts": 0, "restored_files": 0}
+
+        # --- 1. WORKSPACE -> DB (Upsert) ---
+        EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
+                                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
+                                ".zip", ".tar", ".gz", ".pdf", ".docx"}
+
+        for f_path in workspace_dir.rglob("*"):
+            if not f_path.is_file() or f_path.name.startswith("."):
+                continue
+
+            file_name = f_path.name
+            file_ext = f_path.suffix.lower()
+            file_size = f_path.stat().st_size
+            disk_mtime = f_path.stat().st_mtime
+
+            # Determine type
+            atype = "document"
+            if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+                atype = "code"
+            elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
+                atype = "data"
+            elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+                atype = "image"
+
+            existing_art = self.artefacts.get(file_name)
+
+            # Check if file is binary to avoid reading it into memory as text
+            is_binary = file_ext in EXPLICIT_BINARY_EXTS
+            if not is_binary:
+                try:
+                    with open(f_path, 'rb') as f:
+                        if b'\x00' in f.read(1024):
+                            is_binary = True
+                except Exception:
+                    is_binary = True
+
+            if is_binary:
+                content_placeholder = (
+                    f"### Data File: `{file_name}`\n\n"
+                    f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
+                    f"- **Size**: {file_size:,} bytes\n"
+                    f"- **Location**: `./{file_name}`\n\n"
+                )
+                if existing_art is None:
+                    self.artefacts.add(
+                        title=file_name,
+                        artefact_type=atype,
+                        content=content_placeholder,
+                        active=True,
+                        visibility=ArtefactVisibility.FULL,
+                        commit_message="Synced from disk (binary)"
+                    )
+                    report["new_artefacts"] += 1
+                else:
+                    # Only update if disk is newer
+                    db_updated_at = existing_art.get("updated_at", "")
+                    # Simple heuristic: always update placeholder if size differs to ensure metadata sync
+                    if existing_art.get("content", "").find(f"Size**: {file_size:,}") == -1:
+                        self.artefacts.update(
+                            title=file_name,
+                            new_content=content_placeholder,
+                            new_type=atype,
+                            active=True,
+                            visibility=ArtefactVisibility.FULL,
+                            commit_message="Updated from disk (binary metadata)"
+                        )
+                        report["updated_artefacts"] += 1
+            else:
+                # Text File
+                try:
+                    disk_content = f_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+
+                if existing_art is None:
+                    self.artefacts.add(
+                        title=file_name,
+                        artefact_type=atype,
+                        content=disk_content,
+                        active=True,
+                        visibility=ArtefactVisibility.FULL,
+                        commit_message="Synced from disk (text)"
+                    )
+                    report["new_artefacts"] += 1
+                else:
+                    db_content = existing_art.get("content", "")
+                    if db_content != disk_content:
+                        self.artefacts.update(
+                            title=file_name,
+                            new_content=disk_content,
+                            new_type=atype,
+                            active=True,
+                            visibility=ArtefactVisibility.FULL,
+                            commit_message="Updated from disk (text modified)"
+                        )
+                        report["updated_artefacts"] += 1
+
+        # --- 2. DB -> WORKSPACE (Heal/Restore) ---
+        active_arts = self.artefacts.list(active_only=True)
+        for art in active_arts:
+            title = art.get("title")
+            atype = art.get("type", "document")
+
+            # Skip image placeholders or binary data stubs that don't have raw text to write
+            if atype in ("image", "data") and not art.get("content", "").strip().startswith("import"):
+                # For data files, we can't reconstruct the binary from the placeholder text
+                continue
+
+            file_path = workspace_dir / title
+            if not file_path.exists():
+                try:
+                    file_path.write_text(art.get("content", ""), encoding="utf-8")
+                    report["restored_files"] += 1
+                except Exception:
+                    pass
+
+        self.commit()
+        return report
