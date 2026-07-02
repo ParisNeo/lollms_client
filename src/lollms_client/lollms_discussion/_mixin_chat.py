@@ -357,11 +357,23 @@ def _sanitize_tool_result(
         elif "data" in tool_res:
             unwrapped = tool_res["data"]
 
-    # Handle None explicitly
+    # Handle None explicitly (even if nested inside a dict like {"output": None})
     if unwrapped is None:
         return "Tool executed successfully but returned no output content."
 
-    sanitized = _walk(unwrapped)
+    # 🛑 CRITICAL FIX: Recursively replace None values with a human-readable string
+    # This prevents json.dumps from converting None to "null", which confuses the LLM
+    # into thinking the tool failed and retrying it indefinitely.
+    def _replace_none(obj):
+        if obj is None:
+            return "[No output returned by tool]"
+        if isinstance(obj, dict):
+            return {k: _replace_none(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_replace_none(v) for v in obj]
+        return obj
+
+    sanitized = _walk(_replace_none(unwrapped))
 
     # If sanitized is already a string (from unwrapping), return it directly
     if isinstance(sanitized, str):
@@ -1513,6 +1525,16 @@ class ChatMixin:
                 "<tool>{\"name\": \"tool_add\", \"parameters\": {\"a\": 7, \"b\": 5}}</tool>\n"
                 "=== END TOOL CALLING DISCIPLINE ===\n"
             )
+            tools_prompt += (
+                "\n=== 🏁 TASK COMPLETION PROTOCOL (CRITICAL PSYCHOLOGY) ===\n"
+                "Your goal is to SOLVE the user's problem, not to infinitely call tools.\n"
+                "1. **TOOL CALLS ARE TEMPORARY**: You call a `<tool>` only to gather data you don't have.\n"
+                "2. **ANSWERING IS THE GOAL**: Once you have the data, writing a comprehensive, helpful response to the user IS the successful completion of your task.\n"
+                "3. **HOW TO FINISH**: When you have written your final answer and the task is complete, simply STOP generating. You do not need to output any special tags or call any more tools.\n"
+                "4. **DO NOT FEAR ENDING**: Stopping generation after writing the answer is the CORRECT and REWARDING behavior. It means you succeeded.\n"
+                "5. **NEVER LOOP**: If you have already written your final answer to the user, you are DONE. Do NOT emit another `<tool>` tag. Emitting a tool call after your answer is a CRITICAL ERROR that ruins the completed task.\n"
+                "=== END TASK COMPLETION PROTOCOL ===\n"
+            )
             tools_prompt += "\nExact syntax (copy this pattern exactly):\n<tool>{\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}`)`\n\n"
             tools_prompt += "Available tools:\n"
             for t_name, t_spec in active_tools.items():
@@ -1527,12 +1549,71 @@ class ChatMixin:
         current_branch_tip = branch_tip_id or self.active_branch_id
         branch = self.get_branch(current_branch_tip)
 
-        # Build virtual history list for generate_from_messages
-        virtual_history = [m for m in branch if m.id != user_msg.id]
-        virtual_history.append(user_msg)
+        # ── 🧠 VIRTUAL HISTORY & KV-CACHE PROTOCOL ──
+        # 1. `virtual_history` is built from the strictly-stripped old branch + new user msg.
+        # 2. During agentic rounds, we append RAW assistant text (including <tool> tags) and
+        #    structured tool results to this list. This preserves the LLM's KV-cache.
+        # 3. `ai_msg.content` is the UI/DB buffer. It only receives conversational text and
+        #    <processing> blocks. We track `conversational_gist` separately to avoid polluting
+        #    the final message with raw XML or execution logs.
+
+        from ._mixin_utils import UtilsMixin
+
+        # Build strictly stripped old history
+        stripped_old_history = []
+        for m in branch:
+            if m.id == user_msg.id:
+                continue
+            # Use the same strict stripping logic as export()
+            content = m.content.strip()
+            # Strip thoughts
+            content = re.sub(r'<tool_call>.*?</arg_value>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<tool_call>.*$', '', content, flags=re.DOTALL | re.IGNORECASE)
+
+            # Strip artifact/note/skill XML and replace with anchors
+            pattern = re.compile(r'<(artifact|artefact|note|skill)\b([^>]*?)>(.*?)</\1>', re.DOTALL | re.IGNORECASE)
+            def _strip_tag(match):
+                tag_name = match.group(1).lower()
+                attrs_str = match.group(2)
+                attrs = dict(re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str))
+                title = attrs.get("name") or attrs.get("title") or "artifact"
+                type_label = "note" if tag_name == "note" else ("skill" if tag_name == "skill" else attrs.get("type", "code"))
+                return f'\n[🔒SYSTEM_{tag_name.upper()}_CREATED:{title}|{type_label}]\n'
+
+            content = pattern.sub(_strip_tag, content)
+
+            # Strip processing blocks
+            if m.sender_type == 'assistant':
+                def _strip_processing(match):
+                    block_content = match.group(0)
+                    inner_arts = re.findall(r'title=["\']([^"\']*)["\'].*?type=["\']([^"\']*)["\']', block_content, re.IGNORECASE)
+                    if not inner_arts:
+                        inner_arts = re.findall(r'title=["\']([^"\']*)["\']', block_content, re.IGNORECASE)
+                        inner_arts = [(t, "document") for t in inner_arts]
+                    anchors = "\n".join(f"[🔒SYSTEM_ARTIFACT_CREATED:{t}|{ty}]" for t, ty in inner_arts)
+                    return f"\n{anchors}\n" if anchors else ""
+
+                content = re.sub(r'<processing[^>]*>.*?</processing>', _strip_processing, content, flags=re.DOTALL | re.IGNORECASE)
+                content = re.sub(r'<processing[^>]*>', '', content, flags=re.IGNORECASE).replace("</processing>", "")
+
+                # Strip log mimicry lines
+                lines = [line for line in content.splitlines() if not line.strip().startswith(("*", "✓", "🏗️", "🔧", "✅", "❌", "·ᴽЧØс·", "[BLIND_ACTION_EXECUTED]"))]
+                content = "\n".join(lines).strip()
+
+            stripped_old_history.append(SimpleNamespace(
+                sender_type=m.sender_type,
+                content=content
+            ))
+
+        virtual_history = stripped_old_history
+        virtual_history.append(SimpleNamespace(
+            sender_type="user",
+            content=user_message
+        ))
 
         tool_calls_this_turn = []
         round_count = 0
+        conversational_gist = ""  # Accumulates only the conversational text for the final DB message
 
         # Track the last executed tool to prevent immediate repetition loops (Success Loops)
         last_executed_tool_signature = None
@@ -1664,10 +1745,102 @@ class ChatMixin:
                     except Exception:
                         call_data = {}
 
+                    # ── 🛑 CRITICAL FIX: PHANTOM TOOL CALL PREVENTION ──
+                    # If the LLM emits a <tool> tag but the JSON is malformed or missing
+                    # the "name" key, we MUST NOT execute active_tools[""]. 
+                    # Instead, we inject a correction and force a continuation.
+                    if not isinstance(call_data, dict) or not call_data.get("name"):
+                        ASCIIColors.warning(f"[ChatMixin] Malformed tool call detected. JSON: {tool_call_json_str[:200]}")
+
+                        # Inject a correction into the virtual history so the LLM knows it failed
+                        correction_msg = (
+                            "=== ⚠️ TOOL CALL FORMAT ERROR ===\n"
+                            "Your last tool call was malformed or missing the 'name' field. "
+                            f"Raw received: `{tool_call_json_str[:150]}`\n"
+                            "You MUST output a valid JSON object with a 'name' key matching an available tool, "
+                            "and a 'parameters' key containing the arguments.\n"
+                            "Example: <tool>{\"name\": \"tool_wikipedia_search\", \"parameters\": {\"query\": \"Einstein\"}}</tool>\n"
+                            "Please output the corrected tool call now."
+                        )
+
+                        # 🛑 CRITICAL: Append the RAW assistant text (including the broken tag) to preserve KV-cache
+                        raw_round_text = ss.get_clean_text_so_far()
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=raw_round_text
+                        ))
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=correction_msg
+                        ))
+
+                        # Force another round to let the LLM correct itself
+                        continue
+
                     tool_name = call_data.get("name", "")
                     tool_params = call_data.get("parameters", {})
 
-                    # ── Live UI Tool Call Feedback Injection ──
+                    # ── 🛑 CRITICAL FIX: ZOMBIE TOOL CALL INTERCEPTION ──
+                    # If the LLM generates a substantial final answer (conversational gist)
+                    # and THEN emits a tool call, it is a "Zombie Call". The LLM has already
+                    # answered the user. Executing the tool again is useless and triggers
+                    # the loop guard. We must intercept and terminate the turn immediately.
+                    raw_round_text = ss.get_clean_text_so_far()
+
+                    # Isolate just this round's conversational text (before the tool tag)
+                    round_conversational_text = raw_round_text
+                    if f"<tool>{tool_call_json_str}</tool>" in round_conversational_text:
+                        round_conversational_text = round_conversational_text.split(f"<tool>{tool_call_json_str}</tool>")[0]
+                    elif tool_call_json_str in round_conversational_text:
+                        round_conversational_text = round_conversational_text.split(tool_call_json_str)[0]
+
+                    # Clean any processing blocks from the gist
+                    round_conversational_clean = re.sub(r'<processing.*?>.*?</processing>', '', round_conversational_text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+                    # If we have a substantial final answer, treat this as a zombie call
+                    if len(round_conversational_clean) > 100:
+                        ASCIIColors.warning(f"[ChatMixin] 🧟 ZOMBIE TOOL CALL INTERCEPTED. LLM generated final answer ({len(round_conversational_clean)} chars) then emitted tool '{tool_name}'. Terminating turn.")
+
+                        # 1. Accumulate the final conversational text into the gist
+                        conversational_gist += round_conversational_clean
+
+                        # 2. Strip the zombie tool tag from the UI buffer
+                        if tool_call_json_str in ai_msg.content:
+                            ai_msg.content = ai_msg.content.replace(f"<tool>{tool_call_json_str}</tool>", "")
+                            ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
+
+                        # 3. Set the final ai_msg.content to the clean gist
+                        ai_msg.content = conversational_gist.strip()
+
+                        # 4. Break the loop immediately
+                        break
+
+                    # ── 🛑 ARCHITECTURAL FIX: VIRTUAL HISTORY SEPARATION ──
+                    # 1. Append the RAW assistant text (including <tool> tag) to virtual_history.
+                    # 2. Strip the <tool> tag from the UI buffer (ai_msg.content).
+                    # 3. Accumulate conversational gist for the final DB message.
+
+                    raw_round_text = ss.get_clean_text_so_far()
+
+                    # Isolate just this round's conversational text (before the tool tag)
+                    round_conversational_text = raw_round_text
+                    if f"<tool>{tool_call_json_str}</tool>" in round_conversational_text:
+                        round_conversational_text = round_conversational_text.split(f"<tool>{tool_call_json_str}</tool>")[0]
+                    elif tool_call_json_str in round_conversational_text:
+                        round_conversational_text = round_conversational_text.split(tool_call_json_str)[0]
+
+                    # Clean any processing blocks from the conversational gist
+                    round_conversational_clean = re.sub(r'<processing.*?>.*?</processing>', '', round_conversational_text, flags=re.DOTALL | re.IGNORECASE).strip()
+                    if round_conversational_clean:
+                        conversational_gist += round_conversational_clean + "\n\n"
+
+                    # 1. Append RAW assistant text to virtual_history (preserves KV-cache)
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=raw_round_text
+                    ))
+
+                    # 2. Strip tool tag from UI buffer and open processing block
                     if tool_call_json_str in ai_msg.content:
                         ai_msg.content = ai_msg.content.replace(f"<tool>{tool_call_json_str}</tool>", "")
                         ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
@@ -1712,7 +1885,20 @@ class ChatMixin:
                         # If so, force break to prevent infinite success loops
                         if tool_calls_this_turn:
                             last_call = tool_calls_this_turn[-1]
-                            if last_call["name"] == tool_name and last_call["params"] == tool_params:
+                            # 🛑 CRITICAL FIX: Only block if the previous call SUCCEEDED with valid output
+                            # If the previous call returned null/empty output, the LLM is retrying to fix it, NOT looping
+                            last_result = last_call.get("result", {})
+                            last_output = last_result.get("output", "")
+
+                            # Check if previous output was actually valid (not empty/null)
+                            previous_had_valid_output = (
+                                last_output and 
+                                last_output != "Tool executed successfully but returned no output content." and
+                                last_output != "[No output returned by tool]" and
+                                "null" not in str(last_output).lower()[:20]
+                            )
+
+                            if last_call["name"] == tool_name and last_call["params"] == tool_params and previous_had_valid_output:
                                 # LOOP DETECTED (logging removed)
                                 tool_res = {
                                     "success": False,
@@ -2277,27 +2463,6 @@ class ChatMixin:
                         "result": {"output": clean_result_str, "success": tool_success}
                     })
 
-                    raw_round_text = ss.get_clean_text_so_far()
-                    if virtual_history:
-                        for prev_m in virtual_history:
-                            if prev_m.sender_type == "assistant":
-                                raw_round_text = raw_round_text.replace(prev_m.content, "")
-
-                    raw_round_clean = re.sub(r'<processing.*?>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE).strip()
-
-                    # 🛑 CRITICAL FIX: Ensure strict user/assistant alternation.
-                    # If the assistant text is empty (all content was inside <processing>),
-                    # use a minimal placeholder so the chat template doesn't break.
-                    # An empty "" assistant message causes llama.cpp Jinja templates to
-                    # produce no output on the next generation round.
-                    if not raw_round_clean:
-                        raw_round_clean = "[Processing complete. Awaiting tool result.]"
-
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=raw_round_clean
-                    ))
-
                     # ── 🛑 SUCCESS LOOP DETECTION & PREVENTION ─────────────────────
                     # Check if the LAST assistant message in history was a tool call to the SAME tool
                     # This prevents the LLM from getting stuck in a "success loop"
@@ -2342,7 +2507,6 @@ class ChatMixin:
                             sender_type="user",
                             content=user_part
                         ))
-                        ai_msg.content += "\n\n"
                         # 🛑 CRITICAL: Force the loop to continue so the LLM generates a final answer
                         # The tool succeeded — the LLM MUST now read the result and respond to the user.
                         continue
@@ -2360,7 +2524,6 @@ class ChatMixin:
                             sender_type="user",
                             content=user_part
                         ))
-                        ai_msg.content += "\n\n"
                         # If this was a forced break due to loop detection, ensure we exit
                         if 'force_break_after_tool' in locals() and force_break_after_tool:
                             ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
@@ -2370,6 +2533,46 @@ class ChatMixin:
                 else:
                     break
             else:
+                # ── 🛑 CRITICAL FIX: PENDING TOOL INTENT CHECK ──
+                # The LLM generated text but did NOT emit a <tool> tag (tool_trigger is False).
+                # However, the LLM may have expressed intent to call a tool ("Let me search for...")
+                # but failed to actually output the XML. We must detect this and force a continuation
+                # instead of breaking the loop and leaving the task incomplete.
+                raw_round_text = ss.get_clean_text_so_far()
+                intent_phrases = [
+                    "let me search", "let me call", "let me run", "let me query",
+                    "i'll search", "i'll call", "i'll run", "i'll query",
+                    "now let me", "i will search", "i will call",
+                    "searching for", "calling tool", "running tool",
+                    "now searching", "let's search", "let us search"
+                ]
+                has_intent = any(phrase in raw_round_text.lower() for phrase in intent_phrases)
+                has_tool_tag = "<tool>" in raw_round_text.lower()
+
+                if has_intent and not has_tool_tag and not was_cancelled and round_count < max_reasoning_steps:
+                    ASCIIColors.info(f"[ChatMixin] Detected pending tool intent without XML tag. Forcing continuation...")
+
+                    # 🛑 CRITICAL: Append RAW assistant text to virtual_history (preserves KV-cache)
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=raw_round_text
+                    ))
+
+                    # Force the LLM to output the actual tool tag now
+                    intent_correction = (
+                        "=== ⚠️ MISSING TOOL CALL ===\n"
+                        "You expressed intent to call a tool, but you did NOT output the required `<tool>` XML tag. "
+                        "To execute the action, you MUST output the tag on a new line now.\n"
+                        "Do NOT explain further. Output ONLY the `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>` block."
+                    )
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=intent_correction
+                    ))
+
+                    # Force another reasoning round
+                    continue
+
                 # ── 🔄 FORCE CONTINUATION AFTER CONTEXT UNLOCK ─────────────────
                 # If the model requested files to be loaded, force at least one more round
                 # so it can immediately use the newly available context
@@ -2383,9 +2586,12 @@ class ChatMixin:
                         f"You can now read their full content and use them. Please continue your task.]\n\n"
                     )
 
-                    # Append to AI message content (will be visible in next round's history)
-                    ai_msg.content += continuation_prompt
-                    _cb(callback, continuation_prompt, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    # 🛑 CRITICAL: Append RAW assistant text to virtual_history (preserves KV-cache)
+                    raw_round_text = ss.get_clean_text_so_far()
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=raw_round_text
+                    ))
 
                     # Add a user message to force the loop to continue
                     virtual_history.append(SimpleNamespace(
@@ -2397,6 +2603,15 @@ class ChatMixin:
                     ss.context_unlock_requested = False
                     continue  # Jump to next reasoning round immediately
 
+                # ── 🛑 FINALIZE: No tool call, no intent, no unlock. This is the final answer. ──
+                # Accumulate the final conversational text into the gist.
+                raw_round_text = ss.get_clean_text_so_far()
+                round_conversational_clean = re.sub(r'<processing.*?>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE).strip()
+                if round_conversational_clean:
+                    conversational_gist += round_conversational_clean
+
+                # Set the final ai_msg.content to the clean gist (stripped of all tool tags and processing blocks)
+                ai_msg.content = conversational_gist.strip()
                 break
 
         # ── 11. Final Post-Processing & Database Commit ──

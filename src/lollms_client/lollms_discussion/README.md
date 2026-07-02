@@ -51,29 +51,41 @@ data_workspace/
 
 The `chat()` method is not a simple API call; it is an **Agentic State Machine**. It handles pre-hydration, multi-step reasoning, tool execution, and self-healing file restoration.
 
-### Execution Workflow
+### Execution Workflow & Virtual History Protocol
+
+The `chat()` method is not a simple API call; it is an **Agentic State Machine** that orchestrates multi-step reasoning, tool execution, and context preservation. 
+
+The core architectural concept is the separation of **Old History** from **Virtual History**:
+- **Old History**: All messages up to the current user prompt. To save tokens and prevent mimicry, these are aggressively stripped of execution logs (`<processing>` blocks) and raw XML. Artifact creations are replaced with `[🔒SYSTEM_ARTIFACT_CREATED:title|type]` anchors.
+- **Virtual History**: The rounds seen as extra alternations between user and assistant during the current turn. The assistant messages contain the **raw text including `<tool>` tags**, and the user messages contain the structured `<tool_result>`. This raw preservation ensures perfect KV-cache alignment and allows the LLM to understand exactly what it already asked for.
 
 ```mermaid
 flowchart TD
-    A[Start chat] --> B[Pre-Hydration]
-    B --> C[Memory Decay & RAG Injection]
-    C --> D[Dynamic Tool Mounting]
-    D --> E[Context Assembly]
-    E --> F[Reasoning Loop]
+    Start([Start Chat]) --> Init[Init ai_msg, virtual_history = stripped old_branch + new user_msg]
+    Init --> Loop{Round < Max?}
     
-    subgraph F [Reasoning Loop Max 20 Steps]
-        direction TB
-        F1[LLM Generation] --> F2{Tool Call?}
-        F2 -- Yes --> F3[Execute Tool]
-        F3 --> F4[Sync Files to Artefacts]
-        F4 --> F5[Feedback to LLM]
-        F5 --> F1
-        F2 -- No --> F6[Final Answer]
-    end
+    Loop -- Yes --> Gen[LLM Generates via _StreamState]
+    Gen --> HasTool{ss.tool_trigger?}
     
-    F --> G[Post-Processing]
-    G --> H[Memory Saving]
-    H --> I[Commit to DB]
+    HasTool -- No --> CheckIntent{Pending Tool Intent?}
+    
+    %% Intent Check Branch
+    CheckIntent -- Yes --> InjectCorrection[Inject correction to virtual_history]
+    InjectCorrection --> Loop
+    
+    %% Finalization Branch
+    CheckIntent -- No --> Finalize[Save Gist to ai_msg, Break Loop]
+    Finalize --> End([End Chat])
+    
+    %% Tool Execution Branch
+    HasTool -- Yes --> AppendVA[Append raw text as virtual assistant msg]
+    AppendVA --> Exec[Execute Tool, Stream UI processing block]
+    Exec --> AppendVU[Append tool result as virtual user msg]
+    AppendVU --> Loop
+    
+    %% Max Rounds Branch
+    Loop -- No --> ForceFinal[Force final answer without tool calls]
+    ForceFinal --> End
 ```
 
 ### Detailed Phase Breakdown
