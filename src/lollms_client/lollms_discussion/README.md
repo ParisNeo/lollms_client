@@ -107,11 +107,11 @@ flowchart TD
         * **Run**: Executes Python function.
         * **Post-Scan**: Detects NEW files created by tool → Auto-registers as Artefacts.
     * **Feedback**: Sanitizes tool output (strips base64 blobs) and feeds back to LLM.
-4.  **Termination**: Commits DB, resets cancellation flags.
+    4.  **Termination**: Commits DB, resets cancellation flags.
 
 ### Processing Block Status Metadata
 
-When the LLM triggers a tool call or builds an artifact, the system intercepts the action and wraps it in a `<processing>` block in the live chat stream. Upon completion of the action, the system injects an HTML comment metadata tag immediately after the closing `</processing>` tag to indicate the outcome.
+When the LLM triggers a tool call, builds an artifact, or requests a context visibility change, the system intercepts the action and wraps it in a `<processing>` block in the live chat stream. Upon completion of the action, the system injects an HTML comment metadata tag immediately after the closing `</processing>` tag to indicate the outcome.
 
 This metadata is **not** meant to be read by the LLM, but rather by the **frontend rendering engine**. It allows the UI to definitively know whether an operation succeeded or failed when the block closes, enabling accurate visual styling (e.g., green for success, red for failure).
 
@@ -120,8 +120,11 @@ This metadata is **not** meant to be read by the LLM, but rather by the **fronte
     *   `<!-- status:failure -->`: The tool encountered an error, crashed, or was blocked by the loop interceptor.
 *   **Artefact Building**:
     *   `<!-- status:finished -->`: The artifact was fully received and registered in the workspace.
+*   **Context Visibility Management**:
+    *   `<!-- status:success -->`: The files were successfully locked, unlocked, or hidden.
+    *   `<!-- status:failure -->`: None of the requested files were found in the workspace.
 
-**Example Stream Output:**
+**Example Stream Output (Tool Call):**
 ```xml
 <processing type="tool" title="Tool Execution: tool_execute_sql_query">
 * Calling local tool system for 'tool_execute_sql_query'...
@@ -133,6 +136,58 @@ Output Logs:
 </processing>
 <!-- status:success -->
 ```
+
+**Example Stream Output (Context Unlock):**
+```xml
+<processing type="context_update" title="Context Visibility Manager">
+* Unlocking context files...
+Context Update:
+✅ Unlocking: data.csv, utils.py
+</processing>
+<!-- status:success -->
+```
+
+### Multi-Tier Context Visibility Management
+
+To optimize the LLM's context window budget, the system uses a tiered visibility protocol for workspace files. The LLM can dynamically promote or demote files into different visibility states using dedicated XML tags.
+
+| Visibility Tier | Symbol | Context Behavior |
+| :--- | :--- | :--- |
+| **`FULL`** | `[C]` | Fully loaded in context (verbatim text/code/schema). |
+| **`METADATA`** | `[M]` | Only signatures, schemas, and metadata are loaded. |
+| **`TREE_UNLOCKABLE`**| `[U]` | Listed in the directory tree, but excluded from context. |
+| **`TREE_LOCKED`** | `[L]` | Excluded from context and cannot be unlocked by the LLM. |
+| **`HIDDEN`** | — | Completely excluded from both the context and the directory tree. |
+
+#### LLM Control Tags
+
+The LLM can request visibility changes by outputting the following tags. The `ChatMixin` intercepts these tags, applies the visibility changes via `ArtefactManager.set_visibility()`, commits the discussion, and forces a continuation round so the LLM immediately utilizes the newly available context.
+
+1.  **Unlock (Load to `[C]`)**:
+    Used to load the full content of a file into the active context window.
+    ```xml
+    <unlock_file>
+    filename.ext
+    </unlock_file>
+    ```
+
+2.  **Lock (Demote to `[L]`)**:
+    Used to free up context space by locking a file. It remains visible in the directory tree but cannot be loaded by the LLM.
+    ```xml
+    <lock_file>
+    filename.ext
+    </lock_file>
+    ```
+
+3.  **Hide (Remove from Tree)**:
+    Used to completely remove a file from the LLM's awareness (both context and directory tree).
+    ```xml
+    <hide_file>
+    filename.ext
+    </hide_file>
+    ```
+
+Upon execution, the system replaces the raw XML tag in the LLM's message with a `<processing type="context_update">` block detailing the outcome (which files were processed, already in state, or not found) and a status meta tag.
 
 ### The `chat()` Method API
 
