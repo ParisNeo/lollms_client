@@ -127,6 +127,17 @@ class CoreMixin:
 
         object.__setattr__(self, 'artefacts', ArtefactManager(self))
 
+        # ── AUTO-INGEST & SELF-HEAL WORKSPACE ──
+        # Always run the bidirectional sync at startup.
+        # 1. If the workspace_data directory has files, they are ingested into the DB (Disk → DB).
+        # 2. If the DB has artifacts but the directory is empty/missing files, they are restored (DB → Disk).
+        # The previous condition only ran sync if the directory was non-empty, which prevented
+        # the heal pass from restoring orphaned DB artifacts when the physical files were missing.
+        try:
+            self.sync_workspace_to_artefacts()
+        except Exception as sync_ex:
+            ASCIIColors.warning(f"[CoreMixin] Auto-ingestion/heal of workspace files failed: {sync_ex}")
+
         # ── Memory system ─────────────────────────────────────────────────
         self._init_memory(memory_manager)
 
@@ -662,6 +673,31 @@ class CoreMixin:
         """
         return getattr(self, 'workspace_path', None)
 
+    def get_workspace_data_path(self) -> Optional[str]:
+        """
+        Returns the absolute path to the discussion's isolated workspace_data subfolder.
+        
+        This is the recommended CWD (Current Working Directory) for executing 
+        scripts and tools so relative paths resolve correctly.
+
+        Returns:
+            str | None: The resolved workspace_data path, or None if not configured.
+        """
+        return getattr(self, 'workspace_data_path', None)
+
+
+    def get_workspace_path(self) -> Optional[str]:
+        """
+        Returns the absolute path to the discussion's isolated workspace directory.
+
+        This method provides backward compatibility for frontend code expecting
+        a method call rather than direct attribute access.
+
+        Returns:
+            str | None: The resolved workspace path, or None if not configured.
+        """
+        return getattr(self, 'workspace_path', None)
+
     def get_active_file_path(self, file_name: str, create_if_missing: bool = True) -> Optional[str]:
         """
         Safely resolves the absolute path of a file inside the discussion's workspace_data directory.
@@ -816,19 +852,30 @@ class CoreMixin:
         for art in active_arts:
             title = art.get("title")
             atype = art.get("type", "document")
+            content = art.get("content", "")
 
-            # Skip image placeholders or binary data stubs that don't have raw text to write
-            if atype in ("image", "data") and not art.get("content", "").strip().startswith("import"):
-                # For data files, we can't reconstruct the binary from the placeholder text
+            # Skip image artifacts: we cannot reconstruct the binary file from the text placeholder.
+            # For 'data' artifacts, we skip true binaries (.db, .sqlite, .xlsx) but allow text-based ones (.csv).
+            if atype == "image":
                 continue
 
             file_path = workspace_dir / title
-            if not file_path.exists():
+            file_ext = file_path.suffix.lower()
+
+            # Determine if this is a true binary data file that we cannot reconstruct from text
+            is_true_binary = atype == "data" and file_ext in (".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet")
+            if is_true_binary:
+                continue
+
+            # For text-based artifacts (code, document, note, skill, and text-data like CSV), restore them to disk
+            # if they are missing. This heals workspaces that lost physical files.
+            if not file_path.exists() and content:
                 try:
-                    file_path.write_text(art.get("content", ""), encoding="utf-8")
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    file_path.write_text(content, encoding="utf-8")
                     report["restored_files"] += 1
-                except Exception:
-                    pass
+                except Exception as heal_ex:
+                    ASCIIColors.warning(f"[Sync] Failed to restore artifact '{title}' to disk: {heal_ex}")
 
         self.commit()
         return report
