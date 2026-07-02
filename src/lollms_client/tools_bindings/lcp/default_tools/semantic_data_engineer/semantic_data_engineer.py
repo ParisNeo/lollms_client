@@ -21,6 +21,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 TOOL_LIBRARY_NAME = "SEMANTIC_DATA_ENGINEER"
 TOOL_LIBRARY_DESC = "A highly specialized data engineering library providing safe pre-compiled data macros (filtering, aggregation, schemas, plotting, ABox conversion) without code execution."
+from lollms_client.lollms_artefact import ArtefactType
 TOOL_LIBRARY_ICON = "📊"
 
 def init_tool_library() -> None:
@@ -35,20 +36,25 @@ def init_tool_library() -> None:
     })
 
 
-def _get_workspace_dir() -> Path:
+def _get_workspace_dir(discussion_instance: Optional[Any] = None) -> Path:
     """
-    Returns the CURRENT WORKING DIRECTORY.
+    Returns the active workspace directory.
 
-    ARCHITECTURAL RULE: Tools are AGNOSTIC. They do NOT know about discussions.
-    The LCP Binding sets the CWD to the discussion-isolated workspace BEFORE execution.
-    Therefore, the tool simply operates on "." (current directory).
+    ARCHITECTURAL RULE: Tools are AGNOSTIC, but they CAN ask the discussion 
+    for its workspace path if they need it. The discussion knows its exact
+    isolated workspace_data_path.
+
+    If running standalone (no discussion), it falls back to ./data_workspace.
     """
     from ascii_colors import ASCIIColors
-    import os
 
-    workspace_dir = Path(os.getcwd()).resolve()
-    ASCIIColors.success(f"[SemanticDataEngineer] 🎯 Operating in CWD: '{workspace_dir}'")
-    return workspace_dir
+    if discussion_instance and hasattr(discussion_instance, "get_workspace_data_path"):
+        ws_path = discussion_instance.get_workspace_data_path()
+        if ws_path:
+            return Path(ws_path)
+
+    ASCIIColors.warning("[SemanticDataEngineer] No discussion instance found. Falling back to ./data_workspace")
+    return Path("./data_workspace").resolve()
 
 
 def _find_file_fuzzy(file_name: str, workspace_dir: Path) -> Optional[Path]:
@@ -227,8 +233,8 @@ def tool_get_table_schema(
         discussion_instance (Any, optional): Active discussion session instance. Defaults to None.
         lollms_client_instance (Any, optional): Active client instance. Defaults to None.
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
 
     # 🛡️ FUZZY FILE RESOLUTION
     file_path = _find_file_fuzzy(file_name, workspace_dir)
@@ -281,7 +287,9 @@ def tool_filter_and_slice_data(
     columns_to_keep: Optional[List[str]] = None,
     limit: int = 50,
     save_as_new_artifact: bool = False,
-    output_artifact_title: Optional[str] = None
+    output_artifact_title: Optional[str] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Filters and slices a dataset without writing Python code, optionally saving the output as a new version or artifact.
@@ -298,8 +306,8 @@ def tool_filter_and_slice_data(
         output_artifact_title (str, optional): Title of the new artifact if save_as_new_artifact is True.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
 
     # 🛡️ FUZZY FILE RESOLUTION
     file_path = _find_file_fuzzy(file_name, workspace_dir)
@@ -367,7 +375,7 @@ def tool_filter_and_slice_data(
             
             art = discussion_instance.artefacts.add(
                 title=out_title,
-                artefact_type=ArtefactType.DATA,
+                artefact_type="data",
                 content=new_schema,
                 file_ext=ext,
                 active=True,
@@ -398,7 +406,9 @@ def tool_get_unique_values(
     file_name: str,
     column_name: str,
     table_name: Optional[str] = None,
-    limit: int = 100
+    limit: int = 100,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Returns unique elements and category frequency counts from a column.
@@ -409,8 +419,8 @@ def tool_get_unique_values(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
         limit (integer, optional): Maximum unique items to list. Defaults to 100.
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -449,7 +459,9 @@ def tool_compute_column_aggregations(
     metric_column: str,
     group_by_column: Optional[str] = None,
     table_name: Optional[str] = None,
-    operation: str = "mean"
+    operation: str = "mean",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Computes mathematical aggregations on a numerical column (sum, mean, min, max, count), optionally grouping by another column.
@@ -461,8 +473,9 @@ def tool_compute_column_aggregations(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
         operation (str, optional): Aggregation operation: 'sum', 'mean', 'min', 'max', 'count'. Defaults to 'mean'.
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    import pandas as pd
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -520,7 +533,9 @@ def tool_compute_column_aggregations(
 
 def tool_query_database_sql(
     file_name: str,
-    sql_query: str
+    sql_query: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     PRIMARY DATA RETRIEVAL TOOL: Executes standard SQL queries directly against SQLite database files or local CSV/Excel table models.
@@ -534,8 +549,8 @@ def tool_query_database_sql(
         sql_query (str): Valid SQLite standard SQL query to execute (SELECT, JOIN, GROUP BY, etc.).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -605,7 +620,9 @@ def tool_update_cell_value(
     row_match_column: str = "",
     row_match_value: str = "",
     column_to_update: str = "",
-    new_value: str = ""
+    new_value: str = "",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Surgically updates a cell value in a spreadsheet or database row without code execution.
@@ -619,8 +636,8 @@ def tool_update_cell_value(
         new_value (str): The new value to set.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -687,7 +704,9 @@ def tool_update_cell_value(
 def tool_insert_new_row(
     file_name: str,
     row_data: Dict[str, Any],
-    table_name: Optional[str] = None
+    table_name: Optional[str] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Inserts a new row/record into a spreadsheet or SQLite table.
@@ -698,8 +717,8 @@ def tool_insert_new_row(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -758,7 +777,9 @@ def tool_delete_rows_by_criteria(
     file_name: str,
     match_column: str,
     match_value: str,
-    table_name: Optional[str] = None
+    table_name: Optional[str] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Deletes all rows matching a specific column value.
@@ -769,8 +790,8 @@ def tool_delete_rows_by_criteria(
         match_value (str): Value to match in that column.
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -832,8 +853,8 @@ def tool_query_database_sql(
         sql_query (str): Valid SQLite standard SQL query to execute.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -946,7 +967,9 @@ def tool_generate_advanced_visualization(
     title: Optional[str] = None,
     x_label: Optional[str] = None,
     y_label: Optional[str] = None,
-    colors: Optional[List[str]] = None
+    colors: Optional[List[str]] = None,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Generates advanced multi-series charts (multi-line, stacked bar, scatter, pie) in high-quality dark mode.
@@ -968,8 +991,8 @@ def tool_generate_advanced_visualization(
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -1097,7 +1120,9 @@ def tool_compute_statistics_and_plot(
     x_column: Optional[str] = None,
     y_column: Optional[str] = None,
     title: Optional[str] = None,
-    color: str = "#4f46e5"
+    color: str = "#4f46e5",
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Computes numerical statistics (mean, variance, standard deviation, null counts)
@@ -1118,8 +1143,8 @@ def tool_compute_statistics_and_plot(
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -1223,7 +1248,9 @@ def tool_compute_statistics_and_plot(
 # ── 6. BOOTSTRAP TBOX MACRO ─────────────────────────────────────────────────
 
 def tool_bootstrap_tbox_from_database(
-    file_name: str
+    file_name: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Scans a database file (SQLite, Excel, CSV) and bootstraps a clean ontological schema (TBox).
@@ -1233,8 +1260,8 @@ def tool_bootstrap_tbox_from_database(
         file_name (str): The filename of the DB, CSV, or Excel file in the workspace.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -1308,7 +1335,9 @@ def tool_bootstrap_tbox_from_database(
 
 def tool_convert_to_abox(
     file_name: str,
-    tbox_file_name: str
+    tbox_file_name: str,
+    discussion_instance: Optional[Any] = None,
+    lollms_client_instance: Optional[Any] = None
 ) -> dict:
     """
     Reads a database, parses rows based on a TBox schema, and compiles them into
@@ -1319,8 +1348,8 @@ def tool_convert_to_abox(
         tbox_file_name (str): Filename of the TBox schema file (bootstrapped or custom).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use CWD (set by LCP Binding)
-    workspace_dir = _get_workspace_dir()
+    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
+    workspace_dir = _get_workspace_dir(discussion_instance)
     db_file_path = (workspace_dir / file_name).resolve()
     tbox_path = (workspace_dir / tbox_file_name).resolve()
 
