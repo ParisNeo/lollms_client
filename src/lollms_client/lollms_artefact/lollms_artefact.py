@@ -392,13 +392,18 @@ class ArtefactManager:
                 except Exception as e:
                     trace_exception(e)
 
-            if not wrote_physical and isinstance(content, str) and atype not in (ArtefactType.IMAGE, ArtefactType.DATA):
-                try:
-                    primary_path.write_text(content, encoding="utf-8", errors="ignore")
-                    versioned_path.write_text(content, encoding="utf-8", errors="ignore")
-                    wrote_physical = True
-                except Exception as e:
-                    trace_exception(e)
+            # Fallback: If no physical bytes were written, attempt to write the string content.
+            # For text-based data files (like .csv, .tsv), the 'content' field holds the raw text
+            # and should be written to disk if physical_data is missing.
+            if not wrote_physical and isinstance(content, str) and content:
+                # Skip true binary types (images) to prevent writing base64/placeholder text as a file
+                if atype != ArtefactType.IMAGE:
+                    try:
+                        primary_path.write_text(content, encoding="utf-8", errors="ignore")
+                        versioned_path.write_text(content, encoding="utf-8", errors="ignore")
+                        wrote_physical = True
+                    except Exception as e:
+                        trace_exception(e)
 
             if logical_content:
                 try:
@@ -516,9 +521,15 @@ class ArtefactManager:
         artefacts.append(new_artefact)
         self._save_all(artefacts)
 
+        # 🛑 CRITICAL FIX: Pass physical_data directly.
+        # The previous code referenced `final_physical_data` — a variable that was never
+        # defined in this scope — causing silent sync failures and potential NameError.
+        # For text-based artifacts (code, document, note, skill) where physical_data is None,
+        # the _sync_to_disk_workspace method handles writing the string content to disk.
+        # For data/image artifacts, physical_data contains the raw bytes to write.
         self._sync_to_disk_workspace(
             title, content, version, artefact_type, language, extra_data.get("file_ext"),
-            physical_data=final_physical_data if 'final_physical_data' in locals() else physical_data,
+            physical_data=physical_data,
             logical_content=logical_content
         )
         return new_artefact
@@ -932,24 +943,8 @@ class ArtefactManager:
         return self.squash_versions(title, keep_last_n=keep_count)
 
     def remove(self, title: str, version: Optional[int] = None) -> int:
-        self._cleanup_data_artefact_files(title, version)
-        art = self.get(title, version)
-        if art:
-            try:
-                workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-                try:
-                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-                    if awd is not None:
-                        workspace_dir = awd
-                except ImportError:
-                    pass
-                del_filename = self._get_filename_with_ext(title, art.get('type'), art.get('language'), art.get('file_ext'))
-                del_path = workspace_dir / self._discussion.id / del_filename
-                if del_path.exists():
-                    del_path.unlink()
-            except Exception as e:
-                ASCIIColors.warning(f"Failed to delete working file: {e}")
-
+        self._cleanup_artefact_files(title, version)
+        
         artefacts = self._get_all_raw()
         initial = len(artefacts)
         if version is None:
@@ -960,6 +955,77 @@ class ArtefactManager:
         if removed:
             self._save_all(artefacts)
         return removed
+
+    def _cleanup_artefact_files(self, title: str, version: Optional[int] = None):
+        """
+        Securely purges all physical and logical twins of an artefact from disk.
+        Removes the active file in workspace_data, the versioned physical twin,
+        and the versioned .lam logical twin from artefacts_metadata.
+        """
+        try:
+            if getattr(self._discussion, "workspace_data_path", None):
+                ws_data_dir = Path(self._discussion.workspace_data_path)
+                meta_dir = Path(self._discussion.artefacts_metadata_path)
+            else:
+                base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+                disc_id = self._discussion.id
+                disc_ws_dir = base_workspace_dir / disc_id
+                ws_data_dir = disc_ws_dir / "workspace_data"
+                meta_dir = disc_ws_dir / "artefacts_metadata"
+
+            if not ws_data_dir.exists():
+                return
+
+            # 1. Delete the active workspace file
+            arts = self._get_all_raw()
+            target_arts = [a for a in arts if a.get('title') == title and (version is None or a.get('version') == version)]
+            
+            for art in target_arts:
+                clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
+                filename = self._get_filename_with_ext(clean_title, art.get('type'), art.get('language'), art.get('file_ext'))
+                
+                active_path = ws_data_dir / filename
+                if active_path.exists():
+                    try:
+                        active_path.unlink()
+                    except Exception:
+                        pass
+
+                # 2. Delete the versioned physical twin and .lam logical twin
+                name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
+                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_title))
+                art_meta_dir = meta_dir / art_id
+                
+                if art_meta_dir.exists():
+                    versioned_phys = art_meta_dir / f"{name_part}_v{art.get('version', 1)}{ext_part}"
+                    if versioned_phys.exists():
+                        try:
+                            versioned_phys.unlink()
+                        except Exception:
+                            pass
+                        
+                    versioned_lam = art_meta_dir / f"{name_part}.lam"
+                    if versioned_lam.exists():
+                        try:
+                            versioned_lam.unlink()
+                        except Exception:
+                            pass
+
+            # 3. If removing all versions, delete the metadata directory itself
+            if version is None:
+                clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
+                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_title))
+                art_meta_dir = meta_dir / art_id
+                if art_meta_dir.exists():
+                    try:
+                        # Remove the directory and any remaining contents
+                        import shutil
+                        shutil.rmtree(str(art_meta_dir))
+                    except Exception:
+                        pass
+                        
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to cleanup artifact files for '{title}': {e}")
 
     def _cleanup_data_artefact_files(self, title: str, version: Optional[int] = None):
         try:
