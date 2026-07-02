@@ -128,7 +128,8 @@ class OpenAIBinding(LollmsLLMBinding):
         allowed_params = {
             "model", "messages", "temperature", "top_p", "n",
             "stop", "max_tokens", "presence_penalty", "frequency_penalty",
-            "logit_bias", "stream", "user", "max_completion_tokens"
+            "logit_bias", "stream", "user", "max_completion_tokens",
+            "reasoning_effort"
         }
 
         params = {
@@ -262,10 +263,13 @@ class OpenAIBinding(LollmsLLMBinding):
                         )["enable_thinking"] = True
                     else:
                         # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
-                        params["reasoning"] = {
-                            "effort": reasoning_effort or "low",
-                            "summary": reasoning_summary or "auto"
-                        }
+                        # Chat Completions uses flat reasoning_effort, not the
+                        # nested `reasoning` dict (that is Responses API only).
+                        params["reasoning_effort"] = reasoning_effort or "low"
+                        # Some providers extend the API with a summary field;
+                        # pass it via extra_body so the SDK doesn't reject it.
+                        if reasoning_summary and reasoning_summary != "auto":
+                            params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
                         # These models reject temperature / top_p
                         params.pop("temperature", None)
                         params.pop("top_p", None)
@@ -290,7 +294,7 @@ class OpenAIBinding(LollmsLLMBinding):
 
                     params.pop("top_p", None)
                     params.pop("frequency_penalty", None)
-                    params.pop("reasoning", None)
+                    params.pop("reasoning_effort", None)
 
                     if not think:
                         params["temperature"] = 1
@@ -511,10 +515,13 @@ class OpenAIBinding(LollmsLLMBinding):
                 )["enable_thinking"] = True
             else:
                 # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
-                params["reasoning"] = {
-                    "effort": reasoning_effort or "low",
-                    "summary": reasoning_summary or "auto",
-                }
+                # Chat Completions uses flat reasoning_effort, not the
+                # nested `reasoning` dict (that is Responses API only).
+                params["reasoning_effort"] = reasoning_effort or "low"
+                # Some providers extend the API with a summary field;
+                # pass it via extra_body so the SDK doesn't reject it.
+                if reasoning_summary and reasoning_summary != "auto":
+                    params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
                 # These models reject temperature / top_p
                 params.pop("temperature", None)
                 params.pop("top_p", None)
@@ -542,7 +549,7 @@ class OpenAIBinding(LollmsLLMBinding):
                 params.pop("top_p", None)
                 params.pop("frequency_penalty", None)
                 params.pop("presence_penalty", None)
-                params.pop("reasoning", None)
+                params.pop("reasoning_effort", None)
 
                 if not think:
                     params["temperature"] = 1
