@@ -28,6 +28,7 @@ def tool_execute_sql_query(
     """
     sql_query = str(sql_query).strip()
 
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator.
     # Auto-detect file if not specified
     if not file_name:
         db_files = list(Path(".").glob("*.db")) + list(Path(".").glob("*.sqlite")) + list(Path(".").glob("*.csv"))
