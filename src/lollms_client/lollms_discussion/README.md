@@ -714,7 +714,57 @@ async def submit_form(disc_id: str, form_id: str, answers: dict):
 
 ---
 
-## 🛡️ 9. Security & Integrity Rules
+### 🔄 9.1 Tool Failure Visibility & Anti-Loop Protocol
+
+A critical architectural requirement is that the LLM **must always see the error details** when a tool fails, and the system **must never mask a failure as a success**. If the LLM cannot see why a tool failed, it will blindly retry the same call indefinitely, causing an infinite agentic loop.
+
+#### The Three-Pronged Fix
+
+The agentic loop in `ChatMixin` implements a three-pronged defense against infinite tool-retry loops:
+
+1.  **Raw Dict Failure Detection (`is_failure`)**:
+    The system checks the raw `tool_res` dictionary for `success: False` or a non-200 `status_code` **before** looking at the sanitized string. This prevents `prompt_injection` text (which may not contain the word "Error") from masking a failure.
+    ```python
+    is_failure = (
+        (isinstance(tool_res, dict) and tool_res.get("success") is False) or
+        (isinstance(tool_res, dict) and tool_res.get("status_code", 200) != 200) or
+        "crashed" in status_done_line.lower() or
+        (isinstance(tool_res, dict) and tool_res.get("error") and not tool_res.get("success", True))
+    )
+    ```
+
+2.  **Error-Aware Sanitization (`_sanitize_tool_result`)**:
+    When a tool returns a `prompt_injection` key alongside `success: False`, the sanitizer now includes the actual `error` message in the text fed back to the LLM. Previously, only the injection text was returned, hiding the root cause.
+    ```python
+    if not success and isinstance(tool_res, dict):
+        error_msg = tool_res.get("error", "")
+        # ...
+        return f"{success_status}\nError: {error_msg}\n{pinj}"
+    ```
+
+3.  **Virtual History Feedback**:
+    When a tool fails, the result injected into `virtual_history` is explicitly labeled as a failure with actionable guidance:
+    ```python
+    user_part = (
+        f'<tool_result name="{tool_name}">\n'
+        f"{clean_result_str}\n"
+        f"</tool_result>\n\n"
+        f"⚠️ **Tool Execution Failed.**\n"
+        f"The tool '{tool_name}' encountered an error. Please politely inform the user..."
+    )
+    ```
+
+#### FailureMemory Loop Guard
+
+In addition to visibility, the system maintains a `FailureMemory` instance per `chat()` turn. This is a **signature-based loop interceptor**.
+
+*   **Signature**: `f"{tool_name}::{json.dumps(tool_params, sort_keys=True)}"`
+*   **First Failure**: The signature is recorded in `FailureMemory._signatures`. The error result is fed back to the LLM, and the loop **continues** to allow the LLM to correct itself.
+*   **Second Identical Call**: Before executing a tool, the system checks if the signature already exists in `_signatures`. If it does, execution is **blocked**, a "Loop Intercepted" error is returned, and the agentic loop **breaks**.
+
+This ensures the LLM gets exactly one chance to retry a failed tool with modified parameters before the system forcefully terminates the loop to prevent token waste.
+
+### 🛡️ 9. Security & Integrity Rules
 
 1.  **Path Sovereignty**: Tools **cannot** access files outside `data_workspace/discussions/{id}/`. The CWD switch enforces this at the OS level.
 2.  **No Blind Edits**: The Aider patch engine requires verbatim `SEARCH` blocks. It uses 6-pass fuzzy matching (Exact → Whitespace → Indent → Comments → Blanks → Core Delta) to ensure safe edits.
@@ -729,28 +779,46 @@ Place a Python file in `tools_bindings/lcp/default_tools/`:
 
 ```python
 # my_tool.py
-def tool_analyze_my_data(file_name: str, discussion_instance=None) -> dict:
-    """Analyzes a file and logs to memory."""
-    # File is available at simple relative path due to CWD switch
-    path = Path(file_name) 
+def tool_analyze_my_data(file_name: str) -> dict:
+    """
+    Analyzes a file and logs to memory.
+    
+    Args:
+        file_name (str): The name of the file to analyze.
+    """
+    # File is available at a simple relative path due to the CWD switch
+    # performed by the LCP Binding/ChatMixin before execution.
+    from pathlib import Path
+    path = Path(file_name)
+    
     if not path.exists():
-        return {"error": "File missing"}
+        return {"success": False, "error": f"File '{file_name}' not found."}
     
     # Do work...
     
-    # Auto-sync result as artifact
-    if discussion_instance:
-        discussion_instance.artefacts.add(
-            title="result", 
-            artefact_type="document", 
-            content="Analysis complete..."
-        )
+    # Tools MUST NOT accept discussion_instance or lollms_client_instance.
+    # They must NOT directly manipulate the database or commit artifacts.
+    # Simply return the result. The orchestrator will detect any new files
+    # created in the CWD and automatically register them as artifacts.
         
-    return {"success": True, "prompt_injection": "Analysis done. Tell the user the result."}
+    return {
+        "success": True, 
+        "output": "Analysis complete.",
+        "prompt_injection": "Analysis done. Tell the user the result."
+    }
 ```
+
+### 🛑 CRITICAL: LCP Tool Agnosticism Doctrine
+
+**LCP tools are strictly agnostic to Lollms.** They must **NEVER** accept `discussion_instance`, `lollms_client_instance`, or any internal Lollms state object as input parameters. 
+
+1.  **Agnostic Signatures**: Tools must operate purely on parameters that an LLM can naturally generate (strings, numbers, lists). The LCP AST parser filters out internal parameters, but tools must not rely on them for workspace resolution or artifact registration.
+2.  **CWD Reliance**: The ChatMixin orchestrator is responsible for setting the CWD to the isolated workspace before execution. Tools should resolve files using simple relative paths (e.g., `Path(file_name)`).
+3.  **Output-Only Communication**: Tools communicate results back by returning a dictionary. They must never attempt to directly manipulate the discussion database, commit artifacts, or access the client. The orchestrator detects new/modified files after execution and syncs them.
 
 The LCP Binding will automatically:
 1.  Parse the function signature via AST.
 2.  Register it as a callable tool.
 3.  Set CWD to the discussion workspace before execution.
 4.  Sync any new files created back to the artefact system.
+5.  **Track Errors**: Capture full tracebacks for both explicit tool failures and unexpected crashes, returning them in the result dictionary.
