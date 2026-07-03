@@ -353,10 +353,6 @@ class LCPBinding(LollmsToolBinding):
         ASCIIColors.cyan(f"  • kwargs keys: {list(kwargs.keys())}")
         ASCIIColors.cyan("="*80 + "\n")
 
-        # Recover discussion_instance and lollms_client_instance if passed inside the params dictionary by the closure
-        discussion_instance = discussion_instance or params.get("discussion_instance") or params.get("discussion")
-        lollms_client_instance = kwargs.get("lollms_client_instance") or params.get("lollms_client_instance") or params.get("client")
-
         tool_def = next((t for t in self.discovered_tools if t.get("name") == tool_name), None)
         if not tool_def:
             return {"error": f"Tool '{tool_name}' not found.", "status_code": 404}
@@ -456,19 +452,6 @@ class LCPBinding(LollmsToolBinding):
                 for k, v in params.items():
                     if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                         clean_params[k] = v
-                    elif k in ("discussion_instance", "lollms_client_instance", "discussion", "client"):
-                        continue
-
-                # Inject orchestrator context parameters if explicitly requested by the tool signature
-                if "discussion_instance" in sig.parameters and "discussion_instance" not in clean_params:
-                    clean_params["discussion_instance"] = discussion_instance
-                elif "discussion" in sig.parameters and "discussion" not in clean_params:
-                    clean_params["discussion"] = discussion_instance
-
-                if "lollms_client_instance" in sig.parameters and "lollms_client_instance" not in clean_params:
-                    clean_params["lollms_client_instance"] = lollms_client_instance
-                elif "client" in sig.parameters and "client" not in clean_params:
-                    clean_params["client"] = lollms_client_instance
 
                 result = execute_function(**clean_params)
             finally:
