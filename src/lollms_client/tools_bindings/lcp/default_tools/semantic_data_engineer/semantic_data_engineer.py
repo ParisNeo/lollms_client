@@ -178,37 +178,28 @@ def _save_data_source(df: Any, file_path: Path, table_name: str) -> None:
 # ── 1. SCHEMA DETECTOR MACRO ────────────────────────────────────────────────
 
 def tool_get_table_schema(
-    file_name: str,
+    file_path: str,
     table_name: Optional[str] = None
 ) -> dict:
     """
     Retrieves the exact column names, data types, row counts, and null counts of a dataset.
 
     Args:
-        file_name (str): Filename of the target CSV, Excel, or SQLite file in the workspace.
+        file_path (str): File relative path of the target CSV, Excel, or SQLite file in the workspace.
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
-    workspace_dir = Path(".")
-
-    # 🛡️ FUZZY FILE RESOLUTION
-    file_path = _find_file_fuzzy(file_name, workspace_dir)
-
-    if not file_path:
-        # 🛑 BREAK LOOP: List available files to help LLM correct itself
+    file_path = Path(file_path)
+    if not file_path.is_file():
+        workspace_dir = Path(".")
         available_files = [f.name for f in workspace_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
-        if versions_dir := (workspace_dir / "versions"):
-            if versions_dir.exists():
-                available_files.extend([f"versions/{f.name}" for f in versions_dir.iterdir() if f.is_file()])
-
         return {
             "success": False, 
-            "error": f"File '{file_name}' not found.",
-            "prompt_injection": f"\n\n⚠️ **File Not Found.**\nI looked for '{file_name}' but it doesn't exist in the workspace.\n\n**Available Files:**\n{', '.join(available_files[:10])}\n\n**Action:** Check the artifact title or file extension. Did you mean one of the files above?"
+            "error": f"File '{file_path}' not found.",
+            "prompt_injection": f"\n\n⚠️ **File Not Found.**\nI looked for '{file_path}' but it doesn't exist in the workspace.\n\n**Available Files:**\n{', '.join(available_files[:10])}\n\n**Action:** Check the artifact title or file extension. Did you mean one of the files above?"
         }
 
     try:
-        df, resolved_table = _load_data_source(file_path, table_name, discussion_instance)
+        df, resolved_table = _load_data_source(file_path, table_name)
 
         schema = {}
         for col in df.columns:
@@ -275,7 +266,7 @@ def tool_filter_and_slice_data(
 
     try:
         df, resolved_table = _load_data_source(file_path, table_name)
-        
+
         # Apply columns slice
         if columns_to_keep:
             valid_cols = [c for c in columns_to_keep if c in df.columns]
@@ -320,7 +311,7 @@ def tool_filter_and_slice_data(
             out_filename = f"{out_title}{ext}"
             out_path = workspace_dir / out_filename
 
-            _save_data_source(df, out_path, resolved_table)
+            _save_data_source(df, out_path, out_title)
 
             # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects new file.
             return {
