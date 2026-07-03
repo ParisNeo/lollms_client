@@ -2045,7 +2045,7 @@ class ArtefactManager:
             raise FileNotFoundError(f"File not found: {file_path}")
 
         if title is None:
-            title = path.stem
+            title = path.name
 
         ext = path.suffix.lower()
 
