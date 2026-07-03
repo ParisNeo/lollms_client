@@ -337,7 +337,19 @@ def _sanitize_tool_result(
         inner = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
         if isinstance(inner, dict):
             success = inner.get("success", True)
-        success_status = "✓ Success" if success else "⚠ Partial Success"
+        # 🛑 CRITICAL FIX: Also check the top-level tool_res for success=False
+        if isinstance(tool_res, dict) and tool_res.get("success") is False:
+            success = False
+        success_status = "✓ Success" if success else "⚠ Tool Failed"
+        # 🛑 CRITICAL FIX: Include the error message when the tool failed, so the LLM
+        # sees WHY it failed and doesn't retry blindly.
+        error_msg = ""
+        if not success and isinstance(tool_res, dict):
+            error_msg = tool_res.get("error", "")
+            if not error_msg and isinstance(inner, dict):
+                error_msg = inner.get("error", "")
+        if error_msg:
+            return f"{success_status}\nError: {error_msg}\n{pinj}"
         return f"{success_status}\n{pinj}"
 
     # 🛑 CRITICAL FIX: Unwrap the tool result to get the actual content
@@ -1305,10 +1317,17 @@ class ChatMixin:
         object.__setattr__(self, "_affected_artefacts_this_turn", [])
 
         # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
-        if not hasattr(self, "_failure_memory") or not self._failure_memory:
-            object.__setattr__(self, "_failure_memory", FailureMemory())
+        # 🛑 CRITICAL FIX: Ensure FailureMemory is always fresh and empty at the start of every chat() turn.
+        # We force re-instantiation if it doesn't exist or if it's missing the _signatures set.
+        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
+            fm = FailureMemory()
+            if not hasattr(fm, "_signatures"):
+                object.__setattr__(fm, "_signatures", set())
+            object.__setattr__(self, "_failure_memory", fm)
         else:
             self._failure_memory.failures = []
+            self._failure_memory._signatures.clear()
+            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
 
         # Reset cancellation flag at the start of each chat turn
         self.reset_cancel_state()
@@ -1477,20 +1496,9 @@ class ChatMixin:
         # If enable_data_tools is True (or not explicitly disabled) AND data files exist in workspace
         enable_data_tools = kwargs.get("enable_data_tools", True)
 
-        # Check workspace for data files FIRST (before checking if LCP binding exists)
+        # Check workspace for data files using the discussion's resolved workspace_data_path
         from pathlib import Path
-        workspace_dir = Path("./data_workspace")
-        try:
-            from lollms_client.app.server import APP_WORKSPACE_DIR
-            if APP_WORKSPACE_DIR is not None:
-                workspace_dir = APP_WORKSPACE_DIR
-        except ImportError:
-            pass
-
-        # Check discussion-specific workspace first
-        disc_ws = workspace_dir / "discussions" / self.id
-        if disc_ws.exists():
-            workspace_dir = disc_ws
+        workspace_dir = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else Path("./data_workspace")
 
         data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
         has_data_files = any(f.suffix.lower() in data_extensions for f in workspace_dir.rglob("*") if f.is_file())
@@ -1637,11 +1645,22 @@ class ChatMixin:
         round_count = 0
         conversational_gist = ""  # Accumulates only the conversational text for the final DB message
 
-        # Track the last executed tool to prevent immediate repetition loops (Success Loops)
-        last_executed_tool_signature = None
+        # Track the count of exact tool call signatures to prevent infinite loops (Success Loops)
+        # We allow up to 2 identical calls per turn to permit legitimate retries after null/empty output.
+        tool_signature_counts = {}
 
-        if not hasattr(self, "_failure_memory") or not self._failure_memory:
-            object.__setattr__(self, "_failure_memory", FailureMemory())
+        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
+        # 🛑 CRITICAL FIX: Ensure FailureMemory is always fresh and empty at the start of every chat() turn.
+        # We force re-instantiation if it doesn't exist or if it's missing the _signatures set.
+        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
+            fm = FailureMemory()
+            if not hasattr(fm, "_signatures"):
+                object.__setattr__(fm, "_signatures", set())
+            object.__setattr__(self, "_failure_memory", fm)
+        else:
+            self._failure_memory.failures = []
+            self._failure_memory._signatures.clear()
+            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
 
         # Initialize the single, clean database assistant message ONCE before entering the loop
         ai_msg = self.add_message(
@@ -1833,9 +1852,24 @@ class ChatMixin:
                     # ── REFLEXIVE LOOP DETECTION (FailureMemory) ──
                     failure_memory = getattr(self, "_failure_memory", None)
 
-                    if failure_memory and failure_memory.has_previous_failure(tool_name, tool_params):
-                        # Intercepted repetitive execution loop (logging removed)
+                    try:
+                        param_signature = json.dumps(tool_params, sort_keys=True, default=str)
+                    except Exception:
+                        param_signature = str(tool_params)
+                    full_signature = f"{tool_name}::{param_signature}"
 
+                    # 🛑 INSTRUMENTATION: Log the state of the signatures set
+                    if failure_memory and hasattr(failure_memory, "_signatures"):
+                        ASCIIColors.warning(f"[LoopTrace] Checking signature: {full_signature}. Current signatures: {failure_memory._signatures}")
+                    else:
+                        ASCIIColors.warning(f"[LoopTrace] FailureMemory or _signatures missing.")
+
+                    has_prev_failure = (
+                        hasattr(failure_memory, "_signatures") and full_signature in failure_memory._signatures
+                    ) if failure_memory else False
+
+                    if has_prev_failure:
+                        # Intercepted repetitive execution loop (exact same call)
                         if self.is_generation_cancelled():
                             was_cancelled = True
                             break
@@ -1855,36 +1889,20 @@ class ChatMixin:
                     # Execute the tool sequentially
                     try:
                         # ── 🛑 REPETITIVE SUCCESS LOOP GUARD ────────────────────────
-                        # Check if we just executed this exact tool in the previous round
-                        # If so, force break to prevent infinite success loops
-                        if tool_calls_this_turn:
-                            last_call = tool_calls_this_turn[-1]
-                            # 🛑 CRITICAL FIX: Only block if the previous call SUCCEEDED with valid output
-                            # If the previous call returned null/empty output, the LLM is retrying to fix it, NOT looping
-                            last_result = last_call.get("result", {})
-                            last_output = last_result.get("output", "")
+                        # Check if we have executed this EXACT tool signature more than 2 times in this turn.
+                        # We allow up to 2 identical calls to permit legitimate retries after null/empty output.
+                        # If it exceeds 2, we force break to prevent infinite success loops.
+                        tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
+                        force_break_after_tool = False
 
-                            # Check if previous output was actually valid (not empty/null)
-                            previous_had_valid_output = (
-                                last_output and 
-                                last_output != "Tool executed successfully but returned no output content." and
-                                last_output != "[No output returned by tool]" and
-                                "null" not in str(last_output).lower()[:20]
-                            )
-
-                            if last_call["name"] == tool_name and last_call["params"] == tool_params and previous_had_valid_output:
-                                # LOOP DETECTED (logging removed)
-                                tool_res = {
-                                    "success": False,
-                                    "error": f"Repetitive tool call detected. You already called '{tool_name}' with these parameters in the previous turn. The output was already provided to you. Do not call it again.",
-                                    "prompt_injection": f"\n\n🛑 **STOP.** You are calling '{tool_name}' again with the exact same parameters. This is a loop. The data from the previous execution is already in your context. Analyze it and move on."
-                                }
-                                # Force break after this fake failure
-                                force_break_after_tool = True
-                            else:
-                                force_break_after_tool = False
-                        else:
-                            force_break_after_tool = False
+                        if tool_signature_counts[full_signature] > 2:
+                            ASCIIColors.warning(f"[ChatMixin] Repetitive success loop detected for '{tool_name}'. Count: {tool_signature_counts[full_signature]}")
+                            tool_res = {
+                                "success": False,
+                                "error": f"Repetitive tool call detected. You have called '{tool_name}' with these exact parameters {tool_signature_counts[full_signature]} times. The output is already in your context. Do not call it again.",
+                                "prompt_injection": f"\n\n🛑 **STOP.** You are calling '{tool_name}' again with the exact same parameters. This is a loop. The data from the previous execution is already in your context. Analyze it and move on."
+                            }
+                            force_break_after_tool = True
 
                         if force_break_after_tool:
                             # Use the fake error result prepared above
@@ -2333,20 +2351,22 @@ class ChatMixin:
                                 # No CWD restoration needed - ChatMixin never changed it
                                 # LCP Binding handles its own CWD cleanup internally
                                 pass
-                        elif hasattr(self.lollmsClient, "tools") and self.lollmsClient.tools is not None:
-                            tool_res = self.lollmsClient.tools.execute_tool(
-                                tool_name, 
-                                tool_params, 
-                                lollms_client_instance=self.lollmsClient, 
-                                discussion_instance=self,
-                                discussion=self
-                            )
+                        # 🛑 CRITICAL FIX: If the tool is registered via LCP schema (no "callable" key),
+                        # defer to the LCP binding's unified execute_tool() method.
+                        elif hasattr(self.lollmsClient, "tools") and self.lollmsClient.tools is not None and tool_name in active_tools:
+                           tool_res = self.lollmsClient.tools.execute_tool(
+                               tool_name, 
+                               tool_params, 
+                               lollms_client_instance=self.lollmsClient, 
+                               discussion_instance=self,
+                               discussion=self
+                           )
                         else:
-                            tool_res = {
-                                "success": False,
-                                "error": f"Tool '{tool_name}' has no callable and no LCP tools binding is available on the client.",
-                                "status_code": 404
-                            }
+                           tool_res = {
+                               "success": False,
+                               "error": f"Tool '{tool_name}' has no callable and no LCP tools binding is available on the client.",
+                               "status_code": 404
+                           }
 
                         if isinstance(tool_res, dict):
                             # 🛑 CRITICAL FIX: Detect failure from LCP binding (status_code 404 or explicit error key)
@@ -2356,23 +2376,35 @@ class ChatMixin:
 
                             if not tool_res.get("success", True) or is_lcp_error or has_error_key:
                                 error_msg = tool_res.get("error", "Unknown tool error")
-                                if failure_memory:
-                                    failure_memory.record_failure(tool_name, tool_params, error_msg)
 
-                                if failure_memory and failure_memory.has_previous_failure(tool_name, tool_params):
-                                    result_str = f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round. Execution blocked to prevent infinite loop."
-                                    clean_result_str = result_str
-                                    status_done_line = f"* Tool call blocked to prevent loop.\n"
-                                    details_block = f"Loop Intercepted:\n{result_str}\n"
-                                    tool_close_tag = f"{status_done_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
-                                    ai_msg.content += tool_close_tag
-                                    _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-                                    break
-                                else:
-                                    result_str = f"Error executing tool '{tool_name}': {error_msg}"
-                                    clean_result_str = result_str
-                                    status_done_line = f"* Completed execution with errors.\n"
-                                    details_block = f"Error Logs:\n{error_msg}\n"
+                                # 🛑 ARCHITECTURAL FIX: Do NOT record 404 "Tool not found" errors in FailureMemory.
+                                # A 404 is a discovery/routing error, not an execution failure.
+                                # If we record it, the LLM gets permanently blocked from trying the correct tool name.
+                                is_404 = tool_res.get("status_code") == 404
+
+                                if failure_memory and not is_404:
+                                    # 🛑 CRITICAL FIX: Record failure using exact signature.
+                                    # This records the signature so the NEXT time the LLM tries this exact call,
+                                    # it will be blocked. We DO NOT block it here because this is the first failure.
+                                    try:
+                                        param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                                    except Exception:
+                                        param_sig = str(tool_params)
+                                    full_sig = f"{tool_name}::{param_sig}"
+                                    if hasattr(failure_memory, "record_failure_by_signature"):
+                                        failure_memory.record_failure_by_signature(full_sig, error_msg)
+                                    else:
+                                        if not hasattr(failure_memory, "_signatures"):
+                                            object.__setattr__(failure_memory, "_signatures", set())
+                                        failure_memory._signatures.add(full_sig)
+
+                                # 🛑 ARCHITECTURAL FIX: Removed the flawed has_prev_failure check here.
+                                # The previous code recorded the signature and immediately checked if it existed,
+                                # which always evaluated to True and caused every failure to be mislabeled as "Loop Intercepted".
+                                result_str = f"Error executing tool '{tool_name}': {error_msg}"
+                                clean_result_str = result_str
+                                status_done_line = f"* Completed execution with errors.\n"
+                                details_block = f"Error Logs:\n{error_msg}\n"
                             else:
                                 # 🛑 CRITICAL FIX: Robust output extraction
                                 # The tool result might be {"success": True, "output": "content"}
@@ -2419,7 +2451,18 @@ class ChatMixin:
                             result_str = str(tool_res) if tool_res is not None else "No output returned."
                             if "error" in result_str.lower() or "fail" in result_str.lower():
                                 if failure_memory:
-                                    failure_memory.record_failure(tool_name, tool_params, result_str)
+                                    # 🛑 CRITICAL FIX: Record by exact signature
+                                    try:
+                                        param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                                    except Exception:
+                                        param_sig = str(tool_params)
+                                    full_sig = f"{tool_name}::{param_sig}"
+                                    if hasattr(failure_memory, "record_failure_by_signature"):
+                                        failure_memory.record_failure_by_signature(full_sig, result_str)
+                                    else:
+                                        if not hasattr(failure_memory, "_signatures"):
+                                            object.__setattr__(failure_memory, "_signatures", set())
+                                        failure_memory._signatures.add(full_sig)
                                 clean_result_str = result_str
                                 status_done_line = f"* Completed execution with errors.\n"
                                 details_block = f"Error Logs:\n{result_str}\n"
@@ -2431,27 +2474,49 @@ class ChatMixin:
                     except Exception as e:
                         trace_exception(e)
                         if failure_memory:
-                            failure_memory.record_failure(tool_name, tool_params, str(e))
+                            # 🛑 CRITICAL FIX: Record by exact signature
+                            try:
+                                param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                            except Exception:
+                                param_sig = str(tool_params)
+                            full_sig = f"{tool_name}::{param_sig}"
+                            if hasattr(failure_memory, "record_failure_by_signature"):
+                                failure_memory.record_failure_by_signature(full_sig, str(e))
+                            else:
+                                if not hasattr(failure_memory, "_signatures"):
+                                    object.__setattr__(failure_memory, "_signatures", set())
+                                failure_memory._signatures.add(full_sig)
                         result_str = f"Error executing tool '{tool_name}': {e}"
                         clean_result_str = f"Error executing tool '{tool_name}': {e}"
                         status_done_line = f"* Execution crashed.\n"
                         details_block = f"Crash Details:\n{str(e)}\n"
 
                     # Determine the status comment based on the execution outcome
-                    # 🛑 CRITICAL FIX: Also check the raw tool_res dict for explicit failure signals
+                    # 🛑 CRITICAL FIX: Check the raw tool_res dict FIRST for explicit failure signals.
+                    # Do NOT rely on string matching in clean_result_str, as prompt_injection
+                    # text may not contain "Error" or "failed" even when the tool failed.
                     is_failure = (
-                        "Error" in clean_result_str or 
-                        "failed" in clean_result_str.lower() or 
-                        "crashed" in status_done_line.lower() or
                         (isinstance(tool_res, dict) and tool_res.get("success") is False) or
-                        (isinstance(tool_res, dict) and tool_res.get("status_code", 200) != 200)
+                        (isinstance(tool_res, dict) and tool_res.get("status_code", 200) != 200) or
+                        "crashed" in status_done_line.lower() or
+                        (isinstance(tool_res, dict) and tool_res.get("error") and not tool_res.get("success", True))
                     )
                     status_meta = "failure" if is_failure else "success"
                     tool_close_tag = f"{status_done_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n"
                     ai_msg.content += tool_close_tag
                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                    tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
+                    # 🛑 CRITICAL FIX: Determine tool_success from the raw tool_res dict, not from
+                    # string matching in clean_result_str. prompt_injection text can mask failures.
+                    tool_success = (
+                        isinstance(tool_res, dict) and 
+                        tool_res.get("success", True) is not False and
+                        tool_res.get("status_code", 200) == 200
+                    ) if isinstance(tool_res, dict) else True
+                    if not isinstance(tool_res, dict):
+                        # Non-dict results: fall back to string matching
+                        tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
+
                     tool_calls_this_turn.append({
                         "name": tool_name,
                         "params": tool_params,
@@ -2523,6 +2588,14 @@ class ChatMixin:
                         if 'force_break_after_tool' in locals() and force_break_after_tool:
                             ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
                             break
+                        # 🛑 CRITICAL FIX: Clear the failure signature on success
+                        if failure_memory and hasattr(failure_memory, "_signatures"):
+                            try:
+                                clear_sig = f"{tool_name}::{json.dumps(tool_params, sort_keys=True, default=str)}"
+                                failure_memory._signatures.discard(clear_sig)
+                            except Exception:
+                                pass
+
                         # 🛑 CRITICAL: Also continue on failure so the LLM can inform the user
                         continue
                 else:
