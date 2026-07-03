@@ -21,8 +21,7 @@ def init_tool_library() -> None:
 
 def tool_tool_maker(
     args: dict,
-    lollms_client_instance: Optional[Any] = None,
-    discussion_instance: Optional[Any] = None
+    tools_dir: str = "./lcp_tools"
 ) -> dict:
     """
     Compile and register a new local tool dynamically on disk and in the active session.
@@ -42,18 +41,11 @@ def tool_tool_maker(
     if not code:
         return {"success": False, "error": "code parameter is mandatory."}
 
-    # 1. Resolve Target Tools Folder
-    lc = lollms_client_instance or (discussion_instance.lollmsClient if discussion_instance else None)
-    if not lc:
-        return {"success": False, "error": "LollmsClient instance is required to resolve tools folder."}
-
-    lcp_binding = getattr(lc, "tools", None)
-    if not lcp_binding:
-        return {"success": False, "error": "LCP Tools Binding is not loaded on the client."}
-
-    tools_dir = getattr(lcp_binding, "tools_folder_path", None)
-    if not tools_dir:
-        return {"success": False, "error": "LCP Tools folder path is unresolved."}
+    # 🛑 TOOLS ARE AGNOSTIC: Use provided tools_dir or fallback to CWD.
+    # The orchestrator is responsible for placing the generated file in the correct binding folder
+    # and triggering a re-discovery, OR the user can specify a target directory.
+    tools_dir = Path(tools_dir)
+    tools_dir.mkdir(parents=True, exist_ok=True)
 
     # Write as a clean, flat python file in the LCP directory
     py_file = Path(tools_dir) / f"{tool_name}.py"
@@ -62,32 +54,15 @@ def tool_tool_maker(
         # 2. Save python code directly to disk (LCP will parse schema via AST on re-discovery)
         py_file.write_text(code, encoding="utf-8")
 
-        # 3. Reload tools in active LCP binding so it's instantly discoverable
-        if hasattr(lcp_binding, "_discover_local_tools"):
-            lcp_binding._discover_local_tools()
+        # 🛑 AGNOSTIC: Tool does not access the binding or discussion.
+        # It writes the file to the specified directory. 
+        # The orchestrator can detect this file and register it.
 
-        # 4. Save as a Discussion Artifact
-        if discussion_instance:
-            art_content = (
-                f"# Smart Tool: {tool_name}\n"
-                f"Generated on: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
-                f"### Python Implementation (`{tool_name}.py`)\n"
-                f"```python\n{code}\n```"
-            )
-            discussion_instance.artefacts.add(
-                title=f"{tool_name}_tool",
-                artefact_type="tool",
-                content=art_content,
-                active=True,
-                commit_message=commit_message
-            )
-            discussion_instance.commit()
-
-        ASCIIColors.success(f"[Tool Maker] Successfully compiled flat tool '{tool_name}.py'!")
+        ASCIIColors.success(f"[Tool Maker] Successfully compiled flat tool '{tool_name}.py' at {py_file}!")
         return {
             "success": True,
             "tool_name": tool_name,
-            "message": f"Successfully compiled and registered tool '{tool_name}' on disk (flat file) and as an active session artifact. Schema parsed via AST.",
+            "message": f"Successfully compiled tool '{tool_name}' on disk (flat file). The orchestrator can now register it.",
             "python_file": str(py_file.resolve())
         }
 
