@@ -22,14 +22,14 @@ def init_tool_library() -> None:
 
 
 def _get_workspace_dir() -> Path:
-    workspace_dir = Path("./data_workspace")
-    try:
-        from lollms_client.app.server import APP_WORKSPACE_DIR
-        if APP_WORKSPACE_DIR is not None:
-            workspace_dir = APP_WORKSPACE_DIR
-    except ImportError:
-        pass
-    return workspace_dir
+    """
+    🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator.
+    Fallback to ./data_workspace for standalone execution.
+    """
+    cwd = Path.cwd()
+    if (cwd / "data_workspace").exists() or cwd.name == "data_workspace":
+        return cwd
+    return Path("./data_workspace").resolve()
 
 
 def tool_execute_sparql_query(
