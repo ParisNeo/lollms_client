@@ -82,24 +82,13 @@ def tool_execute_multi_file_service(
         uvicorn_app_import (str): Uvicorn app import string (default "main:app").
     """
     global _ACTIVE_PROCESSES
-    
+
     # 1. Terminate any stale services first to free ports
     old_terminated = _terminate_active_services()
 
-    # Determine workspace directory
-    workspace_dir = Path("./data_workspace")
-    try:
-        from lollms_client.app.server import APP_WORKSPACE_DIR
-        if APP_WORKSPACE_DIR is not None:
-            workspace_dir = APP_WORKSPACE_DIR
-    except ImportError:
-        pass
-
-    if not workspace_dir.exists():
-        return {
-            "success": False,
-            "error": f"Workspace directory does not exist: {workspace_dir.resolve()}"
-        }
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by the orchestrator.
+    # The orchestrator guarantees CWD is the isolated discussion workspace.
+    workspace_dir = Path(".")
 
     backend_path = workspace_dir / backend_file
     frontend_path = workspace_dir / frontend_file
@@ -107,7 +96,7 @@ def tool_execute_multi_file_service(
     if not backend_path.exists():
         return {
             "success": False,
-            "error": f"Backend entry file '{backend_file}' not found in workspace: {workspace_dir.resolve()}"
+            "error": f"Backend entry file '{backend_file}' not found in current workspace directory."
         }
 
     # 2. Allocate Ports
