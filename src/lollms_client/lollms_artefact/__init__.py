@@ -7,7 +7,8 @@ from .lollms_artefact import (
     ArtefactStatus,
     ArtefactManager,
     make_image_id,
-    parse_image_id
+    parse_image_id,
+    sanitize_artifact_filename,
 )
 from .file_import import FileImportMixin, ALL_IMPORT_MODES
 from .internet_import import InternetImportMixin
@@ -20,6 +21,7 @@ __all__ = [
     "ArtefactManager",
     "make_image_id",
     "parse_image_id",
+    "sanitize_artifact_filename",
     "FileImportMixin",
     "ALL_IMPORT_MODES",
     "InternetImportMixin",

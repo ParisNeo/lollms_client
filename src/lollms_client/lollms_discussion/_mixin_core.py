@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, Union, Optional
 from sqlalchemy.orm.exc import NoResultFound
 from ascii_colors import ASCIIColors, trace_exception
 
-from lollms_client.lollms_artefact import ArtefactManager, ArtefactType
+from lollms_client.lollms_artefact import ArtefactManager, ArtefactType, sanitize_artifact_filename
 from ._message import LollmsMessage
 
 if TYPE_CHECKING:
@@ -859,7 +859,11 @@ class CoreMixin:
             if atype == "image":
                 continue
 
-            file_path = workspace_dir / title
+            # CRITICAL: Sanitize the title before constructing the file path to prevent
+            # WinError 123 when titles contain invalid filename characters (e.g., URLs like
+            # "https://lollms.com/the-folding/" passed by the host app's internet import).
+            safe_filename = sanitize_artifact_filename(title)
+            file_path = workspace_dir / safe_filename
             file_ext = file_path.suffix.lower()
 
             # Determine if this is a true binary data file that we cannot reconstruct from text

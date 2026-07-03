@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from ascii_colors import ASCIIColors, trace_exception
+from .lollms_artefact import sanitize_artifact_filename
 
 try:
     import requests
@@ -20,6 +21,37 @@ except ImportError:
     import pipmaster as pm
     pm.ensure_packages("requests")
     import requests
+
+
+def _url_to_markdown_filename(url_or_title: str) -> str:
+    """
+    Converts a URL or arbitrary title string into a valid cross-platform Markdown filename.
+    Strips URL schemes, replaces all invalid Windows/POSIX filename characters
+    (:, /, \\, ?, *, ", <, >, |) with underscores, and ensures a .md extension.
+
+    Examples:
+        https://lollms.com/the-folding/  ->  lollms.com_the-folding.md
+        https://en.wikipedia.org/wiki/Albert_Einstein -> en.wikipedia.org_wiki_Albert_Einstein.md
+    """
+    if not url_or_title:
+        return "untitled.md"
+    # Strip URL scheme prefix (http://, https://, ftp://, etc.)
+    clean = re.sub(r'^[a-zA-Z]+://', '', url_or_title)
+    # Remove trailing slash
+    clean = clean.rstrip('/')
+    # Replace all invalid filename characters with underscore
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', clean)
+    # Collapse multiple consecutive underscores
+    clean = re.sub(r'_+', '_', clean)
+    # Strip leading/trailing underscores, dots, and spaces
+    clean = clean.strip('._ ')
+    # Truncate to safe length (leave room for .md extension)
+    if len(clean) > 190:
+        clean = clean[:190]
+    # Ensure .md extension
+    if not clean.lower().endswith('.md'):
+        clean = clean + '.md'
+    return clean if clean else 'untitled.md'
 
 
 class InternetImportMixin:
@@ -209,7 +241,7 @@ class InternetImportMixin:
                 f"## Abstract\n{description}\n"
             )
 
-            filename = f"Scopus_{scopus_id}.md"
+            filename = sanitize_artifact_filename(f"Scopus_{scopus_id}")
             existing = self.artefacts.get(filename)
             if existing is None:
                 art = self.artefacts.add(title=filename, content=content, active=auto_load)
@@ -308,9 +340,8 @@ class InternetImportMixin:
                 f"**Link**: {url}\n\n"
                 f"## Summary / Snippet\n{abstract}\n"
             )
-            # Create valid safe name
-            safe_title = re.sub(r'[^A-Za-z0-9]', '_', title[:30]).strip("_")
-            filename = f"Scholar_{safe_title}.md"
+            # Create valid safe name from the title
+            filename = sanitize_artifact_filename(f"Scholar_{title}")
             
             existing = self.artefacts.get(filename)
             if existing is None:
@@ -434,7 +465,7 @@ class InternetImportMixin:
                 f"2. The system of claim 1, further comprising a reactive self-healing routine to trigger programmatic updates.\n"
             )
 
-        filename = f"Patent_{patent_id}.md"
+        filename = sanitize_artifact_filename(f"Patent_{patent_id}")
         existing = self.artefacts.get(filename)
         if existing is None:
             art = self.artefacts.add(title=filename, content=content, active=auto_load)
@@ -464,7 +495,7 @@ class InternetImportMixin:
             if page_id != "-1":
                 content = pages[page_id].get("extract", "")
                 full_md = f"# {title}\nSource: {url}\n\n{content}"
-                filename = f"{title}.md"
+                filename = sanitize_artifact_filename(title)
                 existing = self.artefacts.get(filename)
                 if existing is None:
                     art = self.artefacts.add(
@@ -551,7 +582,7 @@ class InternetImportMixin:
             else:
                 content = f"# {paper.title} (Abstract)\nAuthors: {', '.join([a.name for a in paper.authors])}\nSource: {paper.entry_id}\n\n{paper.summary}"
 
-            filename = f"Arxiv_{arxiv_id}.md"
+            filename = sanitize_artifact_filename(f"Arxiv_{arxiv_id}")
             existing = self.artefacts.get(filename)
             if existing is None:
                 art = self.artefacts.add(
@@ -646,7 +677,7 @@ class InternetImportMixin:
             else:
                  raise ValueError("Not a valid GitHub URL.")
 
-            safe_title = re.sub(r'[^A-Za-z0-9_.-]', '_', title) + ".md"
+            safe_title = sanitize_artifact_filename(title)
 
             existing = self.artefacts.get(safe_title)
             if existing is None:
@@ -724,7 +755,7 @@ class InternetImportMixin:
                     a_body_md = md(ans.get('body', '')).strip()
                     content += f"\n### {is_accepted}Answer {i+1} (Score: {ans.get('score', 0)})\n\n{a_body_md}\n\n---\n"
                 
-            title = f"SO_{q_id}.md"
+            title = sanitize_artifact_filename(f"SO_{q_id}")
 
             existing = self.artefacts.get(title)
             if existing is None:
@@ -845,7 +876,7 @@ class InternetImportMixin:
             lang_label = target_transcript.language if hasattr(target_transcript, 'language') else (requested_lang or 'unknown')
             full_content = f"# YouTube Transcript ({lang_label})\nSource: {video_url}\n\n" + "\n".join(lines)
 
-            artefact_name = f"Youtube_Transcript_{video_id}.md"
+            artefact_name = sanitize_artifact_filename(f"Youtube_Transcript_{video_id}")
             existing = self.artefacts.get(artefact_name)
             if existing is None:
                 art = self.artefacts.add(
@@ -864,3 +895,70 @@ class InternetImportMixin:
         except Exception as e:
             trace_exception(e)
         return None
+
+    def import_url(self, url: str, auto_load: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Fetches an arbitrary web URL, extracts the main text content, and saves it
+        as a Markdown artifact with a sanitized filename derived from the URL.
+
+        Args:
+            url (str): The full URL to import (e.g., https://lollms.com/the-folding/).
+            auto_load (bool): Whether to activate the artifact immediately.
+
+        Returns:
+            Optional[Dict]: The created/updated artifact dict, or None on failure.
+        """
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+            }
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+
+            html_content = response.text
+
+            # Extract title from HTML if available
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', html_content, re.IGNORECASE | re.DOTALL)
+            page_title = title_match.group(1).strip() if title_match else ""
+
+            # Strip HTML tags to get plain text
+            import pipmaster as pm
+            pm.ensure_packages("beautifulsoup4")
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html_content, "html.parser")
+
+            # Remove script and style elements
+            for tag in soup.find_all(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+
+            text_content = soup.get_text(separator="\n", strip=True)
+
+            # Build the Markdown content
+            content_parts = [f"# {page_title or url}\n"]
+            content_parts.append(f"**Source URL**: {url}\n")
+            content_parts.append(f"**Imported**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+            content_parts.append("\n---\n")
+            content_parts.append(text_content)
+            full_content = "\n".join(content_parts)
+
+            # Craft a valid markdown filename from the URL
+            filename = sanitize_artifact_filename(url)
+
+            existing = self.artefacts.get(filename)
+            if existing is None:
+                art = self.artefacts.add(
+                    title=filename,
+                    content=full_content,
+                    active=auto_load
+                )
+            else:
+                art = self.artefacts.update(
+                    title=filename,
+                    new_content=full_content,
+                    active=auto_load
+                )
+            self.commit()
+            return art
+        except Exception as e:
+            trace_exception(e)
+            return None

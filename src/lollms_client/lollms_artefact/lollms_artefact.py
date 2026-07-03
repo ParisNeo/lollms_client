@@ -66,6 +66,32 @@ class ArtefactType:
 
 _IMAGE_ID_SEP = "::"
 
+def sanitize_artifact_filename(title: str) -> str:
+    """
+    Sanitizes an artifact title into a valid cross-platform filename.
+
+    Strips URL schemes, replaces all invalid Windows/POSIX filename characters
+    (:, /, \\, ?, *, ", <, >, |) with underscores, and truncates to 200 chars.
+
+    The DB title is preserved as-is for LLM context; only the physical
+    filename produced from this function is safe for disk operations.
+    """
+    if not title:
+        return "untitled"
+    # Strip URL scheme prefix (http://, https://, ftp://, etc.)
+    import re as _re
+    clean = _re.sub(r'^[a-zA-Z]+://', '', title)
+    # Replace all invalid filename characters with underscore
+    clean = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', clean)
+    # Collapse multiple consecutive underscores
+    clean = _re.sub(r'_+', '_', clean)
+    # Strip leading/trailing underscores, dots, and spaces
+    clean = clean.strip('._ ')
+    # Truncate to safe length (leave room for extension)
+    if len(clean) > 200:
+        clean = clean[:200]
+    return clean if clean else "untitled"
+
 def make_image_id(artefact_title: str, index: int) -> str:
     return f"{artefact_title}{_IMAGE_ID_SEP}{index}"
 
@@ -253,6 +279,20 @@ def _find_best_title_match(
     return None
 
 
+_KNOWN_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".cc", ".cxx",
+    ".cs", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".kts", ".sh", ".bash",
+    ".zsh", ".fish", ".bat", ".ps1", ".sql", ".r", ".lua", ".ex", ".exs",
+    ".html", ".htm", ".css", ".md", ".markdown", ".txt", ".csv", ".tsv",
+    ".json", ".yaml", ".yml", ".xml", ".tex", ".toml", ".ini", ".cfg", ".conf",
+    ".log", ".rst", ".db", ".sqlite", ".sqlite3", ".sqlconn", ".xlsx", ".xls",
+    ".parquet", ".ttl", ".rdf", ".png", ".jpg", ".jpeg", ".bmp", ".gif",
+    ".svg", ".webp", ".tiff", ".tif", ".pdf", ".docx", ".pptx", ".odt",
+    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".wma", ".aac",
+    ".mp4", ".avi", ".mov", ".webm",
+}
+
+
 class ArtefactManager:
     """Manages the lifecycle of typed artefacts inside a LollmsDiscussion."""
 
@@ -274,7 +314,7 @@ class ArtefactManager:
             disc_ws_dir = base_workspace_dir / disc_id
             meta_dir = disc_ws_dir / "artefacts_metadata"
 
-        clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
+        clean_title = sanitize_artifact_filename(title.replace("workspace/", "").replace("data_workspace/", ""))
         filename = self._get_filename_with_ext(clean_title, atype, language, file_ext)
         name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
 
@@ -334,8 +374,11 @@ class ArtefactManager:
         return migrated
 
     def _get_filename_with_ext(self, title: str, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None) -> str:
-        if "." in title and len(title.split(".")[-1]) <= 5:
-            return title
+        # Check if the title already ends with a known file extension
+        title_lower = title.lower()
+        for known_ext in _KNOWN_EXTENSIONS:
+            if title_lower.endswith(known_ext):
+                return title
         ext = file_ext or ""
         if not ext:
             if language:
@@ -369,7 +412,7 @@ class ArtefactManager:
             ws_data_dir.mkdir(parents=True, exist_ok=True)
             meta_dir.mkdir(parents=True, exist_ok=True)
 
-            clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
+            clean_title = sanitize_artifact_filename(title.replace("workspace/", "").replace("data_workspace/", ""))
             filename = self._get_filename_with_ext(clean_title, atype, language, file_ext)
             name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
 
@@ -456,7 +499,23 @@ class ArtefactManager:
         logical_content:   Optional[str] = None,
         **extra_data
     ) -> Dict[str, Any]:
-        file_ext = extra_data.get("file_ext") or Path(title).suffix
+        # CRITICAL: Sanitize the title to ensure it is always a valid cross-platform filename.
+        # This prevents WinError 123 and duplicate artifacts when the host app (lollms WebUI)
+        # passes raw URLs or other invalid filename strings as titles. The DB title IS the
+        # sanitized filename; the original raw title (if any) is preserved inside the content.
+        title = sanitize_artifact_filename(title)
+        # CRITICAL FIX: Only use Path.suffix as file_ext if it is a KNOWN extension.
+        # Without this, sanitized URL titles like "lollms.com_the-folding" produce
+        # Path.suffix = ".com_the-folding" (a 16-char garbage extension from the
+        # domain dot), which then gets appended by _get_filename_with_ext creating
+        # duplicate files with wrong extensions (e.g., "lollms.com_the-folding.com_the-folding").
+        # By checking against _KNOWN_EXTENSIONS, domain-name dots are ignored and the
+        # correct type-based extension (.md for documents) is used instead.
+        raw_suffix = Path(title).suffix.lower()
+        if raw_suffix and raw_suffix in _KNOWN_EXTENSIONS:
+            file_ext = extra_data.get("file_ext") or raw_suffix
+        else:
+            file_ext = extra_data.get("file_ext") or None
         file_ext_clean = (file_ext or "").lower()
         if file_ext_clean == ".sql" or title.lower().endswith(".sql"):
             artefact_type = ArtefactType.CODE
@@ -607,7 +666,7 @@ class ArtefactManager:
         if active is not None:
             resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
 
-        target_title = new_title if new_title else title
+        target_title = sanitize_artifact_filename(new_title) if new_title else title
         internal_keys = {
             "id", "title", "type", "version", "content", "images", "image_media_types",
             "audios", "videos", "zip", "language", "url", "tags", "active", "visibility",
@@ -707,6 +766,7 @@ class ArtefactManager:
         )
 
     def rename(self, old_title: str, new_title: str, new_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        new_title = sanitize_artifact_filename(new_title)
         artefacts = self._get_all_raw()
         found = False
         for a in artefacts:
@@ -981,9 +1041,9 @@ class ArtefactManager:
             target_arts = [a for a in arts if a.get('title') == title and (version is None or a.get('version') == version)]
             
             for art in target_arts:
-                clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
+                clean_title = sanitize_artifact_filename(title.replace("workspace/", "").replace("data_workspace/", ""))
                 filename = self._get_filename_with_ext(clean_title, art.get('type'), art.get('language'), art.get('file_ext'))
-                
+
                 active_path = ws_data_dir / filename
                 if active_path.exists():
                     try:

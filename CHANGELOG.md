@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-03 04:44]
+
+- refactor(artefact): update artefact handling and import logic
+
 ## [2026-07-02 08:07]
 
 - fix(openai): use flat reasoning_effort instead of nested reasoning dict
