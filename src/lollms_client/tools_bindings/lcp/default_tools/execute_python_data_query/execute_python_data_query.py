@@ -14,9 +14,7 @@ def init_tool_library() -> None:
     pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl"])
 
 def tool_execute_python_data_query(
-    code: str = "",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    code: str = ""
 ) -> Dict[str, Any]:
     """
     Execute sandboxed Python code to analyze or modify datasets in the workspace.
@@ -69,9 +67,10 @@ def tool_execute_python_data_query(
 
         exec(code, local_vars)
 
-        # ── INTERCEPT MATPLOTLIB PLOTS ON THE FLY ──
+        # 🛑 AGNOSTIC: Tool does not access discussion_instance.
+        # It saves the plots to disk. The orchestrator detects them and registers them.
         fig_nums = plt.get_fignums()
-        if fig_nums and discussion_instance:
+        if fig_nums:
             ASCIIColors.success(f"[Sandbox] Intercepted {len(fig_nums)} generated plot figure(s)!")
             for idx, f_num in enumerate(fig_nums):
                 buf = io.BytesIO()
@@ -80,19 +79,10 @@ def tool_execute_python_data_query(
                 buf.seek(0)
                 plot_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
-                # Register the plot image as a first-class active workspace artifact
+                # Save plot to disk
                 plot_filename = f"custom_analysis_plot_{uuid.uuid4().hex[:6]}.png"
-                art = discussion_instance.artefacts.add(
-                    title=plot_filename,
-                    artefact_type="image",
-                    content=f"### Custom Analysis Plot: {plot_filename}\n\n<artefact_image id=\"{plot_filename}::0\" />",
-                    images=[plot_b64],
-                    image_media_types=["image/png"],
-                    active=True
-                )
-                # Cache in discussion instance for post-turn visual injection
-                if hasattr(discussion_instance, "_affected_artefacts_this_turn"):
-                    discussion_instance._affected_artefacts_this_turn.append(art)
+                plot_path = Path(".") / plot_filename
+                fig.savefig(str(plot_path), bbox_inches='tight', facecolor=fig.get_facecolor())
 
             plt.close('all')
 
