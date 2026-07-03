@@ -827,10 +827,11 @@ class FileImportMixin:
         Parameters
         ----------
         path        : Path to the file on disk.
-        mode        : One of "text", "text_images", "images_only", "ocr".
-        title       : Artefact title (defaults to filename stem).
+        mode        : One of "text", "text_images", "images_only", "ocr", "data", "data_bundle".
+        title       : Artefact title (defaults to full filename with extension).
         activate    : Whether to activate the text artefact immediately.
         progress_cb : Optional callable receiving progress strings.
+        description : Optional description text appended to the artifact content.
 
         Returns
         -------
@@ -850,7 +851,9 @@ class FileImportMixin:
             )
 
         ext   = path.suffix.lower()
-        title = title or path.stem
+        # 🛑 CRITICAL FIX: Default title MUST include the file extension (e.g., "data.csv", not "data")
+        # This ensures the Artifact Title == Physical Filename, which tools rely on for file lookups.
+        title = title or path.name
 
         def _progress(msg: str):
             ASCIIColors.info(f"[FileImport] {msg}")
@@ -886,7 +889,7 @@ class FileImportMixin:
                 _progress(f"Scanning folder for data files: {path}")
                 supported_exts = {".csv", ".tsv", ".xlsx", ".xls"} # SQLite handled separately or skipped for now in fusion logic
                 csv_xlsx_files = []
-                
+
                 # 1. SCAN PHASE: Find all relevant files and extract schemas
                 for root, _, filenames in os.walk(path):
                     for fname in filenames:
@@ -925,7 +928,8 @@ class FileImportMixin:
                     schema_groups = defaultdict(list)
                     schema_info_map = {}  # signature -> (normalized_columns, raw_columns_sample)
 
-                    for f_path in csv_xlsx_files:
+                    for f_idx, f_path in enumerate(csv_xlsx_files):
+                        _progress(f"Analyzing schema [{f_idx+1}/{len(csv_xlsx_files)}]: {f_path.name}")
                         try:
                             ext = f_path.suffix.lower()
                             if ext in (".csv", ".tsv"):
@@ -940,11 +944,14 @@ class FileImportMixin:
                             else:
                                 continue
 
-                            # Create fingerprint using NORMALIZED column names for resilient grouping
-                            # We use .dtypes.str[0] to get simple type kind ('i', 'f', 'O', etc.) which is more stable than full dtype names
+                            # 🛑 CRITICAL FIX: Fingerprint using NORMALIZED COLUMN NAMES ONLY.
+                            # Do NOT include Pandas dtype kinds ('i', 'f', 'O') in the signature.
+                            # Including dtype kinds causes files with identical headers but slightly
+                            # different inferred types (e.g., int vs float due to NaN) to split into
+                            # separate groups, fragmenting the data and causing table overwrites.
                             normalized_signature = tuple(sorted(
-                                (_normalize_column_name(str(c)), str(d.kind)) 
-                                for c, d in zip(df.columns, df.dtypes)
+                                _normalize_column_name(str(c)) 
+                                for c in df.columns
                             ))
 
                             schema_groups[normalized_signature].append(f_path)
@@ -956,15 +963,16 @@ class FileImportMixin:
                             warnings.append(f"Skipped {f_path.name} during schema analysis: {e}")
 
                     _progress(f"Found {len(schema_groups)} unique data structures. Fusing duplicates...")
-                    
+
                     db_path = workspace_dir / f"{title}_consolidated.db"
                     conn = sqlite3.connect(str(db_path))
-                    
+
                     tables_created = 0
                     total_rows_ingested = 0
                     table_details = []
 
                     for idx, (sig, file_list) in enumerate(schema_groups.items()):
+                        _progress(f"Fusing schema group {idx+1}/{len(schema_groups)} ({len(file_list)} files)...")
                         try:
                             # Read ALL files in this group and concatenate them WITH source tracking
                             dfs_to_concat = []
@@ -976,7 +984,7 @@ class FileImportMixin:
 
                             for f_path in file_list:
                                 ext = f_path.suffix.lower()
-                                if progress_cb: progress_cb(f"Reading {f_path.name} for schema group {idx}...")
+                                _progress(f"  Reading: {f_path.name}")
 
                                 if ext in (".csv", ".tsv"):
                                     sep = "\t" if ext == ".tsv" else ("," if ";" not in f_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ";")
@@ -994,7 +1002,7 @@ class FileImportMixin:
 
                                 # Second pass: align all files to reference schema using fuzzy matching
                                 for f_path, df in file_data_list:
-                                    if progress_cb: progress_cb(f"Aligning {f_path.name} columns...")
+                                    _progress(f"  Aligning columns: {f_path.name}")
 
                                     # Fuzzy match current file's columns to reference columns
                                     column_mapping = _fuzzy_match_columns(df.columns.tolist(), reference_columns)
@@ -1029,6 +1037,7 @@ class FileImportMixin:
 
                             # Fuse into one massive dataframe per schema group
                             if dfs_to_concat:
+                                _progress(f"  Concatenating {len(dfs_to_concat)} DataFrames for group {idx+1}...")
                                 fused_df = pd.concat(dfs_to_concat, ignore_index=True)
 
                                 # Clean column names to ensure SQL compatibility (replace spaces/special chars with underscore)
@@ -1062,6 +1071,7 @@ class FileImportMixin:
 
                                     if hasattr(self, 'lollmsClient') and self.lollmsClient:
                                         try:
+                                            _progress(f"  Generating table name via LLM...")
                                             response = self.lollmsClient.generate_text(
                                                 prompt=naming_prompt,
                                                 n_predict=50,
@@ -1098,8 +1108,12 @@ class FileImportMixin:
                                 if len(safe_table_name) > 63: 
                                     safe_table_name = safe_table_name[:61] + "_"
 
-                                # Save with sanitized name but keep original in metadata for display
-                                fused_df.to_sql(safe_table_name, conn, if_exists='replace', index=False)
+                                _progress(f"  Writing table '{safe_table_name}' to SQLite ({len(fused_df):,} rows)...")
+                                # 🛑 CRITICAL FIX: Use 'append' instead of 'replace' to prevent
+                                # data loss if the LLM generates the same table name for multiple groups.
+                                # Since we already grouped by exact schema match, all files in this
+                                # group have identical columns, making append safe.
+                                fused_df.to_sql(safe_table_name, conn, if_exists='append', index=False)
 
                                 # Commit immediately to ensure data is persisted
                                 conn.commit()
@@ -1143,20 +1157,59 @@ class FileImportMixin:
 
                     text = "\n".join(schema_summary)
 
+                    # 🛑 CRITICAL FIX: Read the raw SQLite bytes from disk so the artifact
+                    # system writes a valid binary .db file to the workspace, not a text file.
+                    _progress(f"Reading consolidated database bytes from disk...")
+                    db_physical_bytes = None
+                    try:
+                        db_physical_bytes = db_path.read_bytes()
+                    except Exception as read_err:
+                        ASCIIColors.error(f"Failed to read consolidated database bytes: {read_err}")
+
+                    # Build a proper SQLite schema description for the .lam logical twin
+                    # so the LLM knows the exact table names, column names, and types.
+                    sqlite_schema_lines = [f"# SQLite Database: {title}.db"]
+                    try:
+                        schema_conn = sqlite3.connect(str(db_path))
+                        schema_cursor = schema_conn.cursor()
+                        schema_cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                        db_tables = [row[0] for row in schema_cursor.fetchall() if row[0] != "sqlite_sequence"]
+                        for t_name in db_tables:
+                            schema_cursor.execute(f'PRAGMA table_info("{t_name}")')
+                            cols_info = schema_cursor.fetchall()
+                            col_names = [c[1] for c in cols_info]
+                            col_types = [c[2] or "TEXT" for c in cols_info]
+                            schema_cursor.execute(f'SELECT COUNT(*) FROM "{t_name}"')
+                            row_count = schema_cursor.fetchone()[0]
+
+                            schema_line = f"## Table: {t_name} ({row_count:,} rows)\nColumns: "
+                            schema_line += ", ".join([f"{cn} ({ct})" for cn, ct in zip(col_names, col_types)])
+                            sqlite_schema_lines.append(schema_line)
+                        schema_conn.close()
+                    except Exception as schema_err:
+                        ASCIIColors.warning(f"Failed to extract SQLite schema for .lam: {schema_err}")
+
+                    lam_content = "\n".join(sqlite_schema_lines)
+                    # Append the human-readable summary as well
+                    lam_content += f"\n\n---\n{text}"
+
                     # Create the artifact
                     # Store description in metadata for future reference
                     extra_meta = {}
                     if description and description.strip():
                         extra_meta["description"] = description.strip()
 
+                    _progress(f"Registering consolidated database artifact...")
                     art = self.artefacts.add(
                         title=title,
                         artefact_type=ArtefactType.DATA,
-                        content=text,
+                        content=lam_content,
                         active=activate,
                         file_ext=".db",
                         version=1,
                         read_only=True,
+                        physical_data=db_physical_bytes,
+                        logical_content=lam_content,
                         **extra_meta
                     )
                     _progress(f"Data bundle consolidation complete. Reduced {len(csv_xlsx_files)} files to {tables_created} tables.")
@@ -1508,6 +1561,11 @@ class FileImportMixin:
         activate: bool,
     ) -> Dict:
         """Create or update the text artefact for the imported content."""
+        # 🛑 CRITICAL FIX: Ensure the title includes the file extension to match the physical file on disk.
+        # This prevents the artifact title from being "main" when the file is "main.py".
+        if "." not in title and path.suffix:
+            title = f"{title}{path.suffix.lower()}"
+
         # Parse YAML frontmatter dynamically to detect skills
         metadata, body = _parse_yaml_frontmatter(text)
 
