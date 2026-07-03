@@ -290,6 +290,8 @@ _KNOWN_EXTENSIONS = {
     ".svg", ".webp", ".tiff", ".tif", ".pdf", ".docx", ".pptx", ".odt",
     ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".wma", ".aac",
     ".mp4", ".avi", ".mov", ".webm",
+    # SPICE / Electronic Schematic Formats
+    ".asc", ".cir", ".net", ".op", ".sp", ".spi", ".sch",
 }
 
 
@@ -399,9 +401,12 @@ class ArtefactManager:
 
     def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None, logical_content: Optional[str] = None):
         try:
+            # 🛑 CRITICAL FIX: Prioritize workspace_data_path to ensure files are written
+            # to the exact directory the tools will use as CWD.
             if getattr(self._discussion, "workspace_data_path", None):
                 ws_data_dir = Path(self._discussion.workspace_data_path)
-                meta_dir = Path(self._discussion.artefacts_metadata_path)
+                # The metadata path is the parent's "artefacts_metadata" folder
+                meta_dir = Path(self._discussion.workspace_data_path).parent / "artefacts_metadata"
             else:
                 base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
                 disc_id = self._discussion.id
@@ -520,7 +525,7 @@ class ArtefactManager:
         if file_ext_clean == ".sql" or title.lower().endswith(".sql"):
             artefact_type = ArtefactType.CODE
             language = "sql"
-        elif file_ext_clean in (".py", ".js", ".ts", ".html", ".css", ".sh", ".bash") or any(title.lower().endswith(ext) for ext in (".py", ".js", ".ts", ".html", ".css", ".sh", ".bash")):
+        elif file_ext_clean in (".py", ".js", ".ts", ".html", ".css", ".sh", ".bash", ".asc", ".cir", ".net", ".op") or any(title.lower().endswith(ext) for ext in (".py", ".js", ".ts", ".html", ".css", ".sh", ".bash", ".asc", ".cir", ".net", ".op")):
             artefact_type = ArtefactType.CODE
             if not language:
                 language = file_ext_clean.replace(".", "")
@@ -591,6 +596,16 @@ class ArtefactManager:
             physical_data=physical_data,
             logical_content=logical_content
         )
+
+        # 🛑 CRITICAL FIX: IMMEDIATE MATERIALIZATION DOCTRINE
+        # The physical twin must exist on disk the instant the artifact is created.
+        # This guarantees that if the LLM emits a <tool> tag in the very next token
+        # that references this file by relative path, the file will be found.
+        # _sync_to_disk_workspace is already called above, but for text-based artifacts
+        # where physical_data is None, we must ensure the content string is written.
+        # The _sync_to_disk_workspace method already handles this fallback, so we
+        # just need to ensure it was called successfully (which it was above).
+
         return new_artefact
 
     def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -1247,24 +1262,42 @@ class ArtefactManager:
                 )
 
     def sync_all_active_to_disk(self):
+        """
+        Synchronizes all active artifacts to the physical workspace_data directory.
+
+        🛑 CRITICAL FIX: Always returns a tuple (workspace_dir, synced_files) to prevent
+        TypeError when the caller unpacks the result. Previously, if active_arts was empty,
+        it returned None, causing a crash in _mixin_chat.py.
+
+        Returns:
+            Tuple[Path, List[str]]: The workspace directory and list of synced file paths.
+        """
         active_arts = self.list(active_only=True)
-        if not active_arts:
-            return
 
-        base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-        try:
-            from lollms_client.app.server import APP_WORKSPACE_DIR as awd
-            if awd is not None:
-                base_workspace_dir = awd
-        except ImportError:
-            pass
+        # 🛑 CRITICAL FIX: Resolve workspace_data_path directly from the discussion.
+        # The previous code constructed the path manually and could mismatch the
+        # actual workspace_data_path used by the tools (CWD).
+        if getattr(self._discussion, "workspace_data_path", None):
+            workspace_dir = Path(self._discussion.workspace_data_path)
+        else:
+            base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+            try:
+                from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                if awd is not None:
+                    base_workspace_dir = awd
+            except ImportError:
+                pass
+            disc_id = self._discussion.id
+            workspace_dir = base_workspace_dir / disc_id / "workspace_data"
 
-        disc_id = self._discussion.id
-        workspace_dir = base_workspace_dir / disc_id
         workspace_dir.mkdir(parents=True, exist_ok=True)
         workspace_dir = workspace_dir.resolve()
 
         synced_files = []
+
+        if not active_arts:
+            return workspace_dir, synced_files
+
         for art in active_arts:
             if art.get("type") == "data":
                 file_ext = art.get("file_ext", "")
@@ -1272,14 +1305,14 @@ class ArtefactManager:
                 title = art["title"]
                 art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")))
 
-                versioned_data = workspace_dir / "artefacts_metadata" / art_id / f"{title.replace('.csv','')}_v{version}{file_ext}"
+                versioned_data = workspace_dir.parent / "artefacts_metadata" / art_id / f"{title.replace('.csv','')}_v{version}{file_ext}"
                 if versioned_data.exists():
-                    dest = workspace_dir / "workspace_data" / f"{title}{file_ext}"
+                    dest = workspace_dir / f"{title}{file_ext}"
                     import shutil
                     shutil.copy(str(versioned_data), str(dest))
                     synced_files.append(str(dest.resolve()))
                 else:
-                    unversioned = workspace_dir / "workspace_data" / f"{title}{file_ext}"
+                    unversioned = workspace_dir / f"{title}{file_ext}"
                     if unversioned.exists():
                         synced_files.append(str(unversioned.resolve()))
 
