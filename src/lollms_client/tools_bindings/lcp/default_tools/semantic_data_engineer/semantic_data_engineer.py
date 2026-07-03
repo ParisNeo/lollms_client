@@ -19,9 +19,10 @@ import shutil
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
+from lollms_client.lollms_artefact import ArtefactType
+
 TOOL_LIBRARY_NAME = "SEMANTIC_DATA_ENGINEER"
 TOOL_LIBRARY_DESC = "A highly specialized data engineering library providing safe pre-compiled data macros (filtering, aggregation, schemas, plotting, ABox conversion) without code execution."
-from lollms_client.lollms_artefact import ArtefactType
 TOOL_LIBRARY_ICON = "📊"
 
 def init_tool_library() -> None:
@@ -36,25 +37,11 @@ def init_tool_library() -> None:
     })
 
 
-def _get_workspace_dir(discussion_instance: Optional[Any] = None) -> Path:
-    """
-    Returns the active workspace directory.
-
-    ARCHITECTURAL RULE: Tools are AGNOSTIC, but they CAN ask the discussion 
-    for its workspace path if they need it. The discussion knows its exact
-    isolated workspace_data_path.
-
-    If running standalone (no discussion), it falls back to ./data_workspace.
-    """
-    from ascii_colors import ASCIIColors
-
-    if discussion_instance and hasattr(discussion_instance, "get_workspace_data_path"):
-        ws_path = discussion_instance.get_workspace_data_path()
-        if ws_path:
-            return Path(ws_path)
-
-    ASCIIColors.warning("[SemanticDataEngineer] No discussion instance found. Falling back to ./data_workspace")
-    return Path("./data_workspace").resolve()
+# 🛑 ARCHITECTURAL RULE: LCP TOOLS ARE AGNOSTIC.
+# _get_workspace_dir() has been removed.
+# The orchestrator (ChatMixin/LCPBinding) guarantees that the CWD is set 
+# to the isolated discussion workspace before execution.
+# All file operations MUST use simple relative paths (e.g., Path(".") / file_name).
 
 
 def _find_file_fuzzy(file_name: str, workspace_dir: Path) -> Optional[Path]:
@@ -92,7 +79,7 @@ def _find_file_fuzzy(file_name: str, workspace_dir: Path) -> Optional[Path]:
     return None
 
 
-def _load_data_source(file_path: Path, table_name: Optional[str] = None, discussion_instance: Optional[Any] = None) -> Tuple[Any, str]:
+def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Tuple[Any, str]:
     """Load a CSV, Excel, or SQLite file into a Pandas DataFrame with automatic BOM, delimiter, and self-healing restoration."""
     import pandas as pd
     import numpy as np
@@ -103,37 +90,9 @@ def _load_data_source(file_path: Path, table_name: Optional[str] = None, discuss
     # ── 🛡️ SELF-HEALING FILE RESTORATION PROTOCOL ──
     # If the file is missing from the physical workspace disk folder, but exists
     # as a record inside the SQLite discussion artifacts, restore/write it back instantly!
-    if not resolved_path.exists() and discussion_instance:
-        try:
-            # Strip extension to find the clean artifact title key
-            art_title = file_path.name
-            ext = file_path.suffix.lower()
-            if art_title.lower().endswith(ext):
-                art_title = art_title[:-len(ext)]
-
-            art = discussion_instance.artefacts.get(art_title)
-            if not art:
-                # Fuzzy fallback matching
-                for item in discussion_instance.artefacts.list():
-                    if art_title in item["title"]:
-                        art = item
-                        break
-
-            if art and art.get("content"):
-                resolved_path.parent.mkdir(parents=True, exist_ok=True)
-                resolved_path.write_text(art["content"], encoding="utf-8")
-
-                # Also write to active unversioned path for general consistency
-                active_path = resolved_path.parent.parent / file_path.name
-                try:
-                    active_path.parent.mkdir(parents=True, exist_ok=True)
-                    active_path.write_text(art["content"], encoding="utf-8")
-                except Exception:
-                    pass
-
-                ASCIIColors.success(f"✓ [Self-Healing] Restored missing workspace file '{file_path.name}' directly from the database record!")
-        except Exception as restore_err:
-            ASCIIColors.warning(f"Self-healing file restoration failed: {restore_err}")
+    # 🛑 AGNOSTIC: Self-healing removed. Tools rely on CWD set by orchestrator.
+    # The orchestrator (ChatMixin) syncs all active artifacts to disk BEFORE tool execution.
+    # If a file is missing, the tool returns a clear error and the LLM can retry.
 
     ASCIIColors.cyan(f"[SemanticDataEngineer] Loading data source from: '{resolved_path}'")
     ASCIIColors.cyan(f"  - File Exists: {resolved_path.exists()}")
@@ -220,9 +179,7 @@ def _save_data_source(df: Any, file_path: Path, table_name: str) -> None:
 
 def tool_get_table_schema(
     file_name: str,
-    table_name: Optional[str] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    table_name: Optional[str] = None
 ) -> dict:
     """
     Retrieves the exact column names, data types, row counts, and null counts of a dataset.
@@ -230,11 +187,9 @@ def tool_get_table_schema(
     Args:
         file_name (str): Filename of the target CSV, Excel, or SQLite file in the workspace.
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
-        discussion_instance (Any, optional): Active discussion session instance. Defaults to None.
-        lollms_client_instance (Any, optional): Active client instance. Defaults to None.
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
 
     # 🛡️ FUZZY FILE RESOLUTION
     file_path = _find_file_fuzzy(file_name, workspace_dir)
@@ -287,9 +242,7 @@ def tool_filter_and_slice_data(
     columns_to_keep: Optional[List[str]] = None,
     limit: int = 50,
     save_as_new_artifact: bool = False,
-    output_artifact_title: Optional[str] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    output_artifact_title: Optional[str] = None
 ) -> dict:
     """
     Filters and slices a dataset without writing Python code, optionally saving the output as a new version or artifact.
@@ -306,8 +259,8 @@ def tool_filter_and_slice_data(
         output_artifact_title (str, optional): Title of the new artifact if save_as_new_artifact is True.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
 
     # 🛡️ FUZZY FILE RESOLUTION
     file_path = _find_file_fuzzy(file_name, workspace_dir)
@@ -360,34 +313,21 @@ def tool_filter_and_slice_data(
         from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
         markdown_table = _dataframe_to_markdown(preview_df)
 
-        # Handle file persistence & new artifact registration
-        if save_as_new_artifact and discussion_instance:
+        # Handle file persistence
+        if save_as_new_artifact:
             out_title = output_artifact_title or f"{Path(file_name).stem}_filtered"
             ext = file_path.suffix.lower()
             out_filename = f"{out_title}{ext}"
             out_path = workspace_dir / out_filename
-            
+
             _save_data_source(df, out_path, resolved_table)
-            
-            # Setup new interactive data schema
-            from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-            new_schema, _ = _parse_data_file(out_path, out_title, version=1, progress_cb=None)
-            
-            art = discussion_instance.artefacts.add(
-                title=out_title,
-                artefact_type="data",
-                content=new_schema,
-                file_ext=ext,
-                active=True,
-                read_only=True
-            )
-            discussion_instance.commit()
-            
+
+            # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects new file.
             return {
                 "success": True,
                 "total_rows": total_matching_rows,
                 "artifact_created": out_title,
-                "output": f"Filtered dataset saved successfully as new active artifact '{out_title}'.\n\n### Preview (First {limit} rows):\n\n{markdown_table}"
+                "output": f"Filtered dataset saved successfully as new file '{out_title}'.\n\n### Preview (First {limit} rows):\n\n{markdown_table}"
             }
 
         return {
@@ -406,9 +346,7 @@ def tool_get_unique_values(
     file_name: str,
     column_name: str,
     table_name: Optional[str] = None,
-    limit: int = 100,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    limit: int = 100
 ) -> dict:
     """
     Returns unique elements and category frequency counts from a column.
@@ -419,8 +357,8 @@ def tool_get_unique_values(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
         limit (integer, optional): Maximum unique items to list. Defaults to 100.
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -459,9 +397,7 @@ def tool_compute_column_aggregations(
     metric_column: str,
     group_by_column: Optional[str] = None,
     table_name: Optional[str] = None,
-    operation: str = "mean",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    operation: str = "mean"
 ) -> dict:
     """
     Computes mathematical aggregations on a numerical column (sum, mean, min, max, count), optionally grouping by another column.
@@ -474,8 +410,8 @@ def tool_compute_column_aggregations(
         operation (str, optional): Aggregation operation: 'sum', 'mean', 'min', 'max', 'count'. Defaults to 'mean'.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -533,9 +469,7 @@ def tool_compute_column_aggregations(
 
 def tool_query_database_sql(
     file_name: str,
-    sql_query: str,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    sql_query: str
 ) -> dict:
     """
     PRIMARY DATA RETRIEVAL TOOL: Executes standard SQL queries directly against SQLite database files or local CSV/Excel table models.
@@ -549,8 +483,8 @@ def tool_query_database_sql(
         sql_query (str): Valid SQLite standard SQL query to execute (SELECT, JOIN, GROUP BY, etc.).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -562,6 +496,26 @@ def tool_query_database_sql(
         }
 
     ext = file_path.suffix.lower()
+
+    # ── 🔬 SCIENTIFIC INSTRUMENTATION: Verify SQLite Format ──
+    # Read the first 16 bytes of the file to verify it is a valid SQLite database.
+    # Standard SQLite files start with the string "SQLite format 3\0".
+    # If the header is different, the file is likely encrypted (SQLCipher) or not a database.
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(16)
+        if header != b"SQLite format 3\x00":
+            from ascii_colors import ASCIIColors
+            ASCIIColors.error(f"[SemanticDataEngineer] File '{file_name}' is NOT a valid SQLite database. Header: {header!r}")
+            return {
+                "success": False,
+                "error": f"File '{file_name}' is not a valid SQLite database. The file header does not match the SQLite standard ('SQLite format 3'). It may be encrypted, corrupted, or a different binary format.",
+                "prompt_injection": f"\n\n⚠️ **Invalid Database Format.**\nThe file '{file_name}' is not a valid SQLite database. It may be encrypted (e.g., SQLCipher) or in a proprietary format.\n\n**Action:** Please inform the user that the database cannot be read directly and might require decryption or conversion."
+            }
+    except Exception as header_err:
+        from ascii_colors import ASCIIColors
+        ASCIIColors.warning(f"[SemanticDataEngineer] Failed to read file header for validation: {header_err}")
+        # Proceed anyway; let the sqlite3 driver handle the error
 
     # Establish connection
     try:
@@ -620,9 +574,7 @@ def tool_update_cell_value(
     row_match_column: str = "",
     row_match_value: str = "",
     column_to_update: str = "",
-    new_value: str = "",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    new_value: str = ""
 ) -> dict:
     """
     Surgically updates a cell value in a spreadsheet or database row without code execution.
@@ -636,8 +588,8 @@ def tool_update_cell_value(
         new_value (str): The new value to set.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -645,7 +597,7 @@ def tool_update_cell_value(
 
     try:
         df, resolved_table = _load_data_source(file_path, table_name)
-        
+
         if row_match_column not in df.columns:
             return {"success": False, "error": f"Row matching column '{row_match_column}' not found."}
         if column_to_update not in df.columns:
@@ -654,7 +606,7 @@ def tool_update_cell_value(
         # Find row and apply update
         mask = df[row_match_column].astype(str) == str(row_match_value)
         match_count = int(mask.sum())
-        
+
         if match_count == 0:
             return {"success": False, "error": f"No rows found matching '{row_match_column} == {row_match_value}'."}
 
@@ -673,25 +625,11 @@ def tool_update_cell_value(
             coerced_val = str(new_value)
 
         df.loc[mask, column_to_update] = coerced_val
-        
+
         # Save updated data
         _save_data_source(df, file_path, resolved_table)
 
-        # Trigger version increment in SQLite and file workspace sync
-        if discussion_instance:
-            existing = discussion_instance.artefacts.get(file_name)
-            if existing:
-                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                new_schema, _ = _parse_data_file(file_path, file_name, version=existing["version"] + 1, progress_cb=None)
-                discussion_instance.artefacts.update(
-                    title=file_name,
-                    new_content=new_schema,
-                    new_type="data",
-                    active=True,
-                    file_ext=file_path.suffix.lower()
-                )
-                discussion_instance.commit()
-
+        # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects file modification.
         return {
             "success": True,
             "rows_updated": match_count,
@@ -704,9 +642,7 @@ def tool_update_cell_value(
 def tool_insert_new_row(
     file_name: str,
     row_data: Dict[str, Any],
-    table_name: Optional[str] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    table_name: Optional[str] = None
 ) -> dict:
     """
     Inserts a new row/record into a spreadsheet or SQLite table.
@@ -717,8 +653,8 @@ def tool_insert_new_row(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -726,7 +662,7 @@ def tool_insert_new_row(
 
     try:
         df, resolved_table = _load_data_source(file_path, table_name)
-        
+
         # Build new row aligning with existing columns
         new_row_dict = {}
         for col in df.columns:
@@ -746,25 +682,11 @@ def tool_insert_new_row(
 
         new_row_df = pd.DataFrame([new_row_dict])
         df = pd.concat([df, new_row_df], ignore_index=True)
-        
+
         # Save
         _save_data_source(df, file_path, resolved_table)
 
-        # Trigger version increment in SQLite and file workspace sync
-        if discussion_instance:
-            existing = discussion_instance.artefacts.get(file_name)
-            if existing:
-                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                new_schema, _ = _parse_data_file(file_path, file_name, version=existing["version"] + 1, progress_cb=None)
-                discussion_instance.artefacts.update(
-                    title=file_name,
-                    new_content=new_schema,
-                    new_type="data",
-                    active=True,
-                    file_ext=file_path.suffix.lower()
-                )
-                discussion_instance.commit()
-
+        # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects file modification.
         return {
             "success": True,
             "output": f"Successfully inserted new record into '{file_name}' (Table: '{resolved_table}'). Row content: {json.dumps(new_row_dict)}"
@@ -777,9 +699,7 @@ def tool_delete_rows_by_criteria(
     file_name: str,
     match_column: str,
     match_value: str,
-    table_name: Optional[str] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    table_name: Optional[str] = None
 ) -> dict:
     """
     Deletes all rows matching a specific column value.
@@ -790,8 +710,8 @@ def tool_delete_rows_by_criteria(
         match_value (str): Value to match in that column.
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -799,37 +719,23 @@ def tool_delete_rows_by_criteria(
 
     try:
         df, resolved_table = _load_data_source(file_path, table_name)
-        
+
         if match_column not in df.columns:
             return {"success": False, "error": f"Matching column '{match_column}' not found."}
 
         mask = df[match_column].astype(str) == str(match_value)
         match_count = int(mask.sum())
-        
+
         if match_count == 0:
             return {"success": False, "error": f"No rows found matching '{match_column} == {match_value}'."}
 
         # Keep everything except the matched rows
         df = df[~mask]
-        
+
         # Save
         _save_data_source(df, file_path, resolved_table)
 
-        # Trigger version increment in SQLite and file workspace sync
-        if discussion_instance:
-            existing = discussion_instance.artefacts.get(file_name)
-            if existing:
-                from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                new_schema, _ = _parse_data_file(file_path, file_name, version=existing["version"] + 1, progress_cb=None)
-                discussion_instance.artefacts.update(
-                    title=file_name,
-                    new_content=new_schema,
-                    new_type="data",
-                    active=True,
-                    file_ext=file_path.suffix.lower()
-                )
-                discussion_instance.commit()
-
+        # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects file modification.
         return {
             "success": True,
             "rows_deleted": match_count,
@@ -837,123 +743,6 @@ def tool_delete_rows_by_criteria(
         }
     except Exception as e:
         return {"success": False, "error": f"Failed to delete rows: {e}"}
-
-
-# ── 6. SECURE RELATIONAL QUERY TOOL (SQL) ───────────────────────────────────
-
-def tool_query_database_sql(
-    file_name: str,
-    sql_query: str
-) -> dict:
-    """
-    Executes standard SQL queries directly against SQLite database files or local CSV/Excel table models.
-
-    Args:
-        file_name (str): Filename of the .db, .sqlite, .csv, or .xlsx file.
-        sql_query (str): Valid SQLite standard SQL query to execute.
-    """
-    import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
-    file_path = (workspace_dir / file_name).resolve()
-
-    if not file_path.exists():
-        return {"success": False, "error": f"File '{file_name}' not found."}
-
-    ext = file_path.suffix.lower()
-    
-    # Establish connection
-    try:
-        conn = sqlite3.connect(":memory:")
-        if ext in (".db", ".sqlite", ".sqlite3"):
-            disk_conn = sqlite3.connect(str(file_path))
-            disk_conn.backup(conn)
-            disk_conn.close()
-        elif ext in (".xlsx", ".xls"):
-            xl = pd.ExcelFile(str(file_path))
-            for sheet_name in xl.sheet_names:
-                table_name = sheet_name.replace(" ", "_")
-                df = pd.read_excel(str(file_path), sheet_name=sheet_name)
-                df.to_sql(table_name, conn, index=False, if_exists="replace")
-        else:
-            sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
-            df = pd.read_csv(str(file_path), sep=sep)
-            df.to_sql(file_path.stem.replace(" ", "_"), conn, index=False, if_exists="replace")
-    except Exception as conn_err:
-        return {"success": False, "error": f"Failed to assemble SQL connection: {conn_err}"}
-
-    # Execute SQL
-    try:
-        # Check if write query (updates/deletes/inserts)
-        clean_query = sql_query.strip()
-        clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
-        clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
-        is_select = clean_query.lower().startswith("select")
-
-        if is_select:
-            df_res = pd.read_sql_query(sql_query, conn)
-            conn.close()
-
-            from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
-            md_table = _dataframe_to_markdown(df_res)
-            return {
-                "success": True,
-                "rows_count": len(df_res),
-                "output": f"SQL Query returned {len(df_res)} row(s):\n\n{md_table}"
-            }
-        else:
-            # Writable query
-            if is_read_only:
-                conn.close()
-                return {"success": False, "error": "Database is read-only. Writable SQL queries (INSERT/UPDATE/DELETE) are blocked."}
-
-            cursor = conn.cursor()
-            cursor.execute(sql_query)
-            conn.commit()
-
-            # Backup modified tables from memory DB back to disk file
-            if ext in (".db", ".sqlite", ".sqlite3"):
-                disk_conn = sqlite3.connect(str(file_path))
-                conn.backup(disk_conn)
-                disk_conn.close()
-            elif ext in (".xlsx", ".xls"):
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                tables = [row[0] for row in cursor.fetchall()]
-                with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
-                    for t in tables:
-                        df_write = pd.read_sql_query(f"SELECT * FROM {t}", conn)
-                        df_write.to_excel(writer, sheet_name=t.replace("_", " "), index=False)
-            else:
-                sep = ";" if ext == ".csv" and ";" in file_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0] else ","
-                df_write = pd.read_sql_query(f"SELECT * FROM {file_path.stem.replace(' ', '_')}", conn)
-                df_write.to_csv(file_path, sep=sep, index=False)
-
-            conn.close()
-
-            # Trigger version increment in SQLite and file workspace sync
-            if discussion_instance:
-                existing = discussion_instance.artefacts.get(file_name)
-                if existing:
-                    from lollms_client.lollms_discussion._mixin_file_import import _parse_data_file
-                    new_schema, _ = _parse_data_file(file_path, file_name, version=existing["version"] + 1, progress_cb=None)
-                    discussion_instance.artefacts.update(
-                        title=file_name,
-                        new_content=new_schema,
-                        new_type="data",
-                        active=True,
-                        file_ext=file_path.suffix.lower()
-                    )
-                    discussion_instance.commit()
-
-            return {
-                "success": True,
-                "rows_affected": cursor.rowcount,
-                "output": f"SQL Write Query completed successfully. Affected rows: {cursor.rowcount}"
-            }
-
-    except Exception as query_err:
-        conn.close()
-        return {"success": False, "error": f"SQL query failed: {query_err}"}
 
 
 # ── 7. ADVANCED MULTI-SERIES CHARTING & PLOT MACRO ──────────────────────────
@@ -967,9 +756,7 @@ def tool_generate_advanced_visualization(
     title: Optional[str] = None,
     x_label: Optional[str] = None,
     y_label: Optional[str] = None,
-    colors: Optional[List[str]] = None,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    colors: Optional[List[str]] = None
 ) -> dict:
     """
     Generates advanced multi-series charts (multi-line, stacked bar, scatter, pie) in high-quality dark mode.
@@ -991,8 +778,8 @@ def tool_generate_advanced_visualization(
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -1120,9 +907,7 @@ def tool_compute_statistics_and_plot(
     x_column: Optional[str] = None,
     y_column: Optional[str] = None,
     title: Optional[str] = None,
-    color: str = "#4f46e5",
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    color: str = "#4f46e5"
 ) -> dict:
     """
     Computes numerical statistics (mean, variance, standard deviation, null counts)
@@ -1143,8 +928,8 @@ def tool_compute_statistics_and_plot(
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -1248,9 +1033,7 @@ def tool_compute_statistics_and_plot(
 # ── 6. BOOTSTRAP TBOX MACRO ─────────────────────────────────────────────────
 
 def tool_bootstrap_tbox_from_database(
-    file_name: str,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    file_name: str
 ) -> dict:
     """
     Scans a database file (SQLite, Excel, CSV) and bootstraps a clean ontological schema (TBox).
@@ -1260,8 +1043,8 @@ def tool_bootstrap_tbox_from_database(
         file_name (str): The filename of the DB, CSV, or Excel file in the workspace.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
@@ -1335,9 +1118,7 @@ def tool_bootstrap_tbox_from_database(
 
 def tool_convert_to_abox(
     file_name: str,
-    tbox_file_name: str,
-    discussion_instance: Optional[Any] = None,
-    lollms_client_instance: Optional[Any] = None
+    tbox_file_name: str
 ) -> dict:
     """
     Reads a database, parses rows based on a TBox schema, and compiles them into
@@ -1348,24 +1129,22 @@ def tool_convert_to_abox(
         tbox_file_name (str): Filename of the TBox schema file (bootstrapped or custom).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Use Discussion Workspace Path
-    workspace_dir = _get_workspace_dir(discussion_instance)
+    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
+    workspace_dir = Path(".")
     db_file_path = (workspace_dir / file_name).resolve()
     tbox_path = (workspace_dir / tbox_file_name).resolve()
 
     if not db_file_path.exists() or not tbox_path.exists():
         return {"success": False, "error": "Database or TBox file does not exist in workspace."}
 
-    if not discussion_instance or not discussion_instance.memory_manager:
-        return {"success": False, "error": "No active discussion or memory manager found."}
-
+    # 🛑 AGNOSTIC: Tool does not access discussion_instance.memory_manager.
+    # It generates the ABox data and returns it. The orchestrator is responsible
+    # for ingesting the returned abox_data into long-term memory if desired.
     try:
         with open(tbox_path, "r", encoding="utf-8") as f:
             tbox = json.load(f)
 
-        mm = discussion_instance.memory_manager
-        nodes_created = 0
-        relationships_created = 0
+        abox_data = []
 
         # Process each class defined in the TBox
         for class_name, class_meta in tbox.get("classes", {}).items():
@@ -1386,7 +1165,7 @@ def tool_convert_to_abox(
             }
 
             # Map rows to ABox engrams
-            for idx, row in df.head(50).iterrows(): # Limit ABox inserts to first 50 rows for safety
+            for idx, row in df.head(50).iterrows():  # Limit to first 50 rows for safety
                 pk_val = str(row.iloc[0]) if len(row) > 0 else str(idx)
                 subject_id = f"{class_name.split(':')[-1]}_{pk_val}".lower()
 
@@ -1398,37 +1177,17 @@ def tool_convert_to_abox(
                         content_parts.append(f"  • {prop_name.split(':')[-1]}: {row[col]}")
 
                 content_str = "\n".join(content_parts)
-
-                # Add to persistent memory database
-                mem = mm.add(
-                    content=content_str,
-                    importance=0.75,
-                    tags=["abox_assertion", class_name.split(':')[-1]],
-                    subject_group=class_name.split(':')[-1].lower(),
-                    level=2,
-                    subject=subject_id,
-                    predicate="RELATED_TO",
-                    obj=class_name.split(':')[-1].lower()
-                )
-                nodes_created += 1
-
-                # Relate to general class node
-                if mem:
-                    mm.add_relationship(
-                        source_id=mem["id"],
-                        target_id=mem["id"],
-                        relationship_type="RELATED_TO",
-                        weight=1.0
-                    )
-                    relationships_created += 1
-
-        discussion_instance.commit()
+                abox_data.append({
+                    "content": content_str,
+                    "subject_id": subject_id,
+                    "class_name": class_name
+                })
 
         return {
             "success": True,
-            "nodes_created": nodes_created,
-            "relationships_created": relationships_created,
-            "message": f"ABox Translation Complete. Created {nodes_created} semantic engrams and {relationships_created} relationship edges."
+            "abox_data": abox_data,
+            "nodes_count": len(abox_data),
+            "output": f"ABox Translation Complete. Generated {len(abox_data)} semantic nodes. Ready for memory ingestion."
         }
 
     except Exception as e:
