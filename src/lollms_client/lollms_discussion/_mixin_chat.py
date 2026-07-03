@@ -1528,7 +1528,7 @@ class ChatMixin:
         # If LCP binding exists, merge all discovered tools (including newly mounted ones)
         if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
             try:
-                lcp_tools = lcp_binding.to_chat_tool_specs()
+                lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
                 active_tools.update(lcp_tools)
             except Exception as ex:
                 trace_exception(ex)
@@ -1648,6 +1648,12 @@ class ChatMixin:
         # Track the count of exact tool call signatures to prevent infinite loops (Success Loops)
         # We allow up to 2 identical calls per turn to permit legitimate retries after null/empty output.
         tool_signature_counts = {}
+
+        # 🛑 CRITICAL FIX: Track SUCCESSFUL tool signatures to enforce strict 1-strike policy.
+        # Once a tool succeeds, the LLM must use the result from context. It is FORBIDDEN
+        # to re-run the same tool with the same parameters, even if interleaved with other calls.
+        # This set is NEVER cleared during the turn.
+        successful_tool_signatures = set()
 
         # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
         # 🛑 CRITICAL FIX: Ensure FailureMemory is always fresh and empty at the start of every chat() turn.
@@ -1888,21 +1894,46 @@ class ChatMixin:
 
                     # Execute the tool sequentially
                     try:
-                        # ── 🛑 REPETITIVE SUCCESS LOOP GUARD ────────────────────────
-                        # Check if we have executed this EXACT tool signature more than 2 times in this turn.
-                        # We allow up to 2 identical calls to permit legitimate retries after null/empty output.
-                        # If it exceeds 2, we force break to prevent infinite success loops.
-                        tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
-                        force_break_after_tool = False
+                        # ── 🛑 REPETITIVE SUCCESS LOOP GUARD (CONTEXT-AWARE) ────────────────────────
+                        # Check if we have ALREADY executed this EXACT tool signature successfully.
+                        # We enforce a strict 1-strike policy: if a tool succeeded, the LLM must
+                        # use the result from context. It is FORBIDDEN to re-run the same tool
+                        # with the same parameters, even if interleaved with other tool calls.
+                        # This prevents interleaved success-loops (A succeeds → B fails → retry A).
+                        #
+                        # EXCEPTION: If the tool parameters include a file, and that file has been
+                        # modified on disk since the last success (e.g., via an <artifact> update),
+                        # we ALLOW the call because it is a legitimate Edit-Compile-Run-Debug cycle.
+                        def _get_file_hashes(params: dict) -> dict:
+                            """Returns a dict of {param_name: file_hash} for any param that is an existing file."""
+                            hashes = {}
+                            for k, v in params.items():
+                                if isinstance(v, str):
+                                    p = Path(v)
+                                    if p.is_file():
+                                        try:
+                                            import hashlib
+                                            content = p.read_bytes()
+                                            hashes[k] = hashlib.md5(content).hexdigest()
+                                        except Exception:
+                                            pass
+                            return hashes
 
-                        if tool_signature_counts[full_signature] > 2:
-                            ASCIIColors.warning(f"[ChatMixin] Repetitive success loop detected for '{tool_name}'. Count: {tool_signature_counts[full_signature]}")
+                        current_file_hashes = _get_file_hashes(tool_params)
+                        # Create a signature that includes the file hashes so it changes if files change
+                        context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
+
+                        if context_aware_signature in successful_tool_signatures:
+                            ASCIIColors.warning(f"[ChatMixin] Repetitive SUCCESS loop blocked for '{tool_name}'. Signature already in successful set and files unchanged.")
                             tool_res = {
                                 "success": False,
-                                "error": f"Repetitive tool call detected. You have called '{tool_name}' with these exact parameters {tool_signature_counts[full_signature]} times. The output is already in your context. Do not call it again.",
-                                "prompt_injection": f"\n\n🛑 **STOP.** You are calling '{tool_name}' again with the exact same parameters. This is a loop. The data from the previous execution is already in your context. Analyze it and move on."
+                                "error": f"Repetitive tool call detected. You have already successfully called '{tool_name}' with these exact parameters, and the input files have not changed. The output is already in your context. Do not call it again.",
+                                "prompt_injection": f"\n\n🛑 **STOP.** You are calling '{tool_name}' again with the exact same parameters after it already succeeded. This is a loop. The data from the previous execution is already in your context above. Analyze it and move on to answer the user."
                             }
                             force_break_after_tool = True
+                        else:
+                            tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
+                            force_break_after_tool = False
 
                         if force_break_after_tool:
                             # Use the fake error result prepared above
@@ -1918,15 +1949,13 @@ class ChatMixin:
                         elif active_tools and tool_name in active_tools and "callable" in active_tools[tool_name]:
                             # Sync all active artifacts to disk BEFORE tool execution
                             try:
-                                sync_result = self.artefacts.sync_all_active_to_disk()
-                                if isinstance(sync_result, tuple) and len(sync_result) == 2:
-                                    sync_ws, sync_files = sync_result
-                                else:
-                                    # Handle cases where sync_all_active_to_disk returns None 
-                                    # (e.g., when there are no active artifacts to sync)
-                                    sync_ws, sync_files = None, []
+                                # 🛑 CRITICAL FIX: sync_all_active_to_disk() now ALWAYS returns a tuple.
+                                # This ensures artifacts created in the previous round (e.g., via <artifact> tags)
+                                # are physically materialized on disk before the tool executes.
+                                sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
                             except Exception as ex:
                                 trace_exception(ex)
+                                sync_ws, sync_files = None, []
 
                             import os
                             from pathlib import Path
@@ -1982,9 +2011,10 @@ class ChatMixin:
                                 # We do NOT change CWD here to avoid double-changedirectory conflicts.
                                 call_kwargs = dict(sanitized_params)
 
-                                # Inject active session instances into the tool execution call
-                                call_kwargs["discussion_instance"] = self
-                                call_kwargs["lollms_client_instance"] = self.lollmsClient
+                                # 🛑 CRITICAL FIX: Do NOT inject discussion_instance or lollms_client_instance
+                                # into the direct callable path. This violates the LCP Tool Agnosticism Doctrine.
+                                # Tools must be standalone Unix-style utilities operating on CWD + relative paths.
+                                # The orchestrator handles artifact registration and database commits.
 
                                 # ── Take BEFORE Snapshot ──
                                 files_before = {}
@@ -2014,7 +2044,7 @@ class ChatMixin:
                                                     pass
 
                                 # Execute directly (no thread) - LCP handles CWD internally
-                                tool_res = active_tools[tool_name]["callable"](**call_kwargs)
+                                tool_res = active_tools[tool_name]["callable"](discussion_instance=self,**call_kwargs)
 
                                 # ── Take AFTER Snapshot and Auto-Sync Artifacts ──
                                 files_after = {}
@@ -2348,9 +2378,10 @@ class ChatMixin:
                                                     ai_msg.content += f'\n\n{tag}\n'
                                                 self.commit()
                             finally:
-                                # No CWD restoration needed - ChatMixin never changed it
-                                # LCP Binding handles its own CWD cleanup internally
-                                pass
+                                # 🛑 CRITICAL FIX: ALWAYS restore CWD to prevent workspace corruption.
+                                # If a tool crashes, the CWD must be reverted so subsequent tool calls
+                                # and the files_before snapshot in LCPBinding operate correctly.
+                                os.chdir(old_cwd)
                         # 🛑 CRITICAL FIX: If the tool is registered via LCP schema (no "callable" key),
                         # defer to the LCP binding's unified execute_tool() method.
                         elif hasattr(self.lollmsClient, "tools") and self.lollmsClient.tools is not None and tool_name in active_tools:
@@ -2359,7 +2390,6 @@ class ChatMixin:
                                tool_params, 
                                lollms_client_instance=self.lollmsClient, 
                                discussion_instance=self,
-                               discussion=self
                            )
                         else:
                            tool_res = {
@@ -2445,6 +2475,14 @@ class ChatMixin:
                                 # 🛡️ CRITICAL FIX: Guard against NoneType output from tools
                                 if full_dump is None:
                                     full_dump = "Tool executed successfully but returned no output content."
+                                # 🛑 CRITICAL FIX: Ensure full_dump is a string before slicing.
+                                # The extraction logic above may leave full_dump as a dict or list
+                                # if no unwrapping key was found, causing TypeError on [:2000].
+                                if not isinstance(full_dump, str):
+                                    try:
+                                        full_dump = json.dumps(full_dump, indent=2, default=str, ensure_ascii=False)
+                                    except Exception:
+                                        full_dump = str(full_dump)
                                 safe_output = full_dump[:2000] + ("..." if len(full_dump) > 2000 else "")
                                 details_block = f"Output Logs:\n{safe_output}\n"
                         else:
@@ -2490,6 +2528,9 @@ class ChatMixin:
                         clean_result_str = f"Error executing tool '{tool_name}': {e}"
                         status_done_line = f"* Execution crashed.\n"
                         details_block = f"Crash Details:\n{str(e)}\n"
+                        # 🛑 CRITICAL FIX: Set tool_res to a failure dict so is_failure and tool_success
+                        # are correctly evaluated below, preventing <!-- status:success --> on crashes.
+                        tool_res = {"success": False, "error": str(e)}
 
                     # Determine the status comment based on the execution outcome
                     # 🛑 CRITICAL FIX: Check the raw tool_res dict FIRST for explicit failure signals.
@@ -2516,6 +2557,14 @@ class ChatMixin:
                     if not isinstance(tool_res, dict):
                         # Non-dict results: fall back to string matching
                         tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
+
+                    # 🛑 CRITICAL FIX: Record successful signatures to enforce 1-strike policy.
+                    # This prevents the LLM from re-running a successful tool even if
+                    # interleaved with other failing tool calls. We use the context-aware
+                    # signature so that if the LLM updates a file and retries, it is allowed.
+                    if tool_success and not force_break_after_tool:
+                        successful_tool_signatures.add(context_aware_signature)
+                        ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
 
                     tool_calls_this_turn.append({
                         "name": tool_name,
@@ -2567,6 +2616,21 @@ class ChatMixin:
                             sender_type="user",
                             content=user_part
                         ))
+
+                        # ── 🛑 CRITICAL FIX: DYNAMIC ARTIFACT INJECTION ─────────────────
+                        # If the tool created new files, we must update the virtual_history
+                        # so the LLM knows they exist. To preserve the KV-cache, we append
+                        # a system marker to the LAST user message we just added.
+                        new_files_this_run = [a.get("title") for a in self._affected_artefacts_this_turn if a.get("title")]
+                        if new_files_this_run:
+                            new_files_str = ", ".join(f"`{f}`" for f in new_files_this_run)
+                            # Mutate the last user message in-place to inject the artifact update
+                            virtual_history[-1].content += (
+                                f"\n\n[SYSTEM: New artifacts available in workspace: {new_files_str}. "
+                                f"You can read or reference these files in your next steps.]"
+                            )
+                            ASCIIColors.info(f"[ChatMixin] Injected {len(new_files_this_run)} new artifacts into virtual_history context.")
+
                         # 🛑 CRITICAL: Force the loop to continue so the LLM generates a final answer
                         # The tool succeeded — the LLM MUST now read the result and respond to the user.
                         continue
