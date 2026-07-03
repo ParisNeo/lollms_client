@@ -6,6 +6,7 @@ import uuid
 import importlib.util
 import ast
 import re
+import traceback
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
 
@@ -241,13 +242,26 @@ class LCPBinding(LollmsToolBinding):
 
         for folder in self.tools_folders:
             if not folder or not folder.is_dir(): 
-                ASCIIColors.warning(f"[LCP Discovery] Folder does not exist: {folder}")
+                ASCIIColors.warning(f"[LCP Discovery] Folder does not exist or is not a directory: {folder}")
                 continue
 
             for item in folder.iterdir():
                 py_file = None
                 if item.is_dir():
+                    # Standard convention: directory name matches filename (e.g., my_lib/my_lib.py)
                     py_file = item / f"{item.name}.py"
+                    if not py_file.exists():
+                        # Fallback: Scan for any .py file inside the directory (excluding __init__.py)
+                        # This ensures tools are discovered even if the strict naming convention isn't met.
+                        sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
+                        if sub_py_files:
+                            ASCIIColors.info(f"[LCP Discovery] Standard file '{py_file.name}' not found in '{item.name}'. Falling back to scan: {[f.name for f in sub_py_files]}")
+                            for fallback_py in sub_py_files:
+                                self._load_tool_file(fallback_py)
+                            continue
+                        else:
+                            ASCIIColors.warning(f"[LCP Discovery]   Directory '{item.name}' has no matching .py tool file.")
+                            continue
                 elif item.suffix == ".py" and item.stem != "__init__":
                     py_file = item
 
@@ -422,145 +436,241 @@ class LCPBinding(LollmsToolBinding):
             if current_cwd_str not in old_pythonpath:
                 os.environ["PYTHONPATH"] = f"{current_cwd_str}{os.pathsep}{old_pythonpath}" if old_pythonpath else current_cwd_str
             if current_cwd_str not in old_path:
-                os.environ["PATH"] = f"{current_cwd_str}{os.pathsep}{old_path}"
+                os.environ["PATH"] = f"{current_cwd_str}{os.pathsep}{old_path}" if old_path else current_cwd_str
 
-                # 6. Capture stdout/stderr
-                captured_stdout = io.StringIO()
-                captured_stderr = io.StringIO()
-                old_sys_stdout = sys.stdout
-                old_sys_stderr = sys.stderr
+            # 6. Capture stdout/stderr
+            captured_stdout = io.StringIO()
+            captured_stderr = io.StringIO()
+            old_sys_stdout = sys.stdout
+            old_sys_stderr = sys.stderr
 
-                try:
-                    sys.stdout = captured_stdout
-                    sys.stderr = captured_stderr
+            try:
+                sys.stdout = captured_stdout
+                sys.stderr = captured_stderr
 
-                    # Execute with CLEAN params
-                    # Only pass parameters that are explicitly accepted by the tool signature, OR are generic *args/**kwargs
-                    import inspect
-                    sig = inspect.signature(execute_function)
-                    clean_params = {}
-                    for k, v in params.items():
-                        if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-                            clean_params[k] = v
-                        elif k in ("discussion_instance", "lollms_client_instance", "discussion", "client"):
-                            continue
+                # Execute with CLEAN params
+                # Only pass parameters that are explicitly accepted by the tool signature, OR are generic *args/**kwargs
+                import inspect
+                sig = inspect.signature(execute_function)
+                clean_params = {}
+                for k, v in params.items():
+                    if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        clean_params[k] = v
+                    elif k in ("discussion_instance", "lollms_client_instance", "discussion", "client"):
+                        continue
 
-                    # Inject orchestrator context parameters if explicitly requested by the tool signature
-                    if "discussion_instance" in sig.parameters and "discussion_instance" not in clean_params:
-                        clean_params["discussion_instance"] = discussion_instance
-                    elif "discussion" in sig.parameters and "discussion" not in clean_params:
-                        clean_params["discussion"] = discussion_instance
+                # Inject orchestrator context parameters if explicitly requested by the tool signature
+                if "discussion_instance" in sig.parameters and "discussion_instance" not in clean_params:
+                    clean_params["discussion_instance"] = discussion_instance
+                elif "discussion" in sig.parameters and "discussion" not in clean_params:
+                    clean_params["discussion"] = discussion_instance
 
-                    if "lollms_client_instance" in sig.parameters and "lollms_client_instance" not in clean_params:
-                        clean_params["lollms_client_instance"] = lollms_client_instance
-                    elif "client" in sig.parameters and "client" not in clean_params:
-                        clean_params["client"] = lollms_client_instance
+                if "lollms_client_instance" in sig.parameters and "lollms_client_instance" not in clean_params:
+                    clean_params["lollms_client_instance"] = lollms_client_instance
+                elif "client" in sig.parameters and "client" not in clean_params:
+                    clean_params["client"] = lollms_client_instance
 
-                    result = execute_function(**clean_params)
-                finally:
-                    sys.stdout = old_sys_stdout
-                    sys.stderr = old_sys_stderr
-                    # Forward prints
-                    if captured_stdout.getvalue():
-                        old_sys_stdout.write(f"[LCP Tool '{tool_name}' STDOUT]:\n{captured_stdout.getvalue()}")
-                        old_sys_stdout.flush()
-                    if captured_stderr.getvalue():
-                        old_sys_stdout.write(f"[LCP Tool '{tool_name}' STDERR]:\n{captured_stderr.getvalue()}")
-                        old_sys_stdout.flush()
+                result = execute_function(**clean_params)
+            finally:
+                sys.stdout = old_sys_stdout
+                sys.stderr = old_sys_stderr
+                # Forward prints
+                if captured_stdout.getvalue():
+                    old_sys_stdout.write(f"[LCP Tool '{tool_name}' STDOUT]:\n{captured_stdout.getvalue()}")
+                    old_sys_stdout.flush()
+                if captured_stderr.getvalue():
+                    old_sys_stdout.write(f"[LCP Tool '{tool_name}' STDERR]:\n{captured_stderr.getvalue()}")
+                    old_sys_stdout.flush()
 
-                # ── POST-EXECUTION: AUTOMATIC ARTIFACT SYNC ──
-                # 7. Snapshot workspace files AFTER execution
-                files_after = {}
-                if current_cwd.exists():
-                    for f in current_cwd.rglob("*"):
-                        if f.is_file():
-                            rel_path = f.relative_to(current_cwd)
-                            try:
-                                content = f.read_text(encoding="utf-8", errors="ignore")
-                                files_after[rel_path] = {
-                                    "hash": hash(content),
-                                    "mtime": f.stat().st_mtime,
-                                    "path": f,
-                                    "content": content
-                                }
-                            except Exception:
-                                files_after[rel_path] = {
-                                    "hash": None,
-                                    "mtime": f.stat().st_mtime,
-                                    "path": f,
-                                    "content": None
-                                }
+            # ── 🛡️ ERROR TRACKING: Enrich tool-returned errors with tracebacks ──
+            # If the tool explicitly returned an error dict, we capture the current
+            # stack trace to aid debugging.
+            if isinstance(result, dict) and result.get("success") is False and result.get("error"):
+                tb_str = "".join(traceback.format_stack())
+                result["traceback"] = f"Explicit tool failure captured during execution:\n{tb_str}"
+                ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' reported failure: {result['error']}")
+                ASCIIColors.error(f"Traceback:\n{tb_str}")
 
-                if not discussion_instance:
-                    ASCIIColors.warning("[LCP Tool] No discussion_instance provided. Skipping artifact sync.")
-                else:
-                    # 8. Detect NEW files
-                    new_files = set(files_after.keys()) - set(files_before.keys())
+            # ── POST-EXECUTION: AUTOMATIC ARTIFACT SYNC ──
+            # 7. Snapshot workspace files AFTER execution
+            files_after = {}
+            if current_cwd.exists():
+                for f in current_cwd.rglob("*"):
+                    if f.is_file():
+                        rel_path = f.relative_to(current_cwd)
+                        try:
+                            content = f.read_text(encoding="utf-8", errors="ignore")
+                            files_after[rel_path] = {
+                                "hash": hash(content),
+                                "mtime": f.stat().st_mtime,
+                                "path": f,
+                                "content": content
+                            }
+                        except Exception:
+                            files_after[rel_path] = {
+                                "hash": None,
+                                "mtime": f.stat().st_mtime,
+                                "path": f,
+                                "content": None
+                            }
 
-                    for rel_path in new_files:
-                        file_info = files_after[rel_path]
-                        file_name = rel_path.name
-                        file_ext = rel_path.suffix.lower()
-                        file_path = file_info["path"]
-                        file_size = file_path.stat().st_size
+            if not discussion_instance:
+                ASCIIColors.warning("[LCP Tool] No discussion_instance provided. Skipping artifact sync.")
+            else:
+                # 8. Detect NEW files
+                new_files = set(files_after.keys()) - set(files_before.keys())
 
-                        # 1. Determine Artifact Type based on Extension
+                for rel_path in new_files:
+                    file_info = files_after[rel_path]
+                    file_name = rel_path.name
+                    file_ext = rel_path.suffix.lower()
+                    file_path = file_info["path"]
+                    file_size = file_path.stat().st_size
+
+                    # 1. Determine Artifact Type based on Extension
+                    atype = "document"
+                    if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+                        atype = "code"
+                    elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
+                        atype = "data"
+                    elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
                         atype = "document"
-                        if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
-                            atype = "code"
-                        elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
-                            atype = "data"
-                        elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
-                            atype = "document"
-                        elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
-                            atype = "image"
-                        elif file_ext in (".pdf", ".docx", ".zip", ".tar", ".gz"):
-                            atype = "document"
+                    elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+                        atype = "image"
+                    elif file_ext in (".pdf", ".docx", ".zip", ".tar", ".gz"):
+                        atype = "document"
 
-                        # 2. Decide if we should read content or create a placeholder
-                        EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
-                                                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
-                                                ".zip", ".tar", ".gz", ".pdf", ".docx"}
+                    # 2. Decide if we should read content or create a placeholder
+                    EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
+                                            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
+                                            ".zip", ".tar", ".gz", ".pdf", ".docx"}
 
-                        should_read_content = True
-                        content_placeholder = None
+                    should_read_content = True
+                    content_placeholder = None
 
-                        if file_ext in EXPLICIT_BINARY_EXTS:
+                    if file_ext in EXPLICIT_BINARY_EXTS:
+                        should_read_content = False
+                        content_placeholder = (
+                            f"### Data File Generated: `{file_name}`\n\n"
+                            f"This file was created by the tool `{tool_name}`.\n"
+                            f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
+                            f"- **Size**: {file_size:,} bytes\n"
+                            f"- **Location**: `./{file_name}`\n\n"
+                            f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
+                        )
+                    elif file_info["content"] is None:
+                        try:
+                            with open(file_path, 'rb') as f:
+                                chunk = f.read(1024)
+                                if b'\x00' in chunk:
+                                    should_read_content = False
+                                    content_placeholder = (
+                                        f"### Binary File Detected: `{file_name}`\n\n"
+                                        f"This file appears to be binary (contains null bytes).\n"
+                                        f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
+                                        f"- **Size**: {file_size:,} bytes\n"
+                                        f"- **Location**: `./{file_name}`\n\n"
+                                        f"> **Action**: Download from Workspace Artifacts panel."
+                                    )
+                                else:
+                                    ASCIIColors.warning(f"[LCP Tool] File '{file_name}' read failed initially, forcing text read with encoding ignore.")
+                                    forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
+                                    file_info["content"] = forced_content
+                                    should_read_content = True
+                        except Exception as e:
+                            ASCIIColors.error(f"[LCP Tool] Unable to inspect file '{file_name}': {e}")
                             should_read_content = False
-                            content_placeholder = (
-                                f"### Data File Generated: `{file_name}`\n\n"
-                                f"This file was created by the tool `{tool_name}`.\n"
-                                f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
-                                f"- **Size**: {file_size:,} bytes\n"
-                                f"- **Location**: `./{file_name}`\n\n"
-                                f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
-                            )
-                        elif file_info["content"] is None:
-                            try:
-                                with open(file_path, 'rb') as f:
-                                    chunk = f.read(1024)
-                                    if b'\x00' in chunk:
-                                        should_read_content = False
-                                        content_placeholder = (
-                                            f"### Binary File Detected: `{file_name}`\n\n"
-                                            f"This file appears to be binary (contains null bytes).\n"
-                                            f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
-                                            f"- **Size**: {file_size:,} bytes\n"
-                                            f"- **Location**: `./{file_name}`\n\n"
-                                            f"> **Action**: Download from Workspace Artifacts panel."
-                                        )
-                                    else:
-                                        ASCIIColors.warning(f"[LCP Tool] File '{file_name}' read failed initially, forcing text read with encoding ignore.")
-                                        forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
-                                        file_info["content"] = forced_content
-                                        should_read_content = True
-                            except Exception as e:
-                                ASCIIColors.error(f"[LCP Tool] Unable to inspect file '{file_name}': {e}")
-                                should_read_content = False
-                                content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
+                            content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
 
-                        # 3. Register Artifact
-                        if not should_read_content and content_placeholder:
+                    # 3. Register Artifact
+                    if not should_read_content and content_placeholder:
+                        existing_art = discussion_instance.artefacts.get(file_name)
+                        if existing_art:
+                            art = discussion_instance.artefacts.update(
+                                title=file_name,
+                                new_content=content_placeholder,
+                                new_type=atype,
+                                active=True,
+                                commit_message=f"Updated binary file reference by tool '{tool_name}'"
+                            )
+                        else:
+                            art = discussion_instance.artefacts.add(
+                                title=file_name,
+                                artefact_type=atype,
+                                content=content_placeholder,
+                                active=True,
+                                commit_message=f"Created by tool '{tool_name}'"
+                            )
+                        ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
+
+                        # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
+                        if discussion_instance.active_branch_id:
+                            ai_msg = discussion_instance.get_message(discussion_instance.active_branch_id)
+                            if ai_msg:
+                                if atype == "image":
+                                    ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                                else:
+                                    ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                                discussion_instance.commit()
+                        continue
+
+                    # Handle Text/Readable Files
+                    existing_art = discussion_instance.artefacts.get(file_name)
+                    if existing_art:
+                        ASCIIColors.info(f"[LCP Tool] File '{file_name}' reappeared on disk. Updating artifact.")
+                        art = discussion_instance.artefacts.update(
+                            title=file_name,
+                            new_content=file_info["content"],
+                            new_type=atype,
+                            active=True,
+                            commit_message=f"Restored by tool '{tool_name}'"
+                        )
+                    else:
+                        ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Creating NEW artifact from file: '{file_name}'")
+                        art = discussion_instance.artefacts.add(
+                            title=file_name,
+                            artefact_type=atype,
+                            content=file_info["content"],
+                            active=True,
+                            commit_message=f"Created by tool '{tool_name}'"
+                        )
+                        ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Created NEW artifact: '{file_name}'")
+
+                    # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
+                    if discussion_instance.active_branch_id:
+                        ai_msg = discussion_instance.get_message(discussion_instance.active_branch_id)
+                        if ai_msg:
+                            if atype == "image":
+                                ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
+                            else:
+                                ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
+                            discussion_instance.commit()
+
+                # 9. Detect MODIFIED files
+                common_files = set(files_after.keys()) & set(files_before.keys())
+                for rel_path in common_files:
+                    before_info = files_before[rel_path]
+                    after_info = files_after[rel_path]
+                    file_name = rel_path.name
+                    file_ext = rel_path.suffix.lower()
+                    file_path = after_info["path"]
+
+                    content_changed = before_info.get("hash") != after_info.get("hash")
+                    became_binary = before_info.get("content") is not None and after_info.get("content") is None
+                    became_text = before_info.get("content") is None and after_info.get("content") is not None
+
+                    if content_changed or became_binary or became_text:
+                        if after_info["content"] is None:
+                            ASCIIColors.info(f"[LCP Tool] Detected modified binary file '{file_name}'. Updating placeholder artifact.")
+                            content_placeholder = (
+                                f"### Binary File Modified: `{file_name}`\n\n"
+                                f"This file was updated by the tool `{tool_name}`.\n"
+                                f"- **Type**: {file_ext.upper()} Binary/Data\n"
+                                f"- **Location**: `./{file_name}`\n"
+                                f"- **Size**: {file_path.stat().st_size:,} bytes\n\n"
+                                f"You can download or view this file directly from the Workspace Artifacts panel."
+                            )
+
                             existing_art = discussion_instance.artefacts.get(file_name)
                             if existing_art:
                                 art = discussion_instance.artefacts.update(
@@ -568,7 +678,7 @@ class LCPBinding(LollmsToolBinding):
                                     new_content=content_placeholder,
                                     new_type=atype,
                                     active=True,
-                                    commit_message=f"Updated binary file reference by tool '{tool_name}'"
+                                    commit_message=f"Modified binary file by tool '{tool_name}'"
                                 )
                             else:
                                 art = discussion_instance.artefacts.add(
@@ -576,9 +686,9 @@ class LCPBinding(LollmsToolBinding):
                                     artefact_type=atype,
                                     content=content_placeholder,
                                     active=True,
-                                    commit_message=f"Created by tool '{tool_name}'"
+                                    commit_message=f"Synced binary file by tool '{tool_name}'"
                                 )
-                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Registered file (placeholder): '{file_name}'")
+                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] 🔄 Updated binary file reference: '{file_name}'")
 
                             # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
                             if discussion_instance.active_branch_id:
@@ -591,27 +701,33 @@ class LCPBinding(LollmsToolBinding):
                                     discussion_instance.commit()
                             continue
 
-                        # Handle Text/Readable Files
+                        # Handle Text/Readable Modified Files
                         existing_art = discussion_instance.artefacts.get(file_name)
                         if existing_art:
-                            ASCIIColors.info(f"[LCP Tool] File '{file_name}' reappeared on disk. Updating artifact.")
+                            atype = existing_art.get("type", "document")
+                            if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
+                                atype = "code"
+                            elif file_ext in (".csv", ".db", ".sqlite", ".xlsx", ".xls"):
+                                atype = "data"
+
                             art = discussion_instance.artefacts.update(
                                 title=file_name,
-                                new_content=file_info["content"],
+                                new_content=after_info["content"],
                                 new_type=atype,
                                 active=True,
-                                commit_message=f"Restored by tool '{tool_name}'"
+                                commit_message=f"Modified by tool '{tool_name}'"
                             )
+                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] 🔄 Updated artifact '{file_name}' (v{existing_art.get('version', 1)+1})")
                         else:
-                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Creating NEW artifact from file: '{file_name}'")
+                            ASCIIColors.warning(f"[LCP Tool] File '{file_name}' modified on disk but no artifact found. Creating one.")
+                            atype = "code" if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir") else "document"
                             art = discussion_instance.artefacts.add(
                                 title=file_name,
                                 artefact_type=atype,
-                                content=file_info["content"],
+                                content=after_info["content"],
                                 active=True,
-                                commit_message=f"Created by tool '{tool_name}'"
+                                commit_message=f"Synced by tool '{tool_name}'"
                             )
-                            ASCIIColors.success(f"[LCP Tool '{tool_name}'] ✨ Created NEW artifact: '{file_name}'")
 
                         # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
                         if discussion_instance.active_branch_id:
@@ -623,101 +739,15 @@ class LCPBinding(LollmsToolBinding):
                                     ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
                                 discussion_instance.commit()
 
-                    # 9. Detect MODIFIED files
-                    common_files = set(files_after.keys()) & set(files_before.keys())
-                    for rel_path in common_files:
-                        before_info = files_before[rel_path]
-                        after_info = files_after[rel_path]
-                        file_name = rel_path.name
-                        file_ext = rel_path.suffix.lower()
-                        file_path = after_info["path"]
-
-                        content_changed = before_info.get("hash") != after_info.get("hash")
-                        became_binary = before_info.get("content") is not None and after_info.get("content") is None
-                        became_text = before_info.get("content") is None and after_info.get("content") is not None
-
-                        if content_changed or became_binary or became_text:
-                            if after_info["content"] is None:
-                                ASCIIColors.info(f"[LCP Tool] Detected modified binary file '{file_name}'. Updating placeholder artifact.")
-                                content_placeholder = (
-                                    f"### Binary File Modified: `{file_name}`\n\n"
-                                    f"This file was updated by the tool `{tool_name}`.\n"
-                                    f"- **Type**: {file_ext.upper()} Binary/Data\n"
-                                    f"- **Location**: `./{file_name}`\n"
-                                    f"- **Size**: {file_path.stat().st_size:,} bytes\n\n"
-                                    f"You can download or view this file directly from the Workspace Artifacts panel."
-                                )
-
-                                existing_art = discussion_instance.artefacts.get(file_name)
-                                if existing_art:
-                                    art = discussion_instance.artefacts.update(
-                                        title=file_name,
-                                        new_content=content_placeholder,
-                                        new_type=atype,
-                                        active=True,
-                                        commit_message=f"Modified binary file by tool '{tool_name}'"
-                                    )
-                                else:
-                                    art = discussion_instance.artefacts.add(
-                                        title=file_name,
-                                        artefact_type=atype,
-                                        content=content_placeholder,
-                                        active=True,
-                                        commit_message=f"Synced binary file by tool '{tool_name}'"
-                                    )
-                                ASCIIColors.success(f"[LCP Tool '{tool_name}'] 🔄 Updated binary file reference: '{file_name}'")
-
-                                # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
-                                if discussion_instance.active_branch_id:
-                                    ai_msg = discussion_instance.get_message(discussion_instance.active_branch_id)
-                                    if ai_msg:
-                                        if atype == "image":
-                                            ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
-                                        else:
-                                            ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
-                                        discussion_instance.commit()
-                                continue
-
-                            # Handle Text/Readable Modified Files
-                            existing_art = discussion_instance.artefacts.get(file_name)
-                            if existing_art:
-                                atype = existing_art.get("type", "document")
-                                if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir"):
-                                    atype = "code"
-                                elif file_ext in (".csv", ".db", ".sqlite", ".xlsx", ".xls"):
-                                    atype = "data"
-
-                                art = discussion_instance.artefacts.update(
-                                    title=file_name,
-                                    new_content=after_info["content"],
-                                    new_type=atype,
-                                    active=True,
-                                    commit_message=f"Modified by tool '{tool_name}'"
-                                )
-                                ASCIIColors.success(f"[LCP Tool '{tool_name}'] 🔄 Updated artifact '{file_name}' (v{existing_art.get('version', 1)+1})")
-                            else:
-                                ASCIIColors.warning(f"[LCP Tool] File '{file_name}' modified on disk but no artifact found. Creating one.")
-                                atype = "code" if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir") else "document"
-                                art = discussion_instance.artefacts.add(
-                                    title=file_name,
-                                    artefact_type=atype,
-                                    content=after_info["content"],
-                                    active=True,
-                                    commit_message=f"Synced by tool '{tool_name}'"
-                                )
-
-                            # ── NATIVE CORE SYNC: Inject visual reference tags into active message response ──
-                            if discussion_instance.active_branch_id:
-                                ai_msg = discussion_instance.get_message(discussion_instance.active_branch_id)
-                                if ai_msg:
-                                    if atype == "image":
-                                        ai_msg.content += f'\n\n<artefact_image id="{file_name}::0" />\n'
-                                    else:
-                                        ai_msg.content += f'\n\n<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />\n'
-                                    discussion_instance.commit()
-
-                return {"output": result, "status_code": 200}
+            return {"output": result, "status_code": 200}
 
         except Exception as e:
+            # ── 🛡️ ERROR TRACKING: Capture full traceback for unexpected crashes ──
+            tb_str = traceback.format_exc()
             trace_exception(e)
-            return {"error": f"Error executing '{tool_name}': {str(e)}", "status_code": 500}
+            ASCIIColors.error(f"[LCP Error Tracking] Unexpected crash executing '{tool_name}':\n{tb_str}")
+            return {
+                "error": f"Error executing '{tool_name}': {str(e)}",
+                "traceback": tb_str,
+                "status_code": 500
+            }
