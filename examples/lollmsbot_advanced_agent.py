@@ -823,7 +823,7 @@ class LollmsBot:
         self.register_gateway(self.cli_gateway)
         
         # 5. Connect and register ROS TurtleBot3 Tools
-        tb.init_tool_library()
+        tb.init_tools_library()
         self._register_lcp_tools()
         # Print active memory status on startup
         self.print_memory_status()
