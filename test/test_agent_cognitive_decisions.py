@@ -114,6 +114,13 @@ class MockGemmaAgentClient:
             return reply
 
         # ── Test Scenario B: Surgical Implementation (Plan + Patch) ──
+        if "[system: the" in prompt_text_lower and "has been successfully created/updated" in prompt_text_lower:
+            if "math_ops.py" in prompt_text_lower or "safe_divide" in prompt_text_lower:
+                reply = "I have successfully updated math_ops.py with the safe_divide function."
+                if callback:
+                    callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+                    return reply
+
         if "math_ops.py" in prompt_text_lower or "safe_divide" in prompt_text_lower:
             # Simulate the spinoff agent returning the artifact directly
             # The ChatMixin will process this and apply the patch
@@ -137,26 +144,34 @@ class MockGemmaAgentClient:
             return reply
 
         # ── Test Scenario C: Two-Step Ingestion & Data Query (Multi-Turn) ──
-        # Turn 2: The prompt will contain the tool_result wrapper from the system.
-        # CRITICAL FIX: We MUST check for "tool_result" FIRST to prevent the Turn 1
-        # condition ("sales_database" in prompt) from matching the user's original
-        # message which is still present in the history.
+        # CRITICAL: Check for system markers to determine the current agentic round.
+
+        # Round 3: Tool has been executed, result is in history. Emit final answer.
         if "tool_result" in prompt_text_lower:
             reply = "Based on my data query of the sales database, the product with the highest revenue is the **Smartphone Alpha** with a total revenue of **$124,500.00 USD**."
             if callback:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
 
+        # Round 2: Artifact was saved in Round 1, ChatMixin injected system marker.
+        # Emit the tool call to execute the script.
+        # CRITICAL FIX: The ChatMixin now includes the artifact title in the system marker.
+        # We check for the marker and the artifact title to prevent collision with Scenario B.
+        if "[system: the" in prompt_text_lower and "has been successfully created/updated" in prompt_text_lower and "query.py" in prompt_text_lower:
+            reply = '<tool>{"name": "tool_execute_python_data_query", "parameters": {"code": "query.py"}}</tool>'
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+            return reply
+
+        # Round 1: User asks to analyze data. Emit the artifact containing the script.
         if "sales_database" in prompt_text_lower or "highest revenue" in prompt_text_lower:
-            # Turn 1: Save the query script inside an ephemeral artifact
-            # Note: The tool name must match the LCP-discovered name (prefixed with 'tool_')
             reply = (
                 '<artifact name="query.py" type="code" language="python" ephemeral="true">\n'
                 "import pandas as pd\n"
-                "df = pd.read_csv('sales_database.csv')\n"
+                "df = pd.read_csv('sales_database.csv', encoding='utf-8-sig')\n"
+                "df.columns = df.columns.str.strip()\n"
                 "print(df.loc[df['revenue'].idxmax()][['product_name', 'revenue']].to_dict())\n"
-                "</artifact>\n"
-                '<tool>{"name": "tool_execute_python_data_query", "parameters": {"code": "query.py"}}</tool>'
+                "</artifact>"
             )
             if callback:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -227,8 +242,17 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         tmp_workspace_path = Path(self.tmp_workspace)
         ws_data_dir = tmp_workspace_path / "workspace_data"
         ws_data_dir.mkdir(parents=True, exist_ok=True)
-        self.csv_path = ws_data_dir / "sales_database.csv"
-        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+
+        # 🛑 CRITICAL FIX: The artifact title MUST match the physical filename exactly.
+        # The mock LLM generates a script reading 'sales_database.csv'.
+        # We register the artifact with the .csv extension in the title so that
+        # ArtefactManager does NOT auto-append a second extension (producing sales_database.csv.csv).
+        self.csv_filename = "sales_database.csv"
+        self.csv_path = ws_data_dir / self.csv_filename
+
+        # CRITICAL FIX: Use utf-8-sig encoding to write a BOM, ensuring pandas
+        # correctly parses the header without leaving a BOM character on the first column.
+        with open(self.csv_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(["product_name", "category", "revenue"])
             writer.writerow(["Organic Cotton Tee", "Apparel", "15400.0"])
@@ -319,8 +343,10 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         ASCIIColors.cyan("\n▶ Running Scenario C: Multi-Turn Two-Step Data Query")
 
         # Register our dummy CSV file as an active data artifact in the session
+        # 🛑 CRITICAL FIX: Title must include .csv extension to match the physical file
+        # and prevent ArtefactManager from auto-appending a second extension.
         self.discussion.artefacts.add(
-            title="sales_database",
+            title=self.csv_filename,
             artefact_type="data",
             content="Columns: product_name (str), category (str), revenue (float)",
             file_ext=".csv",
@@ -344,7 +370,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
                 "name": "tool_execute_python_data_query",
                 "description": "Execute python code on datasets.",
                 "parameters": [{"name": "code", "type": "str", "required": True}],
-                "callable": lambda code, **kw: tool_execute_python_data_query(code, discussion_instance=self.discussion)
+                "callable": lambda code, **kw: tool_execute_python_data_query(code=code)
             }
         }
 
@@ -372,11 +398,17 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         # Restore the original tools binding
         self.client.tools = original_tools_binding
 
-        # Check if the tool was called OR if the final answer contains the expected data
-        # The mock client may not always trigger the MSG_TYPE_TOOL_CALL event depending on streaming internals,
-        # so we verify the final conversational output as the primary success criterion.
+        # Check if the tool was called AND executed successfully.
+        # The mock LLM's Round 3 response is hardcoded, so we must verify that the
+        # tool actually ran without errors by checking the processing block status.
         final_content = res.get("ai_message").content or ""
-        success = "Smartphone Alpha" in final_content
+
+        # The tool execution must have succeeded (status:success in the processing block)
+        # AND the final answer must contain the expected data.
+        tool_succeeded = "status:success" in final_content and "KeyError" not in final_content
+        answer_correct = "Smartphone Alpha" in final_content
+
+        success = tool_succeeded and answer_correct
 
         self.report_cards.append({
             "name": "Scenario C: Multi-Turn Two-Step Ephemeral Ingestion",
