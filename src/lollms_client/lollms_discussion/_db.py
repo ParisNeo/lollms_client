@@ -1,6 +1,3 @@
-# lollms_discussion/_db.py
-# Database layer: encryption helper, dynamic ORM model factory, LollmsDataManager.
-
 import base64
 import uuid
 from contextlib import contextmanager
@@ -28,13 +25,10 @@ except ImportError:
     ENCRYPTION_AVAILABLE = False
 
 
-# ---------------------------------------------------------------------------
-# Encryption helper
-# ---------------------------------------------------------------------------
-
 class EncryptedString(TypeDecorator):
     """A SQLAlchemy TypeDecorator for field-level database encryption."""
     impl = LargeBinary
+
     cache_ok = True
 
     def __init__(self, key: str, *args, **kwargs):
@@ -62,10 +56,6 @@ class EncryptedString(TypeDecorator):
         except InvalidToken:
             return "<DECRYPTION_FAILED: Invalid Key or Corrupt Data>"
 
-
-# ---------------------------------------------------------------------------
-# Dynamic model factory
-# ---------------------------------------------------------------------------
 
 def create_dynamic_models(
     discussion_mixin: Optional[Type] = None,
@@ -129,10 +119,6 @@ def create_dynamic_models(
     return Base, DynamicDiscussion, DynamicMessage
 
 
-# ---------------------------------------------------------------------------
-# LollmsDataManager
-# ---------------------------------------------------------------------------
-
 class LollmsDataManager:
     """Manages database connection, session, and table creation."""
 
@@ -149,10 +135,6 @@ class LollmsDataManager:
             from sqlalchemy.pool import StaticPool
             engine_kwargs["poolclass"] = StaticPool
         self.engine = create_engine(db_path, **engine_kwargs)
-
-        # ── 🛡️ PREVENT DETACHED INSTANCE ERRORS ──
-        # Disable expire_on_commit so that all attributes (id, metadata, system_prompt)
-        # remain fully loaded in-memory after committing and closing the session.
         self.SessionLocal = sessionmaker(
             autocommit=False, 
             autoflush=False, 
@@ -222,7 +204,6 @@ class LollmsDataManager:
             return [{c.name: getattr(disc, c.name) for c in disc.__table__.columns} for disc in (discussions[:limit] if limit else discussions)]
 
     def get_discussion(self, lollms_client, discussion_id: str, **kwargs):
-        # Imported here to avoid circular dependency at module load time.
         from lollms_client.lollms_discussion import LollmsDiscussion
         with self.get_session() as session:
             try:
