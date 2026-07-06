@@ -1,6 +1,3 @@
-# lollms_discussion/_message.py
-# LollmsMessage: lightweight proxy wrapper around a SQLAlchemy (or in-memory) message object.
-
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -32,8 +29,6 @@ class LollmsMessage:
 
     def __repr__(self):
         return f"<LollmsMessage id={self.id} sender='{self.sender}'>"
-
-    # ------------------------------------------------------------------ images
 
     def get_all_images(self) -> List[Dict[str, Union[str, bool]]]:
         if not self.images:
