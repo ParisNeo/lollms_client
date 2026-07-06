@@ -15,7 +15,7 @@ TOOL_LIBRARY_NAME = "SPARQL_QUERY_RUNNER"
 TOOL_LIBRARY_DESC = "Parses local Turtle (.ttl) RDF graphs and executes fully compliant SPARQL 1.1 queries, returning structured bindings."
 TOOL_LIBRARY_ICON = "🕸️"
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     """Ensure rdflib is installed."""
     import pipmaster as pm
     pm.ensure_packages("rdflib")
@@ -33,14 +33,14 @@ def _get_workspace_dir() -> Path:
 
 
 def tool_execute_sparql_query(
-    file_name: str,
-    sparql_query: str
+    file_name: str = "",
+    sparql_query: str = ""
 ) -> dict:
     """
-    Parses a Turtle (.ttl) file from the workspace and executes a SPARQL 1.1 query.
+    Parses a Turtle (.ttl) or OWL (.owl) file from the workspace and executes a SPARQL 1.1 query.
 
     Args:
-        file_name (str): The filename of the .ttl file in the workspace.
+        file_name (str, optional): The filename of the .ttl or .owl file in the workspace. Auto-discovers if omitted.
         sparql_query (str): The valid SPARQL 1.1 query to execute (SELECT, ASK, CONSTRUCT).
     """
     import rdflib
@@ -48,12 +48,24 @@ def tool_execute_sparql_query(
     import pandas as pd
 
     workspace_dir = _get_workspace_dir()
+
+    # Auto-discover ontology file if not specified
+    if not file_name:
+        ontology_files = list(workspace_dir.glob("*.ttl")) + list(workspace_dir.glob("*.owl"))
+        if ontology_files:
+            file_name = ontology_files[0].name
+        else:
+            return {
+                "success": False,
+                "error": "No file_name provided and no .ttl or .owl files found in workspace."
+            }
+
     file_path = (workspace_dir / file_name).resolve()
 
     if not file_path.exists():
         return {
             "success": False,
-            "error": f"Turtle file '{file_name}' not found in workspace."
+            "error": f"Ontology file '{file_name}' not found in workspace."
         }
 
     # 1. Parse RDF Graph
