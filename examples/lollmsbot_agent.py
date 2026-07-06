@@ -346,7 +346,7 @@ class LollmsBot:
         self.discussion._init_memory(self.memory_manager)
         
         # 3. Setup physiological and robotic couplings
-        tb.init_tool_library()
+        tb.init_tools_library()
         self.affect = AffectiveState()
         self.last_update = time.time()
         self.cumulative_ticks = 0
