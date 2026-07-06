@@ -64,26 +64,28 @@ class UtilsMixin:
         return self.prune_branch(message_id)
 
     def export(self, format_type, branch_tip_id=None, max_allowed_tokens=None,
-               suppress_system_prompt=False, suppress_images=False):
+               suppress_system_prompt=False, suppress_images=False, 
+               virtual_history=None, debug=False, system_prompt_override: Optional[str] = None):
+        """
+        Exports the discussion history. 
+        If virtual_history is provided, it appends the active agentic context (unstripped)
+        to the sanitized historical branch.
+        If debug is True, dumps the final payload to disk for verification.
+        """
         branch_tip_id = branch_tip_id or self.active_branch_id
-
-        # --- Diagnostic Input Logging ---
 
         if not branch_tip_id and format_type in ["lollms_text","openai_chat","ollama_chat","markdown"]:
             return "" if format_type in ["lollms_text","markdown"] else []
         branch = self.get_branch(branch_tip_id)
 
         # Exclude the last message from the branch if it's an assistant message
-        # This prevents empty assistant messages (e.g., from fast path) from being
-        # included in the export, which can cause issues with some systems
         if branch and branch[-1].sender_type == 'assistant':
             branch = branch[:-1]
-        # Force a refresh of the artifacts zone before export
-        system_prompt_part = (self._system_prompt or "").strip()
+            
+        system_prompt_part = (system_prompt_override or self._system_prompt or "").strip()
         data_zone_part     = self.get_full_data_zone()
         full_system_prompt = ""
 
-        # Add dynamic synopsis if available
         if self.pruning_summary:
             data_zone_part = f"--- PROJECT SYNOPSIS ---\n{self.pruning_summary}\n\n" + data_zone_part
 
@@ -96,16 +98,10 @@ class UtilsMixin:
                 full_system_prompt = data_zone_part
         participants = self.participants or {}
 
-        # Scratchpad is now injected via export() to avoid template issues with
-        # mid-conversation system messages in strict chat templates like llama.cpp.
         _scratchpad = getattr(self, "scratchpad", "") or ""
 
         def get_full_content(msg):
             content = msg.content.strip()
-
-            # ── SECURITY & CONTEXT OPTIMIZATION: STRIP THOUGHTS BY DEFAULT ──
-            # Completely strip any <think>...</think> reasoning blocks from past messages
-            # before sending them to the LLM to prevent reinforcement of old reasoning paths.
             content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
             content = re.sub(r'<think>.*$', '', content, flags=re.DOTALL | re.IGNORECASE)
 
@@ -113,10 +109,6 @@ class UtilsMixin:
                 return {m.group(1): m.group(2)
                         for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
-            # ──             # ── SINGLE SOURCE OF TRUTH CONTEXT DOCTRINE ──
-            # To prevent massive token duplication and bloat in the context window,
-            # we must NEVER export the full verbatim content of artifacts/notes/skills inside past messages.
-            # We strip any complete XML blocks and replace them with their lightweight placeholders during export.
             pattern = re.compile(r'<(artifact|artefact|note|skill)\b([^>]*?)>(.*?)</\1>', re.DOTALL | re.IGNORECASE)
 
             def _strip_tag_to_placeholder(match: re.Match) -> str:
@@ -124,71 +116,31 @@ class UtilsMixin:
                 attrs = _parse_attrs(match.group(2))
                 title = attrs.get("name") or attrs.get("title") or "artifact"
                 type_label = "note" if tag_name == "note" else ("skill" if tag_name == "skill" else attrs.get("type", "code"))
-                # Export as a stable, lightweight Lollms Artifact Anchor tag so the LLM retains situational awareness
-                # CRITICAL: Use unmistakable SYSTEM marker with special Unicode and DISTINCT syntax to prevent mimicry
-                return f'\n[🔒SYSTEM_ARTIFACT_CREATED:{title}|{type_label}]\n'
+                return f'\n[SYSTEM_{tag_name.upper()}_CREATED:{title}|{type_label}]\n'
 
             content = pattern.sub(_strip_tag_to_placeholder, content)
 
             if msg.sender_type == 'assistant':
-                # Strip completed/closed processing blocks and replace with artifact anchors
-                # to preserve context for the LLM without leaking raw execution logs.
                 def _strip_processing_block(match: re.Match) -> str:
                     block_content = match.group(0)
-                    # Find all created artifacts inside this processing block to build the anchor
-                    inner_arts = re.findall(
-                        r'title=["\']([^"\']*)["\'].*?type=["\']([^"\']*)["\']',
-                        block_content,
-                        re.IGNORECASE
-                    )
+                    inner_arts = re.findall(r'title=["\']([^"\']*)["\'].*?type=["\']([^"\']*)["\']', block_content, re.IGNORECASE)
                     if not inner_arts:
-                        inner_arts = re.findall(
-                            r'title=["\']([^"\']*)["\']',
-                            block_content,
-                            re.IGNORECASE
-                        )
+                        inner_arts = re.findall(r'title=["\']([^"\']*)["\']', block_content, re.IGNORECASE)
                         inner_arts = [(t, "document") for t in inner_arts]
-
-                    anchors = "\n".join(
-                        f"[🔒SYSTEM_ARTIFACT_CREATED:{t}|{ty}]"
-                        for t, ty in inner_arts
-                    )
+                    anchors = "\n".join(f"[SYSTEM_ARTIFACT_CREATED:{t}|{ty}]" for t, ty in inner_arts)
                     return f"\n{anchors}\n" if anchors else ""
 
-                content = re.sub(
-                    r'<processing[^>]*>.*?</processing>',
-                    _strip_processing_block,
-                    content,
-                    flags=re.DOTALL | re.IGNORECASE
-                )
-                # Strip any unclosed processing tags
-                content = re.sub(
-                    r'<processing[^>]*>',
-                    '',
-                    content, flags=re.IGNORECASE
-                )
-                # Strip any remaining closing tags
-                content = content.replace("</processing>", "")
-                # Strip framework-emitted status, checklist lines, and actions
-                lines = []
-                for line in content.splitlines():
-                    l_strip = line.strip()
-                    if l_strip.startswith(("*", "✓", "🏗️", "🔧", "✅", "❌", "·ᴽЧØс·", "[BLIND_ACTION_EXECUTED]")):
-                        continue
-                    lines.append(line)
+                content = re.sub(r'<processing[^>]*>.*?</processing>', _strip_processing_block, content, flags=re.DOTALL | re.IGNORECASE)
+                content = re.sub(r'<processing[^>]*>', '', content, flags=re.IGNORECASE).replace("</processing>", "")
+                lines = [line for line in content.splitlines() if not line.strip().startswith(("*", "✓", "🏗️", "🔧", "✅", "❌", "·ᴽЧØс·", "[BLIND_ACTION_EXECUTED]"))]
                 content = "\n".join(lines).strip()
             return content
 
-        # Helper: find the forward index of the last user message in a list
         def _last_user_index(branch_list):
             for i in range(len(branch_list) - 1, -1, -1):
                 if branch_list[i].sender_type == 'user':
                     return i
             return -1
-
-        def _last_user_msg(branch_list):
-            idx = _last_user_index(branch_list)
-            return branch_list[idx] if idx >= 0 else None
 
         if format_type == "lollms_text":
             final_parts = []
@@ -216,85 +168,42 @@ class UtilsMixin:
             last_user_idx = _last_user_index(messages_to_render)
 
             for idx, msg in enumerate(reversed(messages_to_render)):
-                # Convert reversed index back to forward index
-                fwd_idx    = len(messages_to_render) - 1 - idx
+                fwd_idx = len(messages_to_render) - 1 - idx
                 sender_str = msg.sender.replace(':','').replace('!@>','')
-                
-                tool_calls = msg.metadata.get("tool_calls", []) if (msg.metadata and isinstance(msg.metadata, dict)) else []
-                if msg.sender_type == "assistant" and tool_calls:
-                    raw_content = getattr(msg, "raw_content", "") or msg.content or ""
-                    parts = re.split(r'(<(?:tool)>.*?</(?:tool)>)', raw_content, flags=re.DOTALL | re.IGNORECASE)
-                    num_calls = min(len(parts) // 2, len(tool_calls))
-                    
-                    expanded_parts = []
-                    for i in range(num_calls):
-                        assistant_part = parts[2*i] + parts[2*i + 1]
-                        tc = tool_calls[i]
-                        tool_name = tc.get("name", "unknown")
-                        result_obj = tc.get("result", {})
-                        
-                        if isinstance(result_obj, dict) and "output" in result_obj:
-                            result_str = result_obj["output"]
-                        else:
-                            result_str = json.dumps(result_obj, indent=2, ensure_ascii=False)
-                            
-                        # Truncate very large results for export to avoid context bloat
-                        max_result_len = 4000
-                        if len(result_str) > max_result_len:
-                            result_str = result_str[:max_result_len] + f"\n... [{len(result_str) - max_result_len} chars truncated]"
-                        
-                        user_part = f"Tool output for {tool_name}:\n{result_str}\n\nPlease continue your response based on this information."
-                        
-                        expanded_parts.append(f"!@>{sender_str}:\n{assistant_part}\n")
-                        expanded_parts.append(f"!@>user:\n{user_part}\n")
-                        
-                    remaining_assistant_part = parts[2*num_calls] if 2*num_calls < len(parts) else ""
-                    if remaining_assistant_part.strip():
-                        clean_rem = re.sub(r'<processing.*?>.*?</processing>', '', remaining_assistant_part, flags=re.DOTALL | re.IGNORECASE)
-                        clean_rem = re.sub(r'<processing[^>]*>', '', clean_rem, flags=re.IGNORECASE).replace("</processing>", "")
-                        expanded_parts.append(f"!@>{sender_str}:\n{clean_rem.strip()}\n")
-                        
-                    # Insert in correct order
-                    for part_text in reversed(expanded_parts):
-                        part_toks = self.lollmsClient.count_tokens(part_text)
-                        if max_allowed_tokens is not None and current_tokens + part_toks > max_allowed_tokens:
-                            break
-                        message_parts.insert(0, part_text)
-                        current_tokens += part_toks
-                else:
-                    content    = get_full_content(msg)
-                    active_images = msg.get_active_images()
-                    if active_images:
-                        content += f"\n({len(active_images)} image(s) attached)"
-                    msg_text = f"!@>{sender_str}:\n{content}\n"
-                    msg_toks = self.lollmsClient.count_tokens(msg_text)
-                    if max_allowed_tokens is not None and current_tokens + msg_toks > max_allowed_tokens:
-                        break
-                    message_parts.insert(0, msg_text)
-                    current_tokens += msg_toks
+                content = get_full_content(msg)
+                active_images = msg.get_active_images()
+                if active_images:
+                    content += f"\n({len(active_images)} image(s) attached)"
+                msg_text = f"!@>{sender_str}:\n{content}\n"
+                msg_toks = self.lollmsClient.count_tokens(msg_text)
+                if max_allowed_tokens is not None and current_tokens + msg_toks > max_allowed_tokens:
+                    break
+                message_parts.insert(0, msg_text)
+                current_tokens += msg_toks
 
-                # Inject scratchpad ONLY when non-empty, right after last user message
-                # For OpenAI/ollama_chat formats, we inject as a user message to avoid
-                # strict template issues with mid-conversation system messages
                 if _scratchpad and fwd_idx == last_user_idx:
-                    scratch_content = (
-                        "== TOOL OUTPUT SCRATCHPAD ==\n"
-                        f"{_scratchpad}\n"
-                        "== END SCRATCHPAD =="
-                    )
-                    # Use user role with special marker to avoid template issues
+                    scratch_content = f"== TOOL OUTPUT SCRATCHPAD ==\n{_scratchpad}\n== END SCRATCHPAD =="
                     scratch_text = f"!@>user:\n[SYSTEM CONTEXT]\n{scratch_content}\n[/SYSTEM CONTEXT]\n"
                     scratch_text_toks = self.lollmsClient.count_tokens(scratch_text)
                     if max_allowed_tokens is None or current_tokens + scratch_text_toks <= max_allowed_tokens:
-                        # index 1 = immediately after the user msg prepended at [0]
                         message_parts.insert(1, scratch_text)
                         current_tokens += scratch_text_toks
+
+            # Append Virtual History (Active Agentic Context) - UNSTRIPPED
+            if virtual_history:
+                for v_msg in virtual_history:
+                    sender_str = "user" if v_msg.sender_type == "user" else self.lollmsClient.ai_name
+                    msg_text = f"!@>{sender_str}:\n{v_msg.content}\n"
+                    msg_toks = self.lollmsClient.count_tokens(msg_text)
+                    if max_allowed_tokens is not None and current_tokens + msg_toks > max_allowed_tokens:
+                        break
+                    message_parts.append(msg_text)
+                    current_tokens += msg_toks
 
             final_parts.extend(message_parts)
             return "".join(final_parts).strip()
 
         messages = []
-        # Collect only discussion-level and active artifact images for the system message
         discussion_imgs = self.get_discussion_images()
         system_level_images = [i['data'] for i in discussion_imgs if i.get('active', True)]
         active_art_images = self.artefacts.get_context_images()
@@ -341,109 +250,54 @@ class UtilsMixin:
             if isinstance(role, dict):
                 role = role.get("name","user" if msg.sender_type=='user' else "assistant")
             
-            tool_calls = msg.metadata.get("tool_calls", []) if (msg.metadata and isinstance(msg.metadata, dict)) else []
-            if msg.sender_type == "assistant" and tool_calls:
-                raw_content = getattr(msg, "raw_content", "") or msg.content or ""
-                parts = re.split(r'(<(?:tool)>.*?</(?:tool)>)', raw_content, flags=re.DOTALL | re.IGNORECASE)
-                num_calls = min(len(parts) // 2, len(tool_calls))
-                
-                for i in range(num_calls):
-                    assistant_part = parts[2*i] + parts[2*i + 1]
-                    tc = tool_calls[i]
-                    tool_name = tc.get("name", "unknown")
-                    result_obj = tc.get("result", {})
-                    
-                    if isinstance(result_obj, dict) and "output" in result_obj:
-                        result_str = result_obj["output"]
-                    else:
-                        result_str = json.dumps(result_obj, indent=2, ensure_ascii=False)
-                        
-                    # Truncate very large results for export to avoid context bloat
-                    max_result_len = 4000
-                    if len(result_str) > max_result_len:
-                        result_str = result_str[:max_result_len] + f"\n... [{len(result_str) - max_result_len} chars truncated]"
-                    
-                    user_part = f"Tool output for {tool_name}:\n{result_str}\n\nPlease continue your response based on this information."
-                    
-                    # 1. Append assistant_part
-                    if format_type == "openai_chat":
-                        messages.append({"role": role, "content": assistant_part})
-                    elif format_type == "ollama_chat":
-                        messages.append({"role": role, "content": assistant_part})
-                    elif format_type == "markdown":
-                        messages.append(f"**{role.capitalize()}**: {assistant_part}\n")
-                        
-                    # 2. Append user_part
-                    if format_type == "openai_chat":
-                        messages.append({"role": "user", "content": user_part})
-                    elif format_type == "ollama_chat":
-                        messages.append({"role": "user", "content": user_part})
-                    elif format_type == "markdown":
-                        messages.append(f"**User**: {user_part}\n")
-                        
-                remaining_assistant_part = parts[2*num_calls] if 2*num_calls < len(parts) else ""
-                if remaining_assistant_part.strip():
-                    clean_rem = re.sub(r'<processing.*?>.*?</processing>', '', remaining_assistant_part, flags=re.DOTALL | re.IGNORECASE)
-                    clean_rem = re.sub(r'<processing[^>]*>', '', clean_rem, flags=re.IGNORECASE).replace("</processing>", "")
-                    if format_type == "openai_chat":
-                        messages.append({"role": role, "content": clean_rem.strip()})
-                    elif format_type == "ollama_chat":
-                        messages.append({"role": role, "content": clean_rem.strip()})
-                    elif format_type == "markdown":
-                        messages.append(f"**{role.capitalize()}**: {clean_rem.strip()}\n")
-            else:
-                content = get_full_content(msg)
-                active_images_b64 = msg.get_active_images()
-                images_dicts = build_image_dicts(active_images_b64)
-                if format_type == "openai_chat":
-                    if images_dicts:
-                        parts = [{"type":"text","text":content}] if content else []
-                        for img in images_dicts:
-                            url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
-                            parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
-                        messages.append({"role":role,"content":parts})
-                    else:
-                        messages.append({"role":role,"content":content})
-                elif format_type == "ollama_chat":
-                    md = {"role":role,"content":content}
-                    b64s = [i['data'] for i in images_dicts if i['type']=='base64']
-                    if b64s:
-                        md["images"] = b64s
-                    messages.append(md)
-                elif format_type == "markdown":
-                    line = f"**{role.capitalize()}**: {content}\n"
-                    if images_dicts and not suppress_images:
-                        for img in images_dicts:
-                            url = f"![Image](data:image/jpeg;base64,{img['data']})" if img['type']=='base64' else f"![Image]({img['data']})"
-                            line += f"\n{url}\n"
-                    messages.append(line)
+            content = get_full_content(msg)
+            active_images_b64 = msg.get_active_images()
+            images_dicts = build_image_dicts(active_images_b64)
+            
+            if format_type == "openai_chat":
+                if images_dicts:
+                    parts = [{"type":"text","text":content}] if content else []
+                    for img in images_dicts:
+                        url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
+                        parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
+                    messages.append({"role":role,"content":parts})
                 else:
-                    raise ValueError(f"Unsupported format_type: {format_type}")
+                    messages.append({"role":role,"content":content})
+            elif format_type == "ollama_chat":
+                md = {"role":role,"content":content}
+                b64s = [i['data'] for i in images_dicts if i['type']=='base64']
+                if b64s:
+                    md["images"] = b64s
+                messages.append(md)
+            elif format_type == "markdown":
+                line = f"**{role.capitalize()}**: {content}\n"
+                if images_dicts and not suppress_images:
+                    for img in images_dicts:
+                        url = f"![Image](data:image/jpeg;base64,{img['data']})" if img['type']=='base64' else f"![Image]({img['data']})"
+                        line += f"\n{url}\n"
+                messages.append(line)
 
-            # Inject scratchpad ONLY when non-empty, right after last user message
-            # For OpenAI-compatible APIs with strict templates, use a user message
-            # with special markers rather than a system message mid-conversation
             if _scratchpad and idx == last_user_idx:
-                scratch_content = (
-                    "== TOOL OUTPUT SCRATCHPAD ==\n"
-                    f"{_scratchpad}\n"
-                    "== END SCRATCHPAD =="
-                )
+                scratch_content = f"== TOOL OUTPUT SCRATCHPAD ==\n{_scratchpad}\n== END SCRATCHPAD =="
                 if format_type == "openai_chat":
-                    # Use user role with marker to avoid "system role not supported here" errors
-                    messages.append({
-                        "role": "user",
-                        "content": f"[SYSTEM CONTEXT - TOOL OUTPUTS]\n{scratch_content}\n[/SYSTEM CONTEXT]"
-                    })
+                    messages.append({"role": "user", "content": f"[SYSTEM CONTEXT - TOOL OUTPUTS]\n{scratch_content}\n[/SYSTEM CONTEXT]"})
                 elif format_type == "ollama_chat":
-                    messages.append({
-                        "role": "user",
-                        "content": f"[SYSTEM CONTEXT - TOOL OUTPUTS]\n{scratch_content}\n[/SYSTEM CONTEXT]"
-                    })
+                    messages.append({"role": "user", "content": f"[SYSTEM CONTEXT - TOOL OUTPUTS]\n{scratch_content}\n[/SYSTEM CONTEXT]"})
                 elif format_type == "markdown":
                     messages.append(f"**system**: {scratch_content}\n")
 
-        # ── Memory context injection ─────────────────────────────────────
+        # Append Virtual History (Active Agentic Context) - UNSTRIPPED
+        if virtual_history:
+            for v_msg in virtual_history:
+                role = "user" if v_msg.sender_type == "user" else "assistant"
+                if format_type == "openai_chat":
+                    messages.append({"role": role, "content": v_msg.content})
+                elif format_type == "ollama_chat":
+                    messages.append({"role": role, "content": v_msg.content})
+                elif format_type == "markdown":
+                    sender_str = "User" if role == "user" else "Assistant"
+                    messages.append(f"**{sender_str}**: {v_msg.content}\n")
+
         _mm = getattr(self, 'memory_manager', None)
         if _mm is not None and format_type in ("openai_chat", "ollama_chat"):
             messages = self._inject_memory_into_messages(
@@ -451,22 +305,40 @@ class UtilsMixin:
                 token_counter=self.lollmsClient.count_tokens,
             )
 
-        # ── OpenAI Format Validation & Normalization ─────────────────────
-        # Ensure system message is at the beginning and user/assistant alternate
         if format_type == "openai_chat" and messages:
             messages = self._normalize_openai_messages(messages)
+ 
+        # ── 🔬 SCIENTIFIC DEBUG: EXPORT CONTEXT DUMP ──
+        if debug:
+            try:
+                import os as _os
+                from pathlib import Path as _Path
+                import json as _json
+                from datetime import datetime as _dt
 
-        # --- Diagnostic Output Logging ---
-        if format_type == "markdown":
-            res_val = "\n".join(messages) if format_type == "markdown" else messages
-            ASCIIColors.success(f"📊 [EXPORT DIAGNOSTIC END] Markdown final length: {len(res_val)} chars")
-        elif format_type == "lollms_text":
-            pass
-        else:
-            pass
+                debug_dir = _Path(self.workspace_data_path) / "_debug_dumps"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                
+                timestamp = _dt.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+                dump_file = debug_dir / f"export_dump_{timestamp}.json"
+                
+                dump_payload = {
+                    "timestamp": timestamp,
+                    "discussion_id": self.id,
+                    "format_type": format_type,
+                    "messages": messages
+                }
+                
+                with open(dump_file, "w", encoding="utf-8") as f:
+                    _json.dump(dump_payload, f, indent=2, default=str, ensure_ascii=False)
+                    
+                ASCIIColors.info(f"[UtilsMixin] 🔬 Debug export dump saved to: {dump_file}")
+            except Exception as dump_err:
+                ASCIIColors.warning(f"[UtilsMixin] Failed to write debug export dump: {dump_err}")
 
         return "\n".join(messages) if format_type == "markdown" else messages
-
+    
+    
     def _normalize_openai_messages(self, messages: List[Dict]) -> List[Dict]:
         """
         Normalize messages for OpenAI API compliance:
