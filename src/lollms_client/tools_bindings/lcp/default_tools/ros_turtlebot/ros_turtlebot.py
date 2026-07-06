@@ -327,7 +327,7 @@ class TurtleBotNode(Node if ROS2_AVAILABLE else object):
 ROS2_NODE = None
 
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     """Initialize ROS 2 Context or log simulation fallback."""
     global ROS2_NODE
     if ROS2_AVAILABLE:
