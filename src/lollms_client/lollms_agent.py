@@ -52,7 +52,7 @@ class ToolsManager:
 
     A lollms-format tool script is a Python file containing:
       • Global metadata: TOOL_LIBRARY_NAME, TOOL_LIBRARY_DESC, TOOL_LIBRARY_ICON
-      • An optional ``init_tool_library()`` function for dependency setup
+      • An optional ``init_tools_library()`` function for dependency setup
       • One or more ``tool_*`` functions with docstring-described arguments
 
     The manager extracts JSON-schema-style parameter definitions from
@@ -217,9 +217,9 @@ class ToolsManager:
         exec(compile(content, str(fp), "exec"), module.__dict__)
 
         # Run init if present
-        if hasattr(module, "init_tool_library"):
+        if hasattr(module, "init_tools_library"):
             try:
-                module.init_tool_library()
+                module.init_tools_library()
             except Exception as e:
                 from ascii_colors import ASCIIColors
                 ASCIIColors.warning(f"Tool init failed for {fp.name}: {e}")

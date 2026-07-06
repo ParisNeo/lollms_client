@@ -367,21 +367,57 @@ class LCPBinding(LollmsToolBinding):
 
         try:
             if python_file_path:
-                module_name = f"lollms_client.tools_bindings.lcp.{python_file_path.stem}"
-                if module_name in sys.modules:
-                    del sys.modules[module_name]
+                module_name = f"lollms_client.tools_bindings.lcp.persistent_{python_file_path.stem}"
 
-                spec = importlib.util.spec_from_file_location(module_name, str(python_file_path))
-                if not spec or not spec.loader:
-                    return {"error": f"Spec creation failed for '{tool_name}'.", "status_code": 500}
+                if module_name not in sys.modules:
+                    spec = importlib.util.spec_from_file_location(module_name, str(python_file_path))
+                    if not spec or not spec.loader:
+                        return {"error": f"Spec creation failed for '{tool_name}'.", "status_code": 500}
 
-                tool_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(tool_module)
+                    tool_module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = tool_module  # Cache before execution to prevent circular import issues
+                    spec.loader.exec_module(tool_module)
+                else:
+                    tool_module = sys.modules[module_name]
             else:
                 # Use the dynamically loaded module
                 tool_module = tool_def.get("_dynamic_module")
                 if not tool_module:
                     return {"error": f"Dynamic module missing for '{tool_name}'.", "status_code": 500}
+
+            # ── 🛡️ CRITICAL FIX: CENTRALIZED LIBRARY INITIALIZATION ──
+            # We guarantee that init_tools_library() or init_tools_library() is called exactly
+            # once per tool file path before the tool function executes. This runs regardless
+            # of whether the call originates from the Direct Callable path or the LCP Dispatch path.
+            if python_file_path:
+                if not hasattr(self, "_initialized_libs"):
+                    object.__setattr__(self, "_initialized_libs", set())
+
+                file_key = str(python_file_path.resolve())
+                if file_key not in self._initialized_libs:
+                    try:
+                        # Use the persistent module we already loaded/ensured exists above
+                        # This guarantees state is shared between init and execution.
+                        if module_name in sys.modules:
+                            chk_module = sys.modules[module_name]
+
+                            init_fn = None
+                            if hasattr(chk_module, "init_tools_library"):
+                                init_fn = chk_module.init_tools_library
+                            elif hasattr(chk_module, "init_tools_library"):
+                                init_fn = chk_module.init_tools_library
+
+                            if init_fn and callable(init_fn):
+                                init_fn()
+                                ASCIIColors.success(f"[LCP Init] ✅ Initialized library for {tool_name} via {init_fn.__name__}()")
+                            else:
+                                ASCIIColors.info(f"[LCP Init] No init function found for {tool_name}. Skipping.")
+
+                        self._initialized_libs.add(file_key)
+                    except Exception as init_ex:
+                        ASCIIColors.warning(f"[LCP Init] Failed to pre-initialize tool library for {tool_name}: {init_ex}")
+                        # Still add to initialized set to prevent infinite retry loops on broken files
+                        self._initialized_libs.add(file_key)
 
             # CRITICAL FIX: Execute the EXACT function name requested (e.g., tool_get_table_schema)
             # Do not search for generic entry points.
@@ -453,7 +489,9 @@ class LCPBinding(LollmsToolBinding):
                     if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                         clean_params[k] = v
 
+                ASCIIColors.cyan(f"[LCP Exec Trace] CWD BEFORE tool execution: {Path(os.getcwd()).resolve()}")
                 result = execute_function(**clean_params)
+                ASCIIColors.cyan(f"[LCP Exec Trace] CWD AFTER tool execution: {Path(os.getcwd()).resolve()}")
             finally:
                 sys.stdout = old_sys_stdout
                 sys.stderr = old_sys_stderr
@@ -474,31 +512,43 @@ class LCPBinding(LollmsToolBinding):
                 ASCIIColors.error(f"[LCP Error Tracking] Tool '{tool_name}' reported failure: {result['error']}")
                 ASCIIColors.error(f"Traceback:\n{tb_str}")
 
-            # ── POST-EXECUTION: AUTOMATIC ARTIFACT SYNC ──
+            # ── 🛑 CRITICAL FIX: POST-EXECUTION ARTIFACT SYNC (Filtered) ──
             # 7. Snapshot workspace files AFTER execution
+            _IGNORED_SYNC_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules"}
+            _IGNORED_SYNC_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".lam", ".log"}
+
             files_after = {}
             if current_cwd.exists():
                 for f in current_cwd.rglob("*"):
-                    if f.is_file():
-                        rel_path = f.relative_to(current_cwd)
-                        try:
-                            content = f.read_text(encoding="utf-8", errors="ignore")
-                            files_after[rel_path] = {
-                                "hash": hash(content),
-                                "mtime": f.stat().st_mtime,
-                                "path": f,
-                                "content": content
-                            }
-                        except Exception:
-                            files_after[rel_path] = {
-                                "hash": None,
-                                "mtime": f.stat().st_mtime,
-                                "path": f,
-                                "content": None
-                            }
+                    if not f.is_file():
+                        continue
+                    if any(part in _IGNORED_SYNC_DIRS for part in f.parts):
+                        continue
+                    file_ext = f.suffix.lower()
+                    if file_ext in _IGNORED_SYNC_EXTS or f.name.startswith("."):
+                        continue
+
+                    rel_path = f.relative_to(current_cwd)
+                    try:
+                        content = f.read_text(encoding="utf-8", errors="ignore")
+                        files_after[rel_path] = {
+                            "hash": hash(content),
+                            "mtime": f.stat().st_mtime,
+                            "path": f,
+                            "content": content
+                        }
+                    except Exception:
+                        files_after[rel_path] = {
+                            "hash": None,
+                            "mtime": f.stat().st_mtime,
+                            "path": f,
+                            "content": None
+                        }
 
             if not discussion_instance:
                 ASCIIColors.warning("[LCP Tool] No discussion_instance provided. Skipping artifact sync.")
+                tb_str = "".join(traceback.format_stack())
+                ASCIIColors.warning(f"[LCP Tool] Caller stack trace:\n{tb_str}")                
             else:
                 # 8. Detect NEW files
                 new_files = set(files_after.keys()) - set(files_before.keys())

@@ -1,6 +1,7 @@
 import os
 import sys
 import io
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional 
 from ascii_colors import ASCIIColors
@@ -9,7 +10,7 @@ TOOL_LIBRARY_NAME = "Execute Python Data Query"
 TOOL_LIBRARY_DESC = "Executes sandboxed Python code to analyze or modify datasets in the workspace."
 TOOL_LIBRARY_ICON = "📊"
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl"])
 

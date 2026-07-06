@@ -22,7 +22,7 @@ TOOL_LIBRARY_ICON = "🚀"
 # Central registry to track active background processes across executions
 _ACTIVE_PROCESSES: List[subprocess.Popen] = []
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     """Ensure required packages are available."""
     import pipmaster as pm
     pm.ensure_packages({"uvicorn": ">=0.15.0", "fastapi": ">=0.68.0"})

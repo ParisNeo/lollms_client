@@ -178,7 +178,7 @@ The `generate_with_tools` method enables LLMs to act as agents that can discover
 **Tool Format (lollms scripts):**
 A tool script is a Python file containing:
 - `TOOL_LIBRARY_NAME`, `TOOL_LIBRARY_DESC`, `TOOL_LIBRARY_ICON` metadata
-- An optional `init_tool_library()` for dependency setup
+- An optional `init_tools_library()` for dependency setup
 - One or more `tool_*` functions with docstring-described arguments
 
 ```python
@@ -1087,7 +1087,7 @@ ARXIV_TOOL = '''TOOL_LIBRARY_NAME = 'ArXiv Explorer'
 TOOL_LIBRARY_DESC = 'Search scientific papers on ArXiv.'
 TOOL_LIBRARY_ICON = '🔬'
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'arxiv': '>=2.1.0'})
 
@@ -1128,7 +1128,7 @@ WIKI_TOOL = '''TOOL_LIBRARY_NAME = 'Wikipedia Search'
 TOOL_LIBRARY_DESC = 'Search and retrieve article summaries from Wikipedia.'
 TOOL_LIBRARY_ICON = '📖'
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'wikipedia': '>=1.4.0'})
 

@@ -59,11 +59,11 @@ TOOL_LIBRARY_DESC = "Inspect local subnets for open ports and services."
 TOOL_LIBRARY_ICON = "🌐"
 ```
 
-### Part 2: Installation Hook (`init_tool_library`)
+### Part 2: Installation Hook (`init_tools_library`)
 This function is invoked by the client during initialization. Use it to check and auto-install any third-party dependencies required by the script using `pipmaster`. This keeps the script fully portable.
 
 ```python
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({"scapy": ">=2.5.0"})
 ```
@@ -104,7 +104,7 @@ TOOL_LIBRARY_DESC = "Fetches a URL and extracts readable plain text, headers, an
 TOOL_LIBRARY_ICON = "🕸️"
 
 # ── Part 2: Dependency Verification ──
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     """Ensure beautifulsoup4 is present in the active virtual environment."""
     import pipmaster as pm
     pm.ensure_packages("beautifulsoup4")
@@ -129,7 +129,7 @@ def tool_web_scraper(
     try:
         from bs4 import BeautifulSoup
     except ImportError:
-        return {"success": False, "error": "BeautifulSoup4 was not installed correctly by init_tool_library."}
+        return {"success": False, "error": "BeautifulSoup4 was not installed correctly by init_tools_library."}
 
     try:
         # Fetch raw HTML using python's standard urllib
@@ -239,4 +239,4 @@ for tool in discovered_tools:
 ## 7. Summary of Best Practices
 - **Never nest `<artifact>` inside markdown code blocks** when writing tools, let the XML render directly.
 - **Always provide a detailed docstring** for your main tool function, as the LCP engine extracts it directly as the LLM-facing description.
-- **Use `init_tool_library()`** inside your tool scripts to run a pipmaster check ensuring all required third-party libraries (e.g. `websockets`, `pandas`, `beautifulsoup4`) are installed automatically on startup.
+- **Use `init_tools_library()`** inside your tool scripts to run a pipmaster check ensuring all required third-party libraries (e.g. `websockets`, `pandas`, `beautifulsoup4`) are installed automatically on startup.

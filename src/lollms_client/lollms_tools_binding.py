@@ -127,8 +127,13 @@ class LollmsToolBinding(LollmsBaseBinding):
 
                         # Strip from params dict so the clean parameters go to the tool
                         clean_params = {k: v for k, v in kwargs.items() if k not in ("discussion_instance", "lollms_client_instance")}
-                        
-                        result = self.execute_tool(tool_name, clean_params, discussion_instance=disc_inst)
+
+                        result = self.execute_tool(
+                            tool_name, 
+                            clean_params, 
+                            discussion_instance=disc_inst,
+                            lollms_client_instance=kwargs.get("lollms_client_instance")
+                        )
                         # Normalise: always return a dict
                         if not isinstance(result, dict):
                             result = {"output": result}

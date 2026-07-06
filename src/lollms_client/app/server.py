@@ -3294,7 +3294,7 @@ async def refine_tool_endpoint(payload: RefineToolRequest):
 
 @app.post("/api/run_tool_init")
 async def run_tool_init_endpoint(payload: RunToolInitRequest):
-    """Runs the init_tool_library() function from the provided code and redirects stdout."""
+    """Runs the init_tools_library() function from the provided code and redirects stdout."""
     import sys
     import io
     local_vars = {}
@@ -3303,11 +3303,11 @@ async def run_tool_init_endpoint(payload: RunToolInitRequest):
     sys.stdout = redirected_output
     try:
         exec(payload.code, {}, local_vars)
-        init_fn = local_vars.get("init_tool_library")
+        init_fn = local_vars.get("init_tools_library")
         if not init_fn:
-            return {"success": True, "output": "No 'init_tool_library()' function found (not required)."}
+            return {"success": True, "output": "No 'init_tools_library()' function found (not required)."}
         init_fn()
-        return {"success": True, "output": redirected_output.getvalue() or "init_tool_library() executed successfully (no stdout)."}
+        return {"success": True, "output": redirected_output.getvalue() or "init_tools_library() executed successfully (no stdout)."}
     except Exception as e:
         return {"success": False, "error": str(e), "output": redirected_output.getvalue()}
     finally:
@@ -3323,7 +3323,7 @@ async def parse_tool_functions_endpoint(payload: ParseToolFunctionsRequest):
         functions = []
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
-                if node.name == "init_tool_library":
+                if node.name == "init_tools_library":
                     continue
 
                 doc = ast.get_docstring(node) or "No description."

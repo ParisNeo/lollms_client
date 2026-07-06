@@ -74,15 +74,15 @@ def tool_calculate_tdee(bmr: float, activity_level: str = "sedentary") -> dict:
     return {"tdee": round(bmr * mult, 2)}
 ```
 
-### 🛑 CRITICAL: LCP Tool Agnosticism Doctrine
+### 🛑 CRITICAL: LCP Tool Agnosticism Doctrine (Relaxed)
 
-**LCP tools are strictly agnostic to Lollms.** They must **NEVER** accept `lollms_client_instance`, `discussion_instance`, or any other internal Lollms state object as input parameters. 
+**LCP tools are strictly agnostic to Lollms by default.** They must **NEVER** accept `lollms_client_instance`, `discussion_instance`, or any other internal Lollms state object as input parameters unless explicitly required for advanced agentic patterns.
 
 Tools are designed to be standalone Unix-style utilities. They must operate purely on parameters that an LLM can naturally generate (strings, numbers, lists) and interact with the filesystem using relative paths.
 
-1.  **No Context Injection**: Do not add `discussion_instance` or `lollms_client_instance` to your tool's function signature or docstring. The LCP AST parser filters these out, but relying on them breaks the agnostic contract.
+1.  **Optional Context Injection**: By default, do not add `discussion_instance` or `lollms_client_instance` to your tool's function signature. However, if a tool requires access to the orchestrator (e.g., for spawning child agents), it may declare these parameters. The ChatMixin orchestrator will inject them, and the LCP AST parser will filter them out when building the JSON schema for the LLM.
 2.  **CWD Reliance**: The Lollms orchestrator (ChatMixin) guarantees that the Current Working Directory (CWD) is set to the isolated discussion workspace *before* the tool executes. Tools should resolve files using simple relative paths: `Path(file_name)`.
-3.  **Output-Only Communication**: Tools communicate results back by returning a dictionary. They should never attempt to directly manipulate the discussion database, commit artifacts, or access the client.
+3.  **Output-Only Communication**: Tools communicate results back by returning a dictionary. They should never attempt to directly manipulate the discussion database, commit artifacts, or access the client (unless injected for advanced patterns).
 
 ### 🛡️ Error Tracking & Tracebacks
 

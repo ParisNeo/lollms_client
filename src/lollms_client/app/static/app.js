@@ -1769,7 +1769,7 @@ document.addEventListener("DOMContentLoaded", () => {
             return;
         }
 
-        const templateCode = `# ${cleanName}.py\n# Lollms local LCP tool\n# -----------------------------------------------------------------------------\n\nTOOL_LIBRARY_NAME = "${cleanName.replace(/_/g, ' ').toUpperCase()}"\nTOOL_LIBRARY_DESC = "Explain what this smart tool library does in this metadata block."\nTOOL_LIBRARY_ICON = "🔧"\n\ndef init_tool_library() -> None:\n    \"\"\"\n    Optional: Initialize any third-party libraries needed by your tool using pipmaster.\n    \"\"\"\n    import pipmaster as pm\n    # pm.ensure_packages({"requests": ">=2.0"})\n    pass\n\ndef tool_${cleanName}(\n    query: str,\n    count: int = 5\n) -> dict:\n    \"\"\"\n    Brief description of what this custom tool does.\n\n    Args:\n        query (str): Input query, path, or payload.\n        count (int, optional): Number of items to return/fetch. Defaults to 5.\n    \"\"\"\n    if not query:\n        return {"success": False, "error": "Query parameter must not be empty"}\n\n    return {\n        "success": True,\n        "result": f"Executed '${cleanName}' on query: '{query}' with count {count}"\n    }\n`;
+        const templateCode = `# ${cleanName}.py\n# Lollms local LCP tool\n# -----------------------------------------------------------------------------\n\nTOOL_LIBRARY_NAME = "${cleanName.replace(/_/g, ' ').toUpperCase()}"\nTOOL_LIBRARY_DESC = "Explain what this smart tool library does in this metadata block."\nTOOL_LIBRARY_ICON = "🔧"\n\ndef init_tools_library() -> None:\n    \"\"\"\n    Optional: Initialize any third-party libraries needed by your tool using pipmaster.\n    \"\"\"\n    import pipmaster as pm\n    # pm.ensure_packages({"requests": ">=2.0"})\n    pass\n\ndef tool_${cleanName}(\n    query: str,\n    count: int = 5\n) -> dict:\n    \"\"\"\n    Brief description of what this custom tool does.\n\n    Args:\n        query (str): Input query, path, or payload.\n        count (int, optional): Number of items to return/fetch. Defaults to 5.\n    \"\"\"\n    if not query:\n        return {"success": False, "error": "Query parameter must not be empty"}\n\n    return {\n        "success": True,\n        "result": f"Executed '${cleanName}' on query: '{query}' with count {count}"\n    }\n`;
 
         // Register the new artifact programmatically
         const artTitle = `${cleanName}_tool`;
@@ -2287,7 +2287,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         <div class="tool-tab-pane" id="tool-pane-tests-${safeId}">
                             <div style="display: flex; gap: 16px; height: 100%;">
                                 <div style="width: 250px; border-right: 1px solid var(--border-color); padding-right: 16px; display: flex; flex-direction: column; gap: 12px;">
-                                    <button class="btn btn-primary" id="btn-run-init-${safeId}" style="background-color: var(--success-color); color: #020617;">🧪 Run init_tool_library()</button>
+                                    <button class="btn btn-primary" id="btn-run-init-${safeId}" style="background-color: var(--success-color); color: #020617;">🧪 Run init_tools_library()</button>
                                     <h3>Select Function to Test</h3>
                                     <div id="tool-tests-fn-list-${safeId}" style="display: flex; flex-direction: column; gap: 6px; overflow-y: auto; flex: 1;">
                                         <li class="empty-msg">Save the tool first to parse callable functions.</li>
@@ -2320,7 +2320,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                 <ul style="padding-left: 20px; margin-top: 6px;">
                                     <li><strong>Entry Point</strong>: Your script must define a function named <code>tool_[tool_name]</code> (e.g., <code>tool_${title.replace('_tool','')}</code>) or simply <code>execute</code>.</li>
                                     <li><strong>Schema Auto-Discovery</strong>: Parameter names, default values, type-hints, and descriptive docstrings are parsed via AST on the server automatically. No JSON configuration is needed!</li>
-                                    <li><strong>Imports</strong>: Import any required library inside your function (or at the top). Use <code>pipmaster</code> inside <code>init_tool_library()</code> if custom libraries need automatic installation.</li>
+                                    <li><strong>Imports</strong>: Import any required library inside your function (or at the top). Use <code>pipmaster</code> inside <code>init_tools_library()</code> if custom libraries need automatic installation.</li>
                                 </ul>
                                 <h4 style="margin-top: 12px; font-weight: bold;">🚀 Advanced Integration</h4>
                                 <p style="margin-top: 6px;">To access active conversational or client variables directly inside your tool, simply declare them in your function parameters:</p>
@@ -2486,7 +2486,7 @@ document.addEventListener("DOMContentLoaded", () => {
             // Bind init runner
             runInitBtn.addEventListener("click", () => {
                 runInitBtn.disabled = true;
-                runInitBtn.textContent = "Executing init_tool_library()...";
+                runInitBtn.textContent = "Executing init_tools_library()...";
                 testStdout.textContent = "Loading dependencies in Python sandbox...";
 
                 fetch("/api/run_tool_init", {
@@ -2499,7 +2499,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     if (data.success) {
                         testStdout.textContent = data.output;
                     } else {
-                        testStdout.textContent = `Error in init_tool_library():\n${data.error}\n\nStdout:\n${data.output}`;
+                        testStdout.textContent = `Error in init_tools_library():\n${data.error}\n\nStdout:\n${data.output}`;
                     }
                 })
                 .catch(err => {
@@ -2507,7 +2507,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 })
                 .finally(() => {
                     runInitBtn.disabled = false;
-                    runInitBtn.textContent = "🧪 Run init_tool_library()";
+                    runInitBtn.textContent = "🧪 Run init_tools_library()";
                 });
             });
 

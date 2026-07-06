@@ -1,33 +1,3 @@
-# lollms_discussion/_mixin_branch.py
-# BranchMixin: first-class branch management for LollmsDiscussion.
-#
-# Concepts
-# --------
-# A discussion's messages form a *tree*, not a list.  Every message has an
-# optional parent_id.  A *branch* is the path from a root message (parent=None)
-# to a leaf (no children).  The *active branch* is the leaf whose ID is stored
-# in discussion.active_branch_id.
-#
-# This mixin adds:
-#
-#   BranchInfo dataclass      — snapshot of one branch (id, label, depth, …)
-#   MessageNode dataclass     — one node in the tree with child info
-#
-#   get_children(msg_id)      — direct children of a message
-#   get_siblings(msg_id)      — messages that share the same parent
-#   get_branch_info(leaf_id)  — BranchInfo for any leaf
-#   list_branches()           — all branches in the discussion
-#   get_tree()                — full tree as nested MessageNode dicts
-#   get_message_branches(id)  — branches that pass *through* a given message
-#
-#   switch_branch(leaf_id)    — change active branch  (alias: switch_to_branch)
-#   fork_from(msg_id, …)      — start a new branch from any message
-#   delete_branch(leaf_id)    — remove a branch leaf (and childless ancestors)
-#   prune_branch(msg_id)      — remove a message and all its descendants
-#   merge_branches(…)         — concatenate two branches into a new one
-#
-# All methods are safe to call on both DB-backed and in-memory discussions.
-
 from __future__ import annotations
 
 import uuid
@@ -38,21 +8,17 @@ from typing import Any, Dict, List, Optional, Tuple
 from ascii_colors import ASCIIColors, trace_exception
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
 @dataclass
 class BranchInfo:
     """Lightweight descriptor for one branch (root-to-leaf path)."""
-    leaf_id:       str                 # the leaf message's ID
-    message_ids:   List[str]          # [root_id, …, leaf_id]
-    depth:         int                 # number of messages in the branch
-    label:         str                 # human-readable label (auto or custom)
-    is_active:     bool               # True if this is the current active branch
-    created_at:    Optional[datetime] = None  # leaf message's creation time
-    last_sender:   str                = ""    # sender of the leaf message
-    last_content_preview: str        = ""    # first 80 chars of leaf content
+    leaf_id:       str
+    message_ids:   List[str]
+    depth:         int
+    label:         str
+    is_active:     bool
+    created_at:    Optional[datetime] = None
+    last_sender:   str                = ""
+    last_content_preview: str        = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -74,11 +40,11 @@ class MessageNode:
     parent_id:   Optional[str]
     sender:      str
     sender_type: str
-    content_preview: str            # first 120 chars
+    content_preview: str
     created_at:  Optional[datetime]
     children:    List["MessageNode"] = field(default_factory=list)
-    branch_count: int = 0           # number of branches passing through this node
-    is_active_path: bool = False    # True if on current active branch
+    branch_count: int = 0
+    is_active_path: bool = False
 
     def to_dict(self, recursive: bool = True) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -98,17 +64,9 @@ class MessageNode:
 # ---------------------------------------------------------------------------
 # BranchMixin
 # ---------------------------------------------------------------------------
-
 class BranchMixin:
-    """
-    First-class branch management: discovery, navigation, forking, deletion,
-    and merging.  Designed to sit in the MRO alongside CoreMixin.
-    """
-
-    # ================================================================ helpers
-
     def _children_map(self) -> Dict[str, List[str]]:
-        """Returns {parent_id: [child_id, …]} for every message in the index."""
+        """Returns {parent_id: [child_id, ...]} for every message in the index."""
         self._rebuild_message_index()
         cm: Dict[str, List[str]] = {mid: [] for mid in self._message_index}
         for mid, msg in self._message_index.items():
@@ -118,26 +76,20 @@ class BranchMixin:
         return cm
 
     def _collect_leaves(self, cm: Dict[str, List[str]]) -> List[str]:
-        """Return the IDs of all messages that have no children."""
         return [mid for mid, children in cm.items() if not children]
 
     def _path_to_root(self, leaf_id: str) -> List[str]:
-        """
-        Walks parent links from *leaf_id* up to the root.
-        Returns the path as [root_id, …, leaf_id].
-        """
+        """Walks parent links from *leaf_id* up to the root. Returns the path as [root_id, ..., leaf_id]."""
         path: List[str] = []
         cur = leaf_id
         visited: set = set()
         while cur and cur in self._message_index:
             if cur in visited:
-                break          # cycle guard
+               break
             visited.add(cur)
             path.append(cur)
             cur = self._message_index[cur].parent_id
         return list(reversed(path))
-
-    # ================================================================ discovery
 
     def get_children(self, message_id: str) -> List[Any]:
         """
@@ -167,6 +119,7 @@ class BranchMixin:
             if msg.parent_id == parent_id
         ]
         # Sort by creation time so the UI can display them in order
+
         siblings.sort(key=lambda m: m.created_at or datetime.min)
         return siblings
 
@@ -185,6 +138,7 @@ class BranchMixin:
         created   = getattr(leaf_msg, 'created_at', None)
 
         # Auto-label: "Branch from <sender> @ depth <n>"
+
         label = f"Branch #{leaf_id[:6]} — {sender} (depth {len(path)})"
         meta  = getattr(leaf_msg, 'message_metadata', {}) or {}
         if meta.get('branch_label'):
@@ -206,6 +160,7 @@ class BranchMixin:
         Returns a BranchInfo for every leaf in the discussion tree, sorted by
         creation time of the leaf message (oldest first).
         """
+
         self._rebuild_message_index()
         cm     = self._children_map()
         leaves = self._collect_leaves(cm)

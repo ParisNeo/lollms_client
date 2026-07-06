@@ -401,8 +401,6 @@ class ArtefactManager:
 
     def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None, logical_content: Optional[str] = None):
         try:
-            # 🛑 CRITICAL FIX: Prioritize workspace_data_path to ensure files are written
-            # to the exact directory the tools will use as CWD.
             if getattr(self._discussion, "workspace_data_path", None):
                 ws_data_dir = Path(self._discussion.workspace_data_path)
                 # The metadata path is the parent's "artefacts_metadata" folder
@@ -585,27 +583,11 @@ class ArtefactManager:
         artefacts.append(new_artefact)
         self._save_all(artefacts)
 
-        # 🛑 CRITICAL FIX: Pass physical_data directly.
-        # The previous code referenced `final_physical_data` — a variable that was never
-        # defined in this scope — causing silent sync failures and potential NameError.
-        # For text-based artifacts (code, document, note, skill) where physical_data is None,
-        # the _sync_to_disk_workspace method handles writing the string content to disk.
-        # For data/image artifacts, physical_data contains the raw bytes to write.
         self._sync_to_disk_workspace(
             title, content, version, artefact_type, language, extra_data.get("file_ext"),
             physical_data=physical_data,
             logical_content=logical_content
         )
-
-        # 🛑 CRITICAL FIX: IMMEDIATE MATERIALIZATION DOCTRINE
-        # The physical twin must exist on disk the instant the artifact is created.
-        # This guarantees that if the LLM emits a <tool> tag in the very next token
-        # that references this file by relative path, the file will be found.
-        # _sync_to_disk_workspace is already called above, but for text-based artifacts
-        # where physical_data is None, we must ensure the content string is written.
-        # The _sync_to_disk_workspace method already handles this fallback, so we
-        # just need to ensure it was called successfully (which it was above).
-
         return new_artefact
 
     def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -1274,9 +1256,6 @@ class ArtefactManager:
         """
         active_arts = self.list(active_only=True)
 
-        # 🛑 CRITICAL FIX: Resolve workspace_data_path directly from the discussion.
-        # The previous code constructed the path manually and could mismatch the
-        # actual workspace_data_path used by the tools (CWD).
         if getattr(self._discussion, "workspace_data_path", None):
             workspace_dir = Path(self._discussion.workspace_data_path)
         else:

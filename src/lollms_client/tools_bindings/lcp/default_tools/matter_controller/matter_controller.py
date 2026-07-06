@@ -15,7 +15,7 @@ TOOL_LIBRARY_NAME = "Matter Smart Home Controller"
 TOOL_LIBRARY_DESC = "Interface with local smart home appliances using the IP-based Matter Protocol (CHIP)."
 TOOL_LIBRARY_ICON = "🏠"
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({"websockets": ">=10.0", "aiohttp": ">=3.8.0"})
 

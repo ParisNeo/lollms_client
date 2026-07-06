@@ -808,13 +808,14 @@ def tool_analyze_my_data(file_name: str) -> dict:
     }
 ```
 
-### 🛑 CRITICAL: LCP Tool Agnosticism Doctrine
+### 🛑 CRITICAL: LCP Tool Agnosticism Doctrine (Relaxed)
 
-**LCP tools are strictly agnostic to Lollms.** They must **NEVER** accept `discussion_instance`, `lollms_client_instance`, or any internal Lollms state object as input parameters. 
+**LCP tools are strictly agnostic to Lollms by default.** They must **NEVER** accept `discussion_instance`, `lollms_client_instance`, or any internal Lollms state object as input parameters unless explicitly required for advanced agentic patterns.
 
-1.  **Agnostic Signatures**: Tools must operate purely on parameters that an LLM can naturally generate (strings, numbers, lists). The LCP AST parser filters out internal parameters, but tools must not rely on them for workspace resolution or artifact registration.
-2.  **CWD Reliance**: The ChatMixin orchestrator is responsible for setting the CWD to the isolated workspace before execution. Tools should resolve files using simple relative paths (e.g., `Path(file_name)`).
-3.  **Output-Only Communication**: Tools communicate results back by returning a dictionary. They must never attempt to directly manipulate the discussion database, commit artifacts, or access the client. The orchestrator detects new/modified files after execution and syncs them.
+1.  **Agnostic Signatures**: Tools must operate purely on parameters that an LLM can naturally generate (strings, numbers, lists). The LCP AST parser filters out internal parameters (`discussion_instance`, `lollms_client_instance`) when building the JSON schema for the LLM, so the LLM never sees them.
+2.  **Optional Context Injection**: If a tool explicitly declares `discussion_instance` or `lollms_client_instance` in its function signature, the ChatMixin orchestrator will inject them. This enables advanced patterns like recursive child agent spawning. The LCP AST parser filters these out when building the JSON schema for the LLM, maintaining the agnostic contract at the API level.
+3.  **CWD Reliance**: The ChatMixin orchestrator is responsible for setting the CWD to the isolated workspace before execution. Tools should resolve files using simple relative paths (e.g., `Path(file_name)`).
+4.  **Output-Only Communication**: Tools communicate results back by returning a dictionary. They must never attempt to directly manipulate the discussion database, commit artifacts, or access the client. The orchestrator detects new/modified files after execution and syncs them.
 
 The LCP Binding will automatically:
 1.  Parse the function signature via AST.

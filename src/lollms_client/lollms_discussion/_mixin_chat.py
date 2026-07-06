@@ -9,7 +9,7 @@
 import re
 import json
 import uuid
-import os
+import traceback
 import threading
 import random
 from typing import Any, Dict, List, Optional, Tuple, Callable, Union
@@ -19,10 +19,8 @@ from lollms_client.lollms_types import MSG_TYPE
 from ._message import LollmsMessage
 from lollms_client.lollms_artefact import ArtefactType, make_image_id, ArtefactVisibility, ArtefactStatus
 from lollms_client.lollms_memory import FailureMemory
-# ── Cancellation state & limits ──────────────────────────────────────────────
 _MAX_BRACKET_BUF = 256
 
-# ── Heartbeat Cheering Messages ──────────────────────────────────────────────
 _HEARTBEAT_MESSAGES = [
     "✍️ Writing content...",
     "🧠 Thinking...",
@@ -96,14 +94,8 @@ def _cb(callback: Optional[Callable], text: str, msg_type: MSG_TYPE, meta: Optio
     return True
 
 
-# ── Tool Result Sanitizer ───────────────────────────────────────────────────
-
 _BASE64_RE = re.compile(r'^[A-Za-z0-9+/=\s]{500,}$')
 
-# Field names whose values are typically large base64 binaries that should NOT
-# be fed back to the LLM (they bloat context, confuse the model, and trigger
-# tool-stutter loops where the LLM re-invokes the same tool on the data it
-# just produced).
 _BINARY_BLOB_KEYS = {
     "plot_b64", "image_b64", "audio_b64", "video_b64", "file_b64",
     "screenshot_b64", "pdf_b64", "thumbnail_b64", "base64",
@@ -112,8 +104,6 @@ _BINARY_BLOB_KEYS = {
 
 _MAX_TOOL_RESULT_CHARS = 4000
 
-
-# ── Structural Analyzer for Sparse Artefact Forwarding ─────────────────────
 
 import time as _time
 
@@ -125,9 +115,7 @@ def _analyze_artefact_structure(buffer: str, language: Optional[str]) -> Optiona
    if not buffer:
        return None
 
-   # 1. Markdown Analysis (sections)
    if language in ("markdown", "md"):
-       # Match level 1 and 2 headers
        match = re.search(r'^#{1,2}\s+(.+)$', buffer, re.MULTILINE)
        if match:
            header_text = match.group(1).strip()
@@ -137,9 +125,7 @@ def _analyze_artefact_structure(buffer: str, language: Optional[str]) -> Optiona
            }
        return None
 
-   # 2. Python Analysis
    if language == "python":
-       # Match class or function definitions at the start of a line
        match = re.search(r'^(class|def|async\s+def)\s+([a-zA-Z_][a-zA-Z0-9_]*)', buffer, re.MULTILINE)
        if match:
            kind = match.group(1).replace("async ", "")
@@ -150,9 +136,7 @@ def _analyze_artefact_structure(buffer: str, language: Optional[str]) -> Optiona
            }
        return None
 
-   # 3. JavaScript/TypeScript Analysis
    if language in ("javascript", "js", "typescript", "ts"):
-       # Match class, function, or arrow functions
        match = re.search(r'^(export\s+)?(class|function|const|let)\s+([a-zA-Z_][a-zA-Z0-9_]*)', buffer, re.MULTILINE)
        if match:
            kind = match.group(2)
@@ -163,7 +147,6 @@ def _analyze_artefact_structure(buffer: str, language: Optional[str]) -> Optiona
            }
        return None
 
-   # 4. HTML/CSS Analysis
    if language in ("html", "css"):
        if language == "html":
            match = re.search(r'<(section|div|nav|footer|header|main|article)\s+[^>]*class="[^"]*"', buffer, re.IGNORECASE)
@@ -177,7 +160,6 @@ def _analyze_artefact_structure(buffer: str, language: Optional[str]) -> Optiona
                return {"status": f"Styling .{cls}", "detail": cls}
        return None
 
-   # Fallback: Generic code block detection (first line)
    lines = buffer.strip().splitlines()
    if lines and len(buffer) > 50:
        first_line = lines[0].strip()
@@ -331,18 +313,24 @@ def _sanitize_tool_result(
             return walked
         return str(obj)
 
+    if isinstance(tool_res, dict) and tool_res.get("success") is False:
+        error_msg = tool_res.get("error", "Unknown error")
+        # Check for nested error in output dict
+        if not error_msg or error_msg == "Unknown error":
+            inner = tool_res.get("output")
+            if isinstance(inner, dict):
+                error_msg = inner.get("error", error_msg)
+        return f"⚠ Tool Failed\nError: {error_msg}"
+
     pinj = _find_prompt_injection(tool_res)
     if pinj:
         success = True
         inner = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
         if isinstance(inner, dict):
             success = inner.get("success", True)
-        # 🛑 CRITICAL FIX: Also check the top-level tool_res for success=False
         if isinstance(tool_res, dict) and tool_res.get("success") is False:
             success = False
         success_status = "✓ Success" if success else "⚠ Tool Failed"
-        # 🛑 CRITICAL FIX: Include the error message when the tool failed, so the LLM
-        # sees WHY it failed and doesn't retry blindly.
         error_msg = ""
         if not success and isinstance(tool_res, dict):
             error_msg = tool_res.get("error", "")
@@ -352,8 +340,18 @@ def _sanitize_tool_result(
             return f"{success_status}\nError: {error_msg}\n{pinj}"
         return f"{success_status}\n{pinj}"
 
-    # 🛑 CRITICAL FIX: Unwrap the tool result to get the actual content
-    # Tools return {"success": True, "output": <content>}, but the LLM needs to see <content>, not the wrapper.
+    if isinstance(tool_res, dict) and tool_res.get("success") is False:
+        error_msg = tool_res.get("error", "Unknown tool error")
+        # Check nested output dict for error
+        inner_out = tool_res.get("output")
+        if isinstance(inner_out, dict) and inner_out.get("error"):
+            error_msg = inner_out["error"]
+        # Also check for traceback to give the LLM full context
+        traceback_str = tool_res.get("traceback", "")
+        if traceback_str:
+            return f"⚠ Tool Failed\nError: {error_msg}\nTraceback:\n{traceback_str}"
+        return f"⚠ Tool Failed\nError: {error_msg}"
+
     unwrapped = tool_res
     if isinstance(tool_res, dict):
         if "output" in tool_res:
@@ -371,13 +369,9 @@ def _sanitize_tool_result(
         elif "data" in tool_res:
             unwrapped = tool_res["data"]
 
-    # Handle None explicitly (even if nested inside a dict like {"output": None})
     if unwrapped is None:
         return "Tool executed successfully but returned no output content."
 
-    # 🛑 CRITICAL FIX: Recursively replace None values with a human-readable string
-    # This prevents json.dumps from converting None to "null", which confuses the LLM
-    # into thinking the tool failed and retrying it indefinitely.
     def _replace_none(obj):
         if obj is None:
             return "[No output returned by tool]"
@@ -531,6 +525,16 @@ class _StreamState:
         self._artefact_open_tag = "" # Stores the exact opening tag (e.g., <artifact name="x">)
         self._pending_buffer = ""   # Shadow buffer to safely catch partial tags
 
+        # ── Generic Secondary Tag Interceptor State ──
+        # Handles <skill>, <note>, <lollms_inline>, <lollms_form>, <generate_image>, <edit_image>, etc.
+        # These tags don't need the specialized dual-stream artifact tracker, but DO need
+        # full body buffering + closing-tag detection + dispatch to _dispatch_closed_tag.
+        self._is_accumulating_secondary = False
+        self._secondary_buffer = ""
+        self._secondary_tag_name = ""      # e.g., "skill", "note"
+        self._secondary_closing_tag = ""   # e.g., "</skill>"
+        self._secondary_open_tag = ""      # e.g., '<skill title="...">'
+
         # Heartbeat control for empty/slow artifacts
         self._artefact_heartbeat_thread: Optional[threading.Thread] = None
         self._artefact_heartbeat_stop = threading.Event()
@@ -610,7 +614,7 @@ class _StreamState:
             return True
 
         # ── Tag Detection (Buffering) ──
-        last_open_think = self._pending_buffer.rfind("<tool_call>")
+        last_open_think = self._pending_buffer.rfind("<think")
         last_close_think = self._pending_buffer.rfind("```")
         is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
 
@@ -811,15 +815,119 @@ class _StreamState:
 
                 return True
 
+        # ── Generic Secondary Tag Interception (<skill>, <note>, <lollms_inline>, etc.) ──
+        if not is_inside_thoughts and not self._is_accumulating_secondary:
+            # Check if we are ENTERING a secondary tag
+            lower_buffer = self._pending_buffer.lower()
+            secondary_entered = False
+            for tag_prefix in ("<skill", "<note", "<lollms_inline", "<lollms_form", "<generate_image", "<edit_image"):
+                open_idx = lower_buffer.find(tag_prefix)
+                if open_idx != -1:
+                    # Check if we have the full opening tag (closing '>')
+                    end_of_tag_idx = self._pending_buffer.find(">", open_idx)
+                    if end_of_tag_idx != -1:
+                        # Full opening tag received
+                        tag_start_idx = open_idx
+                        opening_tag = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
+
+                        # Extract tag name (e.g., "skill" from "<skill title=...>")
+                        tag_name_match = re.match(r'<(\w+)', opening_tag)
+                        if tag_name_match:
+                            self._secondary_tag_name = tag_name_match.group(1).lower()
+                            self._secondary_closing_tag = f"</{self._secondary_tag_name}>"
+                            self._secondary_open_tag = opening_tag
+                            self._is_accumulating_secondary = True
+
+                            # Forward text BEFORE the tag to the UI and save it
+                            text_before_tag = self._pending_buffer[:tag_start_idx]
+                            if text_before_tag:
+                                self.ai_message.content += text_before_tag
+                                _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                            # Start the secondary buffer with the opening tag
+                            self._secondary_buffer = opening_tag
+                            self._pending_buffer = ""
+
+                            # Emit a processing block opening for UI feedback
+                            proc_type = self._secondary_tag_name
+                            # Extract title from attributes if present
+                            title_match = re.search(r'(?:title|name)=["\']([^"\']*)["\']', opening_tag, re.IGNORECASE)
+                            proc_title = title_match.group(1) if title_match else self._secondary_tag_name.capitalize()
+                            proc_open = f'\n<processing type="{proc_type}" title="{proc_title}">\n'
+                            self.ai_message.content += proc_open
+                            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            status_msg = _ARTEFACT_TYPE_MESSAGES.get(self._secondary_tag_name, f"✨ Processing {self._secondary_tag_name}...")
+                            status_line = f'{status_msg}\n'
+                            self.ai_message.content += status_line
+                            _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                            secondary_entered = True
+                            break
+                    else:
+                        # Partial tag (no closing '>' yet). Hold everything from the tag start.
+                        text_before_partial = self._pending_buffer[:open_idx]
+                        if text_before_partial:
+                            self.ai_message.content += text_before_partial
+                            _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._pending_buffer = self._pending_buffer[open_idx:]
+                        return True
+
+            if secondary_entered:
+                return True
+
+        # ── Handle Secondary Tag Body Accumulation & Closing ──
+        if self._is_accumulating_secondary:
+            self._secondary_buffer += self._pending_buffer
+            self._pending_buffer = ""
+
+            # Check if the closing tag arrived
+            close_idx = self._secondary_buffer.lower().find(self._secondary_closing_tag.lower())
+            if close_idx != -1:
+                # Closing tag found! Extract the full match.
+                body_content = self._secondary_buffer[len(self._secondary_open_tag):close_idx]
+                closing_tag = self._secondary_buffer[close_idx:close_idx+len(self._secondary_closing_tag)]
+                full_match_text = self._secondary_open_tag + body_content + closing_tag
+
+                self._is_accumulating_secondary = False
+
+                # Dispatch to _dispatch_closed_tag for processing
+                if full_match_text not in self.processed_tags:
+                    self.processed_tags.add(full_match_text)
+                    self._dispatch_closed_tag(
+                        self._secondary_tag_name,
+                        self._secondary_open_tag,
+                        body_content.strip(),
+                        full_match_text
+                    )
+
+                # Close the processing block with status metadata
+                proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+                self.ai_message.content += proc_close_tag
+                _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                # Reset secondary state
+                self._secondary_tag_name = ""
+                self._secondary_closing_tag = ""
+                self._secondary_open_tag = ""
+                self._secondary_buffer = ""
+            else:
+                # Still accumulating body. Emit lightweight status if enabled.
+                # (No structural analysis for secondary tags — just suppress raw output)
+                pass
+            return True
+
         # ── Default Forwarding ──
         # Robust partial tag detection: Check if the buffer ends with a prefix of any known tag.
         # This prevents raw XML from leaking when the LLM streams tokens with trailing spaces or partial attributes.
         def _ends_with_partial_tag(buffer: str) -> int:
             """Returns the start index of the partial tag if found, else -1."""
-            tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<generate_image", "<edit_image"]
+            tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<generate_image", "<edit_image", "<lollms_inline", "<lollms_form"]
             for tag in tags_to_check:
-                # Check if the buffer ends with a substring of the tag (e.g., "<art", "<artifact ")
-                for i in range(1, len(tag) + 1):
+                # Check if the buffer ends with a STRICT prefix of the tag (e.g., "<art", "<to")
+                # We must exclude the full tag itself (range stops at len(tag)), otherwise
+                # a complete "<tool>" tag gets trapped here and never reaches the re.search block.
+                for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
                         # Found a partial match. Return the start index.
                         return len(buffer) - i
@@ -885,9 +993,18 @@ class _StreamState:
                         title=title, new_content=patched, language=lang, bump_version=True, active=self.auto_activate,
                         ephemeral=is_ephemeral
                     )
-                except Exception as e:
-                    ASCIIColors.error(f"Failed to apply patch: {e}")
-                    art = None
+                except Exception as patch_err:
+                    ASCIIColors.error(f"[StreamState] Artifact patch failed: {patch_err}")
+                    proc_open = f'\n<processing type="artefact" title="{title}" language="{lang or ""}">\n'
+                    proc_body = f'* ❌ Failed to apply patch to artifact: {patch_err}\n'
+                    proc_close = f'<!-- status:failure -->\n</processing>\n'
+                    proc_block = proc_open + proc_body + proc_close
+
+                    self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                    _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    return True
             else:
                 if is_new:
                     art = self.discussion.artefacts.add(
@@ -902,6 +1019,23 @@ class _StreamState:
 
             if art:
                 self.affected_artefacts.append(art)
+
+            # ── 🛑 CRITICAL FIX: IMMEDIATE PHYSICAL MATERIALIZATION ──
+            # The physical twin MUST exist on disk the instant the artifact is created.
+            # If the LLM emits a <tool> tag in the very next token that references this file,
+            # the tool will fail with "File not found" if we rely on deferred syncing.
+            # We force a synchronous write to the workspace_data directory right now.
+            try:
+                # Use the discussion's artefact manager to sync this specific file to disk
+                self.discussion.artefacts._sync_to_disk_workspace(
+                    title=art.get("title", title),
+                    content=art.get("content", body),
+                    version=art.get("version", 1),
+                    atype=atype,
+                    language=lang
+                )
+            except Exception as sync_ex:
+                ASCIIColors.warning(f"[StreamState] Failed to immediately materialize artifact '{title}' to disk: {sync_ex}")
 
             # ── CRITICAL: DO NOT MUTATE ai_message.content ──
             # The raw <artifact> XML is preserved in the message content.
@@ -926,6 +1060,7 @@ class _StreamState:
             # LLMs often hallucinate flat structures: {"name": "tool", "arg": "val"}
             # instead of nested: {"name": "tool", "parameters": {"arg": "val"}}
             # We MUST normalize this here to prevent execution failures.
+            tool_name = ""
             try:
                 raw_data = json.loads(body)
                 if isinstance(raw_data, dict):
@@ -945,6 +1080,28 @@ class _StreamState:
                 self.tool_json_data = body
                 ASCIIColors.error(f"[StreamState] JSON decode failed: {je}")
 
+            # ── 🛑 CRITICAL FIX: IMMEDIATE UI FEEDBACK ──
+            # Emit the processing block to the UI INSTANTLY when the </tool> tag closes.
+            # This guarantees the user sees "Calling tool..." while the tool executes,
+            # rather than waiting for the synchronous execution to finish.
+            import html
+            try:
+                parsed_for_ui = json.loads(self.tool_json_data)
+                ui_tool_name = parsed_for_ui.get("name", "unknown") if isinstance(parsed_for_ui, dict) else "unknown"
+                ui_params = parsed_for_ui.get("parameters", {}) if isinstance(parsed_for_ui, dict) else {}
+            except Exception:
+                ui_tool_name = "unknown"
+                ui_params = {}
+
+            escaped_params = html.escape(json.dumps(ui_params, default=str))
+            tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}" params="{escaped_params}">\n'
+            self.ai_message.content += tool_open_tag
+            _cb(self.callback, tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+            status_line = f"* Calling local tool system for '{ui_tool_name}'...\n"
+            self.ai_message.content += status_line
+            _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
             # Halt generation instantly so the executor can take over the loop
             return False
 
@@ -953,13 +1110,51 @@ class _StreamState:
             if not self.enable_notes:
                 return True
             title = attrs.get("title") or attrs.get("name") or f"note_{uuid.uuid4().hex[:8]}"
-            art = self.discussion.artefacts.add(
-                title=title, artefact_type=ArtefactType.NOTE, content=body, active=self.auto_activate
-            )
+
+            is_patch = "<<<<<<< SEARCH" in body
+            if is_patch:
+                existing = self.discussion.artefacts.get(title)
+                if existing:
+                    try:
+                        patched_content = self.discussion.artefacts.apply_aider_patch(existing["content"], body)
+                        art = self.discussion.artefacts.update(
+                            title=title, new_content=patched_content, bump_version=True, active=self.auto_activate
+                        )
+                    except Exception as patch_err:
+                        ASCIIColors.error(f"[StreamState] Note patch failed: {patch_err}")
+                        proc_open = f'\n<processing type="note" title="{title}">\n'
+                        proc_body = f'* ❌ Failed to apply patch to note: {patch_err}\n'
+                        proc_close = f'<!-- status:failure -->\n</processing>\n'
+                        proc_block = proc_open + proc_body + proc_close
+
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        return True
+                else:
+                    ASCIIColors.warning(f"[StreamState] Note patch ignored (note '{title}' not found). Creating new.")
+                    art = self.discussion.artefacts.add(
+                        title=title, artefact_type=ArtefactType.NOTE, content=body, active=self.auto_activate
+                    )
+            else:
+                art = self.discussion.artefacts.add(
+                    title=title, artefact_type=ArtefactType.NOTE, content=body, active=self.auto_activate
+                )
+
             if art:
                 self.affected_artefacts.append(art)
 
-            # Preserve raw XML in content. Export will handle the placeholder.
+            proc_open = f'\n<processing type="note" title="{title}">\n'
+            proc_body = f'* 🗒️ Note captured and saved to workspace.\n'
+            proc_close = f'<!-- status:finished -->\n</processing>\n'
+            proc_block = proc_open + proc_body + proc_close
+
+            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
             _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
                 "title": title,
@@ -974,13 +1169,51 @@ class _StreamState:
             title = attrs.get("title") or attrs.get("name") or f"skill_{uuid.uuid4().hex[:8]}"
             desc = attrs.get("description", "")
             cat = attrs.get("category", "")
-            art = self.discussion.artefacts.add(
-                title=title, artefact_type=ArtefactType.SKILL, content=body, active=self.auto_activate, description=desc, category=cat
-            )
+
+            is_patch = "<<<<<<< SEARCH" in body
+            if is_patch:
+                existing = self.discussion.artefacts.get(title)
+                if existing:
+                    try:
+                        patched_content = self.discussion.artefacts.apply_aider_patch(existing["content"], body)
+                        art = self.discussion.artefacts.update(
+                            title=title, new_content=patched_content, bump_version=True, active=self.auto_activate
+                        )
+                    except Exception as patch_err:
+                        ASCIIColors.error(f"[StreamState] Skill patch failed: {patch_err}")
+                        proc_open = f'\n<processing type="skill" title="{title}">\n'
+                        proc_body = f'* ❌ Failed to apply patch to skill: {patch_err}\n'
+                        proc_close = f'<!-- status:failure -->\n</processing>\n'
+                        proc_block = proc_open + proc_body + proc_close
+
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        return True
+                else:
+                    ASCIIColors.warning(f"[StreamState] Skill patch ignored (skill '{title}' not found). Creating new.")
+                    art = self.discussion.artefacts.add(
+                        title=title, artefact_type=ArtefactType.SKILL, content=body, active=self.auto_activate, description=desc, category=cat
+                    )
+            else:
+                art = self.discussion.artefacts.add(
+                    title=title, artefact_type=ArtefactType.SKILL, content=body, active=self.auto_activate, description=desc, category=cat
+                )
+
             if art:
                 self.affected_artefacts.append(art)
 
-            # Preserve raw XML in content. Export will handle the placeholder.
+            proc_open = f'\n<processing type="skill" title="{title}">\n'
+            proc_body = f'* 🧠 Skill captured and saved to workspace.\n'
+            proc_close = f'<!-- status:finished -->\n</processing>\n'
+            proc_block = proc_open + proc_body + proc_close
+
+            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
             _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_created",
                 "title": title,
@@ -1079,6 +1312,35 @@ class _StreamState:
             self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
             return  # Exit early; the tool call has been dispatched
 
+        # ── Force-dispatch incomplete secondary tags (unclosed <skill>, <note>, etc.) ──
+        if self._is_accumulating_secondary:
+            # The LLM finished generation without closing the tag.
+            # Synthesize a closing tag and dispatch what we have.
+            full_match_text = self._secondary_buffer + self._secondary_closing_tag
+            body_content = self._secondary_buffer[len(self._secondary_open_tag):]
+
+            self._is_accumulating_secondary = False
+
+            if full_match_text not in self.processed_tags:
+                self.processed_tags.add(full_match_text)
+                self._dispatch_closed_tag(
+                    self._secondary_tag_name,
+                    self._secondary_open_tag,
+                    body_content.strip(),
+                    full_match_text
+                )
+
+            # Close the processing block
+            proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+            self.ai_message.content += proc_close_tag
+            _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+            self._secondary_tag_name = ""
+            self._secondary_closing_tag = ""
+            self._secondary_open_tag = ""
+            self._secondary_buffer = ""
+            return
+
         if self._pending_buffer:
             # If we are still inside an artifact for some reason (unclosed tag), dump it to the UI
             if self.artefact_tracker.is_inside_artefact:
@@ -1107,8 +1369,6 @@ class ChatMixin:
         object.__setattr__(self, '_cancel_flag', False)
         super().__init__(*args, **kwargs)
 
-        # 🛑 CRITICAL FIX: Initialize FailureMemory IMMEDIATELY on discussion object
-        # This ensures it exists BEFORE the first chat() call
         from ..lollms_memory.lollms_memory import FailureMemory
         object.__setattr__(self, '_failure_memory', FailureMemory())
 
@@ -1300,6 +1560,7 @@ class ChatMixin:
         fast_artefact_replicas:       Optional[List[str]] = None,  # Custom messages for instant/empty artefacts
         tolerance_level:              Optional[str] = "strict",
         allow_dynamic_tools:          bool = False,  # 🛡️ Security gate for LLM-generated tool execution
+        debug_export:                 bool = True,   # 🔬 Dumps virtual_history and ai_msg.content to disk for debugging
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -1317,8 +1578,6 @@ class ChatMixin:
         object.__setattr__(self, "_affected_artefacts_this_turn", [])
 
         # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
-        # 🛑 CRITICAL FIX: Ensure FailureMemory is always fresh and empty at the start of every chat() turn.
-        # We force re-instantiation if it doesn't exist or if it's missing the _signatures set.
         if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
             fm = FailureMemory()
             if not hasattr(fm, "_signatures"):
@@ -1378,6 +1637,7 @@ class ChatMixin:
         sys_prompt = (personality.system_prompt if personality else None) or self.system_prompt or ""
         
         # Veracity and Formatting Rules
+        # Veracity and Formatting Rules
         rules = (
             "\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
             "Cite retrieved sources as [1],[2]... "
@@ -1390,6 +1650,13 @@ class ChatMixin:
             "# python code here\n"
             "```\n"
             "Never output raw code or markup directly in conversational text without these code blocks.\n"
+            "\n=== ACTION EXECUTION PROTOCOL (CRITICAL — PREVENTS DEAD LOOPS) ===\n"
+            "1. **INTENT ≠ EXECUTION**: Stating 'I will search...', 'Let me analyze...', or 'I will create...' in conversational text DOES NOT execute the action. "
+            "Conversational declarations are completely inert. You have NO ability to perform actions unless you emit the exact functional XML tags.\n"
+            "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the corresponding functional tag (`<tool>`, `<artifact>`, `<note>`, etc.) immediately. "
+            "Do not promise an action in one turn and expect the system to execute it. If you need another round to perform work, you MUST emit the tag that triggers that work.\n"
+            "3. **NO HOLLOW PROMISES**: If you finish your generation without emitting a functional tag, the system will terminate your turn and no action will occur. "
+            "You will lose the ability to continue the task. Therefore, NEVER end your turn with a promise to do something later. Either do it NOW via the tag, or tell the user you cannot do it.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
             "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON output (e.g., {\"success\": true, \"output\": ...}), "
             "this is a **RESULT**, NOT a new tool call. Do **NOT** re-execute or re-emit the same tool call.\n"
@@ -1402,14 +1669,14 @@ class ChatMixin:
             "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
             "for images) and STOP generating.\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
-            "If you decide to output a thought process enclosed in <think>...</think> tags, "
+            "If you decide to output a thought process enclosed in </think> tags, "
             "you MUST output all functional XML tags (such as <artifact>, <tool>, or <mem_new>) "
             "on a NEW LINE strictly AFTER the closing </think> tag. "
-            "NEVER place functional tags inside the <think> reasoning block.\n"
+            "NEVER place functional tags inside the </think> reasoning block.\n"
             "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
             "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
             "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
-            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside <think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
+            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside </think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
         )
 
         extra_instructions = ""
@@ -1529,6 +1796,13 @@ class ChatMixin:
         if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                if not allow_dynamic_tools:
+                    lcp_tools = {
+                        name: spec for name, spec in lcp_tools.items() 
+                        if name != "tool_execute_python_data_query"
+                    }
+                    ASCIIColors.info("[ChatMixin] Dynamic tools disabled. Filtered out 'tool_execute_python_data_query'.")
+
                 active_tools.update(lcp_tools)
             except Exception as ex:
                 trace_exception(ex)
@@ -1580,66 +1854,20 @@ class ChatMixin:
         branch = self.get_branch(current_branch_tip)
 
         # ── 🧠 VIRTUAL HISTORY & KV-CACHE PROTOCOL ──
-        # 1. `virtual_history` is built from the strictly-stripped old branch + new user msg.
+        # 1. `virtual_history` is managed by `export()` in `UtilsMixin`.
         # 2. During agentic rounds, we append RAW assistant text (including <tool> tags) and
         #    structured tool results to this list. This preserves the LLM's KV-cache.
         # 3. `ai_msg.content` is the UI/DB buffer. It only receives conversational text and
         #    <processing> blocks. We track `conversational_gist` separately to avoid polluting
         #    the final message with raw XML or execution logs.
+        # 4. 🛑 CRITICAL: virtual_history MUST start empty. The user's prompt is already
+        #    part of the real historical branch (added via add_message). If we append it
+        #    here, export() produces two consecutive user messages, which breaks strict
+        #    alternation rules (e.g., llama.cpp Jinja templates) and causes KV-cache
+        #    poisoning. virtual_history strictly tracks the NEW assistant answers and
+        #    tool results generated during the agentic loop.
 
-        from ._mixin_utils import UtilsMixin
-
-        # Build strictly stripped old history
-        stripped_old_history = []
-        for m in branch:
-            if m.id == user_msg.id:
-                continue
-            # Use the same strict stripping logic as export()
-            content = m.content.strip()
-            # Strip thoughts
-            content = re.sub(r'<tool_call>.*?</arg_value>', '', content, flags=re.DOTALL | re.IGNORECASE)
-            content = re.sub(r'<tool_call>.*$', '', content, flags=re.DOTALL | re.IGNORECASE)
-
-            # Strip artifact/note/skill XML and replace with anchors
-            pattern = re.compile(r'<(artifact|artefact|note|skill)\b([^>]*?)>(.*?)</\1>', re.DOTALL | re.IGNORECASE)
-            def _strip_tag(match):
-                tag_name = match.group(1).lower()
-                attrs_str = match.group(2)
-                attrs = dict(re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str))
-                title = attrs.get("name") or attrs.get("title") or "artifact"
-                type_label = "note" if tag_name == "note" else ("skill" if tag_name == "skill" else attrs.get("type", "code"))
-                return f'\n[🔒SYSTEM_{tag_name.upper()}_CREATED:{title}|{type_label}]\n'
-
-            content = pattern.sub(_strip_tag, content)
-
-            # Strip processing blocks
-            if m.sender_type == 'assistant':
-                def _strip_processing(match):
-                    block_content = match.group(0)
-                    inner_arts = re.findall(r'title=["\']([^"\']*)["\'].*?type=["\']([^"\']*)["\']', block_content, re.IGNORECASE)
-                    if not inner_arts:
-                        inner_arts = re.findall(r'title=["\']([^"\']*)["\']', block_content, re.IGNORECASE)
-                        inner_arts = [(t, "document") for t in inner_arts]
-                    anchors = "\n".join(f"[🔒SYSTEM_ARTIFACT_CREATED:{t}|{ty}]" for t, ty in inner_arts)
-                    return f"\n{anchors}\n" if anchors else ""
-
-                content = re.sub(r'<processing[^>]*>.*?</processing>', _strip_processing, content, flags=re.DOTALL | re.IGNORECASE)
-                content = re.sub(r'<processing[^>]*>', '', content, flags=re.IGNORECASE).replace("</processing>", "")
-
-                # Strip log mimicry lines
-                lines = [line for line in content.splitlines() if not line.strip().startswith(("*", "✓", "🏗️", "🔧", "✅", "❌", "·ᴽЧØс·", "[BLIND_ACTION_EXECUTED]"))]
-                content = "\n".join(lines).strip()
-
-            stripped_old_history.append(SimpleNamespace(
-                sender_type=m.sender_type,
-                content=content
-            ))
-
-        virtual_history = stripped_old_history
-        virtual_history.append(SimpleNamespace(
-            sender_type="user",
-            content=user_message
-        ))
+        virtual_history = []
 
         tool_calls_this_turn = []
         round_count = 0
@@ -1649,15 +1877,9 @@ class ChatMixin:
         # We allow up to 2 identical calls per turn to permit legitimate retries after null/empty output.
         tool_signature_counts = {}
 
-        # 🛑 CRITICAL FIX: Track SUCCESSFUL tool signatures to enforce strict 1-strike policy.
-        # Once a tool succeeds, the LLM must use the result from context. It is FORBIDDEN
-        # to re-run the same tool with the same parameters, even if interleaved with other calls.
-        # This set is NEVER cleared during the turn.
         successful_tool_signatures = set()
 
         # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
-        # 🛑 CRITICAL FIX: Ensure FailureMemory is always fresh and empty at the start of every chat() turn.
-        # We force re-instantiation if it doesn't exist or if it's missing the _signatures set.
         if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
             fm = FailureMemory()
             if not hasattr(fm, "_signatures"):
@@ -1702,13 +1924,14 @@ class ChatMixin:
             if tools_prompt:
                 current_system_prompt += "\n" + tools_prompt
 
-            # Build messages list for generation context
-            messages_list = [{"role": "system", "content": current_system_prompt}]
-            for m in virtual_history:
-                messages_list.append({
-                    "role": "user" if m.sender_type == "user" else "assistant",
-                    "content": m.content
-                })
+            messages_list = self.export(
+                format_type="openai_chat",
+                branch_tip_id=current_branch_tip,
+                suppress_system_prompt=False,
+                virtual_history=virtual_history,
+                debug=debug_export,
+                system_prompt_override=current_system_prompt
+            )
 
             # ── 🎨 DYNAMIC VISION HYDRATION ──
             # Retrieve all images generated or modified during previous rounds of this turn
@@ -1810,8 +2033,8 @@ class ChatMixin:
                             "Please output the corrected tool call now."
                         )
 
-                        # 🛑 CRITICAL: Append the RAW assistant text (including the broken tag) to preserve KV-cache
-                        raw_round_text = ss.get_clean_text_so_far()
+                        full_round_text = ss.get_clean_text_so_far()
+                        raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
                         virtual_history.append(SimpleNamespace(
                             sender_type="assistant",
                             content=raw_round_text
@@ -1827,15 +2050,70 @@ class ChatMixin:
                     tool_name = call_data.get("name", "")
                     tool_params = call_data.get("parameters", {})
 
-                    # ── 🛑 ARCHITECTURAL FIX: VIRTUAL HISTORY SEPARATION ──
-                    # 1. Append the RAW assistant text (including <tool> tag) to virtual_history.
-                    # 2. Strip the <tool> tag from the UI buffer (ai_msg.content).
-                    # 1. Append RAW assistant text to virtual_history (preserves KV-cache)
-                    raw_round_text = ss.get_clean_text_so_far()
+                    full_round_text = ss.get_clean_text_so_far()
+                    raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+
+                    # Remove <processing> blocks and HTML status comments for LLM context
+                    # 🛑 CRITICAL FIX 3: Use robust regex that catches partial/malformed blocks.
+                    # The previous regex required a perfect </processing> close tag, but streaming
+                    # fragmentation could leave orphaned opening tags or partial content.
+                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                    # Remove any orphaned closing tags from partial stripping
+                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                    # Remove standalone <lollms_artifact> and <artefact_image> tags that were injected outside blocks
+                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
-                        content=raw_round_text
+                        content=clean_history_text.strip()
                     ))
+                    if active_tools and tool_name in active_tools and "callable" not in active_tools[tool_name]:
+                        if lcp_binding and hasattr(lcp_binding, "execute_tool"):
+                            import os as _os
+                            from pathlib import Path as _Path
+                            _old_cwd_lcp = _os.getcwd()
+                            
+                            # Resolve workspace_data path
+                            if hasattr(self, "workspace_data_path") and self.workspace_data_path:
+                                _lcp_workspace_dir = _Path(self.workspace_data_path)
+                            else:
+                                _base_ws = _Path(self.workspace_path) if hasattr(self, "workspace_path") and self.workspace_path else _Path("./data_workspace")
+                                _lcp_workspace_dir = _base_ws / self.id / "workspace_data"
+                            
+                            _lcp_workspace_dir.mkdir(parents=True, exist_ok=True)
+                            _lcp_workspace_str = str(_lcp_workspace_dir.resolve())
+
+                            try:
+                                _os.chdir(_lcp_workspace_str)
+                                try:
+                                    tool_res = lcp_binding.execute_tool(
+                                       tool_name, 
+                                       tool_params, 
+                                       lollms_client_instance=self.lollmsClient, 
+                                       discussion_instance=self,
+                                    )
+                                except Exception as lcp_exec_err:
+                                    trace_exception(lcp_exec_err)
+                                    tool_res = {
+                                       "success": False,
+                                       "error": f"Tool '{tool_name}' crashed: {lcp_exec_err}",
+                                       "traceback": traceback.format_exc()
+                                    }
+                                _lcp_executed = True
+                            finally:
+                                # 🛑 CRITICAL: Always restore CWD to prevent workspace corruption
+                                _os.chdir(_old_cwd_lcp)
+                        else:
+                            tool_res = {
+                                "success": False,
+                                "error": f"Tool '{tool_name}' has no callable and no LCP tools binding is available on the client.",
+                                "status_code": 404
+                            }
+                            _lcp_executed = True
+                    else:
+                        _lcp_executed = True
 
                     # 2. Strip ONLY the raw <tool> JSON tag from the UI/DB buffer (ai_msg.content).
                     # 🛑 CRITICAL: Do NOT strip <processing> blocks here. They are part of the 
@@ -1845,15 +2123,11 @@ class ChatMixin:
                         ai_msg.content = ai_msg.content.replace(f"<tool>{tool_call_json_str}</tool>", "")
                         ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
 
-                    import html
-                    escaped_params = html.escape(json.dumps(tool_params))
-                    tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {tool_name}" params="{escaped_params}">\n'
-                    ai_msg.content += tool_open_tag
-                    _cb(callback, tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-                    status_line = f"* Calling local tool system for '{tool_name}'...\n"
-                    ai_msg.content += status_line
-                    _cb(callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    # ── 🛑 CRITICAL FIX: PREVENT DUPLICATE UI BLOCKS ──
+                    # The _StreamState parser ALREADY emitted the <processing> block and
+                    # "Calling tool..." status to the UI instantly when the </tool> tag closed.
+                    # We MUST NOT emit it again here, or the UI will render duplicate blocks.
+                    # We simply proceed directly to tool execution.
 
                     # ── REFLEXIVE LOOP DETECTION (FailureMemory) ──
                     failure_memory = getattr(self, "_failure_memory", None)
@@ -1875,7 +2149,6 @@ class ChatMixin:
                     ) if failure_memory else False
 
                     if has_prev_failure:
-                        # Intercepted repetitive execution loop (exact same call)
                         if self.is_generation_cancelled():
                             was_cancelled = True
                             break
@@ -1883,27 +2156,30 @@ class ChatMixin:
                         result_str = (
                             f"Error executing tool '{tool_name}': This exact parameters configuration failed on a previous round of this conversation. "
                             f"To prevent an infinite loop, execution was blocked. You must modify your parameters, inspect the data schemas, "
-                            f"or try a different approach instead of repeating the failing call."
+                            f"or try a different approach. If you cannot proceed, inform the user of the error and suggest alternatives."
                         )
                         status_err_line = f"* Tool call blocked to prevent loop.\n"
                         details_block = f"Loop Intercepted:\n{result_str}\n"
                         tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
                         ai_msg.content += tool_close_tag
                         _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                f'<tool_result name="{tool_name}" status="FAILED">\n'
+                                f"{result_str}\n"
+                                f"</tool_result>\n\n"
+                                f"⚠️ **Tool Execution Failed & Loop Blocked.**\n"
+                                f"You attempted to retry a failing tool with identical parameters. The system has blocked this to prevent an infinite loop. "
+                                f"You MUST now write a final response to the user explaining that the operation could not be completed, "
+                                f"detailing the error above, and suggesting possible workarounds or alternative approaches. Do NOT attempt to call the tool again."
+                            )
+                        ))
                         break
 
                     # Execute the tool sequentially
                     try:
-                        # ── 🛑 REPETITIVE SUCCESS LOOP GUARD (CONTEXT-AWARE) ────────────────────────
-                        # Check if we have ALREADY executed this EXACT tool signature successfully.
-                        # We enforce a strict 1-strike policy: if a tool succeeded, the LLM must
-                        # use the result from context. It is FORBIDDEN to re-run the same tool
-                        # with the same parameters, even if interleaved with other tool calls.
-                        # This prevents interleaved success-loops (A succeeds → B fails → retry A).
-                        #
-                        # EXCEPTION: If the tool parameters include a file, and that file has been
-                        # modified on disk since the last success (e.g., via an <artifact> update),
-                        # we ALLOW the call because it is a legitimate Edit-Compile-Run-Debug cycle.
                         def _get_file_hashes(params: dict) -> dict:
                             """Returns a dict of {param_name: file_hash} for any param that is an existing file."""
                             hashes = {}
@@ -1930,14 +2206,30 @@ class ChatMixin:
                                 "error": f"Repetitive tool call detected. You have already successfully called '{tool_name}' with these exact parameters, and the input files have not changed. The output is already in your context. Do not call it again.",
                                 "prompt_injection": f"\n\n🛑 **STOP.** You are calling '{tool_name}' again with the exact same parameters after it already succeeded. This is a loop. The data from the previous execution is already in your context above. Analyze it and move on to answer the user."
                             }
-                            force_break_after_tool = True
+                            virtual_history.append(SimpleNamespace(
+                                sender_type="user",
+                                content=(
+                                    f'<tool_result name="{tool_name}" status="FAILED">\n'
+                                    f"Repetitive tool call detected. The output is already in your context.\n"
+                                    f"</tool_result>\n\n"
+                                    f"⚠️ **Tool Execution Blocked.**\n"
+                                    f"You have already successfully called '{tool_name}' with these exact parameters. The system has blocked this duplicate call. "
+                                    f"You MUST now write a final response to the user using the data already retrieved. Do NOT attempt to call the tool again."
+                                )
+                            ))
+                            # Append the processing block to UI
+                            status_err_line = f"* Tool call blocked to prevent success loop.\n"
+                            details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked.\n<!-- status:failure -->\n</processing>\n\n"
+                            ai_msg.content += status_err_line + details_block
+                            _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            continue
                         else:
                             tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
                             force_break_after_tool = False
 
                         if force_break_after_tool:
                             # Use the fake error result prepared above
-                            pass
+                            pass                        
                         # Check cancellation BEFORE executing tool
                         elif self.is_generation_cancelled():
                             # Generation cancelled (logging removed)
@@ -1949,9 +2241,6 @@ class ChatMixin:
                         elif active_tools and tool_name in active_tools and "callable" in active_tools[tool_name]:
                             # Sync all active artifacts to disk BEFORE tool execution
                             try:
-                                # 🛑 CRITICAL FIX: sync_all_active_to_disk() now ALWAYS returns a tuple.
-                                # This ensures artifacts created in the previous round (e.g., via <artifact> tags)
-                                # are physically materialized on disk before the tool executes.
                                 sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
                             except Exception as ex:
                                 trace_exception(ex)
@@ -1961,7 +2250,6 @@ class ChatMixin:
                             from pathlib import Path
                             old_cwd = os.getcwd()
 
-                            # 🛑 CRITICAL RESOLUTION: Dynamically resolve active workspace from discussion instance path
                             if hasattr(self, 'workspace_path') and self.workspace_path:
                                 base_workspace_dir = Path(self.workspace_path)
                             else:
@@ -1986,9 +2274,6 @@ class ChatMixin:
                             try:
                                 os.chdir(workspace_dir_str)
 
-                                # 🛑 CRITICAL FIX: Strip path prefixes from tool parameters
-                                # LLMs often hallucinate full paths like "workspace/file.csv" or "data_workspace/file.csv"
-                                # We must normalize these to simple filenames for the tool to find them
                                 sanitized_params = {}
                                 for key, value in tool_params.items():
                                     if isinstance(value, str):
@@ -2011,10 +2296,16 @@ class ChatMixin:
                                 # We do NOT change CWD here to avoid double-changedirectory conflicts.
                                 call_kwargs = dict(sanitized_params)
 
-                                # 🛑 CRITICAL FIX: Do NOT inject discussion_instance or lollms_client_instance
-                                # into the direct callable path. This violates the LCP Tool Agnosticism Doctrine.
-                                # Tools must be standalone Unix-style utilities operating on CWD + relative paths.
-                                # The orchestrator handles artifact registration and database commits.
+                                # 🛑 ARCHITECTURAL UPDATE: Conditional Injection
+                                # By default, tools are agnostic. But if a tool explicitly declares
+                                # `discussion_instance` or `lollms_client_instance` in its signature,
+                                # we inject them to enable advanced agentic patterns (like child spawning).
+                                import inspect as _inspect
+                                _tool_sig_params = _inspect.signature(active_tools[tool_name]["callable"]).parameters
+                                if "discussion_instance" in _tool_sig_params:
+                                    call_kwargs["discussion_instance"] = self
+                                if "lollms_client_instance" in _tool_sig_params:
+                                    call_kwargs["lollms_client_instance"] = self.lollmsClient
 
                                 # ── Take BEFORE Snapshot ──
                                 files_before = {}
@@ -2044,7 +2335,7 @@ class ChatMixin:
                                                     pass
 
                                 # Execute directly (no thread) - LCP handles CWD internally
-                                tool_res = active_tools[tool_name]["callable"](discussion_instance=self,**call_kwargs)
+                                tool_res = active_tools[tool_name]["callable"](**call_kwargs)
 
                                 # ── Take AFTER Snapshot and Auto-Sync Artifacts ──
                                 files_after = {}
@@ -2378,44 +2669,24 @@ class ChatMixin:
                                                     ai_msg.content += f'\n\n{tag}\n'
                                                 self.commit()
                             finally:
-                                # 🛑 CRITICAL FIX: ALWAYS restore CWD to prevent workspace corruption.
-                                # If a tool crashes, the CWD must be reverted so subsequent tool calls
-                                # and the files_before snapshot in LCPBinding operate correctly.
                                 os.chdir(old_cwd)
-                        # 🛑 CRITICAL FIX: If the tool is registered via LCP schema (no "callable" key),
-                        # defer to the LCP binding's unified execute_tool() method.
-                        elif hasattr(self.lollmsClient, "tools") and self.lollmsClient.tools is not None and tool_name in active_tools:
-                           tool_res = self.lollmsClient.tools.execute_tool(
-                               tool_name, 
-                               tool_params, 
-                               lollms_client_instance=self.lollmsClient, 
-                               discussion_instance=self,
-                           )
-                        else:
-                           tool_res = {
-                               "success": False,
-                               "error": f"Tool '{tool_name}' has no callable and no LCP tools binding is available on the client.",
-                               "status_code": 404
-                           }
+                        if not _lcp_executed:
+                            tool_res = {
+                                "success": False,
+                                "error": f"Tool '{tool_name}' execution failed. Neither direct callable nor LCP dispatch succeeded.",
+                                "status_code": 500
+                            }
 
                         if isinstance(tool_res, dict):
-                            # 🛑 CRITICAL FIX: Detect failure from LCP binding (status_code 404 or explicit error key)
-                            # before checking the success flag, as LCP errors may omit the success key.
                             is_lcp_error = tool_res.get("status_code") and tool_res.get("status_code") != 200
                             has_error_key = "error" in tool_res and not tool_res.get("success", True)
 
                             if not tool_res.get("success", True) or is_lcp_error or has_error_key:
                                 error_msg = tool_res.get("error", "Unknown tool error")
 
-                                # 🛑 ARCHITECTURAL FIX: Do NOT record 404 "Tool not found" errors in FailureMemory.
-                                # A 404 is a discovery/routing error, not an execution failure.
-                                # If we record it, the LLM gets permanently blocked from trying the correct tool name.
                                 is_404 = tool_res.get("status_code") == 404
 
                                 if failure_memory and not is_404:
-                                    # 🛑 CRITICAL FIX: Record failure using exact signature.
-                                    # This records the signature so the NEXT time the LLM tries this exact call,
-                                    # it will be blocked. We DO NOT block it here because this is the first failure.
                                     try:
                                         param_sig = json.dumps(tool_params, sort_keys=True, default=str)
                                     except Exception:
@@ -2436,11 +2707,6 @@ class ChatMixin:
                                 status_done_line = f"* Completed execution with errors.\n"
                                 details_block = f"Error Logs:\n{error_msg}\n"
                             else:
-                                # 🛑 CRITICAL FIX: Robust output extraction
-                                # The tool result might be {"success": True, "output": "content"}
-                                # OR {"success": True, "output": {"content": "..."}}
-                                # OR {"success": True, "page_content": "..."}
-                                # OR just the raw content itself.
                                 raw_output = tool_res.get("output", tool_res)
 
                                 # Handle nested output dictionaries (common in MCP/external tools)
@@ -2475,9 +2741,6 @@ class ChatMixin:
                                 # 🛡️ CRITICAL FIX: Guard against NoneType output from tools
                                 if full_dump is None:
                                     full_dump = "Tool executed successfully but returned no output content."
-                                # 🛑 CRITICAL FIX: Ensure full_dump is a string before slicing.
-                                # The extraction logic above may leave full_dump as a dict or list
-                                # if no unwrapping key was found, causing TypeError on [:2000].
                                 if not isinstance(full_dump, str):
                                     try:
                                         full_dump = json.dumps(full_dump, indent=2, default=str, ensure_ascii=False)
@@ -2489,7 +2752,6 @@ class ChatMixin:
                             result_str = str(tool_res) if tool_res is not None else "No output returned."
                             if "error" in result_str.lower() or "fail" in result_str.lower():
                                 if failure_memory:
-                                    # 🛑 CRITICAL FIX: Record by exact signature
                                     try:
                                         param_sig = json.dumps(tool_params, sort_keys=True, default=str)
                                     except Exception:
@@ -2512,7 +2774,6 @@ class ChatMixin:
                     except Exception as e:
                         trace_exception(e)
                         if failure_memory:
-                            # 🛑 CRITICAL FIX: Record by exact signature
                             try:
                                 param_sig = json.dumps(tool_params, sort_keys=True, default=str)
                             except Exception:
@@ -2528,40 +2789,42 @@ class ChatMixin:
                         clean_result_str = f"Error executing tool '{tool_name}': {e}"
                         status_done_line = f"* Execution crashed.\n"
                         details_block = f"Crash Details:\n{str(e)}\n"
-                        # 🛑 CRITICAL FIX: Set tool_res to a failure dict so is_failure and tool_success
-                        # are correctly evaluated below, preventing <!-- status:success --> on crashes.
                         tool_res = {"success": False, "error": str(e)}
 
-                    # Determine the status comment based on the execution outcome
-                    # 🛑 CRITICAL FIX: Check the raw tool_res dict FIRST for explicit failure signals.
-                    # Do NOT rely on string matching in clean_result_str, as prompt_injection
-                    # text may not contain "Error" or "failed" even when the tool failed.
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=(
+                                f'<tool_result name="{tool_name}" status="FAILED">\n'
+                                f"{clean_result_str}\n"
+                                f"</tool_result>\n\n"
+                                f"⚠️ **Tool Execution Crashed.**\n"
+                                f"The tool '{tool_name}' encountered an unexpected system error. "
+                                f"Analyze the error and inform the user, or try a different approach."
+                            )
+                        ))
+                    inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
+
                     is_failure = (
-                        (isinstance(tool_res, dict) and tool_res.get("success") is False) or
+                        (isinstance(inner_res, dict) and inner_res.get("success") is False) or
                         (isinstance(tool_res, dict) and tool_res.get("status_code", 200) != 200) or
                         "crashed" in status_done_line.lower() or
-                        (isinstance(tool_res, dict) and tool_res.get("error") and not tool_res.get("success", True))
+                        (isinstance(inner_res, dict) and inner_res.get("error") and not inner_res.get("success", True))
                     )
                     status_meta = "failure" if is_failure else "success"
                     tool_close_tag = f"{status_done_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n"
                     ai_msg.content += tool_close_tag
                     _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-                    # 🛑 CRITICAL FIX: Determine tool_success from the raw tool_res dict, not from
-                    # string matching in clean_result_str. prompt_injection text can mask failures.
+                    inner_res = tool_res.get("output", tool_res) if isinstance(tool_res, dict) else tool_res
                     tool_success = (
-                        isinstance(tool_res, dict) and 
-                        tool_res.get("success", True) is not False and
+                        isinstance(inner_res, dict) and 
+                        inner_res.get("success", True) is not False and
                         tool_res.get("status_code", 200) == 200
-                    ) if isinstance(tool_res, dict) else True
-                    if not isinstance(tool_res, dict):
+                    ) if isinstance(inner_res, dict) else True
+                    if not isinstance(inner_res, dict):
                         # Non-dict results: fall back to string matching
                         tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
 
-                    # 🛑 CRITICAL FIX: Record successful signatures to enforce 1-strike policy.
-                    # This prevents the LLM from re-running a successful tool even if
-                    # interleaved with other failing tool calls. We use the context-aware
-                    # signature so that if the LLM updates a file and retries, it is allowed.
                     if tool_success and not force_break_after_tool:
                         successful_tool_signatures.add(context_aware_signature)
                         ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
@@ -2590,8 +2853,6 @@ class ChatMixin:
                                 f"   Do NOT hallucinate or guess any other file name (such as 'sales_over_time.png'). Only use `{p_fn}`.\n\n"
                             )
 
-                        # 🛑 CRITICAL FIX: EXPLICITLY LABEL OUTPUT AS "NOT A TOOL CALL"
-                        # We must prevent the LLM from misinterpreting JSON results as new tool calls
                         user_part = (
                             f"=== ✅ TOOL RESULT (NOT A TOOL CALL): {tool_name} ===\n"
                             f"⚠️ **WARNING**: The JSON below is the **RESULT** of your previous tool call. "
@@ -2631,79 +2892,117 @@ class ChatMixin:
                             )
                             ASCIIColors.info(f"[ChatMixin] Injected {len(new_files_this_run)} new artifacts into virtual_history context.")
 
-                        # 🛑 CRITICAL: Force the loop to continue so the LLM generates a final answer
-                        # The tool succeeded — the LLM MUST now read the result and respond to the user.
-                        continue
                     else:
                         user_part = (
-                            f'<tool_result name="{tool_name}">\n'
+                            f'<tool_result name="{tool_name}" status="FAILED">\n'
                             f"{clean_result_str}\n"
                             f"</tool_result>\n\n"
                             f"⚠️ **Tool Execution Failed.**\n"
-                            f"The tool '{tool_name}' encountered an error. Please politely inform the user that the operation could not be completed, "
-                            f"briefly explain the likely cause based on the error log above, and suggest a possible workaround or alternative approach. "
-                            f"Do not attempt to call the tool again with the same parameters."
+                            f"The tool '{tool_name}' encountered an error. Here is your mandatory protocol:\n"
+                            f"1. **Analyze**: Read the error log above carefully to understand why it failed.\n"
+                            f"2. **Explore Alternatives**: If there is another way to accomplish the task (e.g., using a different tool, modifying the parameters, or fixing the data), you MUST attempt it.\n"
+                            f"3. **Inform the User**: If you cannot find an alternative approach, you MUST gracefully inform the user about the failure. "
+                            f"Clearly explain what you were trying to do, why it failed (based on the error), and explicitly tell the user what they can do to help (e.g., provide a missing file, change a configuration, or grant permissions)."
                         )
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
                             content=user_part
                         ))
-                        # If this was a forced break due to loop detection, ensure we exit
-                        if 'force_break_after_tool' in locals() and force_break_after_tool:
-                            ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
-                            break
-                        # 🛑 CRITICAL FIX: Clear the failure signature on success
-                        if failure_memory and hasattr(failure_memory, "_signatures"):
-                            try:
-                                clear_sig = f"{tool_name}::{json.dumps(tool_params, sort_keys=True, default=str)}"
-                                failure_memory._signatures.discard(clear_sig)
-                            except Exception:
-                                pass
 
-                        # 🛑 CRITICAL: Also continue on failure so the LLM can inform the user
-                        continue
+                    # 🛑 ARCHITECTURAL FIX: MANDATORY N+1 CONTINUATION
+                    # If a tool was called at turn N, the loop MUST force a turn N+1 so the LLM
+                    # can process the <tool_result> and generate a final conversational answer.
+                    # The loop must NEVER break immediately after a tool execution.
+                    # Loop safety is guaranteed by:
+                    #   - successful_tool_signatures (1-strike policy for identical successful calls)
+                    #   - FailureMemory (blocks identical failing calls after 1 retry)
+                    if 'force_break_after_tool' in locals() and force_break_after_tool:
+                        ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
+                        break
+                    continue
                 else:
                     break
             else:
-                # ── 🛑 CRITICAL FIX: PENDING TOOL INTENT CHECK ──
+                # ── 🛑 CRITICAL FIX: HARDENED PENDING TOOL INTENT CHECK ──
                 # The LLM generated text but did NOT emit a <tool> tag (tool_trigger is False).
-                # However, the LLM may have expressed intent to call a tool ("Let me search for...")
-                # but failed to actually output the XML. We must detect this and force a continuation
-                # instead of breaking the loop and leaving the task incomplete.
+                # We check if the LLM expressed intent to call a tool but failed to output the XML.
+                # 🛑 CRITICAL GUARDS:
+                #   1. Only trigger if the generated text is SHORT (< 500 chars). Long text means the
+                #      LLM already wrote a full answer and the "intent" is likely a conversational offer.
+                #   2. Exclude matches inside questions (lines ending with '?') or markdown lists (1., 2., -).
+                #   3. Exclude matches immediately followed by "skill", "note", "artifact" (those are
+                #      functional tags, not tool calls).
                 raw_round_text = ss.get_clean_text_so_far()
-                intent_phrases = [
-                    "let me search", "let me call", "let me run", "let me query",
-                    "i'll search", "i'll call", "i'll run", "i'll query",
-                    "now let me", "i will search", "i will call",
-                    "searching for", "calling tool", "running tool",
-                    "now searching", "let's search", "let us search"
-                ]
-                has_intent = any(phrase in raw_round_text.lower() for phrase in intent_phrases)
-                has_tool_tag = "<tool>" in raw_round_text.lower()
+                raw_round_len = len(raw_round_text.strip())
 
-                if has_intent and not has_tool_tag and not was_cancelled and round_count < max_reasoning_steps:
-                    ASCIIColors.info(f"[ChatMixin] Detected pending tool intent without XML tag. Forcing continuation...")
+                # Only run intent detection on SHORT responses (preambles before a missed tool call)
+                if raw_round_len < 500:
+                    intent_phrases = [
+                        "let me search", "let me call", "let me run", "let me query",
+                        "i'll search", "i'll call", "i'll run", "i'll query",
+                        "now let me", "i will search", "i will call",
+                        "searching for", "calling tool", "running tool",
+                        "now searching", "let's search", "let us search"
+                    ]
+                    raw_lower = raw_round_text.lower()
+                    has_intent = False
+                    for phrase in intent_phrases:
+                        if phrase in raw_lower:
+                            # Check context: is this inside a question or list?
+                            phrase_idx = raw_lower.find(phrase)
+                            # Look at the line containing the phrase
+                            line_start = raw_lower.rfind('\n', 0, phrase_idx) + 1
+                            line_end = raw_lower.find('\n', phrase_idx)
+                            if line_end == -1:
+                                line_end = len(raw_lower)
+                            line = raw_lower[line_start:line_end]
 
-                    # 🛑 CRITICAL: Append RAW assistant text to virtual_history (preserves KV-cache)
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=raw_round_text
-                    ))
+                            # Skip if line ends with '?' (conversational offer)
+                            if line.rstrip().endswith('?'):
+                                continue
+                            # Skip if line starts with a list marker (1., 2., -, *)
+                            if re.match(r'^\s*(\d+\.|[-*])\s', line):
+                                continue
+                            # Skip if followed by "skill", "note", "artifact" (functional tags, not tools)
+                            remainder = raw_lower[phrase_idx:]
+                            if re.search(r'\b(skill|note|artifact|artefact)\b', remainder[:50]):
+                                continue
 
-                    # Force the LLM to output the actual tool tag now
-                    intent_correction = (
-                        "=== ⚠️ MISSING TOOL CALL ===\n"
-                        "You expressed intent to call a tool, but you did NOT output the required `<tool>` XML tag. "
-                        "To execute the action, you MUST output the tag on a new line now.\n"
-                        "Do NOT explain further. Output ONLY the `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>` block."
-                    )
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=intent_correction
-                    ))
+                            has_intent = True
+                            break
 
-                    # Force another reasoning round
-                    continue
+                    has_tool_tag = "<tool>" in raw_lower
+
+                    if has_intent and not has_tool_tag and not was_cancelled and round_count < max_reasoning_steps:
+                        ASCIIColors.info(f"[ChatMixin] Detected pending tool intent without XML tag. Forcing continuation...")
+
+                        # 🛑 CRITICAL: Append SANITIZED assistant text to virtual_history (preserves KV-cache)
+                        full_round_text = ss.get_clean_text_so_far()
+                        raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                        clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
+                        clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=clean_history_text.strip()
+                        ))
+
+                        # Force the LLM to output the actual tool tag now
+                        intent_correction = (
+                            "=== ⚠️ MISSING TOOL CALL ===\n"
+                            "You expressed intent to call a tool, but you did NOT output the required `<tool>` XML tag. "
+                            "To execute the action, you MUST output the tag on a new line now.\n"
+                            "Do NOT explain further. Output ONLY the `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>` block."
+                        )
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=intent_correction
+                        ))
+
+                        # Force another reasoning round
+                        continue
 
                 # ── 🔄 FORCE CONTINUATION AFTER CONTEXT UNLOCK ─────────────────
                 # If the model requested files to be loaded, force at least one more round
@@ -2718,11 +3017,17 @@ class ChatMixin:
                         f"You can now read their full content and use them. Please continue your task.]\n\n"
                     )
 
-                    # 🛑 CRITICAL: Append RAW assistant text to virtual_history (preserves KV-cache)
+                    # 🛑 CRITICAL: Append SANITIZED assistant text to virtual_history (preserves KV-cache)
+                    # Strip <processing> blocks to prevent the LLM from mimicking execution logs
                     raw_round_text = ss.get_clean_text_so_far()
+                    clean_history_text = re.sub(r'<processing[^>]*>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
                     virtual_history.append(SimpleNamespace(
                         sender_type="assistant",
-                        content=raw_round_text
+                        content=clean_history_text.strip()
                     ))
 
                     # Add a user message to force the loop to continue
@@ -2828,6 +3133,51 @@ class ChatMixin:
 
         self.scratchpad = ""
         object.__setattr__(self, '_active_callback', None)
+
+        # ── 🔬 SCIENTIFIC DEBUG: EXPORT CONTEXT DUMP ──
+        # Dumps the exact virtual_history (LLM context) and ai_msg.content (UI context)
+        # to a JSON file in the discussion workspace to verify context separation.
+        if debug_export:
+            try:
+                import os as _os
+                from pathlib import Path as _Path
+                import json as _json
+                from datetime import datetime as _dt
+
+                debug_dir = _Path(self.workspace_data_path) / "_debug_dumps"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+
+                timestamp = _dt.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+                dump_file = debug_dir / f"turn_dump_{timestamp}.json"
+
+                # Safely serialize SimpleNamespace objects in virtual_history
+                vh_serializable = []
+                for m in virtual_history:
+                    if hasattr(m, '__dict__'):
+                        vh_serializable.append({
+                            "sender_type": getattr(m, "sender_type", "unknown"),
+                            "content": getattr(m, "content", "")
+                        })
+                    elif isinstance(m, dict):
+                        vh_serializable.append(m)
+
+                dump_payload = {
+                    "timestamp": timestamp,
+                    "discussion_id": self.id,
+                    "round_count": round_count,
+                    "was_cancelled": was_cancelled,
+                    "virtual_history_length": len(vh_serializable),
+                    "virtual_history": vh_serializable,
+                    "ai_message_content": ai_msg.content,
+                    "ai_message_metadata": ai_msg.metadata
+                }
+
+                with open(dump_file, "w", encoding="utf-8") as f:
+                    _json.dump(dump_payload, f, indent=2, default=str, ensure_ascii=False)
+
+                ASCIIColors.info(f"[ChatMixin] 🔬 Debug context dump saved to: {dump_file}")
+            except Exception as dump_err:
+                ASCIIColors.warning(f"[ChatMixin] Failed to write debug context dump: {dump_err}")
 
         return {
             "user_message": user_msg,

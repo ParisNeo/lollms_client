@@ -16,7 +16,7 @@ TOOL_LIBRARY_NAME = "Lollms Tool Maker"
 TOOL_LIBRARY_DESC = "Generates and registers a new flat LCP smart tool dynamically using AST parsing."
 TOOL_LIBRARY_ICON = "🛠️"
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     pass
 
 def tool_tool_maker(
