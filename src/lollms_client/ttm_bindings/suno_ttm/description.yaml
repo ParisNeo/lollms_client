@@ -1,0 +1,102 @@
+title: 'Suno TTM'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'suno'
+description: |
+  A binding for Suno AI Text-to-Music using browser-session cookies.
+  This binding allows generating music from text prompts by replaying your logged-in browser session via cookies.
+  It authenticates with Suno using your browser cookie, maintains an active session automatically, and proxies generation requests to Suno's internal API.
+
+
+input_parameters:
+  - name: "cookie"
+    type: "str"
+    default: ""
+    description: "Full Cookie header from your logged-in Suno browser session. Can also be set via the SUNO_COOKIE environment variable."
+    is_secret: true
+
+  - name: "cookie_env_var"
+    type: "str"
+    default: "SUNO_COOKIE"
+    description: "Name of the environment variable holding your Suno cookie (default: SUNO_COOKIE)."
+
+  - name: "output_dir"
+    type: "str"
+    default: "suno_generations"
+    description: "Directory where generated audio files will be saved when save_all=True."
+
+  - name: "auth_base_url"
+    type: "str"
+    default: "https://auth.suno.com"
+    description: "Base URL for Suno Clerk authentication endpoints."
+
+  - name: "api_base_url"
+    type: "str"
+    default: "https://studio-api.prod.suno.com"
+    description: "Base URL for Suno generation and feed endpoints."
+
+  - name: "request_timeout"
+    type: "int"
+    default: 60
+    description: "Timeout in seconds for HTTP requests."
+
+  - name: "poll_interval"
+    type: "float"
+    default: 5.0
+    description: "Interval in seconds between polls while waiting for audio generation to complete."
+
+  - name: "max_poll_retries"
+    type: "int"
+    default: 60
+    description: "Maximum number of polls to wait for generation before raising a timeout error."
+
+  - name: "user_agent"
+    type: "str"
+    default: ""
+    description: "Optional custom User-Agent string. If empty, a default Chrome-like UA is used."
+
+
+generate_music_parameters:
+  - name: "prompt"
+    type: "str"
+    description: "A description of the music you want to generate."
+
+  - name: "model"
+    type: "str"
+    default: ""
+    description: "Model/version identifier (e.g. chirp-v3-0, chirp-v3-5, chirp-v4). If empty, the backend default is used."
+
+  - name: "make_instrumental"
+    type: "bool"
+    default: False
+    description: "Generate an instrumental track without lyrics."
+
+  - name: "wait_audio"
+    type: "bool"
+    default: True
+    description: "Wait for audio generation to complete before returning bytes."
+
+  - name: "save_all"
+    type: "bool"
+    default: False
+    description: "Save all generated audio variants to output_dir alongside returning the first one as bytes."
+
+  - name: "file_prefix"
+    type: "str"
+    default: "suno_generation"
+    description: "Prefix for generated audio file names when save_all=True."
+
+  - name: "tags"
+    type: "str"
+    default: ""
+    description: "Optional style tags (e.g. 'electronic, cinematic, slow build')."
+
+  - name: "title"
+    type: "str"
+    default: ""
+    description: "Optional title for the track."
+
+  - name: "negative_tags"
+    type: "str"
+    default: ""
+    description: "Optional negative tags to avoid certain styles."

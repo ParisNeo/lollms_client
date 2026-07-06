@@ -27,6 +27,21 @@ class LollmsTTMBinding(LollmsBaseBinding):
         pass
 
     @abstractmethod
+    def generate_song(self, prompt: str, **kwargs) -> bytes:
+        """
+        Generates music data from the provided text prompt.
+        """
+        pass
+
+    @abstractmethod
+    def generate_song_from_lyrics(self, prompt: str, lyrics: str, **kwargs) -> bytes:
+        """
+        Generates music data from the provided text prompt.
+        """
+        pass
+
+
+    @abstractmethod
     def list_models(self, **kwargs) -> List[str]:
         """
         Lists the available TTM models or services supported by the binding.

@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-06 10:48]
+
+- feat(ttm): add generate_song and generate_song_from_lyrics abstract methods to LollmsTTMBinding
+
 ## [2026-07-03 04:44]
 
 - refactor(artefact): update artefact handling and import logic
