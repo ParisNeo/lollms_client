@@ -14,6 +14,8 @@ import httpx
 import pipmaster as pm
 import mimetypes
 pm.ensure_packages(["openai","tiktoken"])
+from pathlib import Path
+import ssl
 
 import openai
 import tiktoken
@@ -107,10 +109,36 @@ class OpenAIBinding(LollmsLLMBinding):
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
 
-        verify = False if not self.verify_ssl_certificate else self.certificate_file_path if self.certificate_file_path else True
 
-        self.client = openai.OpenAI(api_key=self.service_key, base_url=None if self.host_address is None else self.host_address if len(self.host_address)>0 else None, http_client=httpx.Client(verify=verify))
-        self.completion_format = ELF_COMPLETION_FORMAT.Chat
+        self.verify = True
+        verify = True
+
+        if not self.verify_ssl_certificate:
+            self.verify = False
+            verify = False
+
+        elif self.certificate_file_path:
+            cert_path = Path(self.certificate_file_path)
+
+            if not cert_path.exists():
+                raise FileNotFoundError(
+                    f"Certificate file not found: {cert_path}"
+                )
+
+            ssl_context = ssl.create_default_context(
+                cafile=str(cert_path)
+            )
+            self.verify = cert_path
+            verify = ssl_context
+
+        self.client = openai.OpenAI(
+            api_key=self.service_key,
+            base_url=self.open_ai_host_address,
+            http_client=httpx.Client(
+                verify=verify,
+                timeout=300.0
+            )
+        )
 
     def _build_openai_params(self, messages: list, **kwargs) -> dict:
         model = kwargs.get("model", self.model_name)
