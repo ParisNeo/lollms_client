@@ -9,7 +9,7 @@ TOOL_LIBRARY_NAME = "Execute SQL Query"
 TOOL_LIBRARY_DESC = "Executes standard SQL queries on dataset files in the workspace."
 TOOL_LIBRARY_ICON = "🗄️"
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages(["pandas", "openpyxl"])
 
