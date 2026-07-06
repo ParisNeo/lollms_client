@@ -439,7 +439,7 @@ WEB_SEARCH_TOOL = '''TOOL_LIBRARY_NAME = 'Web Search'
 TOOL_LIBRARY_DESC = 'Search the internet for relevant URLs and snippets.'
 TOOL_LIBRARY_ICON = '🌐'
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'requests': '>=2.28.0'})
 
@@ -536,7 +536,7 @@ CONTENT_DOWNLOAD_TOOL = '''TOOL_LIBRARY_NAME = 'Content Downloader'
 TOOL_LIBRARY_DESC = 'Download and extract clean text from web URLs with intelligent caching.'
 TOOL_LIBRARY_ICON = '📥'
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'requests': '>=2.28.0', 'beautifulsoup4': '>=4.11.0'})
 
@@ -864,7 +864,7 @@ DATA_LAKE_TOOL = '''TOOL_LIBRARY_NAME = 'Data Lake Builder'
 TOOL_LIBRARY_DESC = 'Build and query a vector data lake from downloaded content.'
 TOOL_LIBRARY_ICON = '🗄️'
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'numpy': '>=1.21.0'})
 
