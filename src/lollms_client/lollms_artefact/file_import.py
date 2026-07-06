@@ -851,8 +851,6 @@ class FileImportMixin:
             )
 
         ext   = path.suffix.lower()
-        # 🛑 CRITICAL FIX: Default title MUST include the file extension (e.g., "data.csv", not "data")
-        # This ensures the Artifact Title == Physical Filename, which tools rely on for file lookups.
         title = title or path.name
 
         def _progress(msg: str):
@@ -944,11 +942,6 @@ class FileImportMixin:
                             else:
                                 continue
 
-                            # 🛑 CRITICAL FIX: Fingerprint using NORMALIZED COLUMN NAMES ONLY.
-                            # Do NOT include Pandas dtype kinds ('i', 'f', 'O') in the signature.
-                            # Including dtype kinds causes files with identical headers but slightly
-                            # different inferred types (e.g., int vs float due to NaN) to split into
-                            # separate groups, fragmenting the data and causing table overwrites.
                             normalized_signature = tuple(sorted(
                                 _normalize_column_name(str(c)) 
                                 for c in df.columns
@@ -1109,10 +1102,6 @@ class FileImportMixin:
                                     safe_table_name = safe_table_name[:61] + "_"
 
                                 _progress(f"  Writing table '{safe_table_name}' to SQLite ({len(fused_df):,} rows)...")
-                                # 🛑 CRITICAL FIX: Use 'append' instead of 'replace' to prevent
-                                # data loss if the LLM generates the same table name for multiple groups.
-                                # Since we already grouped by exact schema match, all files in this
-                                # group have identical columns, making append safe.
                                 fused_df.to_sql(safe_table_name, conn, if_exists='append', index=False)
 
                                 # Commit immediately to ensure data is persisted
@@ -1157,8 +1146,6 @@ class FileImportMixin:
 
                     text = "\n".join(schema_summary)
 
-                    # 🛑 CRITICAL FIX: Read the raw SQLite bytes from disk so the artifact
-                    # system writes a valid binary .db file to the workspace, not a text file.
                     _progress(f"Reading consolidated database bytes from disk...")
                     db_physical_bytes = None
                     try:
@@ -1273,8 +1260,6 @@ class FileImportMixin:
                 # Use clean_title (with extension) for lookup and registration
                 existing = self.artefacts.get(clean_title)
 
-                # 🛑 CRITICAL FIX: Pass schema_text as 'logical_content' and raw bytes as 'physical_data'
-                # This ensures the .lam file contains the rich schema, not the placeholder.
                 if existing is None:
                     art = self.artefacts.add(
                         title=clean_title,
@@ -1561,8 +1546,6 @@ class FileImportMixin:
         activate: bool,
     ) -> Dict:
         """Create or update the text artefact for the imported content."""
-        # 🛑 CRITICAL FIX: Ensure the title includes the file extension to match the physical file on disk.
-        # This prevents the artifact title from being "main" when the file is "main.py".
         if "." not in title and path.suffix:
             title = f"{title}{path.suffix.lower()}"
 
