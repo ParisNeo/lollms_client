@@ -9,7 +9,7 @@ TOOL_LIBRARY_NAME = "HUE"
 TOOL_LIBRARY_DESC = "Tool for interacting with Hue smart lighting system."
 TOOL_LIBRARY_ICON = "💡"
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     """
     Optional: Initialize any third-party libraries needed by your tool using pipmaster.
     """
