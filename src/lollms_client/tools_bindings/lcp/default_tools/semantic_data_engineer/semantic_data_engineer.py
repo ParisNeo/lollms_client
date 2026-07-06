@@ -25,7 +25,7 @@ TOOL_LIBRARY_NAME = "SEMANTIC_DATA_ENGINEER"
 TOOL_LIBRARY_DESC = "A highly specialized data engineering library providing safe pre-compiled data macros (filtering, aggregation, schemas, plotting, ABox conversion) without code execution."
 TOOL_LIBRARY_ICON = "📊"
 
-def init_tool_library() -> None:
+def init_tools_library() -> None:
     """Ensure required libraries are installed."""
     import pipmaster as pm
     pm.ensure_packages({
