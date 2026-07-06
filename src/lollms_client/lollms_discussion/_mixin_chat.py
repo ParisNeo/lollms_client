@@ -525,6 +525,10 @@ class _StreamState:
         self._artefact_open_tag = "" # Stores the exact opening tag (e.g., <artifact name="x">)
         self._pending_buffer = ""   # Shadow buffer to safely catch partial tags
 
+        # ── ONE-ACTION-PER-TURN PROTOCOL ──
+        # Ensures generation halts immediately after dispatching a single functional tag.
+        self._action_dispatched = False
+
         # ── Generic Secondary Tag Interceptor State ──
         # Handles <skill>, <note>, <lollms_inline>, <lollms_form>, <generate_image>, <edit_image>, etc.
         # These tags don't need the specialized dual-stream artifact tracker, but DO need
@@ -583,6 +587,11 @@ class _StreamState:
         if not isinstance(chunk, str) or not chunk:
             return True
 
+        # ── ONE-ACTION-PER-TURN: If an action was already dispatched, consume and discard ──
+        if self._action_dispatched:
+            self._pending_buffer += chunk
+            return True
+
         # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
         self._pending_buffer += chunk
 
@@ -605,9 +614,10 @@ class _StreamState:
                 # Keep any text after the tool call in the pending buffer
                 self._pending_buffer = self._pending_buffer[end_idx + end_len:]
 
-                keep_generating = self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
-                if not keep_generating:
-                    return False
+                # ── ONE-ACTION-PER-TURN: Halt generation immediately after dispatch ──
+                self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
+                self._action_dispatched = True
+                return False
             else:
                 self._tool_buffer += self._pending_buffer
                 self._pending_buffer = ""
@@ -669,6 +679,10 @@ class _StreamState:
                     # Keep any text that came after the closing tag
                     self._pending_buffer = self._artefact_buffer[close_idx+len(closing_tag):]
                     self._artefact_buffer = ""
+
+                    # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
+                    self._action_dispatched = True
+                    return False
                 else:
                     # Still in the middle of the artifact body. Suppress raw output from main stream.
 
@@ -775,6 +789,10 @@ class _StreamState:
                             self._artefact_buffer = ""
                             # Keep any text after the closing tag in the pending buffer
                             self._pending_buffer = remaining_content[close_idx+len(closing_tag):]
+
+                            # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
+                            self._action_dispatched = True
+                            return False
                         else:
                             # We are inside the artifact, waiting for the rest.
                             self._artefact_buffer += remaining_content
@@ -911,6 +929,10 @@ class _StreamState:
                 self._secondary_closing_tag = ""
                 self._secondary_open_tag = ""
                 self._secondary_buffer = ""
+
+                # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
+                self._action_dispatched = True
+                return False
             else:
                 # Still accumulating body. Emit lightweight status if enabled.
                 # (No structural analysis for secondary tags — just suppress raw output)
@@ -1282,6 +1304,10 @@ class _StreamState:
 
         return True
 
+    def was_action_dispatched(self) -> bool:
+        """Returns True if a functional tag was fully dispatched during this generation turn."""
+        return self._action_dispatched
+
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
             if msg_type in (MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING):
@@ -1560,7 +1586,7 @@ class ChatMixin:
         fast_artefact_replicas:       Optional[List[str]] = None,  # Custom messages for instant/empty artefacts
         tolerance_level:              Optional[str] = "strict",
         allow_dynamic_tools:          bool = False,  # 🛡️ Security gate for LLM-generated tool execution
-        debug_export:                 bool = True,   # 🔬 Dumps virtual_history and ai_msg.content to disk for debugging
+        debug_export:                 bool = False,   # 🔬 Dumps virtual_history and ai_msg.content to disk for debugging
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -2007,6 +2033,59 @@ class ChatMixin:
 
             ss.flush_remaining_buffer()
 
+            # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
+            # If the StreamState dispatched an artifact, note, skill, or context update
+            # (but NOT a tool), we must halt generation, hydrate virtual_history, and re-prompt.
+            if ss.was_action_dispatched() and not ss.tool_trigger:
+                full_round_text = ss.get_clean_text_so_far()
+                raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+
+                # Sanitize the raw text to remove processing blocks and HTML comments
+                clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+
+                if not clean_history_text.strip() and ss.affected_artefacts:
+                    for art in ss.affected_artefacts:
+                        title = art.get("title", "artifact")
+                        atype = art.get("type", "code")
+                        lang = art.get("language", "")
+                        content = art.get("content", "")
+                        ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
+                        clean_history_text += f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>\n'
+
+                # Append the sanitized assistant text (containing the raw <artifact> tag) to virtual_history
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=clean_history_text.strip()
+                ))
+
+                # Determine the action type and title for the system marker
+                action_type = "artifact"
+                action_title = ""
+                if ss.affected_artefacts:
+                    last_art = ss.affected_artefacts[-1]
+                    action_type = last_art.get("type", "artifact")
+                    action_title = last_art.get("title", "")
+
+                # Inject a system marker into a new user message to confirm the action and force continuation
+                # CRITICAL: Include the artifact title so the LLM knows exactly which file was created.
+                title_str = f" '{action_title}'" if action_title else ""
+                system_marker = (
+                    f"[SYSTEM: The {action_type}{title_str} has been successfully created/updated and is now available in the workspace. "
+                    f"You may now continue your task. If you need to execute a tool or write another artifact, do so now. "
+                    f"If you have completed the task, provide your final conversational answer to the user.]"
+                )
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=system_marker
+                ))
+
+                # Force another reasoning round
+                continue
+
             if ss.tool_trigger:
                 tool_call_json_str = ss.get_tool_call_json()
                 if tool_call_json_str:
@@ -2176,7 +2255,7 @@ class ChatMixin:
                                 f"detailing the error above, and suggesting possible workarounds or alternative approaches. Do NOT attempt to call the tool again."
                             )
                         ))
-                        break
+                        continue
 
                     # Execute the tool sequentially
                     try:
@@ -2221,17 +2300,11 @@ class ChatMixin:
                             status_err_line = f"* Tool call blocked to prevent success loop.\n"
                             details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked.\n<!-- status:failure -->\n</processing>\n\n"
                             ai_msg.content += status_err_line + details_block
-                            _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                             continue
                         else:
                             tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
-                            force_break_after_tool = False
-
-                        if force_break_after_tool:
-                            # Use the fake error result prepared above
-                            pass                        
-                        # Check cancellation BEFORE executing tool
-                        elif self.is_generation_cancelled():
+                        if self.is_generation_cancelled():
                             # Generation cancelled (logging removed)
                             tool_res = {
                                 "success": False, 
@@ -2262,7 +2335,6 @@ class ChatMixin:
                                 except ImportError:
                                     pass
 
-                            # 🛑 CRITICAL RESOLUTION: Direct tool CWD to the isolated workspace_data/ subfolder
                             if hasattr(self, "workspace_data_path") and self.workspace_data_path:
                                 workspace_dir = Path(self.workspace_data_path)
                             else:
@@ -2290,16 +2362,7 @@ class ChatMixin:
 
                                 ASCIIColors.info(f"[ChatMixin] Sanitized tool params: {sanitized_params}")
 
-                                # 🛑 SEQUENTIAL EXECUTION: Run tool directly in main thread
-                                # CRITICAL: CWD management is delegated to LCP Binding execute_tool()
-                                # The LCP binding will set CWD to the discussion-isolated workspace internally.
-                                # We do NOT change CWD here to avoid double-changedirectory conflicts.
                                 call_kwargs = dict(sanitized_params)
-
-                                # 🛑 ARCHITECTURAL UPDATE: Conditional Injection
-                                # By default, tools are agnostic. But if a tool explicitly declares
-                                # `discussion_instance` or `lollms_client_instance` in its signature,
-                                # we inject them to enable advanced agentic patterns (like child spawning).
                                 import inspect as _inspect
                                 _tool_sig_params = _inspect.signature(active_tools[tool_name]["callable"]).parameters
                                 if "discussion_instance" in _tool_sig_params:
@@ -2335,6 +2398,7 @@ class ChatMixin:
                                                     pass
 
                                 # Execute directly (no thread) - LCP handles CWD internally
+                                call_kwargs["discussion_instance"]=self
                                 tool_res = active_tools[tool_name]["callable"](**call_kwargs)
 
                                 # ── Take AFTER Snapshot and Auto-Sync Artifacts ──
@@ -2825,7 +2889,7 @@ class ChatMixin:
                         # Non-dict results: fall back to string matching
                         tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
 
-                    if tool_success and not force_break_after_tool:
+                    if tool_success :
                         successful_tool_signatures.add(context_aware_signature)
                         ASCIIColors.info(f"[ChatMixin] Recorded successful signature for '{tool_name}'. Total successful: {len(successful_tool_signatures)}")
 
@@ -2908,32 +2972,30 @@ class ChatMixin:
                             sender_type="user",
                             content=user_part
                         ))
-
-                    # 🛑 ARCHITECTURAL FIX: MANDATORY N+1 CONTINUATION
-                    # If a tool was called at turn N, the loop MUST force a turn N+1 so the LLM
-                    # can process the <tool_result> and generate a final conversational answer.
-                    # The loop must NEVER break immediately after a tool execution.
-                    # Loop safety is guaranteed by:
-                    #   - successful_tool_signatures (1-strike policy for identical successful calls)
-                    #   - FailureMemory (blocks identical failing calls after 1 retry)
-                    if 'force_break_after_tool' in locals() and force_break_after_tool:
-                        ASCIIColors.error("[ChatMixin] Breaking loop due to loop protection.")
-                        break
                     continue
                 else:
                     break
             else:
-                # ── 🛑 CRITICAL FIX: HARDENED PENDING TOOL INTENT CHECK ──
-                # The LLM generated text but did NOT emit a <tool> tag (tool_trigger is False).
-                # We check if the LLM expressed intent to call a tool but failed to output the XML.
-                # 🛑 CRITICAL GUARDS:
-                #   1. Only trigger if the generated text is SHORT (< 500 chars). Long text means the
-                #      LLM already wrote a full answer and the "intent" is likely a conversational offer.
-                #   2. Exclude matches inside questions (lines ending with '?') or markdown lists (1., 2., -).
-                #   3. Exclude matches immediately followed by "skill", "note", "artifact" (those are
-                #      functional tags, not tool calls).
                 raw_round_text = ss.get_clean_text_so_far()
                 raw_round_len = len(raw_round_text.strip())
+
+                if ss.was_action_dispatched():
+                    full_round_text = ss.get_clean_text_so_far()
+                    raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
+                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_history_text.strip()
+                    ))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: Action completed. Please continue your task or provide your final answer.]"
+                    ))
+                    continue
 
                 # Only run intent detection on SHORT responses (preambles before a missed tool call)
                 if raw_round_len < 500:
