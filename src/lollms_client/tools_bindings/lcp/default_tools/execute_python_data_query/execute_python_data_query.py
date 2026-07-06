@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional 
 from ascii_colors import ASCIIColors
 
+import matplotlib
+matplotlib.use('Agg')
+
 TOOL_LIBRARY_NAME = "Execute Python Data Query"
 TOOL_LIBRARY_DESC = "Executes sandboxed Python code to analyze or modify datasets in the workspace."
 TOOL_LIBRARY_ICON = "📊"
@@ -45,8 +48,6 @@ def tool_execute_python_data_query(
     # Set up headless matplotlib and standard modules inside execution context
     import base64
     import numpy as np
-    import matplotlib
-    matplotlib.use('Agg') # Safe headless execution
     import matplotlib.pyplot as plt
 
     local_vars = {
