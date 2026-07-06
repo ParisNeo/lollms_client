@@ -756,16 +756,34 @@ class CoreMixin:
                                 ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
                                 ".zip", ".tar", ".gz", ".pdf", ".docx"}
 
+        _IGNORED_SYNC_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules"}
+        _IGNORED_SYNC_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".lam", ".log"}
+
         for f_path in workspace_dir.rglob("*"):
-            if not f_path.is_file() or f_path.name.startswith("."):
+            if not f_path.is_file():
+                continue
+
+            # Skip files in ignored directories (e.g., ./__pycache__/file.pyc)
+            if any(part in _IGNORED_SYNC_DIRS for part in f_path.parts):
                 continue
 
             file_name = f_path.name
             file_ext = f_path.suffix.lower()
+
+            # Skip ignored extensions and hidden files
+            if file_ext in _IGNORED_SYNC_EXTS or file_name.startswith("."):
+                continue
+
+            existing_art = self.artefacts.get(file_name)
+            if existing_art:
+                existing_ext = Path(existing_art.get("title", "")).suffix.lower()
+                if existing_ext in _IGNORED_SYNC_EXTS:
+                    continue
+
             file_size = f_path.stat().st_size
             disk_mtime = f_path.stat().st_mtime
 
-            # Determine type
+            # Determine type (🛑 FIX: Explicitly map binary types so they don't fall back to document/.md)
             atype = "document"
             if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
                 atype = "code"
@@ -775,6 +793,8 @@ class CoreMixin:
                 atype = "image"
 
             existing_art = self.artefacts.get(file_name)
+            if not existing_art:
+                existing_art = self.artefacts.get(f_path.stem)
 
             # Check if file is binary to avoid reading it into memory as text
             is_binary = file_ext in EXPLICIT_BINARY_EXTS
