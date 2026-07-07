@@ -109,6 +109,192 @@ flowchart TD
     * **Feedback**: Sanitizes tool output (strips base64 blobs) and feeds back to LLM.
     4.  **Termination**: Commits DB, resets cancellation flags.
 
+### The `chat()` Method API
+
+The `chat()` method is the primary entry point for interacting with the LollmsDiscussion session. It orchestrates the entire agentic loop, including pre-hydration, multi-step reasoning, tool execution, and self-healing file restoration.
+
+```python
+def chat(
+    self,
+    user_message: str,
+    personality=None,
+    branch_tip_id=None,
+    tools=None,
+    add_user_message: bool = True,
+    images=None,
+    debug: bool = False,
+    remove_thinking_blocks: bool = True,
+    enable_image_generation: bool = True,
+    enable_image_editing:    bool = True,
+    auto_activate_artefacts: bool = True,
+    enable_inline_widgets:        bool = False,
+    enable_notes:                 bool = True,
+    enable_skills:                bool = True,
+    enable_forms:                 bool = True,
+    enable_books:                 bool = False,
+    enable_presentations:         bool = False,
+    memory_manager=None,
+    enable_artefacts:             bool = True,
+    enable_memory:                bool = True,
+    enable_auto_dream:            bool = True,
+    enable_deep_memory_pulling:   bool = True,
+    prehydrate_rag:               bool = True,
+    max_reasoning_steps:          int = 20,
+    enable_in_message_status:     bool = False,
+    enable_sub_agents:            bool = False,
+    forward_artefact_chunks:      bool = False,
+    fast_artefact_replicas:       Optional[List[str]] = None,
+    tolerance_level:              Optional[str] = "strict",
+    allow_dynamic_tools:          bool = False,
+    debug_export:                 bool = False,
+    **kwargs
+) -> Dict[str, Any]:
+```
+
+#### Parameters
+
+**Core Conversation & Context**
+*   `user_message` (`str`): The input text from the user for this turn.
+*   `personality` (`Optional[Any]`): The personality object containing the system prompt and optional RAG data. If `None`, the discussion's default system prompt is used.
+*   `branch_tip_id` (`Optional[str`]): The specific message ID to use as the tip of the conversation branch. If `None`, the discussion's `active_branch_id` is used.
+*   `add_user_message` (`bool`): If `True`, the `user_message` is added to the database history. If `False`, the generation regenerates from the existing branch tip (used for regeneration).
+*   `images` (`Optional[List[str]]`): A list of base64 encoded images to attach to the user message for vision-capable models.
+
+**Artifact & Feature Flags**
+*   `enable_artefacts` (`bool`): Master switch for the artifact creation system (`<artifact>` tags). If `False`, all artifact-related processing is disabled.
+*   `auto_activate_artefacts` (`bool`): If `True`, newly created or updated artifacts are immediately set to `FULL` visibility and injected into the LLM context.
+*   `enable_inline_widgets` (`bool`): Enables the `<lollms_inline>` tag for ephemeral, interactive HTML widgets.
+*   `enable_notes` (`bool`): Enables the `<note>` tag for persistent user-facing knowledge notes.
+*   `enable_skills` (`bool`): Enables the `<skill>` tag for persistent AI behavior capsules.
+*   `enable_forms` (`bool`): Enables the `<lollms_form>` tag for pausing generation to request structured user input.
+*   `enable_books` (`bool`): Conditionally enables book-specific instructions in the system prompt if the user request matches.
+*   `enable_presentations` (`bool`): Conditionally enables HTML presentation slide instructions.
+*   `enable_image_generation` (`bool`): Enables the `<generate_image>` tag if a TTI binding is available.
+*   `enable_image_editing` (`bool`): Enables the `<edit_image>` tag if a TTI binding is available.
+
+**Agentic Loop & Tool Orchestration**
+*   `tools` (`Optional[Dict[str, Dict[str, Any]]]`): A dictionary of external tool specifications that are merged into the active tool registry for this turn. If `None`, the system relies solely on LCP auto-discovery and any dynamically mounted tools (like `semantic_data_engineer`). The dictionary keys are the tool names, and the values are specification dictionaries. A tool spec dict must contain:
+    *   `name` (`str`): The exact name of the tool (must match the dictionary key).
+    *   `description` (`str`): A human/LLM-readable description of what the tool does.
+    *   `parameters` (`List[Dict]`): A list of parameter specifications, where each dict contains `name`, `type`, and `description`.
+    *   `callable` (`Callable`): The Python function that the orchestrator will execute when the LLM calls this tool. The orchestrator automatically handles CWD switching and artifact syncing before/after execution.
+    
+    **Example:**
+    ```python
+    def my_python_executor(code: str) -> dict:
+        # Execution logic here...
+        return {"success": True, "output": "Execution finished."}
+
+    external_tools = {
+        "tool_my_custom_executor": {
+            "name": "tool_my_custom_executor",
+            "description": "Executes arbitrary Python code and returns the output.",
+            "parameters": [{"name": "code", "type": "str", "description": "The Python code to run."}],
+            "callable": my_python_executor
+        }
+    }
+
+    discussion.chat(user_message="Run this code...", tools=external_tools)
+    ```
+*   `allow_dynamic_tools` (`bool`): **Security Gate**. If `True`, allows the LLM to write and execute its own Python tools on the fly via `type="tool"` artifacts. Defaults to `False`.
+*   `enable_code_execution` (`bool`): **Security Gate**. If `True`, registers the `tool_execute_python_code` LCP tool, allowing the LLM to execute arbitrary Python code strings. Defaults to `False`.
+*   `max_reasoning_steps` (`int`): The maximum number of agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles.
+
+#### 🗂️ Multi-Source Tool Orchestration (LCP)
+
+The system natively supports merging tools from multiple distinct sources (LCP auto-discovery, explicit callable dictionaries, and dynamic mounting). 
+
+**1. LCP Auto-Discovery (Client-Level)**
+When constructing the `LollmsClient`, you can configure the LCP binding to scan multiple folders or specific files. All discovered `tool_*` functions are registered and made available to every discussion by default.
+
+```python
+from lollms_client import LollmsClient
+
+client = LollmsClient(
+    # ... llm_binding_name="ollama" ...
+    tools_binding_name="lcp",
+    tools_binding_config={
+        "tools_folders": [
+            "./my_custom_tools_directory",
+            "C:/shared_network_tools/lcp_library"
+        ],
+        "tool_files": [
+            "C:/projects/utilities/matter_lock_controller.py"
+        ]
+    }
+)
+
+# All tools found in the folders/files above are automatically active
+discussion.chat(user_message="Turn off the living room light")
+```
+
+**2. Dynamic Library Mounting (Discussion-Level)**
+The `ChatMixin` automatically detects data files in the workspace and mounts specialized libraries (like `semantic_data_engineer`). You can also manually trigger this via the LCP binding if you need to load a specialized library on the fly.
+
+```python
+# Mount a specific library folder dynamically
+if hasattr(client.tools, "mount_tool_library"):
+    client.tools.mount_tool_library("my_specialized_analyzer")
+
+# Now the tools inside `my_specialized_analyzer` are active for the next chat()
+discussion.chat(user_message="Run the specialized analysis")
+```
+
+**3. Explicit Callable Injection (Turn-Level)**
+For maximum control, you can inject Python functions directly into the `tools` parameter of `chat()`. This is useful for temporary tools, testing, or tools that require closure over local state. These are merged with any LCP-discovered tools.
+
+```python
+def my_temp_tool(query: str) -> dict:
+    """A tool that only exists for this specific turn."""
+    return {"success": True, "output": f"Searched for {query}"}
+
+explicit_tools = {
+    "tool_my_temp": {
+        "name": "tool_my_temp",
+        "description": "A temporary tool for this turn.",
+        "parameters": [{"name": "query", "type": "str", "description": "The search query."}],
+        "callable": my_temp_tool
+    }
+}
+
+# Merges with LCP tools. If LCP has a tool with the same name, this one overrides it.
+discussion.chat(user_message="Search for apples", tools=explicit_tools)
+```
+*   `enable_sub_agents` (`bool`): If `True`, registers internal spinoff sub-agents (e.g., Surgical Code Specialist, Presentation Designer) as executable tools.
+*   `forward_artefact_chunks` (`bool`): If `True`, forwards raw streaming code chunks to the UI callback for live artifact rendering. If `False`, only lightweight structural status events are forwarded.
+*   `fast_artefact_replicas` (`Optional[List[str]]`): Custom status messages to display when an artifact is created with an empty body (instant creation).
+*   `tolerance_level` (`Optional[str]`): Sets the execution tolerance for downstream tools (e.g., `strict` or `lax` for Python data queries).
+
+**Memory & RAG**
+*   `memory_manager` (`Optional[Any]`): The LollmsMemoryManager instance for tiered persistent memory. If `None`, memory features are disabled.
+*   `enable_memory` (`bool`): Master switch for SQLite memory ingestion and retrieval.
+*   `enable_deep_memory_pulling` (`bool`): If `True`, performs associative deep memory pull based on the `user_message` before generation.
+*   `enable_auto_dream` (`bool`): If `True`, triggers a subconscious dream consolidation pass after the turn completes.
+*   `prehydrate_rag` (`bool`): If `True` and the personality has data, queries the RAG database before generation to inject context.
+
+**Debugging & UI Feedback**
+*   `debug` (`bool`): Enables verbose logging of the agentic loop.
+*   `debug_export` (`bool`): Dumps the exact `virtual_history` (LLM context) and `ai_msg.content` (UI context) to a JSON file in the workspace to verify context separation.
+*   `enable_in_message_status` (`bool`): If `True`, emits detailed status comments inside `<processing>` blocks for UI rendering.
+*   `remove_thinking_blocks` (`bool`): If `True`, strips `<think>` or `</think>` blocks from the final saved message content.
+*   `**kwargs`: Additional keyword arguments passed directly to the LLM binding's `generate_from_messages` call (e.g., `temperature`, `streaming_callback`).
+
+#### Return Value
+
+Returns a dictionary containing the complete result of the conversational turn:
+
+```python
+{
+    "user_message": LollmsMessage,  # The user message object
+    "ai_message": LollmsMessage,    # The final AI message object
+    "sources": List[Dict],          # RAG sources retrieved
+    "artefacts": List[Dict],        # Artifacts created/modified this turn
+    "memory_report": Dict,          # Memory operations report
+    "dream_report": Optional[Dict], # Auto-dream consolidation report
+    "was_cancelled": bool           # Cancellation status
+}
+```
+
 ### Processing Block Status Metadata
 
 When the LLM triggers a tool call, builds an artifact, or requests a context visibility change, the system intercepts the action and wraps it in a `<processing>` block in the live chat stream. Upon completion of the action, the system injects an HTML comment metadata tag immediately after the closing `</processing>` tag to indicate the outcome.
@@ -189,41 +375,6 @@ The LLM can request visibility changes by outputting the following tags. The `Ch
 
 Upon execution, the system replaces the raw XML tag in the LLM's message with a `<processing type="context_update">` block detailing the outcome (which files were processed, already in state, or not found) and a status meta tag.
 
-### The `chat()` Method API
-
-```python
-def chat(
-    self,
-    user_message: str,
-    personality=None,
-    branch_tip_id=None,
-    tools=None,
-    add_user_message: bool = True,
-    images=None,
-    # ... (see full signature in code)
-) -> Dict[str, Any]:
-```
-
-**Key Parameters:**
-*   `user_message` (`str`): The input text from the user.
-*   `tools` (`Optional[Dict]`): A dictionary of tool specifications. If `None`, the system relies on LCP auto-discovery.
-*   `images` (`Optional[List[str]]`): List of base64 encoded images for vision models.
-*   `enable_artefacts` (`bool`): Master switch for the artifact creation system.
-*   `allow_dynamic_tools` (`bool`): **Security Gate**. If `True`, allows the LLM to write and execute its own Python tools on the fly.
-*   `max_reasoning_steps` (`int`): Limit for the agentic loop to prevent infinite cycles.
-
-**Return Dictionary:**
-```python
-{
-    "user_message": LollmsMessage,
-    "ai_message": LollmsMessage,
-    "sources": List[Dict],           # RAG sources
-    "artefacts": List[Dict],         # Artifacts created/modified this turn
-    "memory_report": Dict,           # Memory operations report
-    "dream_report": Optional[Dict],  # Auto-dream consolidation report
-    "was_cancelled": bool            # Cancellation status
-}
-```
 
 ---
 
@@ -245,8 +396,22 @@ Because allowing an LLM to write and execute arbitrary code is inherently danger
 *   **Visibility Rules**: Even when disabled, the tool artefact remains in the workspace, subject to standard `[U]`, `[C]`, `[L]` visibility tiers. The user can inspect the code the LLM wrote.
 
 ---
+### 🛡️ 4.1 Security Gates & Strict Tool Registry Isolation
 
-## 🛑 4. Cancellation & Interrupt Protocol
+The `ChatMixin` enforces a **Strict Tool Registry Isolation** doctrine. The LLM is only ever aware of tools that are explicitly registered in the active `tools` dictionary for the current turn. If a tool is filtered out, the LLM has zero knowledge of its existence, preventing hallucination loops.
+
+This is controlled by two critical security gates passed to `discussion.chat()`:
+
+| Security Gate | Default | Filtered Tool | Description |
+| :--- | :--- | :--- | :--- |
+| `allow_dynamic_tools` | `False` | `tool_execute_python_data_query` | If `False`, filters out the dynamic LLM-authored Python tool execution environment. The LLM can still write `.py` files as artifacts, but cannot execute them. |
+| `enable_code_execution` | `False` | `tool_execute_python_code` | If `False`, filters out the arbitrary Python code string execution tool. The LLM cannot run raw Python code strings unless explicitly enabled. |
+
+If the LLM attempts to call a tool that was filtered out (or hallucinates one entirely), the `ChatMixin` intercepts the call *before* execution, injects a targeted correction into `virtual_history` listing the exact names of available tools, and forces a continuation round. This gracefully steers the LLM back to reality without polluting the context with raw stack traces.
+
+---
+
+## 🛑 5. Cancellation & Interrupt Protocol
 
 The `ChatMixin` implements a **Thread-Safe Cancellation Protocol** using a simple boolean flag. This ensures that long-running agentic loops, heavy tool executions, or streaming generations can be interrupted instantly without leaving the database or workspace in an inconsistent state.
 
@@ -297,7 +462,7 @@ discussion.chat(user_message="New question...") # Works normally
 
 ---
 
-## 🌿 5. Branching & Versioning
+## 🌿 6. Branching & Versioning
 
 Messages are not a linear list. They are a **Directed Acyclic Graph (DAG)**.
 
@@ -323,7 +488,7 @@ Every update to an artefact creates a new version (Git-like).
 
 ---
 
-## 📥 6. File Import Modes (`FileImportMixin`)
+## 📥 7. File Import Modes (`FileImportMixin`)
 
 The `import_file` method supports sophisticated ingestion strategies:
 
@@ -421,7 +586,7 @@ This ensures the LLM's context window (the `.lam` schemas and code contents) per
     Returns a report dictionary: `{"new_artefacts": int, "updated_artefacts": int, "restored_files": int}`.
 
 
-## 🎛️ 7. Interactive Widgets (`<lollms_inline>`)
+## 🎛️ 8. Interactive Widgets (`<lollms_inline>`)
 
 Widgets are **ephemeral, in-context, interactive educational demonstrations** rendered directly inside the chat bubble. They are designed for teaching concepts, visualizing data, or providing micro-interactions (similar to platforms like Brilliant.org).
 
@@ -593,7 +758,7 @@ Ensure your Content Security Policy (CSP) allows scripts from `cdn.jsdelivr.net`
 
 ---
 
-## 📋 8. Interactive Forms (`<lollms_form>`)
+## 📋 9. Interactive Forms (`<lollms_form>`)
 
 Forms allow the LLM to request structured data from the user mid-generation. When the LLM emits a `<lollms_form>` tag, the system parses it into a JSON descriptor, pauses the generation loop, and waits for the frontend to submit the user's answers. This is ideal for surveys, configuration steps, or gathering multiple parameters at once.
 
@@ -714,7 +879,7 @@ async def submit_form(disc_id: str, form_id: str, answers: dict):
 
 ---
 
-### 🔄 9.1 Tool Failure Visibility & Anti-Loop Protocol
+### 🔄 10.1 Tool Failure Visibility & Anti-Loop Protocol
 
 A critical architectural requirement is that the LLM **must always see the error details** when a tool fails, and the system **must never mask a failure as a success**. If the LLM cannot see why a tool failed, it will blindly retry the same call indefinitely, causing an infinite agentic loop.
 
@@ -764,12 +929,30 @@ In addition to visibility, the system maintains a `FailureMemory` instance per `
 
 This ensures the LLM gets exactly one chance to retry a failed tool with modified parameters before the system forcefully terminates the loop to prevent token waste.
 
-### 🛡️ 9. Security & Integrity Rules
+### 🛡️ 11. Security & Integrity Rules
 
 1.  **Path Sovereignty**: Tools **cannot** access files outside `data_workspace/discussions/{id}/`. The CWD switch enforces this at the OS level.
 2.  **No Blind Edits**: The Aider patch engine requires verbatim `SEARCH` blocks. It uses 6-pass fuzzy matching (Exact → Whitespace → Indent → Comments → Blanks → Core Delta) to ensure safe edits.
 3.  **Binary Stripping**: Tool results containing base64 blobs (>500 chars) are automatically stripped and replaced with `[base64 blob stripped: 24.3KB]` to prevent context explosion and tool loops.
 4.  **Prompt Injection**: Tools can return a `prompt_injection` key. This overrides the standard JSON dump and tells the LLM exactly what to say next (e.g., "Here is your plot: ![img](url)").
+
+---
+
+## 🚀 Quick Start: Executing Arbitrary Python Code
+
+To allow the LLM to run arbitrary Python code strings (e.g., for quick calculations or ad-hoc scripting), pass `enable_code_execution=True` to `chat()`. This registers the built-in `tool_execute_python_code` LCP tool.
+
+```python
+# Enable the arbitrary code execution security gate
+response = discussion.chat(
+    user_message="Calculate the factorial of 10 using Python and tell me the result.",
+    enable_code_execution=True
+)
+
+# The LLM will output:
+# <tool>{"name": "tool_execute_python_code", "parameters": {"code": "import math; print(math.factorial(10))"}}</tool>
+# The system will execute it, capture stdout, and feed it back to the LLM to formulate the final answer.
+```
 
 ---
 
