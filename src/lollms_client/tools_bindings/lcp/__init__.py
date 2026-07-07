@@ -250,21 +250,31 @@ class LCPBinding(LollmsToolBinding):
 
         self.tools_folders.append(lib_path)
 
-        # Trigger discovery for this specific new folder only (optimization)
-        # But for safety and simplicity, we re-scan all (fast enough for <50 tools)
-        self._discover_local_tools()
+        initial_tool_count = len(self.discovered_tools)
 
-        # Verify if tools were actually added
-        # FIX: Use string comparison or .is_relative_to() instead of 'in' with Path objects
-        lib_path_str = str(lib_path.resolve())
-        new_tools = []
-        for t in self.discovered_tools:
-            file_path_str = str(Path(t.get('_python_file_path', '')).resolve())
-            if file_path_str.startswith(lib_path_str):
-                new_tools.append(t)
+        # Scan the specific library directory for tool files
+        for item in lib_path.iterdir():
+            py_file = None
+            if item.is_dir():
+                py_file = item / f"{item.name}.py"
+                if not py_file.exists():
+                    sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
+                    if sub_py_files:
+                        for fallback_py in sub_py_files:
+                            self._load_tool_file(fallback_py)
+                        continue
+                    else:
+                        continue
+            elif item.suffix == ".py" and item.stem != "__init__":
+                py_file = item
 
-        if new_tools:
-            ASCIIColors.success(f"[LCP Mount] ✅ Successfully mounted '{library_name}': {len(new_tools)} tools registered.")
+            if py_file and py_file.exists():
+                self._load_tool_file(py_file)
+
+        new_tool_count = len(self.discovered_tools) - initial_tool_count
+
+        if new_tool_count > 0:
+            ASCIIColors.success(f"[LCP Mount] ✅ Successfully mounted '{library_name}': {new_tool_count} tools registered.")
             return True
         else:
             ASCIIColors.warning(f"[LCP Mount] ⚠️ Library '{library_name}' mounted but no tools discovered.")
