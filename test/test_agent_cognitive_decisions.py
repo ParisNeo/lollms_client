@@ -143,6 +143,28 @@ class MockGemmaAgentClient:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
 
+        # ── Test Scenario D: Arbitrary Python Code Execution ──
+        # Round 2: Tool has been executed, result is in history. Emit final answer.
+        if "tool_result" in prompt_text_lower and "factorial" in prompt_text_lower:
+            reply = "I executed the Python code. The factorial of 5 is 120."
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+            return reply
+
+        # Round 1: User asks to calculate factorial. Emit the tool call.
+        if "factorial" in prompt_text_lower and "tool_result" not in prompt_text_lower:
+            import json as _json
+            tool_call = {
+                "name": "tool_execute_python_code",
+                "parameters": {
+                    "code": "import math\nprint(math.factorial(5))"
+                }
+            }
+            reply = f"<tool>{_json.dumps(tool_call)}</tool>"
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+            return reply
+
         # ── Test Scenario C: Two-Step Ingestion & Data Query (Multi-Turn) ──
         # CRITICAL: Check for system markers to determine the current agentic round.
 
@@ -342,16 +364,18 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
     def test_scenario_c_multistep_data_query(self):
         ASCIIColors.cyan("\n▶ Running Scenario C: Multi-Turn Two-Step Data Query")
 
-        # Register our dummy CSV file as an active data artifact in the session
-        # 🛑 CRITICAL FIX: Title must include .csv extension to match the physical file
-        # and prevent ArtefactManager from auto-appending a second extension.
+        # Read the raw CSV bytes we wrote in setUp
+        raw_csv_bytes = self.csv_path.read_bytes()
+
         self.discussion.artefacts.add(
             title=self.csv_filename,
             artefact_type="data",
             content="Columns: product_name (str), category (str), revenue (float)",
             file_ext=".csv",
             version=1,
-            read_only=True
+            read_only=True,
+            physical_data=raw_csv_bytes,
+            logical_content="Columns: product_name (str), category (str), revenue (float)"
         )
         self.discussion.commit()
 
@@ -419,6 +443,65 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             "highlights": f"Final Answer: '{final_content}'"
         })
         self.assertTrue(success, "Failed to execute multi-turn data query successfully. Final answer did not contain expected data.")
+
+    def test_scenario_d_python_execution(self):
+        ASCIIColors.cyan("\n▶ Running Scenario D: Arbitrary Python Code Execution")
+
+        user_message = "Please calculate the factorial of 5 using Python."
+
+        # Import the actual LCP tool
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python_code.execute_python_code import tool_execute_python_code
+
+        # CRITICAL FIX: Remove the LCP binding so it doesn't overwrite our direct callable
+        original_tools_binding = getattr(self.client, 'tools', None)
+        self.client.tools = None
+
+        active_tools = {
+            "tool_execute_python_code": {
+                "name": "tool_execute_python_code",
+                "description": "Executes arbitrary Python code and returns the output.",
+                "parameters": [{"name": "code", "type": "str", "description": "The Python code to run."}],
+                "callable": lambda code, **kw: tool_execute_python_code(code=code)
+            }
+        }
+
+        tools_called = []
+        def relay(chunk, msg_type, meta=None):
+            if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
+                tools_called.append(meta.get("tool"))
+            return True
+
+        # Run chat with code execution enabled
+        res = self.discussion.chat(
+            user_message=user_message,
+            streaming_callback=relay,
+            tools=active_tools,
+            enable_memory=False,
+            enable_artefacts=True,
+            enable_code_execution=True  # 🛡️ Security gate must be enabled
+        )
+
+        # Restore the original tools binding
+        self.client.tools = original_tools_binding
+
+        final_content = res.get("ai_message").content or ""
+
+        # The tool execution must have succeeded (status:success in the processing block)
+        # AND the final answer must contain the expected data (120).
+        tool_succeeded = "status:success" in final_content and "120" in final_content
+        answer_correct = "factorial of 5 is 120" in final_content.lower()
+
+        success = tool_succeeded and answer_correct
+
+        self.report_cards.append({
+            "name": "Scenario D: Arbitrary Python Code Execution",
+            "success": success,
+            "decision_reason": "Correctly emitted the tool call for arbitrary Python execution, received the result (120), and formulated the final answer.",
+            "tools_called": tools_called if tools_called else "None (Executed via direct callable)",
+            "response_size": len(final_content),
+            "highlights": f"Final Answer: '{final_content}'"
+        })
+        self.assertTrue(success, "Failed to execute arbitrary Python code successfully. Final answer did not contain expected data.")
 
 
 if __name__ == "__main__":
