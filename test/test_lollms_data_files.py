@@ -43,14 +43,14 @@ class TestLollmsDataFiles(unittest.TestCase):
         df.to_csv(csv_path, index=False)
 
         # Run parse function
-        schema, _ = _parse_data_file(csv_path, "test_data", version=1)
+        schema, _, _ = _parse_data_file(csv_path, "test_data", version=1)
 
         # Verify schema results
         self.assertIn("# Data Interface: test_data", schema)
         self.assertIn("Format: CSV (.csv)", schema)
         self.assertIn("Total Rows: 3", schema)
         self.assertIn("id (int64)", schema)
-        self.assertIn("name (str)", schema)
+        self.assertIn("name (object)", schema)
         self.assertIn("score (float64)", schema)
         self.assertIn("Alice", schema)
 
@@ -76,7 +76,7 @@ class TestLollmsDataFiles(unittest.TestCase):
             df2.to_excel(writer, sheet_name="Sheet2", index=False)
 
         # Run parse function
-        schema, _ = _parse_data_file(excel_path, "test_excel", version=2)
+        schema, _, _ = _parse_data_file(excel_path, "test_excel", version=2)
 
         # Verify schema results
         self.assertIn("# Data Interface: test_excel", schema)
@@ -106,7 +106,7 @@ class TestLollmsDataFiles(unittest.TestCase):
         conn.close()
 
         # Run parse function
-        schema, _ = _parse_data_file(db_path, "test_db", version=1)
+        schema, _, _ = _parse_data_file(db_path, "test_db", version=1)
 
         # Verify schema results
         self.assertIn("# Data Interface: test_db", schema)
