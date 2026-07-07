@@ -42,6 +42,7 @@ class CoreMixin:
         memory_manager=None,
         internet_config: Optional[Dict[str, Any]] = None,
         workspace_path: Optional[str] = None,
+        auto_create_db: bool = True,
     ):
         object.__setattr__(self, 'lollmsClient', lollmsClient)
         object.__setattr__(self, 'autosave', autosave)
@@ -93,12 +94,6 @@ class CoreMixin:
         object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
         object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir.resolve()))
 
-        # Self-healing auto DB instantiation if db_manager is omitted
-        if not db_manager:
-            from ._db import LollmsDataManager
-            db_file_path = parent_dir / "discussion.db"
-            db_manager = LollmsDataManager(f"sqlite:///{db_file_path}")
-
         object.__setattr__(self, 'db_manager', db_manager)
         object.__setattr__(self, '_is_db_backed', db_manager is not None)
 
@@ -113,10 +108,31 @@ class CoreMixin:
                     self._db_discussion = self._session.query(
                         db_manager.DiscussionModel).filter_by(id=resolved_id).one()
                 except NoResultFound:
-                    self._session.close()
-                    raise ValueError(f"No discussion found with ID: {resolved_id}")
+                    proxy_data = {'id': resolved_id}
+                    self._db_discussion = db_manager.DiscussionModel(**proxy_data)
+                    self._session.add(self._db_discussion)
+                    self._session.commit()
+                    self._session.refresh(self._db_discussion)
         else:
             self._create_in_memory_proxy(id=resolved_id)
+            if auto_create_db:
+                from ._db import LollmsDataManager
+                db_file_path = parent_dir / "discussion.db"
+                auto_db_manager = LollmsDataManager(f"sqlite:///{db_file_path}")
+                object.__setattr__(self, 'db_manager', auto_db_manager)
+                object.__setattr__(self, '_is_db_backed', True)
+                self._session = auto_db_manager.get_session()
+                try:
+                    self._db_discussion = self._session.query(
+                        auto_db_manager.DiscussionModel).filter_by(id=resolved_id).one()
+                except NoResultFound:
+                    proxy_data = {'id': resolved_id}
+                    self._db_discussion = auto_db_manager.DiscussionModel(**proxy_data)
+                    self._session.add(self._db_discussion)
+                    self._session.commit()
+                    self._session.refresh(self._db_discussion)
+            else:
+                object.__setattr__(self, '_is_db_backed', False)
 
         object.__setattr__(self, '_system_prompt',
                            getattr(self._db_discussion, 'system_prompt', None))
@@ -165,20 +181,30 @@ class CoreMixin:
             'autosave': kwargs.pop('autosave', False),
             'max_context_size': kwargs.pop('max_context_size', None),
             'internet_config': kwargs.pop('internet_config', None),
-            'workspace_path': kwargs.pop('workspace_path', None)
+            'workspace_path': kwargs.pop('workspace_path', None),
+            'auto_create_db': kwargs.pop('auto_create_db', False)
         }
         if db_manager:
-            with db_manager.get_session() as session:
-                valid_keys = db_manager.DiscussionModel.__table__.columns.keys()
-                db_creation_args = {k: v for k, v in kwargs.items() if k in valid_keys}
-                db_discussion_orm = db_manager.DiscussionModel(**db_creation_args)
-                session.add(db_discussion_orm)
-                session.commit()
-                session.expunge(db_discussion_orm)
-            return cls(lollmsClient=lollms_client, db_manager=db_manager,
-                       db_discussion_obj=db_discussion_orm, **init_args)
+           with db_manager.get_session() as session:
+               valid_keys = db_manager.DiscussionModel.__table__.columns.keys()
+               db_creation_args = {k: v for k, v in kwargs.items() if k in valid_keys}
+               if 'id' not in db_creation_args:
+                   db_creation_args['id'] = str(uuid.uuid4())
+               db_discussion_orm = db_manager.DiscussionModel(**db_creation_args)
+               session.add(db_discussion_orm)
+               session.commit()
+               session.expunge(db_discussion_orm)
+           return cls(lollmsClient=lollms_client, db_manager=db_manager,
+                      db_discussion_obj=db_discussion_orm, **init_args)
         else:
-            return cls(lollmsClient=lollms_client, discussion_id=kwargs.get('id'), **init_args)
+            resolved_id = kwargs.get('id') or str(uuid.uuid4())
+            instance = cls(lollmsClient=lollms_client, discussion_id=resolved_id, **init_args)
+            if instance._is_db_backed:
+                with instance._session as session:
+                    session.add(instance._db_discussion)
+                    session.commit()
+                    session.refresh(instance._db_discussion)
+            return instance
 
     # ---------------------------------------------------------------- proxying
 
@@ -870,6 +896,9 @@ class CoreMixin:
         # --- 2. DB -> WORKSPACE (Heal/Restore) ---
         active_arts = self.artefacts.list(active_only=True)
         for art in active_arts:
+            if not art.get("active", False) or art.get("visibility") == ArtefactVisibility.HIDDEN:
+                continue
+
             title = art.get("title")
             atype = art.get("type", "document")
             content = art.get("content", "")
