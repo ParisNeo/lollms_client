@@ -93,7 +93,8 @@ class LollmsToolBinding(LollmsBaseBinding):
         the flat ``parameters`` list (e.g. ``local_mcp`` style), it is used
         as-is.
         """
-        raw_tools = self.discover_tools(**discover_kwargs)
+        discover_kwargs.pop("force_refresh", None)
+        raw_tools = self.discover_tools(force_refresh=False, **discover_kwargs)
         specs: Dict[str, Dict[str, Any]] = {}
 
         for tool in raw_tools:
