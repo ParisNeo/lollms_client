@@ -108,7 +108,10 @@ class OpenAIBinding(LollmsLLMBinding):
         self.is_vllm = kwargs.get("is_vllm", False)
 
         self.base_address = self.host_address
-        self.open_ai_host_address = f"{self.base_address}/v1"
+        if self.base_address:
+            self.open_ai_host_address = f"{self.base_address}" if self.base_address.endswith("/v1") else f"{self.base_address}/v1"
+        else:
+            self.open_ai_host_address = None
 
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)

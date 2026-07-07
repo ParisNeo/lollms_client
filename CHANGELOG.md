@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-07 17:38]
+
+- fix(openai): handle base address suffix and null values for host address
+
 ## [2026-07-07 12:58]
 
 - feat(openai): add base_address and open_ai_host_address to OpenAIBinding
