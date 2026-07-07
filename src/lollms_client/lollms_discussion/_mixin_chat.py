@@ -1586,6 +1586,7 @@ class ChatMixin:
         fast_artefact_replicas:       Optional[List[str]] = None,  # Custom messages for instant/empty artefacts
         tolerance_level:              Optional[str] = "strict",
         allow_dynamic_tools:          bool = False,  # 🛡️ Security gate for LLM-generated tool execution
+        enable_code_execution:        bool = False,  # 🛡️ Security gate for arbitrary Python code execution
         debug_export:                 bool = False,   # 🔬 Dumps virtual_history and ai_msg.content to disk for debugging
         **kwargs
     ) -> Dict[str, Any]:
@@ -1599,6 +1600,9 @@ class ChatMixin:
         # 🛡️ SECURITY: Store the dynamic tool execution flag.
         # If False, the ArtefactManager will NOT register type="tool" artefacts as executable LCP tools.
         object.__setattr__(self, "allow_dynamic_tools", allow_dynamic_tools)
+
+        # 🛡️ SECURITY: Store the arbitrary code execution flag.
+        object.__setattr__(self, "enable_code_execution", enable_code_execution)
 
         # Initialize list to collect all created/modified artifacts during this turn safely
         object.__setattr__(self, "_affected_artefacts_this_turn", [])
@@ -1819,15 +1823,28 @@ class ChatMixin:
 
         # 2. Merge LCP Tools into Active Toolset
         # If LCP binding exists, merge all discovered tools (including newly mounted ones)
+        # 🛑 CRITICAL: We do NOT force a re-discovery here. The LCP binding's constructor
+        # and explicit mount_tool_library() calls handle discovery and early initialization.
+        # Calling discover_tools(force_refresh=True) here would re-run init_tools_library()
+        # on every chat turn, violating the Early Initialization Doctrine.
         if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
             try:
                 lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                # ── 🛡️ SECURITY GATES: Filter out dangerous tools unless explicitly enabled ──
                 if not allow_dynamic_tools:
                     lcp_tools = {
                         name: spec for name, spec in lcp_tools.items() 
                         if name != "tool_execute_python_data_query"
                     }
                     ASCIIColors.info("[ChatMixin] Dynamic tools disabled. Filtered out 'tool_execute_python_data_query'.")
+
+                if not enable_code_execution:
+                    lcp_tools = {
+                        name: spec for name, spec in lcp_tools.items() 
+                        if name != "tool_execute_python_code"
+                    }
+                    if not enable_code_execution:
+                        ASCIIColors.info("[ChatMixin] Code execution disabled. Filtered out 'tool_execute_python_code'.")
 
                 active_tools.update(lcp_tools)
             except Exception as ex:
@@ -1872,6 +1889,16 @@ class ChatMixin:
                 params_list = t_spec.get("parameters", [])
                 param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
                 tools_prompt += f"- {t_name}({param_desc}): {desc}\n"
+
+            # ── 🛡️ PHANTOM TOOL PREVENTION PROTOCOL ──
+            # Explicitly enumerate allowed tool names to prevent the LLM from
+            # hallucinating tools that exist in its training data but are not
+            # registered in the current session.
+            allowed_tool_names = list(active_tools.keys())
+            tools_prompt += f"\n🚨 **STRICT TOOL REGISTRY ENFORCEMENT** 🚨\n"
+            tools_prompt += f"You are STRICTLY FORBIDDEN from calling any tool not listed above.\n"
+            tools_prompt += f"The ONLY valid tool names you may use are: {', '.join(allowed_tool_names)}\n"
+            tools_prompt += f"If you need to perform an action and no tool in this list is suitable, DO NOT hallucinate a tool name. Instead, inform the user that the required tool is not available in this session.\n"
             tools_prompt += "=== END TOOLS ===\n"
 
         # ── 8. Active Deliberation Loop ──
@@ -2148,19 +2175,57 @@ class ChatMixin:
                         sender_type="assistant",
                         content=clean_history_text.strip()
                     ))
+
+                    # ── 🛡️ PHANTOM TOOL INTERCEPTION ──
+                    # If the LLM hallucinates a tool that is not in the active registry,
+                    # we intercept it BEFORE execution, inject a correction, and force a retry.
+                    # This prevents cascading failures where the LLM panics and tries other unregistered tools.
+                    if not active_tools or tool_name not in active_tools:
+                        ASCIIColors.warning(f"[ChatMixin] Phantom tool call detected: '{tool_name}' is not registered.")
+
+                        # Emit a failure processing block to the UI
+                        status_err_line = f"* Tool call blocked.\n"
+                        details_block = f"Error Logs:\nTool '{tool_name}' is not available in this session.\n"
+                        tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
+                        ai_msg.content += tool_close_tag
+                        _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        # Inject a targeted correction into virtual history
+                        available_tools_str = ", ".join(f"`{t}`" for t in active_tools.keys()) if active_tools else "No tools are available."
+                        correction_msg = (
+                            f"=== ⚠️ INVALID TOOL CALL ===\n"
+                            f"You attempted to call `{tool_name}`, which is **NOT REGISTERED** in this session.\n"
+                            f"You are STRICTLY FORBIDDEN from hallucinating tool names.\n\n"
+                            f"The ONLY tools available to you right now are:\n"
+                            f"{available_tools_str}\n\n"
+                            f"If one of these tools is suitable, output the corrected `<tool>` call now.\n"
+                            f"If NONE of these tools can accomplish the task, DO NOT try to call any tool. "
+                            f"Instead, inform the user that the required tool is not available and complete your response."
+                        )
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="user",
+                            content=correction_msg
+                        ))
+
+                        # Force another reasoning round to let the LLM correct itself
+                        continue
+
+                    tool_res = None
+                    _lcp_executed = False
+
                     if active_tools and tool_name in active_tools and "callable" not in active_tools[tool_name]:
                         if lcp_binding and hasattr(lcp_binding, "execute_tool"):
                             import os as _os
                             from pathlib import Path as _Path
                             _old_cwd_lcp = _os.getcwd()
-                            
+
                             # Resolve workspace_data path
                             if hasattr(self, "workspace_data_path") and self.workspace_data_path:
                                 _lcp_workspace_dir = _Path(self.workspace_data_path)
                             else:
                                 _base_ws = _Path(self.workspace_path) if hasattr(self, "workspace_path") and self.workspace_path else _Path("./data_workspace")
                                 _lcp_workspace_dir = _base_ws / self.id / "workspace_data"
-                            
+
                             _lcp_workspace_dir.mkdir(parents=True, exist_ok=True)
                             _lcp_workspace_str = str(_lcp_workspace_dir.resolve())
 
@@ -2191,7 +2256,35 @@ class ChatMixin:
                                 "status_code": 404
                             }
                             _lcp_executed = True
+                    elif active_tools and tool_name in active_tools and "callable" in active_tools[tool_name]:
+                        # Execute the direct callable provided by to_chat_tool_specs()
+                        try:
+                            # The callable is a closure that already handles CWD, discussion_instance, etc.
+                            # 🛑 CRITICAL FIX: Only inject context if the tool's signature explicitly accepts it.
+                            import inspect as _inspect
+                            _direct_sig = _inspect.signature(active_tools[tool_name]["callable"]).parameters
+                            _direct_call_kwargs = dict(tool_params)
+                            if "discussion_instance" in _direct_sig:
+                                _direct_call_kwargs["discussion_instance"] = self
+                            if "lollms_client_instance" in _direct_sig:
+                                _direct_call_kwargs["lollms_client_instance"] = self.lollmsClient
+
+                            tool_res = active_tools[tool_name]["callable"](**_direct_call_kwargs)
+                            _lcp_executed = True
+                        except Exception as direct_err:
+                            trace_exception(direct_err)
+                            tool_res = {
+                                "success": False,
+                                "error": f"Direct callable execution failed: {direct_err}",
+                                "traceback": traceback.format_exc()
+                            }
+                            _lcp_executed = True
                     else:
+                        tool_res = {
+                            "success": False,
+                            "error": f"Tool '{tool_name}' is not registered in the active tools dictionary for this session.",
+                            "status_code": 404
+                        }
                         _lcp_executed = True
 
                     # 2. Strip ONLY the raw <tool> JSON tag from the UI/DB buffer (ai_msg.content).
@@ -2734,10 +2827,11 @@ class ChatMixin:
                                                 self.commit()
                             finally:
                                 os.chdir(old_cwd)
-                        if not _lcp_executed:
+
+                        if tool_res is None:
                             tool_res = {
                                 "success": False,
-                                "error": f"Tool '{tool_name}' execution failed. Neither direct callable nor LCP dispatch succeeded.",
+                                "error": f"Tool '{tool_name}' execution path did not produce a result.",
                                 "status_code": 500
                             }
 
