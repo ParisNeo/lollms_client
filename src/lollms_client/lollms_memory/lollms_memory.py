@@ -580,6 +580,8 @@ class LollmsMemoryManager:
         with self._session() as s:
             r = self._q(s).filter(_MemoryRecord.id == memory_id).first()
             if r:
+                if r.importance < 0.001:
+                    return None
                 d = self._to_dict(r)
                 self._cache[memory_id] = d
                 return d
@@ -1137,7 +1139,7 @@ class LollmsMemoryManager:
 
         # 1. Hard purge of all zero-importance marked nodes (Soft Deletes)
         with self._session() as s:
-            forgotten_count = s.query(_MemoryRecord).filter(_MemoryRecord.importance <= 0.0).delete(synchronize_session=False)
+            forgotten_count = s.query(_MemoryRecord).filter(_MemoryRecord.importance < -0.001).delete(synchronize_session=False)
             report["forgotten"] += forgotten_count
             s.flush()
 
@@ -1180,8 +1182,9 @@ class LollmsMemoryManager:
 
         # 6. Synaptic Fusion (Semantic Merging of redundant nodes & Fuzzy Tag Normalization)
         # Scan for low-importance pairs sharing the same subject_group or tags
+        # CRITICAL: Exclude soft-deleted nodes (importance < 0.001) to prevent premature merging
         with self._session() as s:
-            candidates = self._q(s).filter(_MemoryRecord.importance < 0.5).all()
+            candidates = self._q(s).filter(_MemoryRecord.importance >= 0.001).filter(_MemoryRecord.importance < 0.5).all()
             fused_ids = set()
             for i, c1 in enumerate(candidates):
                 if c1.id in fused_ids:
