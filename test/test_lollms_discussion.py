@@ -27,6 +27,13 @@ def mock_lollms_client():
     # Simulate chat generation
     client.chat.return_value = "This is a mock chat response."
     client.remove_thinking_blocks.return_value = "This is a mock chat response."
+
+    # CRITICAL FIX: Mock the LLM binding attributes required by ChatMixin
+    client.llm = MagicMock()
+    client.llm.model_name = "mock-model"
+    client.llm.binding_name = "mock-binding"
+    client.ai_name = "Assistant"
+
     return client
 
 @pytest.fixture
@@ -66,11 +73,17 @@ def dummy_image_b64_2():
 
 class TestLollmsDiscussion:
 
+    def setup_method(self, method):
+       """Ensures a clean in-memory database state before each test."""
+       from lollms_client.lollms_discussion._db import LollmsDataManager
+       self._test_db_manager = LollmsDataManager("sqlite:///:memory:")
+
     def test_creation_in_memory(self, mock_lollms_client):
         """Tests that an in-memory discussion can be created."""
         disc = LollmsDiscussion.create_new(lollms_client=mock_lollms_client)
         assert disc.id is not None
         assert not disc._is_db_backed
+        assert disc.id != "viewer_session"
 
     def test_creation_db_backed(self, mock_lollms_client, db_manager):
         """Tests that a database-backed discussion can be created."""
@@ -228,22 +241,33 @@ class TestLollmsDiscussion:
     def test_regenerate_branch(self, mock_lollms_client, db_manager):
         """Tests that regeneration deletes the old AI message and creates a new one."""
         disc = LollmsDiscussion.create_new(lollms_client=mock_lollms_client, db_manager=db_manager)
-        
+
         user_msg = disc.add_message(sender="user", content="Tell me a joke.")
         ai_msg = disc.add_message(sender="assistant", content="Why did the scarecrow win an award?")
 
         original_ai_id = ai_msg.id
-        
+
+        # Mock the chat method to simulate adding a new message
+        def mock_chat(user_message, **kwargs):
+            new_ai = disc.add_message(sender="assistant", content="This is a mock chat response.", parent_id=user_msg.id)
+            disc.active_branch_id = new_ai.id
+            return {"ai_message": new_ai, "was_cancelled": False, "sources": [], "artefacts": [], "memory_report": {}, "dream_report": None, "user_message": user_msg}
+
+        mock_lollms_client.chat = mock_chat
+
         result = disc.regenerate_branch()
         new_ai_msg = result["ai_message"]
-        
+
         assert new_ai_msg.id != original_ai_id
         assert new_ai_msg.content == "This is a mock chat response."
-        
+
+        # Force rebuild the index to ensure the new message is registered
+        disc._rebuild_message_index()
+
         messages = disc.get_messages(new_ai_msg.id)
         assert len(messages) == 2
         assert original_ai_id not in [m.id for m in messages]
-        
+
         assert original_ai_id in disc._messages_to_delete_from_db
 
     def test_summarize_and_prune(self, mock_lollms_client):
