@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict
 from ascii_colors import ASCIIColors
+from sqlalchemy import inspect
 
 TOOL_LIBRARY_NAME = "Execute SQL Query"
 TOOL_LIBRARY_DESC = "Executes standard SQL queries on dataset files in the workspace."
@@ -46,7 +47,43 @@ def tool_execute_sql_query(
     ext = file_path.suffix.lower()
 
     try:
-        if ext in (".db", ".sqlite", ".sqlite3"):
+        if ext == ".sqlconn":
+            import json
+            from sqlalchemy import create_engine, text as sa_text
+            with open(file_path, "r", encoding="utf-8") as f:
+                conn_info = json.load(f)
+            
+            dialect = conn_info.get("dialect", "sqlite").lower()
+            connection_url = conn_info.get("url", "")
+            
+            if not connection_url:
+                if dialect == "sqlite":
+                    db_path = conn_info.get("database", "")
+                    connection_url = f"sqlite:///{db_path}"
+                else:
+                    host = conn_info.get("host", "localhost")
+                    port = conn_info.get("port", "")
+                    username = conn_info.get("username", "")
+                    password = conn_info.get("password", "")
+                    database = conn_info.get("database", "")
+                    port_str = f":{port}" if port else ""
+                    if dialect == "mysql":
+                        connection_url = f"mysql+pymysql://{username}:{password}@{host}{port_str}/{database}"
+                    elif dialect == "postgresql":
+                        connection_url = f"postgresql+psycopg2://{username}:{password}@{host}{port_str}/{database}"
+                    else:
+                        return {"success": False, "error": f"Unsupported dialect: {dialect}"}
+
+            engine = create_engine(connection_url)
+            with engine.connect() as ext_conn:
+                tables = inspect(engine).get_table_names()
+                
+                for table in tables:
+                    df = pd.read_sql_query(sa_text(f'SELECT * FROM "{table}"'), ext_conn)
+                    df.to_sql(table, conn, index=False, if_exists="replace")
+            engine.dispose()
+            
+        elif ext in (".db", ".sqlite", ".sqlite3"):
             disk_conn = sqlite3.connect(str(file_path))
             disk_conn.backup(conn)
             disk_conn.close()
