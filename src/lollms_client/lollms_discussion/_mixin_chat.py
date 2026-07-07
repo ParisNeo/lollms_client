@@ -2277,28 +2277,42 @@ class ChatMixin:
                             }
                             _lcp_executed = True
                     elif active_tools and tool_name in active_tools and "callable" in active_tools[tool_name]:
-                        # Execute the direct callable provided by to_chat_tool_specs()
-                        try:
-                            # The callable is a closure that already handles CWD, discussion_instance, etc.
-                            # 🛑 CRITICAL FIX: Only inject context if the tool's signature explicitly accepts it.
-                            import inspect as _inspect
-                            _direct_sig = _inspect.signature(active_tools[tool_name]["callable"]).parameters
-                            _direct_call_kwargs = dict(tool_params)
-                            if "discussion_instance" in _direct_sig:
-                                _direct_call_kwargs["discussion_instance"] = self
-                            if "lollms_client_instance" in _direct_sig:
-                                _direct_call_kwargs["lollms_client_instance"] = self.lollmsClient
+                        import os as _os
+                        from pathlib import Path as _Path
+                        _old_cwd_direct = _os.getcwd()
 
-                            tool_res = active_tools[tool_name]["callable"](**_direct_call_kwargs)
-                            _lcp_executed = True
-                        except Exception as direct_err:
-                            trace_exception(direct_err)
-                            tool_res = {
-                                "success": False,
-                                "error": f"Direct callable execution failed: {direct_err}",
-                                "traceback": traceback.format_exc()
-                            }
-                            _lcp_executed = True
+                        if hasattr(self, "workspace_data_path") and self.workspace_data_path:
+                            _direct_workspace_dir = _Path(self.workspace_data_path)
+                        else:
+                            _base_ws_direct = _Path(self.workspace_path) if hasattr(self, "workspace_path") and self.workspace_path else _Path("./data_workspace")
+                            _direct_workspace_dir = _base_ws_direct / self.id / "workspace_data"
+
+                        _direct_workspace_dir.mkdir(parents=True, exist_ok=True)
+                        _direct_workspace_str = str(_direct_workspace_dir.resolve())
+
+                        try:
+                            _os.chdir(_direct_workspace_str)
+                            try:
+                                import inspect as _inspect
+                                _direct_sig = _inspect.signature(active_tools[tool_name]["callable"]).parameters
+                                _direct_call_kwargs = dict(tool_params)
+                                if "discussion_instance" in _direct_sig:
+                                    _direct_call_kwargs["discussion_instance"] = self
+                                if "lollms_client_instance" in _direct_sig:
+                                    _direct_call_kwargs["lollms_client_instance"] = self.lollmsClient
+
+                                tool_res = active_tools[tool_name]["callable"](**_direct_call_kwargs)
+                                _lcp_executed = True
+                            except Exception as direct_err:
+                                trace_exception(direct_err)
+                                tool_res = {
+                                    "success": False,
+                                    "error": f"Direct callable execution failed: {direct_err}",
+                                    "traceback": traceback.format_exc()
+                                }
+                                _lcp_executed = True
+                        finally:
+                            _os.chdir(_old_cwd_direct)
                     else:
                         tool_res = {
                             "success": False,
