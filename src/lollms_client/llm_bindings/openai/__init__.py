@@ -98,6 +98,7 @@ class OpenAIBinding(LollmsLLMBinding):
             personality (Optional[int]): Ignored parameter for compatibility with LollmsLLMBinding.
         """
         super().__init__(BindingName, **kwargs)
+        
         self.host_address=kwargs.get("host_address")
         self.model_name=kwargs.get("model_name")
         self.service_key=kwargs.get("service_key")
@@ -105,6 +106,9 @@ class OpenAIBinding(LollmsLLMBinding):
         self.certificate_file_path=kwargs.get("certificate_file_path", None)
         self.default_completion_format=kwargs.get("default_completion_format", ELF_COMPLETION_FORMAT.Chat)
         self.is_vllm = kwargs.get("is_vllm", False)
+
+        self.base_address = self.host_address
+        self.open_ai_host_address = f"{self.base_address}/v1"
 
         if not self.service_key:
             self.service_key = os.getenv("OPENAI_API_KEY", self.service_key)
