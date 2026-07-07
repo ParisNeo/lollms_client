@@ -110,8 +110,19 @@ class TestLollmsArtifactTools(unittest.TestCase):
         self.assertEqual(len(filtered_after), 1) # Now visible!
 
     def test_read_only_flag_and_metadata_rendering(self):
+        # Create a fresh isolated discussion to avoid pollution from other tests
+        import tempfile
+        tmp_workspace = tempfile.mkdtemp(prefix="lollms_readonly_test_")
+        isolated_disc = LollmsDiscussion.create_new(
+            lollms_client=self.client,
+            db_manager=LollmsDataManager("sqlite:///:memory:"),
+            id="test_readonly_session",
+            autosave=True,
+            workspace_path=tmp_workspace
+        )
+
         # Create a read-only artifact
-        art = self.discussion.artefacts.add(
+        art = isolated_disc.artefacts.add(
             title="sales_data",
             artefact_type="data",
             content="data schema description",
@@ -121,31 +132,36 @@ class TestLollmsArtifactTools(unittest.TestCase):
         self.assertTrue(art.get("read_only"))
 
         # Verify the context builder omits version string and appends extension for data artifacts
-        self.discussion.artefacts.activate("sales_data", version=1)
-        self.discussion.commit()
-        zone = self.discussion.artefacts.build_artefacts_context_zone()
+        isolated_disc.artefacts.activate("sales_data", version=1)
+        isolated_disc.commit()
+        zone = isolated_disc.artefacts.build_artefacts_context_zone()
 
         # Displays as: sales_data.xlsx instead of sales_data, and omits v1/version
         self.assertIn("sales_data.xlsx", zone)
         self.assertNotIn("v1", zone)
 
-        # Test toggle endpoint logic
-        existing = self.discussion.artefacts.get("sales_data")
+        # Test toggle endpoint logic on the isolated discussion before cleanup
+        existing = isolated_disc.artefacts.get("sales_data")
         new_state = not existing.get("read_only", False)
-        self.discussion.artefacts.update(
+        isolated_disc.artefacts.update(
             title="sales_data",
             read_only=new_state,
             bump_version=False
         )
-        self.discussion.commit()
-        toggled = self.discussion.artefacts.get("sales_data")
+        isolated_disc.commit()
+        toggled = isolated_disc.artefacts.get("sales_data")
         self.assertFalse(toggled.get("read_only"))
+
+        # Cleanup
+        isolated_disc.close()
+        import shutil
+        shutil.rmtree(tmp_workspace, ignore_errors=True)
 
     def test_in_memory_sqlite_sql_query_operations(self):
         # Create a mock data file (CSV)
         import pandas as pd
-        workspace_dir = Path("./data_workspace")
-        workspace_dir.mkdir(exist_ok=True)
+        workspace_dir = Path(self.discussion.workspace_data_path)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
         csv_path = workspace_dir / "user_salaries.csv"
         df = pd.DataFrame({
             "name": ["Alice", "Bob", "Charlie"],
@@ -185,17 +201,20 @@ class TestLollmsArtifactTools(unittest.TestCase):
         # Clean up mock file
         if csv_path.exists():
             csv_path.unlink()
+        # Clean up any versioned files
+        for f in workspace_dir.glob("user_salaries*.csv"):
+            f.unlink()
 
     def test_external_sql_connection_operations(self):
         # 1. Create a dummy SQLite DB on disk to simulate the "external" database
         import sqlite3
         import pandas as pd
-        workspace_dir = Path("./data_workspace")
-        workspace_dir.mkdir(exist_ok=True)
+        workspace_dir = Path(self.discussion.workspace_data_path)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
         db_path = workspace_dir / "external_test_db.sqlite"
         if db_path.exists():
             db_path.unlink()
-        
+
         conn = sqlite3.connect(str(db_path))
         cursor = conn.cursor()
         cursor.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, role TEXT)")
@@ -217,29 +236,34 @@ class TestLollmsArtifactTools(unittest.TestCase):
 
         # 3. Test schema parsing on .sqlconn file
         from lollms_client.lollms_artefact.data_files import _parse_data_file
-        schema, _ = _parse_data_file(sqlconn_path, "my_external_db", version=1)
+        schema, _, raw_physical_bytes = _parse_data_file(sqlconn_path, "my_external_db", version=1)
 
         self.assertIn("Format: Remote Relational Database (sqlite)", schema)
         self.assertIn("## Table: employees", schema)
         self.assertIn("Eve", schema)
 
-        # 4. Register as active session artifact
+        # 4. Register as active session artifact with physical_data
         art = self.discussion.artefacts.add(
             title="my_external_db",
             artefact_type="data",
             content=schema,
             file_ext=".sqlconn",
             version=1,
-            read_only=False
+            read_only=False,
+            physical_data=raw_physical_bytes
         )
         self.discussion.commit()
 
         # 5. Test LCP SQL Query on .sqlconn
+        import os
+        original_cwd = os.getcwd()
+        os.chdir(self.discussion.workspace_data_path)
         from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.execute_sql_query import tool_execute_sql_query
         sql_res = tool_execute_sql_query(
             sql_query="SELECT name FROM employees WHERE role = 'Architect'",
-            discussion_instance=self.discussion
+            file_name="my_external_db.sqlconn"
         )
+        os.chdir(original_cwd)
         self.assertTrue(sql_res["success"])
         self.assertIn("Eve", sql_res["output"])
 
@@ -252,15 +276,16 @@ class TestLollmsArtifactTools(unittest.TestCase):
             "print(f'Total employees: {len(df)}')\n"
         )
 
+        os.chdir(self.discussion.workspace_data_path)
         python_res = tool_execute_python_data_query(
-            code=py_code,
-            discussion_instance=self.discussion
+            code=py_code
         )
+        os.chdir(original_cwd)
         self.assertTrue(python_res["success"])
         self.assertIn("Total employees: 2", python_res["output"])
 
         # Clean up files
-        for f in (db_path, sqlconn_path, workspace_dir / "my_external_db_v1.sqlconn", workspace_dir / "my_external_db.sqlconn"):
+        for f in (db_path, sqlconn_path, Path(self.discussion.workspace_data_path) / "my_external_db_v1.sqlconn", Path(self.discussion.workspace_data_path) / "my_external_db.sqlconn"):
             if f.exists():
                 f.unlink()
 
@@ -268,8 +293,9 @@ class TestLollmsArtifactTools(unittest.TestCase):
     def test_lcp_sql_and_python_query_tools(self):
         # 1. Create mock data file in the workspace
         import pandas as pd
-        workspace_dir = Path("./data_workspace")
-        workspace_dir.mkdir(exist_ok=True)
+        import io
+        workspace_dir = Path(self.discussion.workspace_data_path)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
         csv_path = workspace_dir / "user_salaries_v1.csv"
         df = pd.DataFrame({
             "name": ["Alice", "Bob", "Charlie"],
@@ -280,14 +306,18 @@ class TestLollmsArtifactTools(unittest.TestCase):
         # Create active unversioned fallback
         df.to_csv(workspace_dir / "user_salaries.csv", index=False)
 
-        # 2. Register data artifact in active discussion
+        # Read raw CSV bytes for physical_data
+        raw_csv_bytes = csv_path.read_bytes()
+
+        # 2. Register data artifact in active discussion with physical_data
         art = self.discussion.artefacts.add(
             title="user_salaries",
             artefact_type="data",
             content="Mock schema",
             file_ext=".csv",
             version=1,
-            read_only=False
+            read_only=False,
+            physical_data=raw_csv_bytes
         )
 
         # Set up a temporary active branch message so discussion_instance.active_branch_id is valid
@@ -297,10 +327,14 @@ class TestLollmsArtifactTools(unittest.TestCase):
         # 3. Test LCP SQL Query Tool
         from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.execute_sql_query import tool_execute_sql_query
 
+        import os
+        original_cwd = os.getcwd()
+        os.chdir(self.discussion.workspace_data_path)
         sql_res = tool_execute_sql_query(
             sql_query="SELECT name FROM user_salaries WHERE salary > 100000",
-            discussion_instance=self.discussion
+            file_name="user_salaries.csv"
         )
+        os.chdir(original_cwd)
         self.assertTrue(sql_res["success"])
         self.assertIn("Alice", sql_res["output"])
         self.assertIn("Charlie", sql_res["output"])
@@ -308,10 +342,13 @@ class TestLollmsArtifactTools(unittest.TestCase):
         # 4. Test LCP Python Data Query Tool
         from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
 
+        original_cwd = os.getcwd()
+        os.chdir(self.discussion.workspace_data_path)
         python_res = tool_execute_python_data_query(
             code="df['salary'] = df['salary'] + 5000",
             discussion_instance=self.discussion
         )
+        os.chdir(original_cwd)
         self.assertTrue(python_res["success"])
 
         # Verify the file was updated and a new version is registered
@@ -319,7 +356,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
         self.assertEqual(updated_art["version"], 2)
 
         # Clean up files
-        for f in (workspace_dir / "user_salaries_v1.csv", workspace_dir / "user_salaries_v2.csv", workspace_dir / "user_salaries.csv"):
+        for f in (Path(self.discussion.workspace_data_path) / "user_salaries_v1.csv", Path(self.discussion.workspace_data_path) / "user_salaries_v2.csv", Path(self.discussion.workspace_data_path) / "user_salaries.csv"):
             if f.exists():
                 f.unlink()
 
