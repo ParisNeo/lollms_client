@@ -1607,17 +1607,6 @@ class ChatMixin:
         # Initialize list to collect all created/modified artifacts during this turn safely
         object.__setattr__(self, "_affected_artefacts_this_turn", [])
 
-        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
-        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
-            fm = FailureMemory()
-            if not hasattr(fm, "_signatures"):
-                object.__setattr__(fm, "_signatures", set())
-            object.__setattr__(self, "_failure_memory", fm)
-        else:
-            self._failure_memory.failures = []
-            self._failure_memory._signatures.clear()
-            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
-
         # Reset cancellation flag at the start of each chat turn
         self.reset_cancel_state()
 
@@ -1829,6 +1818,11 @@ class ChatMixin:
         # on every chat turn, violating the Early Initialization Doctrine.
         if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
             try:
+                # ── 🛡️ SECURITY GATE: Explicitly mount the code execution library if enabled ──
+                # This guarantees the tool is discovered and present in the registry before merging.
+                if enable_code_execution and hasattr(lcp_binding, "mount_tool_library"):
+                    lcp_binding.mount_tool_library("execute_python_code")
+
                 lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
                 # ── 🛡️ SECURITY GATES: Filter out dangerous tools unless explicitly enabled ──
                 if not allow_dynamic_tools:
@@ -1901,6 +1895,39 @@ class ChatMixin:
             tools_prompt += f"If you need to perform an action and no tool in this list is suitable, DO NOT hallucinate a tool name. Instead, inform the user that the required tool is not available in this session.\n"
             tools_prompt += "=== END TOOLS ===\n"
 
+        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
+        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
+            fm = FailureMemory()
+            if not hasattr(fm, "_signatures"):
+                object.__setattr__(fm, "_signatures", set())
+            object.__setattr__(self, "_failure_memory", fm)
+        else:
+            self._failure_memory.failures = []
+            self._failure_memory._signatures.clear()
+            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
+
+        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
+        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
+            fm = FailureMemory()
+            if not hasattr(fm, "_signatures"):
+                object.__setattr__(fm, "_signatures", set())
+            object.__setattr__(self, "_failure_memory", fm)
+        else:
+            self._failure_memory.failures = []
+            self._failure_memory._signatures.clear()
+            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
+
+        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
+        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
+            fm = FailureMemory()
+            if not hasattr(fm, "_signatures"):
+                object.__setattr__(fm, "_signatures", set())
+            object.__setattr__(self, "_failure_memory", fm)
+        else:
+            self._failure_memory.failures = []
+            self._failure_memory._signatures.clear()
+            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
+
         # ── 8. Active Deliberation Loop ──
         ASCIIColors.info("[Trace] Retrieving conversation branch...")
         current_branch_tip = branch_tip_id or self.active_branch_id
@@ -1931,17 +1958,6 @@ class ChatMixin:
         tool_signature_counts = {}
 
         successful_tool_signatures = set()
-
-        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
-        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
-            fm = FailureMemory()
-            if not hasattr(fm, "_signatures"):
-                object.__setattr__(fm, "_signatures", set())
-            object.__setattr__(self, "_failure_memory", fm)
-        else:
-            self._failure_memory.failures = []
-            self._failure_memory._signatures.clear()
-            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
 
         # Initialize the single, clean database assistant message ONCE before entering the loop
         ai_msg = self.add_message(
@@ -1976,6 +1992,10 @@ class ChatMixin:
             current_system_prompt = full_system_prompt
             if tools_prompt:
                 current_system_prompt += "\n" + tools_prompt
+            else:
+                # 🛑 CRITICAL FIX: If no tools are active, ensure tools_prompt is empty 
+                # so it doesn't append an empty string with a newline.
+                pass
 
             messages_list = self.export(
                 format_type="openai_chat",
