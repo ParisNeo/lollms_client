@@ -40,10 +40,10 @@ def tool_execute_python_data_query(
 
     code = str(code).strip()
 
-    # If code is a filename, read it
-    if Path(code).exists():
+    if code.endswith(".py") and Path(code).exists():
+        filename = code
         code = Path(code).read_text(encoding="utf-8")
-        ASCIIColors.info(f"[execute_python_data_query] Loaded code from file: {code}")
+        ASCIIColors.info(f"[execute_python_data_query] Loaded code from file: {filename}")
 
     # Set up headless matplotlib and standard modules inside execution context
     import base64
@@ -86,6 +86,7 @@ def tool_execute_python_data_query(
                 plot_path = Path(".") / plot_filename
                 fig.savefig(str(plot_path), bbox_inches='tight', facecolor=fig.get_facecolor())
 
+            # 🛑 FIX: Explicitly close all figures to free memory and reset matplotlib state
             plt.close('all')
 
     except Exception as e:
