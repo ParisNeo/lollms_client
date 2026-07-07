@@ -583,11 +583,12 @@ class ArtefactManager:
         artefacts.append(new_artefact)
         self._save_all(artefacts)
 
-        self._sync_to_disk_workspace(
-            title, content, version, artefact_type, language, extra_data.get("file_ext"),
-            physical_data=physical_data,
-            logical_content=logical_content
-        )
+        if resolved_visibility != ArtefactVisibility.HIDDEN:
+            self._sync_to_disk_workspace(
+                title, content, version, artefact_type, language, extra_data.get("file_ext"),
+                physical_data=physical_data,
+                logical_content=logical_content
+            )
         return new_artefact
 
     def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -1278,6 +1279,9 @@ class ArtefactManager:
             return workspace_dir, synced_files
 
         for art in active_arts:
+            if not art.get("active", False) or art.get("visibility") == ArtefactVisibility.HIDDEN:
+                continue
+
             if art.get("type") == "data":
                 file_ext = art.get("file_ext", "")
                 version = art.get("version", 1)
@@ -1289,11 +1293,13 @@ class ArtefactManager:
                     dest = workspace_dir / f"{title}{file_ext}"
                     import shutil
                     shutil.copy(str(versioned_data), str(dest))
-                    synced_files.append(str(dest.resolve()))
+                    if str(dest.resolve()) not in synced_files:
+                        synced_files.append(str(dest.resolve()))
                 else:
                     unversioned = workspace_dir / f"{title}{file_ext}"
-                    if unversioned.exists():
+                    if unversioned.exists() and str(unversioned.resolve()) not in synced_files:
                         synced_files.append(str(unversioned.resolve()))
+                continue
 
             self._sync_to_disk_workspace(
                 title=art["title"],
@@ -1306,7 +1312,7 @@ class ArtefactManager:
 
             filename = self._get_filename_with_ext(art["title"], art["type"], art.get("language"), art.get("file_ext"))
             expected_path = workspace_dir / filename
-            if expected_path.exists():
+            if expected_path.exists() and str(expected_path.resolve()) not in synced_files:
                 synced_files.append(str(expected_path.resolve()))
 
         return workspace_dir, synced_files
@@ -1420,7 +1426,13 @@ class ArtefactManager:
                 elif v_tier == ArtefactVisibility.METADATA: marker = "[M]"
                 elif v_tier == ArtefactVisibility.TREE_UNLOCKABLE: marker = "[U]"
                 f_name = a["display_title"].split("/")[-1]
-                lines.append(f"{indent}├── {f_name}  {marker}  ({status})")
+                atype = a.get("type", "document")
+                # Omit version string for data artifacts to match read-only rendering
+                if atype == ArtefactType.DATA:
+                    lines.append(f"{indent}├── {f_name}  {marker}  ({status})")
+                else:
+                    version = a.get("version", 1)
+                    lines.append(f"{indent}├── {f_name}  {marker}  v{version} ({status})")
             return lines
 
         tree_lines.extend(_traverse_tree_prompt(root_node))
