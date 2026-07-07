@@ -338,4 +338,31 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
     # Return both: Schema for context, Raw Bytes for disk storage
     final_schema = "\n\n".join(schema_parts)
     ASCIIColors.success(f"[DataFiles] ✅ Schema generated successfully ({len(final_schema)} chars).")
+
+    # ── WRITE VERSIONED AND ACTIVE FILES TO WORKSPACE ──
+    # The tests expect _parse_data_file to write the physical files to the workspace directory.
+    try:
+        workspace_dir = path.parent
+        file_stem = path.stem
+        file_ext = path.suffix
+
+        # Write versioned file (e.g., test_data_v1.csv)
+        versioned_filename = f"{art_title}_v{version}{file_ext}"
+        versioned_path = workspace_dir / versioned_filename
+        if raw_physical_data is not None:
+            versioned_path.write_bytes(raw_physical_data)
+        else:
+            shutil.copy2(str(path), str(versioned_path))
+
+        # Write active unversioned file (e.g., test_data.csv)
+        active_filename = f"{art_title}{file_ext}"
+        active_path = workspace_dir / active_filename
+        if raw_physical_data is not None:
+            active_path.write_bytes(raw_physical_data)
+        else:
+            shutil.copy2(str(path), str(active_path))
+
+    except Exception as write_err:
+        ASCIIColors.warning(f"[DataFiles] Failed to write versioned/active files to workspace: {write_err}")
+
     return final_schema, [], raw_physical_data
