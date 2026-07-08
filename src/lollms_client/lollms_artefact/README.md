@@ -63,6 +63,9 @@ The `ArtefactManager` interacts directly with `LollmsDiscussion` to orchestrate 
 ```
 
 ### A. Automated File-Tracking and Ingestion
+
+**Default Visibility Doctrine**: To prevent context window bloat, all newly discovered or tool-generated files are registered with `TREE_UNLOCKABLE` visibility by default. The LLM must explicitly unlock a file to load its content into the active context.
+
 During local tool execution, the active directory is snapshotted immediately before and after the run. If a tool writes a new file (such as a Matplotlib chart PNG) or modifies an existing dataset:
 1. The new file is automatically detected on disk.
 2. Its file type is classified, and the raw bytes are saved as a physical twin.
@@ -99,6 +102,6 @@ To prevent untrusted LLMs from executing arbitrary code, dynamic tool registrati
 
 ## 🛠️ 5. Class Reference
 
-* **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`).
+*   **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`, `SCRATCHPAD`).
 * **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, manages version history squashing, and gates dynamic tool registration.
 * **`FileImportMixin`**: Contains multi-modal parser subroutines for importing PDFs, Word documents, PowerPoint presentations, and audio files.
