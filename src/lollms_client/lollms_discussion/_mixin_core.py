@@ -811,7 +811,7 @@ class CoreMixin:
 
             # Determine type (🛑 FIX: Explicitly map binary types so they don't fall back to document/.md)
             atype = "document"
-            if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+            if file_ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".sql", ".cir", ".net", ".op"):
                 atype = "code"
             elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
                 atype = "data"
