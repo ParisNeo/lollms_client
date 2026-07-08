@@ -335,15 +335,38 @@ Context Update:
 
 ### Multi-Tier Context Visibility Management
 
-To optimize the LLM's context window budget, the system uses a tiered visibility protocol for workspace files. The LLM can dynamically promote or demote files into different visibility states using dedicated XML tags.
+To optimize the LLM's context window budget, the system uses a tiered visibility protocol for workspace files. **By default, all newly registered or synced files are assigned `TREE_UNLOCKABLE` (`[U]`) visibility to prevent automatic context pollution.** The LLM can dynamically promote or demote files into different visibility states using dedicated XML tags.
 
 | Visibility Tier | Symbol | Context Behavior |
 | :--- | :--- | :--- |
 | **`FULL`** | `[C]` | Fully loaded in context (verbatim text/code/schema). |
 | **`METADATA`** | `[M]` | Only signatures, schemas, and metadata are loaded. |
-| **`TREE_UNLOCKABLE`**| `[U]` | Listed in the directory tree, but excluded from context. |
+| **`TREE_UNLOCKABLE`**| `[U]` | Listed in the directory tree, but excluded from context. **This is the default state for all newly registered artifacts.** |
 | **`TREE_LOCKED`** | `[L]` | Excluded from context and cannot be unlocked by the LLM. |
 | **`HIDDEN`** | — | Completely excluded from both the context and the directory tree. |
+
+#### State Transition Matrix
+
+The system enforces a strict state machine for artifact visibility. The LLM can trigger transitions using XML tags, while the host application or system orchestrator can trigger transitions via API calls or background processes (like memory consolidation).
+
+| Current State | Target State | Trigger / Mechanism | Description |
+| :--- | :--- | :--- | :--- |
+| **`[U]` TREE_UNLOCKABLE** | **`[C]` FULL** | `<unlock_file>` tag | LLM requests to load the file content into its active context window. |
+| **`[U]` TREE_UNLOCKABLE** | **`[L]` TREE_LOCKED** | `<lock_file>` tag | LLM requests to lock the file to free up context space. |
+| **`[U]` TREE_UNLOCKABLE** | **`HIDDEN`** | `<hide_file>` tag | LLM requests to completely remove the file from its awareness. |
+| **`[C]` FULL** | **`[L]` TREE_LOCKED** | `<lock_file>` tag | LLM requests to lock the file to free up context space. |
+| **`[C]` FULL** | **`HIDDEN`** | `<hide_file>` tag | LLM requests to completely remove the file from its awareness. |
+| **`[L]` TREE_LOCKED** | **`HIDDEN`** | `<hide_file>` tag | LLM requests to completely remove the file from its awareness. |
+| **`[M]` METADATA** | **`[C]` FULL** | `<unlock_file>` tag | LLM requests to promote the file from metadata-only to full content. |
+| **`[M]` METADATA** | **`[L]` TREE_LOCKED** | `<lock_file>` tag | LLM requests to lock the file. |
+| **`[M]` METADATA** | **`HIDDEN`** | `<hide_file>` tag | LLM requests to completely remove the file from its awareness. |
+| **`HIDDEN`** | **`[C]` FULL** | Host Application API | The user or host application explicitly activates the artifact. |
+| **`HIDDEN`** | **`[U]` TREE_UNLOCKABLE** | System Auto-Sync | A new file is detected on disk, or an external tool modifies a hidden file. |
+| **`[L]` TREE_LOCKED** | **`[C]` FULL** | Host Application API | The user or host application explicitly unlocks the file for the LLM. |
+| **`[C]` FULL** | **`[U]` TREE_UNLOCKABLE** | System Auto-Prune | The context management system demotes the file to save tokens. |
+| **`[C]` FULL** | **`[M]` METADATA** | System Auto-Prune | The context management system demotes the file to metadata-only to save tokens. |
+
+> **Note on `[L]` (Locked)**: The LLM **cannot** unlock a `[L]` (Locked) file. Once a file is locked, it remains locked for the duration of the session unless the host application intervenes. This prevents the LLM from repeatedly locking and unlocking large files, which would waste context tokens.
 
 #### LLM Control Tags
 
@@ -411,7 +434,22 @@ If the LLM attempts to call a tool that was filtered out (or hallucinates one en
 
 ---
 
-## 🛑 5. Cancellation & Interrupt Protocol
+### 🧠 5.1 Cognitive Checkpoint System
+
+To prevent context window bloat and preserve the LLM's cognitive state across turns, the `ChatMixin` implements the **Cognitive Checkpoint System**. This system consists of three core components:
+
+1.  **Smart Tool Output Offloading**:
+    When a tool returns a result exceeding 1500 tokens, the system intercepts the output *before* it is appended to `virtual_history`.
+    *   **Structured Data**: If the output is identified as structured data (e.g., from `tool_query*` or contains markdown tables/JSON), it is replaced with a compact system marker: `[SYSTEM: Tool returned X tokens of structured data...]`. The LLM is instructed to use aggregation tools next.
+    *   **Unstructured Text**: The output is saved to a `.log` file in the workspace, registered as a `TREE_UNLOCKABLE` artifact, and replaced with: `[SYSTEM: Tool returned X tokens of text. It has been saved to 'filename.log'...]`.
+
+2.  **The Unfinished Intent Interceptor**:
+    If the LLM stops generating before emitting a functional tag but its text matches an intent pattern (e.g., "Let me query...", "Next I will build..."), the system intercepts the termination. It sanitizes the partial output, appends it to `virtual_history`, and injects a critical system correction: `[SYSTEM: CRITICAL. You stopped generation before executing your stated intent. Output the <tool> or <artifact> tag NOW...]`, forcing another reasoning round.
+
+3.  **Cognitive Scratchpad Protocol**:
+    The LLM is instructed to maintain a `scratchpad.md` artifact (of type `SCRATCHPAD`) during multi-step analysis. It uses this to save intermediate findings and hypotheses. If a hypothesis is proven wrong, the LLM is mandated to use a `SEARCH/REPLACE` block to invalidate the old assumption, preventing contradictory context accumulation.
+
+### 🛑 5.2 Cancellation & Interrupt Protocol
 
 The `ChatMixin` implements a **Thread-Safe Cancellation Protocol** using a simple boolean flag. This ensures that long-running agentic loops, heavy tool executions, or streaming generations can be interrupted instantly without leaving the database or workspace in an inconsistent state.
 
@@ -508,6 +546,48 @@ When importing a folder as `data_bundle`:
 3.  **Group**: Files with identical schemas are merged.
 4.  **LLM Naming**: Sends schema sample to LLM to generate a meaningful table name (e.g., `sales_q1_q2_merged`).
 5.  **Consolidate**: Writes a single `.db` file with multiple tables.
+
+---
+
+## 📦 8. Decoupled Artefact Protocol (.laa & .lab)
+
+Artefacts are fully decoupled from discussions via two standalone archive formats. This allows artefacts to be moved between discussions, stored in Git, or shared externally without losing version history or physical data.
+
+### A. Standalone Artefact Archive (`.laa`)
+Used for exporting a **single artefact** with its **entire version history** (metadata + physical/logical twins). The `.laa` file is a ZIP archive containing a `manifest.json` and individual files for each version's content and physical bytes.
+
+*   **Export**: `discussion.artefacts.export_artefact_to_archive(title, output_path)`
+*   **Import**: `discussion.artefacts.import_artefact_from_archive(laa_path, activate=True)`
+    *   Reconstructs all versions in the target discussion and generates new IDs to prevent collisions.
+
+### B. Linked Artefact Bundle (`.lab`)
+Used for exporting **multiple artefacts** (e.g., a full-stack application: backend, frontend, assets). It preserves the **relative folder structure** of the workspace. By default, it exports the active version of the artefacts, but can include all historical versions if requested.
+
+*   **Single File Flattening**: If only one file is exported, it is placed at the root of the archive. If multiple files are exported, their relative paths from `workspace_data` are preserved.
+*   **Export**: `discussion.artefacts.export_artefact_bundle(paths, output_path, include_versions=False)`
+*   **Import**: `discussion.artefacts.import_artefact_bundle(lab_path, activate=True)`
+    *   Unzips the archive into the target discussion's `workspace_data` and auto-registers all new files as artefacts.
+
+### C. Global Artefact Library
+The system provides a global archive directory (`data_workspace/standalone_artefacts/`) outside any specific discussion to store and manage `.laa` and `.lab` files.
+
+```python
+# Save an artefact to the global library
+discussion.save_artefact_to_global_archive("my_data.csv")
+
+# Load an artefact from the global library into the current discussion
+discussion.load_artefact_from_global_archive("my_data.csv")
+
+# Save a bundle of files to the global library
+discussion.save_artefact_bundle_to_global_archive(
+    paths=["workspace_data/main.py", "workspace_data/index.html"],
+    bundle_name="my_fullstack_app"
+)
+
+# List all available artefacts and bundles in the global library
+discussion.list_global_archive_artefacts()
+discussion.list_global_archive_bundles()
+```
 
 ---
 
