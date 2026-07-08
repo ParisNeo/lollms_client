@@ -64,7 +64,6 @@ from lollms_client import LollmsClient
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager
 from lollms_client.lollms_memory import LollmsMemoryManager
 from lollms_client.lollms_types import MSG_TYPE
-from ascii_colors import ASCIIColors, trace_exception
 from datetime import datetime
 
 from fastapi.exceptions import RequestValidationError
