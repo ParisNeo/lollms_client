@@ -4,6 +4,10 @@
 import re
 import uuid
 import os
+import json
+import shutil
+import zipfile
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -38,8 +42,9 @@ class ArtefactType:
     PRESENTATION  = "presentation"
     DATA          = "data"
     TOOL          = "tool"
+    SCRATCHPAD    = "scratchpad"
 
-    ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE, PRESENTATION, DATA, TOOL}
+    ALL = {FILE, SEARCH_RESULT, NOTE, SKILL, CODE, DOCUMENT, IMAGE, PRESENTATION, DATA, TOOL, SCRATCHPAD}
 
     LABELS = {
         FILE:          "File",
@@ -51,7 +56,8 @@ class ArtefactType:
         IMAGE:         "Image",
         PRESENTATION:  "Presentation",
         DATA:          "Data Interface",
-        TOOL:          "Tool"
+        TOOL:          "Tool",
+        SCRATCHPAD:    "Scratchpad"
     }
 
     @classmethod
@@ -301,9 +307,32 @@ class ArtefactManager:
     def __init__(self, discussion):
         object.__setattr__(self, '_discussion', discussion)
 
+
+    @staticmethod
+    def _sanitize_path_segments(path_str: str) -> str:
+        """
+        Sanitizes a relative path for disk storage.
+        Sanitizes each segment (folder/filename) individually to preserve subfolder structure.
+        """
+        if not path_str:
+            return "untitled"
+
+        # Normalize backslashes to forward slashes
+        path_str = path_str.replace("\\", "/")
+        # Remove dangerous traversal sequences
+        path_str = path_str.replace("..", "").replace("//", "/")
+
+        parts = path_str.split("/")
+        clean_parts = [sanitize_artifact_filename(p) for p in parts if p.strip()]
+
+        if not clean_parts:
+            return "untitled"
+        return "/".join(clean_parts)
+
     def _get_lam_content(self, art: Dict[str, Any]) -> str:
         """Retrieves the logical metadata (.lam) content of an artifact if it exists on disk."""
         title = art.get("title", "untitled")
+        physical_path = art.get("physical_path") or title
         atype = art.get("type", "document")
         language = art.get("language")
         file_ext = art.get("file_ext") or Path(title).suffix
@@ -316,11 +345,12 @@ class ArtefactManager:
             disc_ws_dir = base_workspace_dir / disc_id
             meta_dir = disc_ws_dir / "artefacts_metadata"
 
-        clean_title = sanitize_artifact_filename(title.replace("workspace/", "").replace("data_workspace/", ""))
-        filename = self._get_filename_with_ext(clean_title, atype, language, file_ext)
+        # Use physical_path for disk resolution, falling back to title
+        clean_path = self._sanitize_path_segments(physical_path.replace("workspace/", "").replace("data_workspace/", ""))
+        filename = self._get_filename_with_ext(clean_path, atype, language, file_ext)
         name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
 
-        art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_title))
+        art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
         lam_filename = f"{name_part}.lam"
         lam_path = meta_dir / art_id / lam_filename
 
@@ -399,8 +429,9 @@ class ArtefactManager:
                 ext = type_map.get(atype, ".txt")
         return f"{title}{ext}"
 
-    def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None, logical_content: Optional[str] = None):
+    def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None, logical_content: Optional[str] = None, physical_path: Optional[str] = None):
         try:
+            # Determine workspace directories
             if getattr(self._discussion, "workspace_data_path", None):
                 ws_data_dir = Path(self._discussion.workspace_data_path)
                 # The metadata path is the parent's "artefacts_metadata" folder
@@ -415,23 +446,26 @@ class ArtefactManager:
             ws_data_dir.mkdir(parents=True, exist_ok=True)
             meta_dir.mkdir(parents=True, exist_ok=True)
 
-            clean_title = sanitize_artifact_filename(title.replace("workspace/", "").replace("data_workspace/", ""))
-            filename = self._get_filename_with_ext(clean_title, atype, language, file_ext)
+            # Use physical_path if provided, otherwise fall back to title
+            path_source = physical_path or title
+            clean_path = self._sanitize_path_segments(path_source.replace("workspace/", "").replace("data_workspace/", ""))
+            filename = self._get_filename_with_ext(clean_path, atype, language, file_ext)
             name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
 
-            art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_title))
+            art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
             art_meta_dir = meta_dir / art_id
             art_meta_dir.mkdir(parents=True, exist_ok=True)
 
             primary_path = ws_data_dir / filename
             versioned_path = art_meta_dir / f"{name_part}_v{version}{ext_part}"
-
             lam_filename = f"{name_part}.lam"
             lam_path = art_meta_dir / lam_filename
 
             wrote_physical = False
             if physical_data is not None:
                 try:
+                    # CRITICAL: Ensure parent subdirectories exist before writing
+                    primary_path.parent.mkdir(parents=True, exist_ok=True)
                     primary_path.write_bytes(physical_data)
                     versioned_path.write_bytes(physical_data)
                     wrote_physical = True
@@ -445,12 +479,13 @@ class ArtefactManager:
                 # Skip true binary types (images) to prevent writing base64/placeholder text as a file
                 if atype != ArtefactType.IMAGE:
                     try:
+                        # CRITICAL: Ensure parent subdirectories exist before writing
+                        primary_path.parent.mkdir(parents=True, exist_ok=True)
                         primary_path.write_text(content, encoding="utf-8", errors="ignore")
                         versioned_path.write_text(content, encoding="utf-8", errors="ignore")
                         wrote_physical = True
                     except Exception as e:
                         trace_exception(e)
-
             if logical_content:
                 try:
                     lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
@@ -503,10 +538,13 @@ class ArtefactManager:
         **extra_data
     ) -> Dict[str, Any]:
         # CRITICAL: Sanitize the title to ensure it is always a valid cross-platform filename.
-        # This prevents WinError 123 and duplicate artifacts when the host app (lollms WebUI)
-        # passes raw URLs or other invalid filename strings as titles. The DB title IS the
-        # sanitized filename; the original raw title (if any) is preserved inside the content.
-        title = sanitize_artifact_filename(title)
+        # The title acts as the high-level metadata key. It may contain subfolders.
+        # We sanitize path segments individually to preserve folder structure.
+        title = self._sanitize_path_segments(title)
+
+        # Determine the physical path. If not explicitly provided, it mirrors the title.
+        physical_path = extra_data.pop("physical_path", None) or title
+
         # CRITICAL FIX: Only use Path.suffix as file_ext if it is a KNOWN extension.
         # Without this, sanitized URL titles like "lollms.com_the-folding" produce
         # Path.suffix = ".com_the-folding" (a 16-char garbage extension from the
@@ -542,10 +580,7 @@ class ArtefactManager:
             if active is not None:
                 resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
             else:
-                if artefact_type == ArtefactType.DATA:
-                    resolved_visibility = ArtefactVisibility.FULL
-                else:
-                    resolved_visibility = ArtefactVisibility.HIDDEN
+                resolved_visibility = ArtefactVisibility.TREE_UNLOCKABLE
 
         resolved_status = extra_data.pop("status", ArtefactStatus.STABLE)
 
@@ -560,6 +595,7 @@ class ArtefactManager:
             "id":               str(uuid.uuid4()),
             "title":            title,
             "type":             artefact_type,
+           "physical_path":    physical_path,  # NEW: Explicit disk path
             "version":          version,
             "content":          content,
             "token_count":      token_count,
@@ -586,7 +622,7 @@ class ArtefactManager:
         if resolved_visibility != ArtefactVisibility.HIDDEN:
             self._sync_to_disk_workspace(
                 title, content, version, artefact_type, language, extra_data.get("file_ext"),
-                physical_data=physical_data,
+               physical_data=physical_data, physical_path=physical_path,
                 logical_content=logical_content
             )
         return new_artefact
@@ -664,11 +700,15 @@ class ArtefactManager:
         if active is not None:
             resolved_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
 
-        target_title = sanitize_artifact_filename(new_title) if new_title else title
+        target_title = self._sanitize_path_segments(new_title) if new_title else title
+        # Preserve existing physical path or update if title changes
+        target_physical_path = extra_data.pop("physical_path", None) or target_title
+
         internal_keys = {
             "id", "title", "type", "version", "content", "images", "image_media_types",
             "audios", "videos", "zip", "language", "url", "tags", "active", "visibility",
-            "created_at", "updated_at", "artefact_type", "commit_message", "version_tags"
+            "created_at", "updated_at", "artefact_type", "commit_message", "version_tags",
+            "physical_path", "token_count"
         }
         merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
         merged_extra.update(extra_data)
@@ -716,6 +756,7 @@ class ArtefactManager:
             version           = new_version,
             visibility        = resolved_visibility,
             commit_message    = commit_message if commit_message is not None else latest.get('commit_message'),
+           physical_path     = target_physical_path, # Pass to add()
             version_tags      = version_tags if version_tags is not None else latest.get('version_tags', []),
             **merged_extra,
         )
@@ -1391,41 +1432,37 @@ class ArtefactManager:
         if not visible_artifacts:
             return ""
 
-        for a in visible_artifacts:
-            if a.get("type") == "data":
-                title = a.get("title", "UNNAMED")
-                file_ext = a.get("file_ext", "")
-                expected_filename = title if title.endswith(file_ext) else f"{title}{file_ext}"
-
         tree_lines = ["  workspace/"]
         root_node = {"files": [], "folders": {}}
+    
         for a in visible_artifacts:
-            display_title = a["title"]
+            # Use physical_path for disk tree mapping, falling back to title
+            display_path = a.get("physical_path") or a["title"]
             if a.get("type") == "data" and a.get("file_ext"):
-                if not display_title.lower().endswith(a["file_ext"].lower()):
-                    display_title = f"{display_title}{a['file_ext']}"
-
-            parts = display_title.split("/")
+                if not display_path.lower().endswith(a["file_ext"].lower()):
+                    display_path = f"{display_path}{a['file_ext']}"
+ 
+            parts = display_path.split("/")
             curr = root_node
             for i in range(len(parts) - 1):
-                folder = parts[i]
-                curr = curr["folders"].setdefault(folder, {"files": [], "folders": {}})
-            curr["files"].append({**a, "display_title": display_title})
-
+                 folder = parts[i]
+                 curr = curr["folders"].setdefault(folder, {"files": [], "folders": {}})
+            curr["files"].append({**a, "display_path": display_path})
+ 
         def _traverse_tree_prompt(node, depth=1):
             lines = []
             indent = "  " * depth
             for f_name, f_node in sorted(node["folders"].items()):
                 lines.append(f"{indent}├── {f_name}/")
                 lines.extend(_traverse_tree_prompt(f_node, depth + 1))
-            for a in sorted(node["files"], key=lambda x: x["display_title"]):
+            for a in sorted(node["files"], key=lambda x: x.get("title", "")):
                 v_tier = a.get("visibility", ArtefactVisibility.FULL)
                 status = a.get("status", ArtefactStatus.STABLE).upper()
                 marker = "[L]"
                 if v_tier == ArtefactVisibility.FULL: marker = "[C]"
                 elif v_tier == ArtefactVisibility.METADATA: marker = "[M]"
                 elif v_tier == ArtefactVisibility.TREE_UNLOCKABLE: marker = "[U]"
-                f_name = a["display_title"].split("/")[-1]
+                f_name = a.get("display_path", a.get("title", "")).split("/")[-1]
                 atype = a.get("type", "document")
                 # Omit version string for data artifacts to match read-only rendering
                 if atype == ArtefactType.DATA:
@@ -1463,17 +1500,17 @@ class ArtefactManager:
                 if not content_text:
                     continue
 
-                header = f"### [Full File: '{display_title}']"
+                header = f"### [Full File: '{display_path}']"
                 deactivated_contents = getattr(self._discussion, "deactivated_contents", set())
 
-                if display_title in deactivated_contents:
+                if display_path in deactivated_contents:
                     seq_summaries = getattr(self._discussion, "sequential_summaries", {})
-                    summary_text = seq_summaries.get(display_title, "Detailed summary not available.")
+                    summary_text = seq_summaries.get(display_path, "Detailed summary not available.")
                     full_visible_parts.append(f"{header}\n[SEQUENTIAL COMPRESSED DATA DUE TO BUDGET CONSTRAINTS]:\n{summary_text}")
                 else:
                     if atype == ArtefactType.DATA:
                         schema_desc = content_text
-                        schema_desc = f"**FILENAME FOR TOOLS:** `{display_title}`\n\n{schema_desc}"
+                        schema_desc = f"**FILENAME FOR TOOLS:** `{display_path}`\n\n{schema_desc}"
                         full_visible_parts.append(f"{header}\n{schema_desc}")
                     elif atype == ArtefactType.CODE or (lang and not _ARTEFACT_IMAGE_TAG_RE.search(content_text)):
                         full_visible_parts.append(f"{header}\n{fence}\n{content_text}\n```")
@@ -1851,7 +1888,9 @@ class ArtefactManager:
             version     = int(version_str) if version_str.isdigit() else 1
             is_ephemeral = attrs.pop('ephemeral', 'false').lower() in ('true', '1', 'yes')
             status      = attrs.pop('status', ArtefactStatus.STABLE)
-
+            commit_message = attrs.pop('commit_message', None)
+            version_tags   = attrs.pop('version_tags', None)
+            
             if atype not in ArtefactType.ALL:
                 if atype in ("csv", "tsv", "excel", "xlsx", "xls", "db", "sqlite"):
                     atype = ArtefactType.DATA
@@ -2122,6 +2161,308 @@ class ArtefactManager:
             "companion_images_versions": [{k: v for k, v in ver.items() if k != "id"} for ver in sorted_comp_versions],
             "exported_at": datetime.utcnow().isoformat()
         }
+
+    def export_artefact_to_archive(self, title: str, output_path: Optional[Union[str, Path]] = None) -> Path:
+        """
+        Exports an artefact and ALL its version history to a standalone .laa (Lollms Artefact Archive) file.
+        The .laa file is a ZIP archive containing the manifest and all physical/logical versions.
+        """
+        all_versions = [a for a in self._get_all_raw() if a.get('title') == title]
+        if not all_versions:
+            raise ValueError(f"Cannot export non-existent artefact '{title}'.")
+
+        output_path = Path(output_path) if output_path else Path(f"{sanitize_artifact_filename(title)}.laa")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir_path = Path(temp_dir)
+
+            # 1. Build the manifest
+            manifest = {
+                "artefact_title": title,
+                "exported_at": datetime.utcnow().isoformat(),
+                "versions": []
+            }
+
+            # 2. Extract each version
+            for art in all_versions:
+                v_num = art.get('version', 1)
+                version_entry = {k: v for k, v in art.items() if k not in ('content', 'images', 'physical_data')}
+
+                # Save logical content
+                content_str = art.get('content', '')
+                if content_str:
+                    content_file = temp_dir_path / f"v{v_num}_content.txt"
+                    content_file.write_text(content_str, encoding="utf-8")
+                    version_entry["has_content_file"] = True
+
+                # Save physical bytes if they exist in DB (rare, usually for small data)
+                physical_data = art.get('physical_data')
+                if physical_data and isinstance(physical_data, bytes):
+                    phys_file = temp_dir_path / f"v{v_num}_physical.bin"
+                    phys_file.write_bytes(physical_data)
+                    version_entry["has_physical_file"] = True
+
+                # Save images
+                images = art.get('images', [])
+                if images:
+                    version_entry["images"] = images
+                    version_entry["image_media_types"] = art.get('image_media_types', [])
+
+                manifest["versions"].append(version_entry)
+
+            # 3. Write manifest
+            (temp_dir_path / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+
+            # 4. Zip it up
+            shutil.make_archive(str(output_path.with_suffix('')), 'zip', temp_dir_path)
+
+            # Ensure correct extension
+            final_zip = output_path.with_suffix('.zip')
+            if final_zip.exists() and output_path != final_zip:
+                final_zip.rename(output_path)
+
+        ASCIIColors.success(f"[ArtefactManager] Exported '{title}' to {output_path}")
+        return output_path
+
+    def import_artefact_from_archive(self, laa_path: Union[str, Path], activate: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Imports a standalone .laa (Lollms Artefact Archive) file into the current discussion.
+        Reconstructs all versions and physical files.
+        """
+        laa_path = Path(laa_path)
+        if not laa_path.exists():
+            raise FileNotFoundError(f"Artefact archive not found: {laa_path}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir_path = Path(temp_dir)
+
+            # 1. Unzip
+            try:
+                with zipfile.ZipFile(laa_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir_path)
+            except zipfile.BadZipFile as e:
+                raise ValueError(f"Invalid .laa archive (corrupt or not a ZIP): {e}")
+
+            # 2. Read manifest
+            manifest_file = temp_dir_path / "manifest.json"
+            if not manifest_file.exists():
+                raise ValueError("Invalid .laa archive: manifest.json missing.")
+
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            title = manifest.get("artefact_title")
+            if not title:
+                raise ValueError("Invalid .laa archive: artefact_title missing in manifest.")
+
+            # 3. Clear existing versions of this title in the target discussion
+            existing_arts = self._get_all_raw()
+            cleaned_raw = [a for a in existing_arts if a.get('title') != title]
+            self._save_all(cleaned_raw)
+
+            # 4. Reconstruct each version
+            imported_versions = []
+            for v_entry in manifest.get("versions", []):
+                v_num = v_entry.get('version', 1)
+
+                # Load content
+                content = ""
+                if v_entry.get("has_content_file"):
+                    content_file = temp_dir_path / f"v{v_num}_content.txt"
+                    if content_file.exists():
+                        content = content_file.read_text(encoding="utf-8")
+
+                # Load physical data
+                physical_data = None
+                if v_entry.get("has_physical_file"):
+                    phys_file = temp_dir_path / f"v{v_num}_physical.bin"
+                    if phys_file.exists():
+                        physical_data = phys_file.read_bytes()
+
+                # Reconstruct artifact record
+                art_record = v_entry.copy()
+                art_record['content'] = content
+                if physical_data is not None:
+                    art_record['physical_data'] = physical_data
+                if 'has_content_file' in art_record: del art_record['has_content_file']
+                if 'has_physical_file' in art_record: del art_record['has_physical_file']
+
+                # Generate new ID to prevent collisions
+                art_record['id'] = str(uuid.uuid4())
+                art_record['active'] = False # Will activate the latest one later
+
+                imported_versions.append(art_record)
+
+            # 5. Save all imported versions to DB
+            all_raw = self._get_all_raw()
+            all_raw.extend(imported_versions)
+            self._save_all(all_raw)
+
+            # 6. Activate the latest version if requested
+            if activate and imported_versions:
+                latest_version = max(imported_versions, key=lambda x: x.get('version', 1))
+                self.activate(title, latest_version.get('version', 1))
+
+            ASCIIColors.success(f"[ArtefactManager] Imported '{title}' from {laa_path}")
+            return self.get(title)
+
+    def export_artefact_bundle(self, paths: List[Union[str, Path]], output_path: Optional[Union[str, Path]] = None, include_versions: bool = False) -> Path:
+        """
+        Exports a bundle of artefacts to a standalone .lab (Lollms Artefact Bundle) file.
+        Preserves the relative folder structure of all files.
+        If only one file is provided, it is placed at the root of the archive (flattened).
+        If include_versions is True, all historical versioned physical twins are included.
+        """
+        if not paths:
+            raise ValueError("Cannot export an empty bundle. Provide a list of file or folder paths.")
+
+        ws_data_dir = Path(self._discussion.workspace_data_path) if getattr(self._discussion, "workspace_data_path", None) else Path("./data_workspace")
+        meta_dir = Path(self._discussion.artefacts_metadata_path) if getattr(self._discussion, "artefacts_metadata_path", None) else ws_data_dir.parent / "artefacts_metadata"
+
+        output_path = Path(output_path) if output_path else Path(f"artefact_bundle_{uuid.uuid4().hex[:6]}.lab")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        files_to_zip: Dict[str, Path] = {} # arcname -> physical_path
+
+        # 1. Resolve all physical files to include
+        for p_input in paths:
+            p = Path(p_input)
+
+            # If it's a directory, walk it
+            if p.is_dir():
+                for f in p.rglob("*"):
+                    if f.is_file():
+                        rel_path = f.relative_to(ws_data_dir)
+                        files_to_zip[str(rel_path)] = f
+            # If it's a file
+            elif p.is_file():
+                # Determine the relative path from workspace_data
+                try:
+                    rel_path = p.relative_to(ws_data_dir)
+                except ValueError:
+                    # If the file is outside workspace_data, just use its name
+                    rel_path = Path(p.name)
+
+                # If only ONE file is being exported, flatten it to the root
+                if len(paths) == 1:
+                    arcname = p.name
+                else:
+                    arcname = str(rel_path)
+
+                files_to_zip[arcname] = p
+
+                # If versions are requested, find and append all versioned twins
+                if include_versions:
+                    title = p.stem
+                    art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(rel_path)))
+                    art_meta_dir = meta_dir / art_id
+                    if art_meta_dir.exists():
+                        for v_file in art_meta_dir.glob(f"{title}_v*"):
+                            if v_file.is_file():
+                                v_arcname = f"_versions/{v_file.name}"
+                                files_to_zip[v_arcname] = v_file
+
+        # 2. Create the ZIP archive
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for arcname, phys_path in files_to_zip.items():
+                zipf.write(phys_path, arcname)
+
+        ASCIIColors.success(f"[ArtefactManager] Exported bundle of {len(files_to_zip)} file(s) to {output_path}")
+        return output_path
+
+    def import_artefact_bundle(self, lab_path: Union[str, Path], activate: bool = True) -> List[Dict[str, Any]]:
+        """
+        Imports a .lab (Lollms Artefact Bundle) file into the current discussion.
+        Unzips the archive preserving the relative folder structure and auto-registers
+        all new files as artefacts.
+        """
+        lab_path = Path(lab_path)
+        if not lab_path.exists():
+            raise FileNotFoundError(f"Artefact bundle not found: {lab_path}")
+
+        ws_data_dir = Path(self._discussion.workspace_data_path) if getattr(self._discussion, "workspace_data_path", None) else Path("./data_workspace")
+        ws_data_dir.mkdir(parents=True, exist_ok=True)
+
+        imported_artefacts = []
+
+        with zipfile.ZipFile(lab_path, 'r') as zip_ref:
+            # 1. Extract all files to workspace_data preserving structure
+            zip_ref.extractall(ws_data_dir)
+
+            # 2. Auto-register all extracted files as artefacts
+            for file_info in zip_ref.infolist():
+                if file_info.is_dir():
+                    continue
+
+                # Skip versioned backups if they exist in the archive
+                if file_info.filename.startswith("_versions/"):
+                    continue
+
+                extracted_path = ws_data_dir / file_info.filename
+
+                # Determine type and title
+                file_name = Path(file_info.filename).name
+                file_ext = Path(file_info.filename).suffix.lower()
+
+                atype = "document"
+                if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql"):
+                    atype = "code"
+                elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx"):
+                    atype = "data"
+                elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
+                    atype = "image"
+
+                # Read content for text-based files
+                content = ""
+                logical_content = None
+                physical_data = None
+
+                EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+                if file_ext not in EXPLICIT_BINARY_EXTS:
+                    try:
+                        content = extracted_path.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        pass
+                else:
+                    # CRITICAL FIX: Read raw physical bytes for binary files to prevent empty file corruption
+                    try:
+                        physical_data = extracted_path.read_bytes()
+                    except Exception:
+                        pass
+
+                    # Generate a logical metadata placeholder instead of polluting the physical file
+                    content = f"### Binary File: `{file_name}`\n- Location: `./{file_info.filename}`"
+                    logical_content = content
+
+                # Use the full relative path as the title to preserve folder structure in DB
+                # e.g., "assets/logo.png" or "src/components/Button.tsx"
+                # This ensures ArtefactManager places it in the correct subfolder.
+                art_title = file_info.filename
+
+                existing = self.get(art_title)
+                if existing:
+                    art = self.update(
+                        title=art_title,
+                        new_content=content,
+                        new_type=atype,
+                        active=activate,
+                        bump_version=True,
+                        physical_data=physical_data,
+                        logical_content=logical_content
+                    )
+                else:
+                    art = self.add(
+                        title=art_title,
+                        artefact_type=atype,
+                        content=content,
+                        active=activate,
+                        physical_data=physical_data,
+                        logical_content=logical_content
+                    )
+
+                imported_artefacts.append(art)
+
+        ASCIIColors.success(f"[ArtefactManager] Imported {len(imported_artefacts)} artefact(s) from {lab_path}")
+        return imported_artefacts
 
     def import_file(self, file_path: Union[str, Path], title: Optional[str] = None, active: bool = True) -> Dict[str, Any]:
         path = Path(file_path)
