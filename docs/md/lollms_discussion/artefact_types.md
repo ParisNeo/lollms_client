@@ -31,7 +31,23 @@ Once a type is registered, it is automatically injected into the **System Prompt
 ```text
 === ARTEFACT SYSTEM ===
 ...
-Supported types: code, document, file, image, note, requirement, skill, test_case
+# Artefact Types
+
+The `ArtefactType` class defines the categories of artifacts that can be created and managed within the Lollms Discussion system.
+
+## Supported Types
+
+- `FILE`: Generic file.
+- `SEARCH_RESULT`: Search results.
+- `NOTE`: Persistent user-facing knowledge notes.
+- `SKILL`: Persistent AI behavior capsules.
+- `CODE`: Code files.
+- `DOCUMENT`: General documents.
+- `IMAGE`: Image files.
+- `PRESENTATION`: HTML presentations.
+- `DATA`: Structured data files (CSV, DB, Excel).
+- `TOOL`: Dynamic LLM-authored tools.
+- `SCRATCHPAD`: Cognitive scratchpad for multi-step analysis and hypothesis tracking. Hidden by default to save context.
 === END ARTEFACT INSTRUCTIONS ===
 ```
 
