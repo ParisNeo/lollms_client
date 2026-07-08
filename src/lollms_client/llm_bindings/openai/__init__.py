@@ -146,6 +146,7 @@ class OpenAIBinding(LollmsLLMBinding):
                 timeout=300.0
             )
         )
+        self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
     def _build_openai_params(self, messages: list, **kwargs) -> dict:
         model = kwargs.get("model", self.model_name)
@@ -479,8 +480,42 @@ class OpenAIBinding(LollmsLLMBinding):
     ) -> Union[str, dict]:
 
         # ── Normalize messages to the OpenAI wire format ──────────────────────
+        # OpenAI Chat Completions only accepts these roles:
+        #   system, developer, user, assistant, tool, function
+        _OPENAI_ROLE_MAP = {
+            "system": "system",
+            "developer": "developer",
+            "user": "user",
+            "assistant": "assistant",
+            "tool": "tool",
+            "function": "function",
+            # Non-standard LoLLMS / agent roles mapped to sanctioned equivalents
+            "admin": "system",
+            "root": "system",
+            "manager": "system",
+            "supervisor": "system",
+            "controller": "system",
+            "orchestrator": "system",
+            "planner": "system",
+            "critic": "assistant",
+            "refiner": "assistant",
+            "reviewer": "assistant",
+            "validator": "assistant",
+            "executor": "assistant",
+            "worker": "assistant",
+            "agent": "assistant",
+            "bot": "assistant",
+            "ai": "assistant",
+            "human": "user",
+            "guest": "user",
+            "client": "user",
+            "customer": "user",
+            "operator": "user",
+        }
+
         def normalize_message(msg: Dict) -> Dict:
-            role = msg.get("role", "user")
+            raw_role = msg.get("role", "user") or "user"
+            role = _OPENAI_ROLE_MAP.get(raw_role.lower(), "user")
             content = msg.get("content", "")
             text_parts = []
             images = []

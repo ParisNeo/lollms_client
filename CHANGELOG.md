@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-07 22:06]
+
+- fix(openai): set completion format to chat and harden debug logging for responses
+
 ## [2026-07-07 17:38]
 
 - fix(openai): handle base address suffix and null values for host address

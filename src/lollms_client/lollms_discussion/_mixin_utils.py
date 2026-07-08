@@ -246,9 +246,7 @@ class UtilsMixin:
         last_user_idx = _last_user_index(branch)
 
         for idx, msg in enumerate(branch):
-            role = participants.get(msg.sender, "user" if msg.sender_type=='user' else "assistant")
-            if isinstance(role, dict):
-                role = role.get("name","user" if msg.sender_type=='user' else "assistant")
+            role = msg.sender_type
             
             content = get_full_content(msg)
             active_images_b64 = msg.get_active_images()

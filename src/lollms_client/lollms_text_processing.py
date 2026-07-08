@@ -1343,7 +1343,7 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
                 continue
 
             # DEBUG: Log raw LLM response to understand parsing failures
-            if self.llm.debug or kwargs.get("debug", False):
+            if response and isinstance(response, str) and self.llm.debug or kwargs.get("debug", False):
                 ASCIIColors.magenta(f"[DEBUG] Raw LLM Response ({len(response)} chars):")
                 ASCIIColors.white(response[:2000] + ("..." if len(response) > 2000 else ""))
 

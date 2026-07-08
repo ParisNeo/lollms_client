@@ -2525,7 +2525,9 @@ class ChatMixin:
                                                     pass
 
                                 # Execute directly (no thread) - LCP handles CWD internally
+                                #todo: verify signature first
                                 call_kwargs["discussion_instance"]=self
+
                                 tool_res = active_tools[tool_name]["callable"](**call_kwargs)
 
                                 # ── Take AFTER Snapshot and Auto-Sync Artifacts ──
