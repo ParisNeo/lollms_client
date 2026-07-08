@@ -4,14 +4,14 @@
 
 import json
 import re
-import uuid
+from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from ascii_colors import ASCIIColors, trace_exception
 
 from lollms_client.lollms_utilities import build_image_dicts
-from lollms_client.lollms_artefact import ArtefactType
+from lollms_client.lollms_artefact import ArtefactType, sanitize_artifact_filename
 import ascii_colors as logging
 
 # Create module-level loggers for easy access
@@ -1079,6 +1079,91 @@ class UtilsMixin:
                 "created_at": msg.created_at.isoformat() if msg.created_at else None,
             })
         return json.dumps(export_data, indent=2)
+
+    # ── Standalone Artefact Archive (SAA) Methods ─────────────────────────────
+
+    def get_standalone_archive_dir(self) -> Path:
+        """
+        Returns the path to the global Standalone Artefact Archive directory.
+        This directory exists outside any specific discussion and is used to store
+        exported .laa files that can be imported into any discussion.
+        """
+        base_workspace = Path(self.workspace_path).parent if hasattr(self, 'workspace_path') and self.workspace_path else Path("./data_workspace")
+        archive_dir = base_workspace / "standalone_artefacts"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        return archive_dir
+
+    def save_artefact_to_global_archive(self, title: str) -> Path:
+        """
+        Exports an artefact from the current discussion to the global Standalone Artefact Archive.
+        """
+        archive_dir = self.get_standalone_archive_dir()
+        safe_title = sanitize_artifact_filename(title)
+        output_path = archive_dir / f"{safe_title}.laa"
+
+        result_path = self.artefacts.export_artefact_to_archive(title, output_path)
+        ASCIIColors.info(f"[UtilsMixin] Artefact '{title}' saved to global archive at {result_path}")
+        return result_path
+
+    def load_artefact_from_global_archive(self, title: str, activate: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Imports an artefact from the global Standalone Artefact Archive into the current discussion.
+        """
+        archive_dir = self.get_standalone_archive_dir()
+        safe_title = sanitize_artifact_filename(title)
+        laa_path = archive_dir / f"{safe_title}.laa"
+
+        if not laa_path.exists():
+            ASCIIColors.warning(f"[UtilsMixin] Artefact '{title}' not found in global archive at {laa_path}")
+            return None
+
+        result = self.artefacts.import_artefact_from_archive(laa_path, activate=activate)
+        ASCIIColors.info(f"[UtilsMixin] Artefact '{title}' loaded from global archive into discussion.")
+        return result
+
+    def list_global_archive_artefacts(self) -> List[str]:
+        """
+        Lists all artefacts currently stored in the global Standalone Artefact Archive.
+        """
+        archive_dir = self.get_standalone_archive_dir()
+        return [f.stem for f in archive_dir.glob("*.laa")]
+
+    # ── Artefact Library and Bundle (.lab) Methods ────────────────────────────
+
+    def save_artefact_bundle_to_global_archive(self, paths: List[Union[str, Path]], bundle_name: Optional[str] = None, include_versions: bool = False) -> Path:
+        """
+        Exports a bundle of artefacts from the current discussion to the global Artefact Library.
+        """
+        archive_dir = self.get_standalone_archive_dir()
+        safe_name = sanitize_artifact_filename(bundle_name) if bundle_name else f"bundle_{uuid.uuid4().hex[:6]}"
+        output_path = archive_dir / f"{safe_name}.lab"
+
+        result_path = self.artefacts.export_artefact_bundle(paths, output_path, include_versions=include_versions)
+        ASCIIColors.info(f"[UtilsMixin] Artefact bundle saved to global archive at {result_path}")
+        return result_path
+
+    def load_artefact_bundle_from_global_archive(self, bundle_name: str, activate: bool = True) -> List[Dict[str, Any]]:
+        """
+        Imports an artefact bundle from the global Artefact Library into the current discussion.
+        """
+        archive_dir = self.get_standalone_archive_dir()
+        safe_name = sanitize_artifact_filename(bundle_name)
+        lab_path = archive_dir / f"{safe_name}.lab"
+
+        if not lab_path.exists():
+            ASCIIColors.warning(f"[UtilsMixin] Bundle '{bundle_name}' not found in global archive at {lab_path}")
+            return []
+
+        result = self.artefacts.import_artefact_bundle(lab_path, activate=activate)
+        ASCIIColors.info(f"[UtilsMixin] Loaded {len(result)} artefacts from bundle '{bundle_name}' into discussion.")
+        return result
+
+    def list_global_archive_bundles(self) -> List[str]:
+        """
+        Lists all artefact bundles currently stored in the global Artefact Library.
+        """
+        archive_dir = self.get_standalone_archive_dir()
+        return [f.stem for f in archive_dir.glob("*.lab")]
 
     @classmethod
     def import_from_json_str(cls, json_str, lollms_client, db_manager=None):
