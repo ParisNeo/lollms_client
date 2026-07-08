@@ -1665,8 +1665,13 @@ class ChatMixin:
         # Initialize list to collect all created/modified artifacts during this turn safely
         object.__setattr__(self, "_affected_artefacts_this_turn", [])
 
-        # Reset cancellation flag at the start of each chat turn
+        # 🛡️ CRITICAL FIX: Preserve pre-turn cancellation signal.
+        # If cancel_generation() was called BEFORE chat(), we must observe it.
+        # We capture the state, then reset the flag. The loop will check the captured state.
+        _was_pre_cancelled = self.is_generation_cancelled()
         self.reset_cancel_state()
+        if _was_pre_cancelled:
+            object.__setattr__(self, '_cancel_flag', True)
 
         self.scratchpad = ""
         callback = kwargs.get("streaming_callback")
@@ -2032,6 +2037,10 @@ class ChatMixin:
         # Track if we exited due to cancellation
         was_cancelled = False
 
+        # CRITICAL FIX: Initialize ss to None to prevent UnboundLocalError
+        # if the loop breaks before _StreamState is instantiated (e.g., pre-turn cancellation).
+        ss = None
+
         while round_count < max_reasoning_steps:
             # Check cancellation at the start of each reasoning round
             if self.is_generation_cancelled():
@@ -2225,6 +2234,19 @@ class ChatMixin:
                     if not isinstance(call_data, dict) or not call_data.get("name"):
                         ASCIIColors.warning(f"[ChatMixin] Malformed tool call detected. JSON: {tool_call_json_str[:200]}")
 
+                        # 🛡️ CRITICAL FIX: Record this malformed call in FailureMemory
+                        # to prevent infinite loops of the same malformed payload.
+                        failure_memory = getattr(self, "_failure_memory", None)
+                        if failure_memory:
+                            try:
+                                malformed_sig = "unknown::malformed"
+                                if hasattr(failure_memory, "record_failure_by_signature"):
+                                    failure_memory.record_failure_by_signature(malformed_sig, "Malformed tool call: missing 'name' or invalid JSON")
+                                elif hasattr(failure_memory, "_signatures"):
+                                    failure_memory._signatures.add(malformed_sig)
+                            except Exception:
+                                pass
+
                         # Inject a correction into the virtual history so the LLM knows it failed
                         correction_msg = (
                             "=== ⚠️ TOOL CALL FORMAT ERROR ===\n"
@@ -2279,6 +2301,19 @@ class ChatMixin:
                     # This prevents cascading failures where the LLM panics and tries other unregistered tools.
                     if not active_tools or tool_name not in active_tools:
                         ASCIIColors.warning(f"[ChatMixin] Phantom tool call detected: '{tool_name}' is not registered.")
+
+                        # 🛡️ CRITICAL FIX: Record phantom tool in FailureMemory to prevent infinite loops
+                        failure_memory = getattr(self, "_failure_memory", None)
+                        if failure_memory:
+                            try:
+                                param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                            except Exception:
+                                param_sig = str(tool_params)
+                            phantom_sig = f"{tool_name}::{param_sig}"
+                            if hasattr(failure_memory, "record_failure_by_signature"):
+                                failure_memory.record_failure_by_signature(phantom_sig, f"Phantom tool '{tool_name}' not registered")
+                            elif hasattr(failure_memory, "_signatures"):
+                                failure_memory._signatures.add(phantom_sig)
 
                         # Emit a failure processing block to the UI
                         status_err_line = f"* Tool call blocked.\n"
@@ -2504,7 +2539,7 @@ class ChatMixin:
                             ))
                             # Append the processing block to UI
                             status_err_line = f"* Tool call blocked to prevent success loop.\n"
-                            details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked.\n<!-- status:failure -->\n</processing>\n\n"
+                            details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked\n<!-- status:failure -->\n</processing>\n\n"
                             ai_msg.content += status_err_line + details_block
                             _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                             continue
@@ -3362,14 +3397,14 @@ class ChatMixin:
             ai_msg.metadata = {
                 "mode": "cancelled",
                 "tool_calls": tool_calls_this_turn,
-                "artefacts_modified": [a.get("title") for a in ss.affected_artefacts],
+                "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])],
                 "cancelled": True
             }
         else:
             ai_msg.metadata = {
                 "mode": "agentic" if tool_calls_this_turn else "direct",
                 "tool_calls": tool_calls_this_turn,
-                "artefacts_modified": [a.get("title") for a in ss.affected_artefacts]
+                "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])]
             }
 
         if remove_thinking_blocks:
@@ -3419,7 +3454,7 @@ class ChatMixin:
         ai_msg.metadata = {
             "mode": "agentic" if tool_calls_this_turn else "direct",
             "tool_calls": tool_calls_this_turn,
-            "artefacts_modified": [a.get("title") for a in ss.affected_artefacts]
+            "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])]
         }
 
         # Auto dream
@@ -3435,6 +3470,11 @@ class ChatMixin:
 
         self.scratchpad = ""
         object.__setattr__(self, '_active_callback', None)
+
+        # 🛡️ CRITICAL FIX: Always reset the cancellation flag at the end of the turn.
+        # This ensures that pre-turn and mid-turn cancellation signals are consumed
+        # and do not bleed into subsequent turns.
+        self.reset_cancel_state()
 
         # ── 🔬 SCIENTIFIC DEBUG: EXPORT CONTEXT DUMP ──
         # Dumps the exact virtual_history (LLM context) and ai_msg.content (UI context)
@@ -3485,7 +3525,7 @@ class ChatMixin:
             "user_message": user_msg,
             "ai_message": ai_msg,
             "sources": [],
-            "artefacts": ss.affected_artefacts,
+            "artefacts": ss.affected_artefacts if ss else [],
             "memory_report": mem_report,
             "dream_report": dream_report,
             "was_cancelled": was_cancelled
