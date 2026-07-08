@@ -90,7 +90,12 @@ Use this rule when testing.
         import sqlite3
         conn = sqlite3.connect(str(db_path))
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM data_consolidated_sales")
+        # Dynamically discover the generated table name
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall() if row[0] != "sqlite_sequence"]
+        self.assertTrue(len(tables) > 0, "No tables were created in the consolidated database.")
+        table_name = tables[0]  # Assuming one fused table for this test
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
         count = cursor.fetchone()[0]
         conn.close()
         
