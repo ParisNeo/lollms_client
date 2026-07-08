@@ -782,7 +782,7 @@ class CoreMixin:
                                 ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
                                 ".zip", ".tar", ".gz", ".pdf", ".docx"}
 
-        _IGNORED_SYNC_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules"}
+        _IGNORED_SYNC_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "env", ".env"}
         _IGNORED_SYNC_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".lam", ".log"}
 
         for f_path in workspace_dir.rglob("*"):
@@ -845,21 +845,19 @@ class CoreMixin:
                         artefact_type=atype,
                         content=content_placeholder,
                         active=True,
-                        visibility=ArtefactVisibility.FULL,
+                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                         commit_message="Synced from disk (binary)"
                     )
                     report["new_artefacts"] += 1
                 else:
-                    # Only update if disk is newer
                     db_updated_at = existing_art.get("updated_at", "")
-                    # Simple heuristic: always update placeholder if size differs to ensure metadata sync
                     if existing_art.get("content", "").find(f"Size**: {file_size:,}") == -1:
                         self.artefacts.update(
                             title=file_name,
                             new_content=content_placeholder,
                             new_type=atype,
                             active=True,
-                            visibility=ArtefactVisibility.FULL,
+                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                             commit_message="Updated from disk (binary metadata)"
                         )
                         report["updated_artefacts"] += 1
@@ -876,7 +874,7 @@ class CoreMixin:
                         artefact_type=atype,
                         content=disk_content,
                         active=True,
-                        visibility=ArtefactVisibility.FULL,
+                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                         commit_message="Synced from disk (text)"
                     )
                     report["new_artefacts"] += 1
@@ -888,7 +886,7 @@ class CoreMixin:
                             new_content=disk_content,
                             new_type=atype,
                             active=True,
-                            visibility=ArtefactVisibility.FULL,
+                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
                             commit_message="Updated from disk (text modified)"
                         )
                         report["updated_artefacts"] += 1
