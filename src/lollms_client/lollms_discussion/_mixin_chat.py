@@ -595,6 +595,16 @@ class _StreamState:
         # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
         self._pending_buffer += chunk
 
+        # ── 🛑 ANTI-MIMICRY: Prevent LLM from generating <processing> blocks ──
+        # The <processing> tag is strictly system-generated. If the LLM attempts to
+        # output it, we halt generation immediately to prevent log hallucination.
+        if "<processing" in self._pending_buffer.lower() and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary:
+            ASCIIColors.warning("[StreamState] LLM attempted to generate a <processing> block. Halting generation.")
+            # Strip the processing tag from the buffer
+            self._pending_buffer = re.sub(r'<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
+            # Halt generation by returning False
+            return False
+
         # ── Tool Accumulation & Interception ──
         if self._is_accumulating_tool:
             # Use regex to be tolerant of whitespace or slight malformations in the closing tag (e.g., </tool >)
@@ -1370,11 +1380,56 @@ class _StreamState:
             self._secondary_buffer = ""
             return
 
-        if self._pending_buffer:
+        if self._pending_buffer or self.artefact_tracker.is_inside_artefact:
             # If we are still inside an artifact for some reason (unclosed tag), dump it to the UI
             if self.artefact_tracker.is_inside_artefact:
-                self.ai_message.content += self._pending_buffer
-                _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                # ── 🛑 TRUNCATED ARTIFACT RECOVERY ──
+                # The LLM finished generation without closing the <artifact> tag.
+                # This often happens with SEARCH/REPLACE blocks that hit max_tokens.
+                # We synthesize the closing tag and attempt a best-effort dispatch.
+                self._artefact_buffer += self._pending_buffer
+                self._pending_buffer = ""
+
+                # Check if we have a valid opening tag to extract attributes from
+                lower_buf = self._artefact_buffer.lower()
+                open_idx = lower_buf.find("<artifact")
+                if open_idx == -1:
+                    open_idx = lower_buf.find("<artefact")
+
+                if open_idx != -1:
+                    end_of_open_tag = self._artefact_buffer.find(">", open_idx)
+                    if end_of_open_tag != -1:
+                        opening_tag = self._artefact_buffer[open_idx:end_of_open_tag+1]
+                        body_content = self._artefact_buffer[end_of_open_tag+1:]
+                        closing_tag = "</artifact>"
+                        full_match_text = opening_tag + body_content + closing_tag
+
+                        if full_match_text not in self.processed_tags:
+                            self.processed_tags.add(full_match_text)
+                            ASCIIColors.warning("[StreamState] Detected truncated artifact. Attempting best-effort dispatch.")
+                            self._dispatch_closed_tag(
+                                "artifact",
+                                opening_tag,
+                                body_content.strip(),
+                                full_match_text
+                            )
+
+                        # Close the processing block
+                        proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
+                        self.ai_message.content += proc_close_tag
+                        _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                        # Mark that an action was dispatched so the loop continues correctly
+                        self._action_dispatched = True
+                        self.artefact_tracker.close()
+                        self._artefact_buffer = ""
+                        return
+
+                # Fallback: if we couldn't parse the opening tag, just dump to UI
+                self.ai_message.content += self._artefact_buffer
+                _cb(self.callback, self._artefact_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                self._artefact_buffer = ""
+                self.artefact_tracker.close()
             else:
                 # Otherwise, it's just trailing text or a partial tag that never completed
                 self.ai_message.content += self._pending_buffer
@@ -2082,6 +2137,25 @@ class ChatMixin:
                 break
 
             ss.flush_remaining_buffer()
+
+            # ── 🛑 EMPTY-RESPONSE GUARD (CRITICAL) ──
+            # If the LLM generated zero tokens (or only whitespace/processing blocks),
+            # we must break the loop immediately to prevent an infinite empty-generation cycle.
+            # This happens when the LLM hits a stop sequence prematurely or the API returns empty.
+            clean_text = ss.get_clean_text_so_far().strip()
+            # Strip processing blocks to check if ANY real content was generated
+            content_without_processing = re.sub(
+                r'<processing[^>]*>.*?</processing>', '', clean_text, flags=re.DOTALL | re.IGNORECASE
+            ).strip()
+
+            if not content_without_processing and not ss.tool_trigger and not ss.was_action_dispatched():
+                ASCIIColors.warning("[ChatMixin] Empty LLM response detected (no content, no tool, no artifact). Breaking loop to prevent infinite cycle.")
+                # Append a minimal marker to virtual_history so the LLM knows it produced nothing
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content="[No output generated]"
+                ))
+                break
 
             # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
             # If the StreamState dispatched an artifact, note, skill, or context update
