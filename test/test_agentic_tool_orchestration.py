@@ -111,7 +111,7 @@ class TestAgenticToolOrchestration(unittest.TestCase):
         )
 
         content = res["ai_message"].content
-        self.assertIn("Repetitive tool call detected", content)
+        self.assertIn("Repetitive successful tool call blocked", content)
 
     def test_lcp_tool_cwd_isolation(self):
         """Verify CWD is switched to workspace for LCP tools and restored."""
