@@ -209,3 +209,76 @@ default_tools/
 3.  **Registration:** If `True`, `LCPBinding.register_tool_from_code("my_tool", code)` is called. The code is executed in an isolated module namespace.
 4.  **Invocation:** The LLM can immediately call `<tool>{"name": "tool_my_tool", "parameters": {...}}</tool>`.
 5.  **Cleanup:** If the artefact is updated or deleted, `LCPBinding.unregister_tools_by_prefix("my_tool")` is called to remove the old executable function.
+
+---
+
+## 🔄 Cross-Discussion Tool Portability (.laa / .lab)
+
+Because LCP tools are stored as standard Python artefacts inside the discussion workspace, they fully benefit from the **Decoupled Artefact Protocol**. You can export a tool created in one discussion and import it into another, or share it via the global library.
+
+### Exporting a Tool
+If an LLM creates a specialized tool (e.g., `my_analyzer.py`) in Discussion A, you can export it:
+
+```python
+# Export as a standalone .laa file (preserves version history)
+discussion_a.artefacts.export_artefact_to_archive(
+    title="my_analyzer.py", 
+    output_path="my_analyzer.laa"
+)
+
+# Or save directly to the global library
+discussion_a.save_artefact_to_global_archive("my_analyzer.py")
+```
+
+### Importing a Tool
+In Discussion B, you can import the tool. Once the physical file is reconstructed on disk, the LCP binding can discover and register it.
+
+```python
+# Import from a .laa file
+discussion_b.artefacts.import_artefact_from_archive("my_analyzer.laa")
+
+# Or load from the global library
+discussion_b.load_artefact_from_global_archive("my_analyzer.py")
+
+# The tool is now physically present in Discussion B's workspace.
+# If the LCP binding is configured to scan this workspace, it will auto-discover the tool.
+```
+
+### Bundling Tool Ecosystems
+If a tool requires multiple files (e.g., a main script and a helper module), you can bundle them using the `.lab` format, which preserves the relative folder structure.
+
+```python
+# Export a bundle of tool files
+discussion_a.artefacts.export_artefact_bundle(
+    paths=["workspace_data/my_tool.py", "workspace_data/utils.py"],
+    output_path="my_tool_ecosystem.lab"
+)
+
+# Import the bundle into a new discussion
+discussion_b.artefacts.import_artefact_bundle("my_tool_ecosystem.lab")
+```
+### 8. Context Visibility & Physical Paths
+
+**Path Sovereignty**: The LLM does not see flat filenames; it sees the exact relative path of the artifact from the workspace root (e.g., `path/to/artefact.py`). This ensures that when the LLM writes Python code to read a CSV or import a module, it uses the correct relative path, preventing `FileNotFoundError`.
+
+**Multi-Tier Visibility**: To prevent context bloat, the LLM only sees files that are explicitly unlocked. The system presents a directory tree index to the LLM:
+```text
+## artefacts list
+path/to/artefact.py[F]
+path/to/artefact2.py[L]
+path/to/file.md[F]
+path/to/file.csv[M]
+
+## Full artefacts content
+```python:path/to/artefact.py
+# here is the content
+```
+
+```markdown:path/to/file.md
+here is the content
+``` 
+```markdown:path/to/file.csv
+here is metadata infos about the file
+``` 
+```
+The LLM can dynamically request to load (`[U]` -> `[F]`) or lock (`[F]` -> `[L]`) files using `<unlock_file>` and `<lock_file>` tags.
