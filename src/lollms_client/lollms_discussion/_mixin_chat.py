@@ -689,13 +689,16 @@ class _StreamState:
                     # CRITICAL FIX: Always emit lightweight structural status events,
                     # regardless of forward_artefact_chunks. The forward_artefact_chunks
                     # flag only controls whether raw code chunks (high bandwidth) are forwarded.
-                    # The status tags are tiny and should always fire.
+                    # The status tags are tiny and should always fire to keep the user engaged.
                     event_meta = self.artefact_tracker.feed(chunk)
                     if event_meta:
                         # If forward_artefact_chunks is True, also forward the raw chunk
                         if self.forward_artefact_chunks:
                             _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, event_meta)
+
+                        # Always forward the lightweight structural status tag
                         status_tag = f'{event_meta["status"]}\n'
+                        self.ai_message.content += status_tag
                         _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 return True
 
@@ -2405,6 +2408,8 @@ class ChatMixin:
                         # Create a signature that includes the file hashes so it changes if files change
                         context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
 
+                        ASCIIColors.info(f"[ChatMixin] Success-loop check: tool='{tool_name}', sig='{context_aware_signature[:120]}...', in_set={context_aware_signature in successful_tool_signatures}, set_size={len(successful_tool_signatures)}")
+
                         if context_aware_signature in successful_tool_signatures:
                             ASCIIColors.warning(f"[ChatMixin] Repetitive SUCCESS loop blocked for '{tool_name}'. Signature already in successful set and files unchanged.")
                             tool_res = {
@@ -2427,7 +2432,7 @@ class ChatMixin:
                             status_err_line = f"* Tool call blocked to prevent success loop.\n"
                             details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked.\n<!-- status:failure -->\n</processing>\n\n"
                             ai_msg.content += status_err_line + details_block
-                            _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                            _cb(callback, status_err_line + details_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                             continue
                         else:
                             tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
@@ -2931,6 +2936,39 @@ class ChatMixin:
                                 result_str = full_dump
                                 clean_result_str = _sanitize_tool_result(tool_res)
                                 self._trigger_evolutionary_reflection(tool_name, tool_params, clean_result_str)
+
+                                if self.lollmsClient and hasattr(self.lollmsClient, "count_tokens"):
+                                    tool_output_tokens = self.lollmsClient.count_tokens(clean_result_str)
+                                else:
+                                    tool_output_tokens = len(clean_result_str) // 4
+
+                                if tool_output_tokens > 1500:
+                                    is_structured = (
+                                        tool_name.startswith("tool_query") or 
+                                        tool_name.startswith("tool_execute_python_data") or
+                                        "|" in clean_result_str or 
+                                        "```json" in clean_result_str
+                                    )
+
+                                    if is_structured:
+                                        clean_result_str = f"[SYSTEM: Tool returned {tool_output_tokens} tokens of structured data. The data has been processed and is available in the workspace. DO NOT attempt to read the raw rows. Use aggregation/plotting tools next.]"
+                                    else:
+                                        log_filename = f"tool_output_{tool_name}_{round_count}.log"
+                                        log_filepath = Path(self.workspace_data_path) / log_filename
+                                        log_filepath.parent.mkdir(parents=True, exist_ok=True)
+                                        log_filepath.write_text(clean_result_str, encoding="utf-8", errors="ignore")
+
+                                        self.artefacts.add(
+                                            title=log_filename,
+                                            artefact_type="document",
+                                            content=clean_result_str,
+                                            active=True,
+                                            visibility=ArtefactVisibility.TREE_UNLOCKABLE
+                                        )
+                                        self.commit()
+
+                                        clean_result_str = f"[SYSTEM: Tool returned {tool_output_tokens} tokens of text. It has been saved to '{log_filename}'. Unlock it to read a portion, or save findings to your scratchpad.]"
+
                                 status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
                                 # 🛡️ CRITICAL FIX: Guard against NoneType output from tools
                                 if full_dump is None:
@@ -3047,6 +3085,19 @@ class ChatMixin:
                                 f"   Do NOT hallucinate or guess any other file name (such as 'sales_over_time.png'). Only use `{p_fn}`.\n\n"
                             )
 
+                        # Check if this is a data query tool and guide the LLM to the next phase
+                        next_step_guidance = ""
+                        if tool_name in ("tool_query_database_sql", "tool_execute_sql_query", "tool_execute_python_data_query"):
+                            next_step_guidance = (
+                                f"6. 📊 **DATA GATHERED → BUILD PHASE**: You now have enough data to proceed. "
+                                f"If you have gathered sufficient data for the user's request, your NEXT action should be to "
+                                f"either:\n"
+                                f"   a) Write a Python script artifact to process/visualize the data, OR\n"
+                                f"   b) Build the HTML animation artifact the user requested, OR\n"
+                                f"   c) Provide your final analysis answer.\n"
+                                f"   Do NOT run another SQL query unless you need genuinely different data.\n"
+                            )
+
                         user_part = (
                             f"=== ✅ TOOL RESULT (NOT A TOOL CALL): {tool_name} ===\n"
                             f"⚠️ **WARNING**: The JSON below is the **RESULT** of your previous tool call. "
@@ -3061,7 +3112,8 @@ class ChatMixin:
                             f"3. 💬 **RESPOND** to the user's original question using this data.\n"
                             f"4. 🚫 **FORBIDDEN**: Do **NOT** call '{tool_name}' again with these parameters.\n"
                             f"   The tool already ran successfully. Calling it again is a **LOOP ERROR**.\n"
-                            f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n\n"
+                            f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n"
+                            f"{next_step_guidance}\n"
                             f"### Example of CORRECT behavior:\n"
                             f"❌ WRONG: <tool>{{\"name\": \"{tool_name}\", ...}}</tool>  (LOOP!)\n"
                             f"✅ RIGHT:  \"Based on the results, I can see that...\"  (ANSWER!)\n"
@@ -3072,7 +3124,6 @@ class ChatMixin:
                             content=user_part
                         ))
 
-                        # ── 🛑 CRITICAL FIX: DYNAMIC ARTIFACT INJECTION ─────────────────
                         # If the tool created new files, we must update the virtual_history
                         # so the LLM knows they exist. To preserve the KV-cache, we append
                         # a system marker to the LAST user message we just added.
@@ -3086,6 +3137,19 @@ class ChatMixin:
                             )
                             ASCIIColors.info(f"[ChatMixin] Injected {len(new_files_this_run)} new artifacts into virtual_history context.")
 
+                        # Inject a summary of what has been accomplished so far to prevent
+                        # the LLM from re-starting its analysis from scratch each round.
+                        tools_so_far = [tc["name"] for tc in tool_calls_this_turn]
+                        unique_tools = list(dict.fromkeys(tools_so_far))
+                        progress_summary = (
+                            f"\n\n[SYSTEM: PROGRESS TRACKER — You have completed {len(tool_calls_this_turn)} tool call(s) so far: "
+                            f"{', '.join(unique_tools)}. "
+                            f"You DO NOT need to re-explore the data. Use the results already in your context to proceed. "
+                            f"If the user asked you to build something (e.g., an animation, chart, or report), your NEXT step "
+                            f"should be to CREATE that artifact using the data you have already gathered. "
+                            f"Do NOT re-run the same exploratory queries.]"
+                        )
+                        virtual_history[-1].content += progress_summary
                     else:
                         user_part = (
                             f'<tool_result name="{tool_name}" status="FAILED">\n'
@@ -3128,73 +3192,45 @@ class ChatMixin:
                     continue
 
                 # Only run intent detection on SHORT responses (preambles before a missed tool call)
-                if raw_round_len < 500:
-                    intent_phrases = [
-                        "let me search", "let me call", "let me run", "let me query",
-                        "i'll search", "i'll call", "i'll run", "i'll query",
-                        "now let me", "i will search", "i will call",
-                        "searching for", "calling tool", "running tool",
-                        "now searching", "let's search", "let us search"
-                    ]
-                    raw_lower = raw_round_text.lower()
-                    has_intent = False
-                    for phrase in intent_phrases:
-                        if phrase in raw_lower:
-                            # Check context: is this inside a question or list?
-                            phrase_idx = raw_lower.find(phrase)
-                            # Look at the line containing the phrase
-                            line_start = raw_lower.rfind('\n', 0, phrase_idx) + 1
-                            line_end = raw_lower.find('\n', phrase_idx)
-                            if line_end == -1:
-                                line_end = len(raw_lower)
-                            line = raw_lower[line_start:line_end]
+                intent_pattern = re.compile(r'(let me|now i|next i|i will|i need to|we need to).*(query|get|fetch|build|create|analyze|summarize|aggregate|plot)', re.IGNORECASE)
+                intent_match = intent_pattern.search(raw_round_text)
+                has_intent = False
+                if intent_match:
+                    matched_line = intent_match.group(0)
+                    line_end_idx = raw_round_text.find(matched_line) + len(matched_line)
+                    line_end_char = raw_round_text[line_end_idx] if line_end_idx < len(raw_round_text) else ""
 
-                            # Skip if line ends with '?' (conversational offer)
-                            if line.rstrip().endswith('?'):
-                                continue
-                            # Skip if line starts with a list marker (1., 2., -, *)
-                            if re.match(r'^\s*(\d+\.|[-*])\s', line):
-                                continue
-                            # Skip if followed by "skill", "note", "artifact" (functional tags, not tools)
-                            remainder = raw_lower[phrase_idx:]
-                            if re.search(r'\b(skill|note|artifact|artefact)\b', remainder[:50]):
-                                continue
+                    line_start_idx = raw_round_text.rfind('\n', 0, intent_match.start()) + 1
+                    line_start = raw_round_text[line_start_idx:intent_match.start()].strip().lower()
 
-                            has_intent = True
-                            break
+                    is_question = line_end_char == '?' or line_start.startswith(("would you", "do you", "shall i", "should i", "could you"))
 
-                    has_tool_tag = "<tool>" in raw_lower
+                    if not is_question:
+                        has_intent = True
 
-                    if has_intent and not has_tool_tag and not was_cancelled and round_count < max_reasoning_steps:
-                        ASCIIColors.info(f"[ChatMixin] Detected pending tool intent without XML tag. Forcing continuation...")
+                has_tool_tag = "<tool>" in raw_round_text.lower()
 
-                        # 🛑 CRITICAL: Append SANITIZED assistant text to virtual_history (preserves KV-cache)
-                        full_round_text = ss.get_clean_text_so_far()
-                        raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
-                        clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
-                        clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                        clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="assistant",
-                            content=clean_history_text.strip()
-                        ))
+                if has_intent and not has_tool_tag and not was_cancelled and round_count < max_reasoning_steps:
+                    ASCIIColors.info(f"[ChatMixin] Detected pending tool intent without XML tag. Forcing continuation...")
 
-                        # Force the LLM to output the actual tool tag now
-                        intent_correction = (
-                            "=== ⚠️ MISSING TOOL CALL ===\n"
-                            "You expressed intent to call a tool, but you did NOT output the required `<tool>` XML tag. "
-                            "To execute the action, you MUST output the tag on a new line now.\n"
-                            "Do NOT explain further. Output ONLY the `<tool>{\"name\": \"...\", \"parameters\": {...}}</tool>` block."
-                        )
-                        virtual_history.append(SimpleNamespace(
-                            sender_type="user",
-                            content=intent_correction
-                        ))
+                    full_round_text = ss.get_clean_text_so_far()
+                    raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
+                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_history_text.strip()
+                    ))
 
-                        # Force another reasoning round
-                        continue
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: CRITICAL. You stopped generation before executing your stated intent. Output the <tool> or <artifact> tag NOW. Do not write any more prose.]"
+                    ))
+
+                    continue
 
                 # ── 🔄 FORCE CONTINUATION AFTER CONTEXT UNLOCK ─────────────────
                 # If the model requested files to be loaded, force at least one more round
