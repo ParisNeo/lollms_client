@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from lollms_client.lollms_core import LollmsClient
-    from lollms_client.lollms_personality import LollmsPersonality
+    from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 
 
 # ---------------------------------------------------------------------------
