@@ -7,7 +7,7 @@ from lollms_client.lollms_core import LollmsClient, ELF_COMPLETION_FORMAT
 from lollms_client.lollms_types import MSG_TYPE
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager, LollmsMessage
 from lollms_client.lollms_memory import LollmsMemoryManager, MemoryConfig, FailureMemory
-from lollms_client.lollms_personality import LollmsPersonality
+from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 from lollms_client.lollms_utilities import PromptReshaper
 from lollms_client.lollms_tools_binding import LollmsToolBinding, LollmsTOOLBindingManager
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
