@@ -247,33 +247,76 @@ class UtilsMixin:
 
         for idx, msg in enumerate(branch):
             role = msg.sender_type
-            
+
             content = get_full_content(msg)
             active_images_b64 = msg.get_active_images()
             images_dicts = build_image_dicts(active_images_b64)
-            
-            if format_type == "openai_chat":
-                if images_dicts:
-                    parts = [{"type":"text","text":content}] if content else []
-                    for img in images_dicts:
-                        url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
-                        parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
-                    messages.append({"role":role,"content":parts})
-                else:
-                    messages.append({"role":role,"content":content})
-            elif format_type == "ollama_chat":
-                md = {"role":role,"content":content}
-                b64s = [i['data'] for i in images_dicts if i['type']=='base64']
-                if b64s:
-                    md["images"] = b64s
-                messages.append(md)
-            elif format_type == "markdown":
-                line = f"**{role.capitalize()}**: {content}\n"
-                if images_dicts and not suppress_images:
-                    for img in images_dicts:
-                        url = f"![Image](data:image/jpeg;base64,{img['data']})" if img['type']=='base64' else f"![Image]({img['data']})"
-                        line += f"\n{url}\n"
-                messages.append(line)
+
+            # ── 🧠 DUAL-COPY CONTEXT SPLICING ──
+            # If this is an assistant message AND it contains persisted virtual_history in metadata,
+            # we splice the raw virtual history into the context INSTEAD of the sanitized content.
+            # This allows the LLM to see the exact <tool> tags and <tool_result> payloads from the
+            # previous turn, maintaining perfect KV-cache alignment for multi-turn tool chains.
+            # 
+            # CRITICAL: We only do this if NO virtual_history is already being actively built
+            # by the ChatMixin for the current turn (i.e., `virtual_history` param is None or empty).
+            is_historical_assistant = (role == "assistant")
+            has_persisted_vh = is_historical_assistant and isinstance(msg.metadata, dict) and bool(msg.metadata.get("virtual_history"))
+            is_current_turn_vh_active = bool(virtual_history)
+
+            if has_persisted_vh and not is_current_turn_vh_active:
+                persisted_vh = msg.metadata["virtual_history"]
+                # The sanitized `content` is discarded for this message.
+                # We reconstruct the alternation from the persisted virtual history.
+                for vh_entry in persisted_vh:
+                    vh_role = "user" if vh_entry.get("sender_type") == "user" else "assistant"
+                    vh_content = vh_entry.get("content", "")
+                    if not vh_content:
+                        continue
+
+                    if format_type == "openai_chat":
+                        messages.append({"role": vh_role, "content": vh_content})
+                    elif format_type == "ollama_chat":
+                        messages.append({"role": vh_role, "content": vh_content})
+                    elif format_type == "markdown":
+                        sender_str = "User" if vh_role == "user" else "Assistant"
+                        messages.append(f"**{sender_str}**: {vh_content}\n")
+
+                # We still need to attach images if there were any in the original message
+                if images_dicts and format_type == "openai_chat":
+                    # Append images to the last assistant message we just added
+                    for i in range(len(messages) - 1, -1, -1):
+                        if messages[i]["role"] == "assistant":
+                            parts = [{"type": "text", "text": messages[i]["content"]}] if messages[i]["content"] else []
+                            for img in images_dicts:
+                                url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
+                                parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
+                            messages[i]["content"] = parts
+                            break
+            else:
+                # Standard path: use sanitized content
+                if format_type == "openai_chat":
+                    if images_dicts:
+                        parts = [{"type":"text","text":content}] if content else []
+                        for img in images_dicts:
+                            url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
+                            parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
+                        messages.append({"role":role,"content":parts})
+                    else:
+                        messages.append({"role":role,"content":content})
+                elif format_type == "ollama_chat":
+                    md = {"role":role,"content":content}
+                    b64s = [i['data'] for i in images_dicts if i['type']=='base64']
+                    if b64s:
+                        md["images"] = b64s
+                    messages.append(md)
+                elif format_type == "markdown":
+                    line = f"**{role.capitalize()}**: {content}\n"
+                    if images_dicts and not suppress_images:
+                        for img in images_dicts:
+                            url = f"![Image](data:image/jpeg;base64,{img['data']})" if img['type']=='base64' else f"![Image]({img['data']})"
+                            line += f"\n{url}\n"
+                    messages.append(line)
 
             if _scratchpad and idx == last_user_idx:
                 scratch_content = f"== TOOL OUTPUT SCRATCHPAD ==\n{_scratchpad}\n== END SCRATCHPAD =="
