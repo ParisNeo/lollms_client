@@ -1739,6 +1739,9 @@ class ChatMixin:
             "Do not promise an action in one turn and expect the system to execute it. If you need another round to perform work, you MUST emit the tag that triggers that work.\n"
             "3. **NO HOLLOW PROMISES**: If you finish your generation without emitting a functional tag, the system will terminate your turn and no action will occur. "
             "You will lose the ability to continue the task. Therefore, NEVER end your turn with a promise to do something later. Either do it NOW via the tag, or tell the user you cannot do it.\n"
+            "4. **SAME-SESSION CONTINUATION (MULTI-TURN CHAINS)**: When you are executing a sequence of actions across multiple turns (e.g., testing tools one by one), "
+            "you MUST emit the next action's tag in your IMMEDIATE NEXT response. Do NOT wait for the user to prompt you again. The system preserves your exact execution path, "
+            "so you have full visibility of the previous tool results. If you state 'Now testing tool_X...', the VERY NEXT token you generate MUST be `<tool>{\"name\": \"tool_X\"...}`.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
             "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON output (e.g., {\"success\": true, \"output\": ...}), "
             "this is a **RESULT**, NOT a new tool call. Do **NOT** re-execute or re-emit the same tool call.\n"
@@ -3401,11 +3404,28 @@ class ChatMixin:
                 "cancelled": True
             }
         else:
+            # ── 🧠 DUAL-COPY PERSISTENCE PROTOCOL ──
+            # If this turn involved multiple agentic steps (tool calls or artifact dispatches),
+            # we persist the FULL virtual_history into the message metadata.
+            # This allows the next turn's export() to reconstruct the exact KV-cache state
+            # so the LLM can continue multi-turn sequences without losing the path.
+            has_virtual_history = len(virtual_history) > 0 and (
+                any(vh.sender_type == "user" and "<tool_result" in (vh.content or "") for vh in virtual_history)
+                or any(vh.sender_type == "assistant" and "<tool" in (vh.content or "") for vh in virtual_history)
+            )
+
             ai_msg.metadata = {
                 "mode": "agentic" if tool_calls_this_turn else "direct",
                 "tool_calls": tool_calls_this_turn,
-                "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])]
+                "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])],
             }
+
+            if has_virtual_history:
+                # Store the virtual history as a list of serializable dicts
+                ai_msg.metadata["virtual_history"] = [
+                    {"sender_type": vh.sender_type, "content": vh.content}
+                    for vh in virtual_history
+                ]
 
         if remove_thinking_blocks:
             ai_msg.content = self.lollmsClient.remove_thinking_blocks(ai_msg.content)
@@ -3451,11 +3471,16 @@ class ChatMixin:
                 trace_exception(ex)
 
         # Update metadata for alternating exports
+        # CRITICAL: Preserve virtual_history if it was set in the cancellation/non-cancellation block above.
+        # We only update the mode and counts here to avoid overwriting the persisted virtual history.
+        existing_virtual_history = ai_msg.metadata.get("virtual_history")
         ai_msg.metadata = {
             "mode": "agentic" if tool_calls_this_turn else "direct",
             "tool_calls": tool_calls_this_turn,
             "artefacts_modified": [a.get("title") for a in (ss.affected_artefacts if ss else [])]
         }
+        if existing_virtual_history:
+            ai_msg.metadata["virtual_history"] = existing_virtual_history
 
         # Auto dream
         dream_report = None
