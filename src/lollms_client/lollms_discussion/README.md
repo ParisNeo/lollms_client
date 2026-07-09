@@ -109,6 +109,44 @@ flowchart TD
     * **Feedback**: Sanitizes tool output (strips base64 blobs) and feeds back to LLM.
     4.  **Termination**: Commits DB, resets cancellation flags.
 
+#### 🧠 2.1 Multi-Turn Context Amnesia & Dual-Copy Persistence
+
+A critical challenge in agentic loops is **Multi-Turn Context Amnesia**. When an LLM executes a sequence of actions across multiple turns (e.g., testing 19 tools sequentially), the standard sanitization of historical messages (stripping `<processing>` blocks and raw XML) erases the exact execution path. On the next turn, the LLM loses its place in the sequence, causing it to repeat tools or halt prematurely.
+
+To solve this, the `ChatMixin` implements the **Dual-Copy Virtual History Persistence Protocol**:
+
+1.  **Dual-Copy Storage**: For any assistant message involving multi-step tool calls, the system stores two copies:
+    *   **UI Content (`ai_msg.content`)**: The sanitized, user-facing text containing conversational summaries and `<processing>` execution blocks.
+    *   **Virtual History (`ai_msg.metadata["virtual_history"]`)**: The raw, unsanitized alternation of assistant text (including `<tool>` tags) and user tool results (`<tool_result>` payloads).
+
+2.  **Context Splicing during `export()`**:
+    When building the context for the LLM in the *next* turn, `UtilsMixin.export()` checks the metadata of historical assistant messages. If a message contains persisted `virtual_history` AND no active `virtual_history` is being built for the current turn, the sanitized `ai_msg.content` is **discarded** and replaced with the raw virtual history alternation.
+    *   This ensures the LLM sees the exact `<tool>` tags and `<tool_result>` payloads from the previous turn, maintaining perfect KV-cache alignment.
+    *   Only the *immediately preceding* turn retains its full virtual history; older turns are aggressively stripped to save tokens.
+
+```mermaid
+flowchart TD
+    A[Turn N: User asks to test tools] --> B[ChatMixin executes Tool 1, Tool 2]
+    B --> C{Turn N ends with tool calls?}
+    C -- Yes --> D[Persist virtual_history to ai_msg.metadata]
+    C -- No --> E[Standard sanitized save]
+    D --> F[Turn N+1: User asks to continue]
+    F --> G[export() builds context]
+    G --> H{Did previous AI msg have virtual_history?}
+    H -- Yes --> I[Splice raw virtual_history into context]
+    H -- No --> J[Use standard sanitized content]
+    I --> K[LLM sees exact execution path and continues correctly]
+```
+
+#### 🚦 2.2 Same-Session Continuation Mandate
+
+To complement the Dual-Copy protocol, the system prompt explicitly enforces a **Same-Session Continuation** mandate. The LLM is instructed that when it states an intent to perform a sequence of actions (e.g., "Now testing tool_X..."), it MUST emit the corresponding functional tag (`<tool>`, `<artifact>`) in its immediate next response.
+
+The system prompt includes the following directive:
+> **SAME-SESSION CONTINUATION (MULTI-TURN CHAINS)**: When you are executing a sequence of actions across multiple turns (e.g., testing tools one by one), you MUST emit the next action's tag in your IMMEDIATE NEXT response. Do NOT wait for the user to prompt you again. The system preserves your exact execution path, so you have full visibility of the previous tool results. If you state 'Now testing tool_X...', the VERY NEXT token you generate MUST be `<tool>{"name": "tool_X"...}`.
+
+This combination of architectural persistence (Dual-Copy) and explicit cognitive instruction (Same-Session Mandate) ensures robust multi-turn tool chaining without context loss.
+
 ### The `chat()` Method API
 
 The `chat()` method is the primary entry point for interacting with the LollmsDiscussion session. It orchestrates the entire agentic loop, including pre-hydration, multi-step reasoning, tool execution, and self-healing file restoration.
