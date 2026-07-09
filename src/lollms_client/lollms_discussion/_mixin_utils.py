@@ -78,9 +78,16 @@ class UtilsMixin:
             return "" if format_type in ["lollms_text","markdown"] else []
         branch = self.get_branch(branch_tip_id)
 
-        # Exclude the last message from the branch if it's an assistant message
+        # Exclude the last message from the branch if it's an EMPTY assistant message 
+        # (representing the active, currently-building AI response for this turn).
+        # If it has content or persisted virtual_history, it is a historical message 
+        # from a completed turn and MUST be preserved for context splicing.
         if branch and branch[-1].sender_type == 'assistant':
-            branch = branch[:-1]
+            last_msg = branch[-1]
+            is_empty_building_msg = not last_msg.content.strip()
+            has_persisted_vh = isinstance(last_msg.metadata, dict) and bool(last_msg.metadata.get("virtual_history"))
+            if is_empty_building_msg and not has_persisted_vh:
+                branch = branch[:-1]
             
         system_prompt_part = (system_prompt_override or self._system_prompt or "").strip()
         data_zone_part     = self.get_full_data_zone()
