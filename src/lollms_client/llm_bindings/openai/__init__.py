@@ -878,6 +878,8 @@ class OpenAIBinding(LollmsLLMBinding):
         """
         if model_name is None:
             model_name = self.model_name
+            if model_name is None:
+                return 0
 
         # Default context sizes (update as needed)
         context_map = {
