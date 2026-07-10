@@ -2150,6 +2150,13 @@ class ChatMixin:
 
             ss.flush_remaining_buffer()
 
+            # ── 🛑 ARTIFACT LOOP ENFORCEMENT ──
+            # If we previously flagged a force-final-answer due to an artifact loop,
+            # and the LLM attempts to dispatch another artifact, we instantly break the loop.
+            if getattr(self, "_force_final_answer", False) and ss.was_action_dispatched() and not ss.tool_trigger:
+                ASCIIColors.warning("[ChatMixin] LLM attempted artifact dispatch after force-final-answer. Breaking loop.")
+                break
+
             # ── 🛑 EMPTY-RESPONSE GUARD (CRITICAL) ──
             # If the LLM generated zero tokens (or only whitespace/processing blocks),
             # we must break the loop immediately to prevent an infinite empty-generation cycle.
@@ -2206,13 +2213,16 @@ class ChatMixin:
                     action_type = last_art.get("type", "artifact")
                     action_title = last_art.get("title", "")
 
-                # Inject a system marker into a new user message to confirm the action and force continuation
-                # CRITICAL: Include the artifact title so the LLM knows exactly which file was created.
+                # 🧠 CONTEXTUAL ANCHORING PROTOCOL
+                # Instead of passively saying "action completed", we explicitly anchor the LLM
+                # to the artifact it just created and the user's original request. This prevents
+                # the LLM from re-emitting the same artifact due to context amnesia.
                 title_str = f" '{action_title}'" if action_title else ""
                 system_marker = (
-                    f"[SYSTEM: The {action_type}{title_str} has been successfully created/updated and is now available in the workspace. "
-                    f"You may now continue your task. If you need to execute a tool or write another artifact, do so now. "
-                    f"If you have completed the task, provide your final conversational answer to the user.]"
+                    f"[SYSTEM: The {action_type}{title_str} has been successfully created and saved to the workspace. "
+                    f"You have already fulfilled the user's request. "
+                    f"You MUST NOT create or update this artifact again. "
+                    f"You MUST now provide your final conversational answer to the user, explaining what you have done.]"
                 )
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
