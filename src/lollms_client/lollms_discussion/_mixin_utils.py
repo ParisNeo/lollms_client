@@ -543,29 +543,6 @@ class UtilsMixin:
                 )
             prev_role = role
 
-        # ── DEBUG LOGGING: Log message roles after normalization ───────────
-        discussion_logger.info("AFTER normalization:")
-        for i, msg in enumerate(normalized):
-            role = msg.get("role", "unknown")
-            content_preview = ""
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_parts = [item.get("text", "")[:50] for item in content if item.get("type") == "text"]
-                content_preview = " | ".join(text_parts)[:100]
-            else:
-                content_preview = str(content)[:100]
-            discussion_logger.info(f"  [{i}] role={role} | content_len={len(content_preview)} | preview={content_preview!r}")
-        discussion_logger.info(f"[OpenAI Export] Total messages after: {len(normalized)}")
-
-        # ── DEBUG LOGGING: Verify system message is at beginning ───────────
-        if normalized and normalized[0].get("role") != "system":
-            discussion_logger.error(
-                f"[OpenAI Export] CRITICAL: First message role is '{normalized[0].get('role')}', "
-                f"NOT 'system'. This will cause 'System message must be at the beginning' error."
-            )
-        else:
-            discussion_logger.info("[OpenAI Export] System message correctly positioned at beginning.")
-
         return normalized
     
 
