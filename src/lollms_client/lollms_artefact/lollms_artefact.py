@@ -819,21 +819,23 @@ class ArtefactManager:
         logical_content = merged_extra.pop("logical_content", latest.get("logical_content"))
         physical_data = merged_extra.pop("physical_data", latest.get("physical_data"))
 
-        # 🛑 CRITICAL FIX: Content-First Update Doctrine.
+        # 🛑 CRITICAL FIX: Content-First Update Doctrine (All DATA Artifacts).
         # The _get_all_raw() method strips physical_data (bytes) before returning records to prevent
         # JSON serialization crashes. This means latest.get("physical_data") is ALWAYS None.
         # If we don't rehydrate the physical bytes here, add() receives physical_data=None.
         # _sync_to_disk_workspace then falls back to writing the string content (the .lam schema text)
-        # directly to the physical file, overwriting the raw data (binary .db or text .csv) with schema text.
+        # directly to the physical file, overwriting the raw binary data with schema text.
+        #
+        # This doctrine applies to ALL DATA artifacts (binary .db AND text .csv).
+        # If `new_content` is explicitly provided, we assume it IS the new raw physical data.
+        # We encode it to bytes and write it to disk immediately.
+        # If `new_content` is NOT provided (e.g., only updating logical_content), we rehydrate
+        # from the existing file on disk to preserve the raw bytes.
         if physical_data is None and latest.get("type") == ArtefactType.DATA:
             file_ext = latest.get("file_ext", "")
-            is_binary_db = file_ext in (".db", ".sqlite", ".sqlite3")
 
-            # If new_content is explicitly provided AND this is a text-based data file (not binary DB),
-            # the new_content IS the raw physical data. We encode it to bytes and write it to disk
-            # immediately. This prevents the "phantom revert" where old bytes are read from disk
-            # and passed to add(), creating a duplicate version with the old content.
-            if new_content is not None and not is_binary_db:
+            # If new_content is explicitly provided, it is the new raw physical data.
+            if new_content is not None:
                 try:
                     physical_data = new_content.encode("utf-8")
                     
@@ -854,8 +856,9 @@ class ArtefactManager:
                 except Exception as e:
                     ASCIIColors.warning(f"[ArtefactManager] Failed to write new content during update: {e}")
 
-            # Fallback: If no new_content or it's a binary DB, rehydrate from the existing file on disk.
-            # This preserves the raw bytes for binary databases where new_content is a schema string.
+            # Fallback: If no new_content, rehydrate from the existing file on disk.
+            # This preserves the raw bytes for binary databases where new_content is a schema string,
+            # and for text-based data files where new_content is also a schema string.
             if physical_data is None:
                 try:
                     if getattr(self._discussion, "workspace_data_path", None):
@@ -1532,30 +1535,17 @@ class ArtefactManager:
                 versioned_data = workspace_dir.parent / "artefacts_metadata" / art_id / f"{title.replace('.csv','')}_v{version}{file_ext}"
                 dest = workspace_dir / f"{title}{file_ext}"
                 
-                # 🛑 CRITICAL FIX: Only copy the versioned twin to the workspace if:
-                # 1. The versioned twin exists, AND
-                # 2. The destination file does NOT exist, OR the destination is OLDER than the versioned twin.
-                # This prevents overwriting a freshly-updated active file with a stale versioned twin,
-                # which was causing the "phantom revert" bug (v6 containing old content).
-                should_copy = False
-                if versioned_data.exists():
-                    if not dest.exists():
-                        should_copy = True
-                    else:
-                        try:
-                            versioned_mtime = versioned_data.stat().st_mtime
-                            dest_mtime = dest.stat().st_mtime
-                            if versioned_mtime > dest_mtime:
-                                should_copy = True
-                        except Exception:
-                            should_copy = True
-                
-                if should_copy:
+                # 🛑 CRITICAL FIX: Only copy the versioned twin to the workspace if the active file does NOT exist.
+                # The `update()` and `add()` methods already call `_sync_to_disk_workspace()` which writes the
+                # new content to both the active file and the versioned twin simultaneously.
+                # Therefore, if the active file exists, it is already in sync with the versioned twin.
+                # Copying the versioned twin over it risks overwriting a freshly updated active file with a stale
+                # versioned twin if the filesystem mtime resolution is too coarse (e.g., NTFS ~15ms).
+                if versioned_data.exists() and not dest.exists():
                     import shutil
                     shutil.copy(str(versioned_data), str(dest))
-                    if str(dest.resolve()) not in synced_files:
-                        synced_files.append(str(dest.resolve()))
-                elif dest.exists() and str(dest.resolve()) not in synced_files:
+                
+                if dest.exists() and str(dest.resolve()) not in synced_files:
                     synced_files.append(str(dest.resolve()))
                 continue
 
