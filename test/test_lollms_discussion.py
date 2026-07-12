@@ -36,6 +36,48 @@ def mock_lollms_client():
 
     return client
 
+
+class BranchingMockClient:
+    """
+    Mock client that streams deterministic responses and captures the exact
+    message list passed to generate_from_messages so we can assert which
+    conversational branch the LLM actually saw.
+    """
+    def __init__(self):
+        self.llm = self
+        self.ai_name = "Assistant"
+        self.model_name = "mock-branching-model"
+        self.binding_name = "mock-branching"
+        self._turn = 0
+        self.captured_messages = None
+
+    def count_tokens(self, text: str) -> int:
+        return len(str(text).split())
+
+    def count_image_tokens(self, img) -> int:
+        return 75
+
+    def remove_thinking_blocks(self, text: str) -> str:
+        return text
+
+    def generate_text(self, prompt: str, **kwargs) -> str:
+        return "ok"
+
+    def generate_structured_content(self, prompt: str, schema: dict, **kwargs) -> dict:
+        return {"title": "Mock"}
+
+    def reset_cancel(self):
+        pass
+
+    def generate_from_messages(self, messages: list, **kwargs) -> str:
+        self.captured_messages = messages
+        self._turn += 1
+        callback = kwargs.get("streaming_callback")
+        response = f"Branch response {self._turn}"
+        if callback:
+            callback(response, MSG_TYPE.MSG_TYPE_CHUNK, {})
+        return response
+
 @pytest.fixture
 def db_manager(tmp_path):
     """Creates a LollmsDataManager with a temporary database."""
