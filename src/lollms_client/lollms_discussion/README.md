@@ -65,28 +65,38 @@ flowchart TD
     Init --> Loop{Round < Max?}
     
     Loop -- Yes --> Gen[LLM Generates via _StreamState]
-    Gen --> HasTool{ss.tool_trigger?}
+    Gen --> StripDone[Strip &lt;done/&gt; from content]
+    StripDone --> DoneDetected{&lt;done/&gt; detected?}
     
-    HasTool -- No --> CheckIntent{Pending Tool Intent?}
+    DoneDetected -- Yes --> End([End Chat])
     
-    %% Intent Check Branch
-    CheckIntent -- Yes --> InjectCorrection[Inject correction to virtual_history]
-    InjectCorrection --> Loop
+    DoneDetected -- No --> HasTool{ss.tool_trigger?}
     
-    %% Finalization Branch
-    CheckIntent -- No --> Finalize[Save Gist to ai_msg, Break Loop]
-    Finalize --> End([End Chat])
+    HasTool -- Yes --> ExecTool[Execute Tool, Inject Result + Mandate]
+    ExecTool --> Loop
     
-    %% Tool Execution Branch
-    HasTool -- Yes --> AppendVA[Append raw text as virtual assistant msg]
-    AppendVA --> Exec[Execute Tool, Stream UI processing block]
-    Exec --> AppendVU[Append tool result as virtual user msg]
-    AppendVU --> Loop
+    HasTool -- No --> HasAction{ss.was_action_dispatched?}
     
-    %% Max Rounds Branch
-    Loop -- No --> ForceFinal[Force final answer without tool calls]
+    HasAction -- Yes --> InjectAction[Inject Action Success + Mandate]
+    InjectAction --> Loop
+    
+    HasAction -- No --> IsRound1{Round == 1?}
+    IsRound1 -- Yes --> End
+    IsRound1 -- No --> InjectRemind[Inject 'Continue or &lt;done/&gt;' Mandate]
+    InjectRemind --> Loop
+    
+    Loop -- No --> ForceFinal[Force final answer]
     ForceFinal --> End
 ```
+
+### The `<done/>` Termination Protocol
+
+The agentic loop no longer relies on fragile heuristics (like intent detection) to decide when to terminate. Instead, the LLM is given explicit control via the `<done/>` tag.
+
+1.  **Round 1 Short-Circuit**: If the LLM generates pure conversational text without any functional tags (`<tool>`, `<artifact>`) on the first round, the loop breaks immediately. This is a standard conversational response.
+2.  **Action Continuation**: If the LLM emits a functional tag, the action is executed. The result is injected into `virtual_history` along with a mandate: "When you think you finished your task, issue a final conversational text and end it with a `<done/>` tag."
+3.  **Explicit Termination**: The loop only breaks if the LLM emits `<done/>` on a new line, or if `max_reasoning_steps` is reached. The `<done/>` tag is stripped from `ai_msg.content` before saving so it never appears in the UI.
+4.  **Continuation Mandate**: If the LLM stops generating without `<done/>` and without dispatching an action (and it's not round 1), a system message is injected reminding it to either continue working or emit `<done/>`.
 
 ### Detailed Phase Breakdown
 
@@ -95,18 +105,18 @@ flowchart TD
     * RAG Injection (if personality has data).
     * **Dynamic Tool Mounting**: If data files exist in workspace, `semantic_data_engineer` is auto-mounted.
 2.  **Context Assembly**:
-    * System Prompt + Rules.
+    * System Prompt + Rules (including `<done/>` protocol instructions).
     * **Active Artefacts**: Injects `.lam` content (Logical Twins) for all active files.
     * Memory Handles.
 3.  **Reasoning Loop** (Max 20 steps):
     * **LLM Generation**: Streams tokens to `_StreamState`.
-    * **Stream Parsing**: Intercepts closed XML tags (`<artifact>`, `<tool>`) instantly.
+    * **Stream Parsing**: Intercepts closed XML tags (`<artifact>`, `<tool>`, `<done/>`) instantly.
     * **Tool Execution**:
         * **CWD Switch**: Changes OS Current Working Directory to `data_workspace/discussions/{id}/`.
         * **Sync**: Ensures all active artifacts exist on disk.
         * **Run**: Executes Python function.
         * **Post-Scan**: Detects NEW files created by tool → Auto-registers as Artefacts.
-    * **Feedback**: Sanitizes tool output (strips base64 blobs) and feeds back to LLM.
+    * **Feedback**: Sanitizes tool output (strips base64 blobs) and feeds back to LLM with the `<done/>` mandate.
     4.  **Termination**: Commits DB, resets cancellation flags.
 
 #### 🧠 2.1 Multi-Turn Context Amnesia & Dual-Copy Persistence
