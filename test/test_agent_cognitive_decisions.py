@@ -114,16 +114,8 @@ class MockGemmaAgentClient:
             return reply
 
         # ── Test Scenario B: Surgical Implementation (Plan + Patch) ──
-        if "[system: the" in prompt_text_lower and "has been successfully created/updated" in prompt_text_lower:
-            if "math_ops.py" in prompt_text_lower or "safe_divide" in prompt_text_lower:
-                reply = "I have successfully updated math_ops.py with the safe_divide function."
-                if callback:
-                    callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
-                    return reply
-
-        if "math_ops.py" in prompt_text_lower or "safe_divide" in prompt_text_lower:
-            # Simulate the spinoff agent returning the artifact directly
-            # The ChatMixin will process this and apply the patch
+        # Round 1: User asks to update math_ops.py. Emit the surgical patch artifact.
+        if "math_ops.py" in prompt_text_lower and "safe_divide" in prompt_text_lower and "tool_result" not in prompt_text_lower and "[system:" not in prompt_text_lower:
             reply = (
                 '<artifact name="math_ops.py" type="code" language="python">\n'
                 "<<<<<<< SEARCH\n"
@@ -142,6 +134,21 @@ class MockGemmaAgentClient:
             if callback:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
+
+        # Round 2: Artifact was saved in Round 1, ChatMixin injected system marker.
+        if "[system: the" in prompt_text_lower and "has been successfully created" in prompt_text_lower:
+            if "math_ops.py" in prompt_text_lower or "safe_divide" in prompt_text_lower:
+                reply = "I have successfully updated math_ops.py with the safe_divide function."
+                if callback:
+                    callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+                    return reply
+
+        # Fallback for Round 2 if the marker is slightly different
+        if "math_ops.py" in prompt_text_lower and "has been successfully" in prompt_text_lower and "tool_result" not in prompt_text_lower:
+            reply = "I have successfully updated math_ops.py with the safe_divide function."
+            if callback:
+                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+                return reply
 
         # ── Test Scenario D: Arbitrary Python Code Execution ──
         # Round 2: Tool has been executed, result is in history. Emit final answer.
@@ -179,7 +186,7 @@ class MockGemmaAgentClient:
         # Emit the tool call to execute the script.
         # CRITICAL FIX: The ChatMixin now includes the artifact title in the system marker.
         # We check for the marker and the artifact title to prevent collision with Scenario B.
-        if "[system: the" in prompt_text_lower and "has been successfully created/updated" in prompt_text_lower and "query.py" in prompt_text_lower:
+        if "[system: the" in prompt_text_lower and "has been successfully created" in prompt_text_lower and "query.py" in prompt_text_lower:
             reply = '<tool>{"name": "tool_execute_python_data_query", "parameters": {"code": "query.py"}}</tool>'
             if callback:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
