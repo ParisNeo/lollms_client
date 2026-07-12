@@ -1333,6 +1333,39 @@ answer = agent.generate_with_tools_sync(
 print(answer)  # Just the final response string
 ```
 
+### Multi-Binding Mounting
+
+You can mount multiple bindings for the same modality (e.g., a fast local model and a powerful cloud model) and switch between them dynamically during runtime.
+
+```python
+from lollms_client import LollmsClient
+
+lc = LollmsClient(
+    llm_binding_name="openai",
+    llm_binding_config={
+        "model_name": "gpt-4o",
+        "service_key": "your-openai-api-key"
+    },
+    extra_llms={
+        "local_fast": {
+            "binding_name": "ollama",
+            "binding_config": {"host_address": "http://localhost:11434", "model_name": "llama3.2"}
+        }
+    }
+)
+
+# Use the master binding (openai)
+response1 = lc.generate_text("Explain quantum physics.")
+
+# Switch to the local extra binding
+lc.mount_llm("local_fast")
+response2 = lc.generate_text("Write a haiku about coding.")
+
+# Switch back to master
+lc.mount_llm("master")
+```
+This feature is supported for all modalities (`extra_ttis`, `extra_tts`, `extra_stts`, `extra_ttvs`, `extra_ttms`) with corresponding `mount_tti()`, `mount_tts()`, etc., methods.
+
 ## Using LoLLMs Client with Different Bindings
 
 `lollms-client` supports a wide range of LLM backends through its binding system. This section provides practical examples of how to initialize `LollmsClient` for each of the major supported bindings.
