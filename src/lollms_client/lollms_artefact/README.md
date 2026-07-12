@@ -83,7 +83,74 @@ The chat interface interprets custom tags inserted into the message history:
 
 ---
 
+## ✏️ 6. Updating Artefact Content
+
+You can modify the content of an existing artefact using the `update()` method. By default, this creates a new version in the database, preserving the history of previous states.
+
+```python
+art = discussion.artefacts.update(
+    title="analysis_script.py",
+    new_content="import pandas as pd\nprint('new code')",
+    commit_message="Refactored import logic"
+)
+```
+
+### Overwriting the Current Version
+
+If you want to update the content without creating a new version history entry, you can set `create_new_version=False`. This will overwrite the content of the current active version.
+
+```python
+art = discussion.artefacts.update(
+    title="temp_notes.md",
+    new_content="Updated temporary notes without version bump.",
+    create_new_version=False
+)
+```
+
+---
+
+## ⚠️ 7. Import Conflict Resolution
+
+When importing files into the artefact system, there is a possibility of title collisions (e.g., importing `README.md` from two different sources). The `import_file` method provides an `on_conflict` parameter to define the resolution strategy.
+
+### Strategies
+
+1. **`suffix` (Default)**
+   - **Behavior**: If an artifact with the target title already exists, the new file is renamed with an incrementing suffix (e.g., `README_1.md`, `README_2.md`).
+   - **Use Case**: Preserving all imported files without losing any data or altering the original artifact.
+   - **Result**: Creates a new artifact with the suffixed title. The original artifact remains untouched.
+
+2. **`version`**
+   - **Behavior**: The existing artifact is updated, and its version number is incremented. The physical file is overwritten with the new content, but the previous version is preserved in the database history.
+   - **Use Case**: Importing an updated version of a file where you want to maintain a clear audit trail of changes.
+   - **Result**: Updates the existing artifact and bumps the version (e.g., v1 → v2).
+
+3. **`overwrite`**
+   - **Behavior**: The existing artifact's content is replaced with the new content, but the version number is **not** incremented. Previous version history is preserved, but the active version is silently replaced.
+   - **Use Case**: Correcting or silently updating a file without polluting the version history.
+   - **Result**: Updates the existing artifact. The version number remains the same.
+
+4. **`replace`**
+   - **Behavior**: Completely purges all existing versions and history of the artifact, then creates a fresh `v1` baseline with the new content.
+   - **Use Case**: Starting over cleanly when the previous iterations are no longer relevant or were imported in error.
+   - **Result**: Deletes all previous database records and physical metadata, then creates a new `v1` artifact.
+
+### Example
+
+```python
+# Import a file, replacing any existing artifact with the same name completely
+discussion.import_file(
+    path="path/to/new/README.md",
+    mode="text",
+    title="README.md",
+    on_conflict="replace"
+)
+```
+
+---
+
 ## 🛠️ 4. Dynamic Tool Artefacts (`type="tool"`)
+
 
 The artefact system natively supports the LLM generating its own executable tools. When the LLM creates an artefact with `type="tool"`, the `ArtefactManager` attempts to register it dynamically.
 
