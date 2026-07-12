@@ -782,15 +782,19 @@ class CoreMixin:
                                 ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
                                 ".zip", ".tar", ".gz", ".pdf", ".docx"}
 
-        _IGNORED_SYNC_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "env", ".env"}
-        _IGNORED_SYNC_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".lam", ".log"}
+        _IGNORED_SYNC_DIRS = {"__pycache__", ".venv", "venv", ".git", ".idea", ".vscode", "node_modules", ".lollms", "build", "dist", ".next", "env", ".env", ".hidden_folder"}
+        _IGNORED_SYNC_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".lam"} # Removed .log to allow tool outputs to be ingested
 
         for f_path in workspace_dir.rglob("*"):
             if not f_path.is_file():
                 continue
 
             # Skip files in ignored directories (e.g., ./__pycache__/file.pyc)
-            if any(part in _IGNORED_SYNC_DIRS for part in f_path.parts):
+            # CRITICAL FIX: Check relative parts to robustly catch nested hidden folders
+            rel_parts = f_path.relative_to(workspace_dir).parts
+            if any(part in _IGNORED_SYNC_DIRS for part in rel_parts):
+                continue
+            if any(part.startswith(".") for part in rel_parts[:-1]): # Ignore files inside any hidden directory
                 continue
 
             file_name = f_path.name
