@@ -78,8 +78,24 @@ _SECONDARY_TAG_MAP = {
     "<think>":        ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
     "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
     "<unlock_file":   ("context_unlock",      MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</unlock_file>"),
-    "<lock_file":     ("context_lock",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</lock_file>"),
-    "<hide_file":     ("context_hide",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</hide_file>"),
+    "lock_file":     ("context_lock",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</lock_file>"),
+    "hide_file":     ("context_hide",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</hide_file>"),
+}
+
+_SECONDARY_TAG_MAP = {
+    "<artifact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artifact>"),
+    "<artefact":      ("artifact_update",     MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</artefact>"),
+    "<note":          ("note_start",          MSG_TYPE.MSG_TYPE_NOTE_CHUNK,     MSG_TYPE.MSG_TYPE_NOTE_DONE,         "</note>"),
+    "<skill":         ("skill_start",         MSG_TYPE.MSG_TYPE_SKILL_CHUNK,    MSG_TYPE.MSG_TYPE_SKILL_DONE,        "</skill>"),
+    "<lollms_inline": ("inline_widget_start", MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,   MSG_TYPE.MSG_TYPE_WIDGET_DONE,       "</lollms_inline>"),
+    "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_FORM_READY,     MSG_TYPE.MSG_TYPE_FORM_READY,        "</lollms_form>"),
+    "<mem_new":       ("memory_new",          MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_new>"),
+    "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
+    "":        ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              ""),
+    "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              ""),
+    "<unlock_file":   ("context_unlock",      MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</unlock_file>"),
+    "<lock_file":     ("context_lock",        MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</lock_file>"),
+    "<hide_file":     ("context_hide",        MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</hide_file>"),
 }
 
 
@@ -491,6 +507,7 @@ class _StreamState:
         enable_in_message_status: bool = True,
         content_offset: int = 0,
         fast_artefact_replicas: Optional[List[str]] = None,
+        processed_tags: Optional[set] = None,
     ):
         self.discussion = discussion
         self.callback = callback
@@ -513,17 +530,26 @@ class _StreamState:
         self.forward_artefact_chunks = forward_artefact_chunks
         self.artefact_tracker = _ArtefactStreamTracker()
 
-        self.processed_tags = set()
-
         # Track context unlock requests to force continuation round
         self.context_unlock_requested = False
         self.context_unlocked_files: List[str] = []
+
+        # CRITICAL FIX: Initialize processed_tags from the persistent reference.
+        self.processed_tags = processed_tags if processed_tags is not None else set()
 
         self._is_accumulating_tool = False
         self._tool_buffer = ""
         self._artefact_buffer = ""  # Dedicated buffer for raw artifact content
         self._artefact_open_tag = "" # Stores the exact opening tag (e.g., <artifact name="x">)
         self._pending_buffer = ""   # Shadow buffer to safely catch partial tags
+
+        self._in_code_fence = False
+        self._code_fence_buffer = ""
+        self._in_inline_code = False  # CRITICAL FIX: Track single backtick state across chunks
+
+        # CRITICAL FIX: processed_tags must be passed in from ChatMixin
+        # to persist across multiple reasoning rounds and prevent duplicate dispatch.
+        self.processed_tags = processed_tags if processed_tags is not None else set()
 
         # ── ONE-ACTION-PER-TURN PROTOCOL ──
         # Ensures generation halts immediately after dispatching a single functional tag.
@@ -598,12 +624,107 @@ class _StreamState:
         # ── 🛑 ANTI-MIMICRY: Prevent LLM from generating <processing> blocks ──
         # The <processing> tag is strictly system-generated. If the LLM attempts to
         # output it, we halt generation immediately to prevent log hallucination.
-        if "<processing" in self._pending_buffer.lower() and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary:
-            ASCIIColors.warning("[StreamState] LLM attempted to generate a <processing> block. Halting generation.")
-            # Strip the processing tag from the buffer
-            self._pending_buffer = re.sub(r'<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
-            # Halt generation by returning False
-            return False
+        # STRICT: Only trigger if the tag starts at the beginning of a line (ignoring whitespace).
+        if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
+            proc_match = re.search(r'(?m)^\s*<processing', self._pending_buffer, re.IGNORECASE)
+            if proc_match:
+                ASCIIColors.warning("[StreamState] LLM attempted to generate a <processing> block. Halting generation.")
+                self._pending_buffer = re.sub(r'(?m)^\s*<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
+                return False
+
+        # ── 🛡️ MARKDOWN CODE FENCE & INLINE CODE PROTECTION ──
+        # Track ``` and ` to prevent intercepting functional tags inside documentation or tables.
+        if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary:
+            # Handle triple backticks (```...```)
+            if "```" in self._pending_buffer:
+                self._code_fence_buffer += self._pending_buffer
+                self._pending_buffer = ""
+
+                while "```" in self._code_fence_buffer:
+                    idx = self._code_fence_buffer.find("```")
+                    before = self._code_fence_buffer[:idx]
+                    self._code_fence_buffer = self._code_fence_buffer[idx+3:]
+
+                    if not self._in_code_fence:
+                        self._in_code_fence = True
+                        self.ai_message.content += before + "```"
+                        _cb(self.callback, before + "```", MSG_TYPE.MSG_TYPE_CHUNK)
+                    else:
+                        self._in_code_fence = False
+                        self.ai_message.content += "```"
+                        _cb(self.callback, "```", MSG_TYPE.MSG_TYPE_CHUNK)
+
+                if self._in_code_fence:
+                    self.ai_message.content += self._code_fence_buffer
+                    _cb(self.callback, self._code_fence_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                    self._code_fence_buffer = ""
+                    return True
+                else:
+                    self._pending_buffer = self._code_fence_buffer
+                    self._code_fence_buffer = ""
+
+            elif self._in_code_fence:
+                self.ai_message.content += self._pending_buffer
+                _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                self._pending_buffer = ""
+                return True
+
+            # Handle single backticks (`...`) - CRITICAL FIX for streaming tables
+            # We must buffer text when a backtick is opened to prevent the tag parser
+            # from intercepting functional tags that appear inside inline code spans.
+            elif "`" in self._pending_buffer:
+                if self._in_inline_code:
+                    # We are inside an inline code span, looking for the closing backtick
+                    idx = self._pending_buffer.find("`")
+                    if idx != -1:
+                        # Closing backtick found
+                        self._in_inline_code = False
+                        inline_content = self._pending_buffer[:idx]
+                        self.ai_message.content += inline_content + "`"
+                        _cb(self.callback, inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._pending_buffer = self._pending_buffer[idx+1:]
+                    else:
+                        # Still inside, emit verbatim
+                        self.ai_message.content += self._pending_buffer
+                        _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._pending_buffer = ""
+                        return True
+                else:
+                    # Not currently in inline code, look for an opening backtick
+                    idx = self._pending_buffer.find("`")
+                    before = self._pending_buffer[:idx]
+                    self._pending_buffer = self._pending_buffer[idx+1:]
+
+                    # Check if the closing backtick is in the remainder of the current buffer
+                    closing_idx = self._pending_buffer.find("`")
+                    if closing_idx != -1:
+                        # Complete inline code span in a single chunk
+                        inline_content = self._pending_buffer[:closing_idx]
+                        self.ai_message.content += before + "`" + inline_content + "`"
+                        _cb(self.callback, before + "`" + inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._pending_buffer = self._pending_buffer[closing_idx+1:]
+                    else:
+                        # Opening backtick found, but no closing backtick yet. Enter inline code mode.
+                        self._in_inline_code = True
+                        self.ai_message.content += before + "`"
+                        _cb(self.callback, before + "`", MSG_TYPE.MSG_TYPE_CHUNK)
+                        return True
+
+            elif self._in_inline_code:
+                # We are inside an inline code span from a previous chunk, looking for the closing backtick
+                idx = self._pending_buffer.find("`")
+                if idx != -1:
+                    self._in_inline_code = False
+                    inline_content = self._pending_buffer[:idx]
+                    self.ai_message.content += inline_content + "`"
+                    _cb(self.callback, inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
+                    self._pending_buffer = self._pending_buffer[idx+1:]
+                else:
+                    # Still inside, emit verbatim
+                    self.ai_message.content += self._pending_buffer
+                    _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                    self._pending_buffer = ""
+                    return True
 
         # ── Tool Accumulation & Interception ──
         if self._is_accumulating_tool:
@@ -637,6 +758,46 @@ class _StreamState:
         last_open_think = self._pending_buffer.rfind("<think")
         last_close_think = self._pending_buffer.rfind("```")
         is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
+
+        # ── 🛡️ INLINE TAG QUARANTINE (CRITICAL FIX) ──
+        # If a functional tag appears in the buffer but is NOT at the absolute start
+        # of a line (ignoring whitespace), it is conversational prose and MUST NOT
+        # be intercepted. We flush all text before it, then consume the tag and
+        # emit it directly to the UI as raw text.
+        if not is_inside_thoughts and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
+            inline_tag_found = False
+            # CRITICAL: Check for exact opening tags (e.g., "<tool>") and tag prefixes with attributes (e.g., "<artifact ")
+            # REMOVED "<lollms_inline" so the host application can handle it directly.
+            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
+                idx = self._pending_buffer.find(tag_prefix)
+                if idx != -1:
+                    # Check if it's at the absolute start of a line
+                    is_at_line_start = True
+                    i = idx - 1
+                    while i >= 0 and self._pending_buffer[i] != '\n':
+                        if not self._pending_buffer[i].isspace():
+                            is_at_line_start = False
+                            break
+                        i -= 1
+
+                    if not is_at_line_start:
+                        # It's an inline tag! Flush text before it, then emit the tag raw.
+                        text_before = self._pending_buffer[:idx]
+                        if text_before:
+                            self.ai_message.content += text_before
+                            _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                        # Emit the tag itself directly to the UI
+                        self.ai_message.content += tag_prefix
+                        _cb(self.callback, tag_prefix, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                        # Consume the processed parts from the pending buffer
+                        self._pending_buffer = self._pending_buffer[idx + len(tag_prefix):]
+                        inline_tag_found = True
+                        break # Restart the feed loop for the rest of the buffer
+
+            if inline_tag_found:
+                return True
 
         # ── Handle <artifact> Streaming (State-Driven Dual-Stream) ──
         if not is_inside_thoughts:
@@ -680,6 +841,10 @@ class _StreamState:
                             body_content.strip(), 
                             full_match_text
                         )
+                    else:
+                        ASCIIColors.warning("[StreamState] Duplicate artifact tag detected. Skipping dispatch.")
+                        self._action_dispatched = True
+                        return False
 
                     # Close the processing block cleanly with status metadata INSIDE the block.
                     proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
@@ -715,10 +880,14 @@ class _StreamState:
             # State 2: We are not inside an artifact, check if we are entering one
             else:
                 # Look for the start of an artifact tag (case-insensitive)
+                # STRICT WHITELIST: Only match if the tag starts at the absolute beginning of a line (ignoring whitespace).
+                # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
+                # to prevent intercepting documentation examples as live functional tags.
                 lower_buffer = self._pending_buffer.lower()
-                open_idx = lower_buffer.find("<artifact")
-                if open_idx == -1:
-                    open_idx = lower_buffer.find("<artefact")
+                # The negative lookahead (?!`) ensures the tag is not immediately preceded by a backtick.
+                # The (?!.*\|) ensures the line is not part of a markdown table (no pipe character after the tag).
+                open_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(?:artifact|artefact)', lower_buffer)
+                open_idx = open_match.start() if open_match else -1
 
                 if open_idx != -1:
                     tag_start_idx = open_idx
@@ -791,6 +960,10 @@ class _StreamState:
                                     body_content.strip(), 
                                     full_match_text
                                 )
+                            else:
+                                ASCIIColors.warning("[StreamState] Duplicate artifact tag detected (inline). Skipping dispatch.")
+                                self._action_dispatched = True
+                                return False
 
                             # Close the processing block cleanly with status metadata.
                             proc_close_tag = f'\n</processing>\n'
@@ -826,7 +999,9 @@ class _StreamState:
 
         # ── Handle <tool> Streaming ──
         if not is_inside_thoughts:
-            open_tool_match = re.search(r'<tool>', self._pending_buffer, re.IGNORECASE)
+            # STRICT WHITELIST: Only match if the <tool> tag starts at the absolute beginning of a line (ignoring whitespace).
+            # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
+            open_tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool>', self._pending_buffer, re.IGNORECASE)
             if open_tool_match:
                 tag_start_idx = open_tool_match.start()
 
@@ -846,14 +1021,109 @@ class _StreamState:
 
                 return True
 
+        # ── Handle <unlock_file>, <lock_file>, <hide_file> Streaming ──
+        # These tags must be intercepted here BEFORE the generic secondary tag interceptor
+        # so they can be routed to the specific context visibility handler in _dispatch_closed_tag.
+        if not is_inside_thoughts and not self._is_accumulating_secondary:
+            lower_buffer = self._pending_buffer.lower()
+            context_tag_entered = False
+            for tag_prefix in ("<unlock_file", "<lock_file", "<hide_file"):
+                pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
+                open_match = re.search(pattern, lower_buffer)
+                if open_match:
+                    open_idx = open_match.start()
+                    end_of_tag_idx = self._pending_buffer.find(">", open_idx)
+                    if end_of_tag_idx != -1:
+                        tag_start_idx = open_idx
+                        opening_tag = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
+                        tag_name_match = re.match(r'<(\w+)', opening_tag)
+                        if tag_name_match:
+                            self._secondary_tag_name = tag_name_match.group(1).lower()
+                            self._secondary_closing_tag = f"</{self._secondary_tag_name}>"
+                            self._secondary_open_tag = opening_tag
+                            self._is_accumulating_secondary = True
+
+                            text_before_tag = self._pending_buffer[:tag_start_idx]
+                            if text_before_tag:
+                                self.ai_message.content += text_before_tag
+                                _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
+
+                            self._secondary_buffer = opening_tag
+                            self._pending_buffer = ""
+                            context_tag_entered = True
+                            break
+                    else:
+                        text_before_partial = self._pending_buffer[:open_idx]
+                        if text_before_partial:
+                            self.ai_message.content += text_before_partial
+                            _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._pending_buffer = self._pending_buffer[open_idx:]
+                        return True
+
+            if context_tag_entered:
+                return True
+
+        # ── Handle Context Tag Body Accumulation & Closing ──
+        # CRITICAL FIX: This block must run if we are accumulating a context tag.
+        # It uses the same logic as the generic secondary tag accumulator but is placed
+        # here to ensure it catches the closing tag immediately.
+        if self._is_accumulating_secondary and self._secondary_tag_name in ("unlock_file", "lock_file", "hide_file"):
+            self._secondary_buffer += self._pending_buffer
+            self._pending_buffer = ""
+
+            close_match = re.search(re.escape(self._secondary_closing_tag), self._secondary_buffer, re.IGNORECASE)
+            if close_match:
+                close_idx = close_match.start()
+                close_len = close_match.end() - close_match.start()
+                
+                body_content = self._secondary_buffer[len(self._secondary_open_tag):close_idx]
+                closing_tag = self._secondary_buffer[close_idx:close_idx+close_len]
+                full_match_text = self._secondary_open_tag + body_content + closing_tag
+
+                self._is_accumulating_secondary = False
+
+                if full_match_text not in self.processed_tags:
+                    self.processed_tags.add(full_match_text)
+                    self._dispatch_closed_tag(
+                        self._secondary_tag_name,
+                        self._secondary_open_tag,
+                        body_content.strip(),
+                        full_match_text
+                    )
+
+                proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
+                self.ai_message.content += proc_close_tag
+                _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+                remaining_text = self._secondary_buffer[close_idx + close_len:]
+                
+                self._secondary_tag_name = ""
+                self._secondary_closing_tag = ""
+                self._secondary_open_tag = ""
+                self._secondary_buffer = ""
+
+                if remaining_text.strip():
+                    self._pending_buffer = remaining_text
+                else:
+                    self._action_dispatched = True
+                    return False
+            else:
+                pass
+            return True
+
         # ── Generic Secondary Tag Interception (<skill>, <note>, <lollms_inline>, etc.) ──
         if not is_inside_thoughts and not self._is_accumulating_secondary:
             # Check if we are ENTERING a secondary tag
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
-            for tag_prefix in ("<skill", "<note", "<lollms_inline", "<lollms_form", "<generate_image", "<edit_image"):
-                open_idx = lower_buffer.find(tag_prefix)
-                if open_idx != -1:
+            # REMOVED "<lollms_inline" so the host application can handle it directly.
+            for tag_prefix in ("<skill", "<note", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
+                # STRICT WHITELIST: Only match if the tag starts at the absolute beginning of a line (ignoring whitespace).
+                # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
+                pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
+                open_match = re.search(pattern, lower_buffer)
+                if open_match:
+                    open_idx = open_match.start()
                     # Check if we have the full opening tag (closing '>')
                     end_of_tag_idx = self._pending_buffer.find(">", open_idx)
                     if end_of_tag_idx != -1:
@@ -912,12 +1182,15 @@ class _StreamState:
             self._secondary_buffer += self._pending_buffer
             self._pending_buffer = ""
 
-            # Check if the closing tag arrived
-            close_idx = self._secondary_buffer.lower().find(self._secondary_closing_tag.lower())
-            if close_idx != -1:
+            # Check if the closing tag arrived (case-insensitive regex search)
+            close_match = re.search(re.escape(self._secondary_closing_tag), self._secondary_buffer, re.IGNORECASE)
+            if close_match:
                 # Closing tag found! Extract the full match.
+                close_idx = close_match.start()
+                close_len = close_match.end() - close_match.start()
+                
                 body_content = self._secondary_buffer[len(self._secondary_open_tag):close_idx]
-                closing_tag = self._secondary_buffer[close_idx:close_idx+len(self._secondary_closing_tag)]
+                closing_tag = self._secondary_buffer[close_idx:close_idx+close_len]
                 full_match_text = self._secondary_open_tag + body_content + closing_tag
 
                 self._is_accumulating_secondary = False
@@ -937,15 +1210,22 @@ class _StreamState:
                 self.ai_message.content += proc_close_tag
                 _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+                # Preserve any text that came after the closing tag
+                remaining_text = self._secondary_buffer[close_idx + close_len:]
+                
                 # Reset secondary state
                 self._secondary_tag_name = ""
                 self._secondary_closing_tag = ""
                 self._secondary_open_tag = ""
                 self._secondary_buffer = ""
 
-                # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
-                self._action_dispatched = True
-                return False
+                if remaining_text.strip():
+                    self._pending_buffer = remaining_text
+                    # Fall through to default processing for the remaining text
+                else:
+                    # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
+                    self._action_dispatched = True
+                    return False
             else:
                 # Still accumulating body. Emit lightweight status if enabled.
                 # (No structural analysis for secondary tags — just suppress raw output)
@@ -957,24 +1237,37 @@ class _StreamState:
         # This prevents raw XML from leaking when the LLM streams tokens with trailing spaces or partial attributes.
         def _ends_with_partial_tag(buffer: str) -> int:
             """Returns the start index of the partial tag if found, else -1."""
-            tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<generate_image", "<edit_image", "<lollms_inline", "<lollms_form"]
+            # REMOVED "<lollms_inline" so the host application can handle it directly.
+            tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<generate_image", "<edit_image", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file"]
+
+            # Helper to check if the start of the line is valid for a tag
+            def _is_at_line_start(buf: str, idx: int) -> bool:
+                if idx == 0:
+                    return True
+                # Walk backwards from idx to the previous newline. All chars must be whitespace.
+                i = idx - 1
+                while i >= 0 and buf[i] != '\n':
+                    if not buf[i].isspace():
+                        return False
+                    i -= 1
+                return True
+
             for tag in tags_to_check:
                 # Check if the buffer ends with a STRICT prefix of the tag (e.g., "<art", "<to")
-                # We must exclude the full tag itself (range stops at len(tag)), otherwise
-                # a complete "<tool>" tag gets trapped here and never reaches the re.search block.
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
-                        # Found a partial match. Return the start index.
-                        return len(buffer) - i
+                        start_idx = len(buffer) - i
+                        if _is_at_line_start(buffer, start_idx):
+                            return start_idx
+                        # If not at start of line, it's not a functional tag. Ignore.
 
             # Fallback: Check for partial tags with trailing spaces or partial attribute names
-            # e.g., "<artifact " or "<artifact n" or "<tool "
             for tag in tags_to_check:
-                # Check if the buffer contains the tag followed by spaces/attributes but no closing '>'
                 idx = buffer.rfind(tag)
                 if idx != -1 and ">" not in buffer[idx:]:
-                    # The tag started but hasn't closed yet. Hold it.
-                    return idx
+                    if _is_at_line_start(buffer, idx):
+                        return idx
+                    # If not at start of line, ignore.
 
             return -1
 
@@ -1260,6 +1553,12 @@ class _StreamState:
         elif tag_name in ("unlock_file", "lock_file", "hide_file"):
             from lollms_client.lollms_artefact import ArtefactVisibility
 
+            # ── CONTEXT BUDGET GUARD ──
+            # Maximum tokens allowed for a single file to be unlocked into context.
+            # Files exceeding this threshold are blocked from FULL visibility to
+            # prevent context overflow and empty-response loops.
+            _MAX_UNLOCK_TOKENS = 50000
+
             # Map tag name to target visibility state
             target_visibility = ArtefactVisibility.FULL
             action_verb = "Unlocking"
@@ -1275,6 +1574,7 @@ class _StreamState:
             processed_files = []
             already_in_state = []
             not_found = []
+            blocked_files = []
 
             for t_file in targets:
                 art = self.discussion.artefacts.get(t_file)
@@ -1282,6 +1582,25 @@ class _StreamState:
                     not_found.append(t_file)
                 elif art.get("visibility") == target_visibility:
                     already_in_state.append(t_file)
+                elif target_visibility == ArtefactVisibility.FULL:
+                    # ── CONTEXT BUDGET CHECK ──
+                    # Check if the file is too large to safely load into context
+                    token_count = art.get("token_count", 0)
+                    content_len = len(art.get("content", ""))
+
+                    # If token_count is 0 or unreliable, estimate from content length
+                    if token_count == 0 and content_len > 0:
+                        token_count = content_len // 4
+
+                    if token_count > _MAX_UNLOCK_TOKENS:
+                        ASCIIColors.warning(
+                            f"[ContextBudgetGuard] Blocked unlock of '{t_file}': "
+                            f"~{token_count:,} tokens exceeds limit of {_MAX_UNLOCK_TOKENS:,}."
+                        )
+                        blocked_files.append((t_file, token_count))
+                    else:
+                        self.discussion.artefacts.set_visibility(t_file, target_visibility)
+                        processed_files.append(t_file)
                 else:
                     self.discussion.artefacts.set_visibility(t_file, target_visibility)
                     processed_files.append(t_file)
@@ -1301,18 +1620,42 @@ class _StreamState:
                 status_parts.append(f"⚠️ Already in target state: {', '.join(already_in_state)}")
             if not_found:
                 status_parts.append(f"❌ Not found: {', '.join(not_found)}")
+            if blocked_files:
+                blocked_desc = "; ".join(
+                    f"{bf} (~{tc:,} tokens)" for bf, tc in blocked_files
+                )
+                status_parts.append(
+                    f"🛑 BLOCKED (too large for context): {blocked_desc}. "
+                    f"Use a tool (SQL query, grep, or Python script) to extract "
+                    f"specific data from this file instead of loading it fully."
+                )
 
             status_line = f"* {action_verb} context files...\n"
             details_block = f"Context Update:\n{'; '.join(status_parts)}\n"
-            status_meta = "failure" if not_found and not processed_files else "success"
+            status_meta = "failure" if (not_found and not processed_files) or blocked_files else "success"
 
-            proc_open = f'\n<processing type="context_update" title="Context Visibility Manager">\n'
+            # The generic secondary tag interceptor already emitted the <processing> opening block.
+            # We just need to append the status content and close the block.
             proc_close = f'{status_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n'
-
-            # Replace the raw XML tag in the AI message with the processing block
-            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_open + proc_close)
-            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            self.ai_message.content += proc_close
             _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+            # ── INJECT CONTEXT BUDGET GUIDANCE INTO VIRTUAL HISTORY ──
+            # If files were blocked, inject a system message so the LLM knows
+            # it must use tools to access that data, not <unlock_file>.
+            if blocked_files:
+                blocked_names = ", ".join(f"`{bf}`" for bf, _ in blocked_files)
+                self.context_unlock_requested = True  # Force continuation so LLM sees the guidance
+                self.context_unlocked_files.extend([bf for bf, _ in blocked_files])
+                # Store the blocked guidance for the continuation prompt
+                if not hasattr(self, '_blocked_files_guidance'):
+                    object.__setattr__(self, '_blocked_files_guidance', [])
+                self._blocked_files_guidance.append(
+                    f"The following files are too large to load into context directly: {blocked_names}. "
+                    f"You MUST use a tool (e.g., SQL query, grep, or execute_python_code) to extract "
+                    f"specific data from these files. Do NOT attempt to <unlock_file> them again."
+                )
+
             return True
 
         return True
@@ -1513,6 +1856,314 @@ class ChatMixin:
 
         ASCIIColors.success(f"[Form] '{form_descriptor.get('title')}' answers injected.")
         return True
+
+    def _sync_tool_artifacts(
+        self,
+        tool_name: str,
+        files_before: Dict,
+        files_after: Dict,
+        callback: Optional[Callable]
+    ) -> None:
+        """
+        Detects new and modified files by diffing before/after workspace snapshots,
+        then registers them as artifacts following the Tool-Generated File Visibility Doctrine.
+        This logic is shared between the direct-callable and LCP dispatch paths.
+        """
+        from pathlib import Path
+        from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactType
+
+        # Detect NEW files
+        new_files = set(files_after.keys()) - set(files_before.keys())
+
+        for rel_path in new_files:
+            file_info = files_after[rel_path]
+            file_name = rel_path.name
+            file_ext = rel_path.suffix.lower()
+            file_path = file_info["path"]
+            file_size = file_path.stat().st_size
+
+            atype = "document"
+            if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+                atype = "code"
+            elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
+                atype = "data"
+            elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
+                atype = "document"
+            elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+                atype = "image"
+
+            EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
+                                    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+                                    ".zip", ".tar", ".gz", ".pdf", ".docx"}
+
+            should_read_content = True
+            content_placeholder = None
+
+            if file_ext in EXPLICIT_BINARY_EXTS:
+                should_read_content = False
+                content_placeholder = (
+                    f"### Data File Generated: `{file_name}`\n\n"
+                    f"This file was created by the tool `{tool_name}`.\n"
+                    f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
+                    f"- **Size**: {file_size:,} bytes\n"
+                    f"- **Location**: `./{file_name}`\n\n"
+                    f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
+                )
+            else:
+                try:
+                    with open(file_path, 'rb') as f:
+                        chunk = f.read(1024)
+                        if b'\x00' in chunk:
+                            should_read_content = False
+                            content_placeholder = (
+                                f"### Binary File Detected: `{file_name}`\n\n"
+                                f"This file appears to be binary (contains null bytes).\n"
+                                f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
+                                f"- **Size**: {file_size:,} bytes\n"
+                                f"- **Location**: `./{file_name}`\n\n"
+                                f"> **Action**: Download from Workspace Artifacts panel."
+                            )
+                        else:
+                            forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
+                            file_info["content"] = forced_content
+                            should_read_content = True
+                except Exception as e:
+                    should_read_content = False
+                    content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
+
+            if not should_read_content and content_placeholder:
+                existing_art = self.artefacts.get(file_name)
+                if existing_art:
+                    art = self.artefacts.update(
+                        title=file_name,
+                        new_content=content_placeholder,
+                        new_type=atype,
+                        active=True,
+                        visibility=ArtefactVisibility.FULL,
+                        commit_message=f"Updated binary file reference by tool '{tool_name}'"
+                    )
+                else:
+                    art = self.artefacts.add(
+                        title=file_name,
+                        artefact_type=atype,
+                        content=content_placeholder,
+                        active=True,
+                        visibility=ArtefactVisibility.FULL,
+                        commit_message=f"Created by tool '{tool_name}'"
+                    )
+                self.commit()
+
+                if atype == "image":
+                    try:
+                        import base64
+                        raw_img = file_path.read_bytes()
+                        img_b64 = base64.b64encode(raw_img).decode('utf-8')
+                        self.artefacts.update(
+                            title=file_name,
+                            new_images=[img_b64],
+                            new_image_media_types=[f"image/{file_ext[1:]}"],
+                            bump_version=False
+                        )
+                        self.commit()
+                        self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
+                    except Exception as ex:
+                        trace_exception(ex)
+
+                if self.active_branch_id:
+                    ai_msg_local = self.get_message(self.active_branch_id)
+                    if ai_msg_local:
+                        tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                        if tag not in ai_msg_local.content:
+                            ai_msg_local.content += f'\n\n{tag}\n'
+                        self.commit()
+                continue
+
+            existing_art = self.artefacts.get(file_name)
+            if existing_art:
+                art = self.artefacts.update(
+                    title=file_name,
+                    new_content=file_info["content"],
+                    new_type=atype,
+                    active=True,
+                    visibility=ArtefactVisibility.FULL,
+                    commit_message=f"Restored by tool '{tool_name}'"
+                )
+            else:
+                art = self.artefacts.add(
+                    title=file_name,
+                    artefact_type=atype,
+                    content=file_info["content"],
+                    active=True,
+                    visibility=ArtefactVisibility.FULL,
+                    commit_message=f"Created by tool '{tool_name}'"
+                )
+            self.commit()
+
+            if self.active_branch_id:
+                ai_msg_local = self.get_message(self.active_branch_id)
+                if ai_msg_local:
+                    tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                    if tag not in ai_msg_local.content:
+                        ai_msg_local.content += f'\n\n{tag}\n'
+                    self.commit()
+
+        # Detect MODIFIED files
+        common_files = set(files_after.keys()) & set(files_before.keys())
+        for rel_path in common_files:
+            before_info = files_before[rel_path]
+            after_info = files_after[rel_path]
+            file_name = rel_path.name
+            file_ext = rel_path.suffix.lower()
+            file_path = after_info["path"]
+
+            mtime_changed = before_info["mtime"] != after_info["mtime"]
+            content_changed = before_info.get("hash") != after_info.get("hash")
+
+            img_b64 = None
+            img_mtypes = None
+
+            if mtime_changed or content_changed:
+                atype = "document"
+                if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
+                    atype = "code"
+                elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
+                    atype = "data"
+                elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
+                    atype = "document"
+                elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
+                    atype = "image"
+
+                EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
+                                        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+                                        ".zip", ".tar", ".gz", ".pdf", ".docx"}
+
+                should_read_content = True
+                content_placeholder = None
+
+                if file_ext in EXPLICIT_BINARY_EXTS:
+                    should_read_content = False
+                    content_placeholder = (
+                        f"### Data File Modified: `{file_name}`\n\n"
+                        f"This file was modified by the tool `{tool_name}`.\n"
+                        f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
+                        f"- **Size**: {file_path.stat().st_size:,} bytes\n"
+                        f"- **Location**: `./{file_name}`\n\n"
+                        f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
+                    )
+                else:
+                    try:
+                        with open(file_path, 'rb') as f:
+                            chunk = f.read(1024)
+                            if b'\x00' in chunk:
+                                should_read_content = False
+                                content_placeholder = (
+                                    f"### Binary File Modified: `{file_name}`\n\n"
+                                    f"This file was modified by the tool `{tool_name}`.\n"
+                                    f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
+                                    f"- **Size**: {file_path.stat().st_size:,} bytes\n"
+                                    f"- **Location**: `./{file_name}`\n\n"
+                                    f"> **Action**: Download from Workspace Artifacts panel."
+                                )
+                            else:
+                                forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
+                                after_info["content"] = forced_content
+                                should_read_content = True
+                    except Exception as e:
+                        should_read_content = False
+                        content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
+
+                if not should_read_content and content_placeholder:
+                    if atype == "image":
+                        try:
+                            import base64 as _b64_mod
+                            raw_img = file_path.read_bytes()
+                            img_b64 = _b64_mod.b64encode(raw_img).decode('utf-8')
+                            img_mtypes = [f"image/{file_ext[1:]}"]
+                        except Exception as ex:
+                            trace_exception(ex)
+
+                    existing_art = self.artefacts.get(file_name)
+                    if existing_art:
+                        art = self.artefacts.update(
+                            title=file_name,
+                            new_content=content_placeholder,
+                            new_type=atype,
+                            new_images=img_b64,
+                            new_image_media_types=img_mtypes,
+                            active=(atype == "image"),
+                            visibility=ArtefactVisibility.FULL if atype == "image" else ArtefactVisibility.TREE_UNLOCKABLE,
+                            bump_version=True,
+                            commit_message=f"Updated binary file reference by tool '{tool_name}'"
+                        )
+                    else:
+                        art = self.artefacts.add(
+                            title=file_name,
+                            artefact_type=atype,
+                            content=content_placeholder,
+                            images=img_b64,
+                            image_media_types=img_mtypes,
+                            active=(atype == "image"),
+                            visibility=ArtefactVisibility.FULL if atype == "image" else ArtefactVisibility.TREE_UNLOCKABLE,
+                            commit_message=f"Created by tool '{tool_name}'"
+                        )
+                    self.commit()
+
+                    if atype == "image":
+                        try:
+                            import base64
+                            raw_img = file_path.read_bytes()
+                            img_b64 = base64.b64encode(raw_img).decode('utf-8')
+                            self.artefacts.update(
+                                title=file_name,
+                                new_images=[img_b64],
+                                new_image_media_types=[f"image/{file_ext[1:]}"],
+                                bump_version=True
+                            )
+                            self.commit()
+                            self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
+                        except Exception as ex:
+                            trace_exception(ex)
+
+                    if self.active_branch_id:
+                        ai_msg_local = self.get_message(self.active_branch_id)
+                        if ai_msg_local:
+                            tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                            if tag not in ai_msg_local.content:
+                                ai_msg_local.content += f'\n\n{tag}\n'
+                            self.commit()
+                    continue
+
+                file_size_kb = file_path.stat().st_size / 1024
+                is_large_file = file_size_kb > 100
+
+                existing_art = self.artefacts.get(file_name)
+                if existing_art:
+                    art = self.artefacts.update(
+                        title=file_name,
+                        new_content=after_info["content"],
+                        new_type=atype,
+                        active=not is_large_file,
+                        visibility=ArtefactVisibility.FULL if not is_large_file else ArtefactVisibility.TREE_UNLOCKABLE,
+                        commit_message=f"Modified by tool '{tool_name}'"
+                    )
+                else:
+                    art = self.artefacts.add(
+                        title=file_name,
+                        artefact_type=atype,
+                        content=after_info["content"],
+                        active=not is_large_file,
+                        visibility=ArtefactVisibility.FULL if not is_large_file else ArtefactVisibility.TREE_UNLOCKABLE,
+                        commit_message=f"Created by tool '{tool_name}'"
+                    )
+                self.commit()
+
+                if self.active_branch_id:
+                    ai_msg_local = self.get_message(self.active_branch_id)
+                    if ai_msg_local:
+                        tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
+                        if tag not in ai_msg_local.content:
+                            ai_msg_local.content += f'\n\n{tag}\n'
+                        self.commit()
 
     def _get_spinoff_agent_tools(self, current_prompt: str, images: list, **kwargs) -> Dict[str, Dict[str, Any]]:
         """
@@ -2044,6 +2695,11 @@ class ChatMixin:
         # if the loop breaks before _StreamState is instantiated (e.g., pre-turn cancellation).
         ss = None
 
+        # CRITICAL FIX: Persistent set to track dispatched tags across all reasoning rounds.
+        # This prevents the LLM from re-dispatching the same artifact in a subsequent round,
+        # which causes infinite loops and unwanted version bumps.
+        persistent_processed_tags = set()
+
         while round_count < max_reasoning_steps:
             # Check cancellation at the start of each reasoning round
             if self.is_generation_cancelled():
@@ -2107,7 +2763,8 @@ class ChatMixin:
                 enable_artefacts=enable_artefacts,
                 enable_in_message_status=enable_in_message_status,
                 fast_artefact_replicas=fast_artefact_replicas,
-                content_offset=current_content_length  # Start parsing from current position
+                content_offset=current_content_length,  # Start parsing from current position
+                processed_tags=persistent_processed_tags # Pass the persistent set
             )
 
             def _inline_relay(chunk, msg_type=None, meta=None):
@@ -2156,6 +2813,47 @@ class ChatMixin:
             if getattr(self, "_force_final_answer", False) and ss.was_action_dispatched() and not ss.tool_trigger:
                 ASCIIColors.warning("[ChatMixin] LLM attempted artifact dispatch after force-final-answer. Breaking loop.")
                 break
+
+            # ── 🛑 DUPLICATE ARTIFACT INTERCEPTION (NEW) ──
+            # If the LLM emits an artifact tag that was ALREADY processed in a previous round,
+            # _StreamState skips dispatching it (affected_artefacts remains empty).
+            # We detect this to force the final answer and prevent an infinite loop.
+            if ss.was_action_dispatched() and not ss.tool_trigger and not ss.affected_artefacts:
+                ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Forcing final answer.")
+                object.__setattr__(self, "_force_final_answer", True)
+
+                # Inject a hard stop into virtual_history
+                full_round_text = ss.get_clean_text_so_far()
+                raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+
+                virtual_history.append(SimpleNamespace(
+                    sender_type="assistant",
+                    content=clean_history_text.strip()
+                ))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done.]"
+                ))
+                continue
+
+            # ── 🛑 DUPLICATE ARTIFACT INTERCEPTION ──
+            # If the LLM emits an artifact that was ALREADY dispatched in a previous round,
+            # we intercept it, set the force-final-answer flag, and inject a hard stop.
+            if ss.was_action_dispatched() and not ss.tool_trigger and ss.affected_artefacts:
+                # Check if the latest affected artifact is a duplicate (already in persistent_processed_tags)
+                # The _StreamState adds to processed_tags *before* dispatching.
+                # If it was a duplicate, _dispatch_closed_tag returns early and does NOT add to affected_artefacts.
+                # So, if affected_artefacts is populated, it means it was dispatched.
+                # We need to check if the tag text was already in the set *before* this round.
+                # Actually, the logic inside _dispatch_closed_tag handles the duplicate check.
+                # We just need to verify if the action was a duplicate by checking if the tag is in the set.
+                # But since _StreamState processes it, we can check if the artifact version was bumped unexpectedly.
+                pass # The logic inside _dispatch_closed_tag handles skipping duplicates.
 
             # ── 🛑 EMPTY-RESPONSE GUARD (CRITICAL) ──
             # If the LLM generated zero tokens (or only whitespace/processing blocks),
@@ -2376,6 +3074,34 @@ class ChatMixin:
 
                             try:
                                 _os.chdir(_lcp_workspace_str)
+
+                                # ── Take BEFORE Snapshot (LCP Path) ──
+                                _lcp_files_before = {}
+                                _lcp_cwd = _Path(_lcp_workspace_str)
+                                if _lcp_cwd.exists():
+                                    for f in _lcp_cwd.rglob("*"):
+                                        if f.is_file():
+                                            try:
+                                                rel_path = f.relative_to(_lcp_cwd)
+                                                content = f.read_text(encoding="utf-8", errors="ignore")
+                                                _lcp_files_before[rel_path] = {
+                                                    "hash": hash(content),
+                                                    "mtime": f.stat().st_mtime,
+                                                    "path": f,
+                                                    "content": content
+                                                }
+                                            except Exception:
+                                                try:
+                                                    rel_path = f.relative_to(_lcp_cwd)
+                                                    _lcp_files_before[rel_path] = {
+                                                        "hash": None,
+                                                        "mtime": f.stat().st_mtime,
+                                                        "path": f,
+                                                        "content": None
+                                                    }
+                                                except Exception:
+                                                    pass
+
                                 try:
                                     tool_res = lcp_binding.execute_tool(
                                        tool_name, 
@@ -2391,6 +3117,34 @@ class ChatMixin:
                                        "traceback": traceback.format_exc()
                                     }
                                 _lcp_executed = True
+
+                                # ── Take AFTER Snapshot & Auto-Sync Artifacts (LCP Path) ──
+                                _lcp_files_after = {}
+                                if _lcp_cwd.exists():
+                                    for f in _lcp_cwd.rglob("*"):
+                                        if f.is_file():
+                                            try:
+                                                rel_path = f.relative_to(_lcp_cwd)
+                                                content = f.read_text(encoding="utf-8", errors="ignore")
+                                                _lcp_files_after[rel_path] = {
+                                                    "hash": hash(content),
+                                                    "mtime": f.stat().st_mtime,
+                                                    "path": f,
+                                                    "content": content
+                                                }
+                                            except Exception:
+                                                try:
+                                                    rel_path = f.relative_to(_lcp_cwd)
+                                                    _lcp_files_after[rel_path] = {
+                                                        "hash": None,
+                                                        "mtime": f.stat().st_mtime,
+                                                        "path": f,
+                                                        "content": None
+                                                    }
+                                                except Exception:
+                                                    pass
+
+                                self._sync_tool_artifacts(tool_name, _lcp_files_before, _lcp_files_after, callback)
                             finally:
                                 # 🛑 CRITICAL: Always restore CWD to prevent workspace corruption
                                 _os.chdir(_old_cwd_lcp)
@@ -2683,311 +3437,7 @@ class ChatMixin:
                                                 except Exception:
                                                     pass
 
-                                # Detect NEW files
-                                new_files = set(files_after.keys()) - set(files_before.keys())
-
-                                for rel_path in new_files:
-                                    file_info = files_after[rel_path]
-                                    file_name = rel_path.name
-                                    file_ext = rel_path.suffix.lower()
-                                    file_path = file_info["path"]
-                                    file_size = file_path.stat().st_size
-
-                                    # Determine type
-                                    atype = "document"
-                                    if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
-                                        atype = "code"
-                                    elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
-                                        atype = "data"
-                                    elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
-                                        atype = "document"
-                                    elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
-                                        atype = "image"
-
-                                    # Check if Binary
-                                    EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
-                                                            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
-                                                            ".zip", ".tar", ".gz", ".pdf", ".docx"}
-
-                                    should_read_content = True
-                                    content_placeholder = None
-
-                                    if file_ext in EXPLICIT_BINARY_EXTS:
-                                        should_read_content = False
-                                        content_placeholder = (
-                                            f"### Data File Generated: `{file_name}`\n\n"
-                                            f"This file was created by the tool `{tool_name}`.\n"
-                                            f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
-                                            f"- **Size**: {file_size:,} bytes\n"
-                                            f"- **Location**: `./{file_name}`\n\n"
-                                            f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
-                                        )
-                                    else:
-                                        try:
-                                            with open(file_path, 'rb') as f:
-                                                chunk = f.read(1024)
-                                                if b'\x00' in chunk:
-                                                    should_read_content = False
-                                                    content_placeholder = (
-                                                        f"### Binary File Detected: `{file_name}`\n\n"
-                                                        f"This file appears to be binary (contains null bytes).\n"
-                                                        f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
-                                                        f"- **Size**: {file_size:,} bytes\n"
-                                                        f"- **Location**: `./{file_name}`\n\n"
-                                                        f"> **Action**: Download from Workspace Artifacts panel."
-                                                    )
-                                                else:
-                                                    forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
-                                                    file_info["content"] = forced_content
-                                                    should_read_content = True
-                                        except Exception as e:
-                                            should_read_content = False
-                                            content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
-
-                                    # Register as tree_unlockable or fully active based on type
-                                    if not should_read_content and content_placeholder:
-                                        existing_art = self.artefacts.get(file_name)
-                                        if existing_art:
-                                            art = self.artefacts.update(
-                                                title=file_name,
-                                                new_content=content_placeholder,
-                                                new_type=atype,
-                                                active=True,
-                                                visibility=ArtefactVisibility.FULL,
-                                                commit_message=f"Updated binary file reference by tool '{tool_name}'"
-                                            )
-                                        else:
-                                            art = self.artefacts.add(
-                                                title=file_name,
-                                                artefact_type=atype,
-                                                content=content_placeholder,
-                                                active=True,
-                                                visibility=ArtefactVisibility.FULL,
-                                                commit_message=f"Created by tool '{tool_name}'"
-                                            )
-                                        # Registered file (placeholder) (logging removed)
-                                        self.commit()
-                                        
-                                        # Hydrate active turn list so we can pass base64 pixels to vision
-                                        if atype == "image":
-                                            try:
-                                                import base64
-                                                raw_img = file_path.read_bytes()
-                                                img_b64 = base64.b64encode(raw_img).decode('utf-8')
-                                                self.artefacts.update(
-                                                    title=file_name,
-                                                    new_images=[img_b64],
-                                                    new_image_media_types=[f"image/{file_ext[1:]}"],
-                                                    bump_version=False # In-place update so version remains v1
-                                                )
-                                                self.commit()
-                                                self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
-                                            except Exception as ex:
-                                                trace_exception(ex)
-
-                                            if self.active_branch_id:
-                                                ai_msg = self.get_message(self.active_branch_id)
-                                            if ai_msg:
-                                                tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
-                                                if tag not in ai_msg.content:
-                                                    ai_msg.content += f'\n\n{tag}\n'
-                                                self.commit()
-                                        continue
-
-                                    # Handle Text/Readable Files (Default to Fully Active & Visible)
-                                    existing_art = self.artefacts.get(file_name)
-                                    if existing_art:
-                                        art = self.artefacts.update(
-                                            title=file_name,
-                                            new_content=file_info["content"],
-                                            new_type=atype,
-                                            active=True,
-                                            visibility=ArtefactVisibility.FULL,
-                                            commit_message=f"Restored by tool '{tool_name}'"
-                                        )
-                                    else:
-                                        art = self.artefacts.add(
-                                            title=file_name,
-                                            artefact_type=atype,
-                                            content=file_info["content"],
-                                            active=True,
-                                            visibility=ArtefactVisibility.FULL,
-                                            commit_message=f"Created by tool '{tool_name}'"
-                                        )
-                                    # Created NEW artifact from file (logging removed)
-                                    self.commit()
-
-                                    if self.active_branch_id:
-                                        ai_msg = self.get_message(self.active_branch_id)
-                                        if ai_msg:
-                                            tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
-                                            if tag not in ai_msg.content:
-                                                ai_msg.content += f'\n\n{tag}\n'
-                                            self.commit()
-
-                                # Detect MODIFIED files
-                                common_files = set(files_after.keys()) & set(files_before.keys())
-                                for rel_path in common_files:
-                                    before_info = files_before[rel_path]
-                                    after_info = files_after[rel_path]
-                                    file_name = rel_path.name
-                                    file_ext = rel_path.suffix.lower()
-                                    file_path = after_info["path"]
-
-                                    mtime_changed = before_info["mtime"] != after_info["mtime"]
-                                    content_changed = before_info.get("hash") != after_info.get("hash")
-
-                                    # Initialize image metadata variables for this iteration
-                                    img_b64 = None
-                                    img_mtypes = None
-
-                                    if mtime_changed or content_changed:
-                                        # File was modified!
-                                        atype = "document"
-                                        if file_ext in (".py", ".js", ".ts", ".html", ".css", ".sql", ".cir", ".net", ".op"):
-                                            atype = "code"
-                                        elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
-                                            atype = "data"
-                                        elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
-                                            atype = "document"
-                                        elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
-                                            atype = "image"
-
-                                        # Check if Binary
-                                        EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", 
-                                                                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", 
-                                                                ".zip", ".tar", ".gz", ".pdf", ".docx"}
-
-                                        should_read_content = True
-                                        content_placeholder = None
-
-                                        if file_ext in EXPLICIT_BINARY_EXTS:
-                                            should_read_content = False
-                                            content_placeholder = (
-                                                f"### Data File Modified: `{file_name}`\n\n"
-                                                f"This file was modified by the tool `{tool_name}`.\n"
-                                                f"- **Type**: {file_ext.upper()} (Binary/Structured Data)\n"
-                                                f"- **Size**: {file_size:,} bytes\n"
-                                                f"- **Location**: `./{file_name}`\n\n"
-                                                f"> **Action**: You can download this file from the Workspace Artifacts panel or reference it in SQL/Python tools."
-                                            )
-                                        else:
-                                            try:
-                                                with open(file_path, 'rb') as f:
-                                                    chunk = f.read(1024)
-                                                    if b'\x00' in chunk:
-                                                        should_read_content = False
-                                                        content_placeholder = (
-                                                            f"### Binary File Modified: `{file_name}`\n\n"
-                                                            f"This file was modified by the tool `{tool_name}`.\n"
-                                                            f"- **Type**: {file_ext.upper()} (Unknown Binary)\n"
-                                                            f"- **Size**: {file_size:,} bytes\n"
-                                                            f"- **Location**: `./{file_name}`\n\n"
-                                                            f"> **Action**: Download from Workspace Artifacts panel."
-                                                        )
-                                                    else:
-                                                        forced_content = file_path.read_text(encoding='utf-8', errors='ignore')
-                                                        after_info["content"] = forced_content
-                                                        should_read_content = True
-                                            except Exception as e:
-                                                should_read_content = False
-                                                content_placeholder = f"### File Error: `{file_name}`\n\nFailed to read or inspect file: {e}"
-
-                                        # Register/Update
-                                        if not should_read_content and content_placeholder:
-                                            # Hydrate image metadata if this is an image-type file
-                                            if atype == "image":
-                                                try:
-                                                    import base64 as _b64_mod
-                                                    raw_img = file_path.read_bytes()
-                                                    img_b64 = _b64_mod.b64encode(raw_img).decode('utf-8')
-                                                    img_mtypes = [f"image/{file_ext[1:]}"]
-                                                except Exception as ex:
-                                                    trace_exception(ex)
-
-                                            existing_art = self.artefacts.get(file_name)
-                                            if existing_art:
-                                                art = self.artefacts.update(
-                                                    title=file_name,
-                                                    new_content=content_placeholder,
-                                                    new_type=atype,
-                                                    new_images=img_b64,
-                                                    new_image_media_types=img_mtypes,
-                                                    active=True,
-                                                    visibility=ArtefactVisibility.FULL,
-                                                    bump_version=True,
-                                                    commit_message=f"Updated binary file reference by tool '{tool_name}'"
-                                                )
-                                            else:
-                                                art = self.artefacts.add(
-                                                    title=file_name,
-                                                    artefact_type=atype,
-                                                    content=content_placeholder,
-                                                    images=img_b64,
-                                                    image_media_types=img_mtypes,
-                                                    active=True,
-                                                    visibility=ArtefactVisibility.FULL,
-                                                    commit_message=f"Created by tool '{tool_name}'"
-                                                )
-                                            # Updated file reference (placeholder) (logging removed)
-                                            self.commit()
-                                            
-                                            # Hydrate active turn list so we can pass base64 pixels to vision
-                                            if atype == "image":
-                                                try:
-                                                    import base64
-                                                    raw_img = file_path.read_bytes()
-                                                    img_b64 = base64.b64encode(raw_img).decode('utf-8')
-                                                    self.artefacts.update(
-                                                        title=file_name,
-                                                        new_images=[img_b64],
-                                                        new_image_media_types=[f"image/{file_ext[1:]}"],
-                                                        bump_version=True # Increment version on modification
-                                                        )
-                                                    self.commit()
-                                                    self._affected_artefacts_this_turn.append(self.artefacts.get(file_name))
-                                                except Exception as ex:
-                                                    trace_exception(ex)
-
-                                            if self.active_branch_id:
-                                                ai_msg = self.get_message(self.active_branch_id)
-                                                if ai_msg:
-                                                    tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
-                                                    if tag not in ai_msg.content:
-                                                        ai_msg.content += f'\n\n{tag}\n'
-                                                    self.commit()
-                                            continue
-
-                                        # Handle Text/Readable Files (Default to Fully Active & Visible)
-                                        existing_art = self.artefacts.get(file_name)
-                                        if existing_art:
-                                            art = self.artefacts.update(
-                                                title=file_name,
-                                                new_content=after_info["content"],
-                                                new_type=atype,
-                                                active=True,
-                                                visibility=ArtefactVisibility.FULL,
-                                                commit_message=f"Modified by tool '{tool_name}'"
-                                            )
-                                        else:
-                                            art = self.artefacts.add(
-                                                title=file_name,
-                                                artefact_type=atype,
-                                                content=after_info["content"],
-                                                active=True,
-                                                visibility=ArtefactVisibility.FULL,
-                                                commit_message=f"Created by tool '{tool_name}'"
-                                            )
-                                        # Updated artifact from modified file (logging removed)
-                                        self.commit()
-
-                                        if self.active_branch_id:
-                                            ai_msg = self.get_message(self.active_branch_id)
-                                            if ai_msg:
-                                                tag = f'<artefact_image id="{file_name}::0" />' if atype == "image" else f'<lollms_artifact id="{file_name}" type="{atype}" version="{art.get("version", 1)}" />'
-                                                if tag not in ai_msg.content:
-                                                    ai_msg.content += f'\n\n{tag}\n'
-                                                self.commit()
+                                self._sync_tool_artifacts(tool_name, files_before, files_after, callback)
                             finally:
                                 os.chdir(old_cwd)
 
@@ -3313,6 +3763,16 @@ class ChatMixin:
                     ))
                     continue
 
+                # ── 🛑 CONVERSATIONAL CLOSURE GUARD (CRITICAL) ──
+                # If we have already executed at least one tool successfully, and the LLM
+                # generates a response without another <tool> tag, it is providing its final
+                # conversational answer. We MUST break immediately. Running intent detection
+                # on the final answer causes infinite loops if the answer contains phrases
+                # like "I will analyze" or "Let me summarize".
+                if len(tool_calls_this_turn) > 0:
+                    ASCIIColors.info("[ChatMixin] Tool previously executed and no new tool call detected. Finalizing turn.")
+                    break
+
                 # Only run intent detection on SHORT responses (preambles before a missed tool call)
                 intent_pattern = re.compile(r'(let me|now i|next i|i will|i need to|we need to).*(query|get|fetch|build|create|analyze|summarize|aggregate|plot)', re.IGNORECASE)
                 intent_match = intent_pattern.search(raw_round_text)
@@ -3363,9 +3823,30 @@ class ChatMixin:
                     # Inject a system prompt confirming the unlock and inviting continuation
                     unlock_files_str = ', '.join(ss.context_unlocked_files)
                     continuation_prompt = (
-                        f"\n\n[SYSTEM: The following files have been loaded into context: {unlock_files_str}. "
+                        f"\n\n[SYSTEM: The following files have been processed: {unlock_files_str}. "
                         f"You can now read their full content and use them. Please continue your task.]\n\n"
                     )
+
+                    # ── CONTEXT BUDGET GUARD: Inject blocked files guidance ──
+                    blocked_guidance = getattr(ss, '_blocked_files_guidance', None) or getattr(self, '_blocked_files_guidance', None)
+                    if blocked_guidance:
+                        if isinstance(blocked_guidance, list):
+                            continuation_prompt += (
+                                f"\n[SYSTEM: 🛑 CONTEXT BUDGET LIMIT EXCEEDED. "
+                                f"The following files are too large to load into your context window: "
+                                + " | ".join(blocked_guidance) + 
+                                f"\nYou MUST NOT attempt to <unlock_file> these files again. "
+                                f"Instead, use a tool to extract specific data:\n"
+                                f"  - Use `tool_query_database_sql` for SQL queries on .db files\n"
+                                f"  - Use `tool_execute_python_code` to parse JSON/CSV files with pandas/json modules\n"
+                                f"  - Use a grep-like approach to search for specific patterns\n"
+                                f"Extract ONLY the data you need for your current task.]\n\n"
+                            )
+                        else:
+                            continuation_prompt += f"\n{blocked_guidance}\n\n"
+                        # Clear the guidance after injecting it
+                        if hasattr(self, '_blocked_files_guidance'):
+                            object.__setattr__(self, '_blocked_files_guidance', [])
 
                     # 🛑 CRITICAL: Append SANITIZED assistant text to virtual_history (preserves KV-cache)
                     # Strip <processing> blocks to prevent the LLM from mimicking execution logs
