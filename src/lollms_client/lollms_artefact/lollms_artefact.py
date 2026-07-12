@@ -819,30 +819,61 @@ class ArtefactManager:
         logical_content = merged_extra.pop("logical_content", latest.get("logical_content"))
         physical_data = merged_extra.pop("physical_data", latest.get("physical_data"))
 
-        # 🛑 CRITICAL FIX: Prevent Data Artifact Corruption (Binary AND Text).
+        # 🛑 CRITICAL FIX: Content-First Update Doctrine.
         # The _get_all_raw() method strips physical_data (bytes) before returning records to prevent
         # JSON serialization crashes. This means latest.get("physical_data") is ALWAYS None.
         # If we don't rehydrate the physical bytes here, add() receives physical_data=None.
         # _sync_to_disk_workspace then falls back to writing the string content (the .lam schema text)
         # directly to the physical file, overwriting the raw data (binary .db or text .csv) with schema text.
         if physical_data is None and latest.get("type") == ArtefactType.DATA:
-            try:
-                if getattr(self._discussion, "workspace_data_path", None):
-                    ws_data_dir = Path(self._discussion.workspace_data_path)
-                else:
-                    base_ws = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-                    ws_data_dir = base_ws / self._discussion.id / "workspace_data"
+            file_ext = latest.get("file_ext", "")
+            is_binary_db = file_ext in (".db", ".sqlite", ".sqlite3")
 
-                phys_path = latest.get("physical_path") or latest.get("title", "")
-                clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
-                filename = self._get_filename_with_ext(clean_path, latest.get("type"), latest.get("language"), latest.get("file_ext"))
-                active_physical_path = ws_data_dir / filename
+            # If new_content is explicitly provided AND this is a text-based data file (not binary DB),
+            # the new_content IS the raw physical data. We encode it to bytes and write it to disk
+            # immediately. This prevents the "phantom revert" where old bytes are read from disk
+            # and passed to add(), creating a duplicate version with the old content.
+            if new_content is not None and not is_binary_db:
+                try:
+                    physical_data = new_content.encode("utf-8")
+                    
+                    if getattr(self._discussion, "workspace_data_path", None):
+                        ws_data_dir = Path(self._discussion.workspace_data_path)
+                    else:
+                        base_ws = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+                        ws_data_dir = base_ws / self._discussion.id / "workspace_data"
 
-                if active_physical_path.exists():
-                    physical_data = active_physical_path.read_bytes()
-                    ASCIIColors.info(f"[ArtefactManager] Rehydrated physical bytes for data artifact '{latest.get('title')}' from {active_physical_path}")
-            except Exception as e:
-                ASCIIColors.warning(f"[ArtefactManager] Failed to rehydrate physical bytes for data artifact: {e}")
+                    phys_path = latest.get("physical_path") or latest.get("title", "")
+                    clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
+                    filename = self._get_filename_with_ext(clean_path, latest.get("type"), latest.get("language"), file_ext)
+                    active_physical_path = ws_data_dir / filename
+
+                    active_physical_path.parent.mkdir(parents=True, exist_ok=True)
+                    active_physical_path.write_bytes(physical_data)
+                    ASCIIColors.info(f"[ArtefactManager] Content-First Update: Wrote new physical bytes for '{latest.get('title')}' to {active_physical_path}")
+                except Exception as e:
+                    ASCIIColors.warning(f"[ArtefactManager] Failed to write new content during update: {e}")
+
+            # Fallback: If no new_content or it's a binary DB, rehydrate from the existing file on disk.
+            # This preserves the raw bytes for binary databases where new_content is a schema string.
+            if physical_data is None:
+                try:
+                    if getattr(self._discussion, "workspace_data_path", None):
+                        ws_data_dir = Path(self._discussion.workspace_data_path)
+                    else:
+                        base_ws = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+                        ws_data_dir = base_ws / self._discussion.id / "workspace_data"
+
+                    phys_path = latest.get("physical_path") or latest.get("title", "")
+                    clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
+                    filename = self._get_filename_with_ext(clean_path, latest.get("type"), latest.get("language"), file_ext)
+                    active_physical_path = ws_data_dir / filename
+
+                    if active_physical_path.exists():
+                        physical_data = active_physical_path.read_bytes()
+                        ASCIIColors.info(f"[ArtefactManager] Rehydrated physical bytes for data artifact '{latest.get('title')}' from {active_physical_path}")
+                except Exception as e:
+                    ASCIIColors.warning(f"[ArtefactManager] Failed to rehydrate physical bytes for data artifact: {e}")
 
         result = self.add(
             title             = target_title,
@@ -1499,16 +1530,33 @@ class ArtefactManager:
                 art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")))
 
                 versioned_data = workspace_dir.parent / "artefacts_metadata" / art_id / f"{title.replace('.csv','')}_v{version}{file_ext}"
+                dest = workspace_dir / f"{title}{file_ext}"
+                
+                # 🛑 CRITICAL FIX: Only copy the versioned twin to the workspace if:
+                # 1. The versioned twin exists, AND
+                # 2. The destination file does NOT exist, OR the destination is OLDER than the versioned twin.
+                # This prevents overwriting a freshly-updated active file with a stale versioned twin,
+                # which was causing the "phantom revert" bug (v6 containing old content).
+                should_copy = False
                 if versioned_data.exists():
-                    dest = workspace_dir / f"{title}{file_ext}"
+                    if not dest.exists():
+                        should_copy = True
+                    else:
+                        try:
+                            versioned_mtime = versioned_data.stat().st_mtime
+                            dest_mtime = dest.stat().st_mtime
+                            if versioned_mtime > dest_mtime:
+                                should_copy = True
+                        except Exception:
+                            should_copy = True
+                
+                if should_copy:
                     import shutil
                     shutil.copy(str(versioned_data), str(dest))
                     if str(dest.resolve()) not in synced_files:
                         synced_files.append(str(dest.resolve()))
-                else:
-                    unversioned = workspace_dir / f"{title}{file_ext}"
-                    if unversioned.exists() and str(unversioned.resolve()) not in synced_files:
-                        synced_files.append(str(unversioned.resolve()))
+                elif dest.exists() and str(dest.resolve()) not in synced_files:
+                    synced_files.append(str(dest.resolve()))
                 continue
 
             self._sync_to_disk_workspace(
