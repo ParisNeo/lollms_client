@@ -704,6 +704,44 @@ This ensures the LLM's context window (the `.lam` schemas and code contents) per
     Returns a report dictionary: `{"new_artefacts": int, "updated_artefacts": int, "restored_files": int}`.
 
 
+### Import Conflict Resolution
+
+When importing files into the artefact system, there is a possibility of title collisions (e.g., importing `README.md` from two different sources). The `import_file` method provides an `on_conflict` parameter to define the resolution strategy.
+
+### Strategies
+
+1. **`suffix` (Default)**
+   - **Behavior**: If an artifact with the target title already exists, the new file is renamed with an incrementing suffix (e.g., `README_1.md`, `README_2.md`).
+   - **Use Case**: Preserving all imported files without losing any data or altering the original artifact.
+   - **Result**: Creates a new artifact with the suffixed title. The original artifact remains untouched.
+
+2. **`version`**
+   - **Behavior**: The existing artifact is updated, and its version number is incremented. The physical file is overwritten with the new content, but the previous version is preserved in the database history.
+   - **Use Case**: Importing an updated version of a file where you want to maintain a clear audit trail of changes.
+   - **Result**: Updates the existing artifact and bumps the version (e.g., v1 → v2).
+
+3. **`overwrite`**
+   - **Behavior**: The existing artifact's content is replaced with the new content, but the version number is **not** incremented. Previous version history is preserved, but the active version is silently replaced.
+   - **Use Case**: Correcting or silently updating a file without polluting the version history.
+   - **Result**: Updates the existing artifact. The version number remains the same.
+
+4. **`replace`**
+   - **Behavior**: Completely purges all existing versions and history of the artifact, then creates a fresh `v1` baseline with the new content.
+   - **Use Case**: Starting over cleanly when the previous iterations are no longer relevant or were imported in error.
+   - **Result**: Deletes all previous database records and physical metadata, then creates a new `v1` artifact.
+
+### Example
+
+```python
+# Import a file, replacing any existing artifact with the same name completely
+discussion.import_file(
+    path="path/to/new/README.md",
+    mode="text",
+    title="README.md",
+    on_conflict="replace"
+)
+```
+
 ## 🎛️ 8. Interactive Widgets (`<lollms_inline>`)
 
 Widgets are **ephemeral, in-context, interactive educational demonstrations** rendered directly inside the chat bubble. They are designed for teaching concepts, visualizing data, or providing micro-interactions (similar to platforms like Brilliant.org).
@@ -717,84 +755,51 @@ The architecture strictly separates transient educational tools from persistent 
 | **Purpose** | Teaching, explaining, visualizing concepts. | Real coding, games, persistent tools, scripts. |
 | **Persistence** | Ephemeral. Disappears when the chat scrolls. | Persistent, versioned, saved to disk. |
 | **Size Limit** | Strictly constrained to **600x400px**. | Unconstrained (full screen apps). |
-| **Rendering** | Rendered inline in the chat flow. | Rendered in a dedicated workspace panel/viewer. |
+| **Rendering** | Rendered inline in the chat flow by the **host app**. | Rendered in a dedicated workspace panel/viewer. |
 | **Syntax** | Starts directly with a `<div>` (no `<html>` wrapper). | Contains full file content. |
 
 The LLM is instructed to use widgets **only** for brief, educational animations or interactive diagrams. If a user asks to "build a game" or "create an app", the LLM is strictly forbidden from using `<lollms_inline>` and must use `<artifact>`.
 
-### 📡 Streaming Protocol & Events
+### 🛠️ Host Application Integration (How to Use It)
 
-When the LLM generates a widget, the backend stream parser intercepts the `<lollms_inline>` tag and emits specific events on the streaming callback. A host application should listen for these events to render the widget live.
+Unlike artifacts (which are persisted to disk and managed by the backend), `<lollms_inline>` widgets are **strictly handled by the calling application's frontend**. The backend parser does not wrap them in `<processing>` blocks or dispatch them internally. It passes the raw HTML/CSS/JS content directly to the UI via streaming events.
 
-#### Event Lifecycle
+To integrate interactive widgets into your application, you must intercept these events and render the payload inside a secure sandbox.
+
+#### 1. Event Lifecycle
+When the LLM generates a widget, the backend stream parser (`_StreamState` in `_mixin_chat.py`) detects the `<lollms_inline>` tag and emits specific events on the streaming callback:
 1. **`MSG_TYPE_CHUNK` (Open)**: Fired when `<lollms_inline ...>` is detected. The metadata contains `{"type": "inline_widget_start"}`.
 2. **`MSG_TYPE_WIDGET_CHUNK` (Streaming)**: Fired for every text chunk inside the widget tag. 
    - Meta: `{"title": str, "chunk": str, "widget_type": str}`
 3. **`MSG_TYPE_WIDGET_DONE` (Complete)**: Fired when the closing `</lollms_inline>` tag is detected. It contains the complete, validated raw source.
    - Meta: `{"title": str, "content": str, "widget_type": str}`
 
-#### Widget Content Structure
-The LLM is instructed to output **simplified tag contents**. It does NOT write a complete HTML document (`<!DOCTYPE html>`, `<head>`, `<body>`). 
+#### 2. Intercepting the Event (Python Backend / FastAPI)
+If your backend acts as a proxy to the frontend, ensure you forward these message types to your WebSocket or SSE stream.
 
-It starts directly with a container `<div>` (max-width 600px, max-height 400px) and uses `<script>` tags for logic. The host application is responsible for wrapping this content in an iframe.
-
-**Example LLM Output:**
-```xml
-<lollms_inline type="html" title="Spring Simulation">
-<div id="widget-container" style="width: 600px; height: 400px; overflow: hidden;">
-  <!-- Canvas and interactive elements go here -->
-</div>
-<script>
-  // Dynamically load PixiJS (mandatory for animations)
-  var s = document.createElement('script');
-  s.src = 'https://cdn.jsdelivr.net/npm/pixi.js@7/dist/pixi.min.js';
-  s.onload = function() {
-    let app = new PIXI.Application({ width: 600, height: 400, backgroundColor: 0x0f172a });
-    document.getElementById('widget-container').appendChild(app.view);
-    // Add animations...
-  };
-  document.head.appendChild(s);
-</script>
-</lollms_inline>
+```python
+# Example backend callback handling
+def stream_callback(chunk: str, msg_type: MSG_TYPE, meta: dict):
+    if msg_type == MSG_TYPE.MSG_TYPE_WIDGET_DONE:
+        # Forward the complete widget payload to the frontend
+        websocket.send_json({
+            "type": "widget_complete",
+            "title": meta.get("title"),
+            "html_content": meta.get("content")
+        })
 ```
 
-### 🖥️ Host Application Integration Guide
-
+#### 3. Rendering in the Frontend (JavaScript / React / Vue)
 Because widgets contain raw HTML, CSS, and JavaScript, they **MUST** be rendered inside a secure, sandboxed `<iframe>` to prevent CSS leakage and DOM manipulation of the host application.
 
-#### Step-by-Step Rendering Protocol
+**Widget Content Structure:**
+The LLM outputs **simplified tag contents**. It does NOT write a complete HTML document (`<!DOCTYPE html>`, `<head>`, `<body>`). It starts directly with a container `<div>` (max-width 600px, max-height 400px) and uses `<script>` tags for logic. Your frontend must wrap this content.
 
-**1. Intercept the `MSG_TYPE_WIDGET_DONE` Event**
-In your streaming callback handler, listen for the completed widget payload.
-
-```javascript
-// Frontend Streaming Callback Example
-function handleStreamChunk(chunk, msgType, meta) {
-    if (msgType === MSG_TYPE_WIDGET_DONE) {
-        const widgetHtml = meta.content;
-        const widgetTitle = meta.title;
-        renderWidgetInChat(widgetTitle, widgetHtml);
-    }
-}
-```
-
-**2. Create a Sandbox Iframe**
-Create an `<iframe>` with strict sandbox attributes. The widget should be constrained to 600x400px.
-
-```html
-<div class="chat-widget-wrapper" style="width: 600px; height: 400px; border-radius: 8px; overflow: hidden; border: 1px solid #ccc;">
-    <iframe 
-        sandbox="allow-scripts allow-same-origin" 
-        style="width: 100%; height: 100%; border: none;"
-        title="Interactive Widget">
-    </iframe>
-</div>
-```
-
-**3. Inject the Widget Source Safely (Blob URL Protocol)**
-Write the widget HTML directly into the iframe document. Since the LLM outputs a partial DOM (starting with `<div>`), you must wrap it in a basic HTML structure and inject the host application's predefined widget CSS (which matches `_build_inline_widget_instructions()` in `_mixin_prompt.py`).
-
-🚨 **CRITICAL (`file://` Cross-Origin Fix)**: If your host application runs from the local filesystem (`file:///`), you **MUST** use the Blob URL technique. Setting `iframe.src = "about:blank"` will trigger a `SecurityError` when the parent attempts to access `iframe.contentDocument` due to browser Same-Origin Policy restrictions on null origins. The Blob URL generates a stable `blob:` URI, bypassing the cross-origin block.
+**Secure Rendering Protocol:**
+1. Create an `<iframe>` with strict sandbox attributes.
+2. Wrap the LLM's raw output in a basic HTML document.
+3. Inject predefined CSS to match the dark-mode aesthetic.
+4. Use the **Blob URL Protocol** to bypass `file://` cross-origin restrictions.
 
 ```javascript
 function renderWidgetInChat(title, rawWidgetHtml) {
@@ -804,7 +809,7 @@ function renderWidgetInChat(title, rawWidgetHtml) {
     wrapper.style.height = '400px';
     
     const iframe = document.createElement('iframe');
-    iframe.sandbox = "allow-scripts allow-same-origin";
+    iframe.sandbox = "allow-scripts allow-same-origin"; // Strict sandbox
     iframe.style.width = '100%';
     iframe.style.height = '100%';
     iframe.style.border = 'none';
@@ -844,14 +849,14 @@ function renderWidgetInChat(title, rawWidgetHtml) {
         </html>
     `;
 
-    // Create a Blob from the HTML string
+    // Create a Blob from the HTML string (Bypasses file:// cross-origin blocks)
     const blob = new Blob([fullHtml], { type: 'text/html' });
     const blobUrl = URL.createObjectURL(blob);
 
     // Assign the Blob URL to the iframe src
     iframe.src = blobUrl;
 
-    // Clean up the Blob URL when the iframe finishes loading to prevent memory leaks
+    // Clean up the Blob URL when the iframe finishes loading
     iframe.onload = () => {
         URL.revokeObjectURL(blobUrl);
     };
