@@ -1,284 +1,218 @@
-# LCP: LollmsCommunicationProtocol Tool Binding
+# 📦 lollms_artefact: Dynamic Artefact & Context Subsystem
 
-LCP is a lightweight, zero-dependency local tool execution framework for Lollms. It allows the LLM to discover and execute custom Python scripts directly in-process, without needing to run or maintain external servers.
-
-## 🚀 Core Features
-
-### 1. Multi-Tool File Architecture
-**One File, Many Tools.** You no longer need one file per tool. LCP now scans every function starting with `tool_` inside a Python file and registers each as an independent, callable tool with its own signature.
-*   **Example:** A single `semantic_data_engineer.py` file can expose 15+ distinct macros (`tool_get_schema`, `tool_filter_data`, `tool_plot`, etc.).
-*   **Benefit:** Keeps related tool libraries cohesive and organized in a single module.
-
-### 2. Dynamic Library Mounting
-**Context-Aware Tool Loading.** Tools are no longer static. The system can dynamically mount specialized tool libraries at runtime based on workspace context.
-*   **Auto-Discovery:** If a discussion contains data files (`.csv`, `.db`), the system automatically mounts the `semantic_data_engineer` library without user intervention.
-*   **Zero Config:** No need to manually select a "Data Personality." The tools appear automatically when needed.
-
-### 3. Discussion-Isolated Workspaces
-**Secure, Sandbox-Per-Chat.** Every discussion gets its own isolated workspace folder (`data_workspace/discussions/{discussion_id}/`).
-*   **Automatic Sync:** When a tool creates a file, it is instantly synced as an Artifact in that specific discussion.
-*   **No Path Conflicts:** Tools operate on simple relative paths (e.g., `data.csv`) because the CWD is automatically set to the discussion's folder before execution.
-*   **Binary Safety:** The system intelligently handles binary files (images, databases) by creating placeholder artifacts with download links, preventing context bloat.
-
-### 4. AST-Based Schema Ingestion
-**No Duplicate JSON Schemas.** LCP uses Python's `ast` module to automatically extract tool names, parameters, type annotations, defaults, and descriptions directly from your Python function and its docstring on-the-fly.
-
-### 5. Multi-Source Discovery
-*   **`tools_folders`**: Scan multiple local directories simultaneously.
-*   **`tool_files`**: Import standalone Python tool files directly from anywhere on disk.
-
-### 6. Context Awareness
-Tools can optionally receive the active `LollmsClient` instance and `LollmsDiscussion` session state directly via keyword arguments (`lollms_client_instance`, `discussion_instance`).
-
-### 7. Dynamic Tool Generation from Artefacts
-**LLM-Authored Tools.** LCP integrates seamlessly with the Artefact system. If the LLM generates a `type="tool"` artefact, LCP can dynamically compile and register it in memory.
-*   **`register_tool_from_code(tool_name_prefix, code)`**: Executes raw Python code in an isolated module namespace, extracts `tool_*` functions via AST, and registers them as active tools.
-*   **`unregister_tools_by_prefix(tool_name_prefix)`**: Cleanly removes dynamically generated tools when the artefact is updated or deleted.
-*   **Security Gate**: This feature is disabled by default. The host application must explicitly pass `allow_dynamic_tools=True` to `discussion.chat()` to permit the LLM to execute its own code.
+The `lollms_artefact` package implements the core versioning, lifecycle management, and file-tracking layers for Lollms. It introduces a **Hybrid Storage Architecture** designed to bridge the gap between large physical data files on disk and the context window limitations of Large Language Models.
 
 ---
 
-## 🛠️ How to Write an LCP Tool
+## 🏛️ 1. The Hybrid Storage Philosophy
 
-To create a tool, simply write a Python file and place it inside your LCP tools directory (e.g., `src/lollms_client/tools_bindings/lcp/default_tools/`).
+Conversational AI agents often experience a conflict between model attention and tool execution:
+- **Language Models** require high-level summaries, database schemas, and text content to plan queries and reason logically without wasting thousands of tokens on raw binary data.
+- **Local Tools** (Python scripts, SQL queries, executors) require the exact, unmodified physical bytes to perform computations and write outputs.
 
-### Example 1: Multi-Tool Library (Recommended)
-Group related functions in one file. LCP will register **both** `tool_calculate_bmi` and `tool_calculate_tdee` as separate tools.
+To solve this, the subsystem uses two distinct storage strategies depending on the file type:
 
-```python
-def tool_calculate_bmi(weight_kg: float, height_m: float) -> dict:
-    """
-    Calculates Body Mass Index (BMI).
+### A. Single-Stream (Text, Code, Documents)
+For text-based files (`.py`, `.md`, `.pdf`, `.docx`, `.txt`), the system uses a **Single-Stream** approach:
+* **Storage**: The extracted text content is stored directly in the artefact's `content` field and written to `workspace_data/{title}.{ext}`.
+* **Context Injection**: The LLM context zone reads directly from the `content` field. The LLM sees the full, verbatim text of the file.
+* **No `.lam` files**: Text files do NOT generate Logical Artefact Metadata (`.lam`) files. We do not separate the content from the metadata.
 
-    Args:
-        weight_kg (float): Weight in kilograms.
-        height_m (float): Height in meters.
-    """
-    bmi = weight_kg / (height_m ** 2)
-    category = "Normal"
-    if bmi < 18.5: category = "Underweight"
-    elif bmi >= 25: category = "Overweight"
-    
-    return {"bmi": round(bmi, 2), "category": category}
+### B. Dual-Stream (.lam Protocol for Binary & Structured Data)
+For structured data files (`.csv`, `.db`, `.sqlite`, `.xlsx`), the system uses a **Dual-Stream** approach:
+* **Physical Twin**: Saved on the local file system at `workspace_data/{title}.{ext}`. Contains the raw bytes (e.g., raw CSV rows, SQLite binary). Consumed by local tools.
+* **Logical Twin (`.lam`)**: Saved inside `artefacts_metadata/{id}/{name}.lam`. Contains a high-density, text-based abstraction of the file's structure (column names, inferred data types, sample values). Consumed by the LLM context zone.
 
-def tool_calculate_tdee(bmr: float, activity_level: str = "sedentary") -> dict:
-    """
-    Calculates Total Daily Energy Expenditure (TDEE).
+---
 
-    Args:
-        bmr (float): Basal Metabolic Rate.
-        activity_level (str, optional): Activity level. Defaults to 'sedentary'.
-    """
-    multipliers = {"sedentary": 1.2, "light": 1.375, "moderate": 1.55, "active": 1.725}
-    mult = multipliers.get(activity_level, 1.2)
-    return {"tdee": round(bmr * mult, 2)}
-```
+## 👁️ 2. Multi-Tier Visibility Control
 
-### 🛑 CRITICAL: LCP Tool Agnosticism Doctrine (Relaxed)
+To maintain clean and token-efficient context budgets, every registered artifact is assigned a visibility tier that determines how it is represented in the prompt:
 
-**LCP tools are strictly agnostic to Lollms by default.** They must **NEVER** accept `lollms_client_instance`, `discussion_instance`, or any other internal Lollms state object as input parameters unless explicitly required for advanced agentic patterns.
+| Visibility Tier | Symbol | Prompt Context Behavior |
+| :--- | :--- | :--- |
+| **`FULL`** | `[C]` | The content (for text) or `.lam` schema (for data) is fully injected verbatim into the active context zone. |
+| **`METADATA`** | `[M]` | Only the basic metadata (such as filename, size, and type) is injected, withholding the full schema description. |
+| **`TREE_UNLOCKABLE`**| `[U]` | The file is listed only in the directory index. It is excluded from the active context but can be loaded dynamically. |
+| **`LOCKED`** | `[L]` | The file is completely excluded from the conversation context and cannot be loaded. |
+| **`HIDDEN`** | — | The artifact is completely excluded from both the directory index and the context. |
 
-Tools are designed to be standalone Unix-style utilities. They must operate purely on parameters that an LLM can naturally generate (strings, numbers, lists) and interact with the filesystem using relative paths.
-
-1.  **Optional Context Injection**: By default, do not add `discussion_instance` or `lollms_client_instance` to your tool's function signature. However, if a tool requires access to the orchestrator (e.g., for spawning child agents), it may declare these parameters. The ChatMixin orchestrator will inject them, and the LCP AST parser will filter them out when building the JSON schema for the LLM.
-2.  **CWD Reliance**: The Lollms orchestrator (ChatMixin) guarantees that the Current Working Directory (CWD) is set to the isolated discussion workspace *before* the tool executes. Tools should resolve files using simple relative paths: `Path(file_name)`.
-3.  **Output-Only Communication**: Tools communicate results back by returning a dictionary. They should never attempt to directly manipulate the discussion database, commit artifacts, or access the client (unless injected for advanced patterns).
-
-### 🛡️ Error Tracking & Tracebacks
-
-The `LCPBinding` implements a comprehensive error tracking system to aid debugging. When a tool fails, the binding captures the full Python stack trace and includes it in the returned dictionary.
-
-1.  **Explicit Tool Failures**: If a tool returns `{"success": False, "error": "..."}`, the binding captures the current stack trace and injects it as a `"traceback"` key in the returned dictionary.
-2.  **Unexpected Crashes**: If the tool function raises an unhandled `Exception`, the binding catches it, formats the full traceback via `traceback.format_exc()`, and returns:
-    ```python
-    {
-        "error": "Error executing 'tool_name': <str(exception)>",
-        "traceback": "<full_stack_trace>",
-        "status_code": 500
-    }
-    ```
-3.  **Orchestrator Visibility**: The caller (ChatMixin) receives this dictionary and can log the traceback or display it to the user, ensuring that silent failures never occur.
-
-### Example 2: Standard Agnostic Tool
-Tools operate on files in the current working directory. The orchestrator handles artifact registration and database commits.
-
-```python
-from pathlib import Path
-
-def tool_file_analyzer(file_name: str) -> dict:
-    """
-    Analyzes a file and returns its statistics.
-
-    Args:
-        file_name (str): Name of the file to inspect in the workspace.
-    """
-    # The binding automatically sets CWD to the discussion workspace.
-    # No discussion_instance is needed or allowed.
-    path = Path(file_name)
-    
-    if not path.exists():
-        return {"error": f"File '{file_name}' not found."}
-    
-    content = path.read_text(errors="ignore")
-        
-    return {
-        "status": "success",
-        "output": f"File contains {len(content)} characters."
-    }
-```
-
-### Example 3: Prompt Injection (Controlling the LLM)
-To prevent the LLM from hallucinating next steps after a tool runs, return a `prompt_injection` key. This text is fed directly to the LLM as the tool's "voice".
-
-```python
-def tool_generate_plot(data_file: str) -> dict:
-    """Generates a plot and saves it."""
-    # ... plotting logic ...
-    plot_url = "/api/workspace_files/plot_123.png"
-    
-    return {
-        "success": True,
-        "output": "Plot generated.",
-        "prompt_injection": f"\n\n✅ **Plot Generated Successfully!**\nHere is your chart: \n\n![Plot]({plot_url})\n\nThe plot shows a clear upward trend. You should now explain this trend to the user."
-    }
+The LLM can dynamically promote any `[U]` file into its working memory by outputting the file-loading tag:
+```xml
+<add_files_to_context>
+filename.ext
+</add_files_to_context>
 ```
 
 ---
 
-## 🔧 Configuration
+## 🧬 3. Integration with LollmsDiscussion
 
-Configure the LCP binding inside your client parameters:
+The `ArtefactManager` interacts directly with `LollmsDiscussion` to orchestrate state updates:
+
+```
+        LollmsDiscussion (Session State)
+              │
+              ├──> ArtefactManager
+              │         │
+              │         ├──> [SQLite Metadata Record] (Maintains version logs)
+              │         │
+              │         └──> [Physical Workspace] (Writes and version-controls files)
+              │
+              └──> ChatMixin (Orchestrates tool execution & scans CWD)
+```
+
+### A. Automated File-Tracking and Ingestion
+
+**Default Visibility Doctrine**: To prevent context window bloat, all newly discovered or tool-generated files are registered with `TREE_UNLOCKABLE` visibility by default. The LLM must explicitly unlock a file to load its content into the active context.
+
+During local tool execution, the active directory is snapshotted immediately before and after the run. If a tool writes a new file (such as a Matplotlib chart PNG) or modifies an existing dataset:
+1. The new file is automatically detected on disk.
+2. Its file type is classified, and the raw bytes are saved as a physical twin.
+3. A logical twin (`.lam`) or image reference is compiled (if applicable).
+4. The artifact is committed to the database, incrementing its version.
+5. The corresponding reference tags are appended to the conversational message stream.
+
+### B. Self-Healing and Recovery
+If a tool or script requests a physical file that is missing from the active `workspace_data/` folder, the manager intercepts the failure, queries the database version log, and restores the exact versioned physical bytes back to the disk folder automatically before the execution begins.
+
+### C. Live Rendering Tags
+The chat interface interprets custom tags inserted into the message history:
+* `<lollms_artifact id="title" type="atype" version="N" />`: Renders an interactive file card in the chat bubble allowing the user to view or download the file.
+* `<artefact_image id="title::N" />`: Directs the chat bubble to render the decoded base64 image pixels inline (e.g., showing a generated plot directly in the conversation).
+
+---
+
+## ✏️ 6. Updating Artefact Content
+
+You can modify the content of an existing artefact using the `update()` method. By default, this creates a new version in the database, preserving the history of previous states.
 
 ```python
-client = LollmsClient(
-    llm_binding_name="ollama",
-    llm_binding_config={"model_name": "gemma4:e2b"},
-    tools_binding_name="lcp",
-    tools_binding_config={
-        # Scan multiple local folders
-        "tools_folders": [
-            "./my_custom_tools_directory",
-            "C:/shared_network_tools/lcp_library"
-        ],
-        # Or map standalone files directly from anywhere on disk
-        "tool_files": [
-            "C:/projects/utilities/matter_lock_controller.py"
-        ]
-    }
+art = discussion.artefacts.update(
+    title="analysis_script.py",
+    new_content="import pandas as pd\nprint('new code')",
+    commit_message="Refactored import logic"
+)
+```
+
+### Overwriting the Current Version
+
+If you want to update the content without creating a new version history entry, you can set `create_new_version=False`. This will overwrite the content of the current active version.
+
+```python
+art = discussion.artefacts.update(
+    title="temp_notes.md",
+    new_content="Updated temporary notes without version bump.",
+    create_new_version=False
 )
 ```
 
 ---
 
-## 📂 File Organization
+## ⚠️ 7. Import Conflict Resolution
 
-### Flat Structure (Legacy/Simple)
-```text
-default_tools/
-├── weather.py          # Exposes: tool_get_weather
-├── calculator.py       # Exposes: tool_add, tool_subtract
-```
+When importing files into the artefact system, there is a possibility of title collisions (e.g., importing `README.md` from two different sources). The `import_file` method provides an `on_conflict` parameter to define the resolution strategy.
 
-### Library Structure (Recommended)
-```text
-default_tools/
-├── semantic_data_engineer/
-│   └── semantic_data_engineer.py  # Exposes: tool_get_schema, tool_filter, tool_plot, etc.
-├── matter_controller/
-│   └── matter_controller.py       # Exposes: tool_discover, tool_commission, tool_control
+### Strategies
+
+1. **`suffix` (Default)**
+   - **Behavior**: If an artifact with the target title already exists, the new file is renamed with an incrementing suffix (e.g., `README_1.md`, `README_2.md`).
+   - **Use Case**: Preserving all imported files without losing any data or altering the original artifact.
+   - **Result**: Creates a new artifact with the suffixed title. The original artifact remains untouched.
+
+2. **`version`**
+   - **Behavior**: The existing artifact is updated, and its version number is incremented. The physical file is overwritten with the new content, but the previous version is preserved in the database history.
+   - **Use Case**: Importing an updated version of a file where you want to maintain a clear audit trail of changes.
+   - **Result**: Updates the existing artifact and bumps the version (e.g., v1 → v2).
+
+3. **`overwrite`**
+   - **Behavior**: The existing artifact's content is replaced with the new content, but the version number is **not** incremented. Previous version history is preserved, but the active version is silently replaced.
+   - **Use Case**: Correcting or silently updating a file without polluting the version history.
+   - **Result**: Updates the existing artifact. The version number remains the same.
+
+4. **`replace`**
+   - **Behavior**: Completely purges all existing versions and history of the artifact, then creates a fresh `v1` baseline with the new content.
+   - **Use Case**: Starting over cleanly when the previous iterations are no longer relevant or were imported in error.
+   - **Result**: Deletes all previous database records and physical metadata, then creates a new `v1` artifact.
+
+### Example
+
+```python
+# Import a file, replacing any existing artifact with the same name completely
+discussion.import_file(
+    path="path/to/new/README.md",
+    mode="text",
+    title="README.md",
+    on_conflict="replace"
+)
 ```
 
 ---
 
-## 🛡️ Execution Lifecycle
+## 🛠️ 4. Dynamic Tool Artefacts (`type="tool"`)
 
-1.  **Context Detection:** The chat layer detects data files in the workspace.
-2.  **Dynamic Mounting:** `LCPBinding.mount_tool_library("semantic_data_engineer")` is called automatically.
-3.  **AST Parsing:** LCP scans the file, finds all `tool_*` functions, and registers them.
-4.  **Invocation:** User asks "Filter the data". LLM calls `tool_filter_and_slice_data`.
-5.  **Workspace Sync:**
-    *   LCP changes CWD to `data_workspace/discussions/{id}/`.
-    *   Tool executes and creates `filtered_data.csv`.
-    *   LCP detects the new file and syncs it as an Artifact.
-6.  **Response:** The tool returns `prompt_injection`, instructing the LLM: "Here is the filtered CSV. Reference it in your answer."
-7.  **Final Answer:** LLM presents the result to the user seamlessly.
 
-### Dynamic Tool Lifecycle (LLM-Authored Tools)
-1.  **Generation:** LLM outputs `<artifact type="tool" name="my_tool">def tool_run(): ...</artifact>`.
-2.  **Security Gate:** `ArtefactManager` checks `discussion.allow_dynamic_tools`. If `False`, the process stops here (file is saved but not executed).
-3.  **Registration:** If `True`, `LCPBinding.register_tool_from_code("my_tool", code)` is called. The code is executed in an isolated module namespace.
-4.  **Invocation:** The LLM can immediately call `<tool>{"name": "tool_my_tool", "parameters": {...}}</tool>`.
-5.  **Cleanup:** If the artefact is updated or deleted, `LCPBinding.unregister_tools_by_prefix("my_tool")` is called to remove the old executable function.
+The artefact system natively supports the LLM generating its own executable tools. When the LLM creates an artefact with `type="tool"`, the `ArtefactManager` attempts to register it dynamically.
+
+### Security Gate
+To prevent untrusted LLMs from executing arbitrary code, dynamic tool registration is gated by the `allow_dynamic_tools` flag on the active `LollmsDiscussion` instance.
+*   If `allow_dynamic_tools` is `False` (the default), the tool artefact is saved as a standard code file but is **NOT** parsed or executed.
+*   If `allow_dynamic_tools` is `True`, the manager extracts the Python code and passes it to the active `LCPBinding` for immediate AST parsing and module execution.
+
+### Lifecycle
+1.  **Create**: LLM outputs `<artifact type="tool" name="my_tool">def tool_run(): ...</artifact>`.
+2.  **Gate Check**: `ArtefactManager._register_tool_artefact()` checks `discussion.allow_dynamic_tools`.
+3.  **Register**: If allowed, `LCPBinding.register_tool_from_code("my_tool", code)` is called.
+4.  **Execute**: The tool `tool_my_tool` is now available in the active session registry.
 
 ---
 
-## 🔄 Cross-Discussion Tool Portability (.laa / .lab)
+## 🧩 5. Artefact Properties Reference & Handling Guide
 
-Because LCP tools are stored as standard Python artefacts inside the discussion workspace, they fully benefit from the **Decoupled Artefact Protocol**. You can export a tool created in one discussion and import it into another, or share it via the global library.
+Every artifact in the system is represented as a dictionary (record) with a specific set of keys. Understanding the distinction between these properties is critical for correctly creating, updating, and referencing artifacts, especially when dealing with the Dual-Stream storage architecture.
 
-### Exporting a Tool
-If an LLM creates a specialized tool (e.g., `my_analyzer.py`) in Discussion A, you can export it:
+### Core Properties
 
-```python
-# Export as a standalone .laa file (preserves version history)
-discussion_a.artefacts.export_artefact_to_archive(
-    title="my_analyzer.py", 
-    output_path="my_analyzer.laa"
-)
+| Property | Type | Description & Handling Rules |
+| :--- | :--- | :--- |
+| `title` | `str` | **The primary key.** This is the high-level metadata name used by the LLM and the database to reference the artifact. It may contain subfolder paths (e.g., `My_subfolder/SKILL.md`). It is sanitized via `_sanitize_path_segments` to ensure cross-platform safety. When updating or retrieving an artifact, you query by this title. |
+| `physical_path` | `str` | **The disk location.** This stores the exact relative path (including subfolders and extension) where the physical twin resides in `workspace_data/`. If not explicitly provided during `add()` or `update()`, it defaults to the `title`. **CRITICAL**: File-reading tools should be passed the `physical_path` (or `display_path` from the context zone) to ensure they open the correct file on disk. |
+| `type` | `str` | The category of the artifact (e.g., `ArtefactType.CODE`, `ArtefactType.DATA`). Determines how the artifact is rendered in the context zone and which tools can operate on it. |
+| `content` | `str` | The logical text content. For text/code files, this is the verbatim source code. For `DATA` artifacts, this holds the `.lam` schema description, **NOT** the raw binary bytes. |
+| `version` | `int` | The version number. Incremented automatically on `update()` if `bump_version=True`. The `get()` method returns the highest version by default. |
+| `visibility` | `str` | The context tier (`FULL`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`). Controls how the artifact appears in the LLM's prompt. See [Section 2: Multi-Tier Visibility Control](#-2-multi-tier-visibility-control). |
+| `active` | `bool` | A legacy boolean flag that mirrors `visibility == FULL`. It is `True` if the artifact is fully loaded in context, `False` otherwise. |
+| `language` | `str` | The programming or markup language (e.g., `python`, `html`). Used for syntax highlighting in the context zone and to infer file extensions. |
+| `file_ext` | `str` | The explicit file extension (e.g., `.csv`, `.db`). **CRITICAL for DATA artifacts**: This determines how the physical file is written to disk and prevents binary corruption. |
+| `logical_content` | `str` | Explicit storage for the `.lam` schema text of `DATA` artifacts. While usually mirrored in `content`, this field is the authoritative source for the logical twin during Dual-Stream sync operations. |
+| `physical_data` | `bytes` | The raw binary bytes of a `DATA` or `IMAGE` artifact. **CRITICAL**: This field is stripped from the database record by `_get_all_raw()` to prevent JSON serialization crashes. It is only present in the dictionary returned directly by `add()` or `update()`. Never assume `art.get("physical_data")` will return bytes from a database query; rehydrate from disk if needed. |
+| `token_count` | `int` | The estimated token count of the `content`. Used by the Context Budget Guard to prevent context overflow. |
 
-# Or save directly to the global library
-discussion_a.save_artefact_to_global_archive("my_analyzer.py")
-```
+### Handling Guidelines
 
-### Importing a Tool
-In Discussion B, you can import the tool. Once the physical file is reconstructed on disk, the LCP binding can discover and register it.
+#### 1. Title vs. Physical Path Decoupling
+The architecture decouples the database key (`title`) from the disk location (`physical_path`).
+*   **Creation**: If you create an artifact with `title="My_subfolder/script.py"`, the `physical_path` automatically mirrors this. The physical file is written to `workspace_data/My_subfolder/script.py`.
+*   **Context Injection**: `build_artefacts_context_zone()` displays the `physical_path` to the LLM. When the LLM decides to read a file, it should use this exact string.
+*   **Updating**: If you change the `title` during an update (`new_title`), the `physical_path` is updated to match, and the old physical file is deleted from disk.
 
-```python
-# Import from a .laa file
-discussion_b.artefacts.import_artefact_from_archive("my_analyzer.laa")
+#### 2. Data Artifact Safety (Binary Corruption Prevention)
+`DATA` artifacts (like SQLite databases or CSVs) use the Dual-Stream protocol.
+*   **Never write string `content` to a binary file**: The `_sync_to_disk_workspace` method explicitly refuses to write string `content` to `.db`/`.sqlite` files if `physical_data` is missing. This prevents the database header from being overwritten with `.lam` schema text.
+*   **Rehydration**: When updating a `DATA` artifact's schema, the `update()` method automatically rehydrates `physical_data` by reading the existing bytes from disk *before* calling `add()`. This ensures the raw binary data is preserved across schema updates.
 
-# Or load from the global library
-discussion_b.load_artefact_from_global_archive("my_analyzer.py")
+#### 3. Visibility and Context Budget
+*   **Tool-Generated Files**: By default, tool-generated files >100KB are registered with `visibility=TREE_UNLOCKABLE` and `active=False` to prevent context bloat.
+*   **Unlocking**: The LLM can use `<unlock_file>` to promote a file to `FULL` visibility. However, the Context Budget Guard blocks unlocking files >50,000 tokens, instructing the LLM to use tools (SQL, grep) instead.
 
-# The tool is now physically present in Discussion B's workspace.
-# If the LCP binding is configured to scan this workspace, it will auto-discover the tool.
-```
+#### 4. Image Artifacts
+*   Image artifacts store base64 encoded strings in the `images` list and their MIME types in `image_media_types`.
+*   They are an exception to the visibility doctrine: they are always registered with `visibility=FULL` and `active=True` when generated by tools, so they can be hydrated into the LLM's vision context immediately.
 
-### Bundling Tool Ecosystems
-If a tool requires multiple files (e.g., a main script and a helper module), you can bundle them using the `.lab` format, which preserves the relative folder structure.
+---
 
-```python
-# Export a bundle of tool files
-discussion_a.artefacts.export_artefact_bundle(
-    paths=["workspace_data/my_tool.py", "workspace_data/utils.py"],
-    output_path="my_tool_ecosystem.lab"
-)
+## 🛠️ 6. Class Reference
 
-# Import the bundle into a new discussion
-discussion_b.artefacts.import_artefact_bundle("my_tool_ecosystem.lab")
-```
-### 8. Context Visibility & Physical Paths
-
-**Path Sovereignty**: The LLM does not see flat filenames; it sees the exact relative path of the artifact from the workspace root (e.g., `path/to/artefact.py`). This ensures that when the LLM writes Python code to read a CSV or import a module, it uses the correct relative path, preventing `FileNotFoundError`.
-
-**Multi-Tier Visibility**: To prevent context bloat, the LLM only sees files that are explicitly unlocked. The system presents a directory tree index to the LLM:
-```text
-## artefacts list
-path/to/artefact.py[F]
-path/to/artefact2.py[L]
-path/to/file.md[F]
-path/to/file.csv[M]
-
-## Full artefacts content
-```python:path/to/artefact.py
-# here is the content
-```
-
-```markdown:path/to/file.md
-here is the content
-``` 
-```markdown:path/to/file.csv
-here is metadata infos about the file
-``` 
-```
-The LLM can dynamically request to load (`[U]` -> `[F]`) or lock (`[F]` -> `[L]`) files using `<unlock_file>` and `<lock_file>` tags.
+*   **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`, `SCRATCHPAD`).
+* **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, manages version history squashing, and gates dynamic tool registration.
+* **`FileImportMixin`**: Contains multi-modal parser subroutines for importing PDFs, Word documents, PowerPoint presentations, and audio files.
