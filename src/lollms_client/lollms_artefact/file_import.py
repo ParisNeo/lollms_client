@@ -201,14 +201,26 @@ def _pil_image_to_b64(img: Any, fmt: str = "JPEG") -> Tuple[str, str]:
     return _b64_encode(buf.getvalue()), f"image/{fmt.lower()}"
 
 
-def _detect_artefact_type(path: Path) -> str:
+def _detect_artefact_type_from_mode(path: Path, mode: str) -> str:
+    """
+    Determines the ArtefactType strictly based on the user's explicit import mode.
+    This prevents the .lam Dual-Stream system from hijacking text imports.
+    """
     ext = path.suffix.lower()
-    if ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".sqlconn"):
+    
+    if mode in (IMPORT_MODE_DATA, IMPORT_MODE_DATA_BUNDLE):
         return ArtefactType.DATA
+    if mode == IMPORT_MODE_IMAGES_ONLY:
+        return ArtefactType.IMAGE
+    if mode == IMPORT_MODE_AUDIO_STT:
+        return ArtefactType.DOCUMENT
+        
+    # If mode is text/text_images/ocr, we force DOCUMENT or CODE
     if ext in _CODE_EXTENSIONS:
         return ArtefactType.CODE
     if ext in _IMAGE_EXTENSIONS:
         return ArtefactType.IMAGE
+        
     return ArtefactType.DOCUMENT
 
 
@@ -820,6 +832,7 @@ class FileImportMixin:
         activate:    bool = True,
         progress_cb: Optional[Callable[[str], None]] = None,
         description: Optional[str] = None,
+        on_conflict: str  = "suffix",
     ) -> Dict[str, Any]:
         """
         Import a file into the artefact system.
@@ -832,6 +845,11 @@ class FileImportMixin:
         activate    : Whether to activate the text artefact immediately.
         progress_cb : Optional callable receiving progress strings.
         description : Optional description text appended to the artifact content.
+        on_conflict : Strategy if an artifact with the same title exists.
+                      "suffix" (default): Renames the new file (e.g., file_1.md).
+                      "version": Creates a new version of the existing artifact.
+                      "overwrite": Replaces content without incrementing version.
+                      "replace": Completely purges all previous versions and creates a new v1.
 
         Returns
         -------
@@ -877,7 +895,6 @@ class FileImportMixin:
         is_image_file = ext in _IMAGE_EXTENSIONS
         is_audio_file = ext in (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".wma", ".aac")
 
-        # ── data_bundle mode (Folder Ingestion) ──────────────────────────────
         # ── data_bundle mode (Folder Ingestion) ──────────────────────────────
         if mode == IMPORT_MODE_DATA_BUNDLE:
             if not path.is_dir():
@@ -1209,90 +1226,92 @@ class FileImportMixin:
                         "warnings": warnings,
                     }
 
-            # ── data mode (Single File) ──────────────────────────────────────────
-            if mode == IMPORT_MODE_DATA:
-                _progress("Analyzing structured data file...")
+        # ── data mode (Single File) ──────────────────────────────────────────
+        # 🛑 CRITICAL FIX: Dedented to top-level so it executes when mode == IMPORT_MODE_DATA
+        if mode == IMPORT_MODE_DATA:
+            _progress("Analyzing structured data file...")
 
-                # 🛡️ TITLE NORMALIZATION PROTOCOL (ENFORCED)
-                # CRITICAL: The Artifact Title MUST match the Physical Filename exactly (including extension).
-                # Tools rely on this exact string match to find files on disk.
-                clean_title = title
+            # 🛡️ TITLE NORMALIZATION PROTOCOL (ENFORCED)
+            # CRITICAL: The Artifact Title MUST match the Physical Filename exactly (including extension).
+            # Tools rely on this exact string match to find files on disk.
+            clean_title = title
 
-                # ONLY strip if it's a doubled extension (e.g. "file.csv.csv" -> "file.csv")
-                double_ext = ext + ext
-                if clean_title.lower().endswith(double_ext):
-                    clean_title = clean_title[:-len(ext)]
-                    _progress(f"Normalized title '{title}' -> '{clean_title}' to remove double extension.")
-                # DO NOT add extension if missing here, because 'title' comes from filename.stem by default.
-                # The 'title' variable at this point is already path.stem (no extension).
-                # We MUST append it now to ensure Artifact Title == Filename.
-                if not clean_title.lower().endswith(ext):
-                    clean_title = f"{clean_title}{ext}"
+            # ONLY strip if it's a doubled extension (e.g. "file.csv.csv" -> "file.csv")
+            double_ext = ext + ext
+            if clean_title.lower().endswith(double_ext):
+                clean_title = clean_title[:-len(ext)]
+                _progress(f"Normalized title '{title}' -> '{clean_title}' to remove double extension.")
+            # DO NOT add extension if missing here, because 'title' comes from filename.stem by default.
+            # The 'title' variable at this point is already path.stem (no extension).
+            # We MUST append it now to ensure Artifact Title == Filename.
+            if not clean_title.lower().endswith(ext):
+                clean_title = f"{clean_title}{ext}"
 
-                _progress(f"Final artifact title (with extension): '{clean_title}'")
+            _progress(f"Final artifact title (with extension): '{clean_title}'")
 
-                # 1. Parse and extract the Markdown schema description (This becomes the .lam Logical Twin)
-                # _parse_data_file returns: (schema_text, images_list, raw_physical_bytes)
-                # We pass clean_title (with extension) so the schema header matches the artifact name
-                parse_result = _parse_data_file(path, clean_title, version=1, progress_cb=progress_cb)
+            # 1. Parse and extract the Markdown schema description (This becomes the .lam Logical Twin)
+            # _parse_data_file returns: (schema_text, images_list, raw_physical_bytes)
+            # We pass clean_title (with extension) so the schema header matches the artifact name
+            parse_result = _parse_data_file(path, clean_title, version=1, progress_cb=progress_cb)
 
-                # Handle both 2-tuple (old) and 3-tuple (new) returns from _parse_data_file
-                if len(parse_result) == 3:
-                    schema_text, _, raw_physical_bytes = parse_result
-                else:
-                    schema_text, _ = parse_result
-                    raw_physical_bytes = None
+            # Handle both 2-tuple (old) and 3-tuple (new) returns from _parse_data_file
+            if len(parse_result) == 3:
+                schema_text, _, raw_physical_bytes = parse_result
+            else:
+                schema_text, _ = parse_result
+                raw_physical_bytes = None
 
-                # Fallback: If _parse_data_file didn't return raw bytes, read them ourselves
-                if raw_physical_bytes is None:
-                    try:
-                        raw_physical_bytes = path.read_bytes()
-                    except Exception as e:
-                        _progress(f"Warning: Could not read raw bytes: {e}")
+            # Fallback: If _parse_data_file didn't return raw bytes, read them ourselves
+            if raw_physical_bytes is None:
+                try:
+                    raw_physical_bytes = path.read_bytes()
+                except Exception as e:
+                    _progress(f"Warning: Could not read raw bytes: {e}")
 
-                # Append description if provided (before the schema content)
-                full_description = schema_text
-                if description and description.strip():
-                    full_description = f"## Description\n{description.strip()}\n\n{schema_text}"
+            # Append description if provided (before the schema content)
+            full_description = schema_text
+            if description and description.strip():
+                full_description = f"## Description\n{description.strip()}\n\n{schema_text}"
 
-                atype = ArtefactType.DATA
+            atype = ArtefactType.DATA
 
-                # Use clean_title (with extension) for lookup and registration
-                existing = self.artefacts.get(clean_title)
+            # Use clean_title (with extension) for lookup and registration
+            existing = self.artefacts.get(clean_title)
 
-                if existing is None:
-                    art = self.artefacts.add(
-                        title=clean_title,
-                        artefact_type=atype,
-                        content=full_description,       # Fallback content (usually schema)
-                        active=activate,
-                        file_ext=ext,
-                        version=1,
-                        read_only=True,
-                        physical_data=raw_physical_bytes, # The raw CSV/DB bytes for tools
-                        logical_content=full_description    # The rich schema for the LLM (.lam)
-                    )
-                else:
-                    art = self.artefacts.update(
-                        title=clean_title,
-                        new_content=full_description,
-                        new_type=atype,
-                        active=activate,
-                        file_ext=ext,
-                        version=1,
-                        read_only=True,
-                    )
-                _progress("Data analysis complete.")
+            if existing is None:
+                art = self.artefacts.add(
+                    title=clean_title,
+                    artefact_type=atype,
+                    content=full_description,       # Fallback content (usually schema)
+                    active=activate,
+                    file_ext=ext,
+                    version=1,
+                    read_only=True,
+                    physical_data=raw_physical_bytes, # The raw CSV/DB bytes for tools
+                    logical_content=full_description,    # The rich schema for the LLM (.lam)
+                    commit_message="Imported via FileImport engine (mode=data)"
+                )
+            else:
+                art = self.artefacts.update(
+                    title=clean_title,
+                    new_content=full_description,
+                    new_type=atype,
+                    active=activate,
+                    file_ext=ext,
+                    version=1,
+                    read_only=True,
+                )
+            _progress("Data analysis complete.")
 
-                # 🛑 CRITICAL EXIT: Prevent fall-through to generic text processing
-                return {
-                    "text_artefact": art,
-                    "image_artefact": None,
-                    "mode": mode,
-                    "page_count": 0,
-                    "image_count": 0,
-                    "warnings": warnings,
-                }
+            # 🛑 CRITICAL EXIT: Prevent fall-through to generic text processing
+            return {
+                "text_artefact": art,
+                "image_artefact": None,
+                "mode": mode,
+                "page_count": 0,
+                "image_count": 0,
+                "warnings": warnings,
+            }
 
         # ── images_only: pure image files ────────────────────────────────────
         if mode == IMPORT_MODE_IMAGES_ONLY:
@@ -1341,7 +1360,7 @@ class FileImportMixin:
                     f"## Page {i + 1}\n\n<artefact_image id=\"{make_image_id(f'{title}::images', i)}\" />"
                     for i in range(image_count)
                 )
-                text_artefact = self._import_save_text(title, anchors_content, path, activate)
+                text_artefact = self._import_save_text(title, anchors_content, path, mode, activate)
                 _progress(f"Companion text/anchors artefact created: '{title}' (active={activate})")
 
             return {
@@ -1376,7 +1395,7 @@ class FileImportMixin:
                 if not images_data:
                     warnings.append("No slide images found in PPTX; falling back to text extraction.")
                     text = _extract_pptx_text(path)
-                    text_artefact = self._import_save_text(title, text, path, activate)
+                    text_artefact = self._import_save_text(title, text, path, mode, activate)
                     return {
                         "text_artefact": text_artefact, "image_artefact": None,
                         "mode": mode, "page_count": 0, "image_count": 0, "warnings": warnings,
@@ -1388,7 +1407,7 @@ class FileImportMixin:
                 if not images_data:
                     warnings.append("No embedded images in DOCX; falling back to text extraction.")
                     text = _extract_docx_text(path)
-                    text_artefact = self._import_save_text(title, text, path, activate)
+                    text_artefact = self._import_save_text(title, text, path, mode, activate)
                     return {
                         "text_artefact": text_artefact, "image_artefact": None,
                         "mode": mode, "page_count": 0, "image_count": 0, "warnings": warnings,
@@ -1397,7 +1416,7 @@ class FileImportMixin:
             else:
                 warnings.append(f"OCR mode not applicable for '{ext}'; using text extraction.")
                 text = _extract_text_file(path)
-                text_artefact = self._import_save_text(title, text, path, activate)
+                text_artefact = self._import_save_text(title, text, path, mode, activate)
                 return {
                     "text_artefact": text_artefact, "image_artefact": None,
                     "mode": mode, "page_count": 0, "image_count": 0, "warnings": warnings,
@@ -1408,7 +1427,7 @@ class FileImportMixin:
             ocr_text    = _ocr_images_with_llm(images_b64, lc, _progress)
             _progress(f"OCR complete — {page_count} page(s) transcribed")
 
-            text_artefact = self._import_save_text(title, ocr_text, path, activate)
+            text_artefact = self._import_save_text(title, ocr_text, path, mode, activate)
 
             return {
                 "text_artefact":  text_artefact,
@@ -1503,7 +1522,7 @@ class FileImportMixin:
                 )
 
         # ── Save text artefact ───────────────────────────────────────────────
-        text_artefact = self._import_save_text(title, text, path, activate)
+        text_artefact = self._import_save_text(title, text, path, mode, activate, on_conflict=on_conflict)
 
         # ── Save image artefact (deactivated) ────────────────────────────────
         if include_images and images_data:
@@ -1543,9 +1562,20 @@ class FileImportMixin:
         title:    str,
         text:     str,
         path:     Path,
+        mode:     str,
         activate: bool,
+        on_conflict: str = "suffix",
     ) -> Dict:
-        """Create or update the text artefact for the imported content."""
+        """
+        Create or update the text artefact for the imported content.
+        
+        Args:
+            on_conflict: Strategy when an artifact with the same title exists.
+                         "suffix" (default): Renames the new file (e.g., file_1.md).
+                         "version": Creates a new version of the existing artifact.
+                         "overwrite": Replaces content without incrementing version.
+                         "replace": Completely purges all previous versions and creates a new v1.
+        """
         if "." not in title and path.suffix:
             title = f"{title}{path.suffix.lower()}"
 
@@ -1564,8 +1594,12 @@ class FileImportMixin:
                 "created_at": metadata.get("created", datetime.utcnow().isoformat())
             }
         else:
-            atype = _detect_artefact_type(path)
+            atype = _detect_artefact_type_from_mode(path, mode)
             extra_data = {}
+            # 🛑 CRITICAL FIX: We DO NOT inject file_ext for text imports.
+            # Injecting file_ext triggers the Dual-Stream .lam protocol in ArtefactManager,
+            # which replaces the extracted text with a binary data schema.
+            # Only `data` mode should inject file_ext.
             if atype == ArtefactType.DATA:
                 extra_data["file_ext"] = path.suffix.lower()
 
@@ -1588,17 +1622,81 @@ class FileImportMixin:
                 **extra_data
             )
             ASCIIColors.success(f"[FileImport] Created artefact '{title}' of type '{atype}'")
-        else:
+            return art
+
+        # ── CONFLICT RESOLUTION ──
+        if on_conflict == "suffix":
+            # CRITICAL FIX: Base the new title on the EXISTING artifact's title,
+            # not the source file's stem. This ensures importing 'README_from_elsewhere.md'
+            # into 'README.md' creates 'README_1.md', not 'README_from_elsewhere_1.md'.
+            existing_title = existing.get("title", title)
+            p = Path(existing_title)
+            base_stem = p.stem
+            ext = p.suffix.lower() or path.suffix.lower()
+            
+            counter = 1
+            new_title = f"{base_stem}_{counter}{ext}"
+            
+            # Ensure we don't clash with sanitized titles if they differ
+            while self.artefacts.get(new_title) is not None:
+                counter += 1
+                new_title = f"{base_stem}_{counter}{ext}"
+            
+            art = self.artefacts.add(
+                title         = new_title,
+                artefact_type = atype,
+                content       = text,
+                language      = language,
+                active        = activate,
+                visibility    = visibility_value,
+                **extra_data
+            )
+            ASCIIColors.success(f"[FileImport] Conflict resolved via suffix. Created artefact '{new_title}'")
+            
+        elif on_conflict == "version":
             art = self.artefacts.update(
                 title       = title,
                 new_content = text,
                 new_type    = atype,
                 language    = language,
                 active      = activate,
-                visibility    = visibility_value,
+                visibility  = visibility_value,
+                bump_version= True,
                 **extra_data
             )
-            ASCIIColors.success(
-                f"[FileImport] Updated artefact '{title}' → v{art.get('version', '?')} of type '{atype}'"
+            ASCIIColors.success(f"[FileImport] Conflict resolved via versioning. Updated '{title}' → v{art.get('version', '?')}")
+            
+        elif on_conflict == "overwrite":
+            art = self.artefacts.update(
+                title       = title,
+                new_content = text,
+                new_type    = atype,
+                language    = language,
+                active      = activate,
+                visibility  = visibility_value,
+                create_new_version = False,
+                **extra_data
             )
+            ASCIIColors.success(f"[FileImport] Conflict resolved via overwrite. Replaced content in '{title}'")
+
+        elif on_conflict == "replace":
+            # 1. Purge all existing versions and physical files
+            self.artefacts.remove(title)
+            
+            # 2. Create a completely new v1 baseline
+            art = self.artefacts.add(
+                title         = title,
+                artefact_type = atype,
+                content       = text,
+                language      = language,
+                active        = activate,
+                visibility    = visibility_value,
+                version       = 1,
+                **extra_data
+            )
+            ASCIIColors.success(f"[FileImport] Conflict resolved via replace. Purged history and created new v1 for '{title}'")
+
+        else:
+            raise ValueError(f"Unknown on_conflict strategy: '{on_conflict}'. Must be 'suffix', 'version', 'overwrite', or 'replace'.")
+
         return art
