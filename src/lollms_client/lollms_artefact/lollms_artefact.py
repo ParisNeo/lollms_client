@@ -369,6 +369,10 @@ class ArtefactManager:
         migrated = []
         for a in raw:
             fixed = a.copy()
+            if "physical_data" in fixed:
+                fixed.pop("physical_data")
+                dirty = True
+
             if "id"               not in fixed: fixed["id"]               = str(uuid.uuid4()); dirty = True
             if "type"             not in fixed: fixed["type"]             = ArtefactType.DOCUMENT; dirty = True
             if "title"            not in fixed: fixed["title"]            = "untitled"; dirty = True
@@ -476,8 +480,12 @@ class ArtefactManager:
             # For text-based data files (like .csv, .tsv), the 'content' field holds the raw text
             # and should be written to disk if physical_data is missing.
             if not wrote_physical and isinstance(content, str) and content:
-                # Skip true binary types (images) to prevent writing base64/placeholder text as a file
-                if atype != ArtefactType.IMAGE:
+                # 🛑 CRITICAL FIX: Never write string content to a binary database file (.db, .sqlite).
+                # The 'content' field for DATA artifacts is a logical schema (.lam), not the raw bytes.
+                # Writing it to disk corrupts the SQLite file.
+                is_binary_db = file_ext in (".db", ".sqlite", ".sqlite3")
+                # Skip true binary types (images, databases) to prevent writing base64/placeholder text as a file
+                if atype != ArtefactType.IMAGE and not is_binary_db:
                     try:
                         # CRITICAL: Ensure parent subdirectories exist before writing
                         primary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -486,6 +494,8 @@ class ArtefactManager:
                         wrote_physical = True
                     except Exception as e:
                         trace_exception(e)
+                elif is_binary_db:
+                    ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing.")
             if logical_content:
                 try:
                     lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
@@ -535,6 +545,7 @@ class ArtefactManager:
         version_tags:      Optional[List[str]] = None,
         physical_data:     Optional[bytes] = None,
         logical_content:   Optional[str] = None,
+        create_new_version: bool = True,
         **extra_data
     ) -> Dict[str, Any]:
         # CRITICAL: Sanitize the title to ensure it is always a valid cross-platform filename.
@@ -614,8 +625,15 @@ class ArtefactManager:
             "updated_at":       now,
             "commit_message":   commit_message,
             "version_tags":     version_tags or [],
+            "logical_content":  logical_content, # EXPLICIT: Persist logical twin
             **extra_data,
         }
+
+        # 🛑 CRITICAL FIX: Return a copy with physical_data to the caller for immediate use,
+        # but strip it before saving to the DB to prevent JSON serialization crashes.
+        return_artefact = new_artefact.copy()
+        return_artefact["physical_data"] = physical_data
+
         artefacts.append(new_artefact)
         self._save_all(artefacts)
 
@@ -625,7 +643,7 @@ class ArtefactManager:
                physical_data=physical_data, physical_path=physical_path,
                 logical_content=logical_content
             )
-        return new_artefact
+        return return_artefact
 
     def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
         candidates = [a for a in self._get_all_raw() if a.get('title') == title]
@@ -668,6 +686,55 @@ class ArtefactManager:
             result = [a for a in result if tag_set.issubset(set(a.get('tags', [])))]
         return result
 
+    def update_lam(self, title: str, new_lam_content: str) -> Optional[Dict[str, Any]]:
+        """
+        Updates the logical metadata (.lam) of an artifact.
+        For data artifacts, updates the 'logical_content' field.
+        For text-based artifacts (txt, md, pdf, etc.), updates the 'content' field directly.
+        Persists the new .lam to disk.
+        """
+        latest = self.get(title)
+        if latest is None:
+            raise ValueError(f"Cannot update .lam for non-existent artefact '{title}'.")
+
+        atype = latest.get("type", ArtefactType.DOCUMENT)
+        is_data = (atype == ArtefactType.DATA)
+
+        if is_data:
+            updated_art = self.update(
+                title=title,
+                logical_content=new_lam_content,
+                bump_version=False
+            )
+        else:
+            updated_art = self.update(
+                title=title,
+                new_content=new_lam_content,
+                bump_version=False
+            )
+
+        try:
+            if getattr(self._discussion, "workspace_data_path", None):
+                meta_dir = Path(self._discussion.workspace_data_path).parent / "artefacts_metadata"
+            else:
+                base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+                disc_id = self._discussion.id
+                meta_dir = base_workspace_dir / disc_id / "artefacts_metadata"
+
+            physical_path = latest.get("physical_path") or title
+            clean_path = self._sanitize_path_segments(physical_path.replace("workspace/", "").replace("data_workspace/", ""))
+            filename = self._get_filename_with_ext(clean_path, atype, latest.get("language"), latest.get("file_ext"))
+            name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
+            art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
+            lam_path = meta_dir / art_id / f"{name_part}.lam"
+
+            lam_path.parent.mkdir(parents=True, exist_ok=True)
+            lam_path.write_text(new_lam_content, encoding="utf-8", errors="ignore")
+        except Exception as e:
+            ASCIIColors.warning(f"Failed to write .lam file to disk for '{title}': {e}")
+
+        return updated_art
+
     def update(
         self,
         title:             str,
@@ -680,6 +747,7 @@ class ArtefactManager:
         url:               Optional[str] = None,
         new_title:         Optional[str] = None,
         bump_version:      bool = True,
+        create_new_version: bool = True,
         active:            Optional[bool] = None,
         visibility:        Optional[str] = None,
         commit_message:    Optional[str] = None,
@@ -692,7 +760,12 @@ class ArtefactManager:
             raise ValueError(f"Cannot update non-existent artefact '{title}'.")
 
         new_type = new_type or extra_data.pop("artefact_type", None)
-        new_version = version if version is not None else ((latest.get('version', 1) + 1) if bump_version else latest.get('version', 1))
+        if version is not None:
+            new_version = version
+        elif not create_new_version:
+            new_version = latest.get('version', 1)
+        else:
+            new_version = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
 
         resolved_visibility = visibility or latest.get("visibility")
         if not resolved_visibility:
@@ -708,7 +781,7 @@ class ArtefactManager:
             "id", "title", "type", "version", "content", "images", "image_media_types",
             "audios", "videos", "zip", "language", "url", "tags", "active", "visibility",
             "created_at", "updated_at", "artefact_type", "commit_message", "version_tags",
-            "physical_path", "token_count"
+            "physical_path", "token_count", "logical_content", "physical_data"
         }
         merged_extra = {k: v for k, v in latest.items() if k not in internal_keys}
         merged_extra.update(extra_data)
@@ -741,6 +814,36 @@ class ArtefactManager:
         use_images = new_images if new_images is not None else latest.get('images', [])
         use_mtypes = new_image_media_types if new_image_media_types is not None else latest.get('image_media_types', [])
 
+        # 🛑 CRITICAL FIX: Extract logical_content and physical_data from merged_extra so they can be passed 
+        # explicitly to self.add(), ensuring the .lam schema and raw bytes survive artifact updates.
+        logical_content = merged_extra.pop("logical_content", latest.get("logical_content"))
+        physical_data = merged_extra.pop("physical_data", latest.get("physical_data"))
+
+        # 🛑 CRITICAL FIX: Prevent Data Artifact Corruption (Binary AND Text).
+        # The _get_all_raw() method strips physical_data (bytes) before returning records to prevent
+        # JSON serialization crashes. This means latest.get("physical_data") is ALWAYS None.
+        # If we don't rehydrate the physical bytes here, add() receives physical_data=None.
+        # _sync_to_disk_workspace then falls back to writing the string content (the .lam schema text)
+        # directly to the physical file, overwriting the raw data (binary .db or text .csv) with schema text.
+        if physical_data is None and latest.get("type") == ArtefactType.DATA:
+            try:
+                if getattr(self._discussion, "workspace_data_path", None):
+                    ws_data_dir = Path(self._discussion.workspace_data_path)
+                else:
+                    base_ws = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+                    ws_data_dir = base_ws / self._discussion.id / "workspace_data"
+
+                phys_path = latest.get("physical_path") or latest.get("title", "")
+                clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
+                filename = self._get_filename_with_ext(clean_path, latest.get("type"), latest.get("language"), latest.get("file_ext"))
+                active_physical_path = ws_data_dir / filename
+
+                if active_physical_path.exists():
+                    physical_data = active_physical_path.read_bytes()
+                    ASCIIColors.info(f"[ArtefactManager] Rehydrated physical bytes for data artifact '{latest.get('title')}' from {active_physical_path}")
+            except Exception as e:
+                ASCIIColors.warning(f"[ArtefactManager] Failed to rehydrate physical bytes for data artifact: {e}")
+
         result = self.add(
             title             = target_title,
             artefact_type     = new_type if new_type is not None else latest.get('type', ArtefactType.DOCUMENT),
@@ -758,7 +861,22 @@ class ArtefactManager:
             commit_message    = commit_message if commit_message is not None else latest.get('commit_message'),
            physical_path     = target_physical_path, # Pass to add()
             version_tags      = version_tags if version_tags is not None else latest.get('version_tags', []),
+            logical_content   = logical_content, # EXPLICIT: Persist logical twin on update
+            physical_data     = physical_data,   # EXPLICIT: Persist physical twin on update
             **merged_extra,
+        )
+        
+        # 🛑 CRITICAL FIX: Immediately sync the updated version to the physical workspace
+        self._sync_to_disk_workspace(
+            title=result.get("title", target_title),
+            content=result.get("content", use_content),
+            version=result.get("version", new_version),
+            atype=result.get("type", new_type if new_type is not None else latest.get('type', ArtefactType.DOCUMENT)),
+            language=result.get("language", language if language is not None else latest.get('language')),
+            file_ext=merged_extra.get("file_ext", latest.get("file_ext")),
+            physical_data=physical_data,
+            physical_path=result.get("physical_path", target_physical_path),
+            logical_content=logical_content
         )
         return result
 
@@ -808,6 +926,7 @@ class ArtefactManager:
         new_title = sanitize_artifact_filename(new_title)
         artefacts = self._get_all_raw()
         found = False
+        target_art = None
         for a in artefacts:
             if a.get('title') == old_title:
                 a['title'] = new_title
@@ -818,9 +937,38 @@ class ArtefactManager:
                 if content:
                     a['content'] = content.replace(f'id="{old_title}{_IMAGE_ID_SEP}', f'id="{new_title}{_IMAGE_ID_SEP}').replace(f"id='{old_title}{_IMAGE_ID_SEP}", f"id='{new_title}{_IMAGE_ID_SEP}'")
                 found = True
+                target_art = a
 
         if found:
             self._save_all(artefacts)
+            
+            # 🛑 CRITICAL FIX: Immediately update the physical workspace on rename
+            if target_art:
+                # 1. Delete the old physical file
+                try:
+                    if getattr(self._discussion, "workspace_data_path", None):
+                        ws_data_dir = Path(self._discussion.workspace_data_path)
+                    else:
+                        base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+                        ws_data_dir = base_workspace_dir / self._discussion.id / "workspace_data"
+                    
+                    old_filename = self._get_filename_with_ext(old_title, target_art.get('type'), target_art.get('language'), target_art.get('file_ext'))
+                    old_path = ws_data_dir / old_filename
+                    if old_path.exists():
+                        old_path.unlink()
+                except Exception as e:
+                    ASCIIColors.warning(f"Failed to delete old physical file '{old_title}' during rename: {e}")
+
+                # 2. Write the new physical file
+                self._sync_to_disk_workspace(
+                    title=new_title,
+                    content=target_art.get('content', ''),
+                    version=target_art.get('version', 1),
+                    atype=target_art.get('type', ArtefactType.DOCUMENT),
+                    language=target_art.get('language'),
+                    file_ext=target_art.get('file_ext'),
+                    physical_path=target_art.get('physical_path', new_title)
+                )
             return self.get(new_title)
         return None
 
@@ -1276,14 +1424,35 @@ class ArtefactManager:
             self._save_all(artefacts)
             active_art = self.get(title, version)
             if active_art:
+                # 🛑 CRITICAL FIX: Sync the newly activated version to disk immediately
                 self._sync_to_disk_workspace(
                     title=active_art["title"],
                     content=active_art["content"],
                     version=active_art["version"],
                     atype=active_art["type"],
                     language=active_art.get("language"),
-                    file_ext=active_art.get("file_ext")
+                    file_ext=active_art.get("file_ext"),
+                    physical_path=active_art.get("physical_path", active_art["title"]),
+                    logical_content=active_art.get("logical_content")
                 )
+
+    def sync_to_workspace(self, title: Optional[str] = None) -> Tuple[Path, List[str]]:
+        """
+        Compatibility shim for callers expecting a single-artifact sync method.
+        Delegates to sync_all_active_to_disk(). If a title is provided, that artifact
+        is activated first to ensure it is included in the sync.
+
+        Args:
+            title: Optional artifact title to activate and sync. If None, syncs all active.
+
+        Returns:
+            Tuple[Path, List[str]]: The workspace directory and list of synced file paths.
+        """
+        if title:
+            existing = self.get(title)
+            if existing and not existing.get("active", False):
+                self.activate(title)
+        return self.sync_all_active_to_disk()
 
     def sync_all_active_to_disk(self):
         """
@@ -1403,6 +1572,17 @@ class ArtefactManager:
                 changed = True
         if changed:
             self._save_all(artefacts)
+            if visibility == ArtefactVisibility.FULL:
+                active_art = self.get(title, version)
+                if active_art:
+                    self._sync_to_disk_workspace(
+                        title=active_art["title"],
+                        content=active_art["content"],
+                        version=active_art["version"],
+                        atype=active_art["type"],
+                        language=active_art.get("language"),
+                        file_ext=active_art.get("file_ext")
+                    )
             return True
         return False
 
@@ -1500,7 +1680,21 @@ class ArtefactManager:
                 if not content_text:
                     continue
 
+                # ── CONTEXT BUDGET GUARD (Defense in Depth) ──
+                # If a FULL artifact is suspiciously large (> 200KB text), truncate it
+                # and inject a warning. This prevents context overflow even if the
+                # visibility doctrine was bypassed somehow.
+                _MAX_FULL_CONTENT_CHARS = 200_000
+                was_truncated = False
+                if len(content_text) > _MAX_FULL_CONTENT_CHARS:
+                    original_size = len(content_text)
+                    content_text = content_text[:_MAX_FULL_CONTENT_CHARS]
+                    was_truncated = True
+
                 header = f"### [Full File: '{display_path}']"
+                if was_truncated:
+                    header += f"\n⚠️ **CONTEXT BUDGET LIMIT**: File truncated to {_MAX_FULL_CONTENT_CHARS:,} chars (original: {original_size:,}). Use a tool to access the full content."
+
                 deactivated_contents = getattr(self._discussion, "deactivated_contents", set())
 
                 if display_path in deactivated_contents:
