@@ -202,5 +202,86 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
                          "The .lam schema text was written to the physical .csv file! Corruption detected.")
 
 
+class TestUpdatePhantomRevertFix(unittest.TestCase):
+    """
+    Validates that ArtefactManager.update() does not create a phantom version 
+    with old content after updating with new content (simulates the FastAPI 
+    update_manual_artefact endpoint behavior).
+    """
+
+    def setUp(self):
+        self.client = MockClient()
+        self.db_manager = LollmsDataManager("sqlite:///:memory:")
+        import tempfile
+        self.tmp_dir = tempfile.mkdtemp(prefix="lollms_phantom_revert_")
+        self.discussion = LollmsDiscussion.create_new(
+            lollms_client=self.client,
+            db_manager=self.db_manager,
+            id="phantom_revert_test",
+            workspace_path=self.tmp_dir,
+            autosave=True
+        )
+
+    def tearDown(self):
+        self.discussion.close()
+        import shutil
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_update_does_not_create_phantom_version(self):
+        """
+        Scenario: An artifact is added (v1), then updated with new content using 
+                  bump_version=False and active=True (mimicking the router call).
+        Expected: Only 1 version exists in the database, containing the NEW content.
+                  The physical file on disk also contains the NEW content.
+        """
+        title = "config.txt"
+        original_content = "initial_value = 1"
+        updated_content = "initial_value = 2"
+
+        # 1. Add the artifact (creates v1)
+        self.discussion.artefacts.add(
+            title=title,
+            artefact_type=ArtefactType.DOCUMENT,
+            content=original_content,
+            active=True
+        )
+        self.discussion.commit()
+
+        # Verify initial state
+        history = self.discussion.artefacts.get_version_history(title)
+        self.assertEqual(len(history), 1, "Precondition: Should have 1 version after add()")
+
+        # 2. Update the artifact (simulates router call: bump_version=False, active=True)
+        self.discussion.artefacts.update(
+            title=title,
+            new_content=updated_content,
+            bump_version=False,
+            active=True
+        )
+        self.discussion.commit()
+
+        # 3. Assert NO phantom version was created
+        history_after = self.discussion.artefacts.get_version_history(title)
+        self.assertEqual(len(history_after), 1, 
+                         "Phantom version created! update() should not add a new version when bump_version=False.")
+
+        # 4. Assert the DB content is the NEW content
+        latest_art = self.discussion.artefacts.get(title)
+        self.assertIsNotNone(latest_art)
+        self.assertEqual(latest_art["content"], updated_content,
+                         "DB content should be the updated content, not the original.")
+
+        # 5. Assert the physical file on disk contains the NEW content
+        ws_data_dir = Path(self.discussion.workspace_data_path)
+        file_path = ws_data_dir / title
+        self.assertTrue(file_path.exists(), "Physical file should exist after update.")
+        
+        disk_content = file_path.read_text(encoding="utf-8")
+        self.assertEqual(disk_content, updated_content,
+                         "Physical file on disk should contain the updated content, not the original.")
+        self.assertNotIn(original_content, disk_content,
+                         "Physical file on disk should NOT contain the original content.")
+
+
 if __name__ == "__main__":
     unittest.main()
