@@ -42,6 +42,16 @@ class PathologicalMockClient:
                 '<processing type="tool" title="Fake Execution">\n',
                 '* Running...\n',
                 '</processing>\n'
+            ],
+            "closure_after_tool": [
+                [
+                    '<tool>{"name": "dummy_tool", "parameters": {"query": "test"}}</tool>\n'
+                ],
+                [
+                    'I have retrieved the data.\n',
+                    'Now, I will analyze the results for you.\n',
+                    'The analysis shows everything is working perfectly.\n'
+                ]
             ]
         }
 
@@ -65,12 +75,21 @@ class PathologicalMockClient:
 
     def generate_from_messages(self, messages: list, **kwargs) -> str:
         callback = kwargs.get("streaming_callback")
-        chunks = self._payloads.get(self.payload_type, [])
-
+        
         if self.payload_type == "empty":
             if callback:
                 callback("", MSG_TYPE.MSG_TYPE_CHUNK, {})
             return ""
+
+        if self.payload_type == "closure_after_tool":
+            if not hasattr(self, "_closure_turn"):
+                self._closure_turn = 0
+            
+            turn_idx = min(self._closure_turn, len(self._payloads["closure_after_tool"]) - 1)
+            chunks = self._payloads["closure_after_tool"][turn_idx]
+            self._closure_turn += 1
+        else:
+            chunks = self._payloads.get(self.payload_type, [])
 
         for chunk in chunks:
             if callback:
@@ -213,6 +232,55 @@ class TestAgenticLoopPathologies(unittest.TestCase):
                            "Artifact version should be bumped if patch was applied.")
         self.assertIn("def new():", updated_art.get("content", ""),
                       "Truncated patch content should have been applied.")
+
+    def test_conversational_closure_after_tool(self):
+        """
+        Scenario: LLM calls a tool in Turn 1, then provides a conversational answer 
+                  containing intent keywords ("I will analyze...") in Turn 2.
+        Expected: The loop terminates after Turn 2. The intent detector must NOT 
+                  trigger a continuation because a tool was already executed.
+        """
+        self.client.payload_type = "closure_after_tool"
+        self.client._closure_turn = 0
+
+        round_count_holder = {"count": 0}
+        original_generate = self.client.generate_from_messages
+
+        def counting_generate(*args, **kwargs):
+            round_count_holder["count"] += 1
+            return original_generate(*args, **kwargs)
+
+        self.client.generate_from_messages = counting_generate
+
+        def dummy_tool(query: str, **kwargs) -> dict:
+            """A dummy tool for testing."""
+            return {"success": True, "output": f"Result for {query}"}
+
+        res = self.discussion.chat(
+            user_message="Search for test and analyze it.",
+            max_reasoning_steps=5,
+            enable_artefacts=False,
+            tools={
+                "dummy_tool": {
+                    "name": "dummy_tool",
+                    "description": "A dummy tool for testing.",
+                    "parameters": [{"name": "query", "type": "str", "description": "The query."}],
+                    "callable": dummy_tool
+                }
+            }
+        )
+
+        self.assertEqual(round_count_holder["count"], 2,
+                         "Loop should execute exactly 2 rounds (tool call + final answer) and then break.")
+
+        ai_msg = res.get("ai_message")
+        self.assertIsNotNone(ai_msg)
+        self.assertIn("I will analyze", ai_msg.content,
+                      "The final conversational answer should be preserved in the message content.")
+        
+        tool_calls = ai_msg.metadata.get("tool_calls", [])
+        self.assertEqual(len(tool_calls), 1,
+                         "Exactly one tool call should have been recorded.")
 
 
 if __name__ == "__main__":
