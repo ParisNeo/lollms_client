@@ -50,7 +50,21 @@ class PathologicalMockClient:
                 [
                     'I have retrieved the data.\n',
                     'Now, I will analyze the results for you.\n',
+                    'The analysis shows everything is working perfectly.\n',
+                    '<done/>\n'
+                ]
+            ],
+            "no_done_continuation": [
+                [
+                    '<tool>{"name": "dummy_tool", "parameters": {"query": "test"}}</tool>\n'
+                ],
+                [
+                    'I have retrieved the data.\n',
                     'The analysis shows everything is working perfectly.\n'
+                ],
+                [
+                    'As I was saying, the analysis is complete.\n',
+                    '<done/>\n'
                 ]
             ]
         }
@@ -81,12 +95,12 @@ class PathologicalMockClient:
                 callback("", MSG_TYPE.MSG_TYPE_CHUNK, {})
             return ""
 
-        if self.payload_type == "closure_after_tool":
+        if self.payload_type in ("closure_after_tool", "no_done_continuation"):
             if not hasattr(self, "_closure_turn"):
                 self._closure_turn = 0
             
-            turn_idx = min(self._closure_turn, len(self._payloads["closure_after_tool"]) - 1)
-            chunks = self._payloads["closure_after_tool"][turn_idx]
+            turn_idx = min(self._closure_turn, len(self._payloads[self.payload_type]) - 1)
+            chunks = self._payloads[self.payload_type][turn_idx]
             self._closure_turn += 1
         else:
             chunks = self._payloads.get(self.payload_type, [])
@@ -236,9 +250,8 @@ class TestAgenticLoopPathologies(unittest.TestCase):
     def test_conversational_closure_after_tool(self):
         """
         Scenario: LLM calls a tool in Turn 1, then provides a conversational answer 
-                  containing intent keywords ("I will analyze...") in Turn 2.
-        Expected: The loop terminates after Turn 2. The intent detector must NOT 
-                  trigger a continuation because a tool was already executed.
+                  containing intent keywords ("I will analyze...") and ends with <done/> in Turn 2.
+        Expected: The loop terminates after Turn 2 because <done/> was detected.
         """
         self.client.payload_type = "closure_after_tool"
         self.client._closure_turn = 0
@@ -277,10 +290,59 @@ class TestAgenticLoopPathologies(unittest.TestCase):
         self.assertIsNotNone(ai_msg)
         self.assertIn("I will analyze", ai_msg.content,
                       "The final conversational answer should be preserved in the message content.")
+        self.assertNotIn("<done/>", ai_msg.content,
+                         "The <done/> tag must be stripped from the final saved message content.")
         
         tool_calls = ai_msg.metadata.get("tool_calls", [])
         self.assertEqual(len(tool_calls), 1,
                          "Exactly one tool call should have been recorded.")
+
+    def test_no_done_continuation_mandate(self):
+        """
+        Scenario: LLM calls a tool in Turn 1, then provides a conversational answer in Turn 2
+                  WITHOUT emitting <done/>.
+        Expected: The loop does NOT terminate after Turn 2. It injects a continuation mandate.
+                  The LLM then emits <done/> in Turn 3, and the loop terminates.
+        """
+        self.client.payload_type = "no_done_continuation"
+        self.client._closure_turn = 0
+
+        round_count_holder = {"count": 0}
+        original_generate = self.client.generate_from_messages
+
+        def counting_generate(*args, **kwargs):
+            round_count_holder["count"] += 1
+            return original_generate(*args, **kwargs)
+
+        self.client.generate_from_messages = counting_generate
+
+        def dummy_tool(query: str, **kwargs) -> dict:
+            """A dummy tool for testing."""
+            return {"success": True, "output": f"Result for {query}"}
+
+        res = self.discussion.chat(
+            user_message="Search for test and analyze it.",
+            max_reasoning_steps=5,
+            enable_artefacts=False,
+            tools={
+                "dummy_tool": {
+                    "name": "dummy_tool",
+                    "description": "A dummy tool for testing.",
+                    "parameters": [{"name": "query", "type": "str", "description": "The query."}],
+                    "callable": dummy_tool
+                }
+            }
+        )
+
+        self.assertEqual(round_count_holder["count"], 3,
+                         "Loop should execute 3 rounds: tool call -> no <done/> -> mandate -> <done/>.")
+
+        ai_msg = res.get("ai_message")
+        self.assertIsNotNone(ai_msg)
+        self.assertIn("analysis is complete", ai_msg.content,
+                      "The final conversational answer should be preserved.")
+        self.assertNotIn("<done/>", ai_msg.content,
+                         "The <done/> tag must be stripped from the final saved message content.")
 
 
 if __name__ == "__main__":
