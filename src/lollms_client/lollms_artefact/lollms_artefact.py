@@ -896,24 +896,11 @@ class ArtefactManager:
             version           = new_version,
             visibility        = resolved_visibility,
             commit_message    = commit_message if commit_message is not None else latest.get('commit_message'),
-           physical_path     = target_physical_path, # Pass to add()
+           physical_path     = target_physical_path,
             version_tags      = version_tags if version_tags is not None else latest.get('version_tags', []),
-            logical_content   = logical_content, # EXPLICIT: Persist logical twin on update
-            physical_data     = physical_data,   # EXPLICIT: Persist physical twin on update
+            logical_content   = logical_content,
+            physical_data     = physical_data,
             **merged_extra,
-        )
-        
-        # 🛑 CRITICAL FIX: Immediately sync the updated version to the physical workspace
-        self._sync_to_disk_workspace(
-            title=result.get("title", target_title),
-            content=result.get("content", use_content),
-            version=result.get("version", new_version),
-            atype=result.get("type", new_type if new_type is not None else latest.get('type', ArtefactType.DOCUMENT)),
-            language=result.get("language", language if language is not None else latest.get('language')),
-            file_ext=merged_extra.get("file_ext", latest.get("file_ext")),
-            physical_data=physical_data,
-            physical_path=result.get("physical_path", target_physical_path),
-            logical_content=logical_content
         )
         return result
 
