@@ -104,5 +104,60 @@ The bug is now fixed.
         self.assertIsNone(v3, "Version 3 should NOT exist (double-version bug).")
 
 
+    def test_update_csv_does_not_create_phantom_revert_version(self):
+        """
+        Scenario: A CSV file is imported as a DATA artifact. The LLM updates the content.
+        Expected: The update creates exactly ONE new version (v2) with the new content.
+                  It must NOT create an additional version (v3) containing the old content.
+        """
+        title = "phantom_test.csv"
+        csv_bytes = b"id,name\n1,Alice\n2,Bob\n"
+        lam_content = "# CSV Schema: phantom_test.csv\nColumns: id (int), name (str)"
+
+        # 1. Add the data artifact (v1)
+        self.discussion.artefacts.add(
+            title=title,
+            artefact_type=ArtefactType.DATA,
+            content=lam_content,
+            logical_content=lam_content,
+            physical_data=csv_bytes,
+            file_ext=".csv",
+            active=True
+        )
+        self.discussion.commit()
+
+        # Verify v1
+        art_v1 = self.discussion.artefacts.get(title)
+        self.assertEqual(art_v1["version"], 1)
+        self.assertEqual(art_v1["content"], lam_content)
+
+        # 2. Update the content (should create v2)
+        updated_csv_content = "id,name\n1,Alice\n2,Bob\n3,Charlie\n"
+        updated_lam = "# CSV Schema: phantom_test.csv\nColumns: id (int), name (str)\nRows: 3"
+        
+        self.discussion.artefacts.update(
+            title=title,
+            new_content=updated_csv_content,
+            logical_content=updated_lam,
+            bump_version=True
+        )
+        self.discussion.commit()
+
+        # 3. Check version history
+        history = self.discussion.artefacts.get_version_history(title)
+        self.assertEqual(len(history), 2, "There should be exactly 2 versions (v1 and v2). No phantom v3 should exist.")
+
+        # 4. Verify the latest version has the NEW content
+        art_v2 = self.discussion.artefacts.get(title)
+        self.assertEqual(art_v2["version"], 2, "The latest version should be 2.")
+        self.assertEqual(art_v2["content"], updated_csv_content, "The latest version must contain the updated content.")
+
+        # 5. Verify the physical file on disk has the NEW content
+        ws_data_dir = Path(self.discussion.workspace_data_path)
+        csv_path = ws_data_dir / title
+        self.assertTrue(csv_path.exists())
+        disk_content = csv_path.read_text(encoding="utf-8")
+        self.assertEqual(disk_content, updated_csv_content, "The physical file on disk must contain the updated content.")
+
 if __name__ == "__main__":
     unittest.main()
