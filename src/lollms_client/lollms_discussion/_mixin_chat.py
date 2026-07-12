@@ -1053,11 +1053,11 @@ class _StreamState:
                             context_tag_entered = True
                             break
                     else:
-                        text_before_partial = self._pending_buffer[:open_idx]
+                        text_before_partial = self._pending_buffer[:tag_start_idx]
                         if text_before_partial:
                             self.ai_message.content += text_before_partial
                             _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
-                        self._pending_buffer = self._pending_buffer[open_idx:]
+                        self._pending_buffer = self._pending_buffer[tag_start_idx:]
                         return True
 
             if context_tag_entered:
@@ -1123,15 +1123,13 @@ class _StreamState:
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
-                    open_idx = open_match.start()
-                    # Check if we have the full opening tag (closing '>')
-                    end_of_tag_idx = self._pending_buffer.find(">", open_idx)
+                    tag_start_idx = self._pending_buffer.find(tag_prefix, open_match.start())
+                    if tag_start_idx == -1:
+                        continue
+                    end_of_tag_idx = self._pending_buffer.find(">", tag_start_idx)
                     if end_of_tag_idx != -1:
-                        # Full opening tag received
-                        tag_start_idx = open_idx
                         opening_tag = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
 
-                        # Extract tag name (e.g., "skill" from "<skill title=...>")
                         tag_name_match = re.match(r'<(\w+)', opening_tag)
                         if tag_name_match:
                             self._secondary_tag_name = tag_name_match.group(1).lower()
@@ -1166,12 +1164,11 @@ class _StreamState:
                             secondary_entered = True
                             break
                     else:
-                        # Partial tag (no closing '>' yet). Hold everything from the tag start.
-                        text_before_partial = self._pending_buffer[:open_idx]
+                        text_before_partial = self._pending_buffer[:tag_start_idx]
                         if text_before_partial:
                             self.ai_message.content += text_before_partial
                             _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
-                        self._pending_buffer = self._pending_buffer[open_idx:]
+                        self._pending_buffer = self._pending_buffer[tag_start_idx:]
                         return True
 
             if secondary_entered:
@@ -1333,6 +1330,28 @@ class _StreamState:
                     _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                     _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                     return True
+
+                if art:
+                    self.affected_artefacts.append(art)
+
+                try:
+                    self.discussion.artefacts._sync_to_disk_workspace(
+                        title=art.get("title", title),
+                        content=art.get("content", patched),
+                        version=art.get("version", 1),
+                        atype=atype,
+                        language=lang
+                    )
+                except Exception as sync_ex:
+                    ASCIIColors.warning(f"[StreamState] Failed to immediately materialize patched artifact '{title}' to disk: {sync_ex}")
+
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_updated",
+                    "title": title,
+                    "version": art.get("version", 1) if art else 1,
+                    "art_type": atype
+                })
+                return True
             else:
                 if is_new:
                     art = self.discussion.artefacts.add(
