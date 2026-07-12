@@ -555,6 +555,10 @@ class _StreamState:
         # Ensures generation halts immediately after dispatching a single functional tag.
         self._action_dispatched = False
 
+        # ── DONE TAG DETECTION ──
+        # Set to True when the LLM emits <done/> to signal explicit task termination.
+        self._done_detected = False
+
         # ── Generic Secondary Tag Interceptor State ──
         # Handles <skill>, <note>, <lollms_inline>, <lollms_form>, <generate_image>, <edit_image>, etc.
         # These tags don't need the specialized dual-stream artifact tracker, but DO need
@@ -620,6 +624,18 @@ class _StreamState:
 
         # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
         self._pending_buffer += chunk
+
+        # ── 🛑 DONE TAG DETECTION ──
+        # Detect <done/> or <done> at the start of a line to signal explicit termination.
+        # We strip it from the buffer so it never leaks into the UI or database.
+        if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
+            done_match = re.search(r'(?m)^\s*<done\s*/?>', self._pending_buffer, re.IGNORECASE)
+            if done_match:
+                ASCIIColors.info("[StreamState] <done/> tag detected. Halting generation.")
+                self._done_detected = True
+                # Remove the tag from the buffer
+                self._pending_buffer = re.sub(r'(?m)^\s*<done\s*/?>', '', self._pending_buffer, flags=re.IGNORECASE)
+                return False
 
         # ── 🛑 ANTI-MIMICRY: Prevent LLM from generating <processing> blocks ──
         # The <processing> tag is strictly system-generated. If the LLM attempts to
@@ -1683,6 +1699,10 @@ class _StreamState:
         """Returns True if a functional tag was fully dispatched during this generation turn."""
         return self._action_dispatched
 
+    def was_done_detected(self) -> bool:
+        """Returns True if the LLM emitted the <done/> termination tag."""
+        return self._done_detected
+
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
         if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
             if msg_type in (MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK, MSG_TYPE.MSG_TYPE_REASONING):
@@ -2402,16 +2422,19 @@ class ChatMixin:
             "# python code here\n"
             "```\n"
             "Never output raw code or markup directly in conversational text without these code blocks.\n"
-            "\n=== ACTION EXECUTION PROTOCOL (CRITICAL — PREVENTS DEAD LOOPS) ===\n"
+            "\n=== ACTION EXECUTION & TERMINATION PROTOCOL (CRITICAL) ===\n"
             "1. **INTENT ≠ EXECUTION**: Stating 'I will search...', 'Let me analyze...', or 'I will create...' in conversational text DOES NOT execute the action. "
             "Conversational declarations are completely inert. You have NO ability to perform actions unless you emit the exact functional XML tags.\n"
             "2. **MANDATORY TAG EMISSION**: To execute an action, you MUST output the corresponding functional tag (`<tool>`, `<artifact>`, `<note>`, etc.) immediately. "
             "Do not promise an action in one turn and expect the system to execute it. If you need another round to perform work, you MUST emit the tag that triggers that work.\n"
-            "3. **NO HOLLOW PROMISES**: If you finish your generation without emitting a functional tag, the system will terminate your turn and no action will occur. "
-            "You will lose the ability to continue the task. Therefore, NEVER end your turn with a promise to do something later. Either do it NOW via the tag, or tell the user you cannot do it.\n"
+            "3. **EXPLICIT TERMINATION WITH `<done/>`**: You are in control of the agentic loop. When you have finished your task and provided your final conversational answer to the user, "
+            "you MUST end your generation with a `<done/>` tag on a new line. If you stop generating without emitting `<done/>`, the system will assume you have more work to do and will "
+            "force you to continue. If you have no further actions to take, simply write your final response and append `<done/>` at the end.\n"
             "4. **SAME-SESSION CONTINUATION (MULTI-TURN CHAINS)**: When you are executing a sequence of actions across multiple turns (e.g., testing tools one by one), "
             "you MUST emit the next action's tag in your IMMEDIATE NEXT response. Do NOT wait for the user to prompt you again. The system preserves your exact execution path, "
             "so you have full visibility of the previous tool results. If you state 'Now testing tool_X...', the VERY NEXT token you generate MUST be `<tool>{\"name\": \"tool_X\"...}`.\n"
+            "5. **ROUND 1 SHORT-CIRCUIT**: If the user's request is purely conversational and requires NO tools or artifacts, simply respond conversationally. The system will terminate after the first round. "
+            "Do NOT emit `<done/>` if you are not in an agentic loop.\n"
             "\n=== TOOL CALLING DISCIPLINE (CRITICAL) ===\n"
             "1. **Tool Results ≠ Tool Calls**: When a tool returns JSON output (e.g., {\"success\": true, \"output\": ...}), "
             "this is a **RESULT**, NOT a new tool call. Do **NOT** re-execute or re-emit the same tool call.\n"
@@ -2826,6 +2849,12 @@ class ChatMixin:
 
             ss.flush_remaining_buffer()
 
+            # ── 🏁 DONE TAG TERMINATION PROTOCOL ──
+            # If the LLM emitted <done/>, the task is explicitly complete. Break immediately.
+            if ss.was_done_detected():
+                ASCIIColors.info("[ChatMixin] <done/> tag detected. Terminating agentic loop.")
+                break
+
             # ── 🛑 ARTIFACT LOOP ENFORCEMENT ──
             # If we previously flagged a force-final-answer due to an artifact loop,
             # and the LLM attempts to dispatch another artifact, we instantly break the loop.
@@ -2856,23 +2885,9 @@ class ChatMixin:
                 ))
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
-                    content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done.]"
+                    content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
                 ))
                 continue
-
-            # ── 🛑 DUPLICATE ARTIFACT INTERCEPTION ──
-            # If the LLM emits an artifact that was ALREADY dispatched in a previous round,
-            # we intercept it, set the force-final-answer flag, and inject a hard stop.
-            if ss.was_action_dispatched() and not ss.tool_trigger and ss.affected_artefacts:
-                # Check if the latest affected artifact is a duplicate (already in persistent_processed_tags)
-                # The _StreamState adds to processed_tags *before* dispatching.
-                # If it was a duplicate, _dispatch_closed_tag returns early and does NOT add to affected_artefacts.
-                # So, if affected_artefacts is populated, it means it was dispatched.
-                # We need to check if the tag text was already in the set *before* this round.
-                # Actually, the logic inside _dispatch_closed_tag handles the duplicate check.
-                # We just need to verify if the action was a duplicate by checking if the tag is in the set.
-                # But since _StreamState processes it, we can check if the artifact version was bumped unexpectedly.
-                pass # The logic inside _dispatch_closed_tag handles skipping duplicates.
 
             # ── 🛑 EMPTY-RESPONSE GUARD (CRITICAL) ──
             # If the LLM generated zero tokens (or only whitespace/processing blocks),
@@ -2930,16 +2945,14 @@ class ChatMixin:
                     action_type = last_art.get("type", "artifact")
                     action_title = last_art.get("title", "")
 
-                # 🧠 CONTEXTUAL ANCHORING PROTOCOL
-                # Instead of passively saying "action completed", we explicitly anchor the LLM
-                # to the artifact it just created and the user's original request. This prevents
-                # the LLM from re-emitting the same artifact due to context amnesia.
+                # 🧠 CONTEXTUAL ANCHORING PROTOCOL + DONE MANDATE
+                # We explicitly anchor the LLM to the artifact it just created and mandate <done/>.
                 title_str = f" '{action_title}'" if action_title else ""
                 system_marker = (
                     f"[SYSTEM: The {action_type}{title_str} has been successfully created and saved to the workspace. "
                     f"You have already fulfilled the user's request. "
                     f"You MUST NOT create or update this artifact again. "
-                    f"You MUST now provide your final conversational answer to the user, explaining what you have done.]"
+                    f"You MUST now provide your final conversational answer to the user, explaining what you have done, and end with a <done/> tag on a new line.]"
                 )
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
@@ -3704,6 +3717,7 @@ class ChatMixin:
                             f"4. 🚫 **FORBIDDEN**: Do **NOT** call '{tool_name}' again with these parameters.\n"
                             f"   The tool already ran successfully. Calling it again is a **LOOP ERROR**.\n"
                             f"5. 🔀 If you need MORE data, call a **DIFFERENT** tool or ask a **DIFFERENT** question.\n"
+                            f"6. 🏁 **TERMINATION**: When you have finished your task and written your final answer, you MUST end your generation with a `<done/>` tag on a new line.\n"
                             f"{next_step_guidance}\n"
                             f"### Example of CORRECT behavior:\n"
                             f"❌ WRONG: <tool>{{\"name\": \"{tool_name}\", ...}}</tool>  (LOOP!)\n"
@@ -3782,15 +3796,38 @@ class ChatMixin:
                     ))
                     continue
 
-                # ── 🛑 CONVERSATIONAL CLOSURE GUARD (CRITICAL) ──
-                # If we have already executed at least one tool successfully, and the LLM
-                # generates a response without another <tool> tag, it is providing its final
-                # conversational answer. We MUST break immediately. Running intent detection
-                # on the final answer causes infinite loops if the answer contains phrases
-                # like "I will analyze" or "Let me summarize".
-                if len(tool_calls_this_turn) > 0:
-                    ASCIIColors.info("[ChatMixin] Tool previously executed and no new tool call detected. Finalizing turn.")
+                # ── 🛑 DONE TAG TERMINATION PROTOCOL ──
+                # If the LLM emits <done/> on a new line, the task is complete. Break immediately.
+                raw_round_text = ss.get_clean_text_so_far()
+                done_match = re.search(r'(?m)^\s*<done\s*/>\s*$', raw_round_text.strip())
+                if done_match:
+                    ASCIIColors.info("[ChatMixin] <done/> tag detected. Finalizing turn.")
+                    ai_msg.content = re.sub(r'(?m)^\s*<done\s*/>\s*$', '', ai_msg.content, flags=re.MULTILINE).strip()
                     break
+
+                # ── 🛑 CONTINUATION MANDATE (NO <done/>) ──
+                # If tools were previously executed and the LLM stops without <done/> and without
+                # dispatching a new action, inject a mandate to either continue or emit <done/>.
+                # The Success-Loop Interceptor provides a natural termination guarantee:
+                # if the LLM repeats the same tool call, the loop breaks automatically.
+                if len(tool_calls_this_turn) > 0:
+                    ASCIIColors.info("[ChatMixin] Tool previously executed but no <done/> detected. Injecting continuation mandate.")
+                    full_round_text = ss.get_clean_text_so_far()
+                    raw_round_text_delta = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text_delta, flags=re.DOTALL | re.IGNORECASE)
+                    clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=clean_history_text.strip()
+                    ))
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content="[SYSTEM: You stopped generation without emitting a <done/> tag. If your task is complete, output a final conversational summary and end it with a <done/> tag on a new line. If you need to continue working, emit the next functional tag now.]"
+                    ))
+                    continue
 
                 # Only run intent detection on SHORT responses (preambles before a missed tool call)
                 intent_pattern = re.compile(r'(let me|now i|next i|i will|i need to|we need to).*(query|get|fetch|build|create|analyze|summarize|aggregate|plot)', re.IGNORECASE)
