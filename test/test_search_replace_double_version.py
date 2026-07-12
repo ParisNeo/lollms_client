@@ -159,5 +159,55 @@ The bug is now fixed.
         disk_content = csv_path.read_text(encoding="utf-8")
         self.assertEqual(disk_content, updated_csv_content, "The physical file on disk must contain the updated content.")
 
+    def test_update_text_artifact_no_phantom_revert(self):
+        """
+        Scenario: A Python script artifact is updated with new content.
+        Expected: The update creates exactly ONE new version (v2) with the new content.
+                  It must NOT create an additional version (v3) containing the old content.
+                  The physical file on disk must contain the new content.
+        """
+        title = "app.py"
+        original_code = "def main():\n    print('Hello')\n"
+        updated_code = "def main():\n    print('Hello World')\n    return True\n"
+
+        # 1. Add the text artifact (v1)
+        self.discussion.artefacts.add(
+            title=title,
+            artefact_type=ArtefactType.CODE,
+            content=original_code,
+            language="python",
+            active=True
+        )
+        self.discussion.commit()
+
+        # Verify v1
+        art_v1 = self.discussion.artefacts.get(title)
+        self.assertEqual(art_v1["version"], 1)
+        self.assertEqual(art_v1["content"], original_code)
+
+        # 2. Update the content (should create v2)
+        self.discussion.artefacts.update(
+            title=title,
+            new_content=updated_code,
+            bump_version=True
+        )
+        self.discussion.commit()
+
+        # 3. Check version history
+        history = self.discussion.artefacts.get_version_history(title)
+        self.assertEqual(len(history), 2, "There should be exactly 2 versions (v1 and v2). No phantom v3 should exist.")
+
+        # 4. Verify the latest version has the NEW content
+        art_v2 = self.discussion.artefacts.get(title)
+        self.assertEqual(art_v2["version"], 2, "The latest version should be 2.")
+        self.assertEqual(art_v2["content"], updated_code, "The latest version must contain the updated content.")
+
+        # 5. Verify the physical file on disk has the NEW content
+        ws_data_dir = Path(self.discussion.workspace_data_path)
+        py_path = ws_data_dir / title
+        self.assertTrue(py_path.exists())
+        disk_content = py_path.read_text(encoding="utf-8")
+        self.assertEqual(disk_content, updated_code, "The physical file on disk must contain the updated content.")
+
 if __name__ == "__main__":
     unittest.main()
