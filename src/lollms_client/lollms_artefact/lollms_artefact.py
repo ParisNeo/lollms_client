@@ -496,6 +496,7 @@ class ArtefactManager:
                         trace_exception(e)
                 elif is_binary_db:
                     ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing.")
+                    return False
             if logical_content:
                 try:
                     lam_path.write_text(logical_content, encoding="utf-8", errors="ignore")
@@ -823,42 +824,41 @@ class ArtefactManager:
         # The _get_all_raw() method strips physical_data (bytes) before returning records to prevent
         # JSON serialization crashes. This means latest.get("physical_data") is ALWAYS None.
         # If we don't rehydrate the physical bytes here, add() receives physical_data=None.
-        # _sync_to_disk_workspace then falls back to writing the string content (the .lam schema text)
+        # db_to_physical() then falls back to writing the string content (the .lam schema text)
         # directly to the physical file, overwriting the raw binary data with schema text.
         #
         # This doctrine applies to ALL DATA artifacts (binary .db AND text .csv).
-        # If `new_content` is explicitly provided, we assume it IS the new raw physical data.
-        # We encode it to bytes and write it to disk immediately.
-        # If `new_content` is NOT provided (e.g., only updating logical_content), we rehydrate
-        # from the existing file on disk to preserve the raw bytes.
+        # If `new_content` is explicitly provided AND `logical_content` is None, we assume 
+        # `new_content` IS the new raw physical data. We encode it to bytes.
+        # If `logical_content` is provided (e.g., updating the schema), we rehydrate
+        # from the existing file on disk to preserve the raw bytes BEFORE calling add().
         if physical_data is None and latest.get("type") == ArtefactType.DATA:
             file_ext = latest.get("file_ext", "")
 
-            # If new_content is explicitly provided, it is the new raw physical data.
-            if new_content is not None:
+            # CRITICAL FIX: Distinguish between Raw Data Updates and Schema-Only Updates.
+            # Case 1: `logical_content` is None → `new_content` IS the new raw physical data.
+            # Case 2: `new_content` differs from `logical_content` → `new_content` is the new raw
+            #         physical data, and `logical_content` is the new schema.
+            # Case 3: `new_content` equals `logical_content` → Schema-only update. The physical
+            #         bytes MUST be rehydrated from disk to preserve them.
+            is_raw_data_update = (
+                new_content is not None
+                and isinstance(new_content, str)
+                and (logical_content is None or new_content != logical_content)
+            )
+
+            if is_raw_data_update:
                 try:
                     physical_data = new_content.encode("utf-8")
-                    
-                    if getattr(self._discussion, "workspace_data_path", None):
-                        ws_data_dir = Path(self._discussion.workspace_data_path)
-                    else:
-                        base_ws = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
-                        ws_data_dir = base_ws / self._discussion.id / "workspace_data"
-
-                    phys_path = latest.get("physical_path") or latest.get("title", "")
-                    clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
-                    filename = self._get_filename_with_ext(clean_path, latest.get("type"), latest.get("language"), file_ext)
-                    active_physical_path = ws_data_dir / filename
-
-                    active_physical_path.parent.mkdir(parents=True, exist_ok=True)
-                    active_physical_path.write_bytes(physical_data)
-                    ASCIIColors.info(f"[ArtefactManager] Content-First Update: Wrote new physical bytes for '{latest.get('title')}' to {active_physical_path}")
+                    ASCIIColors.info(f"[ArtefactManager] Encoded new_content to physical bytes for '{latest.get('title')}' ({len(physical_data)} bytes)")
                 except Exception as e:
-                    ASCIIColors.warning(f"[ArtefactManager] Failed to write new content during update: {e}")
+                    ASCIIColors.warning(f"[ArtefactManager] Failed to encode new_content to bytes: {e}")
 
-            # Fallback: If no new_content, rehydrate from the existing file on disk.
-            # This preserves the raw bytes for binary databases where new_content is a schema string,
-            # and for text-based data files where new_content is also a schema string.
+            # Fallback: Rehydrate from disk if physical_data is still None.
+            # This happens when only the schema (.lam) is updated (logical_content is provided)
+            # and we must preserve the binary bytes.
+            # CRITICAL: This must happen BEFORE self.add() because add() calls db_to_physical()
+            # which will overwrite the file with schema text if physical_data is None.
             if physical_data is None:
                 try:
                     if getattr(self._discussion, "workspace_data_path", None):
@@ -875,6 +875,9 @@ class ArtefactManager:
                     if active_physical_path.exists():
                         physical_data = active_physical_path.read_bytes()
                         ASCIIColors.info(f"[ArtefactManager] Rehydrated physical bytes for data artifact '{latest.get('title')}' from {active_physical_path}")
+                    elif new_content is not None and isinstance(new_content, str):
+                        physical_data = new_content.encode("utf-8")
+                        ASCIIColors.info(f"[ArtefactManager] Encoded new_content to physical bytes for '{latest.get('title')}' ({len(physical_data)} bytes)")
                 except Exception as e:
                     ASCIIColors.warning(f"[ArtefactManager] Failed to rehydrate physical bytes for data artifact: {e}")
 
