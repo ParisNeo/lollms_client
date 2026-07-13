@@ -97,13 +97,13 @@ art = discussion.artefacts.update(
 
 ### Overwriting the Current Version
 
-If you want to update the content without creating a new version history entry, you can set `create_new_version=False`. This will overwrite the content of the current active version.
+If you want to update the content without creating a new version history entry, you can set `bump_version=False`. This will overwrite the content of the current active version without incrementing the version number.
 
 ```python
 art = discussion.artefacts.update(
     title="temp_notes.md",
     new_content="Updated temporary notes without version bump.",
-    create_new_version=False
+    bump_version=False
 )
 ```
 
@@ -175,8 +175,8 @@ Every artifact in the system is represented as a dictionary (record) with a spec
 
 | Property | Type | Description & Handling Rules |
 | :--- | :--- | :--- |
-| `title` | `str` | **The primary key.** This is the high-level metadata name used by the LLM and the database to reference the artifact. It may contain subfolder paths (e.g., `My_subfolder/SKILL.md`). It is sanitized via `_sanitize_path_segments` to ensure cross-platform safety. When updating or retrieving an artifact, you query by this title. |
-| `physical_path` | `str` | **The disk location.** This stores the exact relative path (including subfolders and extension) where the physical twin resides in `workspace_data/`. If not explicitly provided during `add()` or `update()`, it defaults to the `title`. **CRITICAL**: File-reading tools should be passed the `physical_path` (or `display_path` from the context zone) to ensure they open the correct file on disk. |
+| `title` | `str` | **The primary logical key.** This is the high-level metadata name used by the LLM and the database to reference the artifact. It may contain subfolder paths (e.g., `My_subfolder/SKILL.md`). It is sanitized via `_sanitize_path_segments` to ensure cross-platform safety. |
+| `physical_path` | `str` | **The unique disk location & retrieval key.** This stores the exact relative path (including subfolders and extension) where the physical twin resides in `workspace_data/`. If not explicitly provided during `add()` or `update()`, it defaults to the `title`. **CRITICAL**: The `get()` and `remove()` methods prioritize matching by `physical_path` over `title` to prevent ambiguity when multiple artifacts share similar titles. File-reading tools should be passed the `physical_path` to ensure they open the correct file on disk. |
 | `type` | `str` | The category of the artifact (e.g., `ArtefactType.CODE`, `ArtefactType.DATA`). Determines how the artifact is rendered in the context zone and which tools can operate on it. |
 | `content` | `str` | The logical text content. For text/code files, this is the verbatim source code. For `DATA` artifacts, this holds the `.lam` schema description, **NOT** the raw binary bytes. |
 | `version` | `int` | The version number. Incremented automatically on `update()` if `bump_version=True`. The `get()` method returns the highest version by default. |
@@ -190,11 +190,13 @@ Every artifact in the system is represented as a dictionary (record) with a spec
 
 ### Handling Guidelines
 
-#### 1. Title vs. Physical Path Decoupling
-The architecture decouples the database key (`title`) from the disk location (`physical_path`).
+#### 1. Title vs. Physical Path Decoupling & Mutually Exclusive Retrieval
+The architecture decouples the logical database key (`title`) from the unique disk location (`physical_path`). To enforce explicit intent and prevent ambiguity, the `ArtefactManager.get()` method accepts `title` and `physical_path` as **mutually exclusive** parameters.
 *   **Creation**: If you create an artifact with `title="My_subfolder/script.py"`, the `physical_path` automatically mirrors this. The physical file is written to `workspace_data/My_subfolder/script.py`.
 *   **Context Injection**: `build_artefacts_context_zone()` displays the `physical_path` to the LLM. When the LLM decides to read a file, it should use this exact string.
 *   **Updating**: If you change the `title` during an update (`new_title`), the `physical_path` is updated to match, and the old physical file is deleted from disk.
+*   **Retrieval (`get`)**: You may query an artifact by passing either `title="README.md"` OR `physical_path="My_subfolder/README.md"`, but not both. Passing both raises a `ValueError`.
+*   **Deletion (`remove`)**: The `remove()` method uses the `physical_path` to calculate the exact metadata directory UUID and purge all physical files (active, versioned, and `.lam` twins) from disk. This guarantees that deleting an artifact removes all traces, preventing the workspace heal scan from resurrecting orphaned files as inactive artifacts.
 
 #### 2. Data Artifact Safety (Binary Corruption Prevention)
 `DATA` artifacts (like SQLite databases or CSVs) use the Dual-Stream protocol.
