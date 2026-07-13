@@ -127,6 +127,75 @@ class TestDataArtefactCorruptionFix(unittest.TestCase):
         except sqlite3.DatabaseError as e:
             self.fail(f"Failed to query database after update: {e}. File may be corrupted.")
 
+    def test_update_without_logical_content_preserves_sqlite_binary(self):
+        """
+        Scenario: A SQLite database is imported as a DATA artifact. The user edits
+        the artifact's metadata via the UI Raw Editor, which calls update() with
+        new_content = edited schema text but does NOT pass logical_content.
+        Expected: The is_raw_data_update heuristic must NOT treat the string
+                  new_content as raw binary data for .db files. The physical .db
+                  file on disk must remain a valid SQLite database.
+        """
+        title = "test_db_no_lam.db"
+        lam_content = "# SQLite Database: test_db_no_lam.db\n## Table: users\nColumns: id (INTEGER), name (TEXT)"
+
+        # 1. Add the data artifact with physical bytes
+        self.discussion.artefacts.add(
+            title=title,
+            artefact_type=ArtefactType.DATA,
+            content=lam_content,
+            logical_content=lam_content,
+            physical_data=self.db_bytes,
+            file_ext=".db",
+            active=True
+        )
+        self.discussion.commit()
+
+        # Verify initial state is valid
+        ws_data_dir = Path(self.discussion.workspace_data_path)
+        db_path = ws_data_dir / title
+        self.assertTrue(db_path.exists(), "Physical .db file should exist after add()")
+        self.assertEqual(db_path.read_bytes()[:16], self.valid_header, "Initial DB should have valid SQLite header")
+
+        # 2. Update the artifact's content WITHOUT passing logical_content.
+        #    This simulates the UI Raw Editor path (POST /api/artifacts/{title}/update)
+        #    which passes new_content=payload.content but no logical_content parameter.
+        #    The is_raw_data_update heuristic must detect _is_binary_db and refuse
+        #    to encode the schema text as physical bytes.
+        updated_lam = "# SQLite Database: test_db_no_lam.db\n## Table: users\nColumns: id (INTEGER), name (TEXT), email (TEXT)"
+        self.discussion.artefacts.update(
+            title=title,
+            new_content=updated_lam,
+            bump_version=True
+        )
+        self.discussion.commit()
+
+        # 3. CRITICAL ASSERTION: The physical file must still be a valid SQLite database
+        self.assertTrue(db_path.exists(), "Physical .db file should still exist after update()")
+        header = db_path.read_bytes()[:16]
+        self.assertEqual(header, self.valid_header,
+                         f"Database corrupted after update without logical_content! "
+                         f"Header is '{header}' instead of '{self.valid_header}'. "
+                         f"The is_raw_data_update heuristic encoded the .lam schema text as binary bytes.")
+
+        # 4. Verify we can still query the database
+        try:
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM users WHERE id = 1")
+            row = cursor.fetchone()
+            self.assertIsNotNone(row, "Database query should return a row")
+            self.assertEqual(row[0], "Alice", "Database content should be preserved")
+            conn.close()
+        except sqlite3.DatabaseError as e:
+            self.fail(f"Failed to query database after update without logical_content: {e}. File may be corrupted.")
+
+        # 5. Verify the artifact's content field was updated to the new schema
+        updated_art = self.discussion.artefacts.get(title)
+        self.assertIsNotNone(updated_art)
+        self.assertIn("email", updated_art.get("content", ""),
+                      "The artifact content should reflect the updated schema with the 'email' column.")
+
     def test_sync_to_disk_refuses_text_for_binary_db(self):
         """
         Scenario: _sync_to_disk_workspace is called directly with string content
