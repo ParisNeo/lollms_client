@@ -2980,12 +2980,12 @@ class ChatMixin:
                         # 🛡️ CRITICAL FIX: Record this malformed call in FailureMemory
                         # to prevent infinite loops of the same malformed payload.
                         failure_memory = getattr(self, "_failure_memory", None)
+                        malformed_sig = "unknown::malformed"
                         if failure_memory:
                             try:
-                                malformed_sig = "unknown::malformed"
                                 if hasattr(failure_memory, "record_failure_by_signature"):
                                     failure_memory.record_failure_by_signature(malformed_sig, "Malformed tool call: missing 'name' or invalid JSON")
-                                elif hasattr(failure_memory, "_signatures"):
+                                if hasattr(failure_memory, "_signatures"):
                                     failure_memory._signatures.add(malformed_sig)
                             except Exception:
                                 pass
@@ -3003,14 +3003,38 @@ class ChatMixin:
 
                         full_round_text = ss.get_clean_text_so_far()
                         raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                        # 🛑 CRITICAL FIX: Sanitize raw_round_text before appending to virtual_history.
+                        # The _StreamState emits <processing> blocks into ai_msg.content when it
+                        # dispatches the tool tag. If we append this unsanitized, the LLM sees the
+                        # <processing> blocks in its history and mimics them, causing infinite
+                        # nested <processing> generation loops.
+                        clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                        clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        # Also strip any raw <tool> tags to prevent the LLM from seeing its own failed call
+                        clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
+                        clean_history_text = clean_history_text.strip()
+                        if not clean_history_text:
+                            clean_history_text = "[Malformed tool call emitted with no conversational text]"
                         virtual_history.append(SimpleNamespace(
                             sender_type="assistant",
-                            content=raw_round_text
+                            content=clean_history_text
                         ))
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
                             content=correction_msg
                         ))
+
+                        # 🛑 CRITICAL FIX: If the malformed call has been seen before, break immediately.
+                        # We use a dedicated counter dict because _signatures is a set (no duplicates).
+                        if not hasattr(self, "_malformed_call_counts"):
+                            object.__setattr__(self, "_malformed_call_counts", {})
+                        self._malformed_call_counts[malformed_sig] = self._malformed_call_counts.get(malformed_sig, 0) + 1
+                        if self._malformed_call_counts[malformed_sig] >= 2:
+                            ASCIIColors.warning("[ChatMixin] Second identical malformed tool call detected. Breaking loop to prevent infinite cycle.")
+                            break
 
                         # Force another round to let the LLM correct itself
                         continue
@@ -3077,10 +3101,46 @@ class ChatMixin:
                             f"If NONE of these tools can accomplish the task, DO NOT try to call any tool. "
                             f"Instead, inform the user that the required tool is not available and complete your response."
                         )
+
+                        # 🛑 CRITICAL FIX: Sanitize raw_round_text before appending to virtual_history.
+                        # The _StreamState emits <processing> blocks into ai_msg.content when it
+                        # dispatches the tool tag. If we append this unsanitized, the LLM sees the
+                        # <processing> blocks in its history and mimics them, causing infinite
+                        # nested <processing> generation loops.
+                        full_round_text = ss.get_clean_text_so_far()
+                        raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                        clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
+                        clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
+                        clean_history_text = clean_history_text.strip()
+                        if not clean_history_text:
+                            clean_history_text = f"[Phantom tool call to '{tool_name}' with no conversational text]"
+                        virtual_history.append(SimpleNamespace(
+                            sender_type="assistant",
+                            content=clean_history_text
+                        ))
                         virtual_history.append(SimpleNamespace(
                             sender_type="user",
                             content=correction_msg
                         ))
+
+                        # 🛑 CRITICAL FIX: If the phantom call has been seen before, break immediately.
+                        if not hasattr(self, "_phantom_call_counts"):
+                            object.__setattr__(self, "_phantom_call_counts", {})
+                        
+                        try:
+                            param_sig = json.dumps(tool_params, sort_keys=True, default=str)
+                        except Exception:
+                            param_sig = str(tool_params)
+                        phantom_sig = f"{tool_name}::{param_sig}"
+                        
+                        self._phantom_call_counts[phantom_sig] = self._phantom_call_counts.get(phantom_sig, 0) + 1
+                        if self._phantom_call_counts[phantom_sig] >= 2:
+                            ASCIIColors.warning(f"[ChatMixin] Second identical phantom tool call '{tool_name}' detected. Breaking loop to prevent infinite cycle.")
+                            break
 
                         # Force another reasoning round to let the LLM correct itself
                         continue
