@@ -2835,10 +2835,12 @@ class ChatMixin:
             # ── 🎨 DYNAMIC VISION HYDRATION ──
             # Retrieve all images generated or modified during previous rounds of this turn
             # and append their base64 pixels to the active vision context so the LLM can "see" them!
+            # CRITICAL FIX: Only hydrate images that are explicitly in FULL visibility context.
+            # Injecting pixels for [U] (TREE_UNLOCKABLE) images crashes non-vision LLMs.
             round_images = list(images) if images else []
             affected_arts = getattr(self, "_affected_artefacts_this_turn", [])
             for art in affected_arts:
-                if art.get("type") == "image" and art.get("images"):
+                if art.get("type") == "image" and art.get("images") and art.get("visibility") == ArtefactVisibility.FULL:
                     for img_b64 in art["images"]:
                         if img_b64 not in round_images:
                             round_images.append(img_b64)
