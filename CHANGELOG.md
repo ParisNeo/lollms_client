@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-13 16:15]
+
+- fix(openai): sanitize tools for NVIDIA NIM compatibility and fix tool injection
+
 ## [2026-07-13 15:58]
 
 - fix(openai): sanitize tools for NVIDIA NIM compatibility and fix tool injection
