@@ -3582,7 +3582,7 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
                 pass
             return text_clean
 
-                import builtins
+        import builtins
         sandbox_builtins = {name: getattr(builtins, name) for name in dir(builtins)}
         local_vars = {"__builtins__": sandbox_builtins}
 
