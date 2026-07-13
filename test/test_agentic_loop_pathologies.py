@@ -66,6 +66,16 @@ class PathologicalMockClient:
                     'As I was saying, the analysis is complete.\n',
                     '<done/>\n'
                 ]
+            ],
+            "malformed_tool_loop": [
+                [
+                    'Saif, I will build this now.\n',
+                    '<tool>{}</tool>\n'
+                ],
+                [
+                    'Let me try again.\n',
+                    '<tool>{}</tool>\n'
+                ]
             ]
         }
 
@@ -95,7 +105,7 @@ class PathologicalMockClient:
                 callback("", MSG_TYPE.MSG_TYPE_CHUNK, {})
             return ""
 
-        if self.payload_type in ("closure_after_tool", "no_done_continuation"):
+        if self.payload_type in ("closure_after_tool", "no_done_continuation", "malformed_tool_loop"):
             if not hasattr(self, "_closure_turn"):
                 self._closure_turn = 0
             
@@ -343,6 +353,46 @@ class TestAgenticLoopPathologies(unittest.TestCase):
                       "The final conversational answer should be preserved.")
         self.assertNotIn("<done/>", ai_msg.content,
                          "The <done/> tag must be stripped from the final saved message content.")
+
+    def test_malformed_tool_call_processing_block_loop_fix(self):
+        """
+        Scenario: The LLM emits a malformed tool call (<tool>{}</tool>) with no 'name' field.
+                  The _StreamState emits <processing> blocks into ai_msg.content when the
+                  </tool> tag closes. The malformed interceptor must sanitize these blocks
+                  before appending to virtual_history to prevent the LLM from mimicking them.
+                  On the second identical malformed call, the loop must break.
+        Expected: Loop executes exactly 2 rounds. virtual_history must NOT contain <processing> blocks.
+        """
+        self.client.payload_type = "malformed_tool_loop"
+        self.client._closure_turn = 0
+
+        round_count_holder = {"count": 0}
+        original_generate = self.client.generate_from_messages
+
+        def counting_generate(*args, **kwargs):
+            round_count_holder["count"] += 1
+            return original_generate(*args, **kwargs)
+
+        self.client.generate_from_messages = counting_generate
+
+        res = self.discussion.chat(
+            user_message="Build a skill from these artifacts.",
+            max_reasoning_steps=5,
+            enable_artefacts=True,
+            enable_skills=True
+        )
+
+        self.assertEqual(round_count_holder["count"], 2,
+                         "Loop should break after 2 rounds: first records signature, second detects duplicate and breaks.")
+
+        ai_msg = res.get("ai_message")
+        self.assertIsNotNone(ai_msg)
+
+        failure_memory = getattr(self.discussion, "_failure_memory", None)
+        self.assertIsNotNone(failure_memory, "FailureMemory must be initialized")
+        self.assertTrue(hasattr(failure_memory, "_signatures"), "FailureMemory must have _signatures set")
+        self.assertIn("unknown::malformed", failure_memory._signatures,
+                      "The malformed signature must be recorded in FailureMemory")
 
 
 if __name__ == "__main__":
