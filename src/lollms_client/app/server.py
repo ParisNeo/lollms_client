@@ -1590,7 +1590,7 @@ async def delete_artifact_version_endpoint(title: str, version: int):
 
 
 class DeleteArtifactFullRequest(BaseModel):
-    delete_physical_data: bool = False  # Optionally drop the physical database table
+    delete_physical_data: bool = False
 
 
 @app.delete("/api/artifacts/{title}")
@@ -1600,7 +1600,6 @@ async def delete_artifact_endpoint(title: str, payload: DeleteArtifactFullReques
         if payload is None:
             payload = DeleteArtifactFullRequest()
 
-        # If deleting physical data for data artifacts
         if payload.delete_physical_data:
             active = discussion.artefacts.get(title)
             if active and active.get("type") == "data":
@@ -1612,12 +1611,8 @@ async def delete_artifact_endpoint(title: str, payload: DeleteArtifactFullReques
                     import sqlite3
                     conn = sqlite3.connect(str(db_path))
                     cursor = conn.cursor()
-
-                    # Get all table names in the DB
                     cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
                     tables = [row[0] for row in cursor.fetchall()]
-
-                    # Find matching tables (tables starting with artifact title)
                     matching_tables = [t for t in tables if t.startswith(title.replace("-", "_").replace(" ", "_"))]
 
                     if matching_tables:
@@ -3587,12 +3582,9 @@ async def execute_sandbox_endpoint(payload: ExecuteSandboxRequest):
                 pass
             return text_clean
 
-                # ── NATIVE EXECUTION ENGINE (100% Trust Certified Tools) ──
-        # All tools are built and certified by ParisNeo; sandboxing is completely deactivated
-        # to allow full, unrestricted access to the OS, local network, hardware, and libraries.
-        import builtins
+                import builtins
         sandbox_builtins = {name: getattr(builtins, name) for name in dir(builtins)}
-        local_vars = {"__builtins__":sandbox_builtins}
+        local_vars = {"__builtins__": sandbox_builtins}
 
         old_cwd = os.getcwd()
         
@@ -4262,16 +4254,13 @@ async def chat_with_document(request: ChatRequest):
                 if synthesis and user_msg:
                     user_msg.content = f"{synthesis}\n\n---\n\nUser query: {original_content}"
 
-                # ── CONTEXT-DRIVEN DYNAMIC TOOL INGESTION ──
                 active_arts = discussion.artefacts.list(active_only=True)
 
-                # Check for Spreadsheet / Database files
                 has_spreadsheet_context = any(
                     any(a.get("title", "").lower().endswith(ext) for ext in (".csv", ".tsv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"))
                     for a in active_arts
                 )
 
-                # Check for Semantic Web Graph / Ontology files
                 has_semantic_graph_context = any(
                     any(a.get("title", "").lower().endswith(ext) for ext in (".ttl", ".rdf", ".owl", ".xml"))
                     for a in active_arts
@@ -4346,46 +4335,16 @@ async def chat_with_document(request: ChatRequest):
                                             "optional": param.default != inspect.Parameter.empty
                                         })
 
-                                    # Helper function to invoke macro compliant with LCP
-                                    def _make_lcp_wrapper(fn_target):
-                                        import inspect
-                                        target_sig = inspect.signature(fn_target)
-
-                                        def _invoke_lcp_macro(**kw):
-                                            # Filter kwargs to only pass parameters accepted by the signature
-                                            filtered_kwargs = {}
-                                            for k, v in kw.items():
-                                                if k in target_sig.parameters:
-                                                    filtered_kwargs[k] = v
-
-                                            # Inject context if explicitly requested by signature
-                                            if "discussion_instance" in target_sig.parameters:
-                                                filtered_kwargs["discussion_instance"] = kw.get("discussion_instance", discussion)
-                                            elif "discussion" in target_sig.parameters:
-                                                filtered_kwargs["discussion"] = kw.get("discussion_instance", discussion)
-
-                                            if "lollms_client_instance" in target_sig.parameters:
-                                                filtered_kwargs["lollms_client_instance"] = kw.get("lollms_client_instance", client)
-                                            elif "client" in target_sig.parameters:
-                                                filtered_kwargs["client"] = kw.get("lollms_client_instance", client)
-
-                                            return fn_target(**filtered_kwargs)
-                                        return _invoke_lcp_macro
-
-                                    # Register as individual, first-class LCP tool callable
-                                    # Helper function to invoke macro compliant with LCP
                                     def _make_lcp_wrapper(fn_target):
                                         import inspect
                                         target_sig = inspect.signature(fn_target)
                                         
                                         def _invoke_lcp_macro(**kw):
-                                            # Filter kwargs to only pass parameters accepted by the signature
                                             filtered_kwargs = {}
                                             for k, v in kw.items():
                                                 if k in target_sig.parameters:
                                                     filtered_kwargs[k] = v
                                                     
-                                            # Inject context if explicitly requested by signature
                                             if "discussion_instance" in target_sig.parameters:
                                                 filtered_kwargs["discussion_instance"] = kw.get("discussion_instance", discussion)
                                             elif "discussion" in target_sig.parameters:
@@ -4399,7 +4358,6 @@ async def chat_with_document(request: ChatRequest):
                                             return fn_target(**filtered_kwargs)
                                         return _invoke_lcp_macro
 
-                                    # Register as individual, first-class LCP tool callable
                                     active_tools[fn_name] = {
                                         "name": fn_name,
                                         "description": fn_obj.__doc__.strip().split("\n\n")[0].strip() if fn_obj.__doc__ else f"Run {fn_name}",
