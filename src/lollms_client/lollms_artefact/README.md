@@ -167,7 +167,51 @@ To prevent untrusted LLMs from executing arbitrary code, dynamic tool registrati
 
 ---
 
-## 🛠️ 5. Class Reference
+## 🧩 5. Artefact Properties Reference & Handling Guide
+
+Every artifact in the system is represented as a dictionary (record) with a specific set of keys. Understanding the distinction between these properties is critical for correctly creating, updating, and referencing artifacts, especially when dealing with the Dual-Stream storage architecture.
+
+### Core Properties
+
+| Property | Type | Description & Handling Rules |
+| :--- | :--- | :--- |
+| `title` | `str` | **The primary key.** This is the high-level metadata name used by the LLM and the database to reference the artifact. It may contain subfolder paths (e.g., `My_subfolder/SKILL.md`). It is sanitized via `_sanitize_path_segments` to ensure cross-platform safety. When updating or retrieving an artifact, you query by this title. |
+| `physical_path` | `str` | **The disk location.** This stores the exact relative path (including subfolders and extension) where the physical twin resides in `workspace_data/`. If not explicitly provided during `add()` or `update()`, it defaults to the `title`. **CRITICAL**: File-reading tools should be passed the `physical_path` (or `display_path` from the context zone) to ensure they open the correct file on disk. |
+| `type` | `str` | The category of the artifact (e.g., `ArtefactType.CODE`, `ArtefactType.DATA`). Determines how the artifact is rendered in the context zone and which tools can operate on it. |
+| `content` | `str` | The logical text content. For text/code files, this is the verbatim source code. For `DATA` artifacts, this holds the `.lam` schema description, **NOT** the raw binary bytes. |
+| `version` | `int` | The version number. Incremented automatically on `update()` if `bump_version=True`. The `get()` method returns the highest version by default. |
+| `visibility` | `str` | The context tier (`FULL`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`). Controls how the artifact appears in the LLM's prompt. See [Section 2: Multi-Tier Visibility Control](#-2-multi-tier-visibility-control). |
+| `active` | `bool` | A legacy boolean flag that mirrors `visibility == FULL`. It is `True` if the artifact is fully loaded in context, `False` otherwise. |
+| `language` | `str` | The programming or markup language (e.g., `python`, `html`). Used for syntax highlighting in the context zone and to infer file extensions. |
+| `file_ext` | `str` | The explicit file extension (e.g., `.csv`, `.db`). **CRITICAL for DATA artifacts**: This determines how the physical file is written to disk and prevents binary corruption. |
+| `logical_content` | `str` | Explicit storage for the `.lam` schema text of `DATA` artifacts. While usually mirrored in `content`, this field is the authoritative source for the logical twin during Dual-Stream sync operations. |
+| `physical_data` | `bytes` | The raw binary bytes of a `DATA` or `IMAGE` artifact. **CRITICAL**: This field is stripped from the database record by `_get_all_raw()` to prevent JSON serialization crashes. It is only present in the dictionary returned directly by `add()` or `update()`. Never assume `art.get("physical_data")` will return bytes from a database query; rehydrate from disk if needed. |
+| `token_count` | `int` | The estimated token count of the `content`. Used by the Context Budget Guard to prevent context overflow. |
+
+### Handling Guidelines
+
+#### 1. Title vs. Physical Path Decoupling
+The architecture decouples the database key (`title`) from the disk location (`physical_path`).
+*   **Creation**: If you create an artifact with `title="My_subfolder/script.py"`, the `physical_path` automatically mirrors this. The physical file is written to `workspace_data/My_subfolder/script.py`.
+*   **Context Injection**: `build_artefacts_context_zone()` displays the `physical_path` to the LLM. When the LLM decides to read a file, it should use this exact string.
+*   **Updating**: If you change the `title` during an update (`new_title`), the `physical_path` is updated to match, and the old physical file is deleted from disk.
+
+#### 2. Data Artifact Safety (Binary Corruption Prevention)
+`DATA` artifacts (like SQLite databases or CSVs) use the Dual-Stream protocol.
+*   **Never write string `content` to a binary file**: The `_sync_to_disk_workspace` method explicitly refuses to write string `content` to `.db`/`.sqlite` files if `physical_data` is missing. This prevents the database header from being overwritten with `.lam` schema text.
+*   **Rehydration**: When updating a `DATA` artifact's schema, the `update()` method automatically rehydrates `physical_data` by reading the existing bytes from disk *before* calling `add()`. This ensures the raw binary data is preserved across schema updates.
+
+#### 3. Visibility and Context Budget
+*   **Tool-Generated Files**: By default, tool-generated files >100KB are registered with `visibility=TREE_UNLOCKABLE` and `active=False` to prevent context bloat.
+*   **Unlocking**: The LLM can use `<unlock_file>` to promote a file to `FULL` visibility. However, the Context Budget Guard blocks unlocking files >50,000 tokens, instructing the LLM to use tools (SQL, grep) instead.
+
+#### 4. Image Artifacts
+*   Image artifacts store base64 encoded strings in the `images` list and their MIME types in `image_media_types`.
+*   They are an exception to the visibility doctrine: they are always registered with `visibility=FULL` and `active=True` when generated by tools, so they can be hydrated into the LLM's vision context immediately.
+
+---
+
+## 🛠️ 6. Class Reference
 
 *   **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`, `SCRATCHPAD`).
 * **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, manages version history squashing, and gates dynamic tool registration.
