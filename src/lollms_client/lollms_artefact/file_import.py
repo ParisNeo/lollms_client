@@ -1,4 +1,4 @@
-# lollms_discussion/_file_import.py
+# lollms_artefact/_file_import.py
 # FileImportMixin — import files of many formats into the artefact system.
 #
 # IMPORT MODES
@@ -1674,7 +1674,7 @@ class FileImportMixin:
                 language    = language,
                 active      = activate,
                 visibility  = visibility_value,
-                create_new_version = False,
+                bump_version= False,
                 **extra_data
             )
             ASCIIColors.success(f"[FileImport] Conflict resolved via overwrite. Replaced content in '{title}'")
