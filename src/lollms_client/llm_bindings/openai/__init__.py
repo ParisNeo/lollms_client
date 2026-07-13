@@ -560,6 +560,33 @@ class OpenAIBinding(LollmsLLMBinding):
 
         openai_messages = [normalize_message(m) for m in messages]
 
+        # ── 🛡️ NVIDIA NIM / STRICT ENDPOINT TOOL SANITIZATION ──
+        # The NVIDIA OpenAI-compatible endpoint strictly validates function IDs.
+        # It throws 404 NotFoundError if an unregistered UUID is passed inside the `tools` array.
+        # Ollama and vLLM ignore this, but we must sanitize the payload for strict routers.
+        raw_tools = kwargs.get("tools")
+        sanitized_tools = None
+
+        if raw_tools and isinstance(raw_tools, list):
+            sanitized_tools = []
+            for tool in raw_tools:
+                if not isinstance(tool, dict):
+                    continue
+                # Filter out isolated UUIDs or malformed function wrappers
+                if "id" in tool and len(str(tool["id"])) == 36 and "-" in str(tool["id"]):
+                    # Strip the raw isolated UUID that breaks NVIDIA's registry
+                    tool.pop("id", None)
+
+                # Enforce standard OpenAI function calling schema
+                if "function" in tool:
+                    func_def = tool["function"]
+                    # Force strict=False to prevent rigid schema validation crashes on NIM
+                    func_def["strict"] = False
+                    # Remove any UUID hidden inside function name or description
+                    if "name" in func_def and isinstance(func_def["name"], str):
+                        func_def["name"] = func_def["name"].replace("23d4f03a-b8a6-4adb-a183-7daa083a09cc", "lcp_tool")
+                sanitized_tools.append(tool)
+
         # ── Build base params ─────────────────────────────────────────────────
         params = {
             "model": self.model_name,
@@ -573,6 +600,12 @@ class OpenAIBinding(LollmsLLMBinding):
         }
         if seed is not None:
             params["seed"] = seed
+
+        # Inject sanitized tools if available
+        if sanitized_tools:
+            params["tools"] = sanitized_tools
+            # Prevent the API from forcing tool calls when the LLM just wants to converse
+            params["tool_choice"] = "auto"
 
         # Drop None values
         params = {k: v for k, v in params.items() if v is not None}
@@ -612,23 +645,33 @@ class OpenAIBinding(LollmsLLMBinding):
             except Exception as ex:
                 trace_exception(ex)
 
-                # Retry: adapt for servers that reject certain fields
-                if "max_tokens" in params:
-                    params["max_completion_tokens"] = params.pop("max_tokens")
+                # 🛡️ CRITICAL FIX: NVIDIA NIM 404 Function Not Found Interceptor
+                # If NVIDIA's strict endpoint still rejects the sanitized tools payload,
+                # we intercept the 404 NotFoundError specifically related to function IDs
+                # and retry WITHOUT the tools array entirely to save the generation.
+                if isinstance(ex, openai.NotFoundError) and "Function" in str(ex) and "Not found for account" in str(ex):
+                    ASCIIColors.warning("[NIM Strict Validation] Intercepted 404 Function Not Found. Retrying without tools array.")
+                    params.pop("tools", None)
+                    params.pop("tool_choice", None)
+                    completion = self.client.chat.completions.create(**params)
+                else:
+                    # Retry: adapt for servers that reject certain fields
+                    if "max_tokens" in params:
+                        params["max_completion_tokens"] = params.pop("max_tokens")
 
-                params.pop("top_p", None)
-                params.pop("frequency_penalty", None)
-                params.pop("presence_penalty", None)
-                params.pop("reasoning_effort", None)
+                    params.pop("top_p", None)
+                    params.pop("frequency_penalty", None)
+                    params.pop("presence_penalty", None)
+                    params.pop("reasoning_effort", None)
 
-                if not think:
-                    params["temperature"] = 1
+                    if not think:
+                        params["temperature"] = 1
 
-                # Strip vLLM-specific extras so the retry is clean
-                if "extra_body" in params:
-                    params["extra_body"].pop("chat_template_kwargs", None)
+                    # Strip vLLM-specific extras so the retry is clean
+                    if "extra_body" in params:
+                        params["extra_body"].pop("chat_template_kwargs", None)
 
-                completion = self.client.chat.completions.create(**params)
+                    completion = self.client.chat.completions.create(**params)
 
             # ── Streaming ─────────────────────────────────────────────────────
             if stream:

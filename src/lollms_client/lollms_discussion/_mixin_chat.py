@@ -3558,9 +3558,10 @@ class ChatMixin:
                                                     pass
 
                                 # Execute directly (no thread) - LCP handles CWD internally
-                                #todo: verify signature first
-                                call_kwargs["discussion_instance"]=self
-
+                                # The signature check above already safely injected
+                                # 'discussion_instance' and 'lollms_client_instance' ONLY if
+                                # the tool explicitly declared them in its function signature.
+                                # Unconditional injection breaks agnostic tools (e.g., tool_internet_search).
                                 tool_res = active_tools[tool_name]["callable"](**call_kwargs)
 
                                 # ── Take AFTER Snapshot and Auto-Sync Artifacts ──
