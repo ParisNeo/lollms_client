@@ -646,8 +646,21 @@ class ArtefactManager:
             )
         return return_artefact
 
-    def get(self, title: str, version: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        candidates = [a for a in self._get_all_raw() if a.get('title') == title]
+    def get(self, title: Optional[str] = None, version: Optional[int] = None, physical_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves an artifact by its title or physical_path.
+        Parameters `title` and `physical_path` are mutually exclusive.
+        """
+        if title is not None and physical_path is not None:
+            raise ValueError("Parameters 'title' and 'physical_path' are mutually exclusive. Provide only one.")
+        if title is None and physical_path is None:
+            raise ValueError("You must provide either 'title' or 'physical_path' to identify the artifact.")
+        
+        if physical_path is not None:
+            candidates = [a for a in self._get_all_raw() if a.get('physical_path') == physical_path]
+        else:
+            candidates = [a for a in self._get_all_raw() if a.get('title') == title]
+            
         if not candidates:
             return None
         if version is not None:
@@ -748,7 +761,6 @@ class ArtefactManager:
         url:               Optional[str] = None,
         new_title:         Optional[str] = None,
         bump_version:      bool = True,
-        create_new_version: bool = True,
         active:            Optional[bool] = None,
         visibility:        Optional[str] = None,
         commit_message:    Optional[str] = None,
@@ -763,8 +775,6 @@ class ArtefactManager:
         new_type = new_type or extra_data.pop("artefact_type", None)
         if version is not None:
             new_version = version
-        elif not create_new_version:
-            new_version = latest.get('version', 1)
         else:
             new_version = (latest.get('version', 1) + 1) if bump_version else latest.get('version', 1)
 
@@ -1252,8 +1262,11 @@ class ArtefactManager:
             target_arts = [a for a in arts if a.get('title') == title and (version is None or a.get('version') == version)]
             
             for art in target_arts:
-                clean_title = sanitize_artifact_filename(title.replace("workspace/", "").replace("data_workspace/", ""))
-                filename = self._get_filename_with_ext(clean_title, art.get('type'), art.get('language'), art.get('file_ext'))
+                # CRITICAL FIX: Use physical_path for disk resolution to handle subfolders correctly.
+                # _sanitize_path_segments preserves subfolder structure, whereas sanitize_artifact_filename flattens it.
+                phys_path = art.get("physical_path") or art.get("title", "")
+                clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
+                filename = self._get_filename_with_ext(clean_path, art.get('type'), art.get('language'), art.get('file_ext'))
 
                 active_path = ws_data_dir / filename
                 if active_path.exists():
@@ -1264,7 +1277,7 @@ class ArtefactManager:
 
                 # 2. Delete the versioned physical twin and .lam logical twin
                 name_part, ext_part = os.path.splitext(filename) if '.' in filename else (filename, "")
-                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_title))
+                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
                 art_meta_dir = meta_dir / art_id
                 
                 if art_meta_dir.exists():
@@ -1284,16 +1297,18 @@ class ArtefactManager:
 
             # 3. If removing all versions, delete the metadata directory itself
             if version is None:
-                clean_title = title.replace("workspace/", "").replace("data_workspace/", "").replace("/", "_").replace("\\", "_")
-                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_title))
-                art_meta_dir = meta_dir / art_id
-                if art_meta_dir.exists():
-                    try:
-                        # Remove the directory and any remaining contents
-                        import shutil
-                        shutil.rmtree(str(art_meta_dir))
-                    except Exception:
-                        pass
+                # Use the physical_path of the first target artifact for consistent UUID generation
+                if target_arts:
+                    phys_path = target_arts[0].get("physical_path") or target_arts[0].get("title", "")
+                    clean_path = self._sanitize_path_segments(phys_path.replace("workspace/", "").replace("data_workspace/", ""))
+                    art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
+                    art_meta_dir = meta_dir / art_id
+                    if art_meta_dir.exists():
+                        try:
+                            import shutil
+                            shutil.rmtree(str(art_meta_dir))
+                        except Exception:
+                            pass
                         
         except Exception as e:
             ASCIIColors.warning(f"Failed to cleanup artifact files for '{title}': {e}")
