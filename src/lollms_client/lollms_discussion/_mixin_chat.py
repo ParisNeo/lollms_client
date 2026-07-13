@@ -57,10 +57,10 @@ _DEFAULT_FAST_REPLICAS = [
 
 _TAG_STARTS = [
     "<tool>",
-    "<think>", "<think ",
+    "</arg_key>", "<think ",
     "<artifact", "<artefact",
     "<generate_image", "<edit_image",
-    "<note", "<skill",
+    "<note", "<skill", "<scratchpad",
     "<lollms_inline",
     "<lollms_form",
     "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete",
@@ -784,7 +784,7 @@ class _StreamState:
             inline_tag_found = False
             # CRITICAL: Check for exact opening tags (e.g., "<tool>") and tag prefixes with attributes (e.g., "<artifact ")
             # REMOVED "<lollms_inline" so the host application can handle it directly.
-            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
+            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
                 idx = self._pending_buffer.find(tag_prefix)
                 if idx != -1:
                     # Check if it's at the absolute start of a line
@@ -1133,7 +1133,7 @@ class _StreamState:
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
             # REMOVED "<lollms_inline" so the host application can handle it directly.
-            for tag_prefix in ("<skill", "<note", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
+            for tag_prefix in ("<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
                 # STRICT WHITELIST: Only match if the tag starts at the absolute beginning of a line (ignoring whitespace).
                 # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
@@ -1234,11 +1234,9 @@ class _StreamState:
 
                 if remaining_text.strip():
                     self._pending_buffer = remaining_text
-                    # Fall through to default processing for the remaining text
-                else:
-                    # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
-                    self._action_dispatched = True
-                    return False
+                # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
+                self._action_dispatched = True
+                return False
             else:
                 # Still accumulating body. Emit lightweight status if enabled.
                 # (No structural analysis for secondary tags — just suppress raw output)
@@ -1251,7 +1249,7 @@ class _StreamState:
         def _ends_with_partial_tag(buffer: str) -> int:
             """Returns the start index of the partial tag if found, else -1."""
             # REMOVED "<lollms_inline" so the host application can handle it directly.
-            tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<generate_image", "<edit_image", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file"]
+            tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<scratchpad", "<generate_image", "<edit_image", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file"]
 
             # Helper to check if the start of the line is valid for a tag
             def _is_at_line_start(buf: str, idx: int) -> bool:
@@ -1525,6 +1523,63 @@ class _StreamState:
             })
             return True
 
+        # 3b. Scratchpad (Intermediate Hypothesis Workspace)
+        elif tag_name == "scratchpad":
+            if not self.enable_artefacts:
+                return True
+            title = attrs.get("title") or attrs.get("name") or "scratchpad"
+
+            is_patch = "<<<<<<< SEARCH" in body
+            if is_patch:
+                existing = self.discussion.artefacts.get(title)
+                if existing:
+                    try:
+                        patched_content = self.discussion.artefacts.apply_aider_patch(existing["content"], body)
+                        art = self.discussion.artefacts.update(
+                            title=title, new_content=patched_content, bump_version=True, active=self.auto_activate
+                        )
+                    except Exception as patch_err:
+                        ASCIIColors.error(f"[StreamState] Scratchpad patch failed: {patch_err}")
+                        proc_open = f'\n<processing type="scratchpad" title="{title}">\n'
+                        proc_body = f'* ❌ Failed to apply patch to scratchpad: {patch_err}\n'
+                        proc_close = f'<!-- status:failure -->\n</processing>\n'
+                        proc_block = proc_open + proc_body + proc_close
+
+                        self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+                        _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        return True
+                else:
+                    ASCIIColors.warning(f"[StreamState] Scratchpad patch ignored (scratchpad '{title}' not found). Creating new.")
+                    art = self.discussion.artefacts.add(
+                        title=title, artefact_type=ArtefactType.SCRATCHPAD, content=body, active=self.auto_activate
+                    )
+            else:
+                art = self.discussion.artefacts.add(
+                    title=title, artefact_type=ArtefactType.SCRATCHPAD, content=body, active=self.auto_activate
+                )
+
+            if art:
+                self.affected_artefacts.append(art)
+
+            proc_open = f'\n<processing type="scratchpad" title="{title}">\n'
+            proc_body = f'* 📝 Scratchpad updated and saved to workspace.\n'
+            proc_close = f'<!-- status:finished -->\n</processing>\n'
+            proc_block = proc_open + proc_body + proc_close
+
+            self.ai_message.content = self.ai_message.content.replace(full_match_text, proc_block)
+            _cb(self.callback, proc_open, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            _cb(self.callback, proc_body, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                "type": "artifact_created",
+                "title": title,
+                "art_type": "scratchpad"
+            })
+            return True
+
         # 4. Long-term Skill
         elif tag_name == "skill":
             if not self.enable_skills:
@@ -1760,6 +1815,9 @@ class _StreamState:
             self._secondary_closing_tag = ""
             self._secondary_open_tag = ""
             self._secondary_buffer = ""
+
+            # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
+            self._action_dispatched = True
             return
 
         if self._pending_buffer or self.artefact_tracker.is_inside_artefact:
