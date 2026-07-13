@@ -480,10 +480,14 @@ class ArtefactManager:
             # For text-based data files (like .csv, .tsv), the 'content' field holds the raw text
             # and should be written to disk if physical_data is missing.
             if not wrote_physical and isinstance(content, str) and content:
-                # 🛑 CRITICAL FIX: Never write string content to a binary database file (.db, .sqlite).
+                # 🛑 CRITICAL FIX: Never write string content to a binary database file (.db, .sqlite, .sqlite3).
                 # The 'content' field for DATA artifacts is a logical schema (.lam), not the raw bytes.
                 # Writing it to disk corrupts the SQLite file.
+                # Also check the title extension as a secondary signal.
                 is_binary_db = file_ext in (".db", ".sqlite", ".sqlite3")
+                if not is_binary_db:
+                    title_suffix = Path(title).suffix.lower()
+                    is_binary_db = title_suffix in (".db", ".sqlite", ".sqlite3")
                 # Skip true binary types (images, databases) to prevent writing base64/placeholder text as a file
                 if atype != ArtefactType.IMAGE and not is_binary_db:
                     try:
@@ -495,7 +499,7 @@ class ArtefactManager:
                     except Exception as e:
                         trace_exception(e)
                 elif is_binary_db:
-                    ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing.")
+                    ASCIIColors.error(f"[ArtefactManager] Refusing to write text content to binary database file '{filename}'. Physical data is missing. Title='{title}', file_ext='{file_ext}'.")
                     return False
             if logical_content:
                 try:
@@ -851,10 +855,16 @@ class ArtefactManager:
             #         physical data, and `logical_content` is the new schema.
             # Case 3: `new_content` equals `logical_content` → Schema-only update. The physical
             #         bytes MUST be rehydrated from disk to preserve them.
+            _BINARY_DB_EXTS = {".db", ".sqlite", ".sqlite3"}
+            _artifact_file_ext = (latest.get("file_ext") or "").lower()
+            _artifact_title_ext = Path(latest.get("title", "")).suffix.lower()
+            _is_binary_db = _artifact_file_ext in _BINARY_DB_EXTS or _artifact_title_ext in _BINARY_DB_EXTS
+
             is_raw_data_update = (
                 new_content is not None
                 and isinstance(new_content, str)
                 and (logical_content is None or new_content != logical_content)
+                and not _is_binary_db
             )
 
             if is_raw_data_update:
@@ -863,12 +873,19 @@ class ArtefactManager:
                     ASCIIColors.info(f"[ArtefactManager] Encoded new_content to physical bytes for '{latest.get('title')}' ({len(physical_data)} bytes)")
                 except Exception as e:
                     ASCIIColors.warning(f"[ArtefactManager] Failed to encode new_content to bytes: {e}")
+            elif _is_binary_db and new_content is not None and isinstance(new_content, str):
+                logical_content = new_content
+                use_content = new_content
+                ASCIIColors.info(f"[ArtefactManager] Binary DB artifact '{latest.get('title')}': treating new_content as .lam schema, preserving physical bytes from disk.")
 
             # Fallback: Rehydrate from disk if physical_data is still None.
             # This happens when only the schema (.lam) is updated (logical_content is provided)
             # and we must preserve the binary bytes.
-            # CRITICAL: This must happen BEFORE self.add() because add() calls db_to_physical()
+            # CRITICAL: This must happen BEFORE self.add() because add() calls _sync_to_disk_workspace()
             # which will overwrite the file with schema text if physical_data is None.
+            # CRITICAL: For binary DB files (.db, .sqlite, .sqlite3), we MUST NEVER fall back to
+            # encoding string content as bytes. If the disk file is missing, we fail gracefully
+            # rather than corrupting the file with schema text.
             if physical_data is None:
                 try:
                     if getattr(self._discussion, "workspace_data_path", None):
@@ -885,9 +902,11 @@ class ArtefactManager:
                     if active_physical_path.exists():
                         physical_data = active_physical_path.read_bytes()
                         ASCIIColors.info(f"[ArtefactManager] Rehydrated physical bytes for data artifact '{latest.get('title')}' from {active_physical_path}")
-                    elif new_content is not None and isinstance(new_content, str):
+                    elif not _is_binary_db and new_content is not None and isinstance(new_content, str):
                         physical_data = new_content.encode("utf-8")
                         ASCIIColors.info(f"[ArtefactManager] Encoded new_content to physical bytes for '{latest.get('title')}' ({len(physical_data)} bytes)")
+                    elif _is_binary_db:
+                        ASCIIColors.error(f"[ArtefactManager] CRITICAL: Cannot rehydrate binary DB '{latest.get('title')}' — physical file missing at {active_physical_path}. Refusing to write schema text as binary data.")
                 except Exception as e:
                     ASCIIColors.warning(f"[ArtefactManager] Failed to rehydrate physical bytes for data artifact: {e}")
 
