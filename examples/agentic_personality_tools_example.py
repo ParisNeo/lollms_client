@@ -4,6 +4,7 @@ agentic_personality_tools_example.py
 ====================================
 A full agentic workflow demonstrating:
 - Custom personality definition with research-focused system prompts
+- Environment file (.env) configuration support with safe fallbacks
 - Multiple file-based tools in lollms format (arXiv + Wikipedia)
 - Multi-step reasoning with automatic tool chaining
 - Agent.generate_with_tools() with rich execution metadata
@@ -23,7 +24,7 @@ Architecture
                        │   (Tool #2)     │
                        └─────────────────┘
                               │
-                              └──────────────────────────→┐
+                              └──────────────────────────→┌
                                                           ↓
                                               ┌─────────────────┐
                                               │  Synthesis      │
@@ -33,11 +34,10 @@ Architecture
 Requirements
 ------------
 pip install lollms_client ascii_colors
-
-Downloads: ~2.2 GB (Ministral 3B Q4_K_M)
 """
 
 import sys
+import os
 import json
 import time
 from pathlib import Path
@@ -46,6 +46,16 @@ from typing import List, Dict, Any
 # Ensure the source is importable when running from the repo root
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+# ── ENVIRONMENT LOADING ─────────────────────────────────────────────────────
+# Safely load environment variables from .env if it exists.
+# If python-dotenv is not installed or the file is missing, we gracefully fallback
+# to hardcoded defaults that work out-of-the-box for local llama_cpp_server.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass  # Fallback to system environment variables or defaults below
 
 from lollms_client import LollmsClient
 from lollms_client.lollms_agent import Agent, AgentRole
@@ -65,26 +75,20 @@ def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'arxiv': '>=2.1.0'})
 
-def tool_search_papers(args: dict):
+def tool_search_papers(query: str, count: int = 3, year_start: int = None, year_end: int = None):
     """
-    Search for scientific papers on ArXiv.
+    Search for scientific papers on ArXiv based on a query.
 
     Args:
-        args: dict with keys:
-            - query (str): Scientific keywords or paper ID
-            - count (int, optional): Number of papers to fetch (default: 3)
-            - year_start (int, optional): Start year for filtering (inclusive)
-            - year_end (int, optional): End year for filtering (inclusive)
+        query (str): Scientific keywords or paper ID to search for.
+        count (int, optional): Number of papers to fetch. Defaults to 3.
+        year_start (int, optional): Start year for filtering papers (inclusive).
+        year_end (int, optional): End year for filtering papers (inclusive).
     """
     import arxiv
     try:
-        query = args.get('query')
         if not query:
             return "Error: Query is required."
-
-        count = args.get('count', 3)
-        year_start = args.get('year_start')
-        year_end = args.get('year_end')
 
         search = arxiv.Search(query=query, max_results=100)
         client = arxiv.Client()
@@ -126,49 +130,67 @@ def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'wikipedia': '>=1.4.0'})
 
-def tool_search_wikipedia(args: dict):
+def tool_search_wikipedia(query: str, max_results: int = 3):
     """
-    Search Wikipedia for articles matching a query and return summaries.
+    Search Wikipedia for articles matching a query and return their summaries.
 
     Args:
-        args: dict with keys:
-            - query (str): The search term or phrase
-            - max_results (int, optional): Maximum number of results (default: 3)
+        query (str): The search term or phrase to look up.
+        max_results (int, optional): Maximum number of results to return. Defaults to 3.
     """
     import wikipedia
+    import time
     try:
-        query = args.get('query')
-        limit = args.get('max_results', 3)
+        if not query:
+            return "Error: Query is required."
+        
+        # Wikipedia API blocks rapid successive requests.
+        time.sleep(1.0)
+        
         search_results = wikipedia.search(query)
         output = []
-        for title in search_results[:limit]:
+        for title in search_results[:max_results]:
             try:
+                time.sleep(0.5)
                 page = wikipedia.summary(title, sentences=5)
                 output.append(f"--- {title} ---\\n{page}")
-            except Exception:
+            except wikipedia.exceptions.DisambiguationError as e:
+                # Pick the first option if it's a disambiguation page
+                if e.options:
+                    time.sleep(0.5)
+                    page = wikipedia.summary(e.options[0], sentences=5)
+                    output.append(f"--- {e.options[0]} ---\\n{page}")
+            except Exception as inner_e:
+                # Skip individual page failures, but keep searching other results
                 continue
-        return "\\n\\n".join(output) if output else "No results found."
+                
+        if not output:
+            return "Error: Could not retrieve Wikipedia summaries. The API may be rate-limiting requests or no exact match was found. Please rely on the arxiv results or use another tool."
+        return "\\n\\n".join(output)
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error: Wikipedia search failed ({str(e)}). The API may be temporarily unavailable. Please proceed using the available ArXiv papers or other tools."
 '''
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-MODEL_ZOO_INDEX = 1   # Ministral-3-3B-Instruct-2512
+# Read variables from the environment with safe defaults for local execution.
+# This allows the script to run out-of-the-box with llama_cpp_server, but
+# easily switch to remote (e.g., openai, groq) by modifying the .env file.
 
-BINDING_CONFIG = {
-    "models_path": "data/models/llama_cpp_models",
-    "binaries_path": "data/bin/llm/llama_cpp_server",
-    "ctx_size": 8192,
-    "n_gpu_layers": -1,
-    "n_threads": 4,
-    "n_parallel": 1,
-    "batch_size": 512,
-    "idle_timeout": 300,
-}
+LLM_BINDING_NAME = os.getenv("LLM_BINDING_NAME", "llama_cpp_server")
+MODEL_NAME = os.getenv("MODEL_NAME", "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf")
+HOST_ADDRESS = os.getenv("HOST_ADDRESS", "http://localhost:11434")
+VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+API_KEY = os.getenv("API_KEY")
+
+MODELS_PATH = os.getenv("MODELS_PATH", str(PROJECT_ROOT / "data" / "models" / "llama_cpp_models"))
+BINARIES_PATH = os.getenv("BINARIES_PATH", str(PROJECT_ROOT / "data" / "bin" / "llm" / "llama_cpp_server"))
+CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "8192"))
+N_GPU_LAYERS = int(os.getenv("N_GPU_LAYERS", "-1"))
 
 TOOLS_DIR = Path.home() / ".lollms_hub" / "tools"
 
@@ -273,42 +295,66 @@ def main():
     print(f"   • {wiki_path}")
 
     # ── 2. Create LollmsClient ────────────────────────────────────────
-    print("\n🚀 Creating LollmsClient with llama_cpp_server binding...")
+    print(f"\n🚀 Creating LollmsClient with {LLM_BINDING_NAME} binding...")
+    
+    # Dynamically construct the binding configuration based on the target binding type.
+    if LLM_BINDING_NAME == "llama_cpp_server":
+        BINDING_CONFIG = {
+            "models_path": MODELS_PATH,
+            "binaries_path": BINARIES_PATH,
+            "ctx_size": CONTEXT_SIZE,
+            "n_gpu_layers": N_GPU_LAYERS,
+            "n_threads": 4,
+            "n_parallel": 1,
+            "batch_size": 512,
+            "idle_timeout": 300,
+        }
+    else:
+        # Remote bindings (ollama, openai, groq, etc.)
+        BINDING_CONFIG = {
+            "model_name": MODEL_NAME,
+            "host_address": HOST_ADDRESS,
+            "verify_ssl_certificate": VERIFY_SSL
+        }
+        # Conditionally inject API key for gated services (OpenAI, Mistral, Groq, etc.)
+        if API_KEY:
+            BINDING_CONFIG["service_key"] = API_KEY
+
     client = LollmsClient(
-        llm_binding_name="llama_cpp_server",
+        llm_binding_name=LLM_BINDING_NAME,
         llm_binding_config=BINDING_CONFIG,
         user_name="user",
         ai_name="assistant",
     )
 
-    # ── 3. Download model if missing ──────────────────────────────────
-    zoo = client.llm.get_zoo()
-    chosen = zoo[MODEL_ZOO_INDEX]
-    model_filename = chosen["filename"]
+    # ── 3. Download model if missing (Local Bindings Only) ────────────
+    if LLM_BINDING_NAME == "llama_cpp_server":
+        model_path = Path(MODELS_PATH) / MODEL_NAME
+        if not model_path.exists():
+            print(f"\n⬇️  Downloading {MODEL_NAME} ...")
+            result = client.llm.download_from_zoo(MODEL_ZOO_INDEX, progress_callback=progress_callback)
+            if not result.get("status"):
+                print(f"❌ Download failed: {result.get('error')}")
+                sys.exit(1)
+            print("✅ Download complete.")
+        else:
+            print(f"\n📁 Model already exists: {MODEL_NAME}")
 
-    model_path = Path(BINDING_CONFIG["models_path"]) / model_filename
-    if not model_path.exists():
-        print(f"\n⬇️  Downloading {chosen['name']} ({chosen['size']}) ...")
-        result = client.llm.download_from_zoo(MODEL_ZOO_INDEX, progress_callback=progress_callback)
-        if not result.get("status"):
-            print(f"❌ Download failed: {result.get('error')}")
+        # ── 4. Load the model ─────────────────────────────────────────
+        print(f"\n🔌 Loading model '{MODEL_NAME}' ...")
+        t0 = time.time()
+        success = client.llm.load_model(MODEL_NAME)
+        if not success:
+            print("❌ Failed to load model.")
             sys.exit(1)
-        print("✅ Download complete.")
+        load_time = time.time() - t0
+        print(f"✅ Model loaded in {load_time:.1f}s")
+
+        for srv in client.llm.ps():
+            print(f"   Server: PID {srv['pid']} | Port {srv['port']} | RSS {srv['rss_mb']} MB")
     else:
-        print(f"\n📁 Model already exists: {model_filename}")
-
-    # ── 4. Load the model ─────────────────────────────────────────────
-    print(f"\n🔌 Loading model '{model_filename}' ...")
-    t0 = time.time()
-    success = client.llm.load_model(model_filename)
-    if not success:
-        print("❌ Failed to load model.")
-        sys.exit(1)
-    load_time = time.time() - t0
-    print(f"✅ Model loaded in {load_time:.1f}s")
-
-    for srv in client.llm.ps():
-        print(f"   Server: PID {srv['pid']} | Port {srv['port']} | RSS {srv['rss_mb']} MB")
+        load_time = 0.0
+        print("\n☁️  Using remote binding. No model download or local loading required.")
 
     # ── 5. Create Research Personality ──────────────────────────────────
     print("\n🎭 Creating ResearchAgent personality...")
@@ -411,10 +457,12 @@ def main():
     print("\n" + "=" * 70)
     print("🧹 Cleanup")
     print("=" * 70)
-    print("Unloading model...")
-    client.llm.unload_model()
+    if LLM_BINDING_NAME == "llama_cpp_server" and hasattr(client.llm, "unload_model"):
+        print("Unloading model...")
+        client.llm.unload_model()
     print("👋 Done!")
 
 
 if __name__ == "__main__":
     main()
+ad

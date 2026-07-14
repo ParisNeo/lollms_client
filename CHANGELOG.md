@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-14 19:59]
+
+- docs(examples): update agentic personality tools example and env config
+
 ## [2026-07-13 16:15]
 
 - fix(openai): sanitize tools for NVIDIA NIM compatibility and fix tool injection
