@@ -206,7 +206,8 @@ def chat(
 *   `personality` (`Optional[Any]`): The personality object containing the system prompt and optional RAG data. If `None`, the discussion's default system prompt is used.
 *   `branch_tip_id` (`Optional[str`]): The specific message ID to use as the tip of the conversation branch. If `None`, the discussion's `active_branch_id` is used.
 *   `add_user_message` (`bool`): If `True`, the `user_message` is added to the database history. If `False`, the generation regenerates from the existing branch tip (used for regeneration).
-*   `images` (`Optional[List[str]]`): A list of base64 encoded images to attach to the user message for vision-capable models.
+*   `images` (`Optional[List[str]]`): A list of base64 encoded images to attach to the user message for vision-capable models. Use `suppress_images=True` to strip these for non-vision models.
+*   `suppress_images` (`bool`): If `True`, prevents any images (user-uploaded, discussion-level, or artifact-generated) from being passed to the LLM binding's generation call. This is essential for using non-vision LLMs that crash or error when receiving image data. Defaults to `False`.
 
 **Artifact & Feature Flags**
 *   `enable_artefacts` (`bool`): Master switch for the artifact creation system (`<artifact>` tags). If `False`, all artifact-related processing is disabled.
