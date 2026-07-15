@@ -545,6 +545,7 @@ class _StreamState:
 
         self._in_code_fence = False
         self._code_fence_buffer = ""
+        self._code_fence_hold_buffer = ""  # Buffers content inside code fences to distinguish closed vs unclosed
         self._in_inline_code = False  # CRITICAL FIX: Track single backtick state across chunks
 
         # CRITICAL FIX: processed_tags must be passed in from ChatMixin
@@ -667,12 +668,23 @@ class _StreamState:
                         _cb(self.callback, before + "```", MSG_TYPE.MSG_TYPE_CHUNK)
                     else:
                         self._in_code_fence = False
+                        # Emit the hold buffer as verbatim text (it was inside a properly closed fence)
+                        if self._code_fence_hold_buffer:
+                            self.ai_message.content += self._code_fence_hold_buffer
+                            _cb(self.callback, self._code_fence_hold_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                            self._code_fence_hold_buffer = ""
+                        # Also emit content before the closing fence (handles single-chunk case)
+                        if before:
+                            self.ai_message.content += before
+                            _cb(self.callback, before, MSG_TYPE.MSG_TYPE_CHUNK)
                         self.ai_message.content += "```"
                         _cb(self.callback, "```", MSG_TYPE.MSG_TYPE_CHUNK)
 
                 if self._in_code_fence:
-                    self.ai_message.content += self._code_fence_buffer
-                    _cb(self.callback, self._code_fence_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                    # Still inside fence — buffer remaining content instead of emitting.
+                    # This lets us distinguish closed fences (emit as text) from unclosed
+                    # fences (re-process through tag detection at flush time).
+                    self._code_fence_hold_buffer += self._code_fence_buffer
                     self._code_fence_buffer = ""
                     return True
                 else:
@@ -680,8 +692,11 @@ class _StreamState:
                     self._code_fence_buffer = ""
 
             elif self._in_code_fence:
-                self.ai_message.content += self._pending_buffer
-                _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                # Buffer content while inside code fence instead of emitting immediately.
+                # This allows us to properly handle functional tags:
+                # - If the fence is closed (``` found), emit everything as verbatim text.
+                # - If the fence is never closed (flush), re-process through tag detection.
+                self._code_fence_hold_buffer += self._pending_buffer
                 self._pending_buffer = ""
                 return True
 
@@ -690,7 +705,7 @@ class _StreamState:
             # from intercepting functional tags that appear inside inline code spans.
             elif "`" in self._pending_buffer:
                 if self._in_inline_code:
-                    # We are inside an inline code span, looking for the closing backtick
+                    # We are inside an inline code span from a previous chunk, looking for the closing backtick
                     idx = self._pending_buffer.find("`")
                     if idx != -1:
                         # Closing backtick found
@@ -700,30 +715,53 @@ class _StreamState:
                         _cb(self.callback, inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
                         self._pending_buffer = self._pending_buffer[idx+1:]
                     else:
-                        # Still inside, emit verbatim
-                        self.ai_message.content += self._pending_buffer
-                        _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
-                        self._pending_buffer = ""
+                        # Check for newline:
+                        # If the LLM moves to a new line without closing the inline code, 
+                        # it was a stray backtick (e.g., inside HTML body). Break out to avoid lockout.
+                        newline_idx = self._pending_buffer.find("\n")
+                        if newline_idx != -1 and self._in_inline_code:
+                            self._in_inline_code = False
+                            # Emit verbatim up to and including the newline to reset state cleanly
+                            self.ai_message.content += self._pending_buffer
+                            _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                            self._pending_buffer = ""
+                        else:
+                            # Still inside, emit verbatim
+                            self.ai_message.content += self._pending_buffer
+                            _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                            self._pending_buffer = ""
                         return True
                 else:
                     # Not currently in inline code, look for an opening backtick
                     idx = self._pending_buffer.find("`")
                     before = self._pending_buffer[:idx]
-                    self._pending_buffer = self._pending_buffer[idx+1:]
+                    remainder = self._pending_buffer[idx+1:]
 
-                    # Check if the closing backtick is in the remainder of the current buffer
-                    closing_idx = self._pending_buffer.find("`")
+                    # Check if the closing backtick is in the remainder of the current chunk
+                    closing_idx = remainder.find("`")
                     if closing_idx != -1:
                         # Complete inline code span in a single chunk
-                        inline_content = self._pending_buffer[:closing_idx]
+                        inline_content = remainder[:closing_idx]
                         self.ai_message.content += before + "`" + inline_content + "`"
                         _cb(self.callback, before + "`" + inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
-                        self._pending_buffer = self._pending_buffer[closing_idx+1:]
+                        self._pending_buffer = remainder[closing_idx+1:]
                     else:
-                        # Opening backtick found, but no closing backtick yet. Enter inline code mode.
-                        self._in_inline_code = True
-                        self.ai_message.content += before + "`"
-                        _cb(self.callback, before + "`", MSG_TYPE.MSG_TYPE_CHUNK)
+                        # Opening backtick found, but no closing backtick in this chunk.
+                        # IMPORTANT FIX: Only enter state if no newline exists between the backtick and the end of the chunk.
+                        # If there's a newline, it means the backtick is a stray character (e.g., raw HTML),
+                        # not an inline code span. Emit verbatim and DO NOT enter _in_inline_code state.
+                        newline_idx = remainder.find("\n")
+                        if newline_idx != -1:
+                            # Stray backtick followed by a newline. Emit verbatim, do not enter code state.
+                            self.ai_message.content += before + "`" + remainder
+                            _cb(self.callback, before + "`" + remainder, MSG_TYPE.MSG_TYPE_CHUNK)
+                            self._pending_buffer = ""
+                        else:
+                            # Genuine inline code span starting. Enter inline code mode.
+                            self._in_inline_code = True
+                            self.ai_message.content += before + "`"
+                            _cb(self.callback, before + "`", MSG_TYPE.MSG_TYPE_CHUNK)
+                            self._pending_buffer = remainder
                         return True
 
             elif self._in_inline_code:
@@ -736,11 +774,23 @@ class _StreamState:
                     _cb(self.callback, inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
                     self._pending_buffer = self._pending_buffer[idx+1:]
                 else:
-                    # Still inside, emit verbatim
-                    self.ai_message.content += self._pending_buffer
-                    _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
-                    self._pending_buffer = ""
-                    return True
+                    # Check for newline: if the LLM moves to a new line without
+                    # closing the inline code, it was a stray backtick. Break out
+                    # to avoid permanent lockout that bypasses functional tags.
+                    newline_idx = self._pending_buffer.find("\n")
+                    if newline_idx != -1:
+                        self._in_inline_code = False
+                        # Emit verbatim up to and including the newline, then let
+                        # the rest of the buffer flow to tag detection logic.
+                        self.ai_message.content += self._pending_buffer
+                        _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._pending_buffer = ""
+                    else:
+                        # Still inside, emit verbatim
+                        self.ai_message.content += self._pending_buffer
+                        _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
+                        self._pending_buffer = ""
+                        return True
 
         # ── Tool Accumulation & Interception ──
         if self._is_accumulating_tool:
@@ -1769,6 +1819,18 @@ class _StreamState:
         """Flushes any safe text remaining in the shadow buffer at the end of generation."""
         # CRITICAL: Stop heartbeat if artifact was never closed
         self._stop_artefact_heartbeat()
+
+        # ── Handle unclosed code fence ──
+        # If we're still in code fence mode at flush time, the fence was never closed.
+        # Re-process the hold buffer through tag detection to intercept any functional tags
+        # that were trapped inside the unclosed fence.
+        if self._in_code_fence:
+            self._in_code_fence = False
+            hold = self._code_fence_hold_buffer
+            self._code_fence_hold_buffer = ""
+            if hold:
+                # Re-feed through the full parser to intercept any functional tags
+                self.feed(hold)
 
         # ── CRITICAL FIX: Force-dispatch incomplete tool calls ──
         # If the LLM finishes generation while we are still accumulating a tool call 

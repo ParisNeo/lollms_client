@@ -264,7 +264,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
             file_name="my_external_db.sqlconn"
         )
         os.chdir(original_cwd)
-        self.assertTrue(sql_res["success"])
+        self.assertTrue(sql_res["success"], f"SQL tool failed: {sql_res.get('error', 'Unknown error')}")
         self.assertIn("Eve", sql_res["output"])
 
         # 6. Test LCP Python Sandbox on .sqlconn

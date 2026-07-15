@@ -96,7 +96,10 @@ def tool_execute_python_data_query(
                 connection_url = conn_info.get("url", "")
                 if not connection_url:
                     if dialect == "sqlite":
-                        connection_url = f"sqlite:///{conn_info.get('database', '')}"
+                        db_path = conn_info.get('database', '')
+                        # Convert Windows backslashes to forward slashes for SQLAlchemy compatibility
+                        db_path = db_path.replace("\\", "/")
+                        connection_url = f"sqlite:///{db_path}"
                     else:
                         host = conn_info.get("host", "localhost")
                         port = conn_info.get("port", "")
@@ -110,7 +113,12 @@ def tool_execute_python_data_query(
                             connection_url = f"postgresql+psycopg2://{username}:{password}@{host}{port_str}/{database}"
 
                 auto_loaded_engine = create_engine(connection_url)
-                local_vars["conn"] = auto_loaded_engine.connect()
+                # Use raw DBAPI2 connection for pandas compatibility.
+                # pd.read_sql_query with SQLAlchemy 2.0 Connection objects fails
+                # with "'Connection' object has no attribute 'cursor'".
+                # raw_connection() returns a DBAPI2 connection (e.g., sqlite3.Connection)
+                # which pandas handles natively.
+                local_vars["conn"] = auto_loaded_engine.raw_connection()
             except Exception as load_err:
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to auto-load conn: {load_err}")
 

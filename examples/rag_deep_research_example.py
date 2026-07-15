@@ -57,7 +57,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from lollms_client import LollmsClient
-from lollms_client.lollms_agent import Agent, AgentRole
+from lollms_client.lollms_agent.lollms_agent import Agent, AgentRole
 from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 from lollms_client.lollms_types import MSG_TYPE
 

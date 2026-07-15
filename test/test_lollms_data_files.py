@@ -50,7 +50,7 @@ class TestLollmsDataFiles(unittest.TestCase):
         self.assertIn("Format: CSV (.csv)", schema)
         self.assertIn("Total Rows: 3", schema)
         self.assertIn("id (int64)", schema)
-        self.assertIn("name (object)", schema)
+        self.assertIn("name (str)", schema)
         self.assertIn("score (float64)", schema)
         self.assertIn("Alice", schema)
 

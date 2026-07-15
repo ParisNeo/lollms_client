@@ -59,6 +59,8 @@ def tool_execute_sql_query(
             if not connection_url:
                 if dialect == "sqlite":
                     db_path = conn_info.get("database", "")
+                    # Convert Windows backslashes to forward slashes for SQLAlchemy compatibility
+                    db_path = db_path.replace("\\", "/")
                     connection_url = f"sqlite:///{db_path}"
                 else:
                     host = conn_info.get("host", "localhost")
@@ -75,12 +77,19 @@ def tool_execute_sql_query(
                         return {"success": False, "error": f"Unsupported dialect: {dialect}"}
 
             engine = create_engine(connection_url)
-            with engine.connect() as ext_conn:
-                tables = inspect(engine).get_table_names()
-                
-                for table in tables:
-                    df = pd.read_sql_query(sa_text(f'SELECT * FROM "{table}"'), ext_conn)
-                    df.to_sql(table, conn, index=False, if_exists="replace")
+            tables = inspect(engine).get_table_names()
+
+            # Use raw DBAPI2 connection for pandas compatibility.
+            # pd.read_sql_query with SQLAlchemy 2.0 Engine/Connection objects fails
+            # with "'Engine' object has no attribute 'cursor'" or
+            # "'Connection' object has no attribute 'cursor'".
+            # engine.raw_connection() returns a raw DBAPI2 connection (sqlite3.Connection)
+            # which pandas handles natively with plain string queries.
+            raw_conn = engine.raw_connection()
+            for table in tables:
+                df = pd.read_sql_query(f'SELECT * FROM "{table}"', raw_conn)
+                df.to_sql(table, conn, index=False, if_exists="replace")
+            raw_conn.close()
             engine.dispose()
             
         elif ext in (".db", ".sqlite", ".sqlite3"):
@@ -108,7 +117,11 @@ def tool_execute_sql_query(
 
         if is_select:
             df_res = pd.read_sql_query(sql_query, conn)
-            output_md = df_res.to_markdown(index=False)
+            try:
+                output_md = df_res.to_markdown(index=False)
+            except (ImportError, ModuleNotFoundError):
+                from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
+                output_md = _dataframe_to_markdown(df_res)
             conn.close()
             return {"success": True, "output": output_md}
         else:
