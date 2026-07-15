@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-15 12:19]
+
+- feat(code-agent): add configuration wizard and enhanced LLM binding config
+
 ## [2026-07-15 01:28]
 
 - feat(app): refactor application structure and remove legacy server implementation

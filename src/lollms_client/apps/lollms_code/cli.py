@@ -203,6 +203,10 @@ class CodeAgentConfig:
         self.models_path: str = ""
         self.binaries_path: str = ""
 
+        # Wizard state
+        self.wizard_completed: bool = False
+        self.llm_binding_config: Dict[str, Any] = {}
+
         # Agent settings
         self.max_reasoning_steps: int = 100
         self.temperature: float = 0.3
@@ -322,27 +326,39 @@ class CodeAgentConfig:
         except Exception as e:
             ASCIIColors.warning(f"Failed to save config: {e}")
 
+    def is_configured(self) -> bool:
+        """Check if minimal configuration exists (binding + model)."""
+        return self.wizard_completed and bool(self.llm_binding) and bool(self.llm_binding_config)
+
 
 # ── Client Creation ────────────────────────────────────────────────────────
 
 def create_client(config: CodeAgentConfig) -> LollmsClient:
     """Creates a LollmsClient based on the configuration."""
-    llm_config: Dict[str, Any] = {
-        "model_name": config.model_name,
-        "host_address": config.host_address,
-        "verify_ssl_certificate": config.verify_ssl,
-    }
+    if config.llm_binding_config:
+        llm_config = dict(config.llm_binding_config)
+    else:
+        llm_config: Dict[str, Any] = {
+            "model_name": config.model_name,
+            "host_address": config.host_address,
+            "verify_ssl_certificate": config.verify_ssl,
+        }
+        if config.llm_binding == "llama_cpp_server":
+            llm_config["ctx_size"] = config.context_size
+            llm_config["n_gpu_layers"] = config.n_gpu_layers
+            if config.models_path:
+                llm_config["models_path"] = config.models_path
+            if config.binaries_path:
+                llm_config["binaries_path"] = config.binaries_path
+
+    if config.model_name and config.model_name != llm_config.get("model_name"):
+        llm_config["model_name"] = config.model_name
+    if config.host_address and config.host_address != llm_config.get("host_address"):
+        llm_config["host_address"] = config.host_address
     if config.api_key:
         llm_config["service_key"] = config.api_key
-
-    # For llama_cpp_server, add local-specific config
-    if config.llm_binding == "llama_cpp_server":
-        llm_config["ctx_size"] = config.context_size
-        llm_config["n_gpu_layers"] = config.n_gpu_layers
-        if config.models_path:
-            llm_config["models_path"] = config.models_path
-        if config.binaries_path:
-            llm_config["binaries_path"] = config.binaries_path
+    if "verify_ssl_certificate" not in llm_config:
+        llm_config["verify_ssl_certificate"] = config.verify_ssl
 
     default_tools_path = PROJECT_ROOT / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools"
 
@@ -627,6 +643,7 @@ def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
     ASCIIColors.white(f"  Type 'skills' to list learned skills.")
     ASCIIColors.white(f"  Type 'clear' to clear conversation history.")
     ASCIIColors.white(f"  Type 'models' to list available models.")
+    ASCIIColors.white(f"  Type 'config' to re-run the configuration wizard.")
     ASCIIColors.cyan("=" * 70 + "\n")
 
     while True:
@@ -667,6 +684,12 @@ def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
                 for m in models:
                     marker = " ← current" if m == current else ""
                     ASCIIColors.white(f"    • {m}{marker}")
+            continue
+        if user_input.lower() == "config":
+            from lollms_client.apps.lollms_code.config_wizard import run_config_wizard
+            run_config_wizard(config)
+            config.save()
+            ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
             continue
 
         # Run the prompt
@@ -855,6 +878,11 @@ Examples:
         help="Clear the agent's conversation history file and exit.",
     )
     parser.add_argument(
+        "--config",
+        action="store_true",
+        help="Run the interactive configuration wizard and exit.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging.",
@@ -877,6 +905,15 @@ def main():
 
     # Load configuration
     config = CodeAgentConfig.load(args)
+
+    # Run configuration wizard if needed or requested
+    if args.config or not config.is_configured():
+        from lollms_client.apps.lollms_code.config_wizard import run_config_wizard
+        run_config_wizard(config)
+        config.save()
+        if args.config:
+            ASCIIColors.green("\n✅ Configuration saved successfully!")
+            return 0
 
     # Handle non-agent commands
     if args.list_skills:
