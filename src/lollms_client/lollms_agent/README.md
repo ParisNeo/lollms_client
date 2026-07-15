@@ -125,6 +125,198 @@ print(f"Rounds: {result['rounds']}, Tools called: {len(result['tool_calls'])}")
 
 ---
 
+## 👜 The Handbag — Unified Agent Resource Folder
+
+The **Handbag** is a self-contained folder that carries **ALL** of an agent's resources in one place. Instead of passing `personality`, `tool_files`, `skills_dirs`, `memory_manager`, and `workspace_path` as separate constructor parameters, you point the agent to a single handbag folder and everything is auto-configured.
+
+### Why Use a Handbag?
+
+| Without Handbag | With Handbag |
+|---|---|
+| 5+ separate constructor parameters | Single `handbag_path` parameter |
+| Resources scattered across the filesystem | Everything in one portable folder |
+| Hard to share or version-control an agent | Copy the folder → share the entire agent |
+| Manual configuration of each subsystem | Auto-configuration with override semantics |
+
+### Folder Structure
+
+```
+my_handbag/
+├── handbag.yaml              # Optional manifest (name, default_personality, skills_mode)
+├── personalities/            # Personality bundles (subdirs with SOUL.md)
+│   ├── researcher/
+│   │   └── SOUL.md
+│   └── coder/
+│       └── SOUL.md
+├── tools/                    # Extra LCP tools (.py files or subdirs)
+│   ├── my_custom_tool.py
+│   └── another_tool/
+│       └── another_tool.py
+├── skills/                   # SKILL.md files (agent creates/updates these over time)
+│   ├── python_patterns/
+│   │   └── SKILL.md
+│   └── ...
+├── rag/                      # RAG documents (text files for retrieval)
+│   ├── doc1.txt
+│   └── doc2.md
+├── memory/                   # Memory database
+│   └── memory.db
+└── workspace/                # Optional isolated workspace
+```
+
+### The `handbag.yaml` Manifest (Optional)
+
+```yaml
+name: "My Agent Handbag"
+version: "1.0"
+description: "A handbag containing all agent resources."
+default_personality: "coder"    # Name of the default personality folder
+skills_mode: "mixed"             # "always_visible", "loadable", or "mixed"
+```
+
+If no manifest is present, the handbag uses sensible defaults (first personality found, `mixed` skills mode).
+
+### What Each Subdirectory Provides
+
+| Subdirectory | Purpose | What It Configures |
+|---|---|---|
+| `personalities/` | Personality bundles (SOUL.md format) | `personality` parameter |
+| `tools/` | Extra LCP tool files (.py) | `tool_files` parameter (appended) |
+| `skills/` | SKILL.md knowledge capsules | `skills_dirs` parameter (appended) |
+| `rag/` | Text documents for retrieval | RAG data source attached to personality |
+| `memory/` | SQLite database for persistent memory | `memory_manager` parameter |
+| `workspace/` | Isolated working directory | `workspace_path` parameter |
+
+Missing subdirectories are silently skipped — you only need the folders you actually use.
+
+### Override Semantics (Critical)
+
+The handbag provides **defaults**. Explicit constructor parameters **always override** handbag-provided values:
+
+```python
+# Handbag provides a personality, but we override it explicitly
+agent = Agent(
+    lc=client,
+    handbag_path="./my_handbag",       # Provides defaults for everything
+    personality=my_custom_personality,  # OVERRIDES handbag's default personality
+)
+
+# Handbag provides tool files, and we ADD more on top
+agent = Agent(
+    lc=client,
+    handbag_path="./my_handbag",       # Provides 3 tool files from tools/
+    tool_files=["extra_tool.py"],      # ADDED to handbag's 3 tools → 4 total
+)
+
+# Handbag provides skills dirs, and we ADD more on top
+agent = Agent(
+    lc=client,
+    handbag_path="./my_handbag",       # Provides skills/ dir
+    skills_dirs=["./extra_skills"],    # ADDED to handbag's skills dir
+)
+```
+
+### RAG Integration
+
+The handbag's `rag/` folder is automatically indexed and attached to the default personality as a RAG data source (if the personality doesn't already have one). The Handbag tries **safestore** for semantic search if available, and falls back to **keyword-based scoring** if not.
+
+```python
+# The RAG is automatically attached — no manual configuration needed
+agent = Agent(lc=client, handbag_path="./my_handbag")
+result = agent.chat(prompt="Search for information about...")
+# The agent can query the rag/ documents via its personality's query_data()
+```
+
+### Quick Start: Creating and Using a Handbag
+
+```python
+from lollms_client import LollmsClient
+from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags, Handbag
+
+# 1. Create a handbag structure on disk (one-time setup)
+Handbag.create_structure("./my_agent_handbag", name="My Research Agent")
+
+# 2. Add a personality (create personalities/researcher/SOUL.md)
+#    Add tools to tools/
+#    Add RAG documents to rag/
+#    Add SKILL.md files to skills/
+
+# 3. Create the client
+client = LollmsClient(
+    llm_binding_name="ollama",
+    llm_binding_config={"model_name": "qwen3:32b", "host_address": "http://localhost:11434"},
+)
+
+# 4. Create the agent with JUST the handbag path
+agent = Agent(
+    lc=client,
+    handbag_path="./my_agent_handbag",
+    name="ResearchBot",
+    role=AgentRole.DOMAIN_EXPERT,
+    capabilities=CapabilityFlags(enable_code_execution=True),
+)
+
+# 5. Chat — the agent has its personality, tools, skills, RAG, and memory
+result = agent.chat(prompt="Analyze the documents in your RAG and summarize key findings.")
+```
+
+### Runtime Personality Switching
+
+When a handbag contains multiple personalities, you can switch between them at runtime:
+
+```python
+# List all personalities in the handbag
+personalities = agent.list_handbag_personalities()
+print(personalities)
+# {'researcher': LollmsPersonality(...), 'coder': LollmsPersonality(...)}
+
+# Switch to a different personality
+agent.switch_handbag_personality("coder")
+# The agent now uses the 'coder' personality with the handbag's RAG attached
+```
+
+### Backward Compatibility
+
+The `handbag_path` parameter is **purely optional**. All existing Agent constructor parameters continue to work exactly as before:
+
+```python
+# This still works perfectly — no handbag needed
+agent = Agent(
+    lc=client,
+    personality=my_personality,
+    tool_files=["tool1.py"],
+    skills_dirs=["./skills"],
+    workspace_path="./workspace",
+)
+
+# This also works — handbag provides defaults, explicit params override
+agent = Agent(
+    lc=client,
+    handbag_path="./my_handbag",       # Provides personality, tools, skills, memory
+    workspace_path="./custom_workspace",  # Overrides handbag's workspace
+)
+```
+
+If neither `personality` nor `handbag_path` provides a personality, the Agent raises a clear `ValueError` with instructions on how to fix it.
+
+### Handbag API Reference
+
+| Method | Description |
+|---|---|
+| `agent.handbag` | Returns the loaded `Handbag` instance, or `None` if no handbag was provided. |
+| `agent.list_handbag_personalities()` | Lists all personalities available in the handbag as `{name: LollmsPersonality}`. |
+| `agent.switch_handbag_personality(name)` | Switches to a different personality from the handbag. Returns `True` on success. |
+| `Handbag.create_structure(path, name)` | Static method that creates a new handbag folder structure on disk. |
+| `Handbag.get_default_personality()` | Returns the manifest-specified default personality (or first found). |
+| `Handbag.get_personalities()` | Returns all loaded personalities. |
+| `Handbag.get_tool_files()` | Returns the list of discovered tool file paths. |
+| `Handbag.get_skills_dirs()` | Returns the list of skills directory paths. |
+| `Handbag.get_rag_data_source()` | Returns the RAG callable (safestore or keyword-based). |
+| `Handbag.create_memory_manager()` | Creates a `LollmsMemoryManager` from the handbag's `memory/` directory. |
+| `Handbag.attach_rag_to_personality(p)` | Attaches the handbag's RAG to a personality if it doesn't have its own. |
+
+---
+
 ## 🔄 Tutorial: Building a Build → Test → Fix Loop
 
 This is the flagship pattern. The agent writes code, executes it, reads the error output, fixes the code, and repeats until the objective is achieved or `max_reasoning_steps` is exhausted.

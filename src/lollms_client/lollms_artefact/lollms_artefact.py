@@ -810,7 +810,7 @@ class ArtefactManager:
             try:
                 workspace_dir = Path("./data_workspace")
                 try:
-                    from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                    from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
                     if awd is not None:
                         workspace_dir = awd
                 except ImportError:
@@ -1340,7 +1340,7 @@ class ArtefactManager:
 
             workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
             try:
-                from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
                 if awd is not None:
                     workspace_dir = awd
             except ImportError:
@@ -1530,7 +1530,7 @@ class ArtefactManager:
         else:
             base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
             try:
-                from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
                 if awd is not None:
                     base_workspace_dir = awd
             except ImportError:

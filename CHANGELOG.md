@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-15 01:28]
+
+- feat(app): refactor application structure and remove legacy server implementation
+
 ## [2026-07-15 00:34]
 
 - refactor(lollms_agent): update _parse_skill_md implementation

@@ -553,7 +553,7 @@ class ExportMixin:
         version = art.get("version", 1)
         workspace_dir = Path("./data_workspace")
         try:
-            from lollms_client.app.server import APP_WORKSPACE_DIR
+            from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR
             if APP_WORKSPACE_DIR is not None:
                 workspace_dir = APP_WORKSPACE_DIR
         except ImportError:
@@ -597,7 +597,7 @@ class ExportMixin:
         version = art.get("version", 1)
         workspace_dir = Path("./data_workspace")
         try:
-            from lollms_client.app.server import APP_WORKSPACE_DIR
+            from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR
             if APP_WORKSPACE_DIR is not None:
                 workspace_dir = APP_WORKSPACE_DIR
         except ImportError:
@@ -748,7 +748,7 @@ class ExportMixin:
 
             # 4. Find and bundle all active datasets (CSVs, Excel files) in the workspace
             try:
-                from lollms_client.app.server import APP_WORKSPACE_DIR
+                from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR
                 if APP_WORKSPACE_DIR and APP_WORKSPACE_DIR.exists():
                     for active_art in self.artefacts.list(active_only=True):
                         if active_art.get("type") == "data":

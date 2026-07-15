@@ -15,7 +15,7 @@ class TestLollmsDataFiles(unittest.TestCase):
         
         # Monkeypatch APP_WORKSPACE_DIR in lollms_client.app.server if imported
         try:
-            import lollms_client.app.server as server
+            import lollms_client.app.Discussion_UI.server as server
             self.old_workspace_dir = server.APP_WORKSPACE_DIR
             server.APP_WORKSPACE_DIR = self.test_dir
         except ImportError:
@@ -24,7 +24,7 @@ class TestLollmsDataFiles(unittest.TestCase):
     def tearDown(self):
         # Restore old workspace directory if patched
         try:
-            import lollms_client.app.server as server
+            import lollms_client.app.Discussion_UI.server as server
             server.APP_WORKSPACE_DIR = self.old_workspace_dir
         except ImportError:
             pass

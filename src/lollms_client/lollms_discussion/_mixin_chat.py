@@ -3551,7 +3551,7 @@ class ChatMixin:
                                 base_workspace_dir = Path("./data_workspace")
                                 # Fallback to server APP_WORKSPACE_DIR if workspace_path is not bound
                                 try:
-                                    from lollms_client.app.server import APP_WORKSPACE_DIR
+                                    from lollms_client.apps.lollms_discussions.server import APP_WORKSPACE_DIR
                                     if APP_WORKSPACE_DIR is not None:
                                         base_workspace_dir = APP_WORKSPACE_DIR
                                 except ImportError:

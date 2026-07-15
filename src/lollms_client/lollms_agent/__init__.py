@@ -9,6 +9,7 @@ from lollms_client.lollms_agent.lollms_agent import (
     BindingToolsBuilder,
     ToolsManager,
 )
+from lollms_client.lollms_agent.handbag import Handbag
 
 __all__ = [
     "Agent",
@@ -20,4 +21,5 @@ __all__ = [
     "ModelSwitcher",
     "BindingToolsBuilder",
     "ToolsManager",
+    "Handbag",
 ]

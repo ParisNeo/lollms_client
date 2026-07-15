@@ -2045,12 +2045,19 @@ class Agent:
         Arbitrary metadata for the agent.
     memory_manager : optional
         LollmsMemoryManager instance for persistent memory.
+    handbag_path : str or Path, optional
+        Path to a Handbag folder containing ALL agent resources (personalities,
+        tools, skills, RAG, memory). When provided, the handbag's resources are
+        used as DEFAULTS for personality, tool_files, skills_dirs, memory_manager,
+        and workspace_path. Explicit constructor parameters always override
+        handbag-provided values.
     _parent_depth : int
         Internal: recursion depth for sub-agent tracking.
     """
 
     lc:                  Any   # LollmsClient
-    personality:         Any   # LollmsPersonality
+    personality:         Optional[Any] = None  # LollmsPersonality (optional if handbag_path provides one)
+    handbag_path:        Optional[Union[str, Path]] = None  # Path to a Handbag folder containing all agent resources
     name:                Optional[str] = None
     role:                str = AgentRole.FREEFORM
     workspace_path:      Optional[Union[str, Path]] = None
@@ -2073,10 +2080,67 @@ class Agent:
     _resolved_workspace: Optional[Path] = field(default=None, init=False)
     _sub_agent_spawner: Optional[SubAgentSpawner] = field(default=None, init=False)
     _model_switcher: Optional[ModelSwitcher] = field(default=None, init=False)
+    _handbag: Any = field(default=None, init=False)
 
     # ---------------------------------------------------------------- init
 
     def __post_init__(self):
+        # ── Handbag Loading ──
+        # A handbag is a folder containing all agent resources (personalities, tools,
+        # skills, RAG, memory). If handbag_path is provided, its values are used as
+        # DEFAULTS. Explicit constructor parameters always take precedence.
+        if self.handbag_path:
+            from lollms_client.lollms_agent.handbag import Handbag
+            handbag = Handbag(self.handbag_path)
+            object.__setattr__(self, '_handbag', handbag)
+
+            # Personality: use handbag default if not explicitly provided
+            if self.personality is None:
+                hb_personality = handbag.get_default_personality()
+                if hb_personality is not None:
+                    handbag.attach_rag_to_personality(hb_personality)
+                    object.__setattr__(self, 'personality', hb_personality)
+
+            # Workspace: use handbag workspace if not explicitly provided
+            if self.workspace_path is None:
+                hb_ws = handbag.get_workspace_path()
+                if hb_ws:
+                    object.__setattr__(self, 'workspace_path', hb_ws)
+
+            # Tool files: append handbag tools to any explicitly provided ones
+            hb_tool_files = handbag.get_tool_files()
+            if hb_tool_files:
+                existing_tools = self.tool_files or []
+                object.__setattr__(self, 'tool_files', list(existing_tools) + hb_tool_files)
+
+            # Skills dirs: append handbag skills dir to any explicitly provided ones
+            hb_skills_dirs = handbag.get_skills_dirs()
+            if hb_skills_dirs:
+                existing_dirs = self.skills_dirs or []
+                object.__setattr__(self, 'skills_dirs', list(existing_dirs) + hb_skills_dirs)
+
+            # Skills mode from manifest (if not explicitly set via capabilities)
+            hb_skills_mode = handbag.get_skills_mode()
+            if hb_skills_mode and self.capabilities.skills_mode == "loadable":
+                # Only override if the user hasn't explicitly changed the default
+                self.capabilities.skills_mode = hb_skills_mode
+
+            # Memory manager: create from handbag if not explicitly provided
+            if self.memory_manager is None:
+                hb_mem = handbag.create_memory_manager()
+                if hb_mem is not None:
+                    object.__setattr__(self, 'memory_manager', hb_mem)
+        else:
+            object.__setattr__(self, '_handbag', None)
+
+        # Validate that we have a personality (from explicit param or handbag)
+        if self.personality is None:
+            raise ValueError(
+                "Agent requires a personality. Either:\n"
+                "  1. Pass 'personality' directly, OR\n"
+                "  2. Provide 'handbag_path' pointing to a folder with a 'personalities/' subdirectory."
+            )
+
         # Resolve workspace path
         if self.workspace_path:
             ws = Path(self.workspace_path)
@@ -2122,6 +2186,44 @@ class Agent:
 
     def has_knowledge(self) -> bool:
         return getattr(self.personality, "has_data", False)
+
+    # ---------------------------------------------------------------- handbag API
+
+    @property
+    def handbag(self):
+        """Returns the loaded Handbag instance, or None if no handbag was provided."""
+        return self._handbag
+
+    def list_handbag_personalities(self) -> Dict[str, Any]:
+        """
+        Lists all personalities available in the handbag.
+        Returns an empty dict if no handbag is loaded.
+        """
+        if self._handbag:
+            return self._handbag.get_personalities()
+        return {}
+
+    def switch_handbag_personality(self, name: str) -> bool:
+        """
+        Switches to a different personality from the handbag.
+        The new personality inherits the handbag's RAG data source if it doesn't
+        have its own.
+
+        Args:
+            name: The name of the personality folder in the handbag.
+
+        Returns:
+            True if the switch was successful, False if the personality was not found.
+        """
+        if not self._handbag:
+            return False
+        personality = self._handbag.get_personality(name)
+        if personality is None:
+            return False
+        self._handbag.attach_rag_to_personality(personality)
+        object.__setattr__(self, 'personality', personality)
+        ASCIIColors.info(f"[Agent] Switched to handbag personality: '{name}'")
+        return True
 
     def __repr__(self) -> str:
         return f"<Agent name={self.display_name!r} role={self.role!r} id={self._agent_id[:8]}>"

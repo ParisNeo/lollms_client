@@ -932,7 +932,7 @@ class FileImportMixin:
                     # Try to override with server's APP_WORKSPACE_DIR only if no custom workspace_path was set
                     if not (_disc and _disc.workspace_path):
                        try:
-                           from lollms_client.app.server import APP_WORKSPACE_DIR as awd
+                           from lollms_client.app.Discussion_UI.server import APP_WORKSPACE_DIR as awd
                            if awd is not None:
                                workspace_dir = awd
                        except ImportError:
