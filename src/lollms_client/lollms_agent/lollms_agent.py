@@ -117,6 +117,7 @@ def _parse_skill_md(file_path: Path, default_always_visible: bool = False) -> Op
     category = ""
     tags: List[str] = []
     body = raw_content
+    fm_always_visible = None  # Track frontmatter always_visible override
 
     # Try YAML frontmatter
     if raw_content.startswith("---"):
@@ -139,9 +140,10 @@ def _parse_skill_md(file_path: Path, default_always_visible: bool = False) -> Op
                     tags = [t.strip().strip('"\'') for t in tags_str.split(",") if t.strip()]
                 elif line.startswith("always_visible:"):
                     val = line.split(":", 1)[1].strip().lower()
-                    # Note: this is overridden by the manager's default unless explicitly True
                     if val in ("true", "1", "yes"):
-                        pass  # Handled by manager
+                        fm_always_visible = True
+                    elif val in ("false", "0", "no"):
+                        fm_always_visible = False
         else:
             # Malformed frontmatter, treat as plain markdown
             pass
@@ -162,7 +164,7 @@ def _parse_skill_md(file_path: Path, default_always_visible: bool = False) -> Op
         tags=tags,
         content=body.strip(),
         file_path=file_path,
-        always_visible=default_always_visible,
+        always_visible=fm_always_visible if fm_always_visible is not None else default_always_visible,
     )
 
 
@@ -1768,63 +1770,10 @@ class _AgentStreamState:
 
         # Tool accumulation
         if self._is_accumulating_tool:
-            close_match = re.search(r'</tool>\s*', self._pending_buffer, re.IGNORECASE)
-            if close_match:
-                end_idx = close_match.start()
-                end_len = len(close_match.group(0))
-
-                full_tool_call = self._tool_buffer + self._pending_buffer[:end_idx + end_len]
-                json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
-                json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
-
-                self._is_accumulating_tool = False
-                self._tool_buffer = ""
-                self._pending_buffer = self._pending_buffer[end_idx + end_len:]
-
-                try:
-                    raw_data = json.loads(json_body)
-                    if isinstance(raw_data, dict):
-                        tool_name = raw_data.get("name", "")
-                        if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
-                            self.tool_json_data = json_body
-                        else:
-                            params = {k: v for k, v in raw_data.items() if k != "name"}
-                            normalized = {"name": tool_name, "parameters": params}
-                            self.tool_json_data = json.dumps(normalized)
-                    else:
-                        self.tool_json_data = json_body
-                except json.JSONDecodeError:
-                    self.tool_json_data = json_body
-
-                self.tool_trigger = True
-                self._action_dispatched = True
-
-                try:
-                    parsed = json.loads(self.tool_json_data)
-                    ui_tool_name = parsed.get("name", "unknown") if isinstance(parsed, dict) else "unknown"
-                except Exception:
-                    ui_tool_name = "unknown"
-
-                import html
-                try:
-                    parsed_for_ui = json.loads(self.tool_json_data)
-                    ui_params = parsed_for_ui.get("parameters", {}) if isinstance(parsed_for_ui, dict) else {}
-                except Exception:
-                    ui_params = {}
-                escaped_params = html.escape(json.dumps(ui_params, default=str))
-
-                tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}" params="{escaped_params}">\n'
-                self.content += tool_open_tag
-                self._cb(tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
-                status_line = f"* Calling tool '{ui_tool_name}'...\n"
-                self.content += status_line
-                self._cb(status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
-
+            self._tool_buffer += self._pending_buffer
+            self._pending_buffer = ""
+            if self._try_complete_tool():
                 return False
-            else:
-                self._tool_buffer += self._pending_buffer
-                self._pending_buffer = ""
             return True
 
         # Tool tag detection
@@ -1840,6 +1789,9 @@ class _AgentStreamState:
                 self._is_accumulating_tool = True
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
+                # CRITICAL FIX: Check if closing </tool> is already in the buffer (single-chunk dispatch)
+                if self._try_complete_tool():
+                    return False
                 return True
 
         # Partial tag detection
@@ -1871,6 +1823,84 @@ class _AgentStreamState:
         self._pending_buffer = ""
         return True
 
+    def _try_complete_tool(self) -> bool:
+        """
+        Checks if </tool> is present in _tool_buffer and dispatches the tool call if found.
+        Returns True if the tool was dispatched, False otherwise.
+        Handles both multi-chunk accumulation and single-chunk complete tool calls.
+        """
+        close_match = re.search(r'</tool>\s*', self._tool_buffer, re.IGNORECASE)
+        if not close_match:
+            return False
+
+        end_idx = close_match.start()
+        end_len = len(close_match.group(0))
+
+        full_tool_call = self._tool_buffer[:end_idx + end_len]
+        json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
+        json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
+
+        self._is_accumulating_tool = False
+        remaining = self._tool_buffer[end_idx + end_len:]
+        self._tool_buffer = ""
+        if remaining:
+            self._pending_buffer = remaining + self._pending_buffer
+
+        # Parse and normalize JSON (with repair for incomplete JSON)
+        try:
+            raw_data = json.loads(json_body)
+        except json.JSONDecodeError:
+            # Attempt to repair incomplete JSON by closing open braces/brackets
+            repaired = json_body
+            while repaired.count('{') > repaired.count('}'):
+                repaired += '}'
+            while repaired.count('[') > repaired.count(']'):
+                repaired += ']'
+            try:
+                raw_data = json.loads(repaired)
+                json_body = repaired
+            except json.JSONDecodeError:
+                raw_data = None
+
+        if isinstance(raw_data, dict):
+            tool_name = raw_data.get("name", "")
+            if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                self.tool_json_data = json_body
+            else:
+                params = {k: v for k, v in raw_data.items() if k != "name"}
+                normalized = {"name": tool_name, "parameters": params}
+                self.tool_json_data = json.dumps(normalized)
+        else:
+            self.tool_json_data = json_body
+
+        self.tool_trigger = True
+        self._action_dispatched = True
+
+        # Emit processing block for UI feedback
+        try:
+            parsed = json.loads(self.tool_json_data)
+            ui_tool_name = parsed.get("name", "unknown") if isinstance(parsed, dict) else "unknown"
+        except Exception:
+            ui_tool_name = "unknown"
+
+        import html
+        try:
+            parsed_for_ui = json.loads(self.tool_json_data)
+            ui_params = parsed_for_ui.get("parameters", {}) if isinstance(parsed_for_ui, dict) else {}
+        except Exception:
+            ui_params = {}
+        escaped_params = html.escape(json.dumps(ui_params, default=str))
+
+        tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}" params="{escaped_params}">\n'
+        self.content += tool_open_tag
+        self._cb(tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+        status_line = f"* Calling tool '{ui_tool_name}'...\n"
+        self.content += status_line
+        self._cb(status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+
+        return True
+
     def flush_remaining_buffer(self):
         """Flushes any safe text remaining at the end of generation."""
         if self._in_code_fence:
@@ -1881,16 +1911,34 @@ class _AgentStreamState:
                 self.feed(hold)
 
         if self._is_accumulating_tool:
-            full_tool_call = self._tool_buffer + self._pending_buffer
-            json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
-            json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
-
-            self._is_accumulating_tool = False
+            self._tool_buffer += self._pending_buffer
             self._pending_buffer = ""
-            self._tool_buffer = ""
+            # Try to complete the tool call normally first
+            if not self._try_complete_tool():
+                # No closing </tool> found — synthesize dispatch from what we have
+                full_tool_call = self._tool_buffer
+                json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
+                json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
 
-            try:
-                raw_data = json.loads(json_body)
+                self._is_accumulating_tool = False
+                self._tool_buffer = ""
+
+                # Parse and normalize JSON (with repair for incomplete JSON)
+                try:
+                    raw_data = json.loads(json_body)
+                except json.JSONDecodeError:
+                    # Attempt to repair incomplete JSON by closing open braces/brackets
+                    repaired = json_body
+                    while repaired.count('{') > repaired.count('}'):
+                        repaired += '}'
+                    while repaired.count('[') > repaired.count(']'):
+                        repaired += ']'
+                    try:
+                        raw_data = json.loads(repaired)
+                        json_body = repaired
+                    except json.JSONDecodeError:
+                        raw_data = None
+
                 if isinstance(raw_data, dict):
                     tool_name = raw_data.get("name", "")
                     if "parameters" not in raw_data or not isinstance(raw_data.get("parameters"), dict):
@@ -1901,25 +1949,23 @@ class _AgentStreamState:
                         self.tool_json_data = json_body
                 else:
                     self.tool_json_data = json_body
-            except json.JSONDecodeError:
-                self.tool_json_data = json_body
 
-            self.tool_trigger = True
-            self._action_dispatched = True
+                self.tool_trigger = True
+                self._action_dispatched = True
 
-            try:
-                parsed = json.loads(self.tool_json_data)
-                ui_tool_name = parsed.get("name", "unknown") if isinstance(parsed, dict) else "unknown"
-            except Exception:
-                ui_tool_name = "unknown"
+                try:
+                    parsed = json.loads(self.tool_json_data)
+                    ui_tool_name = parsed.get("name", "unknown") if isinstance(parsed, dict) else "unknown"
+                except Exception:
+                    ui_tool_name = "unknown"
 
-            tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}">\n'
-            self.content += tool_open_tag
-            self._cb(tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}">\n'
+                self.content += tool_open_tag
+                self._cb(tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
-            status_line = f"* Calling tool '{ui_tool_name}'...\n"
-            self.content += status_line
-            self._cb(status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                status_line = f"* Calling tool '{ui_tool_name}'...\n"
+                self.content += status_line
+                self._cb(status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
             return
 
         if self._pending_buffer:
@@ -3438,14 +3484,6 @@ class Agent:
         """Manual mode: returns the first tool call without executing it."""
         tools_mgr = ToolsManager()
         inline_tools = tools_mgr.build_inline_tools_dict(tools)
-
-        if not inline_tools:
-            return {
-                "response": self.generate(prompt=prompt, system_prompt=system_prompt, temperature=temperature, n_predict=n_predict, streaming_callback=streaming_callback, **extra),
-                "tool_calls": [],
-                "tool_results": [],
-                "rounds": 0,
-            }
 
         tool_descriptions: List[str] = []
         for name, spec in inline_tools.items():
