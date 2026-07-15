@@ -34,6 +34,17 @@ def _ensure_installed(
         __import__(import_name or package_name)
 
 
+def _normalize_dtype(dtype: Any) -> str:
+    """
+    Normalizes pandas internal dtype strings to intuitive Python primitive types
+    for LLM schema consumption.
+    """
+    dtype_str = str(dtype)
+    if dtype_str == "object":
+        return "str"
+    return dtype_str
+
+
 def _get_sqlalchemy_engine_from_file(file_path: Path) -> Tuple[Any, str]:
     """
     Parses a '.sqlconn' connection metadata file and creates a SQLAlchemy engine.
@@ -259,9 +270,9 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                 schema_parts.append(f"- Total Rows: {row_count:,} | Columns: {len(df.columns)}")
                 schema_parts.append("### Columns & Types:")
                 for col in full_df.columns:
-                    dtype = str(full_df[col].dtype)
+                    norm_type = _normalize_dtype(full_df[col].dtype)
                     nulls = int(full_df[col].isnull().sum())
-                    schema_parts.append(f"  • {col} ({dtype}) — {nulls} missing values")
+                    schema_parts.append(f"  • {col} ({norm_type}) — {nulls} missing values")
 
                 numeric_cols = full_df.select_dtypes(include=["number"]).columns
                 if not numeric_cols.empty:
@@ -303,9 +314,9 @@ def _parse_data_file(path: Path, art_title: str, version: int = 1, progress_cb: 
                 schema_parts.append(f"- Total Rows: {row_count:,} | Columns: {len(df.columns)}")
                 schema_parts.append("### Columns & Types:")
                 for col in full_df.columns:
-                    dtype = str(full_df[col].dtype)
+                    norm_type = _normalize_dtype(full_df[col].dtype)
                     nulls = int(full_df[col].isnull().sum())
-                    schema_parts.append(f"  • {col} ({dtype}) — {nulls} missing values")
+                    schema_parts.append(f"  • {col} ({norm_type}) — {nulls} missing values")
 
                 numeric_cols = full_df.select_dtypes(include=["number"]).columns
                 if not numeric_cols.empty:
