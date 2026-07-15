@@ -2455,6 +2455,7 @@ class ChatMixin:
         tolerance_level:              Optional[str] = "strict",
         allow_dynamic_tools:          bool = False,  # 🛡️ Security gate for LLM-generated tool execution
         enable_code_execution:        bool = False,  # 🛡️ Security gate for arbitrary Python code execution
+        suppress_images:              bool = False,  # 🛡️ Set to True for non-vision LLMs to prevent passing image data
         debug_export:                 bool = False,   # 🔬 Dumps virtual_history and ai_msg.content to disk for debugging
         **kwargs
     ) -> Dict[str, Any]:
@@ -2899,14 +2900,17 @@ class ChatMixin:
             # and append their base64 pixels to the active vision context so the LLM can "see" them!
             # CRITICAL FIX: Only hydrate images that are explicitly in FULL visibility context.
             # Injecting pixels for [U] (TREE_UNLOCKABLE) images crashes non-vision LLMs.
-            round_images = list(images) if images else []
-            affected_arts = getattr(self, "_affected_artefacts_this_turn", [])
-            for art in affected_arts:
-                if art.get("type") == "image" and art.get("images") and art.get("visibility") == ArtefactVisibility.FULL:
-                    for img_b64 in art["images"]:
-                        if img_b64 not in round_images:
-                            round_images.append(img_b64)
-                            ASCIIColors.success(f"[Vision Sync] Hydrated LLM context with generated plot: '{art['title']}'")
+            if suppress_images:
+                round_images = None
+            else:
+                round_images = list(images) if images else []
+                affected_arts = getattr(self, "_affected_artefacts_this_turn", [])
+                for art in affected_arts:
+                    if art.get("type") == "image" and art.get("images") and art.get("visibility") == ArtefactVisibility.FULL:
+                        for img_b64 in art["images"]:
+                            if img_b64 not in round_images:
+                                round_images.append(img_b64)
+                                ASCIIColors.success(f"[Vision Sync] Hydrated LLM context with generated plot: '{art['title']}'")
 
             # ── 🔬 SCIENTIFIC DEBUG: EXPORTED PROMPT TRACE ──
             # (Logging removed per user request)
