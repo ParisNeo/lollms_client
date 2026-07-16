@@ -219,22 +219,24 @@ class UtilsMixin:
                 system_level_images.append(img["data"])
 
         active_discussion_b64 = system_level_images
-        if full_system_prompt or (active_discussion_b64 and format_type in ["openai_chat","ollama_chat","markdown"]):
-            discussion_level_images = build_image_dicts(active_discussion_b64)
+        if full_system_prompt or (active_discussion_b64 and format_type in ["openai_chat","ollama_chat","markdown"] and not suppress_images):
+            discussion_level_images = build_image_dicts(active_discussion_b64) if not suppress_images else []
             if format_type == "openai_chat":
                 content_parts = []
                 if full_system_prompt:
                     content_parts.append({"type":"text","text":full_system_prompt})
-                for img in discussion_level_images:
-                    url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
-                    content_parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
+                if not suppress_images:
+                    for img in discussion_level_images:
+                        url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
+                        content_parts.append({"type":"image_url","image_url":{"url":url,"detail":"auto"}})
                 if content_parts:
                     messages.append({"role":"system","content":content_parts})
             elif format_type == "ollama_chat":
                 sd = {"role":"system","content":full_system_prompt or ""}
-                b64s = [i['data'] for i in discussion_level_images if i['type']=='base64']
-                if b64s:
-                    sd["images"] = b64s
+                if not suppress_images:
+                    b64s = [i['data'] for i in discussion_level_images if i['type']=='base64']
+                    if b64s:
+                        sd["images"] = b64s
                 messages.append(sd)
             elif format_type == "markdown":
                 parts = []
@@ -290,7 +292,7 @@ class UtilsMixin:
                         messages.append(f"**{sender_str}**: {vh_content}\n")
 
                 # We still need to attach images if there were any in the original message
-                if images_dicts and format_type == "openai_chat":
+                if images_dicts and not suppress_images and format_type == "openai_chat":
                     # Append images to the last assistant message we just added
                     for i in range(len(messages) - 1, -1, -1):
                         if messages[i]["role"] == "assistant":
@@ -303,7 +305,7 @@ class UtilsMixin:
             else:
                 # Standard path: use sanitized content
                 if format_type == "openai_chat":
-                    if images_dicts:
+                    if images_dicts and not suppress_images:
                         parts = [{"type":"text","text":content}] if content else []
                         for img in images_dicts:
                             url = f"data:image/jpeg;base64,{img['data']}" if img['type']=='base64' else img['data']
@@ -313,9 +315,10 @@ class UtilsMixin:
                         messages.append({"role":role,"content":content})
                 elif format_type == "ollama_chat":
                     md = {"role":role,"content":content}
-                    b64s = [i['data'] for i in images_dicts if i['type']=='base64']
-                    if b64s:
-                        md["images"] = b64s
+                    if not suppress_images:
+                        b64s = [i['data'] for i in images_dicts if i['type']=='base64']
+                        if b64s:
+                            md["images"] = b64s
                     messages.append(md)
                 elif format_type == "markdown":
                     line = f"**{role.capitalize()}**: {content}\n"

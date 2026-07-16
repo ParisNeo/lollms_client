@@ -2890,6 +2890,7 @@ class ChatMixin:
                 format_type="openai_chat",
                 branch_tip_id=current_branch_tip,
                 suppress_system_prompt=False,
+                suppress_images=suppress_images,
                 virtual_history=virtual_history,
                 debug=debug_export,
                 system_prompt_override=current_system_prompt

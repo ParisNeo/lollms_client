@@ -231,8 +231,11 @@ def run_config_wizard(config) -> None:
 
     existing_config = config.llm_binding_config if config.llm_binding_config else {}
 
-    global_params = desc.get("global_input_parameters") or desc.get("input_parameters") or [] if desc else []
-    model_params = desc.get("model_input_parameters") or [] if desc else []
+    global_params = []
+    model_params = []
+    if desc:
+        global_params = desc.get("global_input_parameters") or desc.get("input_parameters") or []
+        model_params = desc.get("model_input_parameters") or []
 
     if global_params:
         ASCIIColors.cyan("  ── Global Parameters ──")
@@ -399,4 +402,3 @@ def needs_configuration(config) -> bool:
     Returns True if configuration is incomplete.
     """
     return not config.wizard_completed or not config.llm_binding_config
-```

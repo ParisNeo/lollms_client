@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-16 06:15]
+
+- feat(discussion): add option to suppress images for non-vision LLMs
+
 ## [2026-07-15 12:19]
 
 - feat(code-agent): add configuration wizard and enhanced LLM binding config

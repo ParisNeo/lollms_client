@@ -194,6 +194,7 @@ def chat(
     fast_artefact_replicas:       Optional[List[str]] = None,
     tolerance_level:              Optional[str] = "strict",
     allow_dynamic_tools:          bool = False,
+    suppress_images:              bool = False,  # 🛡️ Set to True for non-vision LLMs to prevent passing image data
     debug_export:                 bool = False,
     **kwargs
 ) -> Dict[str, Any]:
