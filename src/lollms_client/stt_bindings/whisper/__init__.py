@@ -141,8 +141,11 @@ class WhisperSTTBinding(LollmsSTTBinding):
         
         return True
 
-    def _load_whisper_model(self, model_name_to_load: str):
+    def _load_whisper_model(self, model_name_to_load: str ="small"):
         """Loads or reloads the Whisper model with file locking to prevent concurrent downloads."""
+        if model_name_to_load is None or model_name_to_load.lower()=="none":
+            model_name_to_load = "small"
+        
         if model_name_to_load not in whisper.available_models():
             ASCIIColors.warning(f"'{model_name_to_load}' is not a standard Whisper model size. Attempting to load anyway. Known sizes: {self.WHISPER_MODEL_SIZES}")
 
