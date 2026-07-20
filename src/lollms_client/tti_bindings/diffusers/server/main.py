@@ -1444,8 +1444,7 @@ async def generate_image(request: T2IRequest):
         return Response(content=future.result(), media_type="image/png")
 
     except Exception as e:
-        if client and client.debug:
-            trace_exception(e)
+        trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if temp_config and manager:
@@ -1531,8 +1530,7 @@ async def edit_image(request: EditRequestJSON):
 
     except Exception as e:
         ASCIIColors.error(f"Exception in /edit_image. Sanitized Payload: {json.dumps(get_sanitized_request_for_logging(request), indent=2)}")
-        if client and client.debug:
-            trace_exception(e)
+        trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if temp_config and manager:
@@ -1586,8 +1584,7 @@ def pull_model_endpoint(payload: PullModelRequest):
             ASCIIColors.green(f"Model '{model_id}' pulled to {dest_dir}")
             return {"status": "ok", "model_name": folder_name}
         except Exception as e:
-            if client and client.debug:
-                trace_exception(e)
+            trace_exception(e)
             raise HTTPException(status_code=500, detail=f"Failed to pull HF model: {e}")
 
     if payload.safetensors_url:
@@ -1615,8 +1612,7 @@ def pull_model_endpoint(payload: PullModelRequest):
         except Exception as e:
             if temp_path.exists():
                 temp_path.unlink()
-            if client and client.debug:
-                trace_exception(e)
+            trace_exception(e)
             raise HTTPException(status_code=500, detail=f"Failed to download safetensors: {e}")
 
 
@@ -1710,8 +1706,7 @@ def set_settings_endpoint(settings: Dict[str, Any]):
     try:
         return {"success": state.update_settings(settings)}
     except Exception as e:
-        if client and client.debug:
-            trace_exception(e)
+        trace_exception(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
