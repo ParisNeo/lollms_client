@@ -318,9 +318,11 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ASCIIColors.error(f"Error details: {e}")
             if hasattr(e, 'response') and e.response:
                 try:
-                    ASCIIColors.error(f"Server response: {e.response.json().get('detail', e.response.text)}")
+                    err_detail = e.response.json().get('detail', e.response.text)
                 except json.JSONDecodeError:
-                    ASCIIColors.error(f"Server raw response: {e.response.text}")
+                    err_detail = e.response.text
+                ASCIIColors.error(f"Server response: {err_detail}")
+                raise RuntimeError(f"Diffusers server error: {err_detail}") from e
             raise RuntimeError("Communication with the Diffusers server failed.") from e
 
     def _post_multipart_request(self, endpoint: str, data: Optional[dict] = None, files: Optional[list] = None) -> requests.Response:
@@ -331,16 +333,17 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
-            # (Error handling is the same as above)
             ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
             ASCIIColors.error(f"Error details: {e}")
             if hasattr(e, 'response') and e.response:
                 try:
-                    ASCIIColors.error(f"Server response: {e.response.json().get('detail', e.response.text)}")
+                    err_detail = e.response.json().get('detail', e.response.text)
                 except json.JSONDecodeError:
-                    ASCIIColors.error(f"Server raw response: {e.response.text}")
+                    err_detail = e.response.text
+                ASCIIColors.error(f"Server response: {err_detail}")
+                raise RuntimeError(f"Diffusers server error: {err_detail}") from e
             raise RuntimeError("Communication with the Diffusers server failed.") from e
-        
+
     def _get_request(self, endpoint: str, params: Optional[dict] = None) -> requests.Response:
         """Helper to make GET requests to the server."""
         try:
