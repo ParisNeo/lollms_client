@@ -210,6 +210,12 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     else:
                         python_executable = self.venv_dir / "bin" / "python"
 
+                    if not python_executable.exists():
+                        raise RuntimeError(
+                            f"Python executable not found in venv: {python_executable}. "
+                            "The virtual environment may be corrupted or dependencies were not installed."
+                        )
+
                     command = [
                         str(python_executable),
                         str(server_script),
@@ -233,12 +239,17 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     log_file_path = self.models_path / "diffusers_server.log"
                     log_f = open(log_file_path, "w", encoding="utf-8")
 
-                    self.server_process = subprocess.Popen(
-                        command,
-                        stdout=log_f,
-                        stderr=subprocess.STDOUT
-                    )
-                    log_f.close()
+                    try:
+                        self.server_process = subprocess.Popen(
+                            command,
+                            stdout=log_f,
+                            stderr=subprocess.STDOUT
+                        )
+                    except Exception as popen_err:
+                        log_f.close()
+                        raise RuntimeError(f"Failed to execute subprocess: {popen_err}")
+                    finally:
+                        log_f.close()
 
                     ASCIIColors.info(
                         f"Diffusers server launched on "
@@ -250,8 +261,17 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
                         while True:
                             if self.server_process.poll() is not None:
+                                error_tail = "No log data available."
+                                try:
+                                    with open(log_file_path, "r", encoding="utf-8", errors="ignore") as err_log:
+                                        lines = err_log.readlines()
+                                        error_tail = "".join(lines[-30:]) if lines else "Log file is empty."
+                                except Exception:
+                                    pass
+
                                 raise RuntimeError(
-                                    "Diffusers server process terminated unexpectedly."
+                                    f"Diffusers server process terminated unexpectedly with code {self.server_process.returncode}.\n"
+                                    f"--- Server Log Tail ---\n{error_tail}"
                                 )
 
                             if self.is_server_running():
