@@ -235,6 +235,118 @@ Consolidated Notes:"""
             synthesis_prompt, images, system_prompt, **kwargs
         )
     
+    
+    def generate_with_tag(
+                            self, 
+                            prompt:str, 
+                            tag:str, 
+                            images:list=None, 
+                            system_prompt:str="", 
+                            n_predict:int=None, 
+                            temperature:float=None,
+                            top_k:int=None,
+                            top_p:float=None,
+                            repeat_penalty:float=None,
+                            repeat_last_n:int=None,
+                            callback:Callable=None,
+                            **kwargs):
+        extra_system_prompt = f"""return the requested content inside the following xml tag:
+<{tag}>
+requested content (code, diagram, text, report etc...)
+</{tag}>
+"""
+        if system_prompt and system_prompt!="":
+            system_prompt += f"\n{extra_system_prompt}"
+        else:
+            system_prompt = extra_system_prompt
+            
+        response = self.llm.generate_text(
+            prompt,
+            images=images,
+            system_prompt=system_prompt,
+            n_predict=n_predict,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repeat_penalty=repeat_penalty,
+            repeat_last_n=repeat_last_n,
+            streaming_callback=callback,
+            **kwargs
+        )
+
+        pattern = f"<{tag}>(.*?)</{tag}>"
+        match = re.search(pattern, response, re.DOTALL)
+        extracted_content = match.group(1).strip() if match else response
+
+        return extracted_content
+    
+    def generate_with_tags(
+                            self, 
+                            prompt:str, 
+                            images:list=None, 
+                            system_prompt:str="", 
+                            n_predict:int=None, 
+                            temperature:float=None,
+                            top_k:int=None,
+                            top_p:float=None,
+                            repeat_penalty:float=None,
+                            repeat_last_n:int=None,
+                            callback:Callable=None,
+                            **kwargs):
+        """
+        Generates multiple named outputs enclosed in <tag name="..."> tags.
+        This is highly useful for multi-file generation, structured data extraction, 
+        or separating different components of an LLM response.
+        
+        Returns:
+            dict: A dictionary mapping the 'name' attribute of each tag to its content.
+                  e.g., {"main.py": "...", "utils.py": "..."}
+        """
+        extra_system_prompt = f"""return the requested contents inside the following xml tags with a name attribute:
+<tag name="the name of output 1">
+content 1
+</tag>
+<tag name="the name of output 2">
+content 2
+</tag>
+You can add as many tags as needed. Ensure the name attribute clearly identifies the content.
+"""
+        if system_prompt and system_prompt!="":
+            system_prompt += f"\n{extra_system_prompt}"
+        else:
+            system_prompt = extra_system_prompt
+            
+        response = self.llm.generate_text(
+            prompt,
+            images=images,
+            system_prompt=system_prompt,
+            n_predict=n_predict,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repeat_penalty=repeat_penalty,
+            repeat_last_n=repeat_last_n,
+            streaming_callback=callback,
+            **kwargs
+        )
+
+        # CRITICAL: Remove thinking blocks FIRST so we never extract content 
+        # from inside <thinking> or <think> tags.
+        clean_response = self.remove_thinking_blocks(response)
+
+        # Regex to find <tag name="...">...</tag>
+        # Using DOTALL to match across newlines
+        pattern = r'<tag\s+name=["\'](.*?)["\']\s*>(.*?)</tag>'
+        matches = re.findall(pattern, clean_response, re.DOTALL | re.IGNORECASE)
+        
+        outputs = {}
+        for name, content in matches:
+            outputs[name.strip()] = content.strip()
+            
+        return outputs
+    
+    
+    
     def _split_text_into_chunks(self, text: str, chunk_size: int, overlap_size: int) -> List[str]:
         """
         Split text into overlapping chunks based on token estimates.
