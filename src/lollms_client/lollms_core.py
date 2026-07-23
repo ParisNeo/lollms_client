@@ -1045,6 +1045,17 @@ class LollmsClient():
         if self.llm:
             return self.llm.tp.long_context_processing(text_to_process, contextual_prompt, **kwargs)
 
+    def generate_with_tag(self, prompt:str, tag:str, **kwargs):
+        if self.llm:
+            return self.llm.tp.generate_with_tag(prompt, tag, **kwargs)
+        raise RuntimeError("LLM binding not initialized.")
+            
+    def generate_with_tags(self, prompt:str, **kwargs):
+        if self.llm:
+            return self.llm.tp.generate_with_tags(prompt, **kwargs)
+        raise RuntimeError("LLM binding not initialized.")
+            
+
 def chunk_text(text, tokenizer, detokenizer, chunk_size, overlap, use_separators=True):
     tokens = tokenizer(text)
     chunks = []
