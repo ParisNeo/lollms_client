@@ -1679,10 +1679,32 @@ def set_settings_endpoint(settings: Dict[str, Any]):
 
 @router.get("/status")
 def status_endpoint():
+    active_model_info = None
+    if state.manager and state.manager.is_loaded:
+        vram_strategy = "Standard"
+        if state.manager.config.get("enable_cpu_offload"):
+            vram_strategy = "CPU Offload"
+        elif state.manager.config.get("enable_sequential_cpu_offload"):
+            vram_strategy = "Sequential CPU Offload"
+
+        active_model_info = {
+            "model_name": state.manager.config.get("model_name"),
+            "family": _model_family(state.manager.config.get("model_name", "")),
+            "current_task": state.manager.current_task,
+            "quant_backend": state.manager.config.get("quant_backend"),
+            "vram_strategy": vram_strategy
+        }
+
     return {
         "status": "running",
         "diffusers_available": DIFFUSERS_AVAILABLE,
+        "device": state.config.get("device"),
         "model_loaded": state.manager.is_loaded if state.manager else False,
+        "active_model": active_model_info,
+        "registry": {
+            "total_managers": len(state.registry.get_all_managers()),
+            "active_managers": len(state.registry.get_active_managers())
+        },
         "missing_pipeline_classes": _MISSING_PIPELINES,
     }
 
