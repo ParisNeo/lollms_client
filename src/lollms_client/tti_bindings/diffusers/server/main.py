@@ -937,11 +937,14 @@ class ModelManager:
                 )
             raise e
 
-        # Fix: upcast VAE to float32 to prevent black/chunky artifacts
-        if self.pipeline and hasattr(self.pipeline, 'vae') and hasattr(self.pipeline.vae, 'dtype'):
-            if self.pipeline.vae.dtype == torch.float16:
+        if self.pipeline and hasattr(self.pipeline, 'vae') and self.pipeline.vae is not None:
+            if hasattr(self.pipeline.vae, 'dtype') and self.pipeline.vae.dtype == torch.float16:
                 ASCIIColors.info("Upcasting VAE to float32 to prevent artifacts.")
                 self.pipeline.vae = self.pipeline.vae.to(dtype=torch.float32)
+            elif not hasattr(self.pipeline.vae, 'dtype'):
+                ASCIIColors.warning("VAE object is missing 'dtype' attribute. Skipping upcast.")
+        else:
+            ASCIIColors.warning("Pipeline loaded without a valid VAE component. Skipping VAE upcast.")
 
         self._set_scheduler()
 
