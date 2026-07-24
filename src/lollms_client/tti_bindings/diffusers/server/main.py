@@ -938,11 +938,11 @@ class ModelManager:
             raise e
 
         if self.pipeline and hasattr(self.pipeline, 'vae') and self.pipeline.vae is not None:
-            if hasattr(self.pipeline.vae, 'dtype') and self.pipeline.vae.dtype == torch.float16:
-                ASCIIColors.info("Upcasting VAE to float32 to prevent artifacts.")
-                self.pipeline.vae = self.pipeline.vae.to(dtype=torch.float32)
-            elif not hasattr(self.pipeline.vae, 'dtype'):
-                ASCIIColors.warning("VAE object is missing 'dtype' attribute. Skipping upcast.")
+            try:
+                ASCIIColors.info("Explicitly casting VAE to float32 to prevent artifacts and NaN latents.")
+                self.pipeline.vae.to(dtype=torch.float32)
+            except Exception as vae_e:
+                ASCIIColors.warning(f"Could not upcast VAE to float32: {vae_e}")
         else:
             ASCIIColors.warning("Pipeline loaded without a valid VAE component. Skipping VAE upcast.")
 
