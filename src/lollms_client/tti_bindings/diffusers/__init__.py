@@ -6,6 +6,7 @@ import subprocess
 import time
 import json
 import threading
+import signal
 from io import BytesIO
 from pathlib import Path
 from ascii_colors import trace_exception
@@ -67,11 +68,38 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
 
     def is_server_running(self) -> bool:
-        """Checks if the server is already running and responsive."""
+        """
+        Checks if the server is already running and responsive, and prints rich health info.
+        The server is a shared singleton. To kill it, you must do so manually via OS tools.
+        """
         try:
             response = requests.get(f"{self.base_url}/status", timeout=4)
-            if response.status_code == 200 and response.json().get("status") == "running":
-                return True
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "running":
+                    ASCIIColors.green("Diffusers Server is already running and responsive (Shared Singleton Mode).")
+                    ASCIIColors.info(f"  - Device: {data.get('device', 'Unknown')}")
+                    ASCIIColors.info(f"  - Diffusers Available: {data.get('diffusers_available', 'Unknown')}")
+                    ASCIIColors.info(f"  - Model Loaded: {data.get('model_loaded', False)}")
+
+                    active_model = data.get("active_model")
+                    if active_model:
+                        ASCIIColors.info(f"  - Active Model: {active_model.get('model_name', 'Unknown')}")
+                        ASCIIColors.info(f"  - Model Family: {active_model.get('family', 'Unknown')}")
+                        ASCIIColors.info(f"  - Current Task: {active_model.get('current_task', 'Idle')}")
+                        ASCIIColors.info(f"  - Quantization: {active_model.get('quant_backend', 'None')}")
+                        ASCIIColors.info(f"  - VRAM Strategy: {active_model.get('vram_strategy', 'Standard')}")
+                    else:
+                        ASCIIColors.warning("  - Active Model: None configured")
+
+                    if data.get("missing_pipeline_classes"):
+                        ASCIIColors.warning(f"  - Missing Pipelines: {', '.join(data['missing_pipeline_classes'])}")
+
+                    reg = data.get("registry", {})
+                    ASCIIColors.info(f"  - Registry: {reg.get('total_managers', 0)} manager(s), {reg.get('active_managers', 0)} active")
+
+                    ASCIIColors.magenta("  - NOTE: This server is shared across all processes. To stop it, manually kill the process using your OS (e.g., taskkill /F /PID <pid> or kill -9 <pid>).")
+                    return True
         except requests.exceptions.RequestException:
             return False
         return False
@@ -244,12 +272,24 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     try:
                         env = os.environ.copy()
                         env["PYTHONUNBUFFERED"] = "1"
+
+                        creationflags = 0
+                        preexec_fn = None
+                        if sys.platform == "win32":
+                            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                        else:
+                            preexec_fn = os.setsid
+
                         self.server_process = subprocess.Popen(
                             command,
                             stdout=log_f,
                             stderr=subprocess.STDOUT,
-                            env=env
+                            env=env,
+                            creationflags=creationflags,
+                            preexec_fn=preexec_fn
                         )
+                        self.server_pid = self.server_process.pid
+                        ASCIIColors.info(f"Diffusers server process started with PID: {self.server_pid}")
                     except Exception as popen_err:
                         log_f.close()
                         raise RuntimeError(f"Failed to execute subprocess: {popen_err}")
@@ -389,6 +429,40 @@ class DiffusersTTIBinding(LollmsTTIBinding):
         except requests.exceptions.RequestException as e:
             ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
             raise RuntimeError("Communication with the Diffusers server failed.") from e
+
+    def stop_server(self):
+        """Stops the Diffusers server process if it was started by this binding."""
+        if not self.server_process:
+            ASCIIColors.info("No local Diffusers server process is managed by this binding.")
+            return
+
+        pid = getattr(self, "server_pid", self.server_process.pid)
+        ASCIIColors.warning(f"Attempting to stop Diffusers server process (PID: {pid})...")
+
+        try:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], check=False, capture_output=True)
+            else:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+                time.sleep(2)
+                if self.server_process.poll() is None:
+                    ASCIIColors.warning(f"Process {pid} did not terminate gracefully. Forcing kill...")
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            self.server_process.wait(timeout=5)
+            ASCIIColors.success(f"Diffusers server process (PID: {pid}) stopped successfully.")
+        except Exception as e:
+            ASCIIColors.error(f"Error stopping Diffusers server process: {e}")
+        finally:
+            self.server_process = None
+            self.server_pid = None
 
     def unload_model(self):
         ASCIIColors.info("Requesting server to unload the current model...")
