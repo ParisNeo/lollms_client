@@ -1379,6 +1379,7 @@ async def generate_image(request: T2IRequest):
         num_steps         = pipeline_args.get("num_inference_steps", 25)
         seed              = pipeline_args.get("seed", -1)
         guidance_scale    = pipeline_args.get("guidance_scale", 7.0)
+        
         pipeline_args["width"]               = int(width   or 1024)
         pipeline_args["height"]              = int(height  or 1024)
         pipeline_args["num_inference_steps"] = int(num_steps or 25)
@@ -1429,8 +1430,7 @@ async def generate_image(request: T2IRequest):
     finally:
         if temp_config and manager:
             state.registry.release_manager(temp_config)
-            ASCIIColors.info(f"Released per-request model: {temp_config['model_name']}")
-            
+            ASCIIColors.info(f"Released per-request model: {temp_config['model_name']}")       
             
 @router.post("/edit_image")
 async def edit_image(request: EditRequestJSON):
