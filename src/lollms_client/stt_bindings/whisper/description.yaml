@@ -2,13 +2,38 @@ title: Whisper STT Binding
 author: ParisNeo
 creation_date: 2025-10-21
 last_update_date: 2025-10-21
-description: A Speech-To-Text (STT) binding for transcribing audio using OpenAI's Whisper model locally. It requires 'ffmpeg' to be installed on the system.
+description: A Speech-To-Text (STT) binding for transcribing audio using OpenAI's Whisper model locally. It requires 'ffmpeg' to be installed on the system. Operates via a standalone shared server to enable multi-process VRAM sharing and OOM management.
 global_input_parameters:
-  - name: device
+  - name: host
     type: str
-    description: "The device to run the model on ('cpu', 'cuda', 'mps'). If not specified, it will be auto-detected."
+    description: "The host address for the Whisper server."
     mandatory: false
-    default: ""
+    default: "localhost"
+  - name: port
+    type: int
+    description: "The port number on which the dedicated Whisper server will run."
+    mandatory: false
+    default: 9633
+  - name: auto_start_server
+    type: bool
+    description: "If True, the binding will automatically spawn the server in a background process if it is not already running."
+    mandatory: false
+    default: false
+  - name: wait_for_server
+    type: bool
+    description: "If True, the constructor will block until the server is fully operational."
+    mandatory: false
+    default: false
+  - name: venv_path
+    type: str
+    description: "Path to the virtual environment dedicated to the Whisper server."
+    mandatory: false
+    default: "./venv/stt_whisper_venv"
+  - name: cache_dir
+    type: str
+    description: "Directory where Whisper models and server logs will be stored."
+    mandatory: false
+    default: "./data/stt_models/whisper"
 model_input_parameters:
   - name: model_name
     type: str
