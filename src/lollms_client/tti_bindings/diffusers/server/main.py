@@ -983,11 +983,23 @@ class ModelManager:
                             self._load_pipeline_for_task(task)
                             ASCIIColors.info(f"Worker: Load sequence finished. is_loaded={self.is_loaded}")
 
+                        if not self.is_loaded or self.pipeline is None:
+                            raise RuntimeError(f"Model failed to load for task {task}. Pipeline is unavailable.")
+
                     if self.supported_args:
                         filtered_args = {k: v for k, v in pipeline_args.items() if k in self.supported_args}
                     else:
                         ASCIIColors.warning("Supported argument set not found. Using unfiltered arguments.")
                         filtered_args = pipeline_args
+
+                    if "generator" not in filtered_args or filtered_args.get("generator") is None:
+                        seed = pipeline_args.get("seed", -1)
+                        if seed != -1:
+                            try:
+                                filtered_args["generator"] = torch.Generator(device=self.config["device"]).manual_seed(seed)
+                            except Exception as gen_e:
+                                ASCIIColors.warning(f"Worker: Failed to create generator on device '{self.config['device']}'. Falling back to CPU. Error: {gen_e}")
+                                filtered_args["generator"] = torch.Generator(device="cpu").manual_seed(seed)
 
                     log_args = {k: v for k, v in filtered_args.items() if k not in ['generator', 'image', 'mask_image']}
                     if filtered_args.get("generator"):
@@ -1044,9 +1056,7 @@ class ModelManager:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
             except queue.Empty:
-                continue
-            
-            
+                continue       
             
 class PipelineRegistry:
     _instance = None
