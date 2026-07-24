@@ -1010,12 +1010,25 @@ class ModelManager:
                     with torch.no_grad():
                         output = self.pipeline(**filtered_args)
 
-                    if output is None or not hasattr(output, "images") or not output.images:
-                        raise RuntimeError("Diffusers pipeline returned no output or empty images list. This may indicate a silent pipeline failure (e.g., NaN loss).")
+                    ASCIIColors.info(f"[DEBUG] Pipeline execution finished. Output type: {type(output)}")
+                    if output is None:
+                        raise RuntimeError("Diffusers pipeline returned None. This indicates a silent failure in the pipeline.")
+
+                    if not hasattr(output, "images"):
+                        raise RuntimeError(f"Diffusers pipeline output has no 'images' attribute. Output attributes: {dir(output)}")
+                    
+                    ASCIIColors.info(f"[DEBUG] Output.images type: {type(output.images)}")
+                    if not output.images:
+                        raise RuntimeError("Diffusers pipeline returned an empty images list. This may indicate a silent pipeline failure (e.g., NaN loss).")
 
                     pil = output.images[0]
+                    ASCIIColors.info(f"[DEBUG] First image type: {type(pil)}")
+                    
                     if pil is None:
                         raise RuntimeError("Diffusers pipeline returned None as the first image. Check model compatibility and parameters.")
+                    
+                    if not hasattr(pil, 'size'):
+                        raise RuntimeError(f"First image object has no 'size' attribute. Object type: {type(pil)}, repr: {repr(pil)[:200]}")
 
                     buf = BytesIO()
                     pil.save(buf, format="PNG")
@@ -1032,6 +1045,9 @@ class ModelManager:
                         torch.cuda.empty_cache()
             except queue.Empty:
                 continue
+            
+            
+            
 class PipelineRegistry:
     _instance = None
     _lock = threading.Lock()
