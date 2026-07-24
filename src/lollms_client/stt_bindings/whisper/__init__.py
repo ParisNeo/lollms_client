@@ -1,401 +1,270 @@
-# lollms_client/stt_bindings/whisper/__init__.py
 import os
-import tempfile
+import sys
+import base64
+import subprocess
+import threading
+import time
+import json
+import socket
 from pathlib import Path
 from typing import Optional, List, Union, Dict, Any
 from ascii_colors import trace_exception, ASCIIColors
-import time
-import filelock
-
-# --- Package Management and Conditional Imports ---
-_whisper_installed = False
-_whisper_installation_error = ""
 
 try:
     import pipmaster as pm
-    import platform # For OS detection for torch index
+except ImportError:
+    print("FATAL: pipmaster is not installed. Please install it using: pip install pipmaster")
+    sys.exit(1)
 
-    # Determine initial device preference to guide torch installation
-    preferred_torch_device_for_install = "cpu" # Default assumption
-    
-    # Tentatively set preference based on OS, assuming user might want GPU if available
-    if platform.system() == "Linux" or platform.system() == "Windows":
-        # On Linux/Windows, CUDA is the primary GPU acceleration for PyTorch.
-        # We will try to install a CUDA version of PyTorch.
-        preferred_torch_device_for_install = "cuda"
-    elif platform.system() == "Darwin":
-        # On macOS, MPS is the acceleration. Standard torch install usually handles this.
-        preferred_torch_device_for_install = "mps" # or keep cpu if mps detection is later
+try:
+    from filelock import FileLock, Timeout
+except ImportError:
+    print("FATAL: The 'filelock' library is required. Please install it by running: pip install filelock")
+    sys.exit(1)
 
-    torch_pkgs = ["torch", "torchaudio","xformers"]
-    audiocraft_core_pkgs = ["openai-whisper", "filelock"]
-
-    torch_index_url = None
-    if preferred_torch_device_for_install == "cuda":
-        # Specify a common CUDA version index. Pip should resolve the correct torch version.
-        # As of late 2023/early 2024, cu118 or cu121 are common. Let's use cu126.
-        # Users with different CUDA setups might need to pre-install torch manually.
-        torch_index_url = "https://download.pytorch.org/whl/cu126"
-        ASCIIColors.info(f"Attempting to ensure PyTorch with CUDA support (target index: {torch_index_url})")
-        # Install torch and torchaudio first from the specific index
-        pm.ensure_packages(torch_pkgs, index_url=torch_index_url)
-        # Then install audiocraft and other dependencies; pip should use the already installed torch
-        pm.ensure_packages(audiocraft_core_pkgs)
-    else:
-        # For CPU, MPS, or if no specific CUDA preference was determined for install
-        ASCIIColors.info("Ensuring PyTorch, AudioCraft, and dependencies using default PyPI index.")
-        pm.ensure_packages(torch_pkgs + audiocraft_core_pkgs)
-
-    import whisper
-    import torch
-    _whisper_installed = True
-except Exception as e:
-    _whisper_installation_error = str(e)
-    whisper = None
-    torch = None
-
-
-# --- End Package Management ---
-
+import requests
 from lollms_client.lollms_stt_binding import LollmsSTTBinding
 
-# Defines the binding name for the manager
-BindingName = "WhisperSTTBinding" # Changed to avoid conflict with class name
+BindingName = "WhisperSTTBinding"
 
 class WhisperSTTBinding(LollmsSTTBinding):
-    """
-    LollmsSTTBinding implementation for OpenAI's Whisper model.
-    This binding runs Whisper locally.
-    Requires `ffmpeg` to be installed on the system.
-    """
-
-    # Standard Whisper model sizes
-    WHISPER_MODEL_SIZES = ["turbo"]
-
-    def __init__(self,
-                 **kwargs # To catch any other LollmsSTTBinding standard args
-                 ):
-        """
-        Initialize the Whisper STT binding.
-
-        Args:
-            model_name (str): The Whisper model size to use (e.g., "turbo").
-                              Defaults to "turno".
-            device (Optional[str]): The device to run the model on ("cpu", "cuda", "mps").
-                                    If None, `torch` will attempt to auto-detect. Defaults to None.
-        """
-        super().__init__(binding_name="whisper") # Not applicable
-        self.default_model_name = kwargs.get("model_name", "turbo")
-
-        if not _whisper_installed:
-            raise ImportError(f"Whisper STT binding dependencies not met. Please ensure 'openai-whisper' and 'torch' are installed. Error: {_whisper_installation_error}")
-
-        self.device = kwargs.get("device", None)
-        if self.device is None or self.device == "": # Auto-detect if not specified or empty
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available(): # For Apple Silicon
-                self.device = "mps"
-            else:
-                self.device = "cpu"
+    def __init__(self, **kwargs):
+        super().__init__(binding_name="whisper")
+        self.config = kwargs
+        self.host = kwargs.get("host", "localhost")
+        self.port = kwargs.get("port", 9633)
+        self.auto_start_server = kwargs.get("auto_start_server", False)
+        self.wait_for_server = kwargs.get("wait_for_server", False)
+        self.server_process = None
+        self.base_url = f"http://{self.host}:{self.port}"
+        self.binding_root = Path(__file__).parent
+        self.server_dir = self.binding_root / "server"
         
-        # Validate device string
-        if not self.device or self.device.strip() == "":
-            ASCIIColors.warning("Device was empty or invalid, defaulting to 'cpu'")
-            self.device = "cpu"
+        self.venv_dir = Path(kwargs.get("venv_path", "./venv/stt_whisper_venv")).resolve()
+        self.cache_dir = Path(kwargs.get("cache_dir", "./data/stt_models/whisper")).resolve()
         
-        ASCIIColors.info(f"WhisperSTTBinding: Using device '{self.device}'.")
+        self.venv_dir.mkdir(exist_ok=True, parents=True)
+        self.cache_dir.mkdir(exist_ok=True, parents=True)
         
-        self.loaded_model_name = None
-        self.model = None
+        if self.auto_start_server:
+            self.ensure_server_is_running(self.wait_for_server)
+
+    def is_server_running(self) -> bool:
         try:
-            self._load_whisper_model(kwargs.get("model_name", "turbo")) # Default to "turbo" if not specified
-        except Exception as e:
-            pass
-
-
-    def _get_whisper_cache_dir(self) -> Path:
-        """Get the Whisper cache directory."""
-        # Whisper uses the same cache location as specified in its code
-        cache_dir = os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-        return Path(cache_dir) / "whisper"
-
-    def _is_model_downloaded(self, model_name: str) -> bool:
-        """Check if a Whisper model is already downloaded and valid."""
-        cache_dir = self._get_whisper_cache_dir()
-        # Whisper models are stored as {model_name}.pt
-        model_file = cache_dir / f"{model_name}.pt"
-        
-        if not model_file.exists():
+            response = requests.get(f"{self.base_url}/status", timeout=4)
+            if response.status_code == 200 and response.json().get("status") == "running":
+                return True
+        except requests.exceptions.RequestException:
             return False
-        
-        # Check if file size is reasonable (at least 1MB to catch partial downloads)
+        return False
+
+    def _is_port_available(self, host: str, port: int) -> bool:
         try:
-            file_size = model_file.stat().st_size
-            if file_size < 1_000_000:  # Less than 1MB is likely corrupted
-                ASCIIColors.warning(f"Model file {model_file} appears corrupted (size: {file_size} bytes). Will re-download.")
-                return False
-        except Exception as e:
-            ASCIIColors.warning(f"Could not check model file size: {e}")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, port))
+                return True
+        except OSError:
             return False
-        
-        return True
 
-    def _load_whisper_model(self, model_name_to_load: str ="small"):
-        """Loads or reloads the Whisper model with file locking to prevent concurrent downloads."""
-        if model_name_to_load is None or model_name_to_load.lower()=="none":
-            model_name_to_load = "small"
-        
-        if model_name_to_load not in whisper.available_models():
-            ASCIIColors.warning(f"'{model_name_to_load}' is not a standard Whisper model size. Attempting to load anyway. Known sizes: {self.WHISPER_MODEL_SIZES}")
-
-        if self.model is not None and self.loaded_model_name == model_name_to_load:
-            ASCIIColors.info(f"Whisper model '{model_name_to_load}' already loaded.")
+    def ensure_server_is_running(self, wait=False):
+        ASCIIColors.info("Attempting to start or connect to the Whisper server...")
+        if self.is_server_running():
+            ASCIIColors.green("Whisper Server is already running and responsive.")
             return
 
-        # Get the cache directory and create lock file path
-        cache_dir = self._get_whisper_cache_dir()
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        lock_file = cache_dir / f"{model_name_to_load}.lock"
-        model_file = cache_dir / f"{model_name_to_load}.pt"
+        original_port = self.port
+        while not self._is_port_available(self.host, self.port):
+            ASCIIColors.warning(f"Port {self.port} is busy. Trying next port...")
+            self.port += 1
+            self.base_url = f"http://{self.host}:{self.port}"
 
-        ASCIIColors.info(f"Loading Whisper model: '{model_name_to_load}' on device '{self.device}'...")
+        if self.port != original_port:
+            ASCIIColors.info(f"Selected new port {self.port} for Whisper server.")
+
+        self.start_server(wait)
+
+    def install_server_dependencies(self):
+        ASCIIColors.info(f"Setting up virtual environment in: {self.venv_dir}")
+        pm_v = pm.PackageManager(venv_path=str(self.venv_dir), create_if_not_exist=True)
+
+        ASCIIColors.info(f"Installing server dependencies")
+        pm_v.ensure_packages(["requests", "uvicorn", "fastapi", "python-multipart", "filelock"])
+        pm_v.ensure_packages(["ascii_colors", "pipmaster"])
+        pm_v.ensure_packages(["tqdm", "numpy", "pillow"])
         
-        # Use file lock to prevent concurrent downloads
-        lock = filelock.FileLock(lock_file, timeout=300)  # 5 minute timeout
-        
-        try:
-            with lock:
-                # Check if model is already downloaded and valid
-                if self._is_model_downloaded(model_name_to_load):
-                    ASCIIColors.info(f"Model '{model_name_to_load}' already downloaded, loading from cache...")
-                else:
-                    ASCIIColors.info(f"Downloading model '{model_name_to_load}' (this process has the lock)...")
-                    # If model file exists but is corrupted, delete it first
-                    if model_file.exists():
-                        try:
-                            ASCIIColors.warning(f"Removing corrupted model file: {model_file}")
-                            model_file.unlink()
-                        except Exception as e:
-                            ASCIIColors.error(f"Could not remove corrupted model file: {e}")
-                
-                # Load the model (will download if not cached)
-                self.model = whisper.load_model(model_name_to_load, device=self.device)
-                self.loaded_model_name = model_name_to_load
-                self.model_name = model_name_to_load
-                ASCIIColors.green(f"Whisper model '{model_name_to_load}' loaded successfully.")
-                
-        except filelock.Timeout:
-            error_msg = f"Timeout waiting for model '{model_name_to_load}' download lock. Another process may be downloading."
-            ASCIIColors.error(error_msg)
-            self.model = None
-            self.loaded_model_name = None
-            raise RuntimeError(error_msg)
-        except Exception as e:
-            self.model = None
-            self.loaded_model_name = None
-            ASCIIColors.error(f"Failed to load Whisper model '{model_name_to_load}': {e}")
-            trace_exception(e)
-            # If loading failed, try to clean up potentially corrupted file
-            if model_file.exists():
-                try:
-                    ASCIIColors.warning(f"Cleaning up potentially corrupted model file after error...")
-                    model_file.unlink()
-                except Exception as cleanup_error:
-                    ASCIIColors.error(f"Could not clean up model file: {cleanup_error}")
-            raise RuntimeError(f"Failed to load Whisper model '{model_name_to_load}'") from e
-        finally:
-            # Clean up lock file if it exists and is not locked
+        ASCIIColors.info(f"Installing pytorch")
+        torch_index_url = None
+        if sys.platform == "win32":
             try:
-                if lock_file.exists() and not lock.is_locked:
-                    lock_file.unlink()
-            except Exception:
-                pass  # Ignore cleanup errors
+                result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
+                ASCIIColors.green("NVIDIA GPU detected. Installing CUDA-enabled PyTorch.")
+                torch_index_url = "https://download.pytorch.org/whl/cu126"
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                ASCIIColors.yellow("`nvidia-smi` not found or failed. Installing standard PyTorch.")
 
+        pm_v.ensure_packages(["torch", "torchaudio"], index_url=torch_index_url)
+        pm_v.ensure_packages(["openai-whisper"])
+        ASCIIColors.green("Server dependencies are satisfied.")
+
+    def start_server(self, wait: bool = True, timeout_s: int = 40):
+        def _start_server_background():
+            lock_path = self.venv_dir / "whisper_server.lock"
+            lock = FileLock(lock_path)
+
+            try:
+                with lock.acquire(timeout=0):
+                    server_script = self.server_dir / "main.py"
+                    venv_cfg = self.venv_dir / "pyvenv.cfg"
+
+                    if not venv_cfg.exists():
+                        ASCIIColors.warning("Invalid or missing virtual environment. Reinstalling...")
+                        self.install_server_dependencies()
+
+                    if sys.platform == "win32":
+                        python_executable = self.venv_dir / "Scripts" / "python.exe"
+                    else:
+                        python_executable = self.venv_dir / "bin" / "python"
+
+                    if not python_executable.exists():
+                        raise RuntimeError(f"Python executable not found in venv: {python_executable}.")
+
+                    command = [
+                        str(python_executable),
+                        str(server_script),
+                        "--host", self.host,
+                        "--port", str(self.port),
+                        "--cache-dir", str(self.cache_dir.resolve())
+                    ]
+
+                    log_file_path = self.cache_dir / "whisper_server.log"
+                    log_f = open(log_file_path, "w", encoding="utf-8")
+
+                    try:
+                        creationflags = 0
+                        if sys.platform == "win32":
+                            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+                        
+                        self.server_process = subprocess.Popen(
+                            command,
+                            stdout=log_f,
+                            stderr=subprocess.STDOUT,
+                            creationflags=creationflags
+                        )
+                    except Exception as popen_err:
+                        log_f.close()
+                        raise RuntimeError(f"Failed to execute subprocess: {popen_err}")
+                    finally:
+                        log_f.close()
+
+                    ASCIIColors.info(f"Whisper server launched on http://{self.host}:{self.port}")
+
+                    if wait:
+                        start_time = time.time()
+                        while True:
+                            if self.server_process.poll() is not None:
+                                error_tail = "No log data available."
+                                try:
+                                    with open(log_file_path, "r", encoding="utf-8", errors="ignore") as err_log:
+                                        lines = err_log.readlines()
+                                        error_tail = "".join(lines[-30:]) if lines else "Log file is empty."
+                                except Exception:
+                                    pass
+                                raise RuntimeError(
+                                    f"Whisper server process terminated unexpectedly with code {self.server_process.returncode}.\n"
+                                    f"--- Server Log Tail ---\n{error_tail}"
+                                )
+
+                            if self.is_server_running():
+                                ASCIIColors.success("Whisper server is ready.")
+                                return
+
+                            elapsed = time.time() - start_time
+                            if elapsed >= timeout_s:
+                                raise TimeoutError(f"Server failed to start within {timeout_s} seconds.")
+                            time.sleep(1)
+            except Exception as ex:
+                ASCIIColors.error(f"Failed to start Whisper server: {ex}")
+                raise
+
+        thread = threading.Thread(target=_start_server_background, daemon=True)
+        thread.start()
+        if wait:
+            thread.join()
+
+    def _post_json_request(self, endpoint: str, data: Optional[dict] = None) -> requests.Response:
+        try:
+            url = f"{self.base_url}{endpoint}"
+            response = requests.post(url, json=data, timeout=3600)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.error(f"Failed to communicate with Whisper server at {url}. Error: {e}")
+            if hasattr(e, 'response') and e.response:
+                try:
+                    err_detail = e.response.json().get('detail', e.response.text)
+                except json.JSONDecodeError:
+                    err_detail = e.response.text
+                ASCIIColors.error(f"Server response: {err_detail}")
+                raise RuntimeError(f"Whisper server error: {err_detail}") from e
+            raise RuntimeError("Communication with the Whisper server failed.") from e
+
+    def _get_request(self, endpoint: str, params: Optional[dict] = None) -> requests.Response:
+        try:
+            url = f"{self.base_url}{endpoint}"
+            response = requests.get(url, params=params, timeout=60)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.error(f"Failed to communicate with Whisper server at {url}.")
+            raise RuntimeError("Communication with the Whisper server failed.") from e
 
     def transcribe_audio(self, audio_source: Union[str, Path, bytes], model: Optional[str] = None, **kwargs) -> str:
-        """
-        Transcribes audio using Whisper.
+        if self.auto_start_server:
+            self.ensure_server_is_running(True)
+            
+        if not self.is_server_running() and not self.auto_start_server:
+             raise RuntimeError("Whisper server is not running and auto_start_server is False.")
 
-        Args:
-            audio_source (Union[str, Path, bytes]): Path to the audio file or raw audio bytes.
-            model (Optional[str]): The specific Whisper model size to use.
-                                  If None, uses the model loaded during initialization.
-            **kwargs: Additional parameters for Whisper's transcribe method, e.g.:
-                      `language` (str): Language code (e.g., "en", "fr"). If None, Whisper auto-detects.
-                      `fp16` (bool): Whether to use fp16, defaults to True if CUDA available.
-                      `task` (str): "transcribe" or "translate".
-
-        Returns:
-            str: The transcribed text.
-
-        Raises:
-            FileNotFoundError: If the audio file does not exist.
-            RuntimeError: If the Whisper model is not loaded or transcription fails.
-            Exception: For other errors during transcription.
-        """
-        if not self.model:
-            self._load_whisper_model(self.default_model_name)
-
-        temp_audio_file = None
         try:
             if isinstance(audio_source, (str, Path)):
                 audio_file = Path(audio_source)
                 if not audio_file.exists():
                     raise FileNotFoundError(f"Audio file not found at: {audio_source}")
+                with open(audio_file, "rb") as f:
+                    audio_bytes = f.read()
             elif isinstance(audio_source, bytes):
-                temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                temp_audio_file.write(audio_source)
-                temp_audio_file.close()
-                audio_file = Path(temp_audio_file.name)
+                audio_bytes = audio_source
             else:
                 raise ValueError("audio_source must be str, Path, or bytes")
 
-            if model and model != self.loaded_model_name:
-                ASCIIColors.info(f"Switching Whisper model to '{model}' for this transcription.")
-                try:
-                    self._load_whisper_model(model)
-                except RuntimeError as e:
-                    if self.model is None:
-                        raise RuntimeError(f"Failed to switch to Whisper model '{model}' and no model currently loaded.") from e
-                    else:
-                        ASCIIColors.warning(f"Failed to switch to Whisper model '{model}'. Using previously loaded model '{self.loaded_model_name}'. Error: {e}")
-
-            if self.model is None:
-                raise RuntimeError("Whisper model is not loaded. Cannot transcribe.")
-
-            # Prepare Whisper-specific options from kwargs
-            whisper_options = {}
-            if "language" in kwargs:
-                whisper_options["language"] = kwargs["language"]
-            if "fp16" in kwargs:
-                whisper_options["fp16"] = kwargs["fp16"]
-            else:
-                whisper_options["fp16"] = (self.device == "cuda")
-            if "task" in kwargs:
-                whisper_options["task"] = kwargs["task"]
-
-            ASCIIColors.info(f"Transcribing '{audio_file.name}' with Whisper model '{self.loaded_model_name}' (options: {whisper_options})...")
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
             
-            result = self.model.transcribe(str(audio_file), **whisper_options)
-            transcribed_text = result.get("text", "")
-            ASCIIColors.green("Transcription successful.")
-            return transcribed_text.strip()
-
+            payload = {
+                "audio_b64": audio_b64,
+                "model_name": model or self.config.get("model_name", "base"),
+                "language": kwargs.get("language"),
+                "task": kwargs.get("task", "transcribe"),
+                "fp16": kwargs.get("fp16")
+            }
+            
+            response = self._post_json_request("/transcribe", data=payload)
+            return response.json().get("text", "")
+            
         except Exception as e:
             ASCIIColors.error(f"Whisper transcription failed: {e}")
             trace_exception(e)
             raise Exception(f"Whisper transcription error: {e}") from e
-        finally:
-            if temp_audio_file:
-                Path(temp_audio_file.name).unlink(missing_ok=True)
 
     @staticmethod
     def list_models(**kwargs) -> List[str]:
-        """
-        Lists the available standard Whisper model sizes.
+        return ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3", "turbo"]
 
-        Args:
-            **kwargs: Additional parameters (currently unused).
-
-        Returns:
-            List[str]: A list of available Whisper model size identifiers.
-        """
-        return whisper.available_models() # Return a copy
+    def ps(self) -> List[dict]:
+        try:
+            return self._get_request("/ps").json()
+        except Exception:
+            return [{"error": "Could not connect to server to get process status."}]
 
     def __del__(self):
-        """Clean up: Unload the model to free resources."""
-        if self.model is not None:
-            del self.model
-            self.model = None
-            if torch and hasattr(torch, 'cuda') and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            ASCIIColors.info(f"WhisperSTTBinding for model '{self.loaded_model_name}' destroyed and resources released.")
-
-
-# --- Main Test Block (Example Usage) ---
-if __name__ == '__main__':
-    if not _whisper_installed:
-        print(f"{ASCIIColors.RED}Whisper dependencies not met. Skipping tests. Error: {_whisper_installation_error}{ASCIIColors.RESET}")
-        print(f"{ASCIIColors.YELLOW}Please ensure 'openai-whisper' and 'torch' are installed, and 'ffmpeg' is in your system PATH.{ASCIIColors.RESET}")
-        exit()
-
-    ASCIIColors.yellow("--- WhisperSTTBinding Test ---")
-    
-    # --- Prerequisites for testing ---
-    # 1. Create a dummy WAV file for testing, or provide a path to a real one.
-    #    You'll need `scipy` to create a dummy WAV easily, or use an external tool.
-    #    Let's assume a simple way to signal a missing test file.
-    test_audio_file = Path("test_audio_for_whisper.wav")
-    
-    # Try to create a dummy file if it doesn't exist (requires scipy)
-    if not test_audio_file.exists():
-        try:
-            import numpy as np
-            from scipy.io.wavfile import write as write_wav
-            samplerate = 44100; fs = 100
-            t = np.linspace(0., 1., samplerate)
-            amplitude = np.iinfo(np.int16).max
-            data = amplitude * np.sin(2. * np.pi * fs * t)
-            write_wav(test_audio_file, samplerate, data.astype(np.int16))
-            ASCIIColors.green(f"Created dummy audio file: {test_audio_file}")
-        except ImportError:
-            ASCIIColors.warning(f"SciPy not installed. Cannot create dummy audio file.")
-            ASCIIColors.warning(f"Please place a '{test_audio_file.name}' in the current directory or modify the path.")
-        except Exception as e_dummy_audio:
-            ASCIIColors.error(f"Could not create dummy audio file: {e_dummy_audio}")
-
-
-    if not test_audio_file.exists():
-        ASCIIColors.error(f"Test audio file '{test_audio_file}' not found. Skipping transcription test.")
-    else:
-        try:
-            ASCIIColors.cyan("\n--- Initializing WhisperSTTBinding (model: 'tiny') ---")
-            # Using 'tiny' model for faster testing. Change to 'turbo' or 'small' for better quality.
-            stt_binding = WhisperSTTBinding(model_name="tiny")
-
-            ASCIIColors.cyan("\n--- Listing available Whisper models ---")
-            models = stt_binding.list_models()
-            print(f"Available models: {models}")
-
-            ASCIIColors.cyan(f"\n--- Transcribing '{test_audio_file.name}' with 'tiny' model ---")
-            transcription = stt_binding.transcribe_audio(test_audio_file)
-            print(f"Transcription (tiny): '{transcription}'")
-
-            # Test with a specific language hint (if your audio is not English or for robustness)
-            # ASCIIColors.cyan(f"\n--- Transcribing '{test_audio_file.name}' with 'tiny' model and language hint 'en' ---")
-            # transcription_lang_hint = stt_binding.transcribe_audio(test_audio_file, language="en")
-            # print(f"Transcription (tiny, lang='en'): '{transcription_lang_hint}'")
-
-            # Test switching model dynamically (optional, will re-download/load if different)
-            # ASCIIColors.cyan(f"\n--- Transcribing '{test_audio_file.name}' by switching to 'turbo' model ---")
-            # transcription_base = stt_binding.transcribe_audio(test_audio_file, model="turbo")
-            # print(f"Transcription (turbo): '{transcription_base}'")
-
-
-        except ImportError as e_imp:
-            ASCIIColors.error(f"Import error during test: {e_imp}")
-            ASCIIColors.info("This might be due to `openai-whisper` or `torch` not being installed correctly.")
-        except FileNotFoundError as e_fnf:
-            ASCIIColors.error(f"File not found during test: {e_fnf}")
-        except RuntimeError as e_rt:
-            ASCIIColors.error(f"Runtime error during test (often model load or ffmpeg issue): {e_rt}")
-            if "ffmpeg" in str(e_rt).lower():
-                ASCIIColors.yellow("This error often means 'ffmpeg' is not installed or not found in your system's PATH.")
-                ASCIIColors.yellow("Please install ffmpeg: https://ffmpeg.org/download.html")
-        except Exception as e:
-            ASCIIColors.error(f"An unexpected error occurred during testing: {e}")
-            trace_exception(e)
-        finally:
-            # Clean up dummy audio file if we created it for this test
-            # (Be careful if you are using a real test_audio_file you want to keep)
-            # if "samplerate" in locals() and test_audio_file.exists(): # Simple check if we likely created it
-            #     try:
-            #         os.remove(test_audio_file)
-            #         ASCIIColors.info(f"Removed dummy audio file: {test_audio_file}")
-            #     except Exception as e_del:
-            #         ASCIIColors.warning(f"Could not remove dummy audio file {test_audio_file}: {e_del}")
-            pass # For this example, let's not auto-delete. User can manage it.
-
-
-    ASCIIColors.yellow("\n--- WhisperSTTBinding Test Finished ---")
+        pass
