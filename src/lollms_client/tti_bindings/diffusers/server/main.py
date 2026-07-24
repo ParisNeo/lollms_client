@@ -1066,7 +1066,13 @@ class ModelManager:
                     with torch.no_grad():
                         output = self.pipeline(**filtered_args)
 
+                    if output is None or not hasattr(output, "images") or not output.images:
+                        raise RuntimeError("Diffusers pipeline returned no output or empty images list. This may indicate a silent pipeline failure (e.g., NaN loss).")
+
                     pil = output.images[0]
+                    if pil is None:
+                        raise RuntimeError("Diffusers pipeline returned None as the first image. Check model compatibility and parameters.")
+
                     buf = BytesIO()
                     pil.save(buf, format="PNG")
                     future.set_result(buf.getvalue())
