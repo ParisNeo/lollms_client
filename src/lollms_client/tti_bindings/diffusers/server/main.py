@@ -900,11 +900,12 @@ class ModelManager:
         )
 
     def _load_pipeline_for_task(self, task: str):
-        if self.pipeline and self.current_task == task:
+        if self.pipeline is not None and self.current_task == task and self.is_loaded:
             return
-        if self.pipeline:
+        if self.pipeline is not None:
             self._unload_pipeline()
 
+        last_exc = ""
         model_name = self.config.get("model_name", "")
         if not model_name:
             raise ValueError("Model name cannot be empty for loading.")
@@ -927,9 +928,10 @@ class ModelManager:
         try:
             self._execute_load_pipeline(task, model_path, torch_dtype)
             return
-        except Exception as e:
-            if "out of memory" not in str(e).lower() or not hasattr(self, 'registry'):
-                raise e
+        except Exception as oom_error:
+            last_exc = oom_error
+            if "out of memory" not in str(oom_error).lower() or not hasattr(self, 'registry'):
+                raise
 
         ASCIIColors.warning(f"Failed to load '{model_name}' due to OOM. Attempting to unload other models to free VRAM.")
         candidates = sorted(
@@ -939,7 +941,7 @@ class ModelManager:
         if not candidates:
             raise Exception("OOM error, but no other models are available to unload.")
 
-        last_exc = e
+        
         for victim in candidates:
             ASCIIColors.info(f"Unloading '{victim.config['model_name']}' to free VRAM.")
             victim._unload_pipeline()
@@ -953,7 +955,8 @@ class ModelManager:
                     raise retry_e
 
         raise last_exc
-
+    
+    
     def _unload_pipeline(self):
         if self.pipeline:
             model_name = self.config.get('model_name', 'Unknown')
