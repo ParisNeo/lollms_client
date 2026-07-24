@@ -478,33 +478,7 @@ class ModelManager:
             except Exception as e:
                 ASCIIColors.warning(f"Could not switch scheduler to {scheduler_name_key}: {e}. Using current default.")
 
-    # ------------------------------------------------------------------
-    # Quantization config builder
-    # ------------------------------------------------------------------
     def _build_quant_config(self) -> "Optional[Any]":
-        """
-        Build a PipelineQuantizationConfig from the simple quant_backend /
-        quant_level / quant_components settings stored in self.config.
-
-        Returns None if quantization is disabled or the required libraries
-        are not installed, so callers can safely pass it as
-        ``quantization_config=self._build_quant_config()`` and it will be
-        silently ignored when None.
-
-        Backend reference
-        -----------------
-        bitsandbytes_4bit  – NF4/FP4, ~50 % VRAM reduction, requires bitsandbytes
-        bitsandbytes_8bit  – INT8,     ~30 % VRAM reduction, requires bitsandbytes
-        quanto             – INT8/INT4/FP8, CPU+MPS friendly, requires optimum-quanto
-        torchao            – INT8/INT4/FP8, torch.compile-friendly, requires torchao
-        gguf               – load pre-quantised .gguf transformer files (Q8_0 … Q2_K)
-
-        Per-family smart defaults (when quant_components is None)
-        ---------------------------------------------------------
-        FLUX/FLUX2 models: quantize ["transformer", "text_encoder_2"]  (T5 is huge)
-        Qwen models      : quantize ["transformer", "text_encoder"]
-        Everything else  : quantize ["transformer"]
-        """
         backend = self.config.get("quant_backend")
         if not backend:
             return None
@@ -517,12 +491,11 @@ class ModelManager:
             return None
 
         level      = self.config.get("quant_level")
-        components = self.config.get("quant_components")  # may be None → auto
+        components = self.config.get("quant_components")
         model_name = self.config.get("model_name", "")
         family = _model_family(model_name)
         torch_dtype = TORCH_DTYPE_MAP_STR_TO_OBJ.get(self.config.get("torch_dtype_str", "bfloat16"), torch.bfloat16)
 
-        # ── smart component defaults ────────────────────────────────────────────
         if components is None:
             if family in {"flux", "flux_kontext", "flux2_klein", "flux2_dev", "flux_fill", "flux_redux"}:
                 components = ["transformer", "text_encoder_2"]
@@ -531,13 +504,7 @@ class ModelManager:
             else:
                 components = ["transformer"]
 
-        # ── Text-encoder components usually come from Transformers, not Diffusers,
-        #    so they need TransformersBnBConfig rather than DiffusersBnBConfig.
-        #    We build a quant_mapping so we can mix backends when needed.
-        # ──────────────────────────────────────────────────────────────────────────
-
         try:
-            # ── bitsandbytes ──────────────────────────────────────────────────────
             if backend in ("bitsandbytes_4bit", "bitsandbytes_8bit"):
                 if DiffusersBnBConfig is None:
                     raise ImportError("bitsandbytes not installed. Run: pip install bitsandbytes")
@@ -551,7 +518,6 @@ class ModelManager:
                         bnb_4bit_use_double_quant=True,
                     )
                     transformer_cfg = diffusers_cfg
-                    # Text encoders must use the Transformers BnB config
                     te_cfg = None
                     if TransformersBnBConfig is not None:
                         te_cfg = TransformersBnBConfig(
@@ -560,12 +526,11 @@ class ModelManager:
                             bnb_4bit_compute_dtype=torch_dtype,
                             bnb_4bit_use_double_quant=True,
                         )
-                else:  # bitsandbytes_8bit
+                else:
                     diffusers_cfg = DiffusersBnBConfig(load_in_8bit=True)
                     transformer_cfg = diffusers_cfg
                     te_cfg = TransformersBnBConfig(load_in_8bit=True) if TransformersBnBConfig else None
 
-                # Build per-component mapping so text-encoders use the right class
                 te_component_names = {"text_encoder", "text_encoder_2", "text_encoder_3"}
                 quant_mapping = {}
                 for comp in components:
@@ -577,7 +542,6 @@ class ModelManager:
                 ASCIIColors.info(f"Quantization: {backend} ({bnb_type if backend=='bitsandbytes_4bit' else 'int8'}) on {list(quant_mapping.keys())}")
                 return PipelineQuantizationConfig(quant_mapping=quant_mapping)
 
-            # ── quanto ────────────────────────────────────────────────────────────
             elif backend == "quanto":
                 if DiffusersQuantoConfig is None:
                     raise ImportError("optimum-quanto not installed. Run: pip install optimum-quanto")
@@ -586,7 +550,6 @@ class ModelManager:
                 ASCIIColors.info(f"Quantization: quanto {dtype} on {components}")
                 return PipelineQuantizationConfig(quant_mapping=quant_mapping)
 
-            # ── torchao ───────────────────────────────────────────────────────────
             elif backend == "torchao":
                 if DiffusersTorchAoConfig is None:
                     raise ImportError("torchao not installed. Run: pip install torchao")
@@ -595,13 +558,7 @@ class ModelManager:
                 ASCIIColors.info(f"Quantization: torchao {dtype_str} on {components}")
                 return PipelineQuantizationConfig(quant_mapping=quant_mapping)
 
-            # ── gguf ──────────────────────────────────────────────────────────────
             elif backend == "gguf":
-                # GGUF quantizes only the transformer; it must be loaded via
-                # from_single_file with a GGUFQuantizationConfig on the model
-                # component, not via PipelineQuantizationConfig.
-                # We return a sentinel dict instead so _execute_load_pipeline
-                # can handle it in the GGUF-specific branch.
                 if DiffusersGGUFConfig is None:
                     raise ImportError("gguf not installed. Run: pip install gguf")
                 gguf_dtype_str = level or "Q8_0"
@@ -616,27 +573,18 @@ class ModelManager:
             ASCIIColors.error(f"Quantization backend '{backend}' unavailable: {e}")
             return None
 
-    # ------------------------------------------------------------------
-    # Core loader — branched by model family
-    # ------------------------------------------------------------------
     def _load_gguf_pipeline(self, model_name: str, model_path: Union[str, Path], quant_cfg: Dict[str, Any]):
-        """
-        Loads a GGUF model (such as a GGUF transformer) and integrates it into a standard pipeline.
-        """
         import torch
         from diffusers import GGUFQuantizationConfig
 
-        # ── Monkeypatch the Diffusers conversion function to prevent KeyErrors on pruned models (like FLUX.2 Klein) ──
         import diffusers.loaders.single_file_utils as sfu
         import diffusers.loaders.single_file_model as sfm
 
-        # Get original reference
         original_convert_fn = sfu.convert_flux_transformer_checkpoint_to_diffusers
 
         def patched_convert_fn(checkpoint, *args, **kwargs):
             ASCIIColors.info("[SafeDict] Intercepting GGUF checkpoint conversion with SafeDict wrapper.")
             
-            # --- Dynamic Dimension Adaptor on torch.split ---
             original_torch_split = torch.split
 
             def patched_torch_split(tensor, split_size_or_sections, dim=0, *args_split, **kwargs_split):
@@ -653,7 +601,6 @@ class ModelManager:
                         split_size_or_sections = tuple(new_sizes)
                 return original_torch_split(tensor, split_size_or_sections, dim=dim, *args_split, **kwargs_split)
 
-            # Apply localized hook to python torch module
             safe_checkpoint = SafeDict(checkpoint)
             original_split_ref = torch.split
             torch.split = patched_torch_split
@@ -663,19 +610,15 @@ class ModelManager:
             try:
                 return original_convert_fn(safe_checkpoint, *args, **kwargs)
             finally:
-                # Always restore original methods
                 torch.split = original_split_ref
                 if hasattr(sfu, "torch"):
                     sfu.torch.split = original_split_ref
 
-        # 1. Patch single_file_utils namespace
         sfu.convert_flux_transformer_checkpoint_to_diffusers = patched_convert_fn
 
-        # 2. Patch single_file_model namespace
         if hasattr(sfm, "convert_flux_transformer_checkpoint_to_diffusers"):
             sfm.convert_flux_transformer_checkpoint_to_diffusers = patched_convert_fn
 
-        # 3. Patch the SINGLE_FILE_LOADABLE_CLASSES dictionary by name or partial name match
         patched_count = 0
         if hasattr(sfm, "SINGLE_FILE_LOADABLE_CLASSES") and isinstance(sfm.SINGLE_FILE_LOADABLE_CLASSES, dict):
             for key, val in sfm.SINGLE_FILE_LOADABLE_CLASSES.items():
@@ -693,12 +636,10 @@ class ModelManager:
         if patched_count == 0:
             ASCIIColors.warning("[SafeDict] Warning: No matching loader class was found in SINGLE_FILE_LOADABLE_CLASSES to patch.")
 
-        # Resolve local GGUF file path
         gguf_file = Path(model_path)
         if gguf_file.exists() and gguf_file.is_dir():
             gguf_files = list(gguf_file.glob("*.gguf"))
             if gguf_files:
-                # Prioritize GGUF file matching our selected quantization level
                 gguf_level = quant_cfg.get("gguf_level", "Q4_K_M")
                 level_match = [f for f in gguf_files if gguf_level.lower() in f.name.lower()]
                 gguf_file = level_match[0] if level_match else gguf_files[0]
@@ -712,7 +653,6 @@ class ModelManager:
         compute_dtype = quant_cfg.get("compute_dtype", torch.bfloat16)
         family = _model_family(model_name)
 
-        # ── Determine Base Shell & Config Repository Early ──
         base_shell = self.config.get("gguf_base_shell")
         if not base_shell:
             if "klein" in model_name.lower():
@@ -730,7 +670,6 @@ class ModelManager:
             else:
                 base_shell = "black-forest-labs/FLUX.1-dev"
 
-        # Determine config repository dynamically to allow custom gated-bypass shells or fallback to base_shell
         gguf_config_shell = self.config.get("gguf_config_shell") or base_shell
         gguf_subfolder = self.config.get("gguf_subfolder") or "transformer"
 
@@ -745,7 +684,6 @@ class ModelManager:
         if hf_token:
             load_params_single["token"] = hf_token
 
-        # Resolve the correct Model Class for GGUF loading
         if family == "qwen":
             try:
                 from diffusers import QwenImageTransformer2DModel
@@ -757,7 +695,6 @@ class ModelManager:
             from diffusers import FluxTransformer2DModel
             model_class = FluxTransformer2DModel
 
-        # Load GGUF Transformer natively using the correct class
         transformer = model_class.from_single_file(
             str(gguf_file),
             **load_params_single
@@ -776,7 +713,6 @@ class ModelManager:
         if not self.config["safety_checker_on"]:
             load_params["safety_checker"] = None
 
-        # Resolve Pipeline Class
         if family == "qwen":
             try:
                 from diffusers import QwenImageEditPlusPipeline
@@ -798,7 +734,6 @@ class ModelManager:
         family = _model_family(model_name)
         use_device_map = False
 
-        # ── Shared HF load parameters ───────────────────────────────────────────
         base_params: Dict[str, Any] = {"torch_dtype": torch_dtype}
         if self.config.get("hf_cache_path"):
             base_params["cache_dir"] = str(self.config["hf_cache_path"])
@@ -814,22 +749,18 @@ class ModelManager:
         if not self.config["safety_checker_on"]:
             hf_params["safety_checker"] = None
 
-        # ── Quantization ──────────────────────────────────────────────────────
         quant_cfg = self._build_quant_config()
         _is_gguf_quant = isinstance(quant_cfg, dict) and quant_cfg.get("_gguf")
         if quant_cfg is not None and not _is_gguf_quant:
             hf_params["quantization_config"] = quant_cfg
-            # quantized models must use device_map; disable manual .to() later
             use_device_map = True
             hf_params.setdefault("device_map", "auto")
 
         try:
-            # ── GGUF Quantization override (Must happen first!) ──
             if _is_gguf_quant:
                 self._load_gguf_pipeline(model_name, model_path, quant_cfg)
                 use_device_map = False
 
-            # ── FLUX.1 Kontext ────────────────────────────────────────────────────
             elif family == "flux_kontext":
                 if FluxKontextPipeline is None:
                     raise ImportError("FluxKontextPipeline not available. Upgrade diffusers: pip install git+https://github.com/huggingface/diffusers.git")
@@ -840,7 +771,6 @@ class ModelManager:
                     hf_params["device_map"] = "balanced"
                 self.pipeline = FluxKontextPipeline.from_pretrained(model_name, **hf_params)
 
-            # ── FLUX.2 Klein ──────────────────────────────────────────────────────
             elif family == "flux2_klein":
                 if Flux2KleinPipeline is None:
                     raise ImportError("Flux2KleinPipeline not available. Upgrade diffusers: pip install git+https://github.com/huggingface/diffusers.git")
@@ -851,7 +781,6 @@ class ModelManager:
                     hf_params["device_map"] = "balanced"
                 self.pipeline = Flux2KleinPipeline.from_pretrained(model_name, **hf_params)
 
-            # ── FLUX.2 Dev ────────────────────────────────────────────────────────
             elif family == "flux2_dev":
                 if Flux2Pipeline is None:
                     raise ImportError("Flux2Pipeline not available. Upgrade diffusers: pip install git+https://github.com/huggingface/diffusers.git")
@@ -862,7 +791,6 @@ class ModelManager:
                     hf_params["device_map"] = "balanced"
                 self.pipeline = Flux2Pipeline.from_pretrained(model_name, **hf_params)
 
-            # ── FLUX.1 Fill (dedicated inpainting) ────────────────────────────────
             elif family == "flux_fill":
                 if FluxFillPipeline is None:
                     raise ImportError("FluxFillPipeline not available. Upgrade diffusers: pip install git+https://github.com/huggingface/diffusers.git")
@@ -873,7 +801,6 @@ class ModelManager:
                     hf_params["device_map"] = "balanced"
                 self.pipeline = FluxFillPipeline.from_pretrained(model_name, **hf_params)
 
-            # ── FLUX.1 Redux (image variation) ────────────────────────────────────
             elif family == "flux_redux":
                 if FluxPriorReduxPipeline is None:
                     raise ImportError("FluxPriorReduxPipeline not available. Upgrade diffusers: pip install git+https://github.com/huggingface/diffusers.git")
@@ -884,7 +811,6 @@ class ModelManager:
                     hf_params["device_map"] = "balanced"
                 self.pipeline = FluxPriorReduxPipeline.from_pretrained(model_name, **hf_params)
 
-            # ── Generic FLUX (Schnell / Dev via AutoPipeline) ─────────────────────
             elif family == "flux":
                 ASCIIColors.info(f"Loading generic FLUX pipeline for '{model_name}'.")
                 should_offload = self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]
@@ -893,7 +819,6 @@ class ModelManager:
                     hf_params["device_map"] = "balanced"
                 self.pipeline = AutoPipelineForText2Image.from_pretrained(model_name, **hf_params)
 
-            # ── Qwen Image Edit ───────────────────────────────────────────────────
             elif family == "qwen":
                 ASCIIColors.info(f"Loading Qwen Image Edit pipeline for '{model_name}'.")
                 should_offload = self.config["enable_cpu_offload"] or self.config["enable_sequential_cpu_offload"]
@@ -908,9 +833,7 @@ class ModelManager:
                 else:
                     self.pipeline = DiffusionPipeline.from_pretrained(model_name, **hf_params)
 
-            # ── Standard (SDXL, SD1.5, etc.) ─────────────────────────────────────
             else:
-                # ── GGUF path: load pre-quantised transformer .gguf + pipeline shell
                 if _is_gguf_quant:
                     self._load_gguf_pipeline(model_name, model_path, quant_cfg)
                     use_device_map = False
@@ -986,7 +909,6 @@ class ModelManager:
         if not model_name:
             raise ValueError("Model name cannot be empty for loading.")
 
-        # Ensure device and dtype are resolved before loading
         if self.config.get("device", "auto").lower() == "auto":
             if torch.cuda.is_available():
                 self.config["device"] = "cuda"
@@ -995,7 +917,6 @@ class ModelManager:
             else:
                 self.config["device"] = "cpu"
 
-        # Resolve dtype if auto
         if self.config.get("torch_dtype_str", "auto").lower() == "auto":
             self.config["torch_dtype_str"] = "float16" if self.config["device"] != "cpu" else "float32"
 
@@ -1058,7 +979,9 @@ class ModelManager:
                     with self.lock:
                         self.last_used_time = time.time()
                         if not self.is_loaded or self.current_task != task:
+                            ASCIIColors.info(f"Worker: Model not loaded or task changed. Triggering load for task {task}...")
                             self._load_pipeline_for_task(task)
+                            ASCIIColors.info(f"Worker: Load sequence finished. is_loaded={self.is_loaded}")
 
                     if self.supported_args:
                         filtered_args = {k: v for k, v in pipeline_args.items() if k in self.supported_args}
@@ -1066,7 +989,6 @@ class ModelManager:
                         ASCIIColors.warning("Supported argument set not found. Using unfiltered arguments.")
                         filtered_args = pipeline_args
 
-                    # Enhanced logging before generation
                     log_args = {k: v for k, v in filtered_args.items() if k not in ['generator', 'image', 'mask_image']}
                     if filtered_args.get("generator"):
                         gen = filtered_args["generator"]
@@ -1110,7 +1032,6 @@ class ModelManager:
                         torch.cuda.empty_cache()
             except queue.Empty:
                 continue
-
 class PipelineRegistry:
     _instance = None
     _lock = threading.Lock()
@@ -1437,12 +1358,15 @@ async def generate_image(request: T2IRequest):
 
         pipeline_args["generator"] = None
         if seed != -1:
-            pipeline_args["generator"] = torch.Generator(device=manager.config["device"]).manual_seed(seed)
+            try:
+                pipeline_args["generator"] = torch.Generator(device=manager.config["device"]).manual_seed(seed)
+            except Exception as gen_e:
+                ASCIIColors.warning(f"Failed to create generator on device '{manager.config['device']}'. Falling back to CPU. Error: {gen_e}")
+                pipeline_args["generator"] = torch.Generator(device="cpu").manual_seed(seed)
 
         model_name = manager.config.get("model_name", "")
         family = _model_family(model_name)
 
-        # Route to new-gen enricher or legacy Qwen special-casing
         if family in {"flux_kontext", "flux2_klein", "flux2_dev", "flux_fill", "flux_redux", "flux"}:
             task = _enrich_args_for_family(family, pipeline_args, [], seed, manager)
         elif "Qwen-Image-Edit" in model_name:
@@ -1477,8 +1401,8 @@ async def generate_image(request: T2IRequest):
         if temp_config and manager:
             state.registry.release_manager(temp_config)
             ASCIIColors.info(f"Released per-request model: {temp_config['model_name']}")
-
-
+            
+            
 @router.post("/edit_image")
 async def edit_image(request: EditRequestJSON):
     manager = None
