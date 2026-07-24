@@ -342,10 +342,17 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             ASCIIColors.error(f"HTTP Error from Diffusers server at {url}.")
             if hasattr(e, 'response') and e.response is not None:
                 try:
-                    err_detail = e.response.json().get('detail', e.response.text)
+                    err_data = e.response.json()
+                    err_detail = err_data.get('detail', e.response.text)
+
+                    if isinstance(err_detail, dict) and 'traceback' in err_detail:
+                        ASCIIColors.error(f"Server Traceback:\n{err_detail['traceback']}")
+                        ASCIIColors.error(f"Server Error Detail: {err_detail.get('message', 'Unknown error')}")
+                    else:
+                        ASCIIColors.error(f"Server response detail: {err_detail}")
                 except json.JSONDecodeError:
                     err_detail = e.response.text
-                ASCIIColors.error(f"Server response detail: {err_detail}")
+                    ASCIIColors.error(f"Server response detail: {err_detail}")
                 raise RuntimeError(f"Diffusers server error: {err_detail}") from e
             raise RuntimeError("Communication with the Diffusers server failed.") from e
         except requests.exceptions.RequestException as e:
