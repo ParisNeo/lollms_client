@@ -1066,6 +1066,25 @@ class ModelManager:
                         ASCIIColors.warning("Supported argument set not found. Using unfiltered arguments.")
                         filtered_args = pipeline_args
 
+                    # Enhanced logging before generation
+                    log_args = {k: v for k, v in filtered_args.items() if k not in ['generator', 'image', 'mask_image']}
+                    if filtered_args.get("generator"):
+                        gen = filtered_args["generator"]
+                        log_args["generator"] = f"torch.Generator(device={gen.device}, seed={gen.initial_seed()})"
+                    if 'image' in filtered_args:
+                        log_args['image'] = f"[<{len(filtered_args['image']) if isinstance(filtered_args['image'], list) else 1} PIL Image(s)>]"
+                    if filtered_args.get("mask_image"):
+                        log_args['mask_image'] = "<PIL Mask Image>"
+                    
+                    ASCIIColors.cyan(f"--- Executing Generation ---")
+                    ASCIIColors.cyan(f"Model: {self.config.get('model_name', 'Unknown')}")
+                    ASCIIColors.cyan(f"Task: {task}")
+                    try:
+                        print(json.dumps(log_args, indent=2, default=str))
+                    except Exception:
+                        print(log_args)
+                    ASCIIColors.cyan("----------------------------")
+
                     with torch.no_grad():
                         output = self.pipeline(**filtered_args)
 
@@ -1091,7 +1110,6 @@ class ModelManager:
                         torch.cuda.empty_cache()
             except queue.Empty:
                 continue
-
 
 class PipelineRegistry:
     _instance = None
