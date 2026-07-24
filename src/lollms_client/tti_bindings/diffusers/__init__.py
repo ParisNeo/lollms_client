@@ -5,6 +5,7 @@ import requests
 import subprocess
 import time
 import json
+import threading
 from io import BytesIO
 from pathlib import Path
 from ascii_colors import trace_exception
@@ -218,6 +219,7 @@ class DiffusersTTIBinding(LollmsTTIBinding):
 
                     command = [
                         str(python_executable),
+                        "-u",
                         str(server_script),
                         "--host", self.host,
                         "--port", str(self.port),
@@ -240,10 +242,13 @@ class DiffusersTTIBinding(LollmsTTIBinding):
                     log_f = open(log_file_path, "w", encoding="utf-8")
 
                     try:
+                        env = os.environ.copy()
+                        env["PYTHONUNBUFFERED"] = "1"
                         self.server_process = subprocess.Popen(
                             command,
                             stdout=log_f,
-                            stderr=subprocess.STDOUT
+                            stderr=subprocess.STDOUT,
+                            env=env
                         )
                     except Exception as popen_err:
                         log_f.close()
@@ -333,16 +338,19 @@ class DiffusersTTIBinding(LollmsTTIBinding):
             response = requests.post(url, json=data, timeout=3600) # Long timeout for generation
             response.raise_for_status()
             return response
-        except requests.exceptions.RequestException as e:
-            ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
-            ASCIIColors.error(f"Error details: {e}")
-            if hasattr(e, 'response') and e.response:
+        except requests.exceptions.HTTPError as e:
+            ASCIIColors.error(f"HTTP Error from Diffusers server at {url}.")
+            if hasattr(e, 'response') and e.response is not None:
                 try:
                     err_detail = e.response.json().get('detail', e.response.text)
                 except json.JSONDecodeError:
                     err_detail = e.response.text
-                ASCIIColors.error(f"Server response: {err_detail}")
+                ASCIIColors.error(f"Server response detail: {err_detail}")
                 raise RuntimeError(f"Diffusers server error: {err_detail}") from e
+            raise RuntimeError("Communication with the Diffusers server failed.") from e
+        except requests.exceptions.RequestException as e:
+            ASCIIColors.error(f"Failed to communicate with Diffusers server at {url}.")
+            ASCIIColors.error(f"Error details: {e}")
             raise RuntimeError("Communication with the Diffusers server failed.") from e
 
     def _post_multipart_request(self, endpoint: str, data: Optional[dict] = None, files: Optional[list] = None) -> requests.Response:
