@@ -2926,6 +2926,12 @@ class ChatMixin:
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
+                    # ── ⏱️ TIME TO FIRST TOKEN (TTFT) ──
+                    if not getattr(self, "_ttft_logged", True) and chunk:
+                        ttft = _time.perf_counter() - _t_gen_start
+                        ASCIIColors.info(f"[TTFT] First token received in {ttft:.3f} s.")
+                        object.__setattr__(self, "_ttft_logged", True)
+
                     if meta and meta.get("was_processed"):
                         return True
                     return ss.feed(chunk)
@@ -2934,9 +2940,33 @@ class ChatMixin:
             # Sanitize kwargs to prevent duplicate argument passing
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "stream")}
 
+            # ── 📊 CONTEXT FILL TELEMETRY ──
+            try:
+                total_tokens = 0
+                if self.lollmsClient and hasattr(self.lollmsClient, "count_tokens"):
+                    for msg in messages_list:
+                        content = msg.get("content", "") if isinstance(msg, dict) else ""
+                        if isinstance(content, str):
+                            total_tokens += self.lollmsClient.count_tokens(content)
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    total_tokens += self.lollmsClient.count_tokens(part.get("text", ""))
+
+                max_ctx = 4096
+                if self.lollmsClient and hasattr(self.lollmsClient, "get_ctx_size"):
+                    max_ctx = self.lollmsClient.get_ctx_size() or max_ctx
+
+                if max_ctx > 0:
+                    fill_pct = (total_tokens / max_ctx) * 100.0
+                    ASCIIColors.info(f"[Context] Round {round_count} fill: {total_tokens}/{max_ctx} tokens ({fill_pct:.1f}%)")
+            except Exception as ctx_err:
+                ASCIIColors.warning(f"[Context] Failed to calculate context fill: {ctx_err}")
+
             # Execute generation turn (streams and appends to the existing ai_msg.content directly)
             ASCIIColors.info(f"[Trace] Starting generation for round {round_count}...")
             _t_gen_start = _time.perf_counter()
+            object.__setattr__(self, "_ttft_logged", False)
             try:
                 self.lollmsClient.generate_from_messages(
                     messages=messages_list,
