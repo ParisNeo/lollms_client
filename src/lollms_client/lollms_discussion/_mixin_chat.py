@@ -2809,9 +2809,13 @@ class ChatMixin:
             ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
 
         # ── 8. Active Deliberation Loop ──
+        import time as _chat_time
+        _t_branch_start = _chat_time.perf_counter()
         ASCIIColors.info("[Trace] Retrieving conversation branch...")
         current_branch_tip = branch_tip_id or self.active_branch_id
         branch = self.get_branch(current_branch_tip)
+        _t_branch_end = _chat_time.perf_counter()
+        ASCIIColors.info(f"[Trace] Branch retrieved in {(_t_branch_end - _t_branch_start)*1000:.2f} ms ({len(branch)} messages).")
 
         # ── 🧠 VIRTUAL HISTORY & KV-CACHE PROTOCOL ──
         # 1. `virtual_history` is managed by `export()` in `UtilsMixin`.
@@ -2953,6 +2957,8 @@ class ChatMixin:
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "stream")}
 
             # Execute generation turn (streams and appends to the existing ai_msg.content directly)
+            ASCIIColors.info(f"[Trace] Starting generation for round {round_count}...")
+            _t_gen_start = _time.perf_counter()
             try:
                 self.lollmsClient.generate_from_messages(
                     messages=messages_list,
@@ -2962,7 +2968,11 @@ class ChatMixin:
                     streaming_callback=_inline_relay,
                     **gen_kwargs
                 )
+                _t_gen_end = _time.perf_counter()
+                ASCIIColors.info(f"[Trace] Generation round {round_count} stream completed in {(_t_gen_end - _t_gen_start):.2f} s.")
             except Exception as gen_err:
+                _t_gen_end = _time.perf_counter()
+                ASCIIColors.warning(f"[Trace] Generation round {round_count} failed after {(_t_gen_end - _t_gen_start):.2f} s.")
                 if self.is_generation_cancelled():
                     was_cancelled = True
                     break
