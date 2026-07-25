@@ -79,17 +79,10 @@ def tool_execute_sql_query(
             engine = create_engine(connection_url)
             tables = inspect(engine).get_table_names()
 
-            # Use raw DBAPI2 connection for pandas compatibility.
-            # pd.read_sql_query with SQLAlchemy 2.0 Engine/Connection objects fails
-            # with "'Engine' object has no attribute 'cursor'" or
-            # "'Connection' object has no attribute 'cursor'".
-            # engine.raw_connection() returns a raw DBAPI2 connection (sqlite3.Connection)
-            # which pandas handles natively with plain string queries.
-            raw_conn = engine.raw_connection()
-            for table in tables:
-                df = pd.read_sql_query(f'SELECT * FROM "{table}"', raw_conn)
-                df.to_sql(table, conn, index=False, if_exists="replace")
-            raw_conn.close()
+            with engine.connect() as connection:
+                for table in tables:
+                    df = pd.read_sql_query(f'SELECT * FROM "{table}"', connection)
+                    df.to_sql(table, conn, index=False, if_exists="replace")
             engine.dispose()
             
         elif ext in (".db", ".sqlite", ".sqlite3"):
