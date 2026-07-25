@@ -3007,7 +3007,7 @@ class ChatMixin:
                 ASCIIColors.warning("[ChatMixin] LLM attempted artifact dispatch after force-final-answer. Breaking loop.")
                 break
 
-            # ── 🛑 DUPLICATE ARTIFACT INTERCEPTION (NEW) ──
+            # ── 🛑 CRITICAL FIX: DUPLICATE ARTIFACT INTERCEPTION (NEW) ──
             # If the LLM emits an artifact tag that was ALREADY processed in a previous round,
             # _StreamState skips dispatching it (affected_artefacts remains empty).
             # We detect this to force the final answer and prevent an infinite loop.
@@ -3032,25 +3032,10 @@ class ChatMixin:
                     sender_type="user",
                     content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
                 ))
-                continue
-
-            # ── 🛑 EMPTY-RESPONSE GUARD (CRITICAL) ──
-            # If the LLM generated zero tokens (or only whitespace/processing blocks),
-            # we must break the loop immediately to prevent an infinite empty-generation cycle.
-            # This happens when the LLM hits a stop sequence prematurely or the API returns empty.
-            clean_text = ss.get_clean_text_so_far().strip()
-            # Strip processing blocks to check if ANY real content was generated
-            content_without_processing = re.sub(
-                r'<processing[^>]*>.*?</processing>', '', clean_text, flags=re.DOTALL | re.IGNORECASE
-            ).strip()
-
-            if not content_without_processing and not ss.tool_trigger and not ss.was_action_dispatched():
-                ASCIIColors.warning("[ChatMixin] Empty LLM response detected (no content, no tool, no artifact). Breaking loop to prevent infinite cycle.")
-                # Append a minimal marker to virtual_history so the LLM knows it produced nothing
-                virtual_history.append(SimpleNamespace(
-                    sender_type="assistant",
-                    content="[No output generated]"
-                ))
+                
+                # 🛑 ARCHITECTURAL FIX: Hard-break the loop immediately. 
+                # Continuing the loop allows the LLM another generation pass, which it uses 
+                # to hallucinate another preamble. We must force the loop to terminate.
                 break
 
             # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
