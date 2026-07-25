@@ -6,16 +6,39 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 from datetime import datetime
 
-# Import the mixins to test the ChatMixin logic in isolation
-from lollms_client.lollms_discussion._mixin_chat import ChatMixin
-from lollms_client.lollms_discussion._mixin_core import CoreMixin
-from lollms_client.lollms_discussion._mixin_utils import UtilsMixin
-from lollms_client.lollms_discussion._mixin_branch import BranchMixin
-from lollms_client.lollms_discussion._mixin_memory import MemoryMixin
-from lollms_client.lollms_discussion._mixin_prompt import PromptMixin
+# Add src to path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
 from lollms_client.lollms_discussion import LollmsDiscussion
+from lollms_client.lollms_discussion._db import LollmsDataManager
 from lollms_client.lollms_discussion._message import LollmsMessage
 from lollms_client.lollms_types import MSG_TYPE
+
+
+class MockLollmsClient:
+    def __init__(self):
+        self.debug = False
+        self.llm = self
+        self.model_name = "test-model"
+        self.binding_name = "test-binding"
+        self.ai_name = "Assistant"
+        self.tools = None
+        
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+        
+    def count_image_tokens(self, image: str) -> int:
+        return 256
+
+    def remove_thinking_blocks(self, text: str) -> str:
+        return text
+
+    def generate_text(self, prompt: str, **kwargs) -> str:
+        return "Simulated response"
+
+    def generate_from_messages(self, messages, **kwargs):
+        pass
 
 
 class FakeLCPBinding:
@@ -26,7 +49,6 @@ class FakeLCPBinding:
         self.raise_exception = False
 
     def execute_tool(self, tool_name, params, lollms_client_instance=None, discussion_instance=None):
-        print(f"--- [TEST MOCK] FakeLCPBinding.execute_tool called!")
         self.executed = True
         self.cwd_during_exec = Path(os.getcwd()).resolve()
 
@@ -42,16 +64,8 @@ class FakeLCPBinding:
 @pytest.fixture
 def isolated_discussion(tmp_path, monkeypatch):
     """Creates a LollmsDiscussion instance with an isolated workspace."""
-    mock_client = MagicMock()
-    mock_client.llm = MagicMock()
-    mock_client.llm.model_name = "test-model"
-    mock_client.llm.binding_name = "test-binding"
-    mock_client.ai_name = "Assistant"
-    mock_client.count_tokens = lambda x: len(x.split())
-    mock_client.remove_thinking_blocks = lambda x: x
-    mock_client.generate_text = lambda *args, **kwargs: "ok"
-
-    from lollms_client.lollms_discussion._db import LollmsDataManager
+    mock_client = MockLollmsClient()
+    
     db_file_path = tmp_path / "discussion.db"
     db_manager = LollmsDataManager(f"sqlite:///{db_file_path}")
 
@@ -62,8 +76,10 @@ def isolated_discussion(tmp_path, monkeypatch):
         workspace_path=str(tmp_path),
         autosave=False
     )
-
-    return disc
+    
+    yield disc
+    
+    disc.close()
 
 
 def _make_streaming_mock(tool_name: str, tool_params: dict):
@@ -75,9 +91,7 @@ def _make_streaming_mock(tool_name: str, tool_params: dict):
     full_payload = f"<tool>{tool_json}</tool>"
 
     def mock_generate(*args, **kwargs):
-        print(f"--- [TEST MOCK] generate_from_messages called! Payload: {full_payload}")
         callback = kwargs.get('streaming_callback')
-        print(f"--- [TEST MOCK] Callback: {callback}")
         if callback:
             # Send the entire payload in one chunk to avoid partial-tag 
             # state machine fragmentation in _StreamState.
@@ -116,7 +130,6 @@ def _setup_discussion_mocks(discussion, msg_id="msg_1"):
     
     # Mock add_message to return a fake AI message wrapper to prevent DB errors
     def fake_add_message(**kwargs):
-        print(f"--- [TEST MOCK] add_message called with: {kwargs.keys()}")
         ai_dummy = SimpleNamespace(
             id="ai_msg_1",
             sender="assistant",
@@ -176,7 +189,6 @@ def test_lcp_dispatch_sets_and_restores_cwd(isolated_discussion, tmp_path):
     )
     
     # Act
-    print("--- [TEST] Calling chat()...")
     isolated_discussion.chat(
         user_message="Run dummy tool",
         tools=active_tools,
@@ -184,7 +196,6 @@ def test_lcp_dispatch_sets_and_restores_cwd(isolated_discussion, tmp_path):
         add_user_message=False,
         max_reasoning_steps=1
     )
-    print("--- [TEST] chat() returned.")
     
     # Assert
     assert fake_lcp.executed, "LCP binding execute_tool was never called"
@@ -225,7 +236,6 @@ def test_lcp_dispatch_restores_cwd_on_crash(isolated_discussion, tmp_path):
     )
     
     # Act
-    print("--- [TEST] Calling chat()...")
     isolated_discussion.chat(
         user_message="Run crashing dummy tool",
         tools=active_tools,
@@ -233,7 +243,6 @@ def test_lcp_dispatch_restores_cwd_on_crash(isolated_discussion, tmp_path):
         add_user_message=False,
         max_reasoning_steps=1
     )
-    print("--- [TEST] chat() returned.")
     
     # Assert
     assert fake_lcp.executed, "LCP binding execute_tool was never called"
@@ -252,7 +261,6 @@ def test_direct_callable_path_sets_and_restores_cwd(isolated_discussion, tmp_pat
     cwd_during_exec = []
 
     def mock_tool_callable(discussion_instance=None, **kwargs):
-        print(f"--- [TEST MOCK] mock_tool_callable called!")
         cwd_during_exec.append(Path(os.getcwd()).resolve())
         return {"success": True, "output": "Direct call success"}
 
@@ -275,7 +283,6 @@ def test_direct_callable_path_sets_and_restores_cwd(isolated_discussion, tmp_pat
     )
     
     # Act
-    print("--- [TEST] Calling chat()...")
     isolated_discussion.chat(
         user_message="Run direct tool",
         tools=active_tools,
@@ -283,7 +290,6 @@ def test_direct_callable_path_sets_and_restores_cwd(isolated_discussion, tmp_pat
         add_user_message=False,
         max_reasoning_steps=1
     )
-    print("--- [TEST] chat() returned.")
     
     # Assert
     assert len(cwd_during_exec) > 0, "Direct callable was never executed"
