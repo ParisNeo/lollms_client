@@ -3082,14 +3082,33 @@ class ChatMixin:
                     action_type = last_art.get("type", "artifact")
                     action_title = last_art.get("title", "")
 
-                # 🧠 CONTEXTUAL ANCHORING PROTOCOL + DONE MANDATE
-                # We explicitly anchor the LLM to the artifact it just created and mandate <done/>.
+                # 🧠 CONTEXTUAL ANCHORING PROTOCOL
+                # If the sanitized history is empty, it means the artifact was emitted with 
+                # no conversational wrapper. We inject the RAW artifact XML into virtual_history
+                # so the LLM can literally "see" the code it just wrote. This enables multi-step
+                # workflows (e.g., Code -> Review -> Patch) and prevents blind recreation loops.
+                if not clean_history_text.strip() and ss.affected_artefacts:
+                    for art in ss.affected_artefacts:
+                        title = art.get("title", "artifact")
+                        atype = art.get("type", "code")
+                        lang = art.get("language", "")
+                        content = art.get("content", "")
+                        ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
+                        clean_history_text += f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>\n'
+
+                # Update the assistant message to contain the real content (if we injected it)
+                virtual_history[-1].content = clean_history_text.strip()
+
+                # 🧠 STATUS CHECK PROTOCOL (Replaces Forced Done)
+                # We anchor the LLM to the fact that the artifact is saved, and ask it if it is finished.
+                # This allows multi-step workflows (verification, patching) before final termination.
                 title_str = f" '{action_title}'" if action_title else ""
                 system_marker = (
                     f"[SYSTEM: The {action_type}{title_str} has been successfully created and saved to the workspace. "
-                    f"You have already fulfilled the user's request. "
-                    f"You MUST NOT create or update this artifact again. "
-                    f"You MUST now provide your final conversational answer to the user, explaining what you have done, and end with a <done/> tag on a new line.]"
+                    f"You can see its full content in your previous message. "
+                    f"Are you finished with the user's request? "
+                    f"If YES, provide your final conversational answer to the user and end your generation with a `<done/>` tag. "
+                    f"If NO, and you need to perform more tasks (e.g., reviewing the code, patching imports, running tests), do that now.]"
                 )
                 virtual_history.append(SimpleNamespace(
                     sender_type="user",
