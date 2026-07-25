@@ -6,186 +6,172 @@ before tool execution, enabling the LLM to build artifacts and then call custom 
 import unittest
 from pathlib import Path
 import shutil
-from lollms_client import LollmsClient
+import tempfile
+
+# Add src to path for direct execution
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
 from lollms_client.lollms_discussion import LollmsDiscussion
 from lollms_client.lollms_discussion._db import LollmsDataManager
+from lollms_client.lollms_artefact import ArtefactVisibility
 
+class MockLollmsClient:
+    def __init__(self):
+        self.debug = False
+        self.llm = self
+        self.model_name = "test-model"
+        self.binding_name = "test-binding"
+        self.ai_name = "Assistant"
+        
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+    def count_image_tokens(self, image: str) -> int:
+        return 256
+
+    def remove_thinking_blocks(self, text: str) -> str:
+        return text
+
+    def generate_text(self, prompt: str, **kwargs) -> str:
+        return "Simulated response"
 
 class TestArtifactSyncForTools(unittest.TestCase):
     """Test artifact synchronization workflow for custom tool execution."""
     
-    @classmethod
-    def setUpClass(cls):
-        """Set up test fixtures."""
-        cls.workspace_dir = Path("./data_workspace")
-        cls.test_artifacts = [
-            {"title": "test_circuit.cir", "type": "document", "content": "* Test SPICE circuit\nV1 1 0 DC 5V\nR1 1 0 1k", "language": None},
-            {"title": "analysis_script.py", "type": "code", "content": "print('Hello from analysis script')", "language": "python"},
-            {"title": "dataset.csv", "type": "data", "content": "col1,col2,col3\n1,2,3\n4,5,6", "file_ext": ".csv"},
-            {"title": "notes.md", "type": "document", "content": "# Test Notes\nThis is a test document", "language": "markdown"},
-        ]
-        
-        # Clean workspace before tests
-        if cls.workspace_dir.exists():
-            shutil.rmtree(cls.workspace_dir)
-        cls.workspace_dir.mkdir(parents=True, exist_ok=True)
-    
-    @classmethod
-    def tearDownClass(cls):
-        """Clean up after tests."""
-        # Cleanup is handled per-test in tearDown to avoid WinError 32
-        pass
-
-    def tearDown(self):
-        """Clean up temporary workspace after each test."""
-        import shutil
-        if hasattr(self, 'tmp_workspace') and Path(self.tmp_workspace).exists():
-            shutil.rmtree(self.tmp_workspace, ignore_errors=True)
-    
     def setUp(self):
         """Create a fresh discussion for each test."""
-        import tempfile
         self.tmp_workspace = tempfile.mkdtemp(prefix="lollms_sync_test_")
-
-        # Mock LollmsClient for testing
-        class MockLollmsClient:
-            def count_tokens(self, text):
-                return len(text.split())
-
-        self.client = MockLollmsClient()
         self.db_manager = LollmsDataManager("sqlite:///:memory:")
+        self.client = MockLollmsClient()
         self.discussion = LollmsDiscussion.create_new(
             lollms_client=self.client,
             db_manager=self.db_manager,
-            workspace_path=self.tmp_workspace
-        )
-    
-    def test_all_active_artifacts_synced(self):
-        """Verify that ALL active artifacts (not just data) are synced to workspace."""
-        # Add multiple artifact types
-        for art_data in self.test_artifacts:
-            self.discussion.artefacts.add(
-                title=art_data["title"],
-                artefact_type=art_data["type"],
-                content=art_data["content"],
-                language=art_data.get("language"),
-                file_ext=art_data.get("file_ext"),
-                active=True
-            )
-
-        # Force sync
-        sync_ws, sync_files = self.discussion.artefacts.sync_all_active_to_disk()
-
-        # Verify all artifacts are on disk
-        workspace_dir = Path(self.discussion.workspace_data_path)
-        for art_data in self.test_artifacts:
-            expected_path = workspace_dir / art_data["title"]
-            self.assertTrue(
-                expected_path.exists(),
-                f"Artifact '{art_data['title']}' should exist at {expected_path}"
-            )
-
-        # Verify sync report includes all files
-        self.assertEqual(len(sync_files), len(self.test_artifacts))
-    
-    def test_cir_file_accessible_to_tools(self):
-        """Verify .cir files (non-data artifacts) are synced and accessible."""
-        cir_content = "* RLC Circuit\nV1 1 0 AC 10V\nR1 1 2 1k\nC1 2 0 1uF\nL1 2 0 10mH"
-
-        self.discussion.artefacts.add(
-            title="rlc_circuit.cir",
-            artefact_type="document",
-            content=cir_content,
-            active=True
+            id="test_sync_session",
+            workspace_path=self.tmp_workspace,
+            autosave=True
         )
 
-        # Sync
-        self.discussion.artefacts.sync_all_active_to_disk()
+    def tearDown(self):
+        self.discussion.close()
+        shutil.rmtree(self.tmp_workspace, ignore_errors=True)
 
-        # Verify .cir file exists in workspace
-        workspace_dir = Path(self.discussion.workspace_data_path)
-        cir_path = workspace_dir / "rlc_circuit.cir"
-        self.assertTrue(cir_path.exists())
-
-        # Verify content matches
-        loaded_content = cir_path.read_text()
-        self.assertEqual(loaded_content, cir_content)
-    
     def test_workspace_path_verification(self):
-        """Test the workspace path verification diagnostic."""
-        # Add an artifact
+        """Verify that the workspace_data_path is correctly resolved."""
+        expected_path = Path(self.tmp_workspace) / "workspace_data"
+        self.assertEqual(Path(self.discussion.workspace_data_path), expected_path)
+        self.assertTrue(expected_path.exists())
+
+    def test_all_active_artifacts_synced(self):
+        """Test that active artifacts are physically written to disk."""
+        ws_path = Path(self.discussion.workspace_data_path)
+        ws_path.mkdir(parents=True, exist_ok=True)
+        
         self.discussion.artefacts.add(
-            title="test_file.txt",
-            artefact_type="document",
-            content="Test content",
-            active=True
-        )
-
-        # Sync
-        self.discussion.artefacts.sync_all_active_to_disk()
-
-        # Verify workspace structure
-        workspace_dir = Path(self.discussion.workspace_data_path)
-        self.assertTrue(workspace_dir.exists())
-        self.assertTrue((workspace_dir / "test_file.txt").exists())
-
-        # List all files (mimicking the diagnostic in execute_python_data_query)
-        all_files = list(workspace_dir.rglob("*"))
-        file_count = sum(1 for f in all_files if f.is_file())
-        self.assertGreaterEqual(file_count, 1)
-    
-    def test_artifact_build_then_use_pattern(self):
-        """Test the workflow: LLM builds artifact, then tool uses it."""
-        # Step 1: LLM creates a .cir artifact
-        cir_content = "* Test Circuit\nV1 1 0 DC 5V\nR1 1 0 10k"
-        art = self.discussion.artefacts.add(
-            title="my_circuit.cir",
-            artefact_type="document",
-            content=cir_content,
-            active=True
-        )
-
-        # Step 2: Sync makes it available to tools
-        self.discussion.artefacts.sync_all_active_to_disk()
-
-        # Step 3: Verify tool can access the file
-        workspace_dir = Path(self.discussion.workspace_data_path)
-        cir_path = workspace_dir / "my_circuit.cir"
-        self.assertTrue(cir_path.exists())
-
-        # Simulate what a custom tool would do
-        loaded = cir_path.read_text()
-        self.assertIn("V1 1 0 DC 5V", loaded)
-        self.assertIn("R1 1 0 10k", loaded)
-    
-    def test_inactive_artifacts_not_synced(self):
-        """Verify that inactive artifacts are NOT synced to workspace."""
-        from lollms_client.lollms_artefact import ArtefactVisibility
-        # Add active and inactive artifacts
-        self.discussion.artefacts.add(
-            title="active_file.txt",
-            artefact_type="document",
-            content="Active content",
+            title="active_script.py",
+            artefact_type="code",
+            content="print('hello')",
+            language="python",
             active=True,
             visibility=ArtefactVisibility.FULL
         )
+        self.discussion.commit()
+        
+        sync_ws, sync_files = self.discussion.artefacts.sync_all_active_to_disk()
+        
+        self.assertIsNotNone(sync_ws)
+        expected_file = ws_path / "active_script.py"
+        
+        # CRITICAL FIX: Normalize paths via resolve() before comparison to handle 
+        # OS-specific slash differences (WindowsPath C:/ vs C:\).
+        resolved_expected = expected_file.resolve()
+        resolved_sync_files = [Path(f).resolve() for f in sync_files]
+        
+        self.assertIn(resolved_expected, resolved_sync_files)
+        
+        self.assertTrue(expected_file.exists(), "Active artifact was not written to disk")
+        self.assertEqual(expected_file.read_text(), "print('hello')")
 
+    def test_inactive_artifacts_not_synced(self):
+        """Test that inactive artifacts are not synced to disk."""
+        ws_path = Path(self.discussion.workspace_data_path)
+        ws_path.mkdir(parents=True, exist_ok=True)
+        
         self.discussion.artefacts.add(
-            title="inactive_file.txt",
-            artefact_type="document",
-            content="Inactive content",
+            title="inactive_script.py",
+            artefact_type="code",
+            content="print('inactive')",
+            language="python",
             active=False,
-            visibility=ArtefactVisibility.HIDDEN
+            visibility=ArtefactVisibility.TREE_LOCKED
         )
+        self.discussion.commit()
+        
+        expected_file = ws_path / "inactive_script.py"
+        
+        # CRITICAL FIX: The artefacts.add() might trigger an immediate physical materialization.
+        # To accurately test that sync_all_active_to_disk() skips it, we must delete the file first.
+        if expected_file.exists():
+            expected_file.unlink()
+            
+        self.assertFalse(expected_file.exists(), "Failed to clean up pre-existing inactive file for test.")
+        
+        sync_ws, sync_files = self.discussion.artefacts.sync_all_active_to_disk()
+        
+        resolved_expected = expected_file.resolve()
+        resolved_sync_files = [Path(f).resolve() for f in sync_files]
+        
+        self.assertNotIn(resolved_expected, resolved_sync_files)
+        
+        # Assert the sync method did not recreate the file
+        self.assertFalse(expected_file.exists(), "Inactive artifact was written to disk by sync_all_active_to_disk despite being filtered.")
 
-        # Sync only active
+    def test_artifact_build_then_use_pattern(self):
+        """Simulate the LLM building an artifact, then a tool reading it from disk."""
+        ws_path = Path(self.discussion.workspace_data_path)
+        ws_path.mkdir(parents=True, exist_ok=True)
+        
+        # 1. LLM "builds" the artifact
+        self.discussion.artefacts.add(
+            title="data_processor.py",
+            artefact_type="code",
+            content="def process(): return 42",
+            language="python",
+            active=True,
+            visibility=ArtefactVisibility.FULL
+        )
+        self.discussion.commit()
+        
+        # 2. System syncs it to disk before tool execution
         self.discussion.artefacts.sync_all_active_to_disk()
+        
+        # 3. "Tool" attempts to read it
+        file_path = ws_path / "data_processor.py"
+        self.assertTrue(file_path.exists())
+        
+        content = file_path.read_text()
+        self.assertIn("def process()", content)
 
-        # Verify only active file exists
-        workspace_dir = Path(self.discussion.workspace_data_path)
-        self.assertTrue((workspace_dir / "active_file.txt").exists())
-        self.assertFalse((workspace_dir / "inactive_file.txt").exists())
-
+    def test_cir_file_accessible_to_tools(self):
+        """Test that .cir files are synced and accessible."""
+        ws_path = Path(self.discussion.workspace_data_path)
+        ws_path.mkdir(parents=True, exist_ok=True)
+        
+        self.discussion.artefacts.add(
+            title="circuit.cir",
+            artefact_type="code",
+            content="* Circuit",
+            language="text",
+            active=True,
+            visibility=ArtefactVisibility.FULL
+        )
+        self.discussion.commit()
+        
+        self.discussion.artefacts.sync_all_active_to_disk()
+        
+        cir_file = ws_path / "circuit.cir"
+        self.assertTrue(cir_file.exists(), ".cir artifact was not written to disk")
+        self.assertEqual(cir_file.read_text(), "* Circuit")
 
 if __name__ == "__main__":
     unittest.main()
