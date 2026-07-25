@@ -1708,12 +1708,44 @@ def status_endpoint():
             "vram_strategy": vram_strategy
         }
 
+    available_models = []
+    scanned_paths = []
+    
+    def scan_for_models(root: Path):
+        if not root or not root.exists():
+            return
+        scanned_paths.append(str(root.resolve()))
+        for model_index in root.rglob("model_index.json"):
+            folder = model_index.parent
+            available_models.append({
+                "model_name": str(folder.resolve()),
+                "display_name": folder.name,
+                "type": "diffusers_pipeline"
+            })
+        for safepath in root.rglob("*.safetensors"):
+            if (safepath.parent / "model_index.json").exists():
+                continue
+            available_models.append({
+                "model_name": str(safepath.resolve()),
+                "display_name": safepath.stem,
+                "type": "safetensors_checkpoint"
+            })
+
+    try:
+        scan_for_models(Path(state.models_path))
+        if state.extra_models_path:
+            scan_for_models(Path(state.extra_models_path))
+    except Exception as scan_e:
+        ASCIIColors.warning(f"Status endpoint failed to scan models: {scan_e}")
+
     return {
         "status": "running",
         "diffusers_available": DIFFUSERS_AVAILABLE,
         "device": state.config.get("device"),
         "model_loaded": state.manager.is_loaded if state.manager else False,
         "active_model": active_model_info,
+        "available_models": available_models,
+        "scanned_paths": scanned_paths,
         "registry": {
             "total_managers": len(state.registry.get_all_managers()),
             "active_managers": len(state.registry.get_active_managers())
