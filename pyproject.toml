@@ -69,3 +69,10 @@ exclude = ["lollms_client.egg-info*", "lollms_client.llm_bindings.llama_cpp_serv
 version = {attr = "lollms_client.__version__"}
 [tool.setuptools.package-data]
 lollms_client = ["assets/*.json", "**/description.yaml", "apps/lollms_discussions/static/*", "apps/lollms_code/*"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore::pyparsing.exceptions.PyparsingDeprecationWarning",
+    "ignore:.*pyparsing.*:DeprecationWarning",
+    "ignore:Matplotlib is currently using agg.*:UserWarning"
+]
