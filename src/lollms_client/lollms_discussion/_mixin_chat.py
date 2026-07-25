@@ -2786,28 +2786,6 @@ class ChatMixin:
             self._failure_memory._signatures.clear()
             ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
 
-        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
-        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
-            fm = FailureMemory()
-            if not hasattr(fm, "_signatures"):
-                object.__setattr__(fm, "_signatures", set())
-            object.__setattr__(self, "_failure_memory", fm)
-        else:
-            self._failure_memory.failures = []
-            self._failure_memory._signatures.clear()
-            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
-
-        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
-        if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
-            fm = FailureMemory()
-            if not hasattr(fm, "_signatures"):
-                object.__setattr__(fm, "_signatures", set())
-            object.__setattr__(self, "_failure_memory", fm)
-        else:
-            self._failure_memory.failures = []
-            self._failure_memory._signatures.clear()
-            ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
-
         # ── 8. Active Deliberation Loop ──
         import time as _chat_time
         _t_branch_start = _chat_time.perf_counter()
