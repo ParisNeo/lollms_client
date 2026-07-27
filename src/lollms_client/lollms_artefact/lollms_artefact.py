@@ -465,6 +465,25 @@ class ArtefactManager:
             lam_filename = f"{name_part}.lam"
             lam_path = art_meta_dir / lam_filename
 
+            # ── STALE FILE CLEANUP ──
+            # If the computed filename has an extension but the raw clean_path does not,
+            # we must delete any stale, extensionless file left over from previous runs
+            # to prevent duplicate files (e.g., "README" and "README.md").
+            if ext_part and not Path(clean_path).suffix:
+                stale_primary = ws_data_dir / clean_path
+                if stale_primary.exists() and stale_primary != primary_path:
+                    try:
+                        stale_primary.unlink()
+                    except Exception:
+                        pass
+
+                stale_versioned = art_meta_dir / f"{clean_path}_v{version}"
+                if stale_versioned.exists() and stale_versioned != versioned_path:
+                    try:
+                        stale_versioned.unlink()
+                    except Exception:
+                        pass
+
             wrote_physical = False
             if physical_data is not None:
                 try:
