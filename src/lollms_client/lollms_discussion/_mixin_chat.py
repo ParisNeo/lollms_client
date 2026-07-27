@@ -952,7 +952,7 @@ class _StreamState:
                 lower_buffer = self._pending_buffer.lower()
                 # The negative lookahead (?!`) ensures the tag is not immediately preceded by a backtick.
                 # The (?!.*\|) ensures the line is not part of a markdown table (no pipe character after the tag).
-                open_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<(?:artifact|artefact)', lower_buffer)
+                open_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)(?<![\w\[])<(?:artifact|artefact)', lower_buffer)
                 open_idx = open_match.start() if open_match else -1
 
                 if open_idx != -1:
@@ -2840,6 +2840,10 @@ class ChatMixin:
         # if the loop breaks before _StreamState is instantiated (e.g., pre-turn cancellation).
         ss = None
 
+        # Initialize mimicry attempt counter exactly once at the start of the turn
+        # CRITICAL FIX: Use a list to ensure safe mutation across reasoning rounds.
+        object.__setattr__(self, "_mimicry_attempt_counts", [0])
+
         # CRITICAL FIX: Persistent set to track dispatched tags across all reasoning rounds.
         # This prevents the LLM from re-dispatching the same artifact in a subsequent round,
         # which causes infinite loops and unwanted version bumps.
@@ -4006,7 +4010,7 @@ class ChatMixin:
                     ))
                     continue
 
-                # ── 🛑 DONE TAG TERMINATION PROTOCOL ──
+                # ── 🏁 DONE TAG TERMINATION PROTOCOL ──
                 # If the LLM emits <done/> on a new line, the task is complete. Break immediately.
                 raw_round_text = ss.get_clean_text_so_far()
                 done_match = re.search(r'(?m)^\s*<done\s*/>\s*$', raw_round_text.strip())
@@ -4137,6 +4141,67 @@ class ChatMixin:
                     ss.context_unlock_requested = False
                     continue  # Jump to next reasoning round immediately
 
+                # ── 🛑 MIMICRY INTERCEPTION PROTOCOL ──
+                # If the LLM mimics system infrastructure markers instead of emitting real tags,
+                # intercept it, sanitize the buffer, and force a correction round.
+                _mimicry_patterns = [
+                    re.compile(r'\[🔒SYSTEM_ARTIFACT_ANCHOR:', re.IGNORECASE),
+                    re.compile(r'\[SYSTEM:', re.IGNORECASE),
+                    re.compile(r'\[content stripped', re.IGNORECASE),
+                    re.compile(r'\[🔒SYSTEM_ARTIFACT_CREATED:', re.IGNORECASE),
+                    re.compile(r'\[🔒SYSTEM_ARTIFACT_UPDATED:', re.IGNORECASE),
+                ]
+
+                def _detect_mimicry(text: str) -> bool:
+                    if not text:
+                        return False
+                    tail = text[-500:]
+                    return any(pattern.search(tail) for pattern in _mimicry_patterns)
+
+                if _detect_mimicry(ai_msg.content):
+                    if not hasattr(self, "_mimicry_attempt_counts"):
+                        object.__setattr__(self, "_mimicry_attempt_counts", [0])
+
+                    self._mimicry_attempt_counts[0] += 1
+                    current_attempts = self._mimicry_attempt_counts[0]
+                    ASCIIColors.warning(f"[ChatMixin] LLM mimicked system markers. Correction attempt {current_attempts}.")
+
+                    if current_attempts >= 2:
+                        ASCIIColors.error("[ChatMixin] LLM repeatedly mimicked system markers. Breaking loop to prevent infinite cycle.")
+
+                        # CRITICAL FIX: Hard-clear any content before breaking to guarantee no ghost artifacts
+                        # are left in a state that could be misinterpreted by post-processing.
+                        ai_msg.content = ""
+                        break
+
+                    # Sanitize the ai_msg.content to remove the mimicked markers
+                    sanitized_content = ai_msg.content
+                    for pattern in _mimicry_patterns:
+                        # Remove the line containing the mimicked marker
+                        sanitized_content = re.sub(r'^.*' + pattern.pattern + r'.*$', '', sanitized_content, flags=re.MULTILINE | re.IGNORECASE)
+                    ai_msg.content = sanitized_content.strip()
+
+                    # Append the sanitized (but failed) assistant text to virtual history
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=ai_msg.content if ai_msg.content else "[Empty response after removing mimicked system markers]"
+                    ))
+
+                    # Inject a targeted correction
+                    correction_msg = (
+                        "=== ⚠️ CRITICAL: SYSTEM MARKER MIMICRY DETECTED ===\n"
+                        "Your previous response contained mimicked system infrastructure markers (e.g., `[SYSTEM:`, `[🔒SYSTEM_ARTIFACT_ANCHOR:`, `[content stripped...`).\n"
+                        "These markers are strictly system-generated and are **NOT** functional. Outputting them does **NOT** execute any action.\n\n"
+                        "To create an artifact, you MUST use the actual XML tag: `<artifact name=\"filename.ext\" type=\"code\">...code...</artifact>`\n"
+                        "To call a tool, you MUST use the actual XML tag: `<tool>{\"name\": \"tool_name\", \"parameters\": {...}}</tool>`\n\n"
+                        "Do NOT mimic system placeholders. Output the real functional tag NOW to perform your intended action."
+                    )
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=correction_msg
+                    ))
+                    continue
+
                 # ── 🛑 FINALIZE: No tool call, no intent, no unlock. This is the final answer. ──
                 # 🛑 CRITICAL ARCHITECTURAL FIX: Do NOT overwrite ai_msg.content with a sanitized gist.
                 # The `_StreamState` already accumulated conversational text and <processing> blocks
@@ -4169,6 +4234,7 @@ class ChatMixin:
             has_virtual_history = len(virtual_history) > 0 and (
                 any(vh.sender_type == "user" and "<tool_result" in (vh.content or "") for vh in virtual_history)
                 or any(vh.sender_type == "assistant" and "<tool" in (vh.content or "") for vh in virtual_history)
+                or any("SYSTEM MARKER MIMICRY DETECTED" in (vh.content or "") for vh in virtual_history)
             )
 
             ai_msg.metadata = {
