@@ -160,8 +160,9 @@ cython_debug/
 #.idea/
 *.db
 
-# Lollms vscoder file
+# Lollms vscoder folder and vscode folder
 .lollms
+.vscode
 
 # personal code examples (not shared)
 examples_perso
@@ -178,3 +179,4 @@ logs/
 *.xlsx
 *.csv
 None
+
