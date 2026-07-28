@@ -297,23 +297,24 @@ def _extract_text_file(path: Path) -> str:
 # ── PDF ────────────────────────────────────────────────────────────────────
 
 def _extract_pdf_text(path: Path) -> str:
-    """
-    Extract text from all PDF pages using pure PyMuPDF (fitz).
-    Strictly enforces text-layer extraction. NEVER triggers OCR.
-    """
-    _ensure_installed("pymupdf", "fitz")
+    """Extract text from all PDF pages as Markdown, preserving tables."""
+    _ensure_installed("pymupdf4llm")
     try:
-        import fitz
-        doc = fitz.open(str(path))
+        import pymupdf4llm
+
+        # to_markdown returns one big string covering all pages
+        # page_chunks=True returns a list of dicts, one per page
+        chunks: list[dict] = pymupdf4llm.to_markdown(str(path), page_chunks=True)
+
         pages = []
-        for i, page in enumerate(doc):
-            # Use "text" for raw text extraction, strictly avoiding OCR
-            text = page.get_text("text").strip()
-            pages.append(f"## Page {i + 1}\n\n{text}" if text else f"## Page {i + 1}\n\n[No text]")
-        doc.close()
+        for i, chunk in enumerate(chunks):
+            md = (chunk.get("text") or "").strip()
+            pages.append(f"## Page {i + 1}\n\n{md}" if md else f"## Page {i + 1}\n\n[No text]")
+
         return "\n\n".join(pages)
-    except Exception as e:
-        ASCIIColors.warning(f"[FileImport] PyMuPDF text extraction failed: {e}. Falling back to pypdf.")
+
+    except ImportError:
+        ASCIIColors.warning("[FileImport] pymupdf4llm not installed — falling back to pypdf")
         _ensure_installed("pypdf")
         try:
             from pypdf import PdfReader
@@ -879,6 +880,19 @@ class FileImportMixin:
                     pass
 
         _progress(f"Importing '{path.name}' in mode='{mode}'")
+
+        # ── BINARY TEXT DOCUMENT .MD SUFFIX DOTOCOL ──
+        # CRITICAL FIX: For rich text formats (.pdf, .docx, .pptx, .xlsx) imported in 
+        # text-extraction modes, we MUST append `.md` to the title.
+        # If we keep the original `.pdf` extension, the `_sync_tool_artifacts` logic 
+        # misclassifies it as a binary data file, overwrites the extracted text with 
+        # a "Data File" metadata placeholder, and corrupts the version history (v2 bump).
+        _RICH_TEXT_EXTS = {".pdf", ".docx", ".pptx", ".xlsx", ".odt"}
+        if ext in _RICH_TEXT_EXTS and mode in (IMPORT_MODE_TEXT, IMPORT_MODE_TEXT_IMAGES, IMPORT_MODE_TEXT_EMBEDDED_IMAGES, IMPORT_MODE_OCR):
+            # Only append .md if it doesn't already end with .md
+            if not title.lower().endswith(".md"):
+                title = f"{title}.md"
+            _progress(f"Appended .md suffix to title for rich text import: '{title}'")
 
         text_artefact:  Optional[Dict] = None
         image_artefact: Optional[Dict] = None
@@ -1575,6 +1589,7 @@ class FileImportMixin:
                          "overwrite": Replaces content without incrementing version.
                          "replace": Completely purges all previous versions and creates a new v1.
         """
+        # If the title already has an extension (e.g., we appended .md), we don't add the source suffix.
         if "." not in title and path.suffix:
             title = f"{title}{path.suffix.lower()}"
 
@@ -1595,13 +1610,17 @@ class FileImportMixin:
         else:
             atype = _detect_artefact_type_from_mode(path, mode)
             extra_data = {}
-            # 🛑 CRITICAL FIX: The Dual-Stream .lam protocol MUST ONLY be triggered
-            # when the user explicitly requests `mode="data"`. 
-            # If a user imports a CSV or PDF in `mode="text"`, they want the raw text,
-            # NOT a generated schema. Injecting `file_ext` here causes ArtefactManager
-            # to overwrite the extracted text with a binary data schema.
-            if mode == IMPORT_MODE_DATA:
+            # 🛑 CRITICAL FIX: We DO NOT inject file_ext for text imports.
+            # Injecting file_ext triggers the Dual-Stream .lam protocol in ArtefactManager,
+            # which replaces the extracted text with a binary data schema.
+            # Only `data` mode should inject file_ext.
+            if atype == ArtefactType.DATA:
                 extra_data["file_ext"] = path.suffix.lower()
+            elif title.lower().endswith(".md"):
+                # 🛑 FORCE .md FILE EXTENSION FOR RICH TEXT IMPORTS
+                # This guarantees the physical twin is written as `file.pdf.md` on disk,
+                # completely bypassing the binary data file protocols in _sync_tool_artifacts.
+                extra_data["file_ext"] = ".md"
 
         language = _detect_language(path)
 
