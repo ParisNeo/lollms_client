@@ -108,6 +108,7 @@ The agentic loop no longer relies on fragile heuristics (like intent detection) 
     * System Prompt + Rules (including `<done/>` protocol instructions).
     * **Active Artefacts**: Injects `.lam` content (Logical Twins) for all active files.
     * Memory Handles.
+    * **Context Size Resolution**: The system queries `lc.get_ctx_size()` to determine the token budget. This uses the 4-layer protocol (Forced > Binding > Hardcoded > Default) to accurately identify the maximum context window before assembling the prompt.
 3.  **Reasoning Loop** (Max 20 steps):
     * **LLM Generation**: Streams tokens to `_StreamState`.
     * **Stream Parsing**: Intercepts closed XML tags (`<artifact>`, `<tool>`, `<done/>`) instantly.
