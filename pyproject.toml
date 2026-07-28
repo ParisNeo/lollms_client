@@ -38,7 +38,8 @@ dependencies = [
     "numpy",
     "pillow",
     "sqlalchemy",
-    "jsonschema"
+    "jsonschema",
+    "pymupdf4llm==1.28.0"
 ]
 
 [project.optional-dependencies]
