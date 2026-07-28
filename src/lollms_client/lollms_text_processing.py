@@ -1454,29 +1454,25 @@ Continue the JSON exactly from where it left off. Do not repeat any previous con
             if isinstance(response, dict) and not response.get("status", True):
                 continue
 
-            # DEBUG: Log raw LLM response to understand parsing failures
-            if response and isinstance(response, str) and self.llm.debug or kwargs.get("debug", False):
-                ASCIIColors.magenta(f"[DEBUG] Raw LLM Response ({len(response)} chars):")
-                ASCIIColors.white(response[:2000] + ("..." if len(response) > 2000 else ""))
+            is_debug = (hasattr(self.llm, 'debug') and self.llm.debug) or kwargs.get("debug", False)
 
-            response = self.remove_thinking_blocks(response)
+            if is_debug and isinstance(response, str):
+                raw_len = len(response)
+                response = self.remove_thinking_blocks(response)
+                clean_len = len(response)
+                json_string = self._extract_json_multi_strategy(response)
 
-            # DEBUG: Log response after thinking block removal
-            if self.llm.debug or kwargs.get("debug", False):
-                ASCIIColors.cyan(f"[DEBUG] After thinking removal ({len(response)} chars):")
-                ASCIIColors.white(response[:1500] + ("..." if len(response) > 1500 else ""))
-
-            # Multi-strategy extraction
-            json_string = self._extract_json_multi_strategy(response)
-
-            # DEBUG: Log extracted JSON string
-            if self.llm.debug or kwargs.get("debug", False):
+                ASCIIColors.magenta(f"[Structured Gen] Raw: {raw_len}c | Clean: {clean_len}c | JSON: {len(json_string) if json_string else 0}c")
+                if raw_len != clean_len:
+                    ASCIIColors.cyan(f"[Structured Gen] Cleaned Response:\n{response[:500]}")
                 if json_string:
-                    ASCIIColors.green(f"[DEBUG] Extracted JSON ({len(json_string)} chars):")
-                    ASCIIColors.white(json_string[:1000] + ("..." if len(json_string) > 1000 else ""))
+                    ASCIIColors.green(f"[Structured Gen] Extracted JSON:\n{json_string[:500]}")
                 else:
-                    ASCIIColors.red("[DEBUG] Failed to extract any JSON from response")
-            
+                    ASCIIColors.red("[Structured Gen] Failed to extract JSON.")
+            else:
+                response = self.remove_thinking_blocks(response)
+                json_string = self._extract_json_multi_strategy(response)
+
             if not json_string:
                 self._log_warning(f"Attempt {attempt + 1}: No JSON found in response")
                 continue
