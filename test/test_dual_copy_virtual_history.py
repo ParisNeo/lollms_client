@@ -24,6 +24,7 @@ class ScriptedToolClient:
         self.binding_name = "mock"
         self.round_scripts = []
         self.current_round = 0
+        self.default_ctx_size = 32768  # Prevent context overflow truncation during testing
 
     def count_tokens(self, text: str) -> int:
         return len(text) // 4
@@ -37,12 +38,15 @@ class ScriptedToolClient:
     def reset_cancel(self):
         pass
 
+    def get_ctx_size(self, model_name=None) -> int:
+        return self.default_ctx_size
+
     def generate_text(self, prompt: str, **kwargs) -> str:
         return "Simulated text generation."
 
     def generate_from_messages(self, messages: list, **kwargs) -> str:
         callback = kwargs.get("streaming_callback")
-        script = self.round_scripts[self.current_round] if self.current_round < len(self.round_scripts) else []
+        script = self.round_scripts[self.current_round] if self.current_round < len(self.round_scripts) else ["<done/>"]
         self.current_round += 1
         
         if callback:
@@ -91,10 +95,11 @@ class TestDualCopyVirtualHistory(unittest.TestCase):
             }
         }
 
-        # Script: Round 1 streams a tool call, Round 2 streams the final answer
+        # Script: Round 1 streams a tool call, Round 2 streams the final answer, Round 3 handles the <done/> mandate
         self.client.round_scripts = [
             ['<tool>{"name": "tool_dummy", "parameters": {}}</tool>'],
-            ["The tool executed successfully. The result is 42."]
+            ["The tool executed successfully. The result is 42."],
+            ["<done/>"]
         ]
 
         res_turn1 = self.discussion.chat(
@@ -126,8 +131,9 @@ class TestDualCopyVirtualHistory(unittest.TestCase):
 
         # --- Turn 2: Standard Chat (No Tools) ---
         # We need a second turn to verify export() splices Turn 1's history correctly.
+        self.client.current_round = 0  # Reset for the next turn
         self.client.round_scripts = [
-            ["I understand. Let me know if you need anything else."]
+            ["I understand. Let me know if you need anything else.<done/>"]
         ]
 
         # Export context for Turn 2 WITHOUT active virtual_history
