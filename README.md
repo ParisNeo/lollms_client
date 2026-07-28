@@ -741,6 +741,40 @@ with tempfile.TemporaryDirectory() as tmpdir:
 3.  **`memorize()`:** After the user mentions their favorite language, `memorize()` is called. The LLM analyzes the last turn, identifies this new, important fact, and appends it to the `discussion.memory` zone.
 4.  **Recall:** In the final turn, when asked to recall the favorite language, the AI has access to the updated `memory` content within its system context and can correctly answer "Rust". This demonstrates true long-term, stateful memory.
 
+### Dynamic Context Size Resolution (4-Layer Protocol)
+
+When working with models, accurately determining the context window size is critical for token budgeting and preventing overflow. `lollms_client` employs a sophisticated 4-layer resolution cascade when `get_ctx_size()` is called on an LLM binding:
+
+1.  **Forced Context Size (`forced_ctx_size`)**: If explicitly set (either via `kwargs` during initialization or dynamically via `set_forced_ctx_size()`), this value is returned immediately. It acts as the absolute source of truth, overriding all automatic detection.
+2.  **Binding-Specific Detection (`_get_ctx_size`)**: If the binding instance implements a `_get_ctx_size()` method (e.g., querying an API for the model's specific limit), it is called. If it returns a valid integer, that is used.
+3.  **Hardcoded List (`assets/models_ctx_sizes.json`)**: The library maintains a local JSON file mapping known model names/aliases to their context sizes. If the `model_name` matches an entry, the hardcoded value is used.
+4.  **Default Fallback (`default_ctx_size`)**: If the model is completely unknown and no binding-specific method exists, it falls back to the `default_ctx_size` provided during initialization.
+
+This protocol ensures that you can always force a specific context window for testing or constrained environments, while still benefiting from automatic detection for known models.
+
+```python
+from lollms_client import LollmsClient
+
+# Initialize with a forced context size (Layer 1)
+lc = LollmsClient(
+    llm_binding_name="ollama",
+    llm_binding_config={
+        "model_name": "llama3",
+        "forced_ctx_size": 4096 # Forces get_ctx_size() to always return 4096
+    }
+)
+
+print(f"Forced Context Size: {lc.get_ctx_size()}") # Output: 4096
+
+# You can also dynamically update it at runtime
+lc.llm.set_forced_ctx_size(8192)
+print(f"Updated Context Size: {lc.get_ctx_size()}") # Output: 8192
+
+# Clear the forced override to fall back to automatic detection (Layers 2-4)
+lc.llm.set_forced_ctx_size(None)
+print(f"Auto-detected Context Size: {lc.get_ctx_size()}") # Output: 8192 (from hardcoded list for llama3)
+```
+
 ### Human-Inspired Multi-Level Memory System
 
 `LollmsDiscussion` incorporates a biological-inspired persistent memory system (`LollmsMemoryManager`) consisting of four hierarchical layers:
