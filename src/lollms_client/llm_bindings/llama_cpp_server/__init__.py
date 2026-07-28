@@ -1434,7 +1434,7 @@ class LlamaCppServerBinding(LollmsLLMBinding):
     # Context size
     # ──────────────────────────────────────────────────────────────────────────
 
-    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
+    def _get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
         """
         Returns the context size for *model_name* (defaults to current model).
         Query order:
