@@ -961,7 +961,7 @@ class OllamaBinding(LollmsLLMBinding):
         ASCIIColors.info(f"Ollama model set to: {model_name}. It will be loaded by the server on first use.")
         return True
 
-    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
+    def _get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
         """
         Retrieves the context size for an Ollama model.
         
