@@ -57,7 +57,7 @@ _DEFAULT_FAST_REPLICAS = [
 
 _TAG_STARTS = [
     "<tool>",
-    " <", "<think ",
+    "</arg_key>", "<think ",
     "<artifact", "<artefact",
     "<generate_image", "<edit_image",
     "<note", "<skill", "<scratchpad",
@@ -75,8 +75,8 @@ _SECONDARY_TAG_MAP = {
     "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_FORM_READY,     MSG_TYPE.MSG_TYPE_FORM_READY,        "</lollms_form>"),
     "<mem_new":       ("memory_new",          MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_new>"),
     "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
-    " ":        ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              " "),
-    "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              " "),
+    "<think>":        ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
+    "<think":         ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
     "<unlock_file":   ("context_unlock",      MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</unlock_file>"),
     "lock_file":     ("context_lock",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</lock_file>"),
     "hide_file":     ("context_hide",        MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</hide_file>"),
@@ -218,10 +218,14 @@ class _ArtefactStreamTracker:
 
        self.current_buffer += chunk
 
+       # Throttle analysis to prevent performance hit on every token.
+       # Reduced to 30ms (from 100ms) so fast local LLMs don't miss boundaries.
        now = _time.time()
        if now - self.last_event_time < 0.03:
            return None
 
+       # CRITICAL FIX: Always re-analyze the full buffer, not just the chunk.
+       # This ensures boundaries that arrived during the throttle window are detected.
        analysis = _analyze_artefact_structure(self.current_buffer, self.current_language)
        if analysis and analysis.get("detail") != self.last_event_detail:
            self.last_event_detail = analysis.get("detail")
@@ -252,6 +256,25 @@ def _sanitize_tool_result(
     """
     Converts an arbitrary tool execution result into a clean, LLM-friendly
     text representation.
+    Rules
+    -----
+    1.  If ``tool_res`` (or its LCP-wrapped ``output`` inner dict) exposes a
+        ``prompt_injection`` key anywhere in its tree, that string is used
+        verbatim. Tool authors craft ``prompt_injection`` to tell the LLM
+        *exactly* what to do next (e.g. reference the produced file with an
+        <img /> tag). Using it as the LLM-facing message prevents the LLM
+        from re-running the same tool on the freshly-produced artifact.
+    2.  Known large-binary fields (``plot_b64``, ``image_b64``, ...) are
+        stripped and replaced with a tiny "[base64 blob stripped: 24.3KB]"
+        note so the LLM knows a file was produced without ingesting the data.
+    3.  Any standalone long base64-looking string is replaced with the same
+        note (defence in depth).
+    4.  Any string longer than ``max_chars`` is truncated with an ellipsis.
+    5.  Lists are capped at 50 entries and walked recursively.
+    6.  The result is always returned as a plain ``str`` (JSON-serialised
+        when the input was structured).
+    7.  🛑 CRITICAL FIX: If the tool returns {"success": True, "output": <content>},
+        extract the <content> directly rather than showing the LLM the wrapper dict.
     """
 
     def _find_prompt_injection(obj: Any, depth: int = 0) -> Optional[str]:
@@ -308,6 +331,7 @@ def _sanitize_tool_result(
 
     if isinstance(tool_res, dict) and tool_res.get("success") is False:
         error_msg = tool_res.get("error", "Unknown error")
+        # Check for nested error in output dict
         if not error_msg or error_msg == "Unknown error":
             inner = tool_res.get("output")
             if isinstance(inner, dict):
@@ -334,9 +358,11 @@ def _sanitize_tool_result(
 
     if isinstance(tool_res, dict) and tool_res.get("success") is False:
         error_msg = tool_res.get("error", "Unknown tool error")
+        # Check nested output dict for error
         inner_out = tool_res.get("output")
         if isinstance(inner_out, dict) and inner_out.get("error"):
             error_msg = inner_out["error"]
+        # Also check for traceback to give the LLM full context
         traceback_str = tool_res.get("traceback", "")
         if traceback_str:
             return f"⚠ Tool Failed\nError: {error_msg}\nTraceback:\n{traceback_str}"
@@ -346,6 +372,7 @@ def _sanitize_tool_result(
     if isinstance(tool_res, dict):
         if "output" in tool_res:
             unwrapped = tool_res["output"]
+            # If output is still a dict with nested content, unwrap one more level
             if isinstance(unwrapped, dict):
                 for key in ("content", "text", "result", "data", "page_content", "summary"):
                     if key in unwrapped:
@@ -372,6 +399,7 @@ def _sanitize_tool_result(
 
     sanitized = _walk(_replace_none(unwrapped))
 
+    # If sanitized is already a string (from unwrapping), return it directly
     if isinstance(sanitized, str):
         if len(sanitized) > max_chars:
             return sanitized[:max_chars] + f"\n... [truncated, {len(sanitized) - max_chars} more chars]"
@@ -402,6 +430,7 @@ def _resolve_handle(ref: str, branch_messages: List) -> Optional[Dict[str, str]]
 
     msg = branch_messages[msg_idx]
     
+    # Extract code blocks
     blocks = []
     pattern = re.compile(r'```(\w*)\n(.*?)```', re.DOTALL)
     for m in pattern.finditer(getattr(msg, "content", "") or ""):
@@ -497,47 +526,62 @@ class _StreamState:
         self.tool_json_data = ""
         self.affected_artefacts = []
 
+        # Sparse artefact forwarding tracker
         self.forward_artefact_chunks = forward_artefact_chunks
         self.artefact_tracker = _ArtefactStreamTracker()
 
+        # Track context unlock requests to force continuation round
         self.context_unlock_requested = False
         self.context_unlocked_files: List[str] = []
 
+        # CRITICAL FIX: Initialize processed_tags from the persistent reference.
         self.processed_tags = processed_tags if processed_tags is not None else set()
 
         self._is_accumulating_tool = False
         self._tool_buffer = ""
-        self._artefact_buffer = ""
-        self._artefact_open_tag = ""
-        self._pending_buffer = ""
+        self._artefact_buffer = ""  # Dedicated buffer for raw artifact content
+        self._artefact_open_tag = "" # Stores the exact opening tag (e.g., <artifact name="x">)
+        self._pending_buffer = ""   # Shadow buffer to safely catch partial tags
 
         self._in_code_fence = False
         self._code_fence_buffer = ""
-        self._code_fence_hold_buffer = ""
-        self._in_inline_code = False
+        self._code_fence_hold_buffer = ""  # Buffers content inside code fences to distinguish closed vs unclosed
+        self._in_inline_code = False  # CRITICAL FIX: Track single backtick state across chunks
 
-        self.raw_text = ""
-
+        # CRITICAL FIX: processed_tags must be passed in from ChatMixin
+        # to persist across multiple reasoning rounds and prevent duplicate dispatch.
         self.processed_tags = processed_tags if processed_tags is not None else set()
 
+        # ── ONE-ACTION-PER-TURN PROTOCOL ──
+        # Ensures generation halts immediately after dispatching a single functional tag.
         self._action_dispatched = False
+
+        # ── DONE TAG DETECTION ──
+        # Set to True when the LLM emits <done/> to signal explicit task termination.
         self._done_detected = False
 
+        # ── Generic Secondary Tag Interceptor State ──
+        # Handles <skill>, <note>, <lollms_inline>, <lollms_form>, <generate_image>, <edit_image>, etc.
+        # These tags don't need the specialized dual-stream artifact tracker, but DO need
+        # full body buffering + closing-tag detection + dispatch to _dispatch_closed_tag.
         self._is_accumulating_secondary = False
         self._secondary_buffer = ""
-        self._secondary_tag_name = ""
-        self._secondary_closing_tag = ""
-        self._secondary_open_tag = ""
+        self._secondary_tag_name = ""      # e.g., "skill", "note"
+        self._secondary_closing_tag = ""   # e.g., "</skill>"
+        self._secondary_open_tag = ""      # e.g., '<skill title="...">'
 
+        # Heartbeat control for empty/slow artifacts
         self._artefact_heartbeat_thread: Optional[threading.Thread] = None
         self._artefact_heartbeat_stop = threading.Event()
         self._artefact_heartbeat_active = False
         self._artefact_received_content = False
 
+        # Fast artefact replicas (user-provided or default)
         self._fast_artefact_replicas = fast_artefact_replicas if fast_artefact_replicas else _DEFAULT_FAST_REPLICAS
 
 
     def _start_artefact_heartbeat(self):
+        """Starts a background thread that emits cheering messages every 15s if no content arrives."""
         if self._artefact_heartbeat_thread is not None:
             return
 
@@ -551,6 +595,9 @@ class _StreamState:
                 if not self._artefact_received_content:
                     msg = random.choice(_HEARTBEAT_MESSAGES)
                     try:
+                        # CRITICAL FIX: Do NOT use was_processed=True here.
+                        # That flag causes _inline_relay to silently drop the message.
+                        # Use a distinct meta key so the UI can style it if desired.
                         _cb(self.callback, f"\n{msg}\n", MSG_TYPE.MSG_TYPE_CHUNK, {"is_heartbeat": True})
                     except Exception:
                         pass
@@ -559,6 +606,7 @@ class _StreamState:
         self._artefact_heartbeat_thread.start()
 
     def _stop_artefact_heartbeat(self):
+        """Stops the heartbeat thread safely."""
         if self._artefact_heartbeat_thread is not None:
             self._artefact_heartbeat_stop.set()
             if threading.current_thread() != self._artefact_heartbeat_thread:
@@ -570,22 +618,30 @@ class _StreamState:
         if not isinstance(chunk, str) or not chunk:
             return True
 
-        self.raw_text += chunk
-
+        # ── ONE-ACTION-PER-TURN: If an action was already dispatched, consume and discard ──
         if self._action_dispatched:
             self._pending_buffer += chunk
             return True
 
+        # CRITICAL FIX: Append to shadow buffer instead of directly to ai_message.content
         self._pending_buffer += chunk
 
+        # ── 🛑 DONE TAG DETECTION ──
+        # Detect <done/> or <done> at the start of a line to signal explicit termination.
+        # We strip it from the buffer so it never leaks into the UI or database.
         if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
             done_match = re.search(r'(?m)^\s*<done\s*/?>', self._pending_buffer, re.IGNORECASE)
             if done_match:
                 ASCIIColors.info("[StreamState] <done/> tag detected. Halting generation.")
                 self._done_detected = True
+                # Remove the tag from the buffer
                 self._pending_buffer = re.sub(r'(?m)^\s*<done\s*/?>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
 
+        # ── 🛑 ANTI-MIMICRY: Prevent LLM from generating <processing> blocks ──
+        # The <processing> tag is strictly system-generated. If the LLM attempts to
+        # output it, we halt generation immediately to prevent log hallucination.
+        # STRICT: Only trigger if the tag starts at the beginning of a line (ignoring whitespace).
         if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
             proc_match = re.search(r'(?m)^\s*<processing', self._pending_buffer, re.IGNORECASE)
             if proc_match:
@@ -593,7 +649,10 @@ class _StreamState:
                 self._pending_buffer = re.sub(r'(?m)^\s*<processing[^>]*>', '', self._pending_buffer, flags=re.IGNORECASE)
                 return False
 
+        # ── 🛡️ MARKDOWN CODE FENCE & INLINE CODE PROTECTION ──
+        # Track ``` and ` to prevent intercepting functional tags inside documentation or tables.
         if not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary:
+            # Handle triple backticks (```...```)
             if "```" in self._pending_buffer:
                 self._code_fence_buffer += self._pending_buffer
                 self._pending_buffer = ""
@@ -609,10 +668,12 @@ class _StreamState:
                         _cb(self.callback, before + "```", MSG_TYPE.MSG_TYPE_CHUNK)
                     else:
                         self._in_code_fence = False
+                        # Emit the hold buffer as verbatim text (it was inside a properly closed fence)
                         if self._code_fence_hold_buffer:
                             self.ai_message.content += self._code_fence_hold_buffer
                             _cb(self.callback, self._code_fence_hold_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
                             self._code_fence_hold_buffer = ""
+                        # Also emit content before the closing fence (handles single-chunk case)
                         if before:
                             self.ai_message.content += before
                             _cb(self.callback, before, MSG_TYPE.MSG_TYPE_CHUNK)
@@ -620,6 +681,9 @@ class _StreamState:
                         _cb(self.callback, "```", MSG_TYPE.MSG_TYPE_CHUNK)
 
                 if self._in_code_fence:
+                    # Still inside fence — buffer remaining content instead of emitting.
+                    # This lets us distinguish closed fences (emit as text) from unclosed
+                    # fences (re-process through tag detection at flush time).
                     self._code_fence_hold_buffer += self._code_fence_buffer
                     self._code_fence_buffer = ""
                     return True
@@ -628,49 +692,72 @@ class _StreamState:
                     self._code_fence_buffer = ""
 
             elif self._in_code_fence:
+                # Buffer content while inside code fence instead of emitting immediately.
+                # This allows us to properly handle functional tags:
+                # - If the fence is closed (``` found), emit everything as verbatim text.
+                # - If the fence is never closed (flush), re-process through tag detection.
                 self._code_fence_hold_buffer += self._pending_buffer
                 self._pending_buffer = ""
                 return True
 
+            # Handle single backticks (`...`) - CRITICAL FIX for streaming tables
+            # We must buffer text when a backtick is opened to prevent the tag parser
+            # from intercepting functional tags that appear inside inline code spans.
             elif "`" in self._pending_buffer:
                 if self._in_inline_code:
+                    # We are inside an inline code span from a previous chunk, looking for the closing backtick
                     idx = self._pending_buffer.find("`")
                     if idx != -1:
+                        # Closing backtick found
                         self._in_inline_code = False
                         inline_content = self._pending_buffer[:idx]
                         self.ai_message.content += inline_content + "`"
                         _cb(self.callback, inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
                         self._pending_buffer = self._pending_buffer[idx+1:]
                     else:
+                        # Check for newline:
+                        # If the LLM moves to a new line without closing the inline code, 
+                        # it was a stray backtick (e.g., inside HTML body). Break out to avoid lockout.
                         newline_idx = self._pending_buffer.find("\n")
                         if newline_idx != -1 and self._in_inline_code:
                             self._in_inline_code = False
+                            # Emit verbatim up to and including the newline to reset state cleanly
                             self.ai_message.content += self._pending_buffer
                             _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
                             self._pending_buffer = ""
                         else:
+                            # Still inside, emit verbatim
                             self.ai_message.content += self._pending_buffer
                             _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
                             self._pending_buffer = ""
                         return True
                 else:
+                    # Not currently in inline code, look for an opening backtick
                     idx = self._pending_buffer.find("`")
                     before = self._pending_buffer[:idx]
                     remainder = self._pending_buffer[idx+1:]
 
+                    # Check if the closing backtick is in the remainder of the current chunk
                     closing_idx = remainder.find("`")
                     if closing_idx != -1:
+                        # Complete inline code span in a single chunk
                         inline_content = remainder[:closing_idx]
                         self.ai_message.content += before + "`" + inline_content + "`"
                         _cb(self.callback, before + "`" + inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
                         self._pending_buffer = remainder[closing_idx+1:]
                     else:
+                        # Opening backtick found, but no closing backtick in this chunk.
+                        # IMPORTANT FIX: Only enter state if no newline exists between the backtick and the end of the chunk.
+                        # If there's a newline, it means the backtick is a stray character (e.g., raw HTML),
+                        # not an inline code span. Emit verbatim and DO NOT enter _in_inline_code state.
                         newline_idx = remainder.find("\n")
                         if newline_idx != -1:
+                            # Stray backtick followed by a newline. Emit verbatim, do not enter code state.
                             self.ai_message.content += before + "`" + remainder
                             _cb(self.callback, before + "`" + remainder, MSG_TYPE.MSG_TYPE_CHUNK)
                             self._pending_buffer = ""
                         else:
+                            # Genuine inline code span starting. Enter inline code mode.
                             self._in_inline_code = True
                             self.ai_message.content += before + "`"
                             _cb(self.callback, before + "`", MSG_TYPE.MSG_TYPE_CHUNK)
@@ -678,6 +765,7 @@ class _StreamState:
                         return True
 
             elif self._in_inline_code:
+                # We are inside an inline code span from a previous chunk, looking for the closing backtick
                 idx = self._pending_buffer.find("`")
                 if idx != -1:
                     self._in_inline_code = False
@@ -686,33 +774,44 @@ class _StreamState:
                     _cb(self.callback, inline_content + "`", MSG_TYPE.MSG_TYPE_CHUNK)
                     self._pending_buffer = self._pending_buffer[idx+1:]
                 else:
+                    # Check for newline: if the LLM moves to a new line without
+                    # closing the inline code, it was a stray backtick. Break out
+                    # to avoid permanent lockout that bypasses functional tags.
                     newline_idx = self._pending_buffer.find("\n")
                     if newline_idx != -1:
                         self._in_inline_code = False
+                        # Emit verbatim up to and including the newline, then let
+                        # the rest of the buffer flow to tag detection logic.
                         self.ai_message.content += self._pending_buffer
                         _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
                         self._pending_buffer = ""
                     else:
+                        # Still inside, emit verbatim
                         self.ai_message.content += self._pending_buffer
                         _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
                         self._pending_buffer = ""
                         return True
 
+        # ── Tool Accumulation & Interception ──
         if self._is_accumulating_tool:
+            # Use regex to be tolerant of whitespace or slight malformations in the closing tag (e.g., </tool >)
             close_match = re.search(r'</tool>\s*', self._pending_buffer, re.IGNORECASE)
             if close_match:
                 end_idx = close_match.start()
                 end_len = len(close_match.group(0))
 
                 full_tool_call = self._tool_buffer + self._pending_buffer[:end_idx + end_len]
+                # Robustly extract JSON body without relying on exact lstrip/rstrip of tags
                 json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
                 json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
 
                 self._is_accumulating_tool = False
                 self._tool_buffer = ""
 
+                # Keep any text after the tool call in the pending buffer
                 self._pending_buffer = self._pending_buffer[end_idx + end_len:]
 
+                # ── ONE-ACTION-PER-TURN: Halt generation immediately after dispatch ──
                 self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
                 self._action_dispatched = True
                 return False
@@ -721,15 +820,24 @@ class _StreamState:
                 self._pending_buffer = ""
             return True
 
+        # ── Tag Detection (Buffering) ──
         last_open_think = self._pending_buffer.rfind("<think")
         last_close_think = self._pending_buffer.rfind("```")
         is_inside_thoughts = (last_open_think != -1) and (last_open_think > last_close_think)
 
+        # ── 🛡️ INLINE TAG QUARANTINE (CRITICAL FIX) ──
+        # If a functional tag appears in the buffer but is NOT at the absolute start
+        # of a line (ignoring whitespace), it is conversational prose and MUST NOT
+        # be intercepted. We flush all text before it, then consume the tag and
+        # emit it directly to the UI as raw text.
         if not is_inside_thoughts and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
             inline_tag_found = False
+            # CRITICAL: Check for exact opening tags (e.g., "<tool>") and tag prefixes with attributes (e.g., "<artifact ")
+            # REMOVED "<lollms_inline" so the host application can handle it directly.
             for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
                 idx = self._pending_buffer.find(tag_prefix)
                 if idx != -1:
+                    # Check if it's at the absolute start of a line
                     is_at_line_start = True
                     i = idx - 1
                     while i >= 0 and self._pending_buffer[i] != '\n':
@@ -739,29 +847,36 @@ class _StreamState:
                         i -= 1
 
                     if not is_at_line_start:
+                        # It's an inline tag! Flush text before it, then emit the tag raw.
                         text_before = self._pending_buffer[:idx]
                         if text_before:
                             self.ai_message.content += text_before
                             _cb(self.callback, text_before, MSG_TYPE.MSG_TYPE_CHUNK)
 
+                        # Emit the tag itself directly to the UI
                         self.ai_message.content += tag_prefix
                         _cb(self.callback, tag_prefix, MSG_TYPE.MSG_TYPE_CHUNK)
 
+                        # Consume the processed parts from the pending buffer
                         self._pending_buffer = self._pending_buffer[idx + len(tag_prefix):]
                         inline_tag_found = True
-                        break
+                        break # Restart the feed loop for the rest of the buffer
 
             if inline_tag_found:
                 return True
 
+        # ── Handle <artifact> Streaming (State-Driven Dual-Stream) ──
         if not is_inside_thoughts:
+            # State 1: We are already inside an artifact (tracker is active)
             if self.artefact_tracker.is_inside_artefact:
+                # Track if we received actual content (for heartbeat suppression)
                 if self._pending_buffer.strip():
                     self._artefact_received_content = True
 
                 self._artefact_buffer += self._pending_buffer
-                self._pending_buffer = ""
+                self._pending_buffer = "" # Consume the buffer into the artifact
 
+                # Check if the closing tag arrived (robust string search)
                 lower_buffer = self._artefact_buffer.lower()
                 close_idx = lower_buffer.find("</artifact>")
                 if close_idx == -1:
@@ -771,6 +886,8 @@ class _StreamState:
                     self._stop_artefact_heartbeat()
                     self.artefact_tracker.close()
 
+                    # Extract the full artifact block cleanly
+                    # Find the opening tag first
                     open_idx = lower_buffer.find("<artifact")
                     if open_idx == -1:
                         open_idx = lower_buffer.find("<artefact")
@@ -781,6 +898,7 @@ class _StreamState:
                     closing_tag = self._artefact_buffer[close_idx:close_idx+len("</artifact>")]
                     full_match_text = opening_tag + body_content + closing_tag
 
+                    # Always dispatch the real body content to create the artifact.
                     if full_match_text not in self.processed_tags:
                         self.processed_tags.add(full_match_text)
                         self._dispatch_closed_tag(
@@ -794,37 +912,57 @@ class _StreamState:
                         self._action_dispatched = True
                         return False
 
+                    # Close the processing block cleanly with status metadata INSIDE the block.
                     proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
                     self.ai_message.content += proc_close_tag
                     _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+                    # Keep any text that came after the closing tag
                     self._pending_buffer = self._artefact_buffer[close_idx+len(closing_tag):]
                     self._artefact_buffer = ""
 
+                    # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
                     self._action_dispatched = True
                     return False
                 else:
+                    # Still in the middle of the artifact body. Suppress raw output from main stream.
+
+                    # CRITICAL FIX: Always emit lightweight structural status events,
+                    # regardless of forward_artefact_chunks. The forward_artefact_chunks
+                    # flag only controls whether raw code chunks (high bandwidth) are forwarded.
+                    # The status tags are tiny and should always fire to keep the user engaged.
                     event_meta = self.artefact_tracker.feed(chunk)
                     if event_meta:
+                        # If forward_artefact_chunks is True, also forward the raw chunk
                         if self.forward_artefact_chunks:
                             _cb(self.callback, chunk, MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, event_meta)
 
+                        # Always forward the lightweight structural status tag
                         status_tag = f'{event_meta["status"]}\n'
                         self.ai_message.content += status_tag
                         _cb(self.callback, status_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
                 return True
 
+            # State 2: We are not inside an artifact, check if we are entering one
             else:
+                # Look for the start of an artifact tag (case-insensitive)
+                # STRICT WHITELIST: Only match if the tag starts at the absolute beginning of a line (ignoring whitespace).
+                # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
+                # to prevent intercepting documentation examples as live functional tags.
                 lower_buffer = self._pending_buffer.lower()
+                # The negative lookahead (?!`) ensures the tag is not immediately preceded by a backtick.
+                # The (?!.*\|) ensures the line is not part of a markdown table (no pipe character after the tag).
                 open_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)(?<![\w\[])<(?:artifact|artefact)', lower_buffer)
                 open_idx = open_match.start() if open_match else -1
 
                 if open_idx != -1:
                     tag_start_idx = open_idx
 
+                    # Check if we have the full opening tag
                     end_of_tag_idx = self._pending_buffer.find(">", tag_start_idx)
 
                     if end_of_tag_idx != -1:
+                        # We have the full opening tag!
                         attrs_str = self._pending_buffer[tag_start_idx:end_of_tag_idx+1]
                         title = "artifact"
                         lang = None
@@ -838,26 +976,33 @@ class _StreamState:
 
                         self.artefact_tracker.open(title, lang)
 
+                        # Forward the text BEFORE the tag to the UI and save it
                         text_before_tag = self._pending_buffer[:tag_start_idx]
                         if text_before_tag:
                             self.ai_message.content += text_before_tag
                             _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
 
+                        # Start the artifact buffer with the opening tag
                         self._artefact_buffer = attrs_str
 
+                        # Determine the type-specific opening message
                         atype = attrs.get("type", "code").lower()
                         opening_status = _ARTEFACT_TYPE_MESSAGES.get(atype, "✨ Starting artifact...")
 
+                        # Fire the opening processing tag to the UI and save it
                         proc_tag = f'\n<processing type="artefact" title="{title}" language="{lang or ""}">\n'
                         self.ai_message.content += proc_tag
                         _cb(self.callback, proc_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+                        # Start the heartbeat in case the artifact body is slow/empty
                         self._start_artefact_heartbeat()
 
+                        # Emit the type-aware initial status message
                         status_line = f'{opening_status}\n'
                         self.ai_message.content += status_line
                         _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+                        # Check if the closing tag also arrived in this same chunk
                         remaining_content = self._pending_buffer[end_of_tag_idx+1:]
                         close_idx = remaining_content.lower().find("</artifact>")
                         if close_idx == -1:
@@ -867,10 +1012,12 @@ class _StreamState:
                             self._stop_artefact_heartbeat()
                             self.artefact_tracker.close()
 
+                            # Extract the body cleanly
                             body_content = remaining_content[:close_idx]
                             closing_tag = remaining_content[close_idx:close_idx+len("</artifact>")]
                             full_match_text = attrs_str + body_content + closing_tag
 
+                            # Always dispatch the real body content to create the artifact.
                             if full_match_text not in self.processed_tags:
                                 self.processed_tags.add(full_match_text)
                                 self._dispatch_closed_tag(
@@ -884,6 +1031,7 @@ class _StreamState:
                                 self._action_dispatched = True
                                 return False
 
+                            # Close the processing block cleanly with status metadata.
                             proc_close_tag = f'\n</processing>\n'
                             status_comment = f'<!-- status:finished -->\n'
                             self.ai_message.content += proc_close_tag + status_comment
@@ -891,29 +1039,39 @@ class _StreamState:
                             _cb(self.callback, status_comment, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
                             self._artefact_buffer = ""
+                            # Keep any text after the closing tag in the pending buffer
                             self._pending_buffer = remaining_content[close_idx+len(closing_tag):]
 
+                            # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
                             self._action_dispatched = True
                             return False
                         else:
+                            # We are inside the artifact, waiting for the rest.
                             self._artefact_buffer += remaining_content
                             self._pending_buffer = ""
 
                         return True
                     else:
+                        # Partial tag detected (e.g., "<art"). 
+                        # Forward text before the partial tag to the UI and save it.
                         text_before_partial = self._pending_buffer[:tag_start_idx]
                         if text_before_partial:
                             self.ai_message.content += text_before_partial
                             _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
 
+                        # Hold the partial tag in the pending buffer for the next chunk
                         self._pending_buffer = self._pending_buffer[tag_start_idx:]
                         return True
 
+        # ── Handle <tool> Streaming ──
         if not is_inside_thoughts:
+            # STRICT WHITELIST: Only match if the <tool> tag starts at the absolute beginning of a line (ignoring whitespace).
+            # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
             open_tool_match = re.search(r'(?m)^\s*(?!`)(?!.*\|)<tool>', self._pending_buffer, re.IGNORECASE)
             if open_tool_match:
                 tag_start_idx = open_tool_match.start()
 
+                # Forward text before the tool tag to the UI and save it
                 text_before_tag = self._pending_buffer[:tag_start_idx]
                 if text_before_tag:
                     self.ai_message.content += text_before_tag
@@ -923,8 +1081,15 @@ class _StreamState:
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
 
+                # CRITICAL FIX: Do NOT emit a <processing> block here.
+                # The ChatMixin will handle the execution UI block once the tool call is parsed.
+                # Emitting it here causes a duplicate/empty processing block in the UI.
+
                 return True
 
+        # ── Handle <unlock_file>, <lock_file>, <hide_file> Streaming ──
+        # These tags must be intercepted here BEFORE the generic secondary tag interceptor
+        # so they can be routed to the specific context visibility handler in _dispatch_closed_tag.
         if not is_inside_thoughts and not self._is_accumulating_secondary:
             lower_buffer = self._pending_buffer.lower()
             context_tag_entered = False
@@ -964,6 +1129,10 @@ class _StreamState:
             if context_tag_entered:
                 return True
 
+        # ── Handle Context Tag Body Accumulation & Closing ──
+        # CRITICAL FIX: This block must run if we are accumulating a context tag.
+        # It uses the same logic as the generic secondary tag accumulator but is placed
+        # here to ensure it catches the closing tag immediately.
         if self._is_accumulating_secondary and self._secondary_tag_name in ("unlock_file", "lock_file", "hide_file"):
             self._secondary_buffer += self._pending_buffer
             self._pending_buffer = ""
@@ -1008,10 +1177,15 @@ class _StreamState:
                 pass
             return True
 
+        # ── Generic Secondary Tag Interception (<skill>, <note>, <lollms_inline>, etc.) ──
         if not is_inside_thoughts and not self._is_accumulating_secondary:
+            # Check if we are ENTERING a secondary tag
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
+            # REMOVED "<lollms_inline" so the host application can handle it directly.
             for tag_prefix in ("<skill", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<unlock_file", "<lock_file", "<hide_file"):
+                # STRICT WHITELIST: Only match if the tag starts at the absolute beginning of a line (ignoring whitespace).
+                # CRITICAL FIX: Exclude lines that start with markdown table/code characters (` or |)
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
@@ -1029,15 +1203,19 @@ class _StreamState:
                             self._secondary_open_tag = opening_tag
                             self._is_accumulating_secondary = True
 
+                            # Forward text BEFORE the tag to the UI and save it
                             text_before_tag = self._pending_buffer[:tag_start_idx]
                             if text_before_tag:
                                 self.ai_message.content += text_before_tag
                                 _cb(self.callback, text_before_tag, MSG_TYPE.MSG_TYPE_CHUNK)
 
+                            # Start the secondary buffer with the opening tag
                             self._secondary_buffer = opening_tag
                             self._pending_buffer = ""
 
+                            # Emit a processing block opening for UI feedback
                             proc_type = self._secondary_tag_name
+                            # Extract title from attributes if present
                             title_match = re.search(r'(?:title|name)=["\']([^"\']*)["\']', opening_tag, re.IGNORECASE)
                             proc_title = title_match.group(1) if title_match else self._secondary_tag_name.capitalize()
                             proc_open = f'\n<processing type="{proc_type}" title="{proc_title}">\n'
@@ -1062,12 +1240,15 @@ class _StreamState:
             if secondary_entered:
                 return True
 
+        # ── Handle Secondary Tag Body Accumulation & Closing ──
         if self._is_accumulating_secondary:
             self._secondary_buffer += self._pending_buffer
             self._pending_buffer = ""
 
+            # Check if the closing tag arrived (case-insensitive regex search)
             close_match = re.search(re.escape(self._secondary_closing_tag), self._secondary_buffer, re.IGNORECASE)
             if close_match:
+                # Closing tag found! Extract the full match.
                 close_idx = close_match.start()
                 close_len = close_match.end() - close_match.start()
                 
@@ -1077,6 +1258,7 @@ class _StreamState:
 
                 self._is_accumulating_secondary = False
 
+                # Dispatch to _dispatch_closed_tag for processing
                 if full_match_text not in self.processed_tags:
                     self.processed_tags.add(full_match_text)
                     self._dispatch_closed_tag(
@@ -1086,12 +1268,15 @@ class _StreamState:
                         full_match_text
                     )
 
+                # Close the processing block with status metadata
                 proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                 self.ai_message.content += proc_close_tag
                 _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+                # Preserve any text that came after the closing tag
                 remaining_text = self._secondary_buffer[close_idx + close_len:]
                 
+                # Reset secondary state
                 self._secondary_tag_name = ""
                 self._secondary_closing_tag = ""
                 self._secondary_open_tag = ""
@@ -1099,18 +1284,28 @@ class _StreamState:
 
                 if remaining_text.strip():
                     self._pending_buffer = remaining_text
+                # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
                 self._action_dispatched = True
                 return False
             else:
+                # Still accumulating body. Emit lightweight status if enabled.
+                # (No structural analysis for secondary tags — just suppress raw output)
                 pass
             return True
 
+        # ── Default Forwarding ──
+        # Robust partial tag detection: Check if the buffer ends with a prefix of any known tag.
+        # This prevents raw XML from leaking when the LLM streams tokens with trailing spaces or partial attributes.
         def _ends_with_partial_tag(buffer: str) -> int:
+            """Returns the start index of the partial tag if found, else -1."""
+            # REMOVED "<lollms_inline" so the host application can handle it directly.
             tags_to_check = ["<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<scratchpad", "<generate_image", "<edit_image", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file"]
 
+            # Helper to check if the start of the line is valid for a tag
             def _is_at_line_start(buf: str, idx: int) -> bool:
                 if idx == 0:
                     return True
+                # Walk backwards from idx to the previous newline. All chars must be whitespace.
                 i = idx - 1
                 while i >= 0 and buf[i] != '\n':
                     if not buf[i].isspace():
@@ -1119,35 +1314,43 @@ class _StreamState:
                 return True
 
             for tag in tags_to_check:
+                # Check if the buffer ends with a STRICT prefix of the tag (e.g., "<art", "<to")
                 for i in range(1, len(tag)):
                     if buffer.endswith(tag[:i]):
                         start_idx = len(buffer) - i
                         if _is_at_line_start(buffer, start_idx):
                             return start_idx
+                        # If not at start of line, it's not a functional tag. Ignore.
 
+            # Fallback: Check for partial tags with trailing spaces or partial attribute names
             for tag in tags_to_check:
                 idx = buffer.rfind(tag)
                 if idx != -1 and ">" not in buffer[idx:]:
                     if _is_at_line_start(buffer, idx):
                         return idx
+                    # If not at start of line, ignore.
 
             return -1
 
         partial_idx = _ends_with_partial_tag(self._pending_buffer)
         if partial_idx != -1:
+            # Forward text before the partial tag to the UI and save it
             text_before_partial = self._pending_buffer[:partial_idx]
             if text_before_partial:
                 self.ai_message.content += text_before_partial
                 _cb(self.callback, text_before_partial, MSG_TYPE.MSG_TYPE_CHUNK)
 
+            # Hold the partial tag in the pending buffer for the next chunk
             self._pending_buffer = self._pending_buffer[partial_idx:]
             return True
 
+        # No partial tags, forward everything and save it
         self.ai_message.content += self._pending_buffer
         _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
         self._pending_buffer = ""
         return True
     def _dispatch_closed_tag(self, tag_name: str, attrs_str: str, body: str, full_match_text: str) -> bool:
+        # If attrs_str starts with '<', it's the full opening tag. Extract attrs from it.
         if attrs_str.startswith('<'):
             attrs = {}
             for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
@@ -1158,6 +1361,7 @@ class _StreamState:
             for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
                 attrs[m.group(1).lower()] = m.group(2)
 
+        # 1. Artifact Creation & Patching
         if tag_name in ("artifact", "artefact"):
             if not self.enable_artefacts:
                 return True
@@ -1213,32 +1417,27 @@ class _StreamState:
                 })
                 return True
             else:
-                from pathlib import Path as _Path
-                from lollms_client.lollms_artefact.lollms_artefact import _KNOWN_EXTENSIONS
-
-                title_ext = _Path(title).suffix.lower()
-                if title_ext and title_ext in _KNOWN_EXTENSIONS:
-                    attrs["file_ext"] = title_ext
-
-                # Prevent kwargs collision: remove keys explicitly mapped to named arguments
-                for k in ("name", "title", "type", "language", "ephemeral"):
-                    attrs.pop(k, None)
-
                 if is_new:
-                            art = self.discussion.artefacts.add(
-                                title=title, artefact_type=atype, content=body, language=lang, active=self.auto_activate,
-                                ephemeral=is_ephemeral, **attrs
-                            )
+                    art = self.discussion.artefacts.add(
+                        title=title, artefact_type=atype, content=body, language=lang, active=self.auto_activate,
+                        ephemeral=is_ephemeral
+                    )
                 else:
                     art = self.discussion.artefacts.update(
                         title=title, new_content=body, new_type=atype, language=lang, bump_version=True, active=self.auto_activate,
-                        ephemeral=is_ephemeral, **attrs
+                        ephemeral=is_ephemeral
                     )
 
             if art:
                 self.affected_artefacts.append(art)
 
+            # ── 🛑 CRITICAL FIX: IMMEDIATE PHYSICAL MATERIALIZATION ──
+            # The physical twin MUST exist on disk the instant the artifact is created.
+            # If the LLM emits a <tool> tag in the very next token that references this file,
+            # the tool will fail with "File not found" if we rely on deferred syncing.
+            # We force a synchronous write to the workspace_data directory right now.
             try:
+                # Use the discussion's artefact manager to sync this specific file to disk
                 self.discussion.artefacts._sync_to_disk_workspace(
                     title=art.get("title", title),
                     content=art.get("content", body),
@@ -1249,6 +1448,13 @@ class _StreamState:
             except Exception as sync_ex:
                 ASCIIColors.warning(f"[StreamState] Failed to immediately materialize artifact '{title}' to disk: {sync_ex}")
 
+            # ── CRITICAL: DO NOT MUTATE ai_message.content ──
+            # The raw <artifact> XML is preserved in the message content.
+            # The export() method in _mixin_utils.py will handle replacing it
+            # with the [🔒SYSTEM_ARTIFACT_CREATED:title|type] marker when building
+            # history for the LLM. This prevents the marker from leaking into the live UI.
+
+            # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
             _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
                 "type": "artifact_updated" if not is_new else "artifact_created",
                 "title": title,
@@ -1257,15 +1463,22 @@ class _StreamState:
             })
             return True
 
+        # 2. Tools Execution Trigger
         elif tag_name in ("tool", "tool"):
             self.tool_trigger = True
 
+            # ── ROBUST JSON PARSING & NORMALIZATION (CRITICAL FIX) ──
+            # LLMs often hallucinate flat structures: {"name": "tool", "arg": "val"}
+            # instead of nested: {"name": "tool", "parameters": {"arg": "val"}}
+            # We MUST normalize this here to prevent execution failures.
             tool_name = ""
             try:
                 raw_data = json.loads(body)
                 if isinstance(raw_data, dict):
+                    # ALWAYS normalize to nested structure for consistency
                     tool_name = raw_data.get("name", "")
 
+                    # Check if already nested
                     if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
                         self.tool_json_data = body
                     else:
@@ -1278,6 +1491,10 @@ class _StreamState:
                 self.tool_json_data = body
                 ASCIIColors.error(f"[StreamState] JSON decode failed: {je}")
 
+            # ── 🛑 CRITICAL FIX: IMMEDIATE UI FEEDBACK ──
+            # Emit the processing block to the UI INSTANTLY when the </tool> tag closes.
+            # This guarantees the user sees "Calling tool..." while the tool executes,
+            # rather than waiting for the synchronous execution to finish.
             import html
             try:
                 parsed_for_ui = json.loads(self.tool_json_data)
@@ -1296,8 +1513,10 @@ class _StreamState:
             self.ai_message.content += status_line
             _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+            # Halt generation instantly so the executor can take over the loop
             return False
 
+        # 3. User Note
         elif tag_name == "note":
             if not self.enable_notes:
                 return True
@@ -1354,6 +1573,7 @@ class _StreamState:
             })
             return True
 
+        # 3b. Scratchpad (Intermediate Hypothesis Workspace)
         elif tag_name == "scratchpad":
             if not self.enable_artefacts:
                 return True
@@ -1410,6 +1630,7 @@ class _StreamState:
             })
             return True
 
+        # 4. Long-term Skill
         elif tag_name == "skill":
             if not self.enable_skills:
                 return True
@@ -1468,11 +1689,17 @@ class _StreamState:
             })
             return True
 
+        # 5. Multi-tier Context Visibility Management
         elif tag_name in ("unlock_file", "lock_file", "hide_file"):
             from lollms_client.lollms_artefact import ArtefactVisibility
 
+            # ── CONTEXT BUDGET GUARD ──
+            # Maximum tokens allowed for a single file to be unlocked into context.
+            # Files exceeding this threshold are blocked from FULL visibility to
+            # prevent context overflow and empty-response loops.
             _MAX_UNLOCK_TOKENS = 50000
 
+            # Map tag name to target visibility state
             target_visibility = ArtefactVisibility.FULL
             action_verb = "Unlocking"
             if tag_name == "lock_file":
@@ -1496,9 +1723,12 @@ class _StreamState:
                 elif art.get("visibility") == target_visibility:
                     already_in_state.append(t_file)
                 elif target_visibility == ArtefactVisibility.FULL:
+                    # ── CONTEXT BUDGET CHECK ──
+                    # Check if the file is too large to safely load into context
                     token_count = art.get("token_count", 0)
                     content_len = len(art.get("content", ""))
 
+                    # If token_count is 0 or unreliable, estimate from content length
                     if token_count == 0 and content_len > 0:
                         token_count = content_len // 4
 
@@ -1517,10 +1747,12 @@ class _StreamState:
 
             if processed_files:
                 self.discussion.commit()
+                # If we unlocked files, mark that we need a continuation round
                 if target_visibility == ArtefactVisibility.FULL:
                     self.context_unlock_requested = True
                     self.context_unlocked_files.extend(processed_files)
 
+            # Build UI feedback inside a processing block
             status_parts = []
             if processed_files:
                 status_parts.append(f"✅ {action_verb}: {', '.join(processed_files)}")
@@ -1542,14 +1774,20 @@ class _StreamState:
             details_block = f"Context Update:\n{'; '.join(status_parts)}\n"
             status_meta = "failure" if (not_found and not processed_files) or blocked_files else "success"
 
+            # The generic secondary tag interceptor already emitted the <processing> opening block.
+            # We just need to append the status content and close the block.
             proc_close = f'{status_line}{details_block}<!-- status:{status_meta} -->\n</processing>\n\n'
             self.ai_message.content += proc_close
             _cb(self.callback, proc_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+            # ── INJECT CONTEXT BUDGET GUIDANCE INTO VIRTUAL HISTORY ──
+            # If files were blocked, inject a system message so the LLM knows
+            # it must use tools to access that data, not <unlock_file>.
             if blocked_files:
                 blocked_names = ", ".join(f"`{bf}`" for bf, _ in blocked_files)
-                self.context_unlock_requested = True
+                self.context_unlock_requested = True  # Force continuation so LLM sees the guidance
                 self.context_unlocked_files.extend([bf for bf, _ in blocked_files])
+                # Store the blocked guidance for the continuation prompt
                 if not hasattr(self, '_blocked_files_guidance'):
                     object.__setattr__(self, '_blocked_files_guidance', [])
                 self._blocked_files_guidance.append(
@@ -1563,9 +1801,11 @@ class _StreamState:
         return True
 
     def was_action_dispatched(self) -> bool:
+        """Returns True if a functional tag was fully dispatched during this generation turn."""
         return self._action_dispatched
 
     def was_done_detected(self) -> bool:
+        """Returns True if the LLM emitted the <done/> termination tag."""
         return self._done_detected
 
     def passthrough(self, chunk, msg_type=None, meta=None) -> bool:
@@ -1576,16 +1816,28 @@ class _StreamState:
         return True
 
     def flush_remaining_buffer(self):
+        """Flushes any safe text remaining in the shadow buffer at the end of generation."""
+        # CRITICAL: Stop heartbeat if artifact was never closed
         self._stop_artefact_heartbeat()
 
+        # ── Handle unclosed code fence ──
+        # If we're still in code fence mode at flush time, the fence was never closed.
+        # Re-process the hold buffer through tag detection to intercept any functional tags
+        # that were trapped inside the unclosed fence.
         if self._in_code_fence:
             self._in_code_fence = False
             hold = self._code_fence_hold_buffer
             self._code_fence_hold_buffer = ""
             if hold:
+                # Re-feed through the full parser to intercept any functional tags
                 self.feed(hold)
 
+        # ── CRITICAL FIX: Force-dispatch incomplete tool calls ──
+        # If the LLM finishes generation while we are still accumulating a tool call 
+        # (e.g., it omitted the closing </tool> tag or hit a stop token), we must 
+        # synthesize the closing tag and dispatch it so tool_trigger is set to True.
         if self._is_accumulating_tool:
+            # Combine buffers to capture any partial JSON that arrived in the last chunk
             full_tool_call = self._tool_buffer + self._pending_buffer
             json_body = re.sub(r'^<tool>', '', full_tool_call, flags=re.IGNORECASE)
             json_body = re.sub(r'</tool>\s*$', '', json_body, flags=re.IGNORECASE).strip()
@@ -1594,10 +1846,14 @@ class _StreamState:
             self._pending_buffer = ""
             self._tool_buffer = ""
 
+            # Dispatch the tool call silently. The ChatMixin will handle the UI processing block.
             self._dispatch_closed_tag("tool", "", json_body, full_tool_call)
-            return
+            return  # Exit early; the tool call has been dispatched
 
+        # ── Force-dispatch incomplete secondary tags (unclosed <skill>, <note>, etc.) ──
         if self._is_accumulating_secondary:
+            # The LLM finished generation without closing the tag.
+            # Synthesize a closing tag and dispatch what we have.
             full_match_text = self._secondary_buffer + self._secondary_closing_tag
             body_content = self._secondary_buffer[len(self._secondary_open_tag):]
 
@@ -1612,6 +1868,7 @@ class _StreamState:
                     full_match_text
                 )
 
+            # Close the processing block
             proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
             self.ai_message.content += proc_close_tag
             _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
@@ -1621,14 +1878,21 @@ class _StreamState:
             self._secondary_open_tag = ""
             self._secondary_buffer = ""
 
+            # ── ONE-ACTION-PER-TURN: Halt generation immediately ──
             self._action_dispatched = True
             return
 
         if self._pending_buffer or self.artefact_tracker.is_inside_artefact:
+            # If we are still inside an artifact for some reason (unclosed tag), dump it to the UI
             if self.artefact_tracker.is_inside_artefact:
+                # ── 🛑 TRUNCATED ARTIFACT RECOVERY ──
+                # The LLM finished generation without closing the <artifact> tag.
+                # This often happens with SEARCH/REPLACE blocks that hit max_tokens.
+                # We synthesize the closing tag and attempt a best-effort dispatch.
                 self._artefact_buffer += self._pending_buffer
                 self._pending_buffer = ""
 
+                # Check if we have a valid opening tag to extract attributes from
                 lower_buf = self._artefact_buffer.lower()
                 open_idx = lower_buf.find("<artifact")
                 if open_idx == -1:
@@ -1652,20 +1916,24 @@ class _StreamState:
                                 full_match_text
                             )
 
+                        # Close the processing block
                         proc_close_tag = '\n<!-- status:finished -->\n</processing>\n'
                         self.ai_message.content += proc_close_tag
                         _cb(self.callback, proc_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+                        # Mark that an action was dispatched so the loop continues correctly
                         self._action_dispatched = True
                         self.artefact_tracker.close()
                         self._artefact_buffer = ""
                         return
 
+                # Fallback: if we couldn't parse the opening tag, just dump to UI
                 self.ai_message.content += self._artefact_buffer
                 _cb(self.callback, self._artefact_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
                 self._artefact_buffer = ""
                 self.artefact_tracker.close()
             else:
+                # Otherwise, it's just trailing text or a partial tag that never completed
                 self.ai_message.content += self._pending_buffer
                 _cb(self.callback, self._pending_buffer, MSG_TYPE.MSG_TYPE_CHUNK)
             self._pending_buffer = ""
@@ -1676,15 +1944,14 @@ class _StreamState:
     def get_clean_text_so_far(self) -> str:
         return self.ai_message.content
 
-    def get_raw_text_so_far(self) -> str:
-        return self.raw_text
-
 # ── ChatMixin Implementation ────────────────────────────────────────────────
 
 class ChatMixin:
     """ChatMixin: orchestrates RAG, tiered memory, and alternating tool rounds."""
 
     def __init__(self, *args, **kwargs):
+        """Initialize ChatMixin with sequential cancellation support."""
+        # Simple boolean flag for sequential control
         object.__setattr__(self, '_cancel_flag', False)
         super().__init__(*args, **kwargs)
 
@@ -1692,8 +1959,12 @@ class ChatMixin:
         object.__setattr__(self, '_failure_memory', FailureMemory())
 
     def cancel_generation(self) -> bool:
+        """
+        Signals the active generation loop to stop gracefully.
+        """
         object.__setattr__(self, '_cancel_flag', True)
 
+        # Propagate to client immediately to stop low-level streaming
         if hasattr(self, 'lollmsClient') and self.lollmsClient:
             try:
                 if hasattr(self.lollmsClient, 'cancel'):
@@ -1705,9 +1976,16 @@ class ChatMixin:
         return True
 
     def is_generation_cancelled(self) -> bool:
+        """
+        Checks if cancellation has been requested.
+
+        Returns:
+            bool: True if cancellation is active, False otherwise.
+        """
         return getattr(self, '_cancel_flag', False)
 
     def reset_cancel_state(self) -> None:
+        """Resets the cancellation flag for a new generation turn."""
         object.__setattr__(self, '_cancel_flag', False)
 
     def _get_pending_forms(self) -> Dict[str, Dict]:
@@ -1745,9 +2023,15 @@ class ChatMixin:
         files_after: Dict,
         callback: Optional[Callable]
     ) -> None:
+        """
+        Detects new and modified files by diffing before/after workspace snapshots,
+        then registers them as artifacts following the Tool-Generated File Visibility Doctrine.
+        This logic is shared between the direct-callable and LCP dispatch paths.
+        """
         from pathlib import Path
         from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactType
 
+        # Detect NEW files
         new_files = set(files_after.keys()) - set(files_before.keys())
 
         for rel_path in new_files:
@@ -1762,14 +2046,14 @@ class ChatMixin:
                 atype = "code"
             elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
                 atype = "data"
-            elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
+            elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl", ".pdf", ".docx", ".pptx", ".odt"):
                 atype = "document"
             elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
                 atype = "image"
 
             EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
                                     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-                                    ".zip", ".tar", ".gz", ".pdf", ".docx"}
+                                    ".zip", ".tar", ".gz"}
 
             should_read_content = True
             content_placeholder = None
@@ -1882,6 +2166,7 @@ class ChatMixin:
                         ai_msg_local.content += f'\n\n{tag}\n'
                     self.commit()
 
+        # Detect MODIFIED files
         common_files = set(files_after.keys()) & set(files_before.keys())
         for rel_path in common_files:
             before_info = files_before[rel_path]
@@ -1902,14 +2187,14 @@ class ChatMixin:
                     atype = "code"
                 elif file_ext in (".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"):
                     atype = "data"
-                elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl"):
+                elif file_ext in (".md", ".txt", ".log", ".out", ".trace", ".asc", ".raw", ".json", ".yaml", ".yml", ".xml", ".ttl", ".pdf", ".docx", ".pptx", ".odt"):
                     atype = "document"
                 elif file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"):
                     atype = "image"
 
                 EXPLICIT_BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
                                         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-                                        ".zip", ".tar", ".gz", ".pdf", ".docx"}
+                                        ".zip", ".tar", ".gz"}
 
                 should_read_content = True
                 content_placeholder = None
@@ -2040,9 +2325,22 @@ class ChatMixin:
                         self.commit()
 
     def _get_spinoff_agent_tools(self, current_prompt: str, images: list, **kwargs) -> Dict[str, Dict[str, Any]]:
+        """
+        Dynamically registers specialized sub-agents as executable in-process tools.
+        Enables the LLM to delegate heavy cognitive, formatting, or parsing tasks on-demand
+        without breaking the main stream or bloating the primary conversation context.
+        """
         spinoffs = {}
 
+        # Spinoff 1: Surgical Artifact Specialist
         def tool_spinoff_code_specialist(task_instructions: str) -> dict:
+            """
+            Spawns a specialized Surgical Code Specialist in a focused, low-temperature sandbox.
+            Ideal for generating complete Python scripts, performing exact aider patches, or refactoring logic.
+
+            Args:
+                task_instructions (str): The specific coding or refactoring instructions for the specialist.
+            """
             custom_system = (
                 "You are an expert Surgical Code Specialist.\n"
                 "You operate in a hyper-focused sandbox isolated from the main conversation's noise.\n"
@@ -2052,6 +2350,7 @@ class ChatMixin:
                 "2. Do NOT use markdown fences or write introductory/concluding prose outside the tags.\n"
                 "3. Ensure character-for-character accuracy in aider SEARCH/REPLACE blocks."
             )
+            # Fetch active artifacts context
             art_zone = self.artefacts.build_artefacts_context_zone()
             payload = f"=== CONTEXT ARTIFACTS ===\n{art_zone}\n\n=== SPECIALIST TASK ===\n{task_instructions}"
             try:
@@ -2059,7 +2358,7 @@ class ChatMixin:
                     prompt=payload,
                     system_prompt=custom_system,
                     images=images,
-                    temperature=0.1,
+                    temperature=0.1,  # Low temperature for deterministic precision
                     **{k: v for k, v in kwargs.items() if k not in ("temperature", "streaming_callback")}
                 )
                 return {"success": True, "output": res.strip()}
@@ -2073,7 +2372,17 @@ class ChatMixin:
             "callable": tool_spinoff_code_specialist
         }
 
+        # Spinoff 2: HTML Slide Presentation Designer
         def tool_spinoff_presentation_designer(style: str, slide_count: int, structure_hints: str) -> dict:
+            """
+            Spawns a specialized HTML Slide Presentation Designer in a focused sandbox.
+            Converts active artifacts into a styled, structured multi-slide HTML5 presentation deck.
+
+            Args:
+                style (str): The design theme (e.g. 'dark', 'light', 'creative').
+                slide_count (int): Expected number of slides.
+                structure_hints (str): Specific topics or structural outlines to focus on.
+            """
             custom_system = (
                 "You are an expert HTML Slide Presentation Designer.\n"
                 "You design beautiful, modern 16:9 slideshows using semantic HTML5 and CSS.\n\n"
@@ -2140,24 +2449,36 @@ class ChatMixin:
         prehydrate_rag:               bool = True,
         max_reasoning_steps:          int = 20,
         enable_in_message_status:     bool = False,
-        enable_sub_agents:            bool = False,
-        forward_artefact_chunks:      bool = False,
-        fast_artefact_replicas:       Optional[List[str]] = None,
+        enable_sub_agents:            bool = False,  # Enable spinoff agents as executable tools
+        forward_artefact_chunks:      bool = False,  # Forward sparse artefact structural events to UI
+        fast_artefact_replicas:       Optional[List[str]] = None,  # Custom messages for instant/empty artefacts
         tolerance_level:              Optional[str] = "strict",
-        allow_dynamic_tools:          bool = False,
-        enable_code_execution:        bool = False,
-        suppress_images:              bool = False,
-        debug_export:                 bool = False,
+        allow_dynamic_tools:          bool = False,  # 🛡️ Security gate for LLM-generated tool execution
+        enable_code_execution:        bool = False,  # 🛡️ Security gate for arbitrary Python code execution
+        suppress_images:              bool = False,  # 🛡️ Set to True for non-vision LLMs to prevent passing image data
+        debug_export:                 bool = False,   # 🔬 Dumps virtual_history and ai_msg.content to disk for debugging
         **kwargs
     ) -> Dict[str, Any]:
+        """
+        Runs the conversational loop, resolving RAG, tiered memories, and tool calls.
+        """
+        # Store tolerance level on active discussion for downstream execution tools (like execute_python_data_query)
         if not hasattr(self, "tolerance_level") or tolerance_level:
             object.__setattr__(self, "tolerance_level", tolerance_level or "strict")
 
+        # 🛡️ SECURITY: Store the dynamic tool execution flag.
+        # If False, the ArtefactManager will NOT register type="tool" artefacts as executable LCP tools.
         object.__setattr__(self, "allow_dynamic_tools", allow_dynamic_tools)
+
+        # 🛡️ SECURITY: Store the arbitrary code execution flag.
         object.__setattr__(self, "enable_code_execution", enable_code_execution)
 
+        # Initialize list to collect all created/modified artifacts during this turn safely
         object.__setattr__(self, "_affected_artefacts_this_turn", [])
 
+        # 🛡️ CRITICAL FIX: Preserve pre-turn cancellation signal.
+        # If cancel_generation() was called BEFORE chat(), we must observe it.
+        # We capture the state, then reset the flag. The loop will check the captured state.
         _was_pre_cancelled = self.is_generation_cancelled()
         self.reset_cancel_state()
         if _was_pre_cancelled:
@@ -2167,6 +2488,7 @@ class ChatMixin:
         callback = kwargs.get("streaming_callback")
         temperature = kwargs.get("temperature")
 
+        # ── 1. Safe SQLite Memory Ingestion ──
         _mm = self._get_memory_manager(memory_manager) if enable_memory else None
         _counter = self.lollmsClient.count_tokens if self.lollmsClient else None
 
@@ -2187,6 +2509,7 @@ class ChatMixin:
             except Exception as ex:
                 trace_exception(ex)
 
+        # ── 2. Add or Retrieve User Message ──
         user_msg = None
         if add_user_message:
             user_msg = self.add_message(
@@ -2203,8 +2526,11 @@ class ChatMixin:
             images = user_msg.get_active_images()
             user_message = user_msg.content
 
+        # ── 3. Build Dynamic System Prompt ──
         sys_prompt = (personality.system_prompt if personality else None) or self.system_prompt or ""
         
+        # Veracity and Formatting Rules
+        # Veracity and Formatting Rules
         rules = (
             "\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
             "Cite retrieved sources as [1],[2]... "
@@ -2242,14 +2568,14 @@ class ChatMixin:
             "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
             "for images) and STOP generating.\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
-            "If you decide to output a thought process enclosed in  tags, "
+            "If you decide to output a thought process enclosed in </think> tags, "
             "you MUST output all functional XML tags (such as <artifact>, <tool>, or <mem_new>) "
-            "on a NEW LINE strictly AFTER the closing  tag. "
-            "NEVER place functional tags inside the  reasoning block.\n"
+            "on a NEW LINE strictly AFTER the closing </think> tag. "
+            "NEVER place functional tags inside the </think> reasoning block.\n"
             "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
             "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
             "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
-            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside  blocks. They must ONLY appear in the final response body AFTER the closing  tag.\n"
+            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside </think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
         )
 
         extra_instructions = ""
@@ -2282,6 +2608,7 @@ class ChatMixin:
 
         full_system_prompt = sys_prompt + "\n" + rules + "\n" + extra_instructions
 
+        # ── 4. RAG Ingestion & Pre-Hydration ──
         rag_context = ""
         if prehydrate_rag and personality and hasattr(personality, "has_data") and personality.has_data:
             try:
@@ -2298,6 +2625,7 @@ class ChatMixin:
         if rag_context:
             full_system_prompt += "\n" + rag_context
 
+        # ── 5. Active Artifacts & Memories Injection ──
         if enable_artefacts:
             artefacts_zone = self.artefacts.build_artefacts_context_zone()
             if artefacts_zone:
@@ -2308,6 +2636,7 @@ class ChatMixin:
             if mem_block:
                 full_system_prompt += "\n=== ACTIVE MEMORIES ===\n" + mem_block + "\n"
 
+        # ── 6. Data Zones Ingestion ──
         data_zones = []
         udz = (self.user_data_zone or "").strip()
         if udz:
@@ -2322,41 +2651,60 @@ class ChatMixin:
         if data_zones:
             full_system_prompt += "\n" + "\n\n".join(data_zones)
 
+        # ── 7. Tool calling registry & Dynamic Library Mounting ──
         active_tools = dict(tools or {})
 
+        # ── DYNAMIC TOOL MOUNTING PROTOCOL ──
+        # Automatically mount specialized tool libraries based on workspace context
         lcp_binding = getattr(self.lollmsClient, "tools", None)
 
+        # 1. Data Tools Auto-Load
+        # If enable_data_tools is True (or not explicitly disabled) AND data files exist in workspace
         enable_data_tools = kwargs.get("enable_data_tools", True)
 
+        # Check workspace for data files using the discussion's resolved workspace_data_path
         from pathlib import Path
         workspace_dir = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else Path("./data_workspace")
 
         data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
         has_data_files = any(f.suffix.lower() in data_extensions for f in workspace_dir.rglob("*") if f.is_file())
 
+        # CRITICAL FIX: If data files exist but LCP binding is None, INSTANTIATE it on-the-fly!
         if has_data_files and (lcp_binding is None):
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
 
+                # Create LCP binding instance with default tools folder
                 lcp_binding = LCPBinding(
                     tools_folders=[Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"]
                 )
 
+                # Attach it to the client for future use
                 self.lollmsClient.tools = lcp_binding
             except Exception as ex:
                 trace_exception(ex)
                 lcp_binding = None
 
+        # Now proceed with tool mounting if LCP binding exists
         if enable_data_tools and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             if has_data_files:
                 lcp_binding.mount_tool_library("semantic_data_engineer")
 
+        # 2. Merge LCP Tools into Active Toolset
+        # If LCP binding exists, merge all discovered tools (including newly mounted ones)
+        # 🛑 CRITICAL: We do NOT force a re-discovery here. The LCP binding's constructor
+        # and explicit mount_tool_library() calls handle discovery and early initialization.
+        # Calling discover_tools(force_refresh=True) here would re-run init_tools_library()
+        # on every chat turn, violating the Early Initialization Doctrine.
         if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
             try:
+                # ── 🛡️ SECURITY GATE: Explicitly mount the code execution library if enabled ──
+                # This guarantees the tool is discovered and present in the registry before merging.
                 if enable_code_execution and hasattr(lcp_binding, "mount_tool_library"):
                     lcp_binding.mount_tool_library("execute_python_code")
 
                 lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                # ── 🛡️ SECURITY GATES: Filter out dangerous tools unless explicitly enabled ──
                 if not allow_dynamic_tools:
                     lcp_tools = {
                         name: spec for name, spec in lcp_tools.items() 
@@ -2376,6 +2724,7 @@ class ChatMixin:
             except Exception as ex:
                 trace_exception(ex)
 
+        # Optionally merge spinoff agents as dynamic local tools
         if enable_sub_agents:
             spinoff_tools = self._get_spinoff_agent_tools(full_system_prompt, images or [], **kwargs)
             active_tools.update(spinoff_tools)
@@ -2415,6 +2764,10 @@ class ChatMixin:
                 param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
                 tools_prompt += f"- {t_name}({param_desc}): {desc}\n"
 
+            # ── 🛡️ PHANTOM TOOL PREVENTION PROTOCOL ──
+            # Explicitly enumerate allowed tool names to prevent the LLM from
+            # hallucinating tools that exist in its training data but are not
+            # registered in the current session.
             allowed_tool_names = list(active_tools.keys())
             tools_prompt += f"\n🚨 **STRICT TOOL REGISTRY ENFORCEMENT** 🚨\n"
             tools_prompt += f"You are STRICTLY FORBIDDEN from calling any tool not listed above.\n"
@@ -2422,6 +2775,7 @@ class ChatMixin:
             tools_prompt += f"If you need to perform an action and no tool in this list is suitable, DO NOT hallucinate a tool name. Instead, inform the user that the required tool is not available in this session.\n"
             tools_prompt += "=== END TOOLS ===\n"
 
+        # ── 🔬 SCIENTIFIC RESOLUTION: Clear FailureMemory at start of turn ──
         if not hasattr(self, "_failure_memory") or not isinstance(self._failure_memory, FailureMemory) or not hasattr(self._failure_memory, "_signatures"):
             fm = FailureMemory()
             if not hasattr(fm, "_signatures"):
@@ -2432,6 +2786,7 @@ class ChatMixin:
             self._failure_memory._signatures.clear()
             ASCIIColors.info("[ChatMixin] FailureMemory cleared for new turn.")
 
+        # ── 8. Active Deliberation Loop ──
         import time as _chat_time
         _t_branch_start = _chat_time.perf_counter()
         ASCIIColors.info("[Trace] Retrieving conversation branch...")
@@ -2440,16 +2795,33 @@ class ChatMixin:
         _t_branch_end = _chat_time.perf_counter()
         ASCIIColors.info(f"[Trace] Branch retrieved in {(_t_branch_end - _t_branch_start)*1000:.2f} ms ({len(branch)} messages).")
 
+        # ── 🧠 VIRTUAL HISTORY & KV-CACHE PROTOCOL ──
+        # 1. `virtual_history` is managed by `export()` in `UtilsMixin`.
+        # 2. During agentic rounds, we append RAW assistant text (including <tool> tags) and
+        #    structured tool results to this list. This preserves the LLM's KV-cache.
+        # 3. `ai_msg.content` is the UI/DB buffer. It only receives conversational text and
+        #    <processing> blocks. We track `conversational_gist` separately to avoid polluting
+        #    the final message with raw XML or execution logs.
+        # 4. 🛑 CRITICAL: virtual_history MUST start empty. The user's prompt is already
+        #    part of the real historical branch (added via add_message). If we append it
+        #    here, export() produces two consecutive user messages, which breaks strict
+        #    alternation rules (e.g., llama.cpp Jinja templates) and causes KV-cache
+        #    poisoning. virtual_history strictly tracks the NEW assistant answers and
+        #    tool results generated during the agentic loop.
+
         virtual_history = []
 
         tool_calls_this_turn = []
         round_count = 0
-        conversational_gist = ""
+        conversational_gist = ""  # Accumulates only the conversational text for the final DB message
 
+        # Track the count of exact tool call signatures to prevent infinite loops (Success Loops)
+        # We allow up to 2 identical calls per turn to permit legitimate retries after null/empty output.
         tool_signature_counts = {}
 
         successful_tool_signatures = set()
 
+        # Initialize the single, clean database assistant message ONCE before entering the loop
         ai_msg = self.add_message(
             sender=personality.name if personality else self.lollmsClient.ai_name,
             sender_type="assistant",
@@ -2461,21 +2833,31 @@ class ChatMixin:
         if callback:
             callback(ai_msg.id, MSG_TYPE.MSG_TYPE_NEW_MESSAGE, {"message_id": ai_msg.id})
 
+        # Track if we exited due to cancellation
         was_cancelled = False
 
+        # CRITICAL FIX: Initialize ss to None to prevent UnboundLocalError
+        # if the loop breaks before _StreamState is instantiated (e.g., pre-turn cancellation).
         ss = None
 
+        # Initialize mimicry attempt counter exactly once at the start of the turn
+        # CRITICAL FIX: Use a list to ensure safe mutation across reasoning rounds.
         object.__setattr__(self, "_mimicry_attempt_counts", [0])
 
+        # CRITICAL FIX: Persistent set to track dispatched tags across all reasoning rounds.
+        # This prevents the LLM from re-dispatching the same artifact in a subsequent round,
+        # which causes infinite loops and unwanted version bumps.
         persistent_processed_tags = set()
 
         while round_count < max_reasoning_steps:
+            # Check cancellation at the start of each reasoning round
             if self.is_generation_cancelled():
                 was_cancelled = True
                 break
 
             round_count += 1
 
+            # Guarantee a clean, un-canceled state before launching each independent generation round
             if self.lollmsClient and getattr(self.lollmsClient, "llm", None):
                 try:
                     self.lollmsClient.llm.reset_cancel()
@@ -2485,6 +2867,10 @@ class ChatMixin:
             current_system_prompt = full_system_prompt
             if tools_prompt:
                 current_system_prompt += "\n" + tools_prompt
+            else:
+                # 🛑 CRITICAL FIX: If no tools are active, ensure tools_prompt is empty 
+                # so it doesn't append an empty string with a newline.
+                pass
 
             messages_list = self.export(
                 format_type="openai_chat",
@@ -2496,6 +2882,11 @@ class ChatMixin:
                 system_prompt_override=current_system_prompt
             )
 
+            # ── 🎨 DYNAMIC VISION HYDRATION ──
+            # Retrieve all images generated or modified during previous rounds of this turn
+            # and append their base64 pixels to the active vision context so the LLM can "see" them!
+            # CRITICAL FIX: Only hydrate images that are explicitly in FULL visibility context.
+            # Injecting pixels for [U] (TREE_UNLOCKABLE) images crashes non-vision LLMs.
             if suppress_images:
                 round_images = None
             else:
@@ -2508,6 +2899,10 @@ class ChatMixin:
                                 round_images.append(img_b64)
                                 ASCIIColors.success(f"[Vision Sync] Hydrated LLM context with generated plot: '{art['title']}'")
 
+            # ── 🔬 SCIENTIFIC DEBUG: EXPORTED PROMPT TRACE ──
+            # (Logging removed per user request)
+
+            # CRITICAL FIX: Track content offset to prevent re-parsing old tool calls
             current_content_length = len(ai_msg.content)
 
             ss = _StreamState(
@@ -2523,17 +2918,19 @@ class ChatMixin:
                 enable_artefacts=enable_artefacts,
                 enable_in_message_status=enable_in_message_status,
                 fast_artefact_replicas=fast_artefact_replicas,
-                content_offset=current_content_length,
-                processed_tags=persistent_processed_tags
+                content_offset=current_content_length,  # Start parsing from current position
+                processed_tags=persistent_processed_tags # Pass the persistent set
             )
 
             def _inline_relay(chunk, msg_type=None, meta=None):
+                # Check cancellation on EVERY token chunk
                 if self.is_generation_cancelled():
-                    return False
+                    return False  # Signal to stop generation
 
                 if msg_type is not None and msg_type != MSG_TYPE.MSG_TYPE_CHUNK:
                     return ss.passthrough(chunk, msg_type, meta)
                 if isinstance(chunk, str):
+                    # ── ⏱️ TIME TO FIRST TOKEN (TTFT) ──
                     if not getattr(self, "_ttft_logged", True) and chunk:
                         ttft = _time.perf_counter() - _t_gen_start
                         ASCIIColors.info(f"[TTFT] First token received in {ttft:.3f} s.")
@@ -2544,25 +2941,21 @@ class ChatMixin:
                     return ss.feed(chunk)
                 return True
 
+            # Sanitize kwargs to prevent duplicate argument passing
             gen_kwargs = {k: v for k, v in kwargs.items() if k not in ("streaming_callback", "temperature", "stream")}
 
+            # ── 📊 CONTEXT FILL TELEMETRY ──
             try:
-                def _count_msg_tokens(msg_item):
-                    if not isinstance(msg_item, dict):
-                        return 0
-                    content = msg_item.get("content", "")
-                    tkns = 0
-                    if isinstance(content, str):
-                        tkns += self.lollmsClient.count_tokens(content)
-                    elif isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                tkns += self.lollmsClient.count_tokens(part.get("text", ""))
-                    return tkns
-
                 total_tokens = 0
                 if self.lollmsClient and hasattr(self.lollmsClient, "count_tokens"):
-                    total_tokens = sum(_count_msg_tokens(msg) for msg in messages_list)
+                    for msg in messages_list:
+                        content = msg.get("content", "") if isinstance(msg, dict) else ""
+                        if isinstance(content, str):
+                            total_tokens += self.lollmsClient.count_tokens(content)
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    total_tokens += self.lollmsClient.count_tokens(part.get("text", ""))
 
                 max_ctx = 4096
                 if self.lollmsClient and hasattr(self.lollmsClient, "get_ctx_size"):
@@ -2571,29 +2964,10 @@ class ChatMixin:
                 if max_ctx > 0:
                     fill_pct = (total_tokens / max_ctx) * 100.0
                     ASCIIColors.info(f"[Context] Round {round_count} fill: {total_tokens}/{max_ctx} tokens ({fill_pct:.1f}%)")
-
-                    safe_threshold = int(max_ctx * 0.75)
-                    if total_tokens > safe_threshold:
-                        ASCIIColors.error(f"[ChatMixin] Context Overflow Detected: {total_tokens}/{max_ctx} tokens. Triggering emergency truncation.")
-
-                        min_vh_size = 2 if tool_calls_this_turn else 0
-                        while len(virtual_history) > min_vh_size and total_tokens > safe_threshold:
-                            removed_msg = virtual_history.pop(0)
-                            removed_content = getattr(removed_msg, "content", "") if hasattr(removed_msg, "content") else ""
-                            if self.lollmsClient and hasattr(self.lollmsClient, "count_tokens"):
-                                removed_tokens = self.lollmsClient.count_tokens(removed_content)
-                            else:
-                                removed_tokens = len(removed_content) // 4
-                            total_tokens -= removed_tokens
-
-                        while len(messages_list) > 2 and total_tokens > safe_threshold:
-                            removed_msg = messages_list.pop(1)
-                            total_tokens -= _count_msg_tokens(removed_msg)
-
-                        ASCIIColors.warning(f"[ChatMixin] Context truncated to {total_tokens} tokens.")
             except Exception as ctx_err:
                 ASCIIColors.warning(f"[Context] Failed to calculate context fill: {ctx_err}")
 
+            # Execute generation turn (streams and appends to the existing ai_msg.content directly)
             ASCIIColors.info(f"[Trace] Starting generation for round {round_count}...")
             _t_gen_start = _time.perf_counter()
             object.__setattr__(self, "_ttft_logged", False)
@@ -2617,24 +2991,35 @@ class ChatMixin:
                 else:
                     raise
 
+            # Check cancellation after generation completes
             if self.is_generation_cancelled():
                 was_cancelled = True
                 break
 
             ss.flush_remaining_buffer()
 
+            # ── 🏁 DONE TAG TERMINATION PROTOCOL ──
+            # If the LLM emitted <done/>, the task is explicitly complete. Break immediately.
             if ss.was_done_detected():
                 ASCIIColors.info("[ChatMixin] <done/> tag detected. Terminating agentic loop.")
                 break
 
+            # ── 🛑 ARTIFACT LOOP ENFORCEMENT ──
+            # If we previously flagged a force-final-answer due to an artifact loop,
+            # and the LLM attempts to dispatch another artifact, we instantly break the loop.
             if getattr(self, "_force_final_answer", False) and ss.was_action_dispatched() and not ss.tool_trigger:
                 ASCIIColors.warning("[ChatMixin] LLM attempted artifact dispatch after force-final-answer. Breaking loop.")
                 break
 
+            # ── 🛑 CRITICAL FIX: DUPLICATE ARTIFACT INTERCEPTION (NEW) ──
+            # If the LLM emits an artifact tag that was ALREADY processed in a previous round,
+            # _StreamState skips dispatching it (affected_artefacts remains empty).
+            # We detect this to force the final answer and prevent an infinite loop.
             if ss.was_action_dispatched() and not ss.tool_trigger and not ss.affected_artefacts:
                 ASCIIColors.warning("[ChatMixin] LLM emitted a duplicate artifact tag. Forcing final answer.")
                 object.__setattr__(self, "_force_final_answer", True)
 
+                # Inject a hard stop into virtual_history
                 full_round_text = ss.get_clean_text_so_far()
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
                 clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
@@ -2651,13 +3036,20 @@ class ChatMixin:
                     sender_type="user",
                     content="[SYSTEM: CRITICAL. You just attempted to recreate an artifact that already exists with the exact same content. This is a loop. You MUST NOT create or update this artifact again. You MUST now provide your final conversational answer to the user, explaining what you have done, and end with <done/>.]"
                 ))
-
+                
+                # 🛑 ARCHITECTURAL FIX: Hard-break the loop immediately. 
+                # Continuing the loop allows the LLM another generation pass, which it uses 
+                # to hallucinate another preamble. We must force the loop to terminate.
                 break
 
+            # ── 🛑 ONE-ACTION-PER-TURN PROTOCOL ──
+            # If the StreamState dispatched an artifact, note, skill, or context update
+            # (but NOT a tool), we must halt generation, hydrate virtual_history, and re-prompt.
             if ss.was_action_dispatched() and not ss.tool_trigger:
                 full_round_text = ss.get_clean_text_so_far()
                 raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
 
+                # Sanitize the raw text to remove processing blocks and HTML comments
                 clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
                 clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
                 clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
@@ -2673,15 +3065,55 @@ class ChatMixin:
                         ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
                         clean_history_text += f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>\n'
 
+                # Append the sanitized assistant text (containing the raw <artifact> tag) to virtual_history
                 virtual_history.append(SimpleNamespace(
                     sender_type="assistant",
                     content=clean_history_text.strip()
                 ))
 
-                if ss.tool_trigger:
-                    break
+                # Determine the action type and title for the system marker
+                action_type = "artifact"
+                action_title = ""
+                if ss.affected_artefacts:
+                    last_art = ss.affected_artefacts[-1]
+                    action_type = last_art.get("type", "artifact")
+                    action_title = last_art.get("title", "")
 
-                break
+                # 🧠 CONTEXTUAL ANCHORING PROTOCOL
+                # If the sanitized history is empty, it means the artifact was emitted with 
+                # no conversational wrapper. We inject the RAW artifact XML into virtual_history
+                # so the LLM can literally "see" the code it just wrote. This enables multi-step
+                # workflows (e.g., Code -> Review -> Patch) and prevents blind recreation loops.
+                if not clean_history_text.strip() and ss.affected_artefacts:
+                    for art in ss.affected_artefacts:
+                        title = art.get("title", "artifact")
+                        atype = art.get("type", "code")
+                        lang = art.get("language", "")
+                        content = art.get("content", "")
+                        ephemeral_attr = ' ephemeral="true"' if art.get("ephemeral") else ""
+                        clean_history_text += f'<artifact name="{title}" type="{atype}" language="{lang}"{ephemeral_attr}>\n{content}\n</artifact>\n'
+
+                # Update the assistant message to contain the real content (if we injected it)
+                virtual_history[-1].content = clean_history_text.strip()
+
+                # 🧠 STATUS CHECK PROTOCOL (Replaces Forced Done)
+                # We anchor the LLM to the fact that the artifact is saved, and ask it if it is finished.
+                # This allows multi-step workflows (verification, patching) before final termination.
+                title_str = f" '{action_title}'" if action_title else ""
+                system_marker = (
+                    f"[SYSTEM: The {action_type}{title_str} has been successfully created and saved to the workspace. "
+                    f"You can see its full content in your previous message. "
+                    f"Are you finished with the user's request? "
+                    f"If YES, provide your final conversational answer to the user and end your generation with a `<done/>` tag. "
+                    f"If NO, and you need to perform more tasks (e.g., reviewing the code, patching imports, running tests), do that now.]"
+                )
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=system_marker
+                ))
+
+                # Force another reasoning round
+                continue
 
             if ss.tool_trigger:
                 tool_call_json_str = ss.get_tool_call_json()
@@ -2691,9 +3123,15 @@ class ChatMixin:
                     except Exception:
                         call_data = {}
 
+                    # ── 🛑 CRITICAL FIX: PHANTOM TOOL CALL PREVENTION ──
+                    # If the LLM emits a <tool> tag but the JSON is malformed or missing
+                    # the "name" key, we MUST NOT execute active_tools[""]. 
+                    # Instead, we inject a correction and force a continuation.
                     if not isinstance(call_data, dict) or not call_data.get("name"):
                         ASCIIColors.warning(f"[ChatMixin] Malformed tool call detected. JSON: {tool_call_json_str[:200]}")
 
+                        # 🛡️ CRITICAL FIX: Record this malformed call in FailureMemory
+                        # to prevent infinite loops of the same malformed payload.
                         failure_memory = getattr(self, "_failure_memory", None)
                         malformed_sig = "unknown::malformed"
                         if failure_memory:
@@ -2705,6 +3143,7 @@ class ChatMixin:
                             except Exception:
                                 pass
 
+                        # Inject a correction into the virtual history so the LLM knows it failed
                         correction_msg = (
                             "=== ⚠️ TOOL CALL FORMAT ERROR ===\n"
                             "Your last tool call was malformed or missing the 'name' field. "
@@ -2717,11 +3156,18 @@ class ChatMixin:
 
                         full_round_text = ss.get_clean_text_so_far()
                         raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
+                        # 🛑 CRITICAL FIX: Sanitize raw_round_text before appending to virtual_history.
+                        # The _StreamState emits <processing> blocks into ai_msg.content when it
+                        # dispatches the tool tag. If we append this unsanitized, the LLM sees the
+                        # <processing> blocks in its history and mimics them, causing infinite
+                        # nested <processing> generation loops.
                         clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
                         clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
                         clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
                         clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
                         clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        # Also strip any raw <tool> tags to prevent the LLM from seeing its own failed call
+                        clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
                         clean_history_text = clean_history_text.strip()
                         if not clean_history_text:
                             clean_history_text = "[Malformed tool call emitted with no conversational text]"
@@ -2734,6 +3180,8 @@ class ChatMixin:
                             content=correction_msg
                         ))
 
+                        # 🛑 CRITICAL FIX: If the malformed call has been seen before, break immediately.
+                        # We use a dedicated counter dict because _signatures is a set (no duplicates).
                         if not hasattr(self, "_malformed_call_counts"):
                             object.__setattr__(self, "_malformed_call_counts", {})
                         self._malformed_call_counts[malformed_sig] = self._malformed_call_counts.get(malformed_sig, 0) + 1
@@ -2741,18 +3189,24 @@ class ChatMixin:
                             ASCIIColors.warning("[ChatMixin] Second identical malformed tool call detected. Breaking loop to prevent infinite cycle.")
                             break
 
+                        # Force another round to let the LLM correct itself
                         continue
 
                     tool_name = call_data.get("name", "")
                     tool_params = call_data.get("parameters", {})
 
-                    full_raw_text = ss.get_raw_text_so_far()
-                    raw_round_text = full_raw_text[current_content_length:] if current_content_length < len(full_raw_text) else full_raw_text
+                    full_round_text = ss.get_clean_text_so_far()
+                    raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
 
-                    clean_history_text = re.sub(r'<processing[^>]*>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
-                    clean_history_text = re.sub(r'<processing[^>]*>', '', clean_history_text, flags=re.IGNORECASE)
-                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                    # Remove <processing> blocks and HTML status comments for LLM context
+                    # 🛑 CRITICAL FIX 3: Use robust regex that catches partial/malformed blocks.
+                    # The previous regex required a perfect </processing> close tag, but streaming
+                    # fragmentation could leave orphaned opening tags or partial content.
+                    clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
                     clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
+                    # Remove any orphaned closing tags from partial stripping
+                    clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
+                    # Remove standalone <lollms_artifact> and <artefact_image> tags that were injected outside blocks
                     clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
                     clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
 
@@ -2761,9 +3215,14 @@ class ChatMixin:
                         content=clean_history_text.strip()
                     ))
 
+                    # ── 🛡️ PHANTOM TOOL INTERCEPTION ──
+                    # If the LLM hallucinates a tool that is not in the active registry,
+                    # we intercept it BEFORE execution, inject a correction, and force a retry.
+                    # This prevents cascading failures where the LLM panics and tries other unregistered tools.
                     if not active_tools or tool_name not in active_tools:
                         ASCIIColors.warning(f"[ChatMixin] Phantom tool call detected: '{tool_name}' is not registered.")
 
+                        # 🛡️ CRITICAL FIX: Record phantom tool in FailureMemory to prevent infinite loops
                         failure_memory = getattr(self, "_failure_memory", None)
                         if failure_memory:
                             try:
@@ -2776,12 +3235,14 @@ class ChatMixin:
                             elif hasattr(failure_memory, "_signatures"):
                                 failure_memory._signatures.add(phantom_sig)
 
+                        # Emit a failure processing block to the UI
                         status_err_line = f"* Tool call blocked.\n"
                         details_block = f"Error Logs:\nTool '{tool_name}' is not available in this session.\n"
                         tool_close_tag = f"{status_err_line}{details_block}<!-- status:failure -->\n</processing>\n\n"
                         ai_msg.content += tool_close_tag
                         _cb(callback, tool_close_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
 
+                        # Inject a targeted correction into virtual history
                         available_tools_str = ", ".join(f"`{t}`" for t in active_tools.keys()) if active_tools else "No tools are available."
                         correction_msg = (
                             f"=== ⚠️ INVALID TOOL CALL ===\n"
@@ -2794,6 +3255,11 @@ class ChatMixin:
                             f"Instead, inform the user that the required tool is not available and complete your response."
                         )
 
+                        # 🛑 CRITICAL FIX: Sanitize raw_round_text before appending to virtual_history.
+                        # The _StreamState emits <processing> blocks into ai_msg.content when it
+                        # dispatches the tool tag. If we append this unsanitized, the LLM sees the
+                        # <processing> blocks in its history and mimics them, causing infinite
+                        # nested <processing> generation loops.
                         full_round_text = ss.get_clean_text_so_far()
                         raw_round_text = full_round_text[current_content_length:] if current_content_length < len(full_round_text) else full_round_text
                         clean_history_text = re.sub(r'<processing[^>]*>.*?(?:</processing>|$)', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
@@ -2801,6 +3267,7 @@ class ChatMixin:
                         clean_history_text = re.sub(r'</processing>', '', clean_history_text, flags=re.IGNORECASE)
                         clean_history_text = re.sub(r'<lollms_artifact[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
                         clean_history_text = re.sub(r'<artefact_image[^/]*/>', '', clean_history_text, flags=re.IGNORECASE)
+                        clean_history_text = re.sub(r'<tool>.*?</tool>', '', clean_history_text, flags=re.DOTALL | re.IGNORECASE)
                         clean_history_text = clean_history_text.strip()
                         if not clean_history_text:
                             clean_history_text = f"[Phantom tool call to '{tool_name}' with no conversational text]"
@@ -2813,6 +3280,7 @@ class ChatMixin:
                             content=correction_msg
                         ))
 
+                        # 🛑 CRITICAL FIX: If the phantom call has been seen before, break immediately.
                         if not hasattr(self, "_phantom_call_counts"):
                             object.__setattr__(self, "_phantom_call_counts", {})
                         
@@ -2827,6 +3295,7 @@ class ChatMixin:
                             ASCIIColors.warning(f"[ChatMixin] Second identical phantom tool call '{tool_name}' detected. Breaking loop to prevent infinite cycle.")
                             break
 
+                        # Force another reasoning round to let the LLM correct itself
                         continue
 
                     tool_res = None
@@ -2838,6 +3307,7 @@ class ChatMixin:
                             from pathlib import Path as _Path
                             _old_cwd_lcp = _os.getcwd()
 
+                            # Resolve workspace_data path
                             if hasattr(self, "workspace_data_path") and self.workspace_data_path:
                                 _lcp_workspace_dir = _Path(self.workspace_data_path)
                             else:
@@ -2850,6 +3320,7 @@ class ChatMixin:
                             try:
                                 _os.chdir(_lcp_workspace_str)
 
+                                # ── Take BEFORE Snapshot (LCP Path) ──
                                 _lcp_files_before = {}
                                 _lcp_cwd = _Path(_lcp_workspace_str)
                                 if _lcp_cwd.exists():
@@ -2892,6 +3363,7 @@ class ChatMixin:
                                     }
                                 _lcp_executed = True
 
+                                # ── Take AFTER Snapshot & Auto-Sync Artifacts (LCP Path) ──
                                 _lcp_files_after = {}
                                 if _lcp_cwd.exists():
                                     for f in _lcp_cwd.rglob("*"):
@@ -2919,6 +3391,7 @@ class ChatMixin:
 
                                 self._sync_tool_artifacts(tool_name, _lcp_files_before, _lcp_files_after, callback)
                             finally:
+                                # 🛑 CRITICAL: Always restore CWD to prevent workspace corruption
                                 _os.chdir(_old_cwd_lcp)
                         else:
                             tool_res = {
@@ -2972,10 +3445,21 @@ class ChatMixin:
                         }
                         _lcp_executed = True
 
+                    # 2. Strip ONLY the raw <tool> JSON tag from the UI/DB buffer (ai_msg.content).
+                    # 🛑 CRITICAL: Do NOT strip <processing> blocks here. They are part of the 
+                    # execution log and must remain in the final saved message. The export() 
+                    # method will sanitize them when building context for the LLM.
                     if tool_call_json_str in ai_msg.content:
                         ai_msg.content = ai_msg.content.replace(f"<tool>{tool_call_json_str}</tool>", "")
                         ai_msg.content = ai_msg.content.replace(tool_call_json_str, "")
 
+                    # ── 🛑 CRITICAL FIX: PREVENT DUPLICATE UI BLOCKS ──
+                    # The _StreamState parser ALREADY emitted the <processing> block and
+                    # "Calling tool..." status to the UI instantly when the </tool> tag closed.
+                    # We MUST NOT emit it again here, or the UI will render duplicate blocks.
+                    # We simply proceed directly to tool execution.
+
+                    # ── REFLEXIVE LOOP DETECTION (FailureMemory) ──
                     failure_memory = getattr(self, "_failure_memory", None)
 
                     try:
@@ -2984,6 +3468,7 @@ class ChatMixin:
                         param_signature = str(tool_params)
                     full_signature = f"{tool_name}::{param_signature}"
 
+                    # 🛑 INSTRUMENTATION: Log the state of the signatures set
                     if failure_memory and hasattr(failure_memory, "_signatures"):
                         ASCIIColors.warning(f"[LoopTrace] Checking signature: {full_signature}. Current signatures: {failure_memory._signatures}")
                     else:
@@ -3023,8 +3508,10 @@ class ChatMixin:
                         ))
                         continue
 
+                    # Execute the tool sequentially
                     try:
                         def _get_file_hashes(params: dict) -> dict:
+                            """Returns a dict of {param_name: file_hash} for any param that is an existing file."""
                             hashes = {}
                             for k, v in params.items():
                                 if isinstance(v, str):
@@ -3039,6 +3526,7 @@ class ChatMixin:
                             return hashes
 
                         current_file_hashes = _get_file_hashes(tool_params)
+                        # Create a signature that includes the file hashes so it changes if files change
                         context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
 
                         ASCIIColors.info(f"[ChatMixin] Success-loop check: tool='{tool_name}', sig='{context_aware_signature[:120]}...', in_set={context_aware_signature in successful_tool_signatures}, set_size={len(successful_tool_signatures)}")
@@ -3061,6 +3549,7 @@ class ChatMixin:
                                     f"You MUST now write a final response to the user using the data already retrieved. Do NOT attempt to call the tool again."
                                 )
                             ))
+                            # Append the processing block to UI
                             status_err_line = f"* Tool call blocked to prevent success loop.\n"
                             details_block = f"Loop Intercepted:\nRepetitive successful tool call blocked\n<!-- status:failure -->\n</processing>\n\n"
                             ai_msg.content += status_err_line + details_block
@@ -3069,12 +3558,14 @@ class ChatMixin:
                         else:
                             tool_signature_counts[full_signature] = tool_signature_counts.get(full_signature, 0) + 1
                         if self.is_generation_cancelled():
+                            # Generation cancelled (logging removed)
                             tool_res = {
                                 "success": False, 
                                 "error": "Execution aborted by user cancellation.",
                                 "prompt_injection": "\n\n⚠️ **Execution Aborted.**\nThe user cancelled the generation. Do not attempt to call tools again."
                             }
                         elif active_tools and tool_name in active_tools and "callable" in active_tools[tool_name]:
+                            # Sync all active artifacts to disk BEFORE tool execution
                             try:
                                 sync_ws, sync_files = self.artefacts.sync_all_active_to_disk()
                             except Exception as ex:
@@ -3089,6 +3580,7 @@ class ChatMixin:
                                 base_workspace_dir = Path(self.workspace_path)
                             else:
                                 base_workspace_dir = Path("./data_workspace")
+                                # Fallback to server APP_WORKSPACE_DIR if workspace_path is not bound
                                 try:
                                     from lollms_client.apps.lollms_discussions.server import APP_WORKSPACE_DIR
                                     if APP_WORKSPACE_DIR is not None:
@@ -3131,6 +3623,7 @@ class ChatMixin:
                                 if "lollms_client_instance" in _tool_sig_params:
                                     call_kwargs["lollms_client_instance"] = self.lollmsClient
 
+                                # ── Take BEFORE Snapshot ──
                                 files_before = {}
                                 current_cwd = Path(workspace_dir_str)
                                 if current_cwd.exists():
@@ -3157,8 +3650,14 @@ class ChatMixin:
                                                 except Exception:
                                                     pass
 
+                                # Execute directly (no thread) - LCP handles CWD internally
+                                # The signature check above already safely injected
+                                # 'discussion_instance' and 'lollms_client_instance' ONLY if
+                                # the tool explicitly declared them in its function signature.
+                                # Unconditional injection breaks agnostic tools (e.g., tool_internet_search).
                                 tool_res = active_tools[tool_name]["callable"](**call_kwargs)
 
+                                # ── Take AFTER Snapshot and Auto-Sync Artifacts ──
                                 files_after = {}
                                 if current_cwd.exists():
                                     for f in current_cwd.rglob("*"):
@@ -3217,6 +3716,9 @@ class ChatMixin:
                                             object.__setattr__(failure_memory, "_signatures", set())
                                         failure_memory._signatures.add(full_sig)
 
+                                # 🛑 ARCHITECTURAL FIX: Removed the flawed has_prev_failure check here.
+                                # The previous code recorded the signature and immediately checked if it existed,
+                                # which always evaluated to True and caused every failure to be mislabeled as "Loop Intercepted".
                                 result_str = f"Error executing tool '{tool_name}': {error_msg}"
                                 clean_result_str = result_str
                                 status_done_line = f"* Completed execution with errors.\n"
@@ -3224,7 +3726,10 @@ class ChatMixin:
                             else:
                                 raw_output = tool_res.get("output", tool_res)
 
+                                # Handle nested output dictionaries (common in MCP/external tools)
                                 if isinstance(raw_output, dict):
+                                    # If output is a dict, try to extract the most relevant field
+                                    # Expanded key list to catch Wikipedia/external tool patterns
                                     extracted = None
                                     for key in ("content", "text", "result", "data", "page_content", "summary", "extract", "html", "body", "query", "pages"):
                                         if key in raw_output:
@@ -3234,10 +3739,13 @@ class ChatMixin:
                                     if extracted is not None:
                                         raw_output = extracted
                                     else:
+                                        # Fall back to JSON dump of the whole dict
                                         raw_output = json.dumps(raw_output, indent=2, default=str, ensure_ascii=False)
                                 elif isinstance(raw_output, list):
                                     raw_output = json.dumps(raw_output, indent=2, default=str, ensure_ascii=False)
                                 elif raw_output is None and isinstance(tool_res, dict) and len(tool_res) > 1:
+                                    # CRITICAL: If 'output' was explicitly None but the tool returned
+                                    # other metadata (success, error, etc.), dump the whole dict.
                                     raw_output = json.dumps(tool_res, indent=2, default=str, ensure_ascii=False)
                                 else:
                                     raw_output = str(raw_output) if raw_output is not None else "No output returned."
@@ -3280,6 +3788,7 @@ class ChatMixin:
                                         clean_result_str = f"[SYSTEM: Tool returned {tool_output_tokens} tokens of text. It has been saved to '{log_filename}'. Unlock it to read a portion, or save findings to your scratchpad.]"
 
                                 status_done_line = f"* Completed execution of '{tool_name}' successfully.\n"
+                                # 🛡️ CRITICAL FIX: Guard against NoneType output from tools
                                 if full_dump is None:
                                     full_dump = "Tool executed successfully but returned no output content."
                                 if not isinstance(full_dump, str):
@@ -3363,6 +3872,7 @@ class ChatMixin:
                         tool_res.get("status_code", 200) == 200
                     ) if isinstance(inner_res, dict) else True
                     if not isinstance(inner_res, dict):
+                        # Non-dict results: fall back to string matching
                         tool_success = "Error" not in clean_result_str and "failed" not in clean_result_str.lower()
 
                     if tool_success :
@@ -3375,9 +3885,14 @@ class ChatMixin:
                         "result": {"output": clean_result_str, "success": tool_success}
                     })
 
+                    # ── 🛑 SUCCESS LOOP DETECTION & PREVENTION ─────────────────────
+                    # Check if the LAST assistant message in history was a tool call to the SAME tool
+                    # This prevents the LLM from getting stuck in a "success loop"
                     last_assistant_msg = virtual_history[-3] if len(virtual_history) >= 3 else None
 
+                    # Always append the tool result to the conversational history so the LLM can see the output
                     if tool_success:
+                        # Extract explicit filename if returned in the result dictionary
                         real_filename_instr = ""
                         if isinstance(tool_res, dict) and tool_res.get("plot_filename"):
                             p_fn = tool_res["plot_filename"]
@@ -3388,6 +3903,7 @@ class ChatMixin:
                                 f"   Do NOT hallucinate or guess any other file name (such as 'sales_over_time.png'). Only use `{p_fn}`.\n\n"
                             )
 
+                        # Check if this is a data query tool and guide the LLM to the next phase
                         next_step_guidance = ""
                         if tool_name in ("tool_query_database_sql", "tool_execute_sql_query", "tool_execute_python_data_query"):
                             next_step_guidance = (
@@ -3427,15 +3943,21 @@ class ChatMixin:
                             content=user_part
                         ))
 
+                        # If the tool created new files, we must update the virtual_history
+                        # so the LLM knows they exist. To preserve the KV-cache, we append
+                        # a system marker to the LAST user message we just added.
                         new_files_this_run = [a.get("title") for a in self._affected_artefacts_this_turn if a.get("title")]
                         if new_files_this_run:
                             new_files_str = ", ".join(f"`{f}`" for f in new_files_this_run)
+                            # Mutate the last user message in-place to inject the artifact update
                             virtual_history[-1].content += (
                                 f"\n\n[SYSTEM: New artifacts available in workspace: {new_files_str}. "
                                 f"You can read or reference these files in your next steps.]"
                             )
                             ASCIIColors.info(f"[ChatMixin] Injected {len(new_files_this_run)} new artifacts into virtual_history context.")
 
+                        # Inject a summary of what has been accomplished so far to prevent
+                        # the LLM from re-starting its analysis from scratch each round.
                         tools_so_far = [tc["name"] for tc in tool_calls_this_turn]
                         unique_tools = list(dict.fromkeys(tools_so_far))
                         progress_summary = (
@@ -3467,56 +3989,6 @@ class ChatMixin:
                 else:
                     break
             else:
-                _mimicry_patterns = [
-                    re.compile(r'\[🔒SYSTEM_ARTIFACT_ANCHOR:', re.IGNORECASE),
-                    re.compile(r'\[SYSTEM:', re.IGNORECASE),
-                    re.compile(r'\[content stripped', re.IGNORECASE),
-                    re.compile(r'\[🔒SYSTEM_ARTIFACT_CREATED:', re.IGNORECASE),
-                    re.compile(r'\[🔒SYSTEM_ARTIFACT_UPDATED:', re.IGNORECASE),
-                ]
-
-                def _detect_mimicry(text: str) -> bool:
-                    if not text:
-                        return False
-                    tail = text[-500:]
-                    return any(pattern.search(tail) for pattern in _mimicry_patterns)
-
-                if _detect_mimicry(ai_msg.content):
-                    if not hasattr(self, "_mimicry_attempt_counts"):
-                        object.__setattr__(self, "_mimicry_attempt_counts", [0])
-
-                    self._mimicry_attempt_counts[0] += 1
-                    current_attempts = self._mimicry_attempt_counts[0]
-                    ASCIIColors.warning(f"[ChatMixin] LLM mimicked system markers. Correction attempt {current_attempts}.")
-
-                    sanitized_content = ai_msg.content
-                    for pattern in _mimicry_patterns:
-                        sanitized_content = re.sub(r'^.*' + pattern.pattern + r'.*$', '', sanitized_content, flags=re.MULTILINE | re.IGNORECASE)
-                    ai_msg.content = sanitized_content.strip()
-
-                    if current_attempts >= 2:
-                        ASCIIColors.error("[ChatMixin] LLM repeatedly mimicked system markers. Breaking loop to prevent infinite cycle.")
-                        break
-
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="assistant",
-                        content=ai_msg.content if ai_msg.content else "[Empty response after removing mimicked system markers]"
-                    ))
-
-                    correction_msg = (
-                        "=== ⚠️ CRITICAL: SYSTEM MARKER MIMICRY DETECTED ===\n"
-                        "Your previous response contained mimicked system infrastructure markers (e.g., `[SYSTEM:`, `[🔒SYSTEM_ARTIFACT_ANCHOR:`, `[content stripped...`).\n"
-                        "These markers are strictly system-generated and are **NOT** functional. Outputting them does **NOT** execute any action.\n\n"
-                        "To create an artifact, you MUST use the actual XML tag: `<artifact name=\"filename.ext\" type=\"code\">...code...</artifact>`\n"
-                        "To call a tool, you MUST use the actual XML tag: `<tool>{\"name\": \"tool_name\", \"parameters\": {...}}</tool>`\n\n"
-                        "Do NOT mimic system placeholders. Output the real functional tag NOW to perform your intended action."
-                    )
-                    virtual_history.append(SimpleNamespace(
-                        sender_type="user",
-                        content=correction_msg
-                    ))
-                    continue
-
                 raw_round_text = ss.get_clean_text_so_far()
                 raw_round_len = len(raw_round_text.strip())
 
@@ -3538,6 +4010,8 @@ class ChatMixin:
                     ))
                     continue
 
+                # ── 🏁 DONE TAG TERMINATION PROTOCOL ──
+                # If the LLM emits <done/> on a new line, the task is complete. Break immediately.
                 raw_round_text = ss.get_clean_text_so_far()
                 done_match = re.search(r'(?m)^\s*<done\s*/>\s*$', raw_round_text.strip())
                 if done_match:
@@ -3545,6 +4019,11 @@ class ChatMixin:
                     ai_msg.content = re.sub(r'(?m)^\s*<done\s*/>\s*$', '', ai_msg.content, flags=re.MULTILINE).strip()
                     break
 
+                # ── 🛑 CONTINUATION MANDATE (NO <done/>) ──
+                # If tools were previously executed and the LLM stops without <done/> and without
+                # dispatching a new action, inject a mandate to either continue or emit <done/>.
+                # The Success-Loop Interceptor provides a natural termination guarantee:
+                # if the LLM repeats the same tool call, the loop breaks automatically.
                 if len(tool_calls_this_turn) > 0:
                     ASCIIColors.info("[ChatMixin] Tool previously executed but no <done/> detected. Injecting continuation mandate.")
                     full_round_text = ss.get_clean_text_so_far()
@@ -3564,6 +4043,7 @@ class ChatMixin:
                     ))
                     continue
 
+                # Only run intent detection on SHORT responses (preambles before a missed tool call)
                 intent_pattern = re.compile(r'(let me|now i|next i|i will|i need to|we need to).*(query|get|fetch|build|create|analyze|summarize|aggregate|plot)', re.IGNORECASE)
                 intent_match = intent_pattern.search(raw_round_text)
                 has_intent = False
@@ -3604,15 +4084,20 @@ class ChatMixin:
 
                     continue
 
+                # ── 🔄 FORCE CONTINUATION AFTER CONTEXT UNLOCK ─────────────────
+                # If the model requested files to be loaded, force at least one more round
+                # so it can immediately use the newly available context
                 if ss.context_unlock_requested and not was_cancelled:
                     ASCIIColors.info(f"[ChatMixin] Context unlock detected ({ss.context_unlocked_files}), forcing continuation round...")
 
+                    # Inject a system prompt confirming the unlock and inviting continuation
                     unlock_files_str = ', '.join(ss.context_unlocked_files)
                     continuation_prompt = (
                         f"\n\n[SYSTEM: The following files have been processed: {unlock_files_str}. "
                         f"You can now read their full content and use them. Please continue your task.]\n\n"
                     )
 
+                    # ── CONTEXT BUDGET GUARD: Inject blocked files guidance ──
                     blocked_guidance = getattr(ss, '_blocked_files_guidance', None) or getattr(self, '_blocked_files_guidance', None)
                     if blocked_guidance:
                         if isinstance(blocked_guidance, list):
@@ -3629,9 +4114,12 @@ class ChatMixin:
                             )
                         else:
                             continuation_prompt += f"\n{blocked_guidance}\n\n"
+                        # Clear the guidance after injecting it
                         if hasattr(self, '_blocked_files_guidance'):
                             object.__setattr__(self, '_blocked_files_guidance', [])
 
+                    # 🛑 CRITICAL: Append SANITIZED assistant text to virtual_history (preserves KV-cache)
+                    # Strip <processing> blocks to prevent the LLM from mimicking execution logs
                     raw_round_text = ss.get_clean_text_so_far()
                     clean_history_text = re.sub(r'<processing[^>]*>.*?</processing>', '', raw_round_text, flags=re.DOTALL | re.IGNORECASE)
                     clean_history_text = re.sub(r'<!-- status:[^>]*-->', '', clean_history_text, flags=re.IGNORECASE)
@@ -3643,16 +4131,89 @@ class ChatMixin:
                         content=clean_history_text.strip()
                     ))
 
+                    # Add a user message to force the loop to continue
                     virtual_history.append(SimpleNamespace(
                         sender_type="user",
                         content=f"[SYSTEM: Files {unlock_files_str} are now available. Continue.]"
                     ))
 
+                    # Reset the flag and continue the loop
                     ss.context_unlock_requested = False
+                    continue  # Jump to next reasoning round immediately
+
+                # ── 🛑 MIMICRY INTERCEPTION PROTOCOL ──
+                # If the LLM mimics system infrastructure markers instead of emitting real tags,
+                # intercept it, sanitize the buffer, and force a correction round.
+                _mimicry_patterns = [
+                    re.compile(r'\[🔒SYSTEM_ARTIFACT_ANCHOR:', re.IGNORECASE),
+                    re.compile(r'\[SYSTEM:', re.IGNORECASE),
+                    re.compile(r'\[content stripped', re.IGNORECASE),
+                    re.compile(r'\[🔒SYSTEM_ARTIFACT_CREATED:', re.IGNORECASE),
+                    re.compile(r'\[🔒SYSTEM_ARTIFACT_UPDATED:', re.IGNORECASE),
+                ]
+
+                def _detect_mimicry(text: str) -> bool:
+                    if not text:
+                        return False
+                    tail = text[-500:]
+                    return any(pattern.search(tail) for pattern in _mimicry_patterns)
+
+                if _detect_mimicry(ai_msg.content):
+                    if not hasattr(self, "_mimicry_attempt_counts"):
+                        object.__setattr__(self, "_mimicry_attempt_counts", [0])
+
+                    self._mimicry_attempt_counts[0] += 1
+                    current_attempts = self._mimicry_attempt_counts[0]
+                    ASCIIColors.warning(f"[ChatMixin] LLM mimicked system markers. Correction attempt {current_attempts}.")
+
+                    if current_attempts >= 2:
+                        ASCIIColors.error("[ChatMixin] LLM repeatedly mimicked system markers. Breaking loop to prevent infinite cycle.")
+
+                        # CRITICAL FIX: Hard-clear any content before breaking to guarantee no ghost artifacts
+                        # are left in a state that could be misinterpreted by post-processing.
+                        ai_msg.content = ""
+                        break
+
+                    # Sanitize the ai_msg.content to remove the mimicked markers
+                    sanitized_content = ai_msg.content
+                    for pattern in _mimicry_patterns:
+                        # Remove the line containing the mimicked marker
+                        sanitized_content = re.sub(r'^.*' + pattern.pattern + r'.*$', '', sanitized_content, flags=re.MULTILINE | re.IGNORECASE)
+                    ai_msg.content = sanitized_content.strip()
+
+                    # Append the sanitized (but failed) assistant text to virtual history
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="assistant",
+                        content=ai_msg.content if ai_msg.content else "[Empty response after removing mimicked system markers]"
+                    ))
+
+                    # Inject a targeted correction
+                    correction_msg = (
+                        "=== ⚠️ CRITICAL: SYSTEM MARKER MIMICRY DETECTED ===\n"
+                        "Your previous response contained mimicked system infrastructure markers (e.g., `[SYSTEM:`, `[🔒SYSTEM_ARTIFACT_ANCHOR:`, `[content stripped...`).\n"
+                        "These markers are strictly system-generated and are **NOT** functional. Outputting them does **NOT** execute any action.\n\n"
+                        "To create an artifact, you MUST use the actual XML tag: `<artifact name=\"filename.ext\" type=\"code\">...code...</artifact>`\n"
+                        "To call a tool, you MUST use the actual XML tag: `<tool>{\"name\": \"tool_name\", \"parameters\": {...}}</tool>`\n\n"
+                        "Do NOT mimic system placeholders. Output the real functional tag NOW to perform your intended action."
+                    )
+                    virtual_history.append(SimpleNamespace(
+                        sender_type="user",
+                        content=correction_msg
+                    ))
                     continue
 
+                # ── 🛑 FINALIZE: No tool call, no intent, no unlock. This is the final answer. ──
+                # 🛑 CRITICAL ARCHITECTURAL FIX: Do NOT overwrite ai_msg.content with a sanitized gist.
+                # The `_StreamState` already accumulated conversational text and <processing> blocks
+                # safely into `ai_msg.content` during the stream. We must preserve this exact buffer
+                # so the execution logs remain visible in the final saved message.
+                # The `export()` method will handle stripping <processing> blocks when building 
+                # context for the LLM to prevent context bloat.
                 break
 
+        # ── 11. Final Post-Processing & Database Commit ──
+
+        # Handle cancellation cleanup
         if was_cancelled:
             if ai_msg.content.strip():
                 ai_msg.content += "\n\n[Generation cancelled by user]"
@@ -3665,9 +4226,13 @@ class ChatMixin:
                 "cancelled": True
             }
         else:
+            # ── 🧠 DUAL-COPY PERSISTENCE PROTOCOL ──
+            # If this turn involved multiple agentic steps (tool calls or artifact dispatches),
+            # we persist the FULL virtual_history into the message metadata.
+            # This allows the next turn's export() to reconstruct the exact KV-cache state
+            # so the LLM can continue multi-turn sequences without losing the path.
             has_virtual_history = len(virtual_history) > 0 and (
-                len(tool_calls_this_turn) > 0
-                or any(vh.sender_type == "user" and "<tool_result" in (vh.content or "") for vh in virtual_history)
+                any(vh.sender_type == "user" and "<tool_result" in (vh.content or "") for vh in virtual_history)
                 or any(vh.sender_type == "assistant" and "<tool" in (vh.content or "") for vh in virtual_history)
                 or any("SYSTEM MARKER MIMICRY DETECTED" in (vh.content or "") for vh in virtual_history)
             )
@@ -3679,6 +4244,7 @@ class ChatMixin:
             }
 
             if has_virtual_history:
+                # Store the virtual history as a list of serializable dicts
                 ai_msg.metadata["virtual_history"] = [
                     {"sender_type": vh.sender_type, "content": vh.content}
                     for vh in virtual_history
@@ -3687,18 +4253,27 @@ class ChatMixin:
         if remove_thinking_blocks:
             ai_msg.content = self.lollmsClient.remove_thinking_blocks(ai_msg.content)
 
+        # The Dual-Stream Buffer architecture now ensures raw <artifact> XML 
+        # never enters ai_msg.content in the first place, so no post-generation
+        # regex cleanup is required.
+
+        # ── 🛡️ AUTO-CORRECT HALLUCINATED FILENAMES ──
+        # Scan through the tool executions of this turn and fix any mismatched filenames
         for tc in tool_calls_this_turn:
             if tc.get("result") and tc["result"].get("success"):
                 out_str = str(tc["result"].get("output", ""))
+                # Locate real plot filename inside the output logs
                 match_fn = re.search(r'plot_filename":\s*"([^"]+)"', out_str) or re.search(r'plot_filename:\s*(\S+)', out_str)
                 if match_fn:
                     real_fn = match_fn.group(1).strip().strip("'\"")
+                    # Dynamically replace hallucinated filenames (like sales_over_time, plot.png) inside image/artifact tags
                     ai_msg.content = re.sub(
                         r'(src|id)=["\'](?:[^"\']*/)?(?:sales_over_time|plot|chart|visualization)\.(?:png|jpg|jpeg)(?:::\d+)?["\']',
                         f'\\1="{real_fn}::0"',
                         ai_msg.content,
                         flags=re.IGNORECASE
                     )
+                    # Also replace plain markdown/HTML source references if outputted as plain text
                     ai_msg.content = re.sub(
                         r'src=["\'](?:/api/workspace_files/)?(?:sales_over_time|plot|chart|visualization)\.png["\']',
                         f'src="/api/workspace_files/{real_fn}"',
@@ -3707,6 +4282,7 @@ class ChatMixin:
                     )
                     ai_msg.content = ai_msg.content.replace("sales_over_time.png", real_fn)
 
+        # Process memories
         mem_cleaned, mem_report = self._process_memory_tags(ai_msg.content, _mm, callback)
         if mem_cleaned != ai_msg.content:
             ai_msg.content = mem_cleaned
@@ -3717,6 +4293,9 @@ class ChatMixin:
             except Exception as ex:
                 trace_exception(ex)
 
+        # Update metadata for alternating exports
+        # CRITICAL: Preserve virtual_history if it was set in the cancellation/non-cancellation block above.
+        # We only update the mode and counts here to avoid overwriting the persisted virtual history.
         existing_virtual_history = ai_msg.metadata.get("virtual_history")
         ai_msg.metadata = {
             "mode": "agentic" if tool_calls_this_turn else "direct",
@@ -3726,6 +4305,7 @@ class ChatMixin:
         if existing_virtual_history:
             ai_msg.metadata["virtual_history"] = existing_virtual_history
 
+        # Auto dream
         dream_report = None
         if enable_auto_dream and _mm is not None:
             try:
@@ -3739,8 +4319,14 @@ class ChatMixin:
         self.scratchpad = ""
         object.__setattr__(self, '_active_callback', None)
 
+        # 🛡️ CRITICAL FIX: Always reset the cancellation flag at the end of the turn.
+        # This ensures that pre-turn and mid-turn cancellation signals are consumed
+        # and do not bleed into subsequent turns.
         self.reset_cancel_state()
 
+        # ── 🔬 SCIENTIFIC DEBUG: EXPORT CONTEXT DUMP ──
+        # Dumps the exact virtual_history (LLM context) and ai_msg.content (UI context)
+        # to a JSON file in the discussion workspace to verify context separation.
         if debug_export:
             try:
                 import os as _os
@@ -3754,6 +4340,7 @@ class ChatMixin:
                 timestamp = _dt.utcnow().strftime("%Y%m%d_%H%M%S_%f")
                 dump_file = debug_dir / f"turn_dump_{timestamp}.json"
 
+                # Safely serialize SimpleNamespace objects in virtual_history
                 vh_serializable = []
                 for m in virtual_history:
                     if hasattr(m, '__dict__'):
@@ -3792,6 +4379,8 @@ class ChatMixin:
             "was_cancelled": was_cancelled
         }
 
+
+# ── Internal parsing helpers ──
 
 def _format_form_answers_for_llm(form_descriptor: Dict, answers: Dict[str, Any]) -> str:
     lines = [
