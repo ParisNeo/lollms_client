@@ -15,6 +15,8 @@ This module defines the abstract base class (`LollmsLLMBinding`) for all Large L
 
 *   `binding_name` (Optional[str]): The unique name of the binding (e.g., "ollama", "openai", "pythonllamacpp").
 *   `model_name` (Optional[str]): The identifier (name, path, or ID) of the currently active or default model for this binding instance. This attribute *must* be set by concrete implementations, often during `__init__` or `load_model`.
+*   `forced_ctx_size` (Optional[int]): A manually forced context size. If set, this overrides all automatic size detection and acts as the absolute source of truth for the context window. Can be initialized via `kwargs` or dynamically set via `set_forced_ctx_size()`.
+*   `default_ctx_size` (Optional[int]): The fallback context size. This is used only if the context size cannot be determined through any other means (forced, binding-specific, or hardcoded list). Initialized via `kwargs` (`ctx_size`).
 
 **Abstract Methods (must be implemented by subclasses):**
 
