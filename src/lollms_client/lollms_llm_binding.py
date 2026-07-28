@@ -69,7 +69,7 @@ def load_known_contexts():
 
 class LollmsLLMBinding(LollmsBaseBinding):
     """Abstract base class for all LOLLMS LLM bindings"""
-    
+
     def __init__(self, 
                  binding_name: str ="unknown",
                  debug:Optional[bool] = False,
@@ -83,7 +83,25 @@ class LollmsLLMBinding(LollmsBaseBinding):
         """
         super().__init__(binding_name=binding_name, debug=debug, **kwargs)
         self.model_name = None #Must be set by the instance
-        self.default_ctx_size = kwargs.get("ctx_size") 
+
+        _ctx_size = kwargs.get("ctx_size")
+        if _ctx_size is not None:
+            try:
+                self.default_ctx_size = int(_ctx_size)
+            except (ValueError, TypeError):
+                self.default_ctx_size = None
+        else:
+            self.default_ctx_size = None
+
+        _forced_ctx_size = kwargs.get("forced_ctx_size")
+        if _forced_ctx_size is not None:
+            try:
+                self.forced_ctx_size = int(_forced_ctx_size)
+            except (ValueError, TypeError):
+                self.forced_ctx_size = None
+        else:
+            self.forced_ctx_size = None
+
         self.default_n_predict = kwargs.get("n_predict")
         self.default_stream = kwargs.get("stream")
         self.default_temperature = kwargs.get("temperature")
@@ -363,7 +381,31 @@ class LollmsLLMBinding(LollmsBaseBinding):
         return model_name.strip().lower()
 
 
+    def set_forced_ctx_size(self, ctx_size: Optional[int]) -> None:
+        """Dynamically updates the forced context size."""
+        if ctx_size is not None:
+            try:
+                self.forced_ctx_size = int(ctx_size)
+            except (ValueError, TypeError):
+                self.forced_ctx_size = None
+        else:
+            self.forced_ctx_size = None
+
     def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
+        # Layer 1: Forced Context Size
+        if self.forced_ctx_size is not None:
+            return self.forced_ctx_size
+
+        # Layer 2: Binding-specific implementation
+        if hasattr(self, "_get_ctx_size") and callable(self._get_ctx_size):
+            try:
+                binding_ctx = self._get_ctx_size(model_name=model_name)
+                if binding_ctx is not None:
+                    return binding_ctx
+            except Exception as e:
+                ASCIIColors.warning(f"[{self.binding_name}] _get_ctx_size failed: {e}")
+
+        # Layer 3: Hardcoded List
         if model_name is None:
             model_name = self.model_name
 
@@ -409,6 +451,7 @@ class LollmsLLMBinding(LollmsBaseBinding):
                 )
                 return context_size
 
+        # Layer 4: Default Fallback
         ASCIIColors.warning(
             f"Context size not found for model '{model_name}', "
             f"falling back to default: {self.default_ctx_size}"
