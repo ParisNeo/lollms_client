@@ -7,3 +7,4 @@ pydantic
 numpy
 jsonschema
 prompt-toolkit>=3.0.0
+pymupdf4llm==1.28.0
