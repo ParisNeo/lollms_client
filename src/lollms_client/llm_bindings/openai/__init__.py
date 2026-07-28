@@ -908,7 +908,7 @@ class OpenAIBinding(LollmsLLMBinding):
             return []
 
 
-    def get_ctx_size(self, model_name: str | None = None) -> int:
+    def _get_ctx_size(self, model_name: str | None = None) -> int:
         """
         Get the context size for a given model.
         If model_name is None, use the instance's model_name.
@@ -948,7 +948,7 @@ class OpenAIBinding(LollmsLLMBinding):
                 return size
 
         # Fallback: default safe value
-        return 8192
+        return None
 
 
     def get_model_info(self) -> dict:
