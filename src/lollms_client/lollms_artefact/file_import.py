@@ -297,24 +297,23 @@ def _extract_text_file(path: Path) -> str:
 # ── PDF ────────────────────────────────────────────────────────────────────
 
 def _extract_pdf_text(path: Path) -> str:
-    """Extract text from all PDF pages as Markdown, preserving tables."""
-    _ensure_installed("pymupdf4llm")
+    """
+    Extract text from all PDF pages using pure PyMuPDF (fitz).
+    Strictly enforces text-layer extraction. NEVER triggers OCR.
+    """
+    _ensure_installed("pymupdf", "fitz")
     try:
-        import pymupdf4llm
-
-        # to_markdown returns one big string covering all pages
-        # page_chunks=True returns a list of dicts, one per page
-        chunks: list[dict] = pymupdf4llm.to_markdown(str(path), page_chunks=True)
-
+        import fitz
+        doc = fitz.open(str(path))
         pages = []
-        for i, chunk in enumerate(chunks):
-            md = (chunk.get("text") or "").strip()
-            pages.append(f"## Page {i + 1}\n\n{md}" if md else f"## Page {i + 1}\n\n[No text]")
-
+        for i, page in enumerate(doc):
+            # Use "text" for raw text extraction, strictly avoiding OCR
+            text = page.get_text("text").strip()
+            pages.append(f"## Page {i + 1}\n\n{text}" if text else f"## Page {i + 1}\n\n[No text]")
+        doc.close()
         return "\n\n".join(pages)
-
-    except ImportError:
-        ASCIIColors.warning("[FileImport] pymupdf4llm not installed — falling back to pypdf")
+    except Exception as e:
+        ASCIIColors.warning(f"[FileImport] PyMuPDF text extraction failed: {e}. Falling back to pypdf.")
         _ensure_installed("pypdf")
         try:
             from pypdf import PdfReader
@@ -1596,11 +1595,12 @@ class FileImportMixin:
         else:
             atype = _detect_artefact_type_from_mode(path, mode)
             extra_data = {}
-            # 🛑 CRITICAL FIX: We DO NOT inject file_ext for text imports.
-            # Injecting file_ext triggers the Dual-Stream .lam protocol in ArtefactManager,
-            # which replaces the extracted text with a binary data schema.
-            # Only `data` mode should inject file_ext.
-            if atype == ArtefactType.DATA:
+            # 🛑 CRITICAL FIX: The Dual-Stream .lam protocol MUST ONLY be triggered
+            # when the user explicitly requests `mode="data"`. 
+            # If a user imports a CSV or PDF in `mode="text"`, they want the raw text,
+            # NOT a generated schema. Injecting `file_ext` here causes ArtefactManager
+            # to overwrite the extracted text with a binary data schema.
+            if mode == IMPORT_MODE_DATA:
                 extra_data["file_ext"] = path.suffix.lower()
 
         language = _detect_language(path)
