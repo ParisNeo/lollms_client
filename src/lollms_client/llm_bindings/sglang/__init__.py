@@ -407,24 +407,6 @@ class SGLangBinding(LollmsLLMBinding):
             trace_exception(e)
             return []
 
-    def get_ctx_size(self, model_name: str | None = None) -> int:
-        if model_name is None:
-            model_name = self.model_name
-        context_map = {
-            "llama-3.1": 131072,
-            "llama-3": 8192,
-            "llama-2": 4096,
-            "qwen": 32768,
-            "gemma": 8192,
-            "mistral": 32768,
-            "phi-3": 128000,
-        }
-        model_name_lower = model_name.lower()
-        for key, size in context_map.items():
-            if key in model_name_lower:
-                return size
-        return super().get_ctx_size(model_name=model_name) or 4096
-
     def get_model_info(self) -> dict:
         return {
             "name": "SGLang",
