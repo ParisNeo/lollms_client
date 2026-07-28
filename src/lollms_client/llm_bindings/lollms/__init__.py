@@ -532,7 +532,7 @@ class LollmsBinding(LollmsLLMBinding):
 
         return len(self.tokenize(text))
 
-    def get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
+    def _get_ctx_size(self, model_name: Optional[str] = None) -> Optional[int]:
         """
         Retrieves the exact context size of the model from the remote lollms server.
         """
