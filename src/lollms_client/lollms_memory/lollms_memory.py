@@ -51,7 +51,7 @@
 
 
 from __future__ import annotations
-
+import time
 import math
 import re
 import uuid
@@ -349,57 +349,26 @@ class LollmsMemoryManager:
 
     @contextmanager
     def _session(self):
-        import time
-        max_retries = 5
-        retry_delay = 0.15
+        """
+        A context manager for safe database sessions.
+        Increases the timeout to prevent strict 5-second crashes under concurrent ASGI load.
+        """
         start_time = time.time()
-
-        for attempt in range(max_retries):
-            s = self._Session()
-            try:
-                # Enable high-concurrency WAL mode and a generous 30-second busy timeout
-                from sqlalchemy import text
-                s.execute(text("PRAGMA journal_mode=WAL"))
-                s.execute(text("PRAGMA busy_timeout=30000"))
-                s.execute(text("PRAGMA synchronous=NORMAL"))
-
-                # Re-attach the shared memory space dynamically on every session connection
-                if getattr(self, "shared_db_path", None) and getattr(self, "shared_db_resolved_path", None):
-                    clean_shared_path = self.shared_db_resolved_path
-                    try:
-                        s.execute(text(f"ATTACH DATABASE '{clean_shared_path}' AS shared_mem_db"))
-                    except Exception as attach_err:
-                        # Ignore if already attached within this connection thread pool
-                        if "already in use" not in str(attach_err).lower() and "already attached" not in str(attach_err).lower():
-                            ASCIIColors.warning(f"[MemoryManager] Re-attach warning: {attach_err}")
-
-                yield s
-
-                # Check elapsed time before committing
-                if time.time() - start_time > 4.5:
-                    raise TimeoutError("Memory operation exceeded strict 5-second deadline.")
-
-                s.commit()
-                self._clear_cache()
-                break  # Successful session transaction
-            except Exception as e:
-                try:
-                    s.rollback()
-                except Exception:
-                    pass
-
-                # Check for lock contention
-                if "database is locked" in str(e).lower():
-                    s.close()
-                    if attempt < max_retries - 1:
-                        # Back off and wait for concurrent lock to release
-                        time.sleep(retry_delay * (attempt + 1))
-                        continue
-                    else:
-                        ASCIIColors.warning(f"[MemoryManager] SQLite database lock contention could not be resolved on: {self.resolved_disk_path}")
-                raise e
-            finally:
-                s.close()
+        # Increase timeout to 15 seconds to handle concurrent SQLite locks gracefully
+        max_timeout = 15.0 
+        
+        session = self._Session()
+        try:
+            yield session
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            elapsed = time.time() - start_time
+            if elapsed > max_timeout:
+                raise TimeoutError(f"Memory operation exceeded {max_timeout}-second deadline.")
+            raise e
+        finally:
+            session.close()
 
     def _q(self, session: Session):
         """
@@ -495,13 +464,11 @@ class LollmsMemoryManager:
     ) -> Dict:
         now = datetime.utcnow()
         with self._session() as s:
-            # Query maximum created_at in database to enforce monotonicity
             max_created = s.query(_MemoryRecord.created_at).filter(_MemoryRecord.owner_id == self.owner_id).order_by(_MemoryRecord.created_at.desc()).first()
             if max_created and max_created[0]:
                 if now <= max_created[0]:
                     now = max_created[0] + timedelta(microseconds=1)
 
-            # Resolve or auto-extract Ontological Triples & tags if omitted
             auto_sub, auto_pred, auto_obj, auto_tags = auto_extract_ontology_from_content(content)
 
             sub_val = subject if (subject and subject != "unknown") else auto_sub
@@ -509,67 +476,23 @@ class LollmsMemoryManager:
             obj_val = obj if (obj and obj != "unknown") else auto_obj
             resolved_tags = tags if tags else auto_tags
 
-            # ── DUAL-DATABASE DISPATCH PROTOCOL ──
-            # Determine target schema based on metadata. 
-            # Semantic engrams (preferences, standards, guidelines) go to the Attached Shared Database (shared_mem_db).
-            # Episodic engrams (interaction logs, events) go to the Private Local Database (main).
-            schema_prefix = "main"
-            is_semantic = "preference" in resolved_tags or "standard" in resolved_tags or "technical_lesson" in resolved_tags or "guideline" in resolved_tags
-
-            if self.shared_db_path and is_semantic:
-                schema_prefix = "shared_mem_db"
-                ASCIIColors.cyan(f"[MemoryManager] Routing SEMANTIC engram '{content[:30]}...' -> Shared DB.")
-            else:
-                ASCIIColors.info(f"[MemoryManager] Routing EPISODIC engram '{content[:30]}...' -> Local DB.")
-
-            # Create records using direct raw SQL insert to support dynamic schema prefixing on SQLite ATTACH
-            from sqlalchemy import text
-            rec_id = str(uuid.uuid4())
             final_tags = ",".join(resolved_tags) if resolved_tags else None
             final_importance = max(0.0, min(1.0, importance if importance is not None else self.config.default_importance))
 
-            insert_sql = f"""
-                INSERT INTO {schema_prefix}.memories (
-                    id, owner_id, content, summary, level, importance, centrality,
-                    use_count, tags, subject_group, created_at, updated_at,
-                    last_used_at, subject, predicate, object, activation
-                ) VALUES (
-                    :id, :owner_id, :content, :summary, :level, :importance, :centrality,
-                    :use_count, :tags, :subject_group, :created_at, :updated_at,
-                    :last_used_at, :subject, :predicate, :object, :activation
-                )
-            """
-            s.execute(text(insert_sql), {
-                "id": rec_id, "owner_id": self.owner_id, "content": content.strip(),
-                "summary": self._auto_summary(content), "level": level, "importance": final_importance,
-                "centrality": 0.0, "use_count": 0, "tags": final_tags, "subject_group": subject_group or sub_val,
-                "created_at": now.isoformat(), "updated_at": now.isoformat(), "last_used_at": now.isoformat(),
-                "subject": sub_val.strip().lower(), "predicate": MemoryOntology.validate_predicate(pred_val),
-                "object": obj_val.strip().lower(), "activation": 0.0
-            })
-            s.flush()
-
-            # Record initial retrieval log in the corresponding schema
-            log_id = str(uuid.uuid4())
-            insert_log_sql = f"""
-                INSERT INTO {schema_prefix}.retrieval_logs (node_id, retrieved_at)
-                VALUES (:node_id, :retrieved_at)
-            """
-            s.execute(text(insert_log_sql), {
-                "node_id": rec_id,
-                "retrieved_at": now.isoformat()
-            })
-            s.flush()
-
-            # Construct a memory record object proxy for return statement
             rec = _MemoryRecord(
-                id=rec_id, owner_id=self.owner_id, content=content.strip(),
+                id=str(uuid.uuid4()), owner_id=self.owner_id, content=content.strip(),
                 summary=self._auto_summary(content), level=level, importance=final_importance,
                 centrality=0.0, use_count=0, tags=final_tags, subject_group=subject_group or sub_val,
                 created_at=now, updated_at=now, last_used_at=now,
                 subject=sub_val.strip().lower(), predicate=MemoryOntology.validate_predicate(pred_val),
                 object=obj_val.strip().lower(), activation=0.0
             )
+            s.add(rec)
+            s.flush()
+
+            log = _RetrievalLog(node_id=rec.id, retrieved_at=now)
+            s.add(log)
+            s.flush()
 
             return self._to_dict(rec)
 
@@ -580,7 +503,7 @@ class LollmsMemoryManager:
         with self._session() as s:
             r = self._q(s).filter(_MemoryRecord.id == memory_id).first()
             if r:
-                if r.importance < 0.001:
+                if r.importance < 0.001 or r.level > 2:
                     return None
                 d = self._to_dict(r)
                 self._cache[memory_id] = d
@@ -742,6 +665,11 @@ class LollmsMemoryManager:
             r.level = 3  # Archive
             r.updated_at = datetime.utcnow()
             s.flush()
+
+            if memory_id in self._cache:
+                del self._cache[memory_id]
+            self._clear_cache()
+
             return True
 
     def hard_delete(self, memory_id: str) -> bool:
