@@ -1021,6 +1021,18 @@ class LollmsClient():
         if self.tti: return self.tti.edit_image(*args, **kwargs)
         raise RuntimeError("TTI binding not initialized.")
 
+    def generate_omni(self, *args, **kwargs):
+        """
+        Unified TTI/Omni generation. Returns a TTIGenerationResult
+        (images list + optional text) instead of raw bytes.
+        Falls back cleanly for legacy bindings since the base class
+        provides a default generate() wrapper.
+        """
+        self.cooperative_unload_except("tti")
+        if self.tti:
+            return self.tti.generate(*args, **kwargs)
+        raise RuntimeError("TTI binding not initialized.")
+
     def generate_audio(self, *args, **kwargs):
         self._cooperative_unload_except("tts")
         if self.tts: return self.tts.generate_audio(*args, **kwargs)
