@@ -1,69 +1,88 @@
 # 📚 LollmsClient: Core Architecture & Text Processing Guide
 
-The `lollms_client` library provides a unified, sovereign interface for interacting with Large Language Models (LLMs) and various modality bindings (TTS, TTI, STT, etc.). This guide covers the fundamental architecture of the `LollmsClient`, the powerful text processing utilities, and how to properly initialize and discover bindings.
+The `lollms_client` library provides a unified, sovereign interface for interacting with Large Language Models (LLMs) and various modality bindings (TTS, TTI, STT, etc.). This guide covers the fundamental architecture of the `LollmsClient`, the powerful text processing utilities, image generation via TTI bindings, and how to properly initialize and discover bindings.
 
 ---
 
 ## 1. Architecture Overview
 
-The library is structured around two primary components:
-1.  **`LollmsClient` (`lollms_core.py`)**: The main orchestrator. It manages bindings (LLM, TTS, TTI, etc.), handles cooperative VRAM management, and delegates high-level text operations to the text processor.
+The library is structured around three primary components:
+1.  **`LollmsClient` (`lollms_core.py`)**: The main orchestrator. It manages bindings (LLM, TTS, TTI, etc.), handles cooperative VRAM management, and delegates high-level text/image operations.
 2.  **`LollmsTextProcessor` (`lollms_text_processing.py`)**: A comprehensive text and code processing layer that sits on top of the LLM binding. It handles context chunking, code generation, structured JSON generation, and tag-based extraction.
+3.  **`LollmsTTIBinding` (`lollms_tti_binding.py`)**: The abstract interface for Text-to-Image and Omni (text+image) generation bindings, covering classic diffusion models as well as modern omni-modality models served via engines like vLLM-Omni.
 
 ---
 
 ## 2. Binding Discovery & Initialization
 
-Before using the client, you need to know what bindings are available and how to configure them. The `LollmsLLMBindingManager` automatically scans the `llm_bindings/` directory.
+Before using the client, you need to know what bindings are available and how to configure them. Every modality (`llm`, `tti`, `tts`, `stt`, `ttv`, `ttm`) has its own binding manager that automatically scans the corresponding `*_bindings/` directory.
 
 ### Listing Available Bindings
 
 ```python
 from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
+from lollms_client.lollms_tti_binding import LollmsTTIBindingManager
 
-manager = LollmsLLMBindingManager()
-available_bindings = manager.get_available_bindings()
+llm_manager = LollmsLLMBindingManager()
+print("Available LLM Bindings:", llm_manager.get_available_bindings())
 
-print("Available LLM Bindings:")
-for binding_name in available_bindings:
-    print(f"  - {binding_name}")
+tti_manager = LollmsTTIBindingManager()
+print("Available TTI Bindings:", tti_manager.get_available_bindings())
 ```
 
 ### Inspecting Binding Requirements
 
-Every binding ships with a `description.yaml` file defining its configuration parameters.
+Every binding ships with a `description.yaml` file defining its configuration parameters. This works uniformly for LLM and TTI bindings.
 
 ```python
 import json
-from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
+from lollms_client.lollms_llm_binding import get_binding_desc
 
-manager = LollmsLLMBindingManager()
-description = manager.get_binding_description("ollama")
+description = get_binding_desc("ollama", binding_type="llm")
+print(json.dumps(description, indent=2))
 
-if description:
-    print(f"--- ollama description.json ---")
-    print(json.dumps(description, indent=2))
+description = get_binding_desc("vllm_omni", binding_type="tti")
+print(json.dumps(description, indent=2))
 ```
 
 ### Populating a `LollmsClient` Instance
 
-You initialize the `LollmsClient` by specifying the `llm_binding_name` and passing a dictionary of configuration parameters (`llm_binding_config`).
+You initialize the `LollmsClient` by specifying binding names and configuration dictionaries per modality, including `tti_binding_name` / `tti_binding_config`.
 
 ```python
 from lollms_client import LollmsClient
 
-llm_config = {
-    "model_name": "gpt-4o",
-    "host_address": "http://localhost:11434",
-}
-
 client = LollmsClient(
     llm_binding_name="ollama",
-    llm_binding_config=llm_config,
+    llm_binding_config={"model_name": "gpt-4o", "host_address": "http://localhost:11434"},
+    tti_binding_name="vllm_omni",
+    tti_binding_config={
+        "host_address": "http://localhost:8091",
+        "model_name": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    },
     debug=True
 )
 
-print(f"Active model: {client.llm.model_name}")
+print(f"Active LLM model: {client.llm.model_name}")
+print(f"Active TTI binding: {client.tti.binding_name}")
+```
+
+You can also mount multiple TTI bindings simultaneously using `extra_ttis` and switch between them at runtime with `mount_tti`:
+
+```python
+client = LollmsClient(
+    llm_binding_name="ollama",
+    tti_binding_name="diffusers",
+    tti_binding_config={"model_name": "stabilityai/sdxl-turbo"},
+    extra_ttis={
+        "omni": {
+            "binding_name": "vllm_omni",
+            "binding_config": {"host_address": "http://localhost:8091", "model_name": "Qwen/Qwen3-Omni-30B-A3B-Instruct"}
+        }
+    }
+)
+
+client.mount_tti("omni")  # switches the active TTI binding to the omni engine
 ```
 
 ---
@@ -114,43 +133,93 @@ response = client.generate_from_messages(
 )
 ```
 
-### Dynamic Context Size Resolution (4-Layer Protocol)
+---
 
-When working with models, accurately determining the context window size is critical for token budgeting and preventing overflow. `lollms_client` employs a sophisticated 4-layer resolution cascade when `get_ctx_size()` is called on an LLM binding:
+## 4. Image Generation with TTI Bindings
 
-1.  **Forced Context Size (`forced_ctx_size`)**: If explicitly set (either via `kwargs` during initialization or dynamically via `set_forced_ctx_size()`), this value is returned immediately. It acts as the absolute source of truth, overriding all automatic detection.
-2.  **Binding-Specific Detection (`_get_ctx_size`)**: If the binding instance implements a `_get_ctx_size()` method (e.g., querying an API for the model's specific limit), it is called. If it returns a valid integer, that is used.
-3.  **Hardcoded List (`assets/models_ctx_sizes.json`)**: The library maintains a local JSON file mapping known model names/aliases to their context sizes. If the `model_name` matches an entry, the hardcoded value is used.
-4.  **Default Fallback (`default_ctx_size`)**: If the model is completely unknown and no binding-specific method exists, it falls back to the `default_ctx_size` provided during initialization.
+The `LollmsTTIBinding` interface supports two usage modes: the **classic mode** (retrocompatible, returns raw image bytes only) and the **omni mode** (returns images *and* text together for modern multimodal engines like vLLM-Omni).
 
-This protocol ensures that you can always force a specific context window for testing or constrained environments, while still benefiting from automatic detection for known models.
+### Classic Mode: `generate_image` / `edit_image`
+
+This is the original interface, supported by every TTI binding (`diffusers`, `dalle`, `vllm_omni`, etc.) and returns raw `bytes`.
 
 ```python
-from lollms_client import LollmsClient
-
-# Initialize with a forced context size (Layer 1)
-lc = LollmsClient(
-    llm_binding_name="ollama",
-    llm_binding_config={
-        "model_name": "llama3",
-        "forced_ctx_size": 4096 # Forces get_ctx_size() to always return 4096
-    }
+image_bytes = client.generate_image(
+    prompt="A cyberpunk cat riding a motorcycle, neon lights, 8k",
+    negative_prompt="blurry, low quality",
+    width=1024,
+    height=1024
 )
 
-print(f"Forced Context Size: {lc.get_ctx_size()}") # Output: 4096
+with open("output/cat.png", "wb") as f:
+    f.write(image_bytes)
+```
 
-# You can also dynamically update it at runtime
-lc.llm.set_forced_ctx_size(8192)
-print(f"Updated Context Size: {lc.get_ctx_size()}") # Output: 8192
+Editing an existing image (image-to-image or inpainting) works the same way:
 
-# Clear the forced override to fall back to automatic detection (Layers 2-4)
-lc.llm.set_forced_ctx_size(None)
-print(f"Auto-detected Context Size: {lc.get_ctx_size()}") # Output: 8192 (from hardcoded list for llama3)
+```python
+edited_bytes = client.edit_image(
+    images="input/photo.png",
+    prompt="Turn the sky into a sunset",
+    mask="input/mask.png"
+)
+```
+
+### Omni Mode: `generate_omni`
+
+Modern models served via engines like [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/) can return descriptive text alongside the generated image in a single call — useful for models that narrate, caption, or reason about what they produced. Use `generate_omni` to access this richer result:
+
+```python
+result = client.generate_omni(
+    prompt="Generate an image of a whale swimming through clouds above a city, and describe the mood.",
+    width=1024,
+    height=1024,
+    modalities=["text", "image"]
+)
+
+print("Narration:", result.text)
+
+for idx, img_bytes in enumerate(result.images):
+    with open(f"output/whale_{idx}.png", "wb") as f:
+        f.write(img_bytes)
+```
+
+`generate_omni` always returns a `TTIGenerationResult` object (a dict-like structure), even for classic non-omni bindings — in that case `result.text` is simply `None`, so calling code can safely check for it:
+
+```python
+result = client.generate_omni(prompt="A watercolor painting of a lighthouse")
+if result.text:
+    print("Model commentary:", result.text)
+image_bytes = result.first_image_bytes()
+```
+
+| Method | Returns | Works with all bindings? | Supports text output? |
+|---|---|---|---|
+| `generate_image` / `edit_image` | `bytes` | Yes (always) | No |
+| `generate_omni` | `TTIGenerationResult` (`.images`, `.text`) | Yes (falls back gracefully) | Yes, when binding supports it |
+
+### Checking Omni Capability
+
+Before requesting text output, you can check whether the active binding actually supports it:
+
+```python
+if getattr(client.tti, "supports_omni", False):
+    result = client.generate_omni(prompt="...", modalities=["text", "image"])
+else:
+    image_bytes = client.generate_image(prompt="...")
+```
+
+### Listing TTI Models and Settings
+
+```python
+models = client.tti.list_models()
+settings = client.tti.get_settings()
+print(models, settings)
 ```
 
 ---
 
-## 4. Advanced Text Processing & Extraction
+## 5. Advanced Text Processing & Extraction
 
 The `LollmsTextProcessor` (accessible via `client.llm.tp` or through `client` wrapper methods) provides robust utilities for handling LLM outputs.
 
@@ -301,10 +370,45 @@ if result["success"]:
 
 ---
 
-## 5. Helper Methods
+## 6. Writing a New TTI Binding
+
+Every TTI binding lives under `tti_bindings/<binding_name>/` and must expose:
+
+- An `__init__.py` defining `BindingName = "YourBindingClass"` and the class itself, subclassing `LollmsTTIBinding`.
+- A `description.yaml` (or `binding_config.py` with `get_binding_desc()`) declaring `global_input_parameters` and `model_input_parameters` so the UI can auto-generate settings forms.
+- Implementations for the abstract methods `generate_image`, `edit_image`, `list_services`, `get_settings`, `set_settings`, and `list_models`.
+- Optionally, an override of `generate()` for bindings that support returning text alongside images (set `supports_omni=True` in `__init__`).
+
+```python
+# tti_bindings/my_binding/__init__.py
+from lollms_client.lollms_tti_binding import LollmsTTIBinding
+
+BindingName = "MyBinding"
+
+class MyBinding(LollmsTTIBinding):
+    def __init__(self, **kwargs):
+        super().__init__(binding_name="my_binding", supports_omni=False, **kwargs)
+
+    def generate_image(self, prompt, negative_prompt="", width=512, height=512, **kwargs) -> bytes:
+        ...
+
+    def edit_image(self, images, prompt, negative_prompt="", mask=None, width=None, height=None, **kwargs) -> bytes:
+        ...
+
+    def list_services(self, **kwargs): ...
+    def get_settings(self, **kwargs): ...
+    def set_settings(self, settings, **kwargs): ...
+    def list_models(self): ...
+```
+
+---
+
+## 7. Helper Methods
 
 The client also provides quick wrappers for common tasks:
 
 *   `client.yes_no(question, context)`: Returns a boolean.
 *   `client.multichoice_question(question, possible_answers)`: Returns the index of the best answer.
 *   `client.extract_keywords(text, num_keywords=5)`: Returns a list of keywords.
+*   `client.mount_tti(alias)` / `client.mount_llm(alias)`: Switches the active binding for a modality among mounted aliases.
+*   `client.list_models()`: Aggregates model lists across all active bindings (LLM, TTI, TTS, STT).
