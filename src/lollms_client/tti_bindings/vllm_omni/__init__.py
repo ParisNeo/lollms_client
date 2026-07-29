@@ -163,10 +163,14 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         eff_steps = kwargs.get("num_inference_steps", self.default_num_inference_steps)
         eff_seed = kwargs.get("seed", self.default_seed)
 
+        messages = [{"role": "user", "content": self._build_content(prompt, images)}]
+        
+        if negative_prompt:
+            messages.append({"role": "cfg_text", "content": negative_prompt})
+
         sampling_params_list = [{
             "num_inference_steps": eff_steps,
             "guidance_scale": eff_guidance,
-            "negative_prompt": negative_prompt or "",
             "seed": eff_seed,
             "width": width,
             "height": height,
@@ -175,7 +179,7 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
 
         payload = {
             "model": active_model,
-            "messages": [{"role": "user", "content": self._build_content(prompt, images)}],
+            "messages": messages,
             "modalities": modalities or self.default_modalities,
             "sampling_params_list": sampling_params_list,
         }
@@ -193,7 +197,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         raw_images, text = self._extract_images_and_text(data)
         processed = [self.process_image(img, **kwargs) for img in raw_images]
         return TTIGenerationResult(images=processed, text=text, raw=data, metadata={"model": payload["model"]})
-    
     
     # ------------------------------------------------------------------
     # Legacy retrocompatible wrappers
