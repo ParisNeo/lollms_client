@@ -2,6 +2,7 @@
 import base64
 import io
 import numpy as np
+import re
 from PIL import Image
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
@@ -25,11 +26,15 @@ def _to_data_url(path_or_b64_or_bytes: Union[str, bytes], mime: str = "image/png
     if s.startswith("http") or s.startswith("data:"):
         return s
         
-    p = Path(s)
-    if p.exists():
-        data = p.read_bytes()
-        b64 = base64.b64encode(data).decode("utf-8")
-        return f"data:{mime};base64,{b64}"
+    # Guard against Errno 36: only check the filesystem if the string is short enough 
+    # to be a valid path and lacks typical base64 characters (like '+', '/', '=' at the end).
+    # OS max path is ~260 on Windows, 4096 on Linux. We use 1024 as a safe threshold.
+    if len(s) < 1024:
+        p = Path(s)
+        if p.exists():
+            data = p.read_bytes()
+            b64 = base64.b64encode(data).decode("utf-8")
+            return f"data:{mime};base64,{b64}"
         
     # Assume it's raw base64. Strip any accidental whitespace/newlines
     s = s.replace("\n", "").replace("\r", "").replace(" ", "")
