@@ -15,20 +15,24 @@ BindingName = "VllmOmniTTIBinding"
 
 
 def _to_data_url(path_or_b64_or_bytes: Union[str, bytes], mime: str = "image/png") -> str:
+    """Converts bytes, file paths, or raw base64 strings into a strict data URL."""
     if isinstance(path_or_b64_or_bytes, bytes):
         b64 = base64.b64encode(path_or_b64_or_bytes).decode("utf-8")
         return f"data:{mime};base64,{b64}"
-    s = str(path_or_b64_or_bytes)
+    
+    s = str(path_or_b64_or_bytes).strip()
+    
     if s.startswith("http") or s.startswith("data:"):
         return s
+        
     p = Path(s)
     if p.exists():
         data = p.read_bytes()
         b64 = base64.b64encode(data).decode("utf-8")
         return f"data:{mime};base64,{b64}"
-    # assume it's already raw base64
-    # Strip any accidental whitespace/newlines
-    s = s.strip().replace("\n", "").replace("\r", "")
+        
+    # Assume it's raw base64. Strip any accidental whitespace/newlines
+    s = s.replace("\n", "").replace("\r", "").replace(" ", "")
     return f"data:{mime};base64,{s}"
 
 EDIT_ONLY_MODEL_PATTERNS = ["qwen-image-edit", "-edit-plus", "-edit-2511", "-edit-2509"]
@@ -123,7 +127,10 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         if images:
             img_list = images if isinstance(images, list) else [images]
             for img in img_list:
-                content.append({"type": "image_url", "image_url": {"url": _to_data_url(img)}})
+                content.append({
+                    "type": "image_url", 
+                    "image_url": {"url": _to_data_url(img)}
+                })
         return content
 
     # ------------------------------------------------------------------
