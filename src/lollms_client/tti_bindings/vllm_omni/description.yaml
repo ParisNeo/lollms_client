@@ -1,0 +1,70 @@
+title: 'vLLM-Omni TTI'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'vllm_omni'
+supported_file_types: ["png", "jpg", "jpeg", "webp"]
+
+description: |
+  This binding connects LoLLMS to a vLLM-Omni server
+  (https://docs.vllm.ai/projects/vllm-omni/) via its OpenAI-compatible
+  /v1/chat/completions endpoint.
+
+  vLLM-Omni serves modern omni-modality models that can generate images,
+  and in some cases return descriptive text alongside the image in the
+  same call. Supported model families include:
+    - Z-Image / Z-Image-Turbo (fast text-to-image diffusion)
+    - FLUX-style diffusion checkpoints
+    - Ovis-Image, GLM-Image
+    - Qwen3-Omni / BAGEL (true omni chat+image models, text + image output)
+
+  Two usage modes are supported:
+  1. Classic mode (generate_image/edit_image): behaves like any other
+     LoLLMS TTI binding, returning only image bytes.
+  2. Omni mode (generate): returns both generated image(s) and any text
+     narration the model produced, useful for models that "explain" or
+     caption what they generated.
+
+global_input_parameters:
+  - name: "host_address"
+    type: "str"
+    default: "http://localhost:8091"
+    description: "Base URL of the running vLLM-Omni OpenAI-compatible server."
+
+  - name: "service_key"
+    type: "str"
+    default: ""
+    description: "Optional bearer token if the vLLM-Omni server requires authentication."
+    is_secret: true
+
+  - name: "verify_ssl_certificate"
+    type: "bool"
+    default: true
+    description: "Whether to verify SSL certificates when calling the server."
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    default: ""
+    description: "The model id as registered on the vLLM-Omni server (e.g. 'Qwen/Qwen3-Omni-30B-A3B-Instruct', 'Tongyi-MAI/Z-Image-Turbo')."
+
+  - name: "num_inference_steps"
+    type: "int"
+    default: 30
+    description: "Number of denoising steps for diffusion-based generation."
+
+  - name: "guidance_scale"
+    type: "float"
+    default: 7.5
+    description: "Classifier-free guidance scale for diffusion generation."
+
+  - name: "seed"
+    type: "int"
+    default: -1
+    description: "Random seed. Use -1 for a random seed each call."
+
+  - name: "modalities"
+    type: "list"
+    default: ["image"]
+    description: "Output modalities requested from the server, e.g. ['image'], ['text','image']."
+
+commands: []
