@@ -1,5 +1,5 @@
+# lollms_client/lollms_tti_binding.py (updated)
 from abc import abstractmethod
-import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Callable
 from ascii_colors import trace_exception, ASCIIColors
@@ -7,6 +7,7 @@ import yaml
 import io
 import base64
 import requests
+import importlib
 from lollms_client.lollms_base_binding import LollmsBaseBinding
 
 try:
@@ -14,24 +15,64 @@ try:
 except ImportError:
     ASCIIColors.warning("Pillow not found. Image processing (metadata/watermarking) will be limited. Install with: pip install Pillow")
 
+
+class TTIGenerationResult(dict):
+    """
+    Unified result container for TTI/Omni generation.
+    Backward compatible: behaves like a dict, but also exposes
+    convenience accessors. Legacy code expecting raw bytes should
+    call `.first_image_bytes()`.
+
+    Keys:
+        images: List[bytes]            -> list of raw image bytes (post-processed)
+        text:   Optional[str]          -> any text returned alongside images (omni models)
+        raw:    Optional[Any]          -> raw provider response (debug/advanced use)
+        metadata: Optional[dict]       -> generation metadata (seed, steps, model, etc.)
+    """
+    def __init__(self, images=None, text=None, raw=None, metadata=None):
+        super().__init__(
+            images=images or [],
+            text=text,
+            raw=raw,
+            metadata=metadata or {}
+        )
+
+    @property
+    def images(self) -> List[bytes]:
+        return self.get("images", [])
+
+    @property
+    def text(self) -> Optional[str]:
+        return self.get("text")
+
+    def first_image_bytes(self) -> bytes:
+        imgs = self.images
+        if not imgs:
+            raise ValueError("No image was returned by the binding.")
+        return imgs[0]
+
+
 class LollmsTTIBinding(LollmsBaseBinding):
-    """Abstract base class for all LOLLMS Text-to-Image bindings."""
+    """Abstract base class for all LOLLMS Text-to-Image / Omni bindings."""
 
     def __init__(self,
-                 binding_name:str="unknown",
-                 debug:Optional[bool] = False,
+                 binding_name: str = "unknown",
+                 debug: Optional[bool] = False,
+                 supports_omni: bool = False,
+                 supports_text_output: bool = False,
                  **kwargs):
         """
         Initialize the LollmsTTIBinding base class.
-        
+
+        New Args (Omni support):
+        - supports_omni (bool): True if the underlying model/service can return
+          text alongside images in a single call (e.g. vLLM-Omni chat-completions
+          style models that narrate + generate, or edit + explain).
+        - supports_text_output (bool): True if generate() may populate `text`
+          in the TTIGenerationResult even outside of a full omni pipeline.
+
         Watermarking Settings (set via kwargs/config):
-        - watermark_path: str (URL, base64, or local path to PNG)
-        - watermark_size_x: int (Width of watermark)
-        - watermark_size_y: int (Height of watermark)
-        - watermark_pos_x: int (X coordinate)
-        - watermark_pos_y: int (Y coordinate)
-        - author: str (Author name for metadata)
-        - system: str (System name for metadata)
+        - watermark_path, watermark_size_x/y, watermark_pos_x/y, author, system
         """
         super().__init__(binding_name=binding_name, debug=debug, **kwargs)
         self.watermark_path = kwargs.get("watermark_path", None)
@@ -46,17 +87,17 @@ class LollmsTTIBinding(LollmsBaseBinding):
         self.author = kwargs.get("author", "ParisNeo")
         self.system = kwargs.get("system", "LoLLMS")
 
-    def process_image(self, 
-                      image_bytes: bytes, 
-                      **kwargs) -> bytes:
-        """
-        Post-processes generated images to add metadata and watermarks.
-        Merges initialization defaults with per-call overrides.
-        """
+        # --- Omni capability flags ---
+        self.supports_omni = supports_omni
+        self.supports_text_output = supports_text_output
+
+    # ------------------------------------------------------------------
+    # Image post-processing (unchanged, reused for every image produced)
+    # ------------------------------------------------------------------
+    def process_image(self, image_bytes: bytes, **kwargs) -> bytes:
         try:
             img = Image.open(io.BytesIO(image_bytes))
-            
-            # 1. Resolve Parameters (Override init defaults with call-time kwargs)
+
             wm_path = kwargs.get("watermark_path", self.watermark_path)
             wm_size = (
                 kwargs.get("watermark_size_x", self.watermark_size[0]),
@@ -69,8 +110,6 @@ class LollmsTTIBinding(LollmsBaseBinding):
             author = kwargs.get("author", self.author)
             system = kwargs.get("system", self.system)
 
-            # 2. Prepare Metadata (Hidden Watermarking)
-            # Mandatory for transparency: identify the tool and model
             final_metadata = {
                 "Software": "LoLLMS",
                 "Binding": self.binding_name,
@@ -80,14 +119,11 @@ class LollmsTTIBinding(LollmsBaseBinding):
                 "Description": f"Built using LoLLMS ({self.binding_name}) with model {self.config.get('model_name', 'unknown')}",
                 "AI-Generated": "True"
             }
-            # Add custom metadata if provided in kwargs
             if "metadata" in kwargs and isinstance(kwargs["metadata"], dict):
                 final_metadata.update(kwargs["metadata"])
 
-            # 3. Apply Visible Watermark if provided
             if wm_path:
                 try:
-                    # Load watermark (from URL, base64, or Path)
                     if str(wm_path).startswith("http"):
                         wm_res = requests.get(wm_path)
                         wm_img = Image.open(io.BytesIO(wm_res.content)).convert("RGBA")
@@ -97,25 +133,19 @@ class LollmsTTIBinding(LollmsBaseBinding):
                     else:
                         wm_img = Image.open(wm_path).convert("RGBA")
 
-                    # Resize watermark
                     wm_img = wm_img.resize(wm_size, Image.Resampling.LANCZOS)
-                    
-                    # Ensure background is compatible for blending
                     if img.mode != 'RGBA':
                         img = img.convert("RGBA")
-                    
-                    # Paste watermark
                     img.paste(wm_img, wm_pos, wm_img)
                     img = img.convert("RGB")
                 except Exception as wm_err:
                     ASCIIColors.error(f"Failed to apply visible watermark: {wm_err}")
 
-            # 4. Save with metadata (PNG info chunks)
             output = io.BytesIO()
             png_info = PngImagePlugin.PngInfo()
             for k, v in final_metadata.items():
                 png_info.add_text(k, str(v))
-            
+
             img.save(output, format="PNG", pnginfo=png_info)
             return output.getvalue()
 
@@ -124,6 +154,51 @@ class LollmsTTIBinding(LollmsBaseBinding):
             ASCIIColors.error("Image post-processing failed. Returning raw bytes.")
             return image_bytes
 
+    # ------------------------------------------------------------------
+    # NEW unified entrypoint — omni-capable
+    # ------------------------------------------------------------------
+    def generate(self,
+                 prompt: str,
+                 negative_prompt: Optional[str] = "",
+                 width: int = 512,
+                 height: int = 512,
+                 images: Optional[Union[str, List[str]]] = None,
+                 mask: Optional[str] = None,
+                 n: int = 1,
+                 modalities: Optional[List[str]] = None,
+                 **kwargs) -> TTIGenerationResult:
+        """
+        Unified generation entrypoint supporting classic TTI models AND
+        modern omni models that return text + image(s) together.
+
+        Default implementation provides retro-compatibility: it dispatches
+        to `generate_image` (or `edit_image` if `images` is provided) and
+        wraps the raw bytes into a TTIGenerationResult with no text.
+
+        Omni-capable bindings (supports_omni=True) SHOULD override this
+        method directly instead of generate_image/edit_image, since they
+        need to return text alongside images from a single request.
+
+        Args:
+            modalities: list like ["image"], ["text","image"] — hints to
+                        the underlying provider about desired output types.
+                        Non-omni bindings ignore this safely.
+        """
+        if images:
+            raw = self.edit_image(
+                images=images, prompt=prompt, negative_prompt=negative_prompt,
+                mask=mask, width=width, height=height, **kwargs
+            )
+        else:
+            raw = self.generate_image(
+                prompt=prompt, negative_prompt=negative_prompt,
+                width=width, height=height, **kwargs
+            )
+        return TTIGenerationResult(images=[raw], text=None, raw=raw)
+
+    # ------------------------------------------------------------------
+    # Legacy abstract methods (kept for retrocompatibility)
+    # ------------------------------------------------------------------
     @abstractmethod
     def generate_image(self,
                        prompt: str,
@@ -131,9 +206,7 @@ class LollmsTTIBinding(LollmsBaseBinding):
                        width: int = 512,
                        height: int = 512,
                        **kwargs) -> bytes:
-        """
-        Generates image data from the provided text prompt.
-        """
+        """Generates image data from the provided text prompt. Returns raw bytes only."""
         pass
 
     @abstractmethod
@@ -145,45 +218,30 @@ class LollmsTTIBinding(LollmsBaseBinding):
                    width: Optional[int] = None,
                    height: Optional[int] = None,
                    **kwargs) -> bytes:
-        """
-        Edits an image or a set of images based on the provided prompts.
-        """
+        """Edits an image or a set of images based on the provided prompts. Returns raw bytes only."""
         pass
 
     @abstractmethod
     def list_services(self, **kwargs) -> List[Dict[str, str]]:
-        """Lists the available TTI services or models supported by the binding."""
         pass
 
     @abstractmethod
     def get_settings(self, **kwargs) -> Optional[Dict[str, Any]]:
-        """Retrieves the current settings for the active TTI service/model."""
         pass
 
     @abstractmethod
     def list_models(self) -> list:
-        """Lists models"""
         pass
-    
+
     def get_zoo(self) -> List[Dict[str, Any]]:
-        """
-        Returns a list of models available for download.
-        each entry is a dict with:
-        name, description, size, type, link
-        """
         return []
 
     def download_from_zoo(self, index: int, progress_callback: Callable[[dict], None] = None) -> dict:
-        """
-        Downloads a model from the zoo using its index.
-        """
         return {"status": False, "message": "Not implemented"}
 
     @abstractmethod
     def set_settings(self, settings: Dict[str, Any], **kwargs) -> bool:
-        """Applies new settings to the active TTI service/model."""
         pass
-
 
 class LollmsTTIBindingManager:
     """Manages TTI binding discovery and instantiation."""
