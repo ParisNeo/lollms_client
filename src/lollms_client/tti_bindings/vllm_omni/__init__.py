@@ -1,4 +1,3 @@
-# lollms_client/tti_bindings/vllm_omni/__init__.py
 import base64
 import io
 import numpy as np
@@ -26,9 +25,6 @@ def _to_data_url(path_or_b64_or_bytes: Union[str, bytes], mime: str = "image/png
     if s.startswith("http") or s.startswith("data:"):
         return s
         
-    # Guard against Errno 36: only check the filesystem if the string is short enough 
-    # to be a valid path and lacks typical base64 characters (like '+', '/', '=' at the end).
-    # OS max path is ~260 on Windows, 4096 on Linux. We use 1024 as a safe threshold.
     if len(s) < 1024:
         p = Path(s)
         if p.exists():
@@ -36,7 +32,6 @@ def _to_data_url(path_or_b64_or_bytes: Union[str, bytes], mime: str = "image/png
             b64 = base64.b64encode(data).decode("utf-8")
             return f"data:{mime};base64,{b64}"
         
-    # Assume it's raw base64. Strip any accidental whitespace/newlines
     s = s.replace("\n", "").replace("\r", "").replace(" ", "")
     return f"data:{mime};base64,{s}"
 
@@ -84,7 +79,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         self.service_key = service_key
         self.verify_ssl_certificate = verify_ssl_certificate
 
-        # Model-level defaults, overridable per-call via kwargs
         self.default_num_inference_steps = kwargs.get("num_inference_steps", 30)
         self.default_guidance_scale = kwargs.get("guidance_scale", 7.5)
         self.default_seed = kwargs.get("seed", -1)
@@ -119,7 +113,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
                         elif url:
                             r = requests.get(url, verify=self.verify_ssl_certificate)
                             images.append(r.content)
-            # some diffusion-only responses put base64 image directly at message level
             if "images" in msg:
                 for img_entry in msg["images"]:
                     b64 = img_entry.get("b64_json") or img_entry.get("data")
@@ -168,6 +161,7 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         sampling_params_list = [{
             "num_inference_steps": eff_steps,
             "guidance_scale": eff_guidance,
+            "negative_prompt": negative_prompt or "",
             "seed": eff_seed,
             "width": width,
             "height": height,
@@ -180,11 +174,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
             "modalities": modalities or self.default_modalities,
             "sampling_params_list": sampling_params_list,
         }
-
-        if negative_prompt:
-            payload["nvext.negative_prompt"] = negative_prompt
-            payload["nvext.guidance_scale"] = eff_guidance
-            payload["nvext.num_inference_steps"] = eff_steps
 
         try:
             resp = requests.post(url, json=payload, headers=self._headers(),
@@ -214,29 +203,32 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
                                 width=width, height=height, modalities=["image"], **kwargs)
         return result.first_image_bytes()
 
-    def _get_image_size(self, image_source: Union[str, bytes]) -> Optional[tuple]:
-        """Determines (width, height) from a data URL, file path, or URL."""
+    def _load_image(self, image_source: Union[str, bytes]) -> Optional[Image.Image]:
+        """Loads a PIL image from a data URL, file path, or URL."""
         try:
             if isinstance(image_source, bytes):
-                img = Image.open(io.BytesIO(image_source))
-                return img.size
+                return Image.open(io.BytesIO(image_source))
             s = str(image_source).strip()
             if s.startswith("data:"):
                 b64_data = s.split(",", 1)[1]
-                img = Image.open(io.BytesIO(base64.b64decode(b64_data)))
-                return img.size
+                return Image.open(io.BytesIO(base64.b64decode(b64_data)))
             elif s.startswith("http"):
                 resp = requests.get(s, verify=self.verify_ssl_certificate, timeout=15)
-                img = Image.open(io.BytesIO(resp.content))
-                return img.size
+                return Image.open(io.BytesIO(resp.content))
             else:
                 p = Path(s)
                 if p.exists():
-                    img = Image.open(p)
-                    return img.size
+                    return Image.open(p)
         except Exception as e:
-            ASCIIColors.warning(f"[VllmOmni] Failed to read image dimensions: {e}")
+            ASCIIColors.warning(f"[VllmOmni] Failed to load source image: {e}")
         return None
+
+    def _img_to_data_url(self, img: Image.Image) -> str:
+        """Converts a PIL Image to a PNG data URL."""
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{b64}"
 
     def edit_image(self,
                    images: Union[str, List[str]],
@@ -250,17 +242,28 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         first_img = images[0] if isinstance(images, list) else images
         
         if width is None or height is None:
-            measured = self._get_image_size(first_img)
+            measured = self._load_image(first_img)
             if measured:
-                if width is None: width = measured[0]
-                if height is None: height = measured[1]
+                if width is None: width = measured.width
+                if height is None: height = measured.height
             else:
                 width = width or 1024
                 height = height or 1024
 
+        processed_images = []
+        img_list = images if isinstance(images, list) else [images]
+        for img_src in img_list:
+            pil_img = self._load_image(img_src)
+            if pil_img:
+                if pil_img.width != width or pil_img.height != height:
+                    pil_img = pil_img.resize((width, height), Image.LANCZOS)
+                processed_images.append(self._img_to_data_url(pil_img))
+            else:
+                processed_images.append(img_src)
+
         result = self.generate(prompt=prompt, negative_prompt=negative_prompt,
                                 width=width, height=height,
-                                images=images, mask=mask, modalities=["image"], **kwargs)
+                                images=processed_images, mask=mask, modalities=["image"], **kwargs)
         return result.first_image_bytes()
 
     # ------------------------------------------------------------------
