@@ -164,9 +164,6 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         eff_seed = kwargs.get("seed", self.default_seed)
 
         messages = [{"role": "user", "content": self._build_content(prompt, images)}]
-        
-        if negative_prompt:
-            messages.append({"role": "cfg_text", "content": negative_prompt})
 
         sampling_params_list = [{
             "num_inference_steps": eff_steps,
@@ -183,6 +180,11 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
             "modalities": modalities or self.default_modalities,
             "sampling_params_list": sampling_params_list,
         }
+
+        if negative_prompt:
+            payload["nvext.negative_prompt"] = negative_prompt
+            payload["nvext.guidance_scale"] = eff_guidance
+            payload["nvext.num_inference_steps"] = eff_steps
 
         try:
             resp = requests.post(url, json=payload, headers=self._headers(),
