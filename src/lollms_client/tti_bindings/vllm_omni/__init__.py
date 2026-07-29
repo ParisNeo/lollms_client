@@ -1,6 +1,8 @@
 # lollms_client/tti_bindings/vllm_omni/__init__.py
 import base64
 import io
+import numpy as np
+from PIL import Image
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 
@@ -25,7 +27,24 @@ def _to_data_url(path_or_b64_or_bytes: Union[str, bytes], mime: str = "image/png
         b64 = base64.b64encode(data).decode("utf-8")
         return f"data:{mime};base64,{b64}"
     # assume it's already raw base64
+    # Strip any accidental whitespace/newlines
+    s = s.strip().replace("\n", "").replace("\r", "")
     return f"data:{mime};base64,{s}"
+
+EDIT_ONLY_MODEL_PATTERNS = ["qwen-image-edit", "-edit-plus", "-edit-2511", "-edit-2509"]
+
+def _is_edit_only_model(model_name: str) -> bool:
+    name = (model_name or "").lower()
+    return any(p in name for p in EDIT_ONLY_MODEL_PATTERNS)
+
+def _generate_noise_image_data_url(width: int = 1024, height: int = 1024) -> str:
+    """Generates a random noise image and returns it as a base64 data URL."""
+    arr = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)
+    img = Image.fromarray(arr, "RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
 
 class VllmOmniTTIBinding(LollmsTTIBinding):
@@ -121,6 +140,14 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
                  modalities: Optional[List[str]] = None,
                  **kwargs) -> TTIGenerationResult:
         url = f"{self.host_address}/v1/chat/completions"
+        
+        active_model = kwargs.get("model_name", self.model_name)
+
+        # Edit-only models (like QwenImageEditPlus) crash with NoneType if no image is provided.
+        # We synthesize a random noise image to satisfy the pipeline's internal `.size` constraint.
+        if not images and _is_edit_only_model(active_model):
+            ASCIIColors.warning(f"[VllmOmni] Model '{active_model}' is edit-only. Synthesizing noise reference image.")
+            images = _generate_noise_image_data_url(width=width, height=height)
 
         extra_body = {
             "sampling_params_list": [{
@@ -135,7 +162,7 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         }
 
         payload = {
-            "model": kwargs.get("model_name", self.model_name),
+            "model": active_model,
             "messages": [{"role": "user", "content": self._build_content(prompt, images)}],
             "modalities": modalities or self.default_modalities,
             "extra_body": extra_body,
@@ -164,6 +191,7 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
                        width: int = 1024,
                        height: int = 1024,
                        **kwargs) -> bytes:
+        
         result = self.generate(prompt=prompt, negative_prompt=negative_prompt,
                                 width=width, height=height, modalities=["image"], **kwargs)
         return result.first_image_bytes()
