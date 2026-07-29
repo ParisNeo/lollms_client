@@ -27,7 +27,7 @@ description: |
 global_input_parameters:
   - name: "host_address"
     type: "str"
-    default: "http://localhost:8091"
+    default: "http://localhost:8081"
     description: "Base URL of the running vLLM-Omni OpenAI-compatible server."
 
   - name: "service_key"
