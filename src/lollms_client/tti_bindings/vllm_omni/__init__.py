@@ -1,7 +1,6 @@
 # lollms_client/tti_bindings/vllm_omni/__init__.py
 import base64
 import io
-import re
 import numpy as np
 from PIL import Image
 from pathlib import Path
@@ -26,15 +25,11 @@ def _to_data_url(path_or_b64_or_bytes: Union[str, bytes], mime: str = "image/png
     if s.startswith("http") or s.startswith("data:"):
         return s
         
-    # Guard against Errno 36: only check the filesystem if the string is short enough 
-    # to be a valid path and lacks typical base64 characters (like '+', '/', '=' at the end).
-    # OS max path is ~260 on Windows, 4096 on Linux. We use 1024 as a safe threshold.
-    if len(s) < 1024:
-        p = Path(s)
-        if p.exists():
-            data = p.read_bytes()
-            b64 = base64.b64encode(data).decode("utf-8")
-            return f"data:{mime};base64,{b64}"
+    p = Path(s)
+    if p.exists():
+        data = p.read_bytes()
+        b64 = base64.b64encode(data).decode("utf-8")
+        return f"data:{mime};base64,{b64}"
         
     # Assume it's raw base64. Strip any accidental whitespace/newlines
     s = s.replace("\n", "").replace("\r", "").replace(" ", "")
@@ -155,29 +150,29 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         
         active_model = kwargs.get("model_name", self.model_name)
 
-        # Edit-only models (like QwenImageEditPlus) crash with NoneType if no image is provided.
-        # We synthesize a random noise image to satisfy the pipeline's internal `.size` constraint.
         if not images and _is_edit_only_model(active_model):
             ASCIIColors.warning(f"[VllmOmni] Model '{active_model}' is edit-only. Synthesizing noise reference image.")
             images = _generate_noise_image_data_url(width=width, height=height)
 
-        extra_body = {
-            "sampling_params_list": [{
-                "num_inference_steps": kwargs.get("num_inference_steps", self.default_num_inference_steps),
-                "guidance_scale": kwargs.get("guidance_scale", self.default_guidance_scale),
-                "negative_prompt": negative_prompt or "",
-                "seed": kwargs.get("seed", self.default_seed),
-                "width": width,
-                "height": height,
-                "n": n,
-            }]
-        }
+        eff_guidance = kwargs.get("guidance_scale", self.default_guidance_scale)
+        eff_steps = kwargs.get("num_inference_steps", self.default_num_inference_steps)
+        eff_seed = kwargs.get("seed", self.default_seed)
+
+        sampling_params_list = [{
+            "num_inference_steps": eff_steps,
+            "guidance_scale": eff_guidance,
+            "negative_prompt": negative_prompt or "",
+            "seed": eff_seed,
+            "width": width,
+            "height": height,
+            "n": n,
+        }]
 
         payload = {
             "model": active_model,
             "messages": [{"role": "user", "content": self._build_content(prompt, images)}],
             "modalities": modalities or self.default_modalities,
-            "extra_body": extra_body,
+            "sampling_params_list": sampling_params_list,
         }
 
         try:
@@ -193,7 +188,8 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
         raw_images, text = self._extract_images_and_text(data)
         processed = [self.process_image(img, **kwargs) for img in raw_images]
         return TTIGenerationResult(images=processed, text=text, raw=data, metadata={"model": payload["model"]})
-
+    
+    
     # ------------------------------------------------------------------
     # Legacy retrocompatible wrappers
     # ------------------------------------------------------------------
