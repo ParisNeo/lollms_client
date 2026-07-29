@@ -212,6 +212,30 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
                                 width=width, height=height, modalities=["image"], **kwargs)
         return result.first_image_bytes()
 
+    def _get_image_size(self, image_source: Union[str, bytes]) -> Optional[tuple]:
+        """Determines (width, height) from a data URL, file path, or URL."""
+        try:
+            if isinstance(image_source, bytes):
+                img = Image.open(io.BytesIO(image_source))
+                return img.size
+            s = str(image_source).strip()
+            if s.startswith("data:"):
+                b64_data = s.split(",", 1)[1]
+                img = Image.open(io.BytesIO(base64.b64decode(b64_data)))
+                return img.size
+            elif s.startswith("http"):
+                resp = requests.get(s, verify=self.verify_ssl_certificate, timeout=15)
+                img = Image.open(io.BytesIO(resp.content))
+                return img.size
+            else:
+                p = Path(s)
+                if p.exists():
+                    img = Image.open(p)
+                    return img.size
+        except Exception as e:
+            ASCIIColors.warning(f"[VllmOmni] Failed to read image dimensions: {e}")
+        return None
+
     def edit_image(self,
                    images: Union[str, List[str]],
                    prompt: str,
@@ -220,8 +244,20 @@ class VllmOmniTTIBinding(LollmsTTIBinding):
                    width: Optional[int] = None,
                    height: Optional[int] = None,
                    **kwargs) -> bytes:
+        
+        first_img = images[0] if isinstance(images, list) else images
+        
+        if width is None or height is None:
+            measured = self._get_image_size(first_img)
+            if measured:
+                if width is None: width = measured[0]
+                if height is None: height = measured[1]
+            else:
+                width = width or 1024
+                height = height or 1024
+
         result = self.generate(prompt=prompt, negative_prompt=negative_prompt,
-                                width=width or 1024, height=height or 1024,
+                                width=width, height=height,
                                 images=images, mask=mask, modalities=["image"], **kwargs)
         return result.first_image_bytes()
 
