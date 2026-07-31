@@ -163,6 +163,11 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         val_multi = _clean(kwargs.get("multimodal"))
         self.multimodal: bool = bool(val_multi) if val_multi is not None else True
 
+
+        self.reasoning = kwargs.get("reasoning", "off")
+        self.reasoning_budget: int = kwargs.get("reasoning_budget", 0)
+
+
         self.rope_scale: Optional[float] = _clean(kwargs.get("rope_scale"), float)
         self.rope_freq_base: Optional[float] = _clean(kwargs.get("rope_freq_base"), float)
         self.rope_freq_scale: Optional[float] = _clean(kwargs.get("rope_freq_scale"), float)
@@ -744,6 +749,8 @@ class LlamaCppServerBinding(LollmsLLMBinding):
             "--n-gpu-layers", str(self.n_gpu_layers),
             "--parallel", str(self.n_parallel),
             "--batch-size", str(self.batch_size),
+            "--reasoning", str(self.reasoning),
+            "--reasoning-budget", str(self.reasoning_budget),
             "--embedding",          # always enable the /embedding endpoint
         ]
         if self.n_threads:
@@ -775,7 +782,26 @@ class LlamaCppServerBinding(LollmsLLMBinding):
         if mmproj:
             ASCIIColors.info(f"Vision projector detected: {mmproj.name}")
             cmd += ["--mmproj", str(mmproj)]
-
+        # Render the command as a formatted table
+        headers = ["Option", "Value"]
+        rows = []
+        i=0
+        while i <len(cmd):
+            arg = cmd[i]
+            if i == 0:
+                rows.append(["[bold]Executable[\bold]", os.path.basename(arg)[-20:]])
+            elif isinstance(arg, str) and arg.startswith("--") and (i + 1 < len(cmd) and isinstance(cmd[i+1], str) and not cmd[i + 1].startswith("--")):
+                # This is an option with a value
+                rows.append(["[bold]"+str(arg[2:]+"[\bold]"), str(cmd[i + 1][-20:])])
+                i += 1  # Skip the next one as it's consumed by this row
+            else:
+                if isinstance(arg, str) and arg.startswith("--"):
+                    rows.append(["[bold]"+str(arg[-20:])+"[\bold]", ""])
+                else:
+                    rows.append(["[bold]"+str(arg[-20:])+"[\bold]", ""])
+            i+=1
+        
+        ASCIIColors.table(*headers, rows=rows, title="llama-server Command", box="square")
         return cmd
 
     def _spawn_server_detached(self, model_name: str) -> tuple:

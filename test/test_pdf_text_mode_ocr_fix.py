@@ -54,31 +54,28 @@ class TestPDFTextModeOCRFix(unittest.TestCase):
         shutil.rmtree(self.tmp_workspace, ignore_errors=True)
 
     @patch('lollms_client.lollms_artefact.file_import._ensure_installed')
-    def test_text_mode_uses_fitz_and_avoids_ocr(self, mock_ensure_installed):
+    def test_text_mode_uses_pymupdf4llm_and_avoids_ocr(self, mock_ensure_installed):
         """
-        Verify that importing a PDF in mode='text' uses PyMuPDF (fitz) for text extraction
+        Verify that importing a PDF in mode='text' uses pymupdf4llm for text extraction
         and does not invoke OCR fallbacks like pdf2image or docling.
         """
         from lollms_client.lollms_artefact import file_import
         
-        mock_page = MagicMock()
-        mock_page.get_text.return_value = "This is the extracted text layer."
-        
-        mock_doc = MagicMock()
-        mock_doc.__iter__.return_value = [mock_page]
-        mock_doc.__enter__.return_value = mock_doc
-        mock_doc.__exit__.return_value = None
+        mock_pymupdf4llm = MagicMock()
+        mock_pymupdf4llm.to_markdown.return_value = [
+            {"text": "This is the extracted text layer."}
+        ]
 
-        with patch.dict(sys.modules, {'fitz': MagicMock(open=MagicMock(return_value=mock_doc))}):
+        with patch.dict(sys.modules, {'pymupdf4llm': mock_pymupdf4llm}):
             result = self.discussion.import_file(
                 path=self.pdf_path,
                 mode="text",
                 activate=True
             )
             
-            mock_ensure_installed.assert_any_call("pymupdf", "fitz")
+            mock_ensure_installed.assert_any_call("pymupdf4llm")
             
-            mock_page.get_text.assert_called_once_with("text")
+            mock_pymupdf4llm.to_markdown.assert_called_once()
             
             text_art = result.get("text_artefact")
             self.assertIsNotNone(text_art)
@@ -89,7 +86,7 @@ class TestPDFTextModeOCRFix(unittest.TestCase):
     @patch('lollms_client.lollms_artefact.file_import._ensure_installed')
     def test_text_mode_falls_back_to_pypdf_safely(self, mock_ensure_installed):
         """
-        Verify that if fitz fails to import or use, it falls back to pypdf 
+        Verify that if pymupdf4llm fails to import or use, it falls back to pypdf 
         (which is also a strict text extractor, NOT OCR).
         """
         from lollms_client.lollms_artefact import file_import
@@ -99,8 +96,9 @@ class TestPDFTextModeOCRFix(unittest.TestCase):
         mock_page.extract_text.return_value = "Text from pypdf layer."
         mock_reader.pages = [mock_page]
 
+        # Simulate pymupdf4llm not being installed
         with patch.dict(sys.modules, {
-            'fitz': None,
+            'pymupdf4llm': None,
             'pypdf': MagicMock(PdfReader=MagicMock(return_value=mock_reader))
         }):
             result = self.discussion.import_file(
@@ -109,7 +107,7 @@ class TestPDFTextModeOCRFix(unittest.TestCase):
                 activate=True
             )
 
-            mock_ensure_installed.assert_any_call("pymupdf", "fitz")
+            mock_ensure_installed.assert_any_call("pymupdf4llm")
             mock_ensure_installed.assert_any_call("pypdf")
 
             mock_page.extract_text.assert_called_once()

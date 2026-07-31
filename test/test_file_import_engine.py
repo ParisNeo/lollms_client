@@ -1,30 +1,42 @@
 import unittest
+from pathlib import Path
 import tempfile
 import shutil
 import os
-from pathlib import Path
+import sys
 from unittest.mock import patch
-from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager, ArtefactType
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from lollms_client.lollms_discussion import LollmsDiscussion
+from lollms_client.lollms_discussion._db import LollmsDataManager
 from lollms_client.lollms_artefact import ArtefactVisibility
 
-class DummyClient:
+class MockLollmsClient:
     def __init__(self):
+        self.debug = False
         self.llm = self
+        self.model_name = "test-model"
+        self.binding_name = "test-binding"
         self.ai_name = "Assistant"
-        self.model_name = "dummy"
-        self.binding_name = "dummy"
+        
     def count_tokens(self, text: str) -> int:
-        return len(text) // 4
-    def count_image_tokens(self, img) -> int:
-        return 0
+        return len(text.split())
+
+    def count_image_tokens(self, image: str) -> int:
+        return 256
+
     def remove_thinking_blocks(self, text: str) -> str:
         return text
+
+    def generate_text(self, prompt: str, **kwargs) -> str:
+        return "Simulated response"
 
 class TestFileImportEngine(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = DummyClient()
+        cls.client = MockLollmsClient()
 
     def setUp(self):
         self.tmp_workspace = tempfile.mkdtemp(prefix="lollms_import_test_")
@@ -54,7 +66,7 @@ class TestFileImportEngine(unittest.TestCase):
         art = res["text_artefact"]
 
         self.assertIsNotNone(art)
-        self.assertEqual(art["type"], ArtefactType.DOCUMENT)
+        self.assertEqual(art["type"], "document")
         self.assertEqual(art["visibility"], ArtefactVisibility.FULL)
         self.assertNotIn("file_ext", art, "file_ext should NOT be injected for text imports.")
         self.assertIn("col1,col2", art["content"], "Full text must be present.")
@@ -70,9 +82,11 @@ class TestFileImportEngine(unittest.TestCase):
             art = res["text_artefact"]
 
         self.assertIsNotNone(art)
-        self.assertEqual(art["type"], ArtefactType.DOCUMENT)
+        self.assertEqual(art["type"], "document")
         self.assertEqual(art["visibility"], ArtefactVisibility.FULL)
-        self.assertNotIn("file_ext", art, "file_ext should NOT be injected for text imports.")
+        # Per architectural standard, rich text files are suffixed with .md to prevent binary interception
+        self.assertEqual(art["title"], "mock.docx.md")
+        self.assertEqual(art["file_ext"], ".md")
 
     def test_data_mode_csv_import(self):
         """Verify CSV imported in DATA mode triggers the .lam Dual-Stream system."""
@@ -82,7 +96,7 @@ class TestFileImportEngine(unittest.TestCase):
         art = res["text_artefact"]
 
         self.assertIsNotNone(art)
-        self.assertEqual(art["type"], ArtefactType.DATA)
+        self.assertEqual(art["type"], "data")
         self.assertEqual(art.get("file_ext"), ".csv", "file_ext MUST be injected for data imports.")
         self.assertIsNotNone(art.get("logical_content"), "DATA mode must produce a logical twin (.lam).")
         self.assertIsNotNone(art.get("physical_data"), "DATA mode must retain raw physical bytes.")
@@ -107,6 +121,7 @@ class TestFileImportEngine(unittest.TestCase):
 
     def test_artefact_builder_default_visibility(self):
         """Verify files created by <artifact> tags default to FULL [C]."""
+        from lollms_client.lollms_artefact import ArtefactType
         self.discussion.artefacts.add(
             title="script.py",
             artefact_type=ArtefactType.CODE,

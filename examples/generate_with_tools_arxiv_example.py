@@ -24,6 +24,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
 from lollms_client import LollmsClient
 from lollms_client.lollms_types import MSG_TYPE
 
@@ -35,14 +41,14 @@ from lollms_client.lollms_types import MSG_TYPE
 MODEL_ZOO_INDEX = 1   # Ministral-3-3B-Instruct-2512 in the built-in zoo
 
 BINDING_CONFIG = {
-    "models_path": "data/models/llama_cpp_models",
-    "binaries_path": "data/bin/llm/llama_cpp_server",
-    "ctx_size": 8192,        # Larger context for tool use
-    "n_gpu_layers": -1,      # 0 for CPU-only
-    "n_threads": 4,
+    "models_path": os.getenv("MODELS_PATH", "data/models/llama_cpp_models"),
+    "binaries_path": os.getenv("BINARIES_PATH", "data/bin/llm/llama_cpp_server"),
+    "ctx_size": int(os.getenv("CONTEXT_SIZE", "8192")),
+    "n_gpu_layers": int(os.getenv("N_GPU_LAYERS", "-1")),
+    "n_threads": int(os.getenv("N_THREADS", "4")),
     "n_parallel": 1,
     "batch_size": 512,
-    "idle_timeout": 300,     # Auto-unload after 5 min idle
+    "idle_timeout": 300,
 }
 
 # Where to store our custom tool
@@ -83,26 +89,22 @@ def tool_search_papers(args: dict):
         year_start = args.get('year_start')
         year_end = args.get('year_end')
 
-        # Fetch more results initially to allow for filtering
         search = arxiv.Search(query=query, max_results=100)
         client = arxiv.Client()
 
         results = []
         for res in client.results(search):
-            # Extract year from published date (format: YYYY-MM-DD)
             try:
                 pub_year = int(res.published.strftime('%Y'))
             except Exception:
                 pub_year = None
 
-            # Apply year filters if specified
             if year_start is not None and pub_year is not None and pub_year < year_start:
                 continue
             if year_end is not None and pub_year is not None and pub_year > year_end:
                 continue
 
             authors = ', '.join(author.name for author in res.authors)
-            # Format the date as YYYY-MM-DD
             pub_date = res.published.strftime('%Y-%m-%d') if res.published else "Unknown date"
             results.append(
                 f"[{res.entry_id}] {res.title}\\n"
@@ -111,7 +113,6 @@ def tool_search_papers(args: dict):
                 f"Abstract: {res.summary[:500]}..."
             )
 
-            # Stop if we have enough results
             if len(results) >= count:
                 break
 
@@ -204,7 +205,6 @@ def main():
         sys.exit(1)
     print("✅ Model loaded and server is ready!")
 
-    # Show server info
     for srv in client.llm.ps():
         print(f"   Server: PID {srv['pid']} | Port {srv['port']} | RSS {srv['rss_mb']} MB")
 
@@ -227,7 +227,7 @@ def main():
 
     result = client.generate_with_tools(
         prompt=search_query,
-        tools=[tool_path],           # Pass the path to our arXiv tool script
+        tools=[tool_path],
         system_prompt=(
             "You are a helpful research assistant. "
             "When the user asks about scientific papers, use the arxiv_search tool. "
@@ -240,7 +240,7 @@ def main():
         auto_execute=True,
     )
 
-    print("\n")  # Newline after streaming
+    print("\n")
 
     # ── 7. Display results metadata ─────────────────────────────────────
     print("=" * 70)

@@ -1,10 +1,7 @@
 import sqlite3
-import pandas as pd
-import re
 from pathlib import Path
 from typing import Any, Dict
 from ascii_colors import ASCIIColors
-from sqlalchemy import inspect
 
 TOOL_LIBRARY_NAME = "Execute SQL Query"
 TOOL_LIBRARY_DESC = "Executes standard SQL queries on dataset files in the workspace."
@@ -12,7 +9,9 @@ TOOL_LIBRARY_ICON = "🗄️"
 
 def init_tools_library() -> None:
     import pipmaster as pm
-    pm.ensure_packages(["pandas", "openpyxl"])
+    pm.ensure_packages(["pandas", "openpyxl", "sqlalchemy"])
+    global pd
+    import pandas as pd
 
 def tool_execute_sql_query(
     sql_query: str = "",
@@ -27,10 +26,11 @@ def tool_execute_sql_query(
         sql_query (str, optional): The standard SQL query (SQLite syntax) to run.
         file_name (str, optional): The filename of the database/CSV/Excel file. Defaults to auto-detect.
     """
+    import re
+    import pandas as pd
+
     sql_query = str(sql_query).strip()
 
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator.
-    # Auto-detect file if not specified
     if not file_name:
         db_files = list(Path(".").glob("*.db")) + list(Path(".").glob("*.sqlite")) + list(Path(".").glob("*.csv"))
         if db_files:
@@ -42,14 +42,13 @@ def tool_execute_sql_query(
     if not file_path.exists():
         return {"success": False, "error": f"File '{file_name}' not found in workspace."}
 
-    # Load into in-memory SQLite
     conn = sqlite3.connect(":memory:")
     ext = file_path.suffix.lower()
 
     try:
         if ext == ".sqlconn":
             import json
-            from sqlalchemy import create_engine, text as sa_text
+            from sqlalchemy import create_engine, inspect as sqlalchemy_inspect
             with open(file_path, "r", encoding="utf-8") as f:
                 conn_info = json.load(f)
             
@@ -59,7 +58,6 @@ def tool_execute_sql_query(
             if not connection_url:
                 if dialect == "sqlite":
                     db_path = conn_info.get("database", "")
-                    # Convert Windows backslashes to forward slashes for SQLAlchemy compatibility
                     db_path = db_path.replace("\\", "/")
                     connection_url = f"sqlite:///{db_path}"
                 else:
@@ -77,7 +75,7 @@ def tool_execute_sql_query(
                         return {"success": False, "error": f"Unsupported dialect: {dialect}"}
 
             engine = create_engine(connection_url)
-            tables = inspect(engine).get_table_names()
+            tables = sqlalchemy_inspect(engine).get_table_names()
 
             with engine.connect() as connection:
                 for table in tables:

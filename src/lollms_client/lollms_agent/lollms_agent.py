@@ -2743,6 +2743,13 @@ class Agent:
         try:
             os.chdir(ws_dir_str)
 
+            # Defensive unwrap: OpenAI models often hallucinate {"arguments": {...}} instead of flat params
+            if "arguments" in tool_params and isinstance(tool_params["arguments"], dict):
+                extracted_args = tool_params.pop("arguments")
+                # Merge extracted arguments back into tool_params, prioritizing them
+                extracted_args.update(tool_params)
+                tool_params = extracted_args
+
             sanitized_params = {}
             for key, value in tool_params.items():
                 if isinstance(value, str):
@@ -2794,7 +2801,6 @@ class Agent:
 
         finally:
             os.chdir(old_cwd)
-
     # ---------------------------------------------------------------- chat (main agentic loop)
 
     def chat(

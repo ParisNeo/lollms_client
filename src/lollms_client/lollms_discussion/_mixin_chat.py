@@ -1451,7 +1451,7 @@ class _StreamState:
             # ── CRITICAL: DO NOT MUTATE ai_message.content ──
             # The raw <artifact> XML is preserved in the message content.
             # The export() method in _mixin_utils.py will handle replacing it
-            # with the [🔒SYSTEM_ARTIFACT_CREATED:title|type] marker when building
+            # with the [🔒artefact tag called, content stripped for brievety, do not mimic:title|type] marker when building
             # history for the LLM. This prevents the marker from leaking into the live UI.
 
             # Fire an event update to the UI so it cleanly rebuilds and replaces the code block
@@ -4148,7 +4148,7 @@ class ChatMixin:
                     re.compile(r'\[🔒SYSTEM_ARTIFACT_ANCHOR:', re.IGNORECASE),
                     re.compile(r'\[SYSTEM:', re.IGNORECASE),
                     re.compile(r'\[content stripped', re.IGNORECASE),
-                    re.compile(r'\[🔒SYSTEM_ARTIFACT_CREATED:', re.IGNORECASE),
+                    re.compile(r'\[🔒artefact tag called, content stripped for brievety, do not mimic:', re.IGNORECASE),
                     re.compile(r'\[🔒SYSTEM_ARTIFACT_UPDATED:', re.IGNORECASE),
                 ]
 

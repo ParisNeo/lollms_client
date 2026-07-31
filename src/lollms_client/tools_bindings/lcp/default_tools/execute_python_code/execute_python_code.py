@@ -7,9 +7,6 @@ from pathlib import Path
 from typing import Any, Dict
 from ascii_colors import ASCIIColors
 
-import matplotlib
-matplotlib.use('Agg')
-
 TOOL_LIBRARY_NAME = "Execute Python Code"
 TOOL_LIBRARY_DESC = "Executes arbitrary sandboxed Python code and returns stdout, stderr, and generated plots."
 TOOL_LIBRARY_ICON = "🐍"
@@ -17,6 +14,9 @@ TOOL_LIBRARY_ICON = "🐍"
 def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl"])
+    global matplotlib
+    import matplotlib
+    matplotlib.use('Agg')
 
 def tool_execute_python_code(
     code: str = ""

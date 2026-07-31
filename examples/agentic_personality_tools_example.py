@@ -196,8 +196,46 @@ TOOLS_DIR = Path.home() / ".lollms_hub" / "tools"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Startup Panel
 # ─────────────────────────────────────────────────────────────────────────────
+
+def print_config_panel():
+    """Prints a formatted panel of all configuration variables at startup."""
+    is_local = LLM_BINDING_NAME == "llama_cpp_server"
+
+    def fmt(val, condition=True):
+        if not condition:
+            return "N/A (remote binding)"
+        return str(val) if val is not None else "None"
+
+    panel_width = 64
+    print("\n" + "┌" + "─" * panel_width + "┐")
+    print("│" + " CONFIGURATION SUMMARY".center(panel_width) + "│")
+    print("├" + "─" * panel_width + "┤")
+
+    rows = [
+        ("LLM Binding", LLM_BINDING_NAME),
+        ("Model Name", MODEL_NAME),
+        ("Host Address", HOST_ADDRESS if not is_local else "localhost (managed)"),
+        ("Verify SSL", VERIFY_SSL),
+        ("API Key", "Loaded" if API_KEY else "None"),
+        ("Local Models Path", fmt(MODELS_PATH, is_local)),
+        ("Binaries Path", fmt(BINARIES_PATH, is_local)),
+        ("Context Size", fmt(CONTEXT_SIZE, is_local)),
+        ("GPU Layers", fmt(N_GPU_LAYERS, is_local)),
+        ("Tools Directory", TOOLS_DIR),
+    ]
+
+    for label, value in rows:
+        line = f" {label}: {value}"
+        print(f"│{line.ljust(panel_width)}│")
+
+    print("└" + "─" * panel_width + "┘\n")
+
+
+ # ─────────────────────────────────────────────────────────────────────────────
+ # Helpers
+ # ─────────────────────────────────────────────────────────────────────────────
 
 def ensure_tools() -> tuple:
     """Create tool files if they don't exist. Returns (arxiv_path, wiki_path)."""
@@ -287,6 +325,8 @@ def main():
     print("  2. Searches Wikipedia for background concepts")
     print("  3. Synthesizes a comprehensive report with citations")
     print()
+
+    print_config_panel()
 
     # ── 1. Ensure tools exist ─────────────────────────────────────────
     arxiv_path, wiki_path = ensure_tools()

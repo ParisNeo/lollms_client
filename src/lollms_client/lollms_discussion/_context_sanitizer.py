@@ -32,7 +32,7 @@ def compress_artifacts_to_anchors(text: str) -> str:
         title = attrs.get("name") or attrs.get("title") or "unknown"
         atype = attrs.get("type", "code")
         version = attrs.get("version", "1")
-        return f"[🔒SYSTEM_ARTIFACT_CREATED:{title}|{atype}|v{version}]"
+        return f"[🔒The LLM did Call artefact tag for creation/update. Code stripped for context preservation. ** Do not mimic this text **:{title}|{atype}|v{version}]"
 
     return _ARTEFACT_RE.sub(_replace_match, text)
 
@@ -76,7 +76,7 @@ def build_anti_mimicry_directives() -> str:
     """
     return (
         "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
-        "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_CREATED:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
+        "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒The LLM did Call artefact tag for creation/update. Code stripped for context preservation. ** Do not mimic this text **:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
         "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
         "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside `</thinking>` blocks. They must ONLY appear in the final response body AFTER the closing `</thinking>` tag.\n"
         "=== END ANTI-MIMICRY PROTOCOL ===\n"

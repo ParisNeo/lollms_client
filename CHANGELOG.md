@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-07-31 17:46]
+
+- feat: add agentic tools and update examples
+
 ## [2026-07-16 06:15]
 
 - feat(discussion): add option to suppress images for non-vision LLMs

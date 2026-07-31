@@ -19,6 +19,8 @@ def init_tools_library() -> None:
     """Ensure rdflib is installed."""
     import pipmaster as pm
     pm.ensure_packages("rdflib")
+    global rdflib
+    import rdflib
 
 
 def _get_workspace_dir() -> Path:
@@ -43,7 +45,6 @@ def tool_execute_sparql_query(
         file_name (str, optional): The filename of the .ttl or .owl file in the workspace. Auto-discovers if omitted.
         sparql_query (str): The valid SPARQL 1.1 query to execute (SELECT, ASK, CONSTRUCT).
     """
-    import rdflib
     from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
     import pandas as pd
 
@@ -71,7 +72,6 @@ def tool_execute_sparql_query(
     # 1. Parse RDF Graph
     g = rdflib.Graph()
     try:
-        # Determine format based on extension
         ext = file_path.suffix.lower()
         rdf_format = "turtle" if ext == ".ttl" else ("xml" if ext in (".rdf", ".xml") else "turtle")
         g.parse(str(file_path), format=rdf_format)
@@ -93,11 +93,9 @@ def tool_execute_sparql_query(
                 row_dict = {}
                 for idx, var in enumerate(query_res.vars):
                     val = row[idx]
-                    # Convert rdflib terms to clean strings or primitives
                     row_dict[str(var)] = str(val) if val is not None else None
                 rows.append(row_dict)
 
-            # Build a polished Markdown table for the chat bubble
             df = pd.DataFrame(rows, columns=variables)
             md_table = _dataframe_to_markdown(df)
 
@@ -130,7 +128,6 @@ def tool_execute_sparql_query(
             }
 
         elif query_res.type in ("CONSTRUCT", "DESCRIBE"):
-            # Serialize returned graph back to Turtle
             triples = len(query_res)
             serialized = query_res.serialize(format="turtle")
             res_str = f"```turtle\n{serialized}\n```"

@@ -309,7 +309,7 @@ class VoxtralLocalBinding(LollmsTTSBinding):
             env["HUGGING_FACE_HUB_TOKEN"] = self.hf_token
 
         ASCIIColors.info(f"VoxtralLocal: Launching vLLM-Omni server…")
-        ASCIIColors.info(f"  Command: {' '.join(cmd)}")
+        ASCIIColors.green(f"  Command: {' '.join(cmd)}")
 
         # On Linux we use start_new_session so the server outlives the parent
         kwargs = {}

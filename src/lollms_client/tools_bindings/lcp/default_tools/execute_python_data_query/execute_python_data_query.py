@@ -2,13 +2,11 @@ import os
 import sys
 import io
 import re
+import json
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional 
 from ascii_colors import ASCIIColors
-
-import matplotlib
-matplotlib.use('Agg')
 
 TOOL_LIBRARY_NAME = "Execute Python Data Query"
 TOOL_LIBRARY_DESC = "Executes sandboxed Python code to analyze or modify datasets in the workspace."
@@ -17,6 +15,9 @@ TOOL_LIBRARY_ICON = "📊"
 def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages(["pandas", "numpy", "matplotlib", "openpyxl", "sqlalchemy"])
+    global matplotlib
+    import matplotlib
+    matplotlib.use('Agg')
 
 def tool_execute_python_data_query(
     code: str = "",
@@ -89,7 +90,6 @@ def tool_execute_python_data_query(
             first_sqlconn = sqlconn_files[0]
             ASCIIColors.info(f"[execute_python_data_query] Auto-loading conn from {first_sqlconn.name}")
             try:
-                import json
                 from sqlalchemy import create_engine
                 conn_info = json.loads(first_sqlconn.read_text(encoding="utf-8"))
                 dialect = conn_info.get("dialect", "sqlite").lower()
@@ -97,7 +97,6 @@ def tool_execute_python_data_query(
                 if not connection_url:
                     if dialect == "sqlite":
                         db_path = conn_info.get('database', '')
-                        # Convert Windows backslashes to forward slashes for SQLAlchemy compatibility
                         db_path = db_path.replace("\\", "/")
                         connection_url = f"sqlite:///{db_path}"
                     else:
@@ -113,11 +112,6 @@ def tool_execute_python_data_query(
                             connection_url = f"postgresql+psycopg2://{username}:{password}@{host}{port_str}/{database}"
 
                 auto_loaded_engine = create_engine(connection_url)
-                # Use raw DBAPI2 connection for pandas compatibility.
-                # pd.read_sql_query with SQLAlchemy 2.0 Connection objects fails
-                # with "'Connection' object has no attribute 'cursor'".
-                # raw_connection() returns a DBAPI2 connection (e.g., sqlite3.Connection)
-                # which pandas handles natively.
                 local_vars["conn"] = auto_loaded_engine.raw_connection()
             except Exception as load_err:
                 ASCIIColors.warning(f"[execute_python_data_query] Failed to auto-load conn: {load_err}")

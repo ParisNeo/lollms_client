@@ -3,24 +3,15 @@
 test_agent_cognitive_decisions.py
 =============================================================================
 Comprehensive Cognitive Decision-Making & Multi-Turn Tool Chaining Test Suite.
-
-This script runs real conversational scenarios to evaluate and audit:
-  1. Intent Classification: Tool vs. No-Tool decision accuracy.
-  2. Action Integrity: Full overwrite vs. Surgical search/replace patches.
-  3. Two-Step Ingestion: Ephemeral artifact generation + parameter-passing.
-  4. Multi-Turn Chaining: Consecutive tool execution before final answer.
 =============================================================================
 """
 
 import sys
-import os
 import json
-import time
 import unittest
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 
-# Ensure correct workspace import resolution
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
@@ -41,6 +32,10 @@ class MockGemmaAgentClient:
         self.ai_name = "Assistant"
         self.model_name = "gemma4:e2b"
         self.binding_name = "ollama"
+        self.default_ctx_size = 32768
+        
+        self.scenario_c_round = 0
+        self.scenario_d_round = 0
 
     def count_tokens(self, text: str) -> int:
         return len(text) // 4
@@ -50,6 +45,12 @@ class MockGemmaAgentClient:
 
     def remove_thinking_blocks(self, text: str) -> str:
         return text
+
+    def get_ctx_size(self, model_name=None) -> int:
+        return self.default_ctx_size
+
+    def reset_cancel(self):
+        pass
 
     def generate_structured_content(self, prompt: str, schema: Dict, **kwargs) -> Dict[str, Any]:
         p_lower = prompt.lower()
@@ -62,7 +63,6 @@ class MockGemmaAgentClient:
         return {"requires_tools_or_actions": False, "reasoning": "Conversational reply."}
 
     def generate_text(self, prompt: str, **kwargs) -> str:
-        # Handles the internal hyper-focused specialist spinoff calls
         if "spinoff" in prompt.lower() or "specialist" in prompt.lower() or "execute the plan" in prompt.lower():
             if "safe_divide" in prompt.lower():
                 return (
@@ -92,8 +92,8 @@ class MockGemmaAgentClient:
         return self._generate_response(messages, callback, **kwargs)
 
     def _generate_response(self, messages: Optional[List[Dict]], callback, **kwargs) -> str:
-        # Extract last user prompt text
         prompt_text = ""
+        system_text = ""
         if messages:
             for msg in reversed(messages):
                 if msg.get("role") == "user":
@@ -103,8 +103,18 @@ class MockGemmaAgentClient:
                     else:
                         prompt_text = str(content)
                     break
+            
+            for msg in messages:
+                if msg.get("role") == "system":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        system_text = "\n".join(part.get("text", "") for part in content if part.get("type") == "text")
+                    else:
+                        system_text = str(content)
+                    break
 
         prompt_text_lower = prompt_text.lower()
+        system_text_lower = system_text.lower()
 
         # ── Test Scenario A: Direct Conversation (No Tools) ──
         if "hello" in prompt_text_lower or "amazing day" in prompt_text_lower:
@@ -113,8 +123,58 @@ class MockGemmaAgentClient:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
 
+        # ── Test Scenario D: Arbitrary Python Code Execution ──
+        # State Machine: Round 0 (Tool Call) -> Round 1 (Tool Result) -> Final Answer
+        if "factorial" in prompt_text_lower and "tool_execute_python_code" in system_text_lower:
+            if self.scenario_d_round == 0:
+                self.scenario_d_round += 1
+                tool_call = {
+                    "name": "tool_execute_python_code",
+                    "parameters": {
+                        "code": "import math\nprint(math.factorial(5))"
+                    }
+                }
+                reply = f"<tool>{json.dumps(tool_call)}</tool>"
+                if callback:
+                    callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+                return reply
+            elif self.scenario_d_round == 1:
+                self.scenario_d_round = 0
+                reply = "I executed the Python code. The factorial of 5 is 120.<done/>"
+                if callback:
+                    callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+                return reply
+
+        # ── Test Scenario C: Two-Step Ingestion & Data Query (Multi-Turn) ──
+        # State Machine: Round 0 (Artifact) -> Round 1 (System Marker) -> Round 2 (Tool Call) -> Round 3 (Tool Result) -> Final Answer
+        if ("sales_database" in prompt_text_lower or "highest revenue" in prompt_text_lower) and "tool_execute_python_data_query" in system_text_lower:
+            if self.scenario_c_round == 0:
+                self.scenario_c_round += 1
+                reply = (
+                    '<artifact name="query.py" type="code" language="python" ephemeral="true">\n'
+                    "import pandas as pd\n"
+                    "df = pd.read_csv('sales_database.csv', encoding='utf-8-sig')\n"
+                    "df.columns = df.columns.str.strip()\n"
+                    "print(df.loc[df['revenue'].idxmax()][['product_name', 'revenue']].to_dict())\n"
+                    "</artifact>"
+                )
+                if callback:
+                    callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+                return reply
+            elif self.scenario_c_round == 1:
+                self.scenario_c_round += 1
+                reply = f'<tool>{json.dumps({"name": "tool_execute_python_data_query", "parameters": {"code": "query.py"}})}</tool>'
+                if callback:
+                    callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+                return reply
+            elif self.scenario_c_round == 2:
+                self.scenario_c_round = 0
+                reply = "Based on my data query of the sales database, the product with the highest revenue is the **Smartphone Alpha** with a total revenue of **$124,500.00 USD**.<done/>"
+                if callback:
+                    callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
+                return reply
+
         # ── Test Scenario B: Surgical Implementation (Plan + Patch) ──
-        # Round 1: User asks to update math_ops.py. Emit the surgical patch artifact.
         if "math_ops.py" in prompt_text_lower and "safe_divide" in prompt_text_lower and "tool_result" not in prompt_text_lower and "[system:" not in prompt_text_lower:
             reply = (
                 '<artifact name="math_ops.py" type="code" language="python">\n'
@@ -135,76 +195,18 @@ class MockGemmaAgentClient:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
             return reply
 
-        # Round 2: Artifact was saved in Round 1, ChatMixin injected system marker.
         if "[system: the" in prompt_text_lower and "has been successfully created" in prompt_text_lower:
             if "math_ops.py" in prompt_text_lower or "safe_divide" in prompt_text_lower:
-                reply = "I have successfully updated math_ops.py with the safe_divide function."
+                reply = "I have successfully updated math_ops.py with the safe_divide function.<done/>"
                 if callback:
                     callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
-                    return reply
+                return reply
 
-        # Fallback for Round 2 if the marker is slightly different
         if "math_ops.py" in prompt_text_lower and "has been successfully" in prompt_text_lower and "tool_result" not in prompt_text_lower:
-            reply = "I have successfully updated math_ops.py with the safe_divide function."
+            reply = "I have successfully updated math_ops.py with the safe_divide function.<done/>"
             if callback:
                 callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
                 return reply
-
-        # ── Test Scenario D: Arbitrary Python Code Execution ──
-        # Round 2: Tool has been executed, result is in history. Emit final answer.
-        if "tool_result" in prompt_text_lower and "factorial" in prompt_text_lower:
-            reply = "I executed the Python code. The factorial of 5 is 120."
-            if callback:
-                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
-            return reply
-
-        # Round 1: User asks to calculate factorial. Emit the tool call.
-        if "factorial" in prompt_text_lower and "tool_result" not in prompt_text_lower:
-            import json as _json
-            tool_call = {
-                "name": "tool_execute_python_code",
-                "parameters": {
-                    "code": "import math\nprint(math.factorial(5))"
-                }
-            }
-            reply = f"<tool>{_json.dumps(tool_call)}</tool>"
-            if callback:
-                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
-            return reply
-
-        # ── Test Scenario C: Two-Step Ingestion & Data Query (Multi-Turn) ──
-        # CRITICAL: Check for system markers to determine the current agentic round.
-
-        # Round 3: Tool has been executed, result is in history. Emit final answer.
-        if "tool_result" in prompt_text_lower:
-            reply = "Based on my data query of the sales database, the product with the highest revenue is the **Smartphone Alpha** with a total revenue of **$124,500.00 USD**."
-            if callback:
-                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
-            return reply
-
-        # Round 2: Artifact was saved in Round 1, ChatMixin injected system marker.
-        # Emit the tool call to execute the script.
-        # CRITICAL FIX: The ChatMixin now includes the artifact title in the system marker.
-        # We check for the marker and the artifact title to prevent collision with Scenario B.
-        if "[system: the" in prompt_text_lower and "has been successfully created" in prompt_text_lower and "query.py" in prompt_text_lower:
-            reply = '<tool>{"name": "tool_execute_python_data_query", "parameters": {"code": "query.py"}}</tool>'
-            if callback:
-                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
-            return reply
-
-        # Round 1: User asks to analyze data. Emit the artifact containing the script.
-        if "sales_database" in prompt_text_lower or "highest revenue" in prompt_text_lower:
-            reply = (
-                '<artifact name="query.py" type="code" language="python" ephemeral="true">\n'
-                "import pandas as pd\n"
-                "df = pd.read_csv('sales_database.csv', encoding='utf-8-sig')\n"
-                "df.columns = df.columns.str.strip()\n"
-                "print(df.loc[df['revenue'].idxmax()][['product_name', 'revenue']].to_dict())\n"
-                "</artifact>"
-            )
-            if callback:
-                callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
-            return reply
 
         # Fallback
         reply = "Simulated response"
@@ -215,33 +217,13 @@ class MockGemmaAgentClient:
 
 class TestAgentCognitiveDecisions(unittest.TestCase):
     @classmethod
-    @classmethod
     def setUpClass(cls):
         cls.report_cards = []
-
-        # ── Setup LollmsClient & Discussion ──
-        # Force offline/simulation mode for deterministic unit testing
-        is_online = False
-
-        if is_online:
-            ASCIIColors.green(f"⚡ Connection found! Running LIVE integration testing with Ollama...")
-            cls.client = LollmsClient(
-                llm_binding_name="ollama",
-                llm_binding_config={"model_name": "gemma4:e2b", "host_address": "http://localhost:11434"},
-                cooperative_vram_management=True,
-                debug=True
-            )
-        else:
-            ASCIIColors.yellow("⚠️  Ollama offline or 'gemma4:e2b' missing. Running in High-Fidelity Cognitive Simulation.")
-            cls.client = MockGemmaAgentClient()
-
-        # Set up a clean local tools folder for LCP sandbox testing
         cls.workspace_dir = Path("./data_workspace")
         cls.workspace_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def tearDownClass(cls):
-        # Print the final detailed diagnostic audit report
         print("\n\n" + "=" * 80)
         print("📊 AGENT COGNITIVE DECISION-MAKING AUDIT REPORT")
         print("=" * 80)
@@ -257,6 +239,18 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
     def setUp(self):
         import tempfile
         import csv
+        
+        is_online = False
+        if is_online:
+            self.client = LollmsClient(
+                llm_binding_name="ollama",
+                llm_binding_config={"model_name": "gemma4:e2b", "host_address": "http://localhost:11434"},
+                cooperative_vram_management=True,
+                debug=True
+            )
+        else:
+            self.client = MockGemmaAgentClient()
+
         self.tmp_workspace = tempfile.mkdtemp(prefix="lollms_test_")
         self.db_manager = LollmsDataManager("sqlite:///:memory:")
         self.discussion = LollmsDiscussion.create_new(
@@ -266,21 +260,13 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             autosave=True,
             workspace_path=self.tmp_workspace
         )
-        # CRITICAL FIX: Write the dummy CSV into the temporary workspace directory
-        # so the tool can find it when executing with CWD set to the workspace.
         tmp_workspace_path = Path(self.tmp_workspace)
         ws_data_dir = tmp_workspace_path / "workspace_data"
         ws_data_dir.mkdir(parents=True, exist_ok=True)
 
-        # 🛑 CRITICAL FIX: The artifact title MUST match the physical filename exactly.
-        # The mock LLM generates a script reading 'sales_database.csv'.
-        # We register the artifact with the .csv extension in the title so that
-        # ArtefactManager does NOT auto-append a second extension (producing sales_database.csv.csv).
         self.csv_filename = "sales_database.csv"
         self.csv_path = ws_data_dir / self.csv_filename
 
-        # CRITICAL FIX: Use utf-8-sig encoding to write a BOM, ensuring pandas
-        # correctly parses the header without leaving a BOM character on the first column.
         with open(self.csv_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(["product_name", "category", "revenue"])
@@ -298,7 +284,6 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
         
         user_message = "Hello Lollms! I hope you are having an amazing day."
         
-        # We capture the streaming events
         tools_called = []
         def relay(chunk, msg_type, meta=None):
             if msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
@@ -326,7 +311,6 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
     def test_scenario_b_surgical_implementation(self):
         ASCIIColors.cyan("\n▶ Running Scenario B: Surgical Implementation (Plan + Patch expected)")
 
-        # Create a baseline code artifact to be updated
         self.discussion.artefacts.add(
             title="math_ops.py",
             artefact_type=ArtefactType.CODE,
@@ -371,7 +355,6 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
     def test_scenario_c_multistep_data_query(self):
         ASCIIColors.cyan("\n▶ Running Scenario C: Multi-Turn Two-Step Data Query")
 
-        # Read the raw CSV bytes we wrote in setUp
         raw_csv_bytes = self.csv_path.read_bytes()
 
         self.discussion.artefacts.add(
@@ -388,11 +371,8 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         user_message = "Analyze the sales_database and tell me which product generated the highest revenue."
 
-        # Setup local tool mock binding for python execution
         from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
 
-        # CRITICAL FIX: Remove the LCP binding so it doesn't overwrite our direct callable
-        # with its own spec (which lacks a "callable" key and triggers a different execution path).
         original_tools_binding = getattr(self.client, 'tools', None)
         self.client.tools = None
 
@@ -411,9 +391,6 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
                 tools_called.append(meta.get("tool"))
             return True
 
-        # Run multi-turn chat
-        # CRITICAL: allow_dynamic_tools=True is required because ChatMixin filters out
-        # 'tool_execute_python_data_query' by default as a security gate.
         res = self.discussion.chat(
             user_message=user_message,
             streaming_callback=relay,
@@ -423,19 +400,10 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             allow_dynamic_tools=True
         )
 
-        # Restore the original tools binding
         self.client.tools = original_tools_binding
 
-        # Restore the original tools binding
-        self.client.tools = original_tools_binding
-
-        # Check if the tool was called AND executed successfully.
-        # The mock LLM's Round 3 response is hardcoded, so we must verify that the
-        # tool actually ran without errors by checking the processing block status.
         final_content = res.get("ai_message").content or ""
 
-        # The tool execution must have succeeded (status:success in the processing block)
-        # AND the final answer must contain the expected data.
         tool_succeeded = "status:success" in final_content and "KeyError" not in final_content
         answer_correct = "Smartphone Alpha" in final_content
 
@@ -456,10 +424,8 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         user_message = "Please calculate the factorial of 5 using Python."
 
-        # Import the actual LCP tool
         from lollms_client.tools_bindings.lcp.default_tools.execute_python_code.execute_python_code import tool_execute_python_code
 
-        # CRITICAL FIX: Remove the LCP binding so it doesn't overwrite our direct callable
         original_tools_binding = getattr(self.client, 'tools', None)
         self.client.tools = None
 
@@ -478,23 +444,19 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
                 tools_called.append(meta.get("tool"))
             return True
 
-        # Run chat with code execution enabled
         res = self.discussion.chat(
             user_message=user_message,
             streaming_callback=relay,
             tools=active_tools,
             enable_memory=False,
             enable_artefacts=True,
-            enable_code_execution=True  # 🛡️ Security gate must be enabled
+            enable_code_execution=True
         )
 
-        # Restore the original tools binding
         self.client.tools = original_tools_binding
 
         final_content = res.get("ai_message").content or ""
 
-        # The tool execution must have succeeded (status:success in the processing block)
-        # AND the final answer must contain the expected data (120).
         tool_succeeded = "status:success" in final_content and "120" in final_content
         answer_correct = "factorial of 5 is 120" in final_content.lower()
 

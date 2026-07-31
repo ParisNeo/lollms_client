@@ -92,8 +92,9 @@ class TestRichTextImport(unittest.TestCase):
         
         self.assertIsNotNone(res.get("text_artefact"), "Import should return a text artifact.")
         
-        art = self.discussion.artefacts.get("lollms_client_doc.docx")
-        self.assertIsNotNone(art, "Artifact should exist in the manager.")
+        # Per architectural standard, rich text imports are suffixed with .md
+        art = self.discussion.artefacts.get("lollms_client_doc.docx.md")
+        self.assertIsNotNone(art, "Artifact should exist in the manager with the .md suffix.")
         
         self.assertEqual(art["version"], 1, "Should only have one version (v1). No v2 metadata version should be created.")
         

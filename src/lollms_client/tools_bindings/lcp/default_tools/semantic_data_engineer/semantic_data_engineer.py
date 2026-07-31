@@ -19,8 +19,6 @@ import shutil
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-from lollms_client.lollms_artefact import ArtefactType
-
 TOOL_LIBRARY_NAME = "SEMANTIC_DATA_ENGINEER"
 TOOL_LIBRARY_DESC = "A highly specialized data engineering library providing safe pre-compiled data macros (filtering, aggregation, schemas, plotting, ABox conversion) without code execution."
 TOOL_LIBRARY_ICON = "📊"
@@ -37,13 +35,6 @@ def init_tools_library() -> None:
     })
 
 
-# 🛑 ARCHITECTURAL RULE: LCP TOOLS ARE AGNOSTIC.
-# _get_workspace_dir() has been removed.
-# The orchestrator (ChatMixin/LCPBinding) guarantees that the CWD is set 
-# to the isolated discussion workspace before execution.
-# All file operations MUST use simple relative paths (e.g., Path(".") / file_name).
-
-
 def _find_file_fuzzy(file_name: str, workspace_dir: Path) -> Optional[Path]:
     """
     Attempts to locate a file even if the extension is missing or path is slightly off.
@@ -51,28 +42,22 @@ def _find_file_fuzzy(file_name: str, workspace_dir: Path) -> Optional[Path]:
     2. Tries adding common extensions (.csv, .db, .sqlite, .xlsx) IF file_name has no dot.
     3. Searches for ANY file in workspace/versions that STARTS WITH the file_name.
     """
-    # 1. Exact Match
     exact_path = workspace_dir / file_name
     if exact_path.exists():
         return exact_path
 
-    # 2. Try Common Extensions (Only if no extension provided)
     if "." not in file_name:
         for ext in [".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls"]:
             candidate = workspace_dir / f"{file_name}{ext}"
             if candidate.exists():
                 return candidate
 
-    # 3. Aggressive Prefix Match (Workspace & Versions)
-    # This handles cases where LLM sends "Conta_..." but file is "Conta_....csv"
     for search_dir in [workspace_dir, workspace_dir / "versions"]:
         if search_dir.exists():
             for f in search_dir.iterdir():
                 if f.is_file():
-                    # Check if file starts with the provided name (case-insensitive)
                     if f.name.lower().startswith(file_name.lower()):
                         return f
-                    # Also check without extension (e.g. "data" matches "data.csv")
                     if f.stem.lower() == file_name.lower():
                         return f
 
@@ -86,13 +71,6 @@ def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Tupl
     from ascii_colors import ASCIIColors
 
     resolved_path = file_path.resolve()
-
-    # ── 🛡️ SELF-HEALING FILE RESTORATION PROTOCOL ──
-    # If the file is missing from the physical workspace disk folder, but exists
-    # as a record inside the SQLite discussion artifacts, restore/write it back instantly!
-    # 🛑 AGNOSTIC: Self-healing removed. Tools rely on CWD set by orchestrator.
-    # The orchestrator (ChatMixin) syncs all active artifacts to disk BEFORE tool execution.
-    # If a file is missing, the tool returns a clear error and the LLM can retry.
 
     ASCIIColors.cyan(f"[SemanticDataEngineer] Loading data source from: '{resolved_path}'")
     ASCIIColors.cyan(f"  - File Exists: {resolved_path.exists()}")
@@ -126,7 +104,6 @@ def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Tupl
         ASCIIColors.cyan(f"  - Parsed Columns: {list(df.columns)}")
         return df, sheet
     else:
-        # Read the first line using utf-8-sig to safely detect the delimiter
         try:
             first_line = file_path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()[0]
             ASCIIColors.cyan(f"  - Raw Header Line Preview: {repr(first_line)}")
@@ -134,10 +111,8 @@ def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Tupl
             first_line = ""
             ASCIIColors.warning(f"  - Delimiter reader warning: {ex}")
 
-        # Robust multi-character/multi-delimiter heuristic detection
         sep = ","
         if ";" in first_line:
-            # Count separator occurrences to find the dominant delimiter
             semicolon_count = first_line.count(";")
             comma_count = first_line.count(",")
             if semicolon_count > comma_count:
@@ -150,7 +125,6 @@ def _load_data_source(file_path: Path, table_name: Optional[str] = None) -> Tupl
         ASCIIColors.cyan(f"  - Resolved Delimiter Separator: {repr(sep)}")
         df = pd.read_csv(str(file_path), sep=sep, encoding="utf-8-sig")
 
-        # Clean column headers of BOM sequences or stray quotation marks
         df.columns = [c.strip().strip("'\"").replace('\ufeff', '') for c in df.columns]
 
         ASCIIColors.cyan(f"  - Parsed Columns after normalization: {list(df.columns)}")
@@ -167,7 +141,6 @@ def _save_data_source(df: Any, file_path: Path, table_name: str) -> None:
         conn.close()
     elif ext in (".xlsx", ".xls"):
         import pandas as pd
-        # Write to single sheet
         with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name=table_name[:31], index=False)
     else:
@@ -250,10 +223,8 @@ def tool_filter_and_slice_data(
         output_artifact_title (str, optional): Title of the new artifact if save_as_new_artifact is True.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
 
-    # 🛡️ FUZZY FILE RESOLUTION
     file_path = _find_file_fuzzy(file_name, workspace_dir)
 
     if not file_path:
@@ -267,15 +238,12 @@ def tool_filter_and_slice_data(
     try:
         df, resolved_table = _load_data_source(file_path, table_name)
 
-        # Apply columns slice
         if columns_to_keep:
             valid_cols = [c for c in columns_to_keep if c in df.columns]
             if valid_cols:
                 df = df[valid_cols]
 
-        # Apply filter
         if filter_column and filter_column in df.columns and filter_value is not None:
-            # Type-coerced comparisons
             if operator == "==":
                 df = df[df[filter_column].astype(str) == str(filter_value)]
             elif operator == "!=":
@@ -283,7 +251,6 @@ def tool_filter_and_slice_data(
             elif operator == "contains":
                 df = df[df[filter_column].astype(str).str.contains(str(filter_value), case=False, na=False)]
             else:
-                # Numeric operators
                 try:
                     num_val = float(filter_value)
                     df[filter_column] = pd.to_numeric(df[filter_column])
@@ -304,7 +271,6 @@ def tool_filter_and_slice_data(
         from lollms_client.lollms_artefact.data_files import _dataframe_to_markdown
         markdown_table = _dataframe_to_markdown(preview_df)
 
-        # Handle file persistence
         if save_as_new_artifact:
             out_title = output_artifact_title or f"{Path(file_name).stem}_filtered"
             ext = file_path.suffix.lower()
@@ -313,7 +279,6 @@ def tool_filter_and_slice_data(
 
             _save_data_source(df, out_path, out_title)
 
-            # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects new file.
             return {
                 "success": True,
                 "total_rows": total_matching_rows,
@@ -348,7 +313,6 @@ def tool_get_unique_values(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
         limit (integer, optional): Maximum unique items to list. Defaults to 100.
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -401,7 +365,6 @@ def tool_compute_column_aggregations(
         operation (str, optional): Aggregation operation: 'sum', 'mean', 'min', 'max', 'count'. Defaults to 'mean'.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -409,7 +372,6 @@ def tool_compute_column_aggregations(
         return {"success": False, "error": f"File '{file_name}' not found."}
 
     try:
-        import pandas as pd
         df, _ = _load_data_source(file_path, table_name)
 
         if metric_column not in df.columns:
@@ -422,18 +384,16 @@ def tool_compute_column_aggregations(
             if group_by_column not in df.columns:
                 return {"success": False, "error": f"Group By column '{group_by_column}' not found."}
 
-            # Apply group by operation
             grouped = df.groupby(group_by_column)[metric_column]
             if op == "sum": res_df = grouped.sum()
             elif op == "min": res_df = grouped.min()
             elif op == "max": res_df = grouped.max()
             elif op == "count": res_df = grouped.count()
-            else: res_df = grouped.mean() # default mean
+            else: res_df = grouped.mean()
 
             res_df = res_df.reset_index()
             res_df.columns = [group_by_column, f"{op}_{metric_column}"]
         else:
-            # Single value aggregation
             if op == "sum": val = df[metric_column].sum()
             elif op == "min": val = df[metric_column].min()
             elif op == "max": val = df[metric_column].max()
@@ -474,7 +434,6 @@ def tool_query_database_sql(
         sql_query (str): Valid SQLite standard SQL query to execute (SELECT, JOIN, GROUP BY, etc.).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -488,10 +447,6 @@ def tool_query_database_sql(
 
     ext = file_path.suffix.lower()
 
-    # ── 🔬 SCIENTIFIC INSTRUMENTATION: Verify SQLite Format ──
-    # Read the first 16 bytes of the file to verify it is a valid SQLite database.
-    # Standard SQLite files start with the string "SQLite format 3\0".
-    # If the header is different, the file is likely encrypted (SQLCipher) or not a database.
     try:
         with open(file_path, "rb") as f:
             header = f.read(16)
@@ -506,9 +461,7 @@ def tool_query_database_sql(
     except Exception as header_err:
         from ascii_colors import ASCIIColors
         ASCIIColors.warning(f"[SemanticDataEngineer] Failed to read file header for validation: {header_err}")
-        # Proceed anyway; let the sqlite3 driver handle the error
 
-    # Establish connection
     try:
         conn = sqlite3.connect(":memory:")
         if ext in (".db", ".sqlite", ".sqlite3"):
@@ -528,9 +481,7 @@ def tool_query_database_sql(
     except Exception as conn_err:
         return {"success": False, "error": f"Failed to assemble SQL connection: {conn_err}"}
 
-    # Execute SQL
     try:
-        # Check if write query (updates/deletes/inserts)
         clean_query = sql_query.strip()
         clean_query = re.sub(r'--.*$', '', clean_query, flags=re.MULTILINE).strip()
         clean_query = re.sub(r'/\*.*?\*/', '', clean_query, flags=re.DOTALL).strip()
@@ -579,7 +530,6 @@ def tool_update_cell_value(
         new_value (str): The new value to set.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -594,14 +544,12 @@ def tool_update_cell_value(
         if column_to_update not in df.columns:
             return {"success": False, "error": f"Target update column '{column_to_update}' not found."}
 
-        # Find row and apply update
         mask = df[row_match_column].astype(str) == str(row_match_value)
         match_count = int(mask.sum())
 
         if match_count == 0:
             return {"success": False, "error": f"No rows found matching '{row_match_column} == {row_match_value}'."}
 
-        # Apply type-coerced update
         orig_dtype = df[column_to_update].dtype
         try:
             if "int" in str(orig_dtype):
@@ -617,10 +565,8 @@ def tool_update_cell_value(
 
         df.loc[mask, column_to_update] = coerced_val
 
-        # Save updated data
         _save_data_source(df, file_path, resolved_table)
 
-        # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects file modification.
         return {
             "success": True,
             "rows_updated": match_count,
@@ -644,7 +590,6 @@ def tool_insert_new_row(
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -654,18 +599,20 @@ def tool_insert_new_row(
     try:
         df, resolved_table = _load_data_source(file_path, table_name)
 
-        # Build new row aligning with existing columns
         new_row_dict = {}
         for col in df.columns:
             if col in row_data:
-                # Type-coerce value to match column data type
                 orig_dtype = df[col].dtype
                 val = row_data[col]
                 try:
-                    if "int" in str(orig_dtype): new_row_dict[col] = int(val)
-                    elif "float" in str(orig_dtype): new_row_dict[col] = float(val)
-                    elif "bool" in str(orig_dtype): new_row_dict[col] = val in (True, "true", "True", 1, "1")
-                    else: new_row_dict[col] = str(val)
+                    if "int" in str(orig_dtype):
+                        new_row_dict[col] = int(val)
+                    elif "float" in str(orig_dtype):
+                        new_row_dict[col] = float(val)
+                    elif "bool" in str(orig_dtype):
+                        new_row_dict[col] = val in (True, "true", "True", 1, "1")
+                    else:
+                        new_row_dict[col] = str(val)
                 except Exception:
                     new_row_dict[col] = val
             else:
@@ -674,10 +621,8 @@ def tool_insert_new_row(
         new_row_df = pd.DataFrame([new_row_dict])
         df = pd.concat([df, new_row_df], ignore_index=True)
 
-        # Save
         _save_data_source(df, file_path, resolved_table)
 
-        # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects file modification.
         return {
             "success": True,
             "output": f"Successfully inserted new record into '{file_name}' (Table: '{resolved_table}'). Row content: {json.dumps(new_row_dict)}"
@@ -701,7 +646,6 @@ def tool_delete_rows_by_criteria(
         match_value (str): Value to match in that column.
         table_name (str, optional): Sheet name (Excel) or Table name (SQLite).
     """
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -720,13 +664,10 @@ def tool_delete_rows_by_criteria(
         if match_count == 0:
             return {"success": False, "error": f"No rows found matching '{match_column} == {match_value}'."}
 
-        # Keep everything except the matched rows
         df = df[~mask]
 
-        # Save
         _save_data_source(df, file_path, resolved_table)
 
-        # 🛑 AGNOSTIC: Tool does not commit to DB. Orchestrator detects file modification.
         return {
             "success": True,
             "rows_deleted": match_count,
@@ -769,7 +710,6 @@ def tool_generate_advanced_visualization(
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -781,7 +721,6 @@ def tool_generate_advanced_visualization(
     except Exception as e:
         return {"success": False, "error": f"Failed to load data: {e}"}
 
-    # Verify columns exist
     if x_column not in df.columns:
         return {"success": False, "error": f"X column '{x_column}' not found."}
     if isinstance(y_columns,list):
@@ -819,7 +758,6 @@ def tool_generate_advanced_visualization(
         chart_title = title or f"Analysis: {resolved_table}"
         ax.set_title(chart_title, color='#f59e0b', fontsize=13, fontweight='bold', pad=12)
 
-        # Plot Series based on type
         ptype = plot_type.lower().strip()
         
         if ptype == "line":
@@ -831,7 +769,6 @@ def tool_generate_advanced_visualization(
                 c = palette[idx % len(palette)]
                 ax.scatter(df[x_column], df[col], label=col, color=c, alpha=0.8)
         elif ptype == "bar":
-            # Multi-bar offset rendering
             x = np.arange(len(df))
             width = 0.8 / len(y_columns)
             for idx, col in enumerate(y_columns):
@@ -846,10 +783,9 @@ def tool_generate_advanced_visualization(
                 ax.bar(df[x_column].astype(str), df[col], bottom=bottoms, label=col, color=c)
                 bottoms += df[col].fillna(0).values
         elif ptype == "pie":
-            # Pie takes only the first Y series
             col = y_columns[0]
             ax.pie(df[col], labels=df[x_column].astype(str), colors=palette, autopct='%1.1f%%', startangle=90, textprops={'color': '#cbd5e1'})
-            ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+            ax.axis('equal')
             ax.grid(False)
 
         if ptype != "pie":
@@ -860,7 +796,6 @@ def tool_generate_advanced_visualization(
 
         plt.tight_layout()
 
-        # Save
         buf = io.BytesIO()
         plt.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor())
         buf.seek(0)
@@ -919,7 +854,6 @@ def tool_compute_statistics_and_plot(
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -931,7 +865,6 @@ def tool_compute_statistics_and_plot(
     except Exception as e:
         return {"success": False, "error": f"Failed to load data: {e}"}
 
-    # 1. Compute Numerical Statistics
     stats = {}
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     for col in numeric_cols:
@@ -945,7 +878,6 @@ def tool_compute_statistics_and_plot(
             "missing_values": int(df[col].isnull().sum())
         }
 
-    # 2. Generate Matplotlib Plot
     plot_filename = f"plot_{uuid.uuid4().hex[:6]}.png"
     plot_path = workspace_dir / plot_filename
     plot_b64 = None
@@ -968,7 +900,6 @@ def tool_compute_statistics_and_plot(
         plot_title = title or f"{plot_type.capitalize()} Plot: {resolved_table}"
         ax.set_title(plot_title, color='#f59e0b', fontsize=12, fontweight='bold', pad=10)
 
-        # Handle columns
         x_col = x_column or (df.columns[0] if len(df.columns) > 0 else "")
         y_col = y_column or (df.columns[1] if len(df.columns) > 1 else "")
 
@@ -989,7 +920,6 @@ def tool_compute_statistics_and_plot(
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
 
-        # Save
         buf = io.BytesIO()
         plt.savefig(buf, format="png", bbox_inches='tight', facecolor=fig.get_facecolor())
         buf.seek(0)
@@ -1034,7 +964,6 @@ def tool_bootstrap_tbox_from_database(
         file_name (str): The filename of the DB, CSV, or Excel file in the workspace.
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     file_path = (workspace_dir / file_name).resolve()
 
@@ -1089,7 +1018,6 @@ def tool_bootstrap_tbox_from_database(
                     "physical_column": col
                 }
 
-        # Write bootstrapped TBox to a schema file on disk
         tbox_file = workspace_dir / f"{file_path.stem}_tbox.json"
         with open(tbox_file, "w", encoding="utf-8") as f:
             json.dump(tbox, f, indent=2)
@@ -1120,7 +1048,6 @@ def tool_convert_to_abox(
         tbox_file_name (str): Filename of the TBox schema file (bootstrapped or custom).
     """
     import pandas as pd
-    # 🛑 TOOLS ARE AGNOSTIC: Rely on CWD set by orchestrator
     workspace_dir = Path(".")
     db_file_path = (workspace_dir / file_name).resolve()
     tbox_path = (workspace_dir / tbox_file_name).resolve()
@@ -1128,39 +1055,31 @@ def tool_convert_to_abox(
     if not db_file_path.exists() or not tbox_path.exists():
         return {"success": False, "error": "Database or TBox file does not exist in workspace."}
 
-    # 🛑 AGNOSTIC: Tool does not access discussion_instance.memory_manager.
-    # It generates the ABox data and returns it. The orchestrator is responsible
-    # for ingesting the returned abox_data into long-term memory if desired.
     try:
         with open(tbox_path, "r", encoding="utf-8") as f:
             tbox = json.load(f)
 
         abox_data = []
 
-        # Process each class defined in the TBox
         for class_name, class_meta in tbox.get("classes", {}).items():
             table = class_meta.get("physical_table")
             if not table:
                 continue
 
-            # Load table rows
             try:
                 df, _ = _load_data_source(db_file_path, table)
             except Exception:
                 continue
 
-            # Filter properties belonging to this class
             class_props = {
                 k: v for k, v in tbox.get("properties", {}).items()
                 if v.get("domain") == class_name
             }
 
-            # Map rows to ABox engrams
-            for idx, row in df.head(50).iterrows():  # Limit to first 50 rows for safety
+            for idx, row in df.head(50).iterrows():
                 pk_val = str(row.iloc[0]) if len(row) > 0 else str(idx)
                 subject_id = f"{class_name.split(':')[-1]}_{pk_val}".lower()
 
-                # Build descriptive content block
                 content_parts = [f"Entity type: {class_name} (ID: {subject_id})"]
                 for prop_name, prop_meta in class_props.items():
                     col = prop_meta.get("physical_column")

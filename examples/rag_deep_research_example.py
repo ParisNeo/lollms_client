@@ -52,36 +52,36 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-# Ensure the source is importable when running from the repo root
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
 
 from lollms_client import LollmsClient
 from lollms_client.lollms_agent.lollms_agent import Agent, AgentRole
 from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 from lollms_client.lollms_types import MSG_TYPE
 
+import os
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-
-MODEL_ZOO_INDEX = 1   # Ministral-3-3B-Instruct-2512
+MODEL_ZOO_INDEX = 1
 
 BINDING_CONFIG = {
-    "models_path": "data/models/llama_cpp_models",
-    "binaries_path": "data/bin/llm/llama_cpp_server",
-    "ctx_size": 8192,
-    "n_gpu_layers": -1,
-    "n_threads": 4,
+    "models_path": os.getenv("MODELS_PATH", "data/models/llama_cpp_models"),
+    "binaries_path": os.getenv("BINARIES_PATH", "data/bin/llm/llama_cpp_server"),
+    "ctx_size": int(os.getenv("CONTEXT_SIZE", "8192")),
+    "n_gpu_layers": int(os.getenv("N_GPU_LAYERS", "-1")),
+    "n_threads": int(os.getenv("N_THREADS", "4")),
     "n_parallel": 1,
     "batch_size": 512,
     "idle_timeout": 300,
 }
 
 TOOLS_DIR = Path.home() / ".lollms_hub" / "tools"
-
-# Cache configuration
 CACHE_DIR = PROJECT_ROOT / "data" / "web"
 CACHE_EXPIRATION_HOURS = 24  # How long cached content remains fresh
 

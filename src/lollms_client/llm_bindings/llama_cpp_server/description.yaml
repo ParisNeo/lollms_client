@@ -150,6 +150,17 @@ input_parameters:
     description: "Directory containing GGUF model files."
     mandatory: false
     default: "data/bin/llama_cpp_bin"
+  - name: reasoning
+    type: str
+    description: "activates or deactivate reasoning"
+    mandatory: false
+    default: "off"
+  - name: reasoning_budget
+    type: int
+    description: "Maximum reasoning budget in token"
+    mandatory: false
+    default: 0
+
 
 commands:
   - name: pull_model
