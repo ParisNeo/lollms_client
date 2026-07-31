@@ -198,8 +198,6 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     repeat_penalty: Optional[float] = None,
                     repeat_last_n: Optional[int] = None,
                     seed: Optional[int] = None,
-                    n_threads: Optional[int] = None,
-                    ctx_size: int | None = None,
                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                     split:Optional[bool]=False, # put to true if the prompt is a discussion
                     user_keyword:Optional[str]="!@>user:",
@@ -224,8 +222,6 @@ class LollmsLLMBinding(LollmsBaseBinding):
                     repeat_penalty: Optional[float] = None,
                     repeat_last_n: Optional[int] = None,
                     seed: Optional[int] = None,
-                    n_threads: Optional[int] = None,
-                    ctx_size: int | None = None,
                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                     think: Optional[bool] = False,
                     reasoning_effort: Optional[bool] = "low", # low, medium, high

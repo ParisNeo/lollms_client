@@ -169,8 +169,6 @@ class GrokBinding(LollmsLLMBinding):
                      repeat_penalty: float = 1.1, # Not supported
                      repeat_last_n: int = 64,   # Not supported
                      seed: Optional[int] = None,      # Not supported
-                     n_threads: Optional[int] = None, # Not applicable
-                     ctx_size: int | None = None,     # Determined by model
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                      think: Optional[bool] = False,
                      reasoning_effort: Optional[str] = "low", # low, medium, high

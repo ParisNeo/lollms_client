@@ -124,13 +124,9 @@ class LiteLLMBinding(LollmsLLMBinding):
                      n_predict: Optional[int] = None,
                      stream: Optional[bool] = None,
                      temperature: Optional[float] = None,
-                     top_k: Optional[int] = None,
                      top_p: Optional[float] = None,
                      repeat_penalty: Optional[float] = None,
-                     repeat_last_n: Optional[int] = None,
                      seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                      **kwargs
                      ) -> Union[str, dict]:

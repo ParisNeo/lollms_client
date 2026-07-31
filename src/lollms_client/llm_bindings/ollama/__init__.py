@@ -97,6 +97,7 @@ class OllamaBinding(LollmsLLMBinding):
         self.service_key=kwargs.get("service_key")
         self.verify_ssl_certificate=kwargs.get("verify_ssl_certificate", True)
         self.default_completion_format=kwargs.get("default_completion_format",ELF_COMPLETION_FORMAT.Chat) 
+        self.n_threads =kwargs.get("n_threads", -1)
 
         if ollama is None:
             raise ImportError("Ollama library is not installed. Please run 'pip install ollama'.")
@@ -223,8 +224,6 @@ class OllamaBinding(LollmsLLMBinding):
                     repeat_penalty: Optional[float] = None,
                     repeat_last_n: Optional[int] = None,
                     seed: Optional[int] = None,
-                    n_threads: Optional[int] = None,
-                    ctx_size: int | None = None,
                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                     split:Optional[bool]=False, # put to true if the prompt is a discussion
                     user_keyword:Optional[str]="!@>user:",
@@ -248,8 +247,6 @@ class OllamaBinding(LollmsLLMBinding):
             repeat_penalty (Optional[float]): Penalty for repeated tokens. Uses instance default if None.
             repeat_last_n (Optional[int]): Number of previous tokens to consider for repeat penalty. Uses instance default if None.
             seed (Optional[int]): Random seed for generation. Uses instance default if None.
-            n_threads (Optional[int]): Number of threads to use. Uses instance default if None.
-            ctx_size (int | None): Context size override for this generation.
             streaming_callback (Optional[Callable[[str, str], None]]): Callback function for streaming output.
                 - First parameter (str): The chunk of text received.
                 - Second parameter (str): The message type (e.g., MSG_TYPE.MSG_TYPE_CHUNK).
@@ -271,9 +268,12 @@ class OllamaBinding(LollmsLLMBinding):
             'repeat_penalty': repeat_penalty,
             'repeat_last_n': repeat_last_n,
             'seed': seed,
-            'num_thread': n_threads,
-            'num_ctx': ctx_size if ctx_size is not None else self.default_ctx_size,
+            
+            'num_ctx': self.forced_ctx_size if self.forced_ctx_size else self.default_ctx_size,
         }
+        if self.n_threads>0:
+            options['num_thread']= self.n_threads
+            
         options = {k: v for k, v in options.items() if v is not None}
         
         full_response_text = ""
@@ -482,12 +482,9 @@ class OllamaBinding(LollmsLLMBinding):
                         repeat_penalty: Optional[float] = None,
                         repeat_last_n: Optional[int] = None,
                         seed: Optional[int] = None,
-                        n_threads: Optional[int] = None,
-                        ctx_size: int | None = None,
                         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                         think: Optional[bool] = False,
                         reasoning_effort: Optional[bool] = "low", # low, medium, high
-                        reasoning_summary: Optional[bool] = "auto", # auto
                         **kwargs
                         ) -> Union[str, dict]:
         options = {}
@@ -498,8 +495,12 @@ class OllamaBinding(LollmsLLMBinding):
         if repeat_penalty is not None: options['repeat_penalty'] = repeat_penalty
         if repeat_last_n is not None: options['repeat_last_n'] = repeat_last_n
         if seed is not None: options['seed'] = seed
-        if n_threads is not None: options['num_thread'] = n_threads
-        if ctx_size is not None: options['num_ctx'] = ctx_size
+        if self.n_threads>0: options['num_thread'] = self.n_threads
+        if self.forced_ctx_size is not None: 
+            options['num_ctx'] = self.forced_ctx_size
+        elif self.default_ctx_size:
+            options['num_ctx'] = self.default_ctx_size
+            
 
         # Ensure strict role alternation and single system prompt
         alternated_messages = self.clean_and_alternate_messages(messages)

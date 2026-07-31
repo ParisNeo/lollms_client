@@ -227,13 +227,9 @@ class LollmsBinding(LollmsLLMBinding):
                     n_predict: Optional[int] = None,
                     stream: Optional[bool] = None,
                     temperature: Optional[float] = None,
-                    top_k: Optional[int] = None,
                     top_p: Optional[float] = None,
                     repeat_penalty: Optional[float] = None,
-                    repeat_last_n: Optional[int] = None,
                     seed: Optional[int] = None,
-                    n_threads: Optional[int] = None,
-                    ctx_size: int | None = None,
                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                     split:Optional[bool]=False, # put to true if the prompt is a discussion
                     user_keyword:Optional[str]="!@>user:",
@@ -393,67 +389,279 @@ class LollmsBinding(LollmsLLMBinding):
         return output
 
     
-    def generate_from_messages(self,
-                     messages: List[Dict],
-                     n_predict: Optional[int] = None,
-                     stream: Optional[bool] = None,
-                     temperature: Optional[float] = None,
-                     top_k: Optional[int] = None,
-                     top_p: Optional[float] = None,
-                     repeat_penalty: Optional[float] = None,
-                     repeat_last_n: Optional[int] = None,
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
-                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
-                     think: Optional[bool] = False,
-                     reasoning_effort: Optional[bool] = "low", # low, medium, high
-                     reasoning_summary: Optional[bool] = "auto", # auto
-                     **kwargs
-                     ) -> Union[str, dict]:
-        # Build the request parameters
+    def generate_from_messages(
+        self,
+        messages: List[Dict],
+        n_predict: Optional[int] = None,
+        stream: Optional[bool] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
+        think: Optional[bool] = False,
+        reasoning_effort: Optional[str] = "low",   # low, medium, high
+        reasoning_summary: Optional[str] = "auto",  # auto
+        **kwargs
+    ) -> Union[str, dict]:
+
+        # ── Normalize messages to the OpenAI wire format ──────────────────────
+        # OpenAI Chat Completions only accepts these roles:
+        #   system, developer, user, assistant, tool, function
+        _OPENAI_ROLE_MAP = {
+            "system": "system",
+            "developer": "developer",
+            "user": "user",
+            "assistant": "assistant",
+            "tool": "tool",
+            "function": "function",
+            # Non-standard LoLLMS / agent roles mapped to sanctioned equivalents
+            "admin": "system",
+            "root": "system",
+            "manager": "system",
+            "supervisor": "system",
+            "controller": "system",
+            "orchestrator": "system",
+            "planner": "system",
+            "critic": "assistant",
+            "refiner": "assistant",
+            "reviewer": "assistant",
+            "validator": "assistant",
+            "executor": "assistant",
+            "worker": "assistant",
+            "agent": "assistant",
+            "bot": "assistant",
+            "ai": "assistant",
+            "human": "user",
+            "guest": "user",
+            "client": "user",
+            "customer": "user",
+            "operator": "user",
+        }
+
+        def normalize_message(msg: Dict) -> Dict:
+            raw_role = msg.get("role", "user") or "user"
+            role = _OPENAI_ROLE_MAP.get(raw_role.lower(), "user")
+            content = msg.get("content", "")
+            text_parts = []
+            images = []
+
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") in ("input_image", "image_url"):
+                        val = item.get("image_url")
+                        if isinstance(val, dict):
+                            val = val.get("url") or val.get("base64")
+                        if isinstance(val, str) and val:
+                            images.append(val)
+
+            text_content = "\n".join(p for p in text_parts if p.strip())
+
+            if not images:
+                return {"role": role, "content": text_content}
+
+            openai_content = []
+            if text_content:
+                openai_content.append({"type": "text", "text": text_content})
+            for img in images:
+                img_url = img
+                if not img.startswith("http") and not img.startswith("data:"):
+                    img_url = f"data:image/jpeg;base64,{img}"
+                openai_content.append(
+                    {"type": "image_url", "image_url": {"url": img_url}}
+                )
+            return {"role": role, "content": openai_content}
+
+        # ── Helper: extract reasoning from any delta / message object ─────────
+        def extract_reasoning(obj):
+            for attr in ("reasoning_content", "reasoning", "thinking", "reasoning_text"):
+                value = getattr(obj, attr, None)
+                if value:
+                    return value
+            return None
+
+        openai_messages = [normalize_message(m) for m in messages]
+
+        # ── 🛡️ NVIDIA NIM / STRICT ENDPOINT TOOL SANITIZATION ──
+        # The NVIDIA OpenAI-compatible endpoint strictly validates function IDs.
+        # It throws 404 NotFoundError if an unregistered UUID is passed inside the `tools` array.
+        # Ollama and vLLM ignore this, but we must sanitize the payload for strict routers.
+        raw_tools = kwargs.get("tools")
+        sanitized_tools = None
+
+        if raw_tools and isinstance(raw_tools, list):
+            sanitized_tools = []
+            for tool in raw_tools:
+                if not isinstance(tool, dict):
+                    continue
+                # Filter out isolated UUIDs or malformed function wrappers
+                if "id" in tool and len(str(tool["id"])) == 36 and "-" in str(tool["id"]):
+                    # Strip the raw isolated UUID that breaks NVIDIA's registry
+                    tool.pop("id", None)
+
+                # Enforce standard OpenAI function calling schema
+                if "function" in tool:
+                    func_def = tool["function"]
+                    # Force strict=False to prevent rigid schema validation crashes on NIM
+                    func_def["strict"] = False
+                    # Remove any UUID hidden inside function name or description
+                    if "name" in func_def and isinstance(func_def["name"], str):
+                        func_def["name"] = func_def["name"].replace("23d4f03a-b8a6-4adb-a183-7daa083a09cc", "lcp_tool")
+                sanitized_tools.append(tool)
+
+        # ── Build base params ─────────────────────────────────────────────────
         params = {
             "model": self.model_name,
-            "messages": messages,
+            "messages": openai_messages,
             "max_tokens": n_predict,
             "n": 1,
             "temperature": temperature,
             "top_p": top_p,
             "frequency_penalty": repeat_penalty,
-            "stream": stream
+            "stream": stream,
         }
-        # Add seed if available, as it's supported by newer OpenAI models
         if seed is not None:
             params["seed"] = seed
 
-        # Remove None values, as the API expects them to be absent
-        params = {k: v for k, v in params.items() if v is not None}
-        
-        output = ""
-        # 2. Call the API
-        try:
-            completion = self.client.chat.completions.create(**params)
+        # Inject sanitized tools if available
+        if sanitized_tools:
+            params["tools"] = sanitized_tools
+            # Prevent the API from forcing tool calls when the LLM just wants to converse
+            params["tool_choice"] = "auto"
 
-            if stream:
-                for chunk in completion:
-                    # The streaming response for chat has a different structure
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        word = delta.content
-                        if streaming_callback is not None:
-                            if not streaming_callback(word, MSG_TYPE.MSG_TYPE_CHUNK):
-                                break
-                        output += word
+        # Drop None values
+        params = {k: v for k, v in params.items() if v is not None}
+
+        # ── Inject think / reasoning params ───────────────────────────────────
+        if think:
+            if self.is_vllm:
+                params.setdefault("extra_body", {}).setdefault(
+                    "chat_template_kwargs", {}
+                )["enable_thinking"] = True
             else:
-                output = completion.choices[0].message.content
-        
+                # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
+                # Chat Completions uses flat reasoning_effort, not the
+                # nested `reasoning` dict (that is Responses API only).
+                params["reasoning_effort"] = reasoning_effort or "low"
+                # Some providers extend the API with a summary field;
+                # pass it via extra_body so the SDK doesn't reject it.
+                if reasoning_summary and reasoning_summary != "auto":
+                    params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
+                # These models reject temperature / top_p
+                params.pop("temperature", None)
+                params.pop("top_p", None)
+        else:
+            if self.is_vllm:
+                # Explicitly disable so vLLM doesn't carry over a cached state
+                params.setdefault("extra_body", {}).setdefault(
+                    "chat_template_kwargs", {}
+                )["enable_thinking"] = False
+
+        output = ""
+
+        try:
+            # ── First attempt ─────────────────────────────────────────────────
+            try:
+                completion = self.client.chat.completions.create(**params)
+
+            except Exception as ex:
+                trace_exception(ex)
+
+                # 🛡️ CRITICAL FIX: NVIDIA NIM 404 Function Not Found Interceptor
+                # If NVIDIA's strict endpoint still rejects the sanitized tools payload,
+                # we intercept the 404 NotFoundError specifically related to function IDs
+                # and retry WITHOUT the tools array entirely to save the generation.
+                if isinstance(ex, openai.NotFoundError) and "Function" in str(ex) and "Not found for account" in str(ex):
+                    ASCIIColors.warning("[NIM Strict Validation] Intercepted 404 Function Not Found. Retrying without tools array.")
+                    params.pop("tools", None)
+                    params.pop("tool_choice", None)
+                    completion = self.client.chat.completions.create(**params)
+                else:
+                    # Retry: adapt for servers that reject certain fields
+                    if "max_tokens" in params:
+                        params["max_completion_tokens"] = params.pop("max_tokens")
+
+                    params.pop("top_p", None)
+                    params.pop("frequency_penalty", None)
+                    params.pop("presence_penalty", None)
+                    params.pop("reasoning_effort", None)
+
+                    if not think:
+                        params["temperature"] = 1
+
+                    # Strip vLLM-specific extras so the retry is clean
+                    if "extra_body" in params:
+                        params["extra_body"].pop("chat_template_kwargs", None)
+
+                    completion = self.client.chat.completions.create(**params)
+
+            # ── Streaming ─────────────────────────────────────────────────────
+            if stream:
+                in_reasoning = False
+
+                for chunk in completion:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    reasoning = extract_reasoning(delta)
+                    content = getattr(delta, "content", None)
+
+                    if reasoning:
+                        if not in_reasoning:
+                            in_reasoning = True
+                            opening = "<think>\n"
+                            output += opening
+                            if streaming_callback:
+                                streaming_callback(opening, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        output += reasoning
+                        if streaming_callback:
+                            streaming_callback(reasoning, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        continue
+
+                    if content:
+                        if in_reasoning:
+                            in_reasoning = False
+                            closing = "\n</think>\n"
+                            output += closing
+                            if streaming_callback:
+                                streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+                        output += content
+                        if streaming_callback:
+                            if not streaming_callback(content, MSG_TYPE.MSG_TYPE_CHUNK):
+                                break
+
+                # Close any dangling <think> block
+                if in_reasoning:
+                    closing = "\n</think>\n"
+                    output += closing
+                    if streaming_callback:
+                        streaming_callback(closing, MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK)
+
+            # ── Non-streaming ─────────────────────────────────────────────────
+            else:
+                message_obj = completion.choices[0].message
+                reasoning = extract_reasoning(message_obj)
+                content = message_obj.content or ""
+
+                if reasoning:
+                    # Server returned reasoning separately — wrap it
+                    output = f"<think>\n{reasoning}\n</think>\n{content}"
+                else:
+                    # vLLM (and some others) embed <think>…</think> in content,
+                    # or thinking was disabled — pass through as-is
+                    output = content
+
         except Exception as e:
-            # Handle API errors gracefully
-            error_message = f"An error occurred with the OpenAI API: {e}"
+            trace_exception(e)
+            err_msg = f"An error occurred with the OpenAI API: {e}"
             if streaming_callback:
-                streaming_callback(error_message, MSG_TYPE.MSG_TYPE_EXCEPTION)
-            return {"status": "error", "message": error_message}
-            
+                streaming_callback(err_msg, MSG_TYPE.MSG_TYPE_EXCEPTION)
+            return {"status": "error", "message": err_msg}
+
         return output
     
     def tokenize(self, text: str) -> list:

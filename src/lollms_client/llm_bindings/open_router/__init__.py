@@ -95,8 +95,6 @@ class OpenRouterBinding(LollmsLLMBinding):
                     repeat_penalty: float = 1.1,  # Ollama default is 1.1
                     repeat_last_n: int = 64,  # Ollama default is 64
                     seed: Optional[int] = None,
-                    n_threads: Optional[int] = None,
-                    ctx_size: int | None = None,
                     streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                     split: Optional[bool] = False,  # put to true if the prompt is a discussion
                     user_keyword: Optional[str] = "!@>user:",
@@ -120,8 +118,6 @@ class OpenRouterBinding(LollmsLLMBinding):
                         repeat_penalty=repeat_penalty,
                         repeat_last_n=repeat_last_n,
                         seed=seed,
-                        n_threads=n_threads,
-                        ctx_size=ctx_size,
                         streaming_callback=streaming_callback,
                         split=split,
                         user_keyword=user_keyword,

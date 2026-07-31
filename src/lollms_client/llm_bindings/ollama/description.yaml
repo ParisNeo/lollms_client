@@ -19,6 +19,12 @@ global_input_parameters:
     description: "Whether to verify the SSL certificate of the Ollama server. Defaults to true."
     mandatory: false
     default: true
+  - name: n_threads
+    type: int
+    description: "Number of threads."
+    mandatory: false
+    default: -1
+
 model_input_parameters:
   - name: model_name
     type: str

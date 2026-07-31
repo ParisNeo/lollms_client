@@ -53,8 +53,6 @@ class LollmsWebuiLLMBinding(LollmsLLMBinding):
                      repeat_penalty: Optional[float] = None,
                      repeat_last_n: Optional[int] = None,
                      seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                      split:Optional[bool]=False, # put to true if the prompt is a discussion
                      user_keyword:Optional[str]="!@>user:",
@@ -119,8 +117,7 @@ class LollmsWebuiLLMBinding(LollmsLLMBinding):
             "top_p": top_p,
             "repeat_penalty": repeat_penalty,
             "repeat_last_n": repeat_last_n,
-            "seed": seed,
-            "n_threads": n_threads
+            "seed": seed
         }
         
         if image_data:

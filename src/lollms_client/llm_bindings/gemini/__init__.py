@@ -84,18 +84,12 @@ class GeminiBinding(LollmsLLMBinding):
                      temperature: float = 0.7,
                      top_k: int = 40,
                      top_p: float = 0.9,
-                     repeat_penalty: float = 1.1,
-                     repeat_last_n: int = 64,
-                     seed: Optional[int] = None,
-                     n_threads: Optional[int] = None,
-                     ctx_size: int | None = None,
                      streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                      split: Optional[bool] = False, 
                      user_keyword: Optional[str] = "!@>user:",
                      ai_keyword: Optional[str] = "!@>assistant:",
                      think: Optional[bool] = False,
-                     reasoning_effort: Optional[str] = "low",
-                     reasoning_summary: Optional[bool] = False,
+                     **kwargs
                      ) -> Union[str, dict]:
         """
         Generate text using the Gemini model.
@@ -181,12 +175,8 @@ class GeminiBinding(LollmsLLMBinding):
                         repeat_penalty: Optional[float] = None,
                         repeat_last_n: Optional[int] = None,
                         seed: Optional[int] = None,
-                        n_threads: Optional[int] = None,
-                        ctx_size: int | None = None,
                         streaming_callback: Optional[Callable[[str, MSG_TYPE], None]] = None,
                         think: Optional[bool] = False,
-                        reasoning_effort: Optional[str] = "low", 
-                        reasoning_summary: Optional[bool] = False,
                         **kwargs
                         ) -> Union[str, dict]:
         """
