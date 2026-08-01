@@ -128,7 +128,7 @@ This protocol works in tandem with the **Anti-Mimicry Defense**. Because older m
 1.  **Pre-Hydration**:
     * Memory Decay & Associative Pull (SQLite).
     * RAG Injection (if personality has data).
-    * **Dynamic Tool Mounting**: If data files exist in workspace, `semantic_data_engineer` is auto-mounted.
+    * **Dynamic Tool Mounting**: If data files exist in workspace AND `enable_data_tools=True`, `semantic_data_engineer` is auto-mounted.
 2.  **Context Assembly**:
     * System Prompt + Rules (including `<done/>` protocol instructions).
     * **Active Artefacts**: Injects `.lam` content (Logical Twins) for all active files.
@@ -220,6 +220,8 @@ def chat(
     fast_artefact_replicas:       Optional[List[str]] = None,
     tolerance_level:              Optional[str] = "strict",
     allow_dynamic_tools:          bool = False,
+    enable_data_tools:            bool = True,
+    enable_code_execution:        bool = False,
     suppress_images:              bool = False,  # 🛡️ Set to True for non-vision LLMs to prevent passing image data
     debug_export:                 bool = False,
     **kwargs
@@ -230,7 +232,7 @@ def chat(
 
 **Core Conversation & Context**
 *   `user_message` (`str`): The input text from the user for this turn.
-*   `personality` (`Optional[Any]`): The personality object containing the system prompt and optional RAG data. If `None`, the discussion's default system prompt is used.
+*   `personality` (`Optional[Any]`): The personality object containing the system prompt, optional RAG data, and **Personality Handbag tools**.
 *   `branch_tip_id` (`Optional[str`]): The specific message ID to use as the tip of the conversation branch. If `None`, the discussion's `active_branch_id` is used.
 *   `add_user_message` (`bool`): If `True`, the `user_message` is added to the database history. If `False`, the generation regenerates from the existing branch tip (used for regeneration).
 *   `images` (`Optional[List[str]]`): A list of base64 encoded images to attach to the user message for vision-capable models. Use `suppress_images=True` to strip these for non-vision models.
@@ -249,19 +251,34 @@ def chat(
 *   `enable_image_editing` (`bool`): Enables the `<edit_image>` tag if a TTI binding is available.
 
 **Agentic Loop & Tool Orchestration**
-*   `tools` (`Optional[Dict[str, Dict[str, Any]]]`): A dictionary of external tool specifications that are merged into the active tool registry for this turn. If `None`, the system relies solely on LCP auto-discovery and any dynamically mounted tools (like `semantic_data_engineer`). The dictionary keys are the tool names, and the values are specification dictionaries. A tool spec dict must contain:
-    *   `name` (`str`): The exact name of the tool (must match the dictionary key).
-    *   `description` (`str`): A human/LLM-readable description of what the tool does.
-    *   `parameters` (`List[Dict]`): A list of parameter specifications, where each dict contains `name`, `type`, and `description`.
-    *   `callable` (`Callable`): The Python function that the orchestrator will execute when the LLM calls this tool. The orchestrator automatically handles CWD switching and artifact syncing before/after execution.
+
+The tool registry follows a **Strict Sovereign Opt-In Doctrine**. The system will NEVER automatically expose all default LCP tools to the LLM. Tools are only activated if they are explicitly requested via one of the following mechanisms:
+
+1.  **Personality Handbag Tools**: If the `personality` object contains a `handbag` or `tools` attribute, those tools are automatically registered for the turn.
+2.  **Explicit `tools` parameter**: The `tools` argument to `chat()` accepts two types of values:
+    *   **Dictionary of Callables**: A mapping of tool names to their specification dictionaries (containing `name`, `description`, `parameters`, `callable`). This is used for injecting custom, session-specific functions.
+    *   **List of Default Tool Names**: A list of strings matching the names of tools available in the `LCPBinding`'s discovered registry (e.g., `["tool_execute_python_code", "tool_query_database_sql"]`). The orchestrator will resolve these names to their specs and register them. If a requested name is not found in the LCP registry, it is ignored.
+3.  **Auto-Mounted Data Tools**: If `enable_data_tools=True` (Default: `True`) AND data files (`.csv`, `.db`, `.xlsx`) exist in the discussion workspace, the system will automatically mount and register the `semantic_data_engineer` LCP library. This is the ONLY automatic tool mounting behavior.
+
+*   `tools` (`Union[Dict[str, Dict[str, Any]], List[str], None]`): A dictionary of external tool specifications OR a list of default LCP tool names to activate.
     
-    **Example:**
+    **Example: Using Default Tool Names**
+    ```python
+    # Explicitly activate the internet search and Python execution tools
+    discussion.chat(
+        user_message="Search for the latest news on AI and summarize it.",
+        tools=["tool_internet_search", "tool_execute_python_code"],
+        enable_code_execution=True
+    )
+    ```
+
+    **Example: Using Custom Callables**
     ```python
     def my_python_executor(code: str) -> dict:
         # Execution logic here...
         return {"success": True, "output": "Execution finished."}
 
-    external_tools = {
+    explicit_tools = {
         "tool_my_custom_executor": {
             "name": "tool_my_custom_executor",
             "description": "Executes arbitrary Python code and returns the output.",
@@ -269,9 +286,9 @@ def chat(
             "callable": my_python_executor
         }
     }
-
-    discussion.chat(user_message="Run this code...", tools=external_tools)
+    discussion.chat(user_message="Run this code...", tools=explicit_tools)
     ```
+*   `enable_data_tools` (`bool`): If `True` (Default), allows the system to auto-mount the `semantic_data_engineer` library if data files are detected in the workspace.
 *   `allow_dynamic_tools` (`bool`): **Security Gate**. If `True`, allows the LLM to write and execute its own Python tools on the fly via `type="tool"` artifacts. Defaults to `False`.
 *   `enable_code_execution` (`bool`): **Security Gate**. If `True`, registers the `tool_execute_python_code` LCP tool, allowing the LLM to execute arbitrary Python code strings. Defaults to `False`.
 *   `max_reasoning_steps` (`int`): The maximum number of agentic reasoning rounds before the loop forces a final answer. Prevents infinite cycles.

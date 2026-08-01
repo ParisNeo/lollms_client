@@ -2449,14 +2449,15 @@ class ChatMixin:
         prehydrate_rag:               bool = True,
         max_reasoning_steps:          int = 20,
         enable_in_message_status:     bool = False,
-        enable_sub_agents:            bool = False,  # Enable spinoff agents as executable tools
-        forward_artefact_chunks:      bool = False,  # Forward sparse artefact structural events to UI
-        fast_artefact_replicas:       Optional[List[str]] = None,  # Custom messages for instant/empty artefacts
+        enable_sub_agents:            bool = False,
+        forward_artefact_chunks:      bool = False,
+        fast_artefact_replicas:       Optional[List[str]] = None,
         tolerance_level:              Optional[str] = "strict",
-        allow_dynamic_tools:          bool = False,  # 🛡️ Security gate for LLM-generated tool execution
-        enable_code_execution:        bool = False,  # 🛡️ Security gate for arbitrary Python code execution
-        suppress_images:              bool = False,  # 🛡️ Set to True for non-vision LLMs to prevent passing image data
-        debug_export:                 bool = False,   # 🔬 Dumps virtual_history and ai_msg.content to disk for debugging
+        allow_dynamic_tools:          bool = False,
+        enable_data_tools:            bool = True,
+        enable_code_execution:        bool = False,
+        suppress_images:              bool = False,
+        debug_export:                 bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -2530,7 +2531,6 @@ class ChatMixin:
         sys_prompt = (personality.system_prompt if personality else None) or self.system_prompt or ""
         
         # Veracity and Formatting Rules
-        # Veracity and Formatting Rules
         rules = (
             "\n=== VERACITY & ATTRIBUTION REQUIREMENTS ===\n"
             "Cite retrieved sources as [1],[2]... "
@@ -2568,14 +2568,14 @@ class ChatMixin:
             "file URL in your final answer (e.g. <img src=\"/api/workspace_files/filename.png\" /> "
             "for images) and STOP generating.\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
-            "If you decide to output a thought process enclosed in </think> tags, "
+            "If you decide to output a thought process enclosed in  tags, "
             "you MUST output all functional XML tags (such as <artifact>, <tool>, or <mem_new>) "
-            "on a NEW LINE strictly AFTER the closing </think> tag. "
-            "NEVER place functional tags inside the </think> reasoning block.\n"
+            "on a NEW LINE strictly AFTER the closing  warn_tag tag. "
+            "NEVER place functional tags inside the  warn_tag reasoning block.\n"
             "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
             "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
             "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
-            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside </think> blocks. They must ONLY appear in the final response body AFTER the closing </think> tag.\n"
+            "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside  warn_tag blocks. They must ONLY appear in the final response body AFTER the closing  warn_tag tag.\n"
         )
 
         extra_instructions = ""
@@ -2652,75 +2652,71 @@ class ChatMixin:
             full_system_prompt += "\n" + "\n\n".join(data_zones)
 
         # ── 7. Tool calling registry & Dynamic Library Mounting ──
-        active_tools = dict(tools or {})
+        # ── SOVEREIGN OPT-IN DOCTRINE ──
+        active_tools = {}
 
-        # ── DYNAMIC TOOL MOUNTING PROTOCOL ──
-        # Automatically mount specialized tool libraries based on workspace context
+        # 1. Personality Handbag Tools
+        if personality and hasattr(personality, "handbag") and personality.handbag:
+            active_tools.update(personality.handbag.tools)
+        if personality and hasattr(personality, "tools") and isinstance(personality.tools, dict):
+            active_tools.update(personality.tools)
+
+        # 2. Explicit User-Supplied Tools (Callables or Default Tool Names)
+        if isinstance(tools, dict):
+            active_tools.update(tools)
+        elif isinstance(tools, list):
+            lcp_binding = getattr(self.lollmsClient, "tools", None)
+            if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
+                try:
+                    lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                    for tool_name in tools:
+                        if tool_name in lcp_tools:
+                            active_tools[tool_name] = lcp_tools[tool_name]
+                        else:
+                            ASCIIColors.warning(f"[ChatMixin] Requested default tool '{tool_name}' not found in LCP registry.")
+                except Exception as ex:
+                    trace_exception(ex)
+
+        # 3. Auto-Mount Data Tools (ONLY if data files exist AND enable_data_tools is True)
         lcp_binding = getattr(self.lollmsClient, "tools", None)
+        enable_data_tools_flag = enable_data_tools
 
-        # 1. Data Tools Auto-Load
-        # If enable_data_tools is True (or not explicitly disabled) AND data files exist in workspace
-        enable_data_tools = kwargs.get("enable_data_tools", True)
-
-        # Check workspace for data files using the discussion's resolved workspace_data_path
         from pathlib import Path
         workspace_dir = Path(self.workspace_data_path) if getattr(self, "workspace_data_path", None) else Path("./data_workspace")
 
         data_extensions = {".csv", ".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet"}
         has_data_files = any(f.suffix.lower() in data_extensions for f in workspace_dir.rglob("*") if f.is_file())
 
-        # CRITICAL FIX: If data files exist but LCP binding is None, INSTANTIATE it on-the-fly!
         if has_data_files and (lcp_binding is None):
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
-
-                # Create LCP binding instance with default tools folder
                 lcp_binding = LCPBinding(
                     tools_folders=[Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"]
                 )
-
-                # Attach it to the client for future use
                 self.lollmsClient.tools = lcp_binding
             except Exception as ex:
                 trace_exception(ex)
                 lcp_binding = None
 
-        # Now proceed with tool mounting if LCP binding exists
-        if enable_data_tools and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+        if enable_data_tools_flag and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
             if has_data_files:
                 lcp_binding.mount_tool_library("semantic_data_engineer")
+                try:
+                    lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                    for t_name, t_spec in lcp_tools.items():
+                        if t_name == "tool_execute_python_data_query":
+                            active_tools[t_name] = t_spec
+                except Exception as ex:
+                    trace_exception(ex)
 
-        # 2. Merge LCP Tools into Active Toolset
-        # If LCP binding exists, merge all discovered tools (including newly mounted ones)
-        # 🛑 CRITICAL: We do NOT force a re-discovery here. The LCP binding's constructor
-        # and explicit mount_tool_library() calls handle discovery and early initialization.
-        # Calling discover_tools(force_refresh=True) here would re-run init_tools_library()
-        # on every chat turn, violating the Early Initialization Doctrine.
-        if lcp_binding and hasattr(lcp_binding, "to_chat_tool_specs"):
+        # 4. Mount Arbitrary Code Execution Tool if enabled
+        if enable_code_execution and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            lcp_binding.mount_tool_library("execute_python_code")
             try:
-                # ── 🛡️ SECURITY GATE: Explicitly mount the code execution library if enabled ──
-                # This guarantees the tool is discovered and present in the registry before merging.
-                if enable_code_execution and hasattr(lcp_binding, "mount_tool_library"):
-                    lcp_binding.mount_tool_library("execute_python_code")
-
                 lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
-                # ── 🛡️ SECURITY GATES: Filter out dangerous tools unless explicitly enabled ──
-                if not allow_dynamic_tools:
-                    lcp_tools = {
-                        name: spec for name, spec in lcp_tools.items() 
-                        if name != "tool_execute_python_data_query"
-                    }
-                    ASCIIColors.info("[ChatMixin] Dynamic tools disabled. Filtered out 'tool_execute_python_data_query'.")
-
-                if not enable_code_execution:
-                    lcp_tools = {
-                        name: spec for name, spec in lcp_tools.items() 
-                        if name != "tool_execute_python_code"
-                    }
-                    if not enable_code_execution:
-                        ASCIIColors.info("[ChatMixin] Code execution disabled. Filtered out 'tool_execute_python_code'.")
-
-                active_tools.update(lcp_tools)
+                for t_name, t_spec in lcp_tools.items():
+                    if t_name == "tool_execute_python_code":
+                        active_tools[t_name] = t_spec
             except Exception as ex:
                 trace_exception(ex)
 
@@ -2765,9 +2761,6 @@ class ChatMixin:
                 tools_prompt += f"- {t_name}({param_desc}): {desc}\n"
 
             # ── 🛡️ PHANTOM TOOL PREVENTION PROTOCOL ──
-            # Explicitly enumerate allowed tool names to prevent the LLM from
-            # hallucinating tools that exist in its training data but are not
-            # registered in the current session.
             allowed_tool_names = list(active_tools.keys())
             tools_prompt += f"\n🚨 **STRICT TOOL REGISTRY ENFORCEMENT** 🚨\n"
             tools_prompt += f"You are STRICTLY FORBIDDEN from calling any tool not listed above.\n"
@@ -4379,7 +4372,9 @@ class ChatMixin:
             "was_cancelled": was_cancelled
         }
 
-
+            
+            
+            
 # ── Internal parsing helpers ──
 
 def _format_form_answers_for_llm(form_descriptor: Dict, answers: Dict[str, Any]) -> str:

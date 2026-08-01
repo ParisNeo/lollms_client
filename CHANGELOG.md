@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-01 16:42]
+
+- docs(lollms_discussion): update README and chat mixin documentation
+
 ## [2026-08-01 16:10]
 
 - refactor(lollms_discussion): improve context sanitizer and diet protocol with updated cognitive decision tests
