@@ -147,8 +147,9 @@ class MockGemmaAgentClient:
 
         # ── Test Scenario C: Two-Step Ingestion & Data Query (Multi-Turn) ──
         # State Machine: Round 0 (Artifact) -> Round 1 (System Marker) -> Round 2 (Tool Call) -> Round 3 (Tool Result) -> Final Answer
-        if ("sales_database" in prompt_text_lower or "highest revenue" in prompt_text_lower) and "tool_execute_python_data_query" in system_text_lower:
-            if self.scenario_c_round == 0:
+        # CRITICAL FIX: Use the state counter to determine the phase, falling back to content checks only for the initial trigger.
+        if "tool_execute_python_data_query" in system_text_lower:
+            if self.scenario_c_round == 0 and ("sales_database" in prompt_text_lower or "highest revenue" in prompt_text_lower):
                 self.scenario_c_round += 1
                 reply = (
                     '<artifact name="query.py" type="code" language="python" ephemeral="true">\n'
@@ -161,13 +162,13 @@ class MockGemmaAgentClient:
                 if callback:
                     callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
                 return reply
-            elif self.scenario_c_round == 1:
+            elif self.scenario_c_round == 1 and "[system: the" in prompt_text_lower:
                 self.scenario_c_round += 1
                 reply = f'<tool>{json.dumps({"name": "tool_execute_python_data_query", "parameters": {"code": "query.py"}})}</tool>'
                 if callback:
                     callback(reply, MSG_TYPE.MSG_TYPE_CHUNK)
                 return reply
-            elif self.scenario_c_round == 2:
+            elif self.scenario_c_round == 2 and "<tool_result" in prompt_text_lower:
                 self.scenario_c_round = 0
                 reply = "Based on my data query of the sales database, the product with the highest revenue is the **Smartphone Alpha** with a total revenue of **$124,500.00 USD**.<done/>"
                 if callback:
@@ -239,7 +240,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
     def setUp(self):
         import tempfile
         import csv
-        
+
         is_online = False
         if is_online:
             self.client = LollmsClient(
@@ -250,6 +251,9 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
             )
         else:
             self.client = MockGemmaAgentClient()
+            # CRITICAL FIX: Reset state machine counters to prevent cross-test contamination
+            self.client.scenario_c_round = 0
+            self.client.scenario_d_round = 0
 
         self.tmp_workspace = tempfile.mkdtemp(prefix="lollms_test_")
         self.db_manager = LollmsDataManager("sqlite:///:memory:")
@@ -404,8 +408,16 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         final_content = res.get("ai_message").content or ""
 
-        tool_succeeded = "status:success" in final_content and "KeyError" not in final_content
-        answer_correct = "Smartphone Alpha" in final_content
+        # The mock agent should have executed the tool and returned the final answer.
+        # If the mock fell through to the fallback, final_content will be "Simulated response".
+        # We check if the mock successfully reached the final answer state.
+        expected_final_answer = "Smartphone Alpha"
+
+        # Verify the mock reached round 2 (final answer state)
+        mock_reached_final_state = self.client.scenario_c_round == 0  # Reset after round 2
+
+        tool_succeeded = mock_reached_final_state and "status:success" in final_content and "KeyError" not in final_content
+        answer_correct = expected_final_answer in final_content
 
         success = tool_succeeded and answer_correct
 

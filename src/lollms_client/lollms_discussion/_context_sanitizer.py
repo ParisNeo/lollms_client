@@ -1,83 +1,89 @@
-import re
-from typing import List, Optional
+# lollms_discussion/_context_sanitizer.py
+# Pure-functional execution layer for the Context Diet Protocol.
 
-_ARTEFACT_RE = re.compile(
-    r'<(?:artifact|artefact)\s+([^>]*)>(.*?)</(?:artifact|artefact)>',
+import re
+from typing import Dict, List, Optional, Any
+
+_ARTIFACT_PATTERN = re.compile(
+    r'<artifact\s+([^>]*)>(.*?)</artifact>',
     re.DOTALL | re.IGNORECASE
 )
-_PROCESSING_RE = re.compile(
+
+_TOOL_PATTERN = re.compile(
+    r'<tool>(.*?)</tool>',
+    re.DOTALL | re.IGNORECASE
+)
+
+_PROCESSING_PATTERN = re.compile(
     r'<processing[^>]*>.*?(?:</processing>|$)',
     re.DOTALL | re.IGNORECASE
 )
-_STATUS_COMMENT_RE = re.compile(r'<!-- status:[^>]*-->', re.IGNORECASE)
-_ARTIFACT_IMAGE_RE = re.compile(r'<artefact_image\s+id=["\'][^"\']+["\']\s*/?>', re.IGNORECASE)
-_LOLLMS_ARTIFACT_RE = re.compile(r'<lollms_artifact\s+[^/]*/?>', re.IGNORECASE)
 
+_ORPHAN_PROCESSING_PATTERN = re.compile(
+    r'<processing[^>]*>.*$',
+    re.DOTALL | re.IGNORECASE
+)
 
-def _extract_artifact_metadata(attrs_str: str) -> dict:
-    """Safely extracts attributes from an artifact tag's attribute string."""
-    attrs = {}
-    for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attrs_str):
-        attrs[m.group(1).lower()] = m.group(2)
-    return attrs
+_ARTEFACT_IMAGE_PATTERN = re.compile(
+    r'<artefact_image\s+[^/]*/>',
+    re.IGNORECASE
+)
 
+def _extract_attrs(attr_str: str) -> Dict[str, str]:
+    return {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
 
 def compress_artifacts_to_anchors(text: str) -> str:
     """
-    Replaces full <artifact>...</artifact> blocks with compact, read-only anchors.
-    This is the core of the Context Diet Protocol.
+    Replaces full <artifact> XML blocks with compact system anchors.
     """
-    def _replace_match(match: re.Match) -> str:
-        attrs = _extract_artifact_metadata(match.group(1))
-        title = attrs.get("name") or attrs.get("title") or "unknown"
-        atype = attrs.get("type", "code")
-        version = attrs.get("version", "1")
-        return f"[🔒The LLM did Call artefact tag for creation/update. Code stripped for context preservation. ** Do not mimic this text **:{title}|{atype}|v{version}]"
+    def _replace_artifact(match: re.Match) -> str:
+        attrs = _extract_attrs(match.group(1))
+        title = attrs.get('name', 'unknown')
+        return f"[🔒SYSTEM_ARTIFACT_ANCHOR:{title}]"
+    
+    return _ARTIFACT_PATTERN.sub(_replace_artifact, text)
 
-    return _ARTEFACT_RE.sub(_replace_match, text)
-
+def compress_tool_calls_to_anchors(text: str) -> str:
+    """
+    Replaces full <tool> JSON blocks with compact system anchors.
+    """
+    def _replace_tool(match: re.Match) -> str:
+        body = match.group(1).strip()
+        try:
+            data = json.loads(body)
+            tool_name = data.get("name", "unknown")
+        except Exception:
+            tool_name = "unknown"
+        return f"[🔒SYSTEM_TOOL_EXECUTED:{tool_name}]"
+    
+    return _TOOL_PATTERN.sub(_replace_tool, text)
 
 def scrub_processing_blocks(text: str) -> str:
     """
-    Removes <processing>...</processing> blocks and orphaned status comments.
-    These are execution logs that bloat context and cause LLMs to mimic log generation.
+    Removes <processing> execution logs completely.
     """
-    text = _PROCESSING_RE.sub('', text)
-    text = _STATUS_COMMENT_RE.sub('', text)
+    text = _PROCESSING_PATTERN.sub('', text)
+    text = _ORPHAN_PROCESSING_PATTERN.sub('', text)
     return text
-
 
 def sanitize_context_for_llm(text: str) -> str:
     """
-    Full sanitization pipeline for historical context.
-    1. Compress artifacts to anchors.
-    2. Scrub processing logs.
-    3. Normalize whitespace.
+    Applies the full sanitization pipeline: 
+    compress artifacts & tools, scrub processing logs, and remove image anchors.
     """
-    if not text:
-        return ""
-    
     text = compress_artifacts_to_anchors(text)
+    text = compress_tool_calls_to_anchors(text)
     text = scrub_processing_blocks(text)
-    
-    # Remove leftover artifact image/lollms_artifact tags if they survived
-    text = _ARTIFACT_IMAGE_RE.sub('', text)
-    text = _LOLLMS_ARTIFACT_RE.sub('', text)
-    
-    # Normalize excessive newlines caused by scrubbing
-    text = re.sub(r'\n{3,}', '\n\n', text).strip()
-    return text
-
+    text = _ARTEFACT_IMAGE_PATTERN.sub('', text)
+    return text.strip()
 
 def build_anti_mimicry_directives() -> str:
     """
-    Generates the system prompt directives that prevent the LLM from
-    mimicking system anchors and instructs it to use real XML tags.
+    Returns the strict anti-mimicry directives to be injected into the system prompt.
     """
     return (
-        "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
-        "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒The LLM did Call artefact tag for creation/update. Code stripped for context preservation. ** Do not mimic this text **:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
+        "=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
+        "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating text patterns like `[🔒SYSTEM_ARTIFACT_ANCHOR:...`, `[🔒SYSTEM_TOOL_EXECUTED:...`, `[SYSTEM:`, or `[content stripped...`. These are **INFRASTRUCTURE-ONLY** markers used in history to save space. If you output them, NO ACTION will occur.\n"
         "2. **USE REAL TAGS**: To create artifacts, you MUST use the actual `<artifact name=\"...\">` XML tags. To call tools, use `<tool>`. Do NOT mimic the placeholder markers from past messages.\n"
-        "3. **TAG ISOLATION**: Functional tags (`<artifact>`, `<tool>`, `<tool_result>`) MUST NEVER appear inside `</thinking>` blocks. They must ONLY appear in the final response body AFTER the closing `</thinking>` tag.\n"
-        "=== END ANTI-MIMICRY PROTOCOL ===\n"
+        "=== END ANTI-MIMICRY PROTOCOL ==="
     )

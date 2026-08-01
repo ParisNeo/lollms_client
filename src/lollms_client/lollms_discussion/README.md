@@ -98,6 +98,31 @@ The agentic loop no longer relies on fragile heuristics (like intent detection) 
 3.  **Explicit Termination**: The loop only breaks if the LLM emits `<done/>` on a new line, or if `max_reasoning_steps` is reached. The `<done/>` tag is stripped from `ai_msg.content` before saving so it never appears in the UI.
 4.  **Continuation Mandate**: If the LLM stops generating without `<done/>` and without dispatching an action (and it's not round 1), a system message is injected reminding it to either continue working or emit `<done/>`.
 
+### 📉 The Context Diet Protocol (Three-View Protocol)
+
+To prevent context window exhaustion during long agentic sessions, the `UtilsMixin.export()` method applies a **Three-View Protocol** to historical messages. This ensures the LLM sees its recent actions with perfect clarity while older actions are compressed into lightweight placeholders.
+
+The logic is implemented in `UtilsMixin.export()` (which calculates the dynamic functional quota) and delegates the actual sanitization to `UtilsMixin._apply_three_view_protocol()` and the pure-functional `lollms_discussion._context_sanitizer` module.
+
+1.  **Recent View (Original - Last 2 Functional Actions)**:
+    *   **Trigger**: `UtilsMixin.export()` maintains a `functional_skip_count` (quota = 2). As it iterates through the branch in reverse, if an assistant message contains functional tags (`<tool>`, `<artifact>`), it increments the count. If the count is ≤ 2, the message is marked as recent (`distance_from_end = 0`).
+    *   **Behavior**: The raw content is preserved **verbatim**, including all functional XML tags and execution logs (`<processing>`).
+    *   **Purpose**: Preserves exact KV-cache alignment for multi-turn agentic chains. The LLM needs to see exactly what it just did to chain tool calls or apply patches accurately. Critically, empty conversational preambles do not consume this quota, ensuring the last two *actual operations* are always visible.
+
+2.  **Reduced View (Older Turns)**:
+    *   **Trigger**: Any assistant message older than the last two functional actions (passed `distance_from_end = 99`).
+    *   **Behavior**: Functional XML tags are replaced with opaque, system-generated placeholders. Execution logs (`<processing>` blocks) are scrubbed completely.
+        *   `<artifact name="main.py">...</artifact>` → `[🔒SYSTEM_ARTIFACT_ANCHOR:main.py]`
+        *   `<tool>{"name": "tool_sql"}</tool>` → `[🔒SYSTEM_TOOL_EXECUTED:tool_sql]`
+    *   **Purpose**: Prevents context bloat. The LLM is informed that an action occurred and what it was, but the token-heavy payload (code blocks, JSON parameters) is stripped.
+
+3.  **User View (Always Verbatim)**:
+    *   **Trigger**: `msg.sender_type == 'user'`.
+    *   **Behavior**: User messages are **never** sanitized. They are always passed to the LLM exactly as written.
+    *   **Purpose**: The LLM must always have perfect recall of user instructions and queries.
+
+This protocol works in tandem with the **Anti-Mimicry Defense**. Because older messages contain placeholders like `[🔒SYSTEM_ARTIFACT_ANCHOR:...]`, the LLM might be tempted to output these markers itself. The system prompt explicitly forbids this, and the `ChatMixin` actively intercepts and halts generation if it detects the LLM mimicking infrastructure markers.
+
 ### Detailed Phase Breakdown
 
 1.  **Pre-Hydration**:
@@ -327,7 +352,7 @@ discussion.chat(user_message="Search for apples", tools=explicit_tools)
 *   `debug` (`bool`): Enables verbose logging of the agentic loop.
 *   `debug_export` (`bool`): Dumps the exact `virtual_history` (LLM context) and `ai_msg.content` (UI context) to a JSON file in the workspace to verify context separation.
 *   `enable_in_message_status` (`bool`): If `True`, emits detailed status comments inside `<processing>` blocks for UI rendering.
-*   `remove_thinking_blocks` (`bool`): If `True`, strips `<think>` or `</think>` blocks from the final saved message content.
+*   `remove_thinking_blocks` (`bool`): If `True`, strips `_EDEFAULT` or `INSTRUCTION` blocks from the final saved message content.
 *   `**kwargs`: Additional keyword arguments passed directly to the LLM binding's `generate_from_messages` call (e.g., `temperature`, `streaming_callback`).
 
 #### Return Value

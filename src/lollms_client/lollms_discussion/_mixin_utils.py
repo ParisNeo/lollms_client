@@ -25,7 +25,7 @@ class UtilsMixin:
     JSON serialisation / deserialisation, clone_without_messages, and fix_orphan_messages.
     """
 
-    # ---- All original methods below (unchanged) ----------------------------
+    # ---- Branch & Export Methods --------------------------------------------
 
     def regenerate_branch(self, branch_tip_id=None, **kwargs):
         self._rebuild_message_index()
@@ -38,7 +38,6 @@ class UtilsMixin:
             if user_parent_id is None or user_parent_id not in self._message_index:
                 raise ValueError("Regeneration failed: No valid user parent.")
             user_msg_to_regenerate_from = self._message_index[user_parent_id]
-            # Delete the old AI message
             self.remove_message(target_id)
         elif target_msg.sender_type == 'user':
             user_msg_to_regenerate_from = target_msg
@@ -49,18 +48,6 @@ class UtilsMixin:
                          branch_tip_id=user_msg_to_regenerate_from.id, **kwargs)
 
     def delete_branch(self, message_id: str):
-        """
-        Compatibility shim — delegates to BranchMixin.prune_branch()
-        which handles both DB-backed and in-memory discussions.
-
-        To delete only the leaf (trimming back empty ancestors), use:
-            disc.delete_branch(leaf_id, keep_ancestors=True)
-
-        To delete a message and ALL its descendants, use:
-            disc.prune_branch(message_id)
-        """
-        # BranchMixin.prune_branch is the canonical implementation.
-        # Calling super() here would go to BranchMixin in the MRO.
         return self.prune_branch(message_id)
 
     def export(self, format_type, branch_tip_id=None, max_allowed_tokens=None,
@@ -76,12 +63,9 @@ class UtilsMixin:
 
         if not branch_tip_id and format_type in ["lollms_text","openai_chat","ollama_chat","markdown"]:
             return "" if format_type in ["lollms_text","markdown"] else []
+        
         branch = self.get_branch(branch_tip_id)
 
-        # Exclude the last message from the branch if it's an EMPTY assistant message 
-        # (representing the active, currently-building AI response for this turn).
-        # If it has content or persisted virtual_history, it is a historical message 
-        # from a completed turn and MUST be preserved for context splicing.
         if branch and branch[-1].sender_type == 'assistant':
             last_msg = branch[-1]
             is_empty_building_msg = not last_msg.content.strip()
@@ -103,51 +87,23 @@ class UtilsMixin:
                 full_system_prompt = system_prompt_part
             else:
                 full_system_prompt = data_zone_part
-        participants = self.participants or {}
-
+        
         _scratchpad = getattr(self, "scratchpad", "") or ""
-
-        def get_full_content(msg):
-            content = msg.content.strip()
-            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
-            content = re.sub(r'<think>.*$', '', content, flags=re.DOTALL | re.IGNORECASE)
-
-            def _parse_attrs(attr_str: str) -> Dict[str, str]:
-                return {m.group(1): m.group(2)
-                        for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', attr_str)}
-
-            pattern = re.compile(r'<(artifact|artefact|note|skill)\b([^>]*?)>(.*?)</\1>', re.DOTALL | re.IGNORECASE)
-
-            def _strip_tag_to_placeholder(match: re.Match) -> str:
-                tag_name = match.group(1).lower()
-                attrs = _parse_attrs(match.group(2))
-                title = attrs.get("name") or attrs.get("title") or "artifact"
-                type_label = "note" if tag_name == "note" else ("skill" if tag_name == "skill" else attrs.get("type", "code"))
-                return f'\n[SYSTEM_{tag_name.upper()}_CREATED:{title}|{type_label}]\n'
-
-            content = pattern.sub(_strip_tag_to_placeholder, content)
-
-            if msg.sender_type == 'assistant':
-                def _strip_processing_block(match: re.Match) -> str:
-                    block_content = match.group(0)
-                    inner_arts = re.findall(r'title=["\']([^"\']*)["\'].*?type=["\']([^"\']*)["\']', block_content, re.IGNORECASE)
-                    if not inner_arts:
-                        inner_arts = re.findall(r'title=["\']([^"\']*)["\']', block_content, re.IGNORECASE)
-                        inner_arts = [(t, "document") for t in inner_arts]
-                    anchors = "\n".join(f"[SYSTEM_ARTIFACT_CREATED:{t}|{ty}]" for t, ty in inner_arts)
-                    return f"\n{anchors}\n" if anchors else ""
-
-                content = re.sub(r'<processing[^>]*>.*?</processing>', _strip_processing_block, content, flags=re.DOTALL | re.IGNORECASE)
-                content = re.sub(r'<processing[^>]*>', '', content, flags=re.IGNORECASE).replace("</processing>", "")
-                lines = [line for line in content.splitlines() if not line.strip().startswith(("*", "✓", "🏗️", "🔧", "✅", "❌", "·ᴽЧØс·", "[BLIND_ACTION_EXECUTED]"))]
-                content = "\n".join(lines).strip()
-            return content
 
         def _last_user_index(branch_list):
             for i in range(len(branch_list) - 1, -1, -1):
                 if branch_list[i].sender_type == 'user':
                     return i
             return -1
+
+        # C1 & C2: Dynamic Functional Quota. The last 2 messages containing 
+        # functional tags (<tool>, <artifact>) are preserved raw.
+        FUNCTIONAL_QUOTA = 2
+        functional_skip_count = 0
+        _functional_tag_pattern = re.compile(r'<(tool|artifact|artefact)\b[^>]*>', re.IGNORECASE)
+
+        def _has_functional_tags(text: str) -> bool:
+            return bool(_functional_tag_pattern.search(text))
 
         if format_type == "lollms_text":
             final_parts = []
@@ -160,6 +116,7 @@ class UtilsMixin:
                 if pi != -1:
                     messages_to_render = branch[pi:]
                     summary_text = f"!@>system:\n--- Conversation Summary ---\n{self.pruning_summary.strip()}\n"
+
             if full_system_prompt:
                 sys_text = f"!@>system:\n{full_system_prompt.strip()}\n"
                 sys_toks = self.lollmsClient.count_tokens(sys_text)
@@ -177,7 +134,15 @@ class UtilsMixin:
             for idx, msg in enumerate(reversed(messages_to_render)):
                 fwd_idx = len(messages_to_render) - 1 - idx
                 sender_str = msg.sender.replace(':','').replace('!@>','')
-                content = get_full_content(msg)
+
+                # Evaluate functional quota for this message
+                is_recent_functional = False
+                if msg.sender_type == 'assistant' and _has_functional_tags(msg.content):
+                    if functional_skip_count < FUNCTIONAL_QUOTA:
+                        functional_skip_count += 1
+                        is_recent_functional = True
+
+                content = self._apply_three_view_protocol(msg, msg.content.strip(), 0 if is_recent_functional else 99)
                 active_images = msg.get_active_images()
                 if active_images:
                     content += f"\n({len(active_images)} image(s) attached)"
@@ -196,7 +161,6 @@ class UtilsMixin:
                         message_parts.insert(1, scratch_text)
                         current_tokens += scratch_text_toks
 
-            # Append Virtual History (Active Agentic Context) - UNSTRIPPED
             if virtual_history:
                 for v_msg in virtual_history:
                     sender_str = "user" if v_msg.sender_type == "user" else self.lollmsClient.ai_name
@@ -254,29 +218,28 @@ class UtilsMixin:
 
         last_user_idx = _last_user_index(branch)
 
+        # C1 & C2: Dynamic Functional Quota for OpenAI/Ollama exports
         for idx, msg in enumerate(branch):
             role = msg.sender_type
+            distance_from_end = len(branch) - 1 - idx
 
-            content = get_full_content(msg)
+            # Evaluate functional quota for this message
+            is_recent_functional = False
+            if msg.sender_type == 'assistant' and _has_functional_tags(msg.content):
+                if functional_skip_count < FUNCTIONAL_QUOTA:
+                    functional_skip_count += 1
+                    is_recent_functional = True
+
+            content = self._apply_three_view_protocol(msg, msg.content.strip(), 0 if is_recent_functional else 99)
+
             active_images_b64 = msg.get_active_images()
             images_dicts = build_image_dicts(active_images_b64)
 
-            # ── 🧠 DUAL-COPY CONTEXT SPLICING ──
-            # If this is an assistant message AND it contains persisted virtual_history in metadata,
-            # we splice the raw virtual history into the context INSTEAD of the sanitized content.
-            # This allows the LLM to see the exact <tool> tags and <tool_result> payloads from the
-            # previous turn, maintaining perfect KV-cache alignment for multi-turn tool chains.
-            # 
-            # CRITICAL: We only do this if NO virtual_history is already being actively built
-            # by the ChatMixin for the current turn (i.e., `virtual_history` param is None or empty).
             is_historical_assistant = (role == "assistant")
             has_persisted_vh = is_historical_assistant and isinstance(msg.metadata, dict) and bool(msg.metadata.get("virtual_history"))
-            is_current_turn_vh_active = bool(virtual_history)
 
-            if has_persisted_vh and not is_current_turn_vh_active:
+            if has_persisted_vh:
                 persisted_vh = msg.metadata["virtual_history"]
-                # The sanitized `content` is discarded for this message.
-                # We reconstruct the alternation from the persisted virtual history.
                 for vh_entry in persisted_vh:
                     vh_role = "user" if vh_entry.get("sender_type") == "user" else "assistant"
                     vh_content = vh_entry.get("content", "")
@@ -291,9 +254,7 @@ class UtilsMixin:
                         sender_str = "User" if vh_role == "user" else "Assistant"
                         messages.append(f"**{sender_str}**: {vh_content}\n")
 
-                # We still need to attach images if there were any in the original message
                 if images_dicts and not suppress_images and format_type == "openai_chat":
-                    # Append images to the last assistant message we just added
                     for i in range(len(messages) - 1, -1, -1):
                         if messages[i]["role"] == "assistant":
                             parts = [{"type": "text", "text": messages[i]["content"]}] if messages[i]["content"] else []
@@ -303,7 +264,6 @@ class UtilsMixin:
                             messages[i]["content"] = parts
                             break
             else:
-                # Standard path: use sanitized content
                 if format_type == "openai_chat":
                     if images_dicts and not suppress_images:
                         parts = [{"type":"text","text":content}] if content else []
@@ -337,7 +297,6 @@ class UtilsMixin:
                 elif format_type == "markdown":
                     messages.append(f"**system**: {scratch_content}\n")
 
-        # Append Virtual History (Active Agentic Context) - UNSTRIPPED
         if virtual_history:
             for v_msg in virtual_history:
                 role = "user" if v_msg.sender_type == "user" else "assistant"
@@ -359,7 +318,6 @@ class UtilsMixin:
         if format_type == "openai_chat" and messages:
             messages = self._normalize_openai_messages(messages)
  
-        # ── 🔬 SCIENTIFIC DEBUG: EXPORT CONTEXT DUMP ──
         if debug:
             try:
                 import os as _os
@@ -389,7 +347,36 @@ class UtilsMixin:
 
         return "\n".join(messages) if format_type == "markdown" else messages
     
+    def _sanitize_for_user_view(self, content: str) -> str:
+        """
+        Sanitizes assistant message content for User/Database view.
+        Removes functional tags and processing blocks, leaving only the final conversational text.
+        """
+        import re as _re
+        content = _re.sub(r'<processing[^>]*>.*?</processing>', '', content, flags=_re.DOTALL | _re.IGNORECASE)
+        return content.strip()
+
+    def _apply_three_view_protocol(self, msg, raw_content: str, distance_from_end: int = 0) -> str:
+        """
+        Applies the Three-View Protocol to LLM context export.
+        
+        1. Recent Assistant Messages (Original View): Preserves raw XML tags for KV-cache alignment.
+        2. Older Assistant Messages (Reduced View): Replaces functional tags with opaque placeholders.
+        3. User Messages: Always preserved verbatim.
+        """
+        from ._context_sanitizer import sanitize_context_for_llm
+        
+        if msg.sender_type != 'assistant':
+            return raw_content
+
+        # C1: KV-Cache Preservation. Keep raw tags if marked as recent functional (distance 0).
+        if distance_from_end == 0:
+            return raw_content
+
+        # C2 & C3: Context Diet & Anti-Mimicry. Sanitize older messages.
+        return sanitize_context_for_llm(raw_content)
     
+     
     def _normalize_openai_messages(self, messages: List[Dict]) -> List[Dict]:
         """
         Normalize messages for OpenAI API compliance:
@@ -406,18 +393,14 @@ class UtilsMixin:
         if not messages:
             return messages
 
-        # ── DEBUG LOGGING: Log message roles before normalization ───────────
-
         normalized = []
         system_content_parts = []
 
-        # Step 1: Extract all system messages
         non_system_messages = []
         for msg in messages:
             if msg.get("role") == "system":
                 content = msg.get("content", "")
                 if isinstance(content, list):
-                    # Handle multimodal content - extract text parts
                     text_parts = [item.get("text", "") for item in content if item.get("type") == "text"]
                     system_content_parts.append("\n".join(text_parts))
                 else:
@@ -425,15 +408,12 @@ class UtilsMixin:
             else:
                 non_system_messages.append(msg)
 
-        # Step 2: Create single fused system message if any system content exists
         if system_content_parts:
             fused_system_content = "\n\n".join(part for part in system_content_parts if part.strip())
             if fused_system_content.strip():
-                # Preserve images from first system message if present
                 first_sys = next((m for m in messages if m.get("role") == "system"), {})
                 first_content = first_sys.get("content", "")
                 if isinstance(first_content, list):
-                    # Keep image_url parts from first system message
                     image_parts = [item for item in first_content if item.get("type") == "image_url"]
                     normalized.append({
                         "role": "system",
@@ -442,7 +422,6 @@ class UtilsMixin:
                 else:
                     normalized.append({"role": "system", "content": fused_system_content})
 
-        # Step 3: Merge consecutive messages of the same role (user/assistant)
         if non_system_messages:
             current_role = None
             current_content = []
@@ -452,14 +431,11 @@ class UtilsMixin:
                 role = msg.get("role")
                 content = msg.get("content", "")
 
-                # Skip empty messages
                 if not content and not msg.get("images"):
                     continue
 
                 if role == current_role:
-                    # Merge with current message
                     if isinstance(content, list):
-                        # Multimodal content
                         for item in content:
                             if item.get("type") == "text":
                                 current_content.append(item.get("text", ""))
@@ -468,16 +444,13 @@ class UtilsMixin:
                     else:
                         current_content.append(str(content))
 
-                    # Merge images from consecutive messages
                     if msg.get("images"):
                         current_images.extend(msg["images"])
                 else:
-                    # Flush previous message if exists
                     if current_role is not None and current_content:
                         merged_content = "\n\n".join(c for c in current_content if c.strip())
                         if merged_content.strip():
                             if current_images:
-                                # Reconstruct multimodal content
                                 text_part = {"type": "text", "text": merged_content}
                                 normalized.append({
                                     "role": current_role,
@@ -486,7 +459,6 @@ class UtilsMixin:
                             else:
                                 normalized.append({"role": current_role, "content": merged_content})
 
-                    # Start new message
                     current_role = role
                     current_content = []
                     current_images = []
@@ -503,7 +475,6 @@ class UtilsMixin:
                     if msg.get("images"):
                         current_images.extend(msg["images"])
 
-            # Flush last message
             if current_role is not None and current_content:
                 merged_content = "\n\n".join(c for c in current_content if c.strip())
                 if merged_content.strip():
@@ -516,8 +487,6 @@ class UtilsMixin:
                     else:
                         normalized.append({"role": current_role, "content": merged_content})
 
-        # Step 4: Ensure first non-system message is user (not assistant)
-        # If it starts with assistant, prepend a minimal user prompt
         non_sys_start = 0
         for i, msg in enumerate(normalized):
             if msg.get("role") != "system":
@@ -527,13 +496,11 @@ class UtilsMixin:
         if non_sys_start < len(normalized):
             first_non_sys = normalized[non_sys_start]
             if first_non_sys.get("role") == "assistant":
-                # Insert a minimal user message to maintain alternation
                 normalized.insert(non_sys_start, {
                     "role": "user",
                     "content": "Continue."
                 })
 
-        # Step 5: Validate alternation (debug check)
         prev_role = None
         for msg in normalized:
             role = msg.get("role")
@@ -548,8 +515,6 @@ class UtilsMixin:
 
         return normalized
     
-
-    
     def summarize_and_prune(self, max_tokens=None, preserve_last_n=4, force_technical=False):
         """
         Generates a persistent technical synopsis and prunes the context.
@@ -561,7 +526,6 @@ class UtilsMixin:
 
         branch = self.get_branch(branch_tip_id)
 
-        # Calculate fingerprint to detect changes
         import hashlib
         fingerprint = hashlib.sha256("".join([f"{m.id}:{hash(m.content)}" for m in branch]).encode()).hexdigest()
 
@@ -572,12 +536,11 @@ class UtilsMixin:
                 return
 
         if meta.get("last_synopsis_fingerprint") == fingerprint and self.pruning_summary:
-            return # Cache hit, nothing changed
+            return 
 
         if len(branch) <= preserve_last_n and not force_technical:
             return
 
-        # Technical Synopsis Prompt
         to_sum = branch[:-preserve_last_n] if not force_technical else branch
         text_to_sum = "\n\n".join(f"{m.sender}: {m.content}" for m in to_sum)
 
@@ -608,7 +571,6 @@ class UtilsMixin:
             if not ctx.strip():
                 return None
             
-            # Align with mock client assertions in tests by directly invoking generate_text
             prompt = (
                 "Extract technical content (equations, code, solutions) for future reference "
                 "from the following conversation:\n\n" + ctx
@@ -621,7 +583,6 @@ class UtilsMixin:
             if not response or not isinstance(response, str):
                 return None
             
-            # Format to include both the text and the mandatory "Memory entry from" header expected by the tests
             timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             entry = f"--- Memory entry from {timestamp} ---\n{response.strip()}"
             if self.memory:
@@ -636,14 +597,12 @@ class UtilsMixin:
             return None
 
     def count_discussion_tokens(self, branch_tip_id=None) -> int:
-        """Reliably count all tokens currently in the active context."""
         status = self.get_context_status(branch_tip_id)
         return status["current_tokens"]
 
     def get_context_status(self, branch_tip_id=None) -> Dict[str, Any]:
         """
         Provides a detailed breakdown of token usage across all context zones.
-        Ensures all content (zones, scratchpad, grouped artifacts, history) is contabilized.
         Optimized with persistent, change-invalidated caching to prevent network floods.
         """
         import hashlib
@@ -656,7 +615,6 @@ class UtilsMixin:
         }
         tokenizer = self.lollmsClient.count_tokens
         
-        # Lazy-initialize a persistent token cache in the discussion metadata dict
         meta = dict(self.metadata or {})
         token_cache = meta.setdefault("_token_cache", {})
         cache_dirty = False
@@ -665,25 +623,21 @@ class UtilsMixin:
             nonlocal cache_dirty
             if not text_block:
                 return 0
-            # Use MD5 hash of content as the cache invalidation key
             h = hashlib.md5(text_block.encode('utf-8', errors='ignore')).hexdigest()
             cache_entry = token_cache.get(category_key, {})
             if cache_entry.get("hash") == h:
                 return cache_entry["tokens"]
             
-            # Recalculate only on change
             count = tokenizer(text_block)
             token_cache[category_key] = {"hash": h, "tokens": count}
             cache_dirty = True
             return count
 
-        # ── 1. System & Data Zones ──────────────────────────────────────────
         system_prompt_text = (self._system_prompt or "").strip()
         pruning_block = ""
         if self.pruning_summary and self.pruning_point_id:
             pruning_block = f"--- Conversation Summary ---\n{self.pruning_summary.strip()}"
         
-        # Build individual zone breakdown
         zone_breakdown = {}
         zone_map = [
             ("system_prompt", system_prompt_text),
@@ -709,20 +663,17 @@ class UtilsMixin:
             if deep_txt: 
                 zone_breakdown["deep_memory"] = {"tokens": _get_cached_tokens(deep_txt, "deep_mem_handles")}
 
-        # ── 2. Artefacts Grouped Breakdown ──────────────────────────────────
         active_artefacts = self.artefacts.list(active_only=True)
         active_artefacts_by_type = {}
         total_art_tokens = 0
 
         for art in active_artefacts:
             atype = art.get('type', 'document')
-            # Extract logical .lam content for data/structured files to ensure token audits align with LLM vision
             content = self.artefacts._get_lam_content(art).strip()
             if not content and not art.get('url'):
                 continue
 
             art_tokens = art.get("token_count")
-            # Always recalculate or use cached .lam tokens for data artifacts
             if art_tokens is None or atype == ArtefactType.DATA:
                 lang = art.get('language') or ''
                 header = f"###[{atype.capitalize()}] {art['title']} (v{art['version']})\n"
@@ -745,10 +696,8 @@ class UtilsMixin:
                 "types": active_artefacts_by_type
             }
 
-        # Assembled System Context (including headers)
         full_data_zone = self.get_full_data_zone()
 
-        # Append active memory context block if available so that system_context tokens include them
         mem_block = ""
         _mm = getattr(self, "memory_manager", None)
         if _mm:
@@ -768,7 +717,6 @@ class UtilsMixin:
             "breakdown": zone_breakdown
         }
 
-        # ── 3. Message History ──────────────────────────────────────────────
         branch_tip_id = branch_tip_id or self.active_branch_id
         history_tokens = 0
         history_breakdown = {"text_tokens": 0, "image_tokens": 0, "message_count": 0}
@@ -776,7 +724,6 @@ class UtilsMixin:
         if branch_tip_id:
             branch = self.get_branch(branch_tip_id)
             msgs_to_render = branch
-            # Respect pruning point
             if self.pruning_summary and self.pruning_point_id:
                 pi = next((i for i, m in enumerate(branch) if m.id == self.pruning_point_id), -1)
                 if pi != -1:
@@ -788,7 +735,6 @@ class UtilsMixin:
                 sender_clean = msg.sender.replace(':', '').replace('!@>', '')
                 content = msg.content.strip()
                 
-                # Handle Images in history
                 active_imgs = msg.get_active_images()
                 img_count = len(active_imgs)
                 img_toks = 0
@@ -799,8 +745,6 @@ class UtilsMixin:
                 
                 msg_text = f"!@>{sender_clean}:\n{content}\n"
                 
-                # Check persistent cache on the LollmsMessage object directly
-                # Invalidate if message is still being modified or tokens not yet set
                 if getattr(msg, "tokens", None) is not None and msg.tokens > 0:
                     msg_toks = msg.tokens
                 else:
@@ -816,7 +760,6 @@ class UtilsMixin:
                 "breakdown": history_breakdown
             }
 
-        # ── 4. Global Discussion Images ─────────────────────────────────────
         disc_imgs = self.get_discussion_images()
         active_disc_imgs = [i for i in disc_imgs if i.get('active', True)]
         if active_disc_imgs:
@@ -826,7 +769,6 @@ class UtilsMixin:
                 "count": len(active_disc_imgs)
             }
 
-        # ── 5. Totals ───────────────────────────────────────────────────────
         total_tokens = sum(z.get("tokens", 0) for z in result["zones"].values())
         result["current_tokens"] = total_tokens
         result["percent"] = round((total_tokens / max_ctx) * 100, 2)
@@ -861,7 +803,6 @@ class UtilsMixin:
             for msg in branch:
                 active.extend(msg.get_active_images())
 
-        # Merge active image-type artifacts so the LLM gets the selected version's pixels
         active_art_images = self.artefacts.get_context_images()
         for img in active_art_images:
             if img.get("data") and img["data"] not in active:
@@ -873,7 +814,6 @@ class UtilsMixin:
         if branch_id not in self._message_index:
             ASCIIColors.warning(f"Non-existent branch ID: {branch_id}")
             return
-        # Set active branch to the exact historical message ID requested to enable forking
         self.active_branch_id = branch_id
         self.touch()
 
@@ -903,8 +843,6 @@ class UtilsMixin:
         new_meta[itemname] = item_value
         self.metadata = new_meta
         self.commit()
-
-    # ---------------------------------------- discussion-level image methods (unchanged)
 
     def add_discussion_image(self, image_b64, source="user", active=True):
         current = self.get_discussion_images()
@@ -994,15 +932,11 @@ class UtilsMixin:
             self.touch(); self.commit()
             self._rebuild_message_index(); self._validate_and_set_active_branch()
 
-    # ---------------------------------------- property
-
     @property
     def system_prompt(self):
         return self._system_prompt
 
-    # ---------------------------------------- legacy artefact shim methods
-    # These delegate to self.artefacts so existing call sites keep working.
-
+    # ── Legacy Artefact Shim Methods ─────────────────────────────────────
     def list_artefacts(self):
         return self.artefacts.list_artefacts()
 
@@ -1027,12 +961,10 @@ class UtilsMixin:
         return self.artefacts.import_artefact(artefact_data, activate=activate)
     
     def load_artefact_into_data_zone(self, title, version=None):
-        """Legacy shim: activates the artefact (new system) and also patches discussion_data_zone for compat."""
         a = self.artefacts.get(title, version)
         if not a:
             raise ValueError(f"Artefact '{title}' not found.")
         self.artefacts.activate(title, version or a['version'])
-        # Also inject into discussion_data_zone for tools that read it directly
         if a.get('content'):
             section = (
                 f"--- Document: {a['title']} v{a['version']} ---\n"
@@ -1044,7 +976,6 @@ class UtilsMixin:
         self.touch(); self.commit()
 
     def unload_artefact_from_data_zone(self, title, version=None):
-        """Legacy shim: deactivates the artefact and removes from discussion_data_zone."""
         a = self.artefacts.get(title, version)
         if not a:
             raise ValueError(f"Artefact '{title}' not found.")
@@ -1111,87 +1042,56 @@ class UtilsMixin:
         return json.dumps(export_data, indent=2)
 
     # ── Standalone Artefact Archive (SAA) Methods ─────────────────────────────
-
     def get_standalone_archive_dir(self) -> Path:
-        """
-        Returns the path to the global Standalone Artefact Archive directory.
-        This directory exists outside any specific discussion and is used to store
-        exported .laa files that can be imported into any discussion.
-        """
         base_workspace = Path(self.workspace_path).parent if hasattr(self, 'workspace_path') and self.workspace_path else Path("./data_workspace")
         archive_dir = base_workspace / "standalone_artefacts"
         archive_dir.mkdir(parents=True, exist_ok=True)
         return archive_dir
 
     def save_artefact_to_global_archive(self, title: str) -> Path:
-        """
-        Exports an artefact from the current discussion to the global Standalone Artefact Archive.
-        """
         archive_dir = self.get_standalone_archive_dir()
         safe_title = sanitize_artifact_filename(title)
         output_path = archive_dir / f"{safe_title}.laa"
-
         result_path = self.artefacts.export_artefact_to_archive(title, output_path)
         ASCIIColors.info(f"[UtilsMixin] Artefact '{title}' saved to global archive at {result_path}")
         return result_path
 
     def load_artefact_from_global_archive(self, title: str, activate: bool = True) -> Optional[Dict[str, Any]]:
-        """
-        Imports an artefact from the global Standalone Artefact Archive into the current discussion.
-        """
         archive_dir = self.get_standalone_archive_dir()
         safe_title = sanitize_artifact_filename(title)
         laa_path = archive_dir / f"{safe_title}.laa"
-
         if not laa_path.exists():
             ASCIIColors.warning(f"[UtilsMixin] Artefact '{title}' not found in global archive at {laa_path}")
             return None
-
         result = self.artefacts.import_artefact_from_archive(laa_path, activate=activate)
         ASCIIColors.info(f"[UtilsMixin] Artefact '{title}' loaded from global archive into discussion.")
         return result
 
     def list_global_archive_artefacts(self) -> List[str]:
-        """
-        Lists all artefacts currently stored in the global Standalone Artefact Archive.
-        """
         archive_dir = self.get_standalone_archive_dir()
         return [f.stem for f in archive_dir.glob("*.laa")]
 
     # ── Artefact Library and Bundle (.lab) Methods ────────────────────────────
-
     def save_artefact_bundle_to_global_archive(self, paths: List[Union[str, Path]], bundle_name: Optional[str] = None, include_versions: bool = False) -> Path:
-        """
-        Exports a bundle of artefacts from the current discussion to the global Artefact Library.
-        """
         archive_dir = self.get_standalone_archive_dir()
         safe_name = sanitize_artifact_filename(bundle_name) if bundle_name else f"bundle_{uuid.uuid4().hex[:6]}"
         output_path = archive_dir / f"{safe_name}.lab"
-
         result_path = self.artefacts.export_artefact_bundle(paths, output_path, include_versions=include_versions)
         ASCIIColors.info(f"[UtilsMixin] Artefact bundle saved to global archive at {result_path}")
         return result_path
 
     def load_artefact_bundle_from_global_archive(self, bundle_name: str, activate: bool = True) -> List[Dict[str, Any]]:
-        """
-        Imports an artefact bundle from the global Artefact Library into the current discussion.
-        """
         archive_dir = self.get_standalone_archive_dir()
         safe_name = sanitize_artifact_filename(bundle_name)
         lab_path = archive_dir / f"{safe_name}.lab"
-
         if not lab_path.exists():
             ASCIIColors.warning(f"[UtilsMixin] Bundle '{bundle_name}' not found in global archive at {lab_path}")
             return []
-
         result = self.artefacts.import_artefact_bundle(lab_path, activate=activate)
         ASCIIColors.info(f"[UtilsMixin] Loaded {len(result)} artefacts from bundle '{bundle_name}' into discussion.")
         return result
 
     def list_global_archive_bundles(self) -> List[str]:
-        """
-        Lists all artefact bundles currently stored in the global Artefact Library.
-        """
         archive_dir = self.get_standalone_archive_dir()
         return [f.stem for f in archive_dir.glob("*.lab")]
 
@@ -1208,4 +1108,45 @@ class UtilsMixin:
         new_discussion.active_branch_id = data.get('active_branch_id')
         if db_manager:
             new_discussion.commit()
-        return new_discussion
+        return new_discussion 
+
+    def get_artefact_content(self, artefact_title_or_path: str, version: Optional[int] = None) -> Optional[str]:
+        artefact = self.artefacts.get(artefact_title_or_path, version)
+        if artefact is None:
+            return None
+
+        base_ws = Path(self.workspace_path) if hasattr(self, 'workspace_path') and self.workspace_path else Path("./data_workspace")
+        ws_dir = base_ws / str(self.id) / "workspace_data"
+
+        filename = artefact.get('title', '')
+
+        if '/' in filename or '\\' in filename:
+            file_path = ws_dir / filename
+        else:
+            file_path = ws_dir / filename
+
+        try:
+            if file_path.exists():
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+
+            ASCIIColors.info(f"[UtilsMixin] Artefact '{artefact_title_or_path}' file not found on disk, attempting sync...")
+            self.artefacts._sync_to_disk_workspace(
+                title=artefact.get("title", filename),
+                content=artefact.get("content", ""),
+                version=artefact.get("version", 1),
+                atype=artefact.get("type", "document"),
+                language=artefact.get("language")
+            )
+
+            if file_path.exists():
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+
+        except Exception as e:
+            ASCIIColors.warning(f"[UtilsMixin] Failed to read artefact '{artefact_title_or_path}': {e}")
+
+        if artefact.get("content"):
+            return artefact["content"]
+
+        return None

@@ -24,10 +24,10 @@ class TestContextDietProtocol(unittest.TestCase):
             "Let me know if you need changes."
         )
         sanitized = compress_artifacts_to_anchors(text)
-        
+
         self.assertNotIn("import os", sanitized)
         self.assertNotIn("<artifact", sanitized)
-        self.assertIn("[🔒SYSTEM_ARTIFACT_CREATED:main.py|code|v2]", sanitized)
+        self.assertIn("[🔒SYSTEM_ARTIFACT_ANCHOR:main.py]", sanitized)
         self.assertIn("Here is the code:", sanitized)
         self.assertIn("Let me know if you need changes.", sanitized)
 
@@ -64,8 +64,8 @@ class TestContextDietProtocol(unittest.TestCase):
             '<artefact_image id="img::0" />'
         )
         sanitized = sanitize_context_for_llm(text)
-        
-        self.assertIn("[🔒SYSTEM_ARTIFACT_CREATED:data.csv|data|v1]", sanitized)
+
+        self.assertIn("[🔒SYSTEM_ARTIFACT_ANCHOR:data.csv]", sanitized)
         self.assertNotIn("a,b,c", sanitized)
         self.assertNotIn("<processing", sanitized)
         self.assertNotIn("Running...", sanitized)
@@ -74,9 +74,10 @@ class TestContextDietProtocol(unittest.TestCase):
     def test_anti_mimicry_directives_content(self):
         """Verify the anti-mimicry directives contain critical instructions."""
         directives = build_anti_mimicry_directives()
-        
+
         self.assertIn("NEVER OUTPUT SYSTEM MARKERS", directives)
-        self.assertIn("[🔒SYSTEM_ARTIFACT_CREATED:", directives)
+        self.assertIn("[🔒SYSTEM_ARTIFACT_ANCHOR:", directives)
+        self.assertIn("[🔒SYSTEM_TOOL_EXECUTED:", directives)
         self.assertIn("USE REAL TAGS", directives)
         self.assertIn("<artifact name=", directives)
 
