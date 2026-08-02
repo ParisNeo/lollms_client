@@ -46,14 +46,14 @@ $$A_{\text{neighbor}} = A_{\text{source}} \times P_{\text{spread}}$$
 The memory system models data using standard semantic web and knowledge graph paradigms:
 
 ### A. The TBox (Terminological Schema)
-Defines the valid classes of concepts and their allowed relationship verbs:
+Defines the valid classes of concepts and their allowed relationship verbs (implemented in the `MemoryOntology` class):
 
 *   **Node Classes**:
     *   `CONCEPT`: Abstract ideas, subjects, tools, or entities.
     *   `PREFERENCE`: User guidelines, constraints, and custom personality rules.
     *   `EVENT`: Milestone occurrences, episodes, or tool outputs.
     *   `DECISION`: Architectural choices, code designs, or lessons learned.
-*   **Relationship Verbs**:
+*   **Relationship Verbs (Predicates)**:
     *   `RELATED_TO` (Default/Associative)
     *   `PREFERS` (Preference mapping)
     *   `IMPLEMENTS` (Code realization)
@@ -63,7 +63,7 @@ Defines the valid classes of concepts and their allowed relationship verbs:
     *   `PART_OF` (Decomposition/Composition)
 
 ### B. The ABox (Assertional Instances)
-The actual facts saved by the LLM are stored as Semantic Triples:
+The actual facts saved by the LLM are stored as Semantic Triples. If the LLM omits the ontology attributes, the `auto_extract_ontology_from_content` function attempts to surgically infer them from the text content:
 ```text
 (user --[PREFERS]--> rust_and_go)
 (complex_plot.py --[IMPLEMENTS]--> data_aggregation)
@@ -112,21 +112,29 @@ When referencing information from Working Memory, the LLM must tag the node to r
 
 ---
 
-## 🗃️ 5. Dual-Database Architecture
+## 🛠️ 5. Application APIs & Direct Management
 
-To provide both private session tracking and shared project learning, the memory system utilizes a **Dual-Database Attachment** paradigm over SQLite:
+Beyond LLM-initiated XML tags, `LollmsMemoryManager` exposes direct Python APIs for building user interfaces and performing explicit queries:
 
-1.  **Private Local Database (`main.memories`)**
-    *   **Scope**: Bound strictly to the current discussion session.
-    *   **Stores**: Local episodic interaction logs, temporary task variables, and session-specific events.
-2.  **Shared Semantic Database (`shared_mem_db.memories`)**
-    *   **Scope**: Shared across all discussions inside a given project workspace.
-    *   **Stores**: Persistent user preferences, validated technical lessons, code style standards, and shared design constraints.
-    *   **Trigger**: Semantic engrams carrying `#preference`, `#standard`, or `#technical_lesson` tags are automatically routed and committed to the attached shared database.
+*   **`list_all(level, search_query, page, page_size)`**: Paginated, searchable retrieval of all memories. Ideal for rendering administrative control panels.
+*   **`edit_memory(memory_id, content, importance, level, tags, subject_group)`**: Manually overwrite any field of a memory record.
+*   **`query(text, top_k, level)`**: Fast, on-the-fly TF-IDF keyword matching over the database. It filters stop words and weights results by Term Frequency-Inverse Document Frequency alongside the memory's base importance.
+*   **`auto_pull_deep_memories(user_message, top_k)`**: Proactively scans user input for keywords matching Level 2 (Deep) memories and promotes them to Level 1 (Working) before the LLM even responds.
 
 ---
 
-## 💤 6. The Dream Cycle (Synaptic Consolidation)
+## 🗃️ 6. Dual-Database Architecture
+
+To provide both private session tracking and shared project learning, the memory system utilizes a **Dual-Database Attachment** paradigm over SQLite:
+
+1.  **Private Local Database (`main.memories`)**: Bound strictly to the current discussion session.
+2.  **Shared Semantic Database (`shared_mem_db.memories`)**: Shared across all discussions inside a given project workspace.
+
+When a `shared_db_path` is provided during initialization, the manager dynamically executes `ATTACH DATABASE` and constructs a cross-schema `UNION ALL` query layer (`_q()`). This allows the application to query and interact with memories from both the local and shared schemas transparently as a single unified graph.
+
+---
+
+## 💤 7. The Dream Cycle (Synaptic Consolidation)
 
 The `dream()` pass is an asynchronous consolidation routine designed to run periodically (or on-demand):
 
@@ -135,3 +143,20 @@ The `dream()` pass is an asynchronous consolidation routine designed to run peri
 3.  **Synaptic Fusion**: Merges redundant or highly overlapping memories (sharing identical tags or categories) into a single, high-density note to optimize storage.
 4.  **Synaptic Auditing**: Uses an LLM to automatically categorize and index un-tagged or "orphaned" memory nodes.
 5.  **Forgetting Pass**: Faded memories that fall below `forget_threshold` are subjected to a final "forgetting evaluation" by the LLM. If evaluated as obsolete, they are permanently purged.
+
+---
+
+## 🧩 8. SSAM Engine (Sovereign Semantic Autarkic Memory)
+
+Exported alongside the main manager is the `SSAMEngine`, a standalone, highly isolated semantic memory engine that strictly enforces LTI/STI (Long-Term Identifier / Short-Term Identifier) separation.
+
+### Architecture
+*   **LTI (Long-Term Identifier)**: The immutable baseline fact securely anchored in the SQLite database.
+*   **STI (Short-Term Identifier)**: A volatile, active projection of an LTI inside the working memory sandbox. Changes made to an STI do not affect the LTI until explicitly committed.
+
+### Key Operations
+*   **`add_lti()`**: Saves a permanent fact to the LTI table.
+*   **`load_to_working_memory()`**: Projects an LTI into the active STI sandbox, computing its history and activation.
+*   **`spread_activation()`**: Spreads energy multiplicatively from a source STI to linked semantic neighbors in the graph, pre-warming them.
+*   **`commit_sandbox_changes(sti_id)`**: Executes a transaction commit protocol that validates and saves STI modifications back to the permanent LTI database.
+*   **`purge_sandbox()`**: Discards the transient working sandbox, reverting any uncommitted cognitive drift.

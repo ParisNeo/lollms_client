@@ -1,13 +1,13 @@
 # 📚 LollmsClient: Core Architecture & Text Processing Guide
 
-The `lollms_client` library provides a unified, sovereign interface for interacting with Large Language Models (LLMs) and various modality bindings (TTS, TTI, STT, etc.). This guide covers the fundamental architecture of the `LollmsClient`, the powerful text processing utilities, image generation via TTI bindings, and how to properly initialize and discover bindings.
+The `lollms_client` library provides a unified, sovereign interface for interacting with Large Language Models (LLMs) and various modality bindings (TTS, TTI, STT, TTM, TTV, and Tools). This guide covers the fundamental architecture of the `LollmsClient`, the powerful text processing utilities, image generation via TTI bindings, tool calling, structured generation, and how to properly initialize and discover bindings.
 
 ---
 
 ## 1. Architecture Overview
 
 The library is structured around three primary components:
-1.  **`LollmsClient` (`lollms_core.py`)**: The main orchestrator. It manages bindings (LLM, TTS, TTI, etc.), handles cooperative VRAM management, and delegates high-level text/image operations.
+1.  **`LollmsClient` (`lollms_core.py`)**: The main orchestrator. It manages bindings (LLM, TTS, TTI, Tools, etc.), handles cooperative VRAM management, and delegates high-level text/image/audio operations.
 2.  **`LollmsTextProcessor` (`lollms_text_processing.py`)**: A comprehensive text and code processing layer that sits on top of the LLM binding. It handles context chunking, code generation, structured JSON generation, and tag-based extraction.
 3.  **`LollmsTTIBinding` (`lollms_tti_binding.py`)**: The abstract interface for Text-to-Image and Omni (text+image) generation bindings, covering classic diffusion models as well as modern omni-modality models served via engines like vLLM-Omni.
 
@@ -15,7 +15,7 @@ The library is structured around three primary components:
 
 ## 2. Binding Discovery & Initialization
 
-Before using the client, you need to know what bindings are available and how to configure them. Every modality (`llm`, `tti`, `tts`, `stt`, `ttv`, `ttm`) has its own binding manager that automatically scans the corresponding `*_bindings/` directory.
+Before using the client, you need to know what bindings are available and how to configure them. Every modality (`llm`, `tti`, `tts`, `stt`, `ttv`, `ttm`, `mcp`) has its own binding manager that automatically scans the corresponding `*_bindings/` directory.
 
 ### Listing Available Bindings
 
@@ -36,7 +36,7 @@ Every binding ships with a `description.yaml` file defining its configuration pa
 
 ```python
 import json
-from lollms_client.lollms_llm_binding import get_binding_desc
+from lollms_client.lollms_bindings_utils import get_binding_desc
 
 description = get_binding_desc("ollama", binding_type="llm")
 print(json.dumps(description, indent=2))
@@ -47,7 +47,7 @@ print(json.dumps(description, indent=2))
 
 ### Populating a `LollmsClient` Instance
 
-You initialize the `LollmsClient` by specifying binding names and configuration dictionaries per modality, including `tti_binding_name` / `tti_binding_config`.
+You initialize the `LollmsClient` by specifying binding names and configuration dictionaries per modality, including `tti_binding_name` / `tti_binding_config` and `tools_binding_name`.
 
 ```python
 from lollms_client import LollmsClient
@@ -60,6 +60,7 @@ client = LollmsClient(
         "host_address": "http://localhost:8091",
         "model_name": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     },
+    tools_binding_name="lcp",
     debug=True
 )
 
@@ -97,7 +98,7 @@ Once initialized, the `LollmsClient` provides direct access to the LLM binding v
 response = client.generate_text(
     prompt="Explain the concept of sovereignty in software architecture.",
     temperature=0.7,
-    max_size=4096
+    n_predict=4096
 )
 print(response)
 ```
@@ -133,6 +134,14 @@ response = client.generate_from_messages(
 )
 ```
 
+### Cancellation
+
+To abort an in-progress generation (useful for UI "Stop" buttons):
+
+```python
+client.llm.cancel()   # Signals the binding to abort generation
+```
+
 ---
 
 ## 4. Image Generation with TTI Bindings
@@ -141,7 +150,7 @@ The `LollmsTTIBinding` interface supports two usage modes: the **classic mode** 
 
 ### Classic Mode: `generate_image` / `edit_image`
 
-This is the original interface, supported by every TTI binding (`diffusers`, `dalle`, `vllm_omni`, etc.) and returns raw `bytes`.
+Supported by every TTI binding (`diffusers`, `dalle`, `vllm_omni`, etc.) and returns raw `bytes`.
 
 ```python
 image_bytes = client.generate_image(
@@ -167,7 +176,7 @@ edited_bytes = client.edit_image(
 
 ### Omni Mode: `generate_omni`
 
-Modern models served via engines like [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/) can return descriptive text alongside the generated image in a single call — useful for models that narrate, caption, or reason about what they produced. Use `generate_omni` to access this richer result:
+Modern models served via engines like [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/) can return descriptive text alongside the generated image in a single call. Use `generate_omni` to access this richer result:
 
 ```python
 result = client.generate_omni(
@@ -184,7 +193,7 @@ for idx, img_bytes in enumerate(result.images):
         f.write(img_bytes)
 ```
 
-`generate_omni` always returns a `TTIGenerationResult` object (a dict-like structure), even for classic non-omni bindings — in that case `result.text` is simply `None`, so calling code can safely check for it:
+`generate_omni` always returns a `TTIGenerationResult` object (a dict-like structure), even for classic non-omni bindings — in that case `result.text` is simply `None`:
 
 ```python
 result = client.generate_omni(prompt="A watercolor painting of a lighthouse")
@@ -193,43 +202,49 @@ if result.text:
 image_bytes = result.first_image_bytes()
 ```
 
-| Method | Returns | Works with all bindings? | Supports text output? |
-|---|---|---|---|
-| `generate_image` / `edit_image` | `bytes` | Yes (always) | No |
-| `generate_omni` | `TTIGenerationResult` (`.images`, `.text`) | Yes (falls back gracefully) | Yes, when binding supports it |
+---
 
-### Checking Omni Capability
+## 5. Agentic Tool Calling
 
-Before requesting text output, you can check whether the active binding actually supports it:
+The `LollmsClient` natively supports tool calling (often referred to as Function Calling) using the `generate_with_tools` method. This enables agentic loops where the LLM can autonomously decide to call a tool, receive the output, and continue reasoning.
 
-```python
-if getattr(client.tti, "supports_omni", False):
-    result = client.generate_omni(prompt="...", modalities=["text", "image"])
-else:
-    image_bytes = client.generate_image(prompt="...")
-```
-
-### Listing TTI Models and Settings
+Tools can be provided as file paths to LCP tool scripts or as inline dictionaries containing a callable.
 
 ```python
-models = client.tti.list_models()
-settings = client.tti.get_settings()
-print(models, settings)
+def get_weather(location: str) -> dict:
+    """Fetches the weather for a given location."""
+    # Dummy implementation
+    return {"location": location, "temperature": "22C", "condition": "Sunny"}
+
+# Define the tool spec expected by the LLM
+weather_tool = {
+    "name": "get_weather",
+    "description": "Get the current weather in a given location",
+    "parameters": [
+        {"name": "location", "type": "str", "description": "The city and state, e.g. San Francisco, CA", "optional": False}
+    ],
+    "callable": get_weather
+}
+
+result = client.generate_with_tools(
+    prompt="What should I wear today in Paris?",
+    tools=[weather_tool],
+    max_tool_rounds=5
+)
+
+print("Final Answer:", result["response"])
+print("Tool Calls Made:", result["tool_calls"])
 ```
 
 ---
 
-## 5. Advanced Text Processing & Extraction
+## 6. Advanced Text Processing & Extraction
 
 The `LollmsTextProcessor` (accessible via `client.llm.tp` or through `client` wrapper methods) provides robust utilities for handling LLM outputs.
 
 ### Tag-Based Extraction: `generate_with_tag`
 
 When you need the LLM to generate a specific block of content (like an SQL query, an HTML snippet, or a report) but want to allow the LLM to "think out loud" or add comments before/after the content, use `generate_with_tag`.
-
-This method instructs the LLM to wrap the final answer in `<tag>...</tag>` and then extracts **only** the content inside the tag.
-
-**Example: Extracting an SQL Query**
 
 ```python
 prompt = """
@@ -240,8 +255,6 @@ Table orders (id, user_id, amount, status)
 Write a query to find the top 5 users by total order amount.
 """
 
-# The LLM might output reasoning like "I need to join tables..." 
-# but we only get the SQL inside <sql_query>
 sql_query = client.generate_with_tag(
     prompt=prompt,
     tag="sql_query",
@@ -252,25 +265,9 @@ print("Extracted SQL:")
 print(sql_query)
 ```
 
-**Guaranteed Clean Extraction**: The text processor ensures that content inside `<thinking>` or `<think>` tags is never accidentally extracted. The `remove_thinking_blocks` logic runs prior to tag extraction.
-
 ### Multi-Output Extraction: `generate_with_tags`
 
-For complex tasks like generating multiple files, structuring a document with distinct sections, or returning data alongside an explanation, use `generate_with_tags`.
-
-This method expects the LLM to output multiple tags with `name` attributes:
-```xml
-<tag name="main.py">
-print("Hello")
-</tag>
-<tag name="utils.py">
-def helper(): pass
-</tag>
-```
-
-It returns a dictionary mapping the names to the content.
-
-**Example: Multi-File Code Generation**
+For complex tasks like generating multiple files or structuring a document with distinct sections, use `generate_with_tags`.
 
 ```python
 prompt = "Create a simple Python REST API using Flask with a main file and a utils file."
@@ -290,25 +287,6 @@ for filename, code in files_dict.items():
     print(f"--- {filename} ---")
     print(code)
     print()
-```
-
-**Example: Structured Data & Explanation**
-
-```python
-prompt = "Analyze the benefits of Rust over C++ for systems programming."
-
-result = client.generate_with_tags(
-    prompt=prompt,
-    temperature=0.4
-)
-
-# result could be:
-# {
-#     "summary": "Rust offers memory safety without garbage collection...",
-#     "comparison_table": "| Feature | Rust | C++ |\n|---|---|---|..."
-# }
-
-print("Summary:", result.get("summary"))
 ```
 
 ### Long Context Processing
@@ -350,6 +328,23 @@ result = client.generate_structured_content(
 # result: {"sentiment": "positive", "confidence": 0.95}
 ```
 
+### Pydantic Model Generation
+
+You can also enforce schemas using Pydantic models via `generate_structured_content_pydantic`.
+
+```python
+from pydantic import BaseModel
+
+class SentimentResult(BaseModel):
+    sentiment: str
+    confidence: float
+
+result = client.generate_structured_content_pydantic(
+    prompt="Analyze the sentiment of: 'I love this new feature!'",
+    model=SentimentResult
+)
+```
+
 ### Code Editing
 
 Instead of regenerating entire files, `edit_code` uses a structured diff approach to efficiently patch existing code.
@@ -370,7 +365,7 @@ if result["success"]:
 
 ---
 
-## 6. Writing a New TTI Binding
+## 7. Writing a New TTI Binding
 
 Every TTI binding lives under `tti_bindings/<binding_name>/` and must expose:
 
@@ -403,7 +398,7 @@ class MyBinding(LollmsTTIBinding):
 
 ---
 
-## 7. Helper Methods
+## 8. Helper Methods
 
 The client also provides quick wrappers for common tasks:
 

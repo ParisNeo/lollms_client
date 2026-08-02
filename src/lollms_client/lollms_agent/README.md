@@ -6,7 +6,7 @@ A fully autonomous, tool-using, self-enhancing agent built on `lollms_client`. U
 
 ## 🧠 Architecture Overview
 
-The Agent is composed of five orthogonal subsystems, each fully isolated and independently configurable:
+The Agent is composed of several orthogonal subsystems, each fully isolated and independently configurable:
 
 | Subsystem | Purpose |
 |---|---|
@@ -15,6 +15,9 @@ The Agent is composed of five orthogonal subsystems, each fully isolated and ind
 | **SubAgentSpawner** | Spawns focused child agents with depth/count limits. Children share the workspace but CANNOT spawn further sub-agents (prevents infinite recursion). |
 | **ModelSwitcher** | On-the-fly model switching via `load_model`/`unload_model` or `model_name` attribute. |
 | **BindingToolsBuilder** | Exposes TTI/TTS/STT/TTM/TTV bindings as callable tools when the corresponding capability flag is enabled. |
+| **ToolsManager** | Discovers and loads file-based LCP tool scripts (`.py`) from the workspace or explicit paths. |
+| **_AgentStreamState** | Transactional stream parser that intercepts `<tool>` and `<done/>` tags during generation, handles code-fence protection, and prevents anti-mimicry. |
+| **Handbag** | A self-contained folder that carries ALL of an agent's resources (personalities, tools, skills, RAG, memory). |
 
 ### Agentic Loop Lifecycle
 
@@ -303,9 +306,6 @@ If neither `personality` nor `handbag_path` provides a personality, the Agent ra
 
 | Method | Description |
 |---|---|
-| `agent.handbag` | Returns the loaded `Handbag` instance, or `None` if no handbag was provided. |
-| `agent.list_handbag_personalities()` | Lists all personalities available in the handbag as `{name: LollmsPersonality}`. |
-| `agent.switch_handbag_personality(name)` | Switches to a different personality from the handbag. Returns `True` on success. |
 | `Handbag.create_structure(path, name)` | Static method that creates a new handbag folder structure on disk. |
 | `Handbag.get_default_personality()` | Returns the manifest-specified default personality (or first found). |
 | `Handbag.get_personalities()` | Returns all loaded personalities. |
@@ -314,6 +314,9 @@ If neither `personality` nor `handbag_path` provides a personality, the Agent ra
 | `Handbag.get_rag_data_source()` | Returns the RAG callable (safestore or keyword-based). |
 | `Handbag.create_memory_manager()` | Creates a `LollmsMemoryManager` from the handbag's `memory/` directory. |
 | `Handbag.attach_rag_to_personality(p)` | Attaches the handbag's RAG to a personality if it doesn't have its own. |
+| `agent.handbag` | Property returning the loaded `Handbag` instance, or `None` if no handbag was provided. |
+| `agent.list_handbag_personalities()` | Lists all personalities available in the handbag as `{name: LollmsPersonality}`. |
+| `agent.switch_handbag_personality(name)` | Switches to a different personality from the handbag. Returns `True` on success. |
 
 ---
 
@@ -474,18 +477,6 @@ def main():
     print(f"Skills created:            {result['skills_created']}")
     print(f"Skills updated:            {result['skills_updated']}")
     print(f"Was cancelled:             {result['was_cancelled']}")
-    print()
-
-    # List workspace files
-    print("📁 Final workspace contents:")
-    for f in sorted(workspace.rglob("*")):
-        if f.is_file():
-            print(f"  {f.relative_to(workspace)} ({f.stat().st_size:,} bytes)")
-
-    # Show the final response
-    print("\n📝 Final Agent Response:")
-    print("-" * 70)
-    print(result["response"][:2000] + ("..." if len(result["response"]) > 2000 else ""))
 
 if __name__ == "__main__":
     main()
@@ -770,7 +761,7 @@ print(f"Audio generated: {sum(1 for tc in result['tool_calls'] if tc['name'] == 
 
 ---
 
-## 📊 Return Value Reference
+## 📊 Return Value Reference (`chat()`)
 
 The `chat()` method returns a structured dictionary:
 
@@ -931,20 +922,26 @@ my_agent_skills/
 
 ---
 
-## 🔗 API Reference Summary
+## 🔗 API Reference
 
-### Agent Core
+### Agent Core (`Agent`)
 
 | Method | Description |
 |---|---|
 | `agent.chat(prompt, ...)` | Main agentic loop. Returns structured dict. |
 | `agent.generate(prompt, ...)` | Direct (non-agentic) text generation. |
 | `agent.generate_with_tools(prompt, tools, ...)` | Backward-compatible wrapper that delegates to `chat()`. |
+| `agent.generate_with_tools_sync(prompt, tools, ...)` | Synchronous convenience wrapper returning only the final text response. |
 | `agent.generate_structured(prompt, schema, ...)` | Structured JSON generation. |
 | `agent.cancel_generation()` | Thread-safe cancellation. |
-| `agent.clear_conversation()` | Clear internal conversation history. |
+| `agent.is_generation_cancelled()` | Returns `True` if generation was cancelled. |
+| `agent.clear_conversation()` | Clears the agent's internal conversation history. |
+| `agent.get_conversation()` | Returns the agent's internal conversation history. |
+| `agent.set_conversation(conversation)` | Sets the agent's internal conversation history. |
+| `agent.get_workspace_path()` | Returns the resolved workspace path as a string. |
+| `agent.list_workspace_files()` | Returns a list of all files in the workspace recursively. |
 
-### Skills API
+### Skills API (`Agent` & `SkillsManager`)
 
 | Method | Description |
 |---|---|
@@ -953,8 +950,10 @@ my_agent_skills/
 | `agent.update_skill(title, new_content)` | Update an existing skill. |
 | `agent.delete_skill(title)` | Delete a skill. |
 | `agent.reload_skills()` | Reload all skills from disk. |
+| `SkillsManager.search_skills(query)` | Searches skills by title, description, tags, or content. |
+| `SkillsManager.load_skill(title)` | Loads the full content of a skill by title. |
 
-### Model Switching API
+### Model Switching API (`Agent` & `ModelSwitcher`)
 
 | Method | Description |
 |---|---|
@@ -963,15 +962,79 @@ my_agent_skills/
 | `agent.switch_model(model_name)` | Switch to a different model. |
 | `agent.restore_original_model()` | Restore the original model. |
 
-### Sub-Agent API
+### Sub-Agent API (`Agent` & `SubAgentSpawner`)
 
 | Method | Description |
 |---|---|
 | `agent.spawn_sub_agent(instruction, personality_conditioning, model_name)` | Spawn a child agent. |
+| `SubAgentSpawner.can_spawn()` | Returns `True` if depth and count limits have not been reached. |
+| `SubAgentSpawner.reset_turn()` | Resets the per-turn spawn counter. |
+
+### Handbag API (`Agent` & `Handbag`)
+
+| Method | Description |
+|---|---|
+| `Handbag.create_structure(path, name)` | Static method that creates a new handbag folder structure on disk. |
+| `Handbag.get_default_personality()` | Returns the manifest-specified default personality (or first found). |
+| `Handbag.get_personalities()` | Returns all loaded personalities. |
+| `Handbag.get_tool_files()` | Returns the list of discovered tool file paths. |
+| `Handbag.get_skills_dirs()` | Returns the list of skills directory paths. |
+| `Handbag.get_rag_data_source()` | Returns the RAG callable (safestore or keyword-based). |
+| `Handbag.create_memory_manager()` | Creates a `LollmsMemoryManager` from the handbag's `memory/` directory. |
+| `Handbag.attach_rag_to_personality(p)` | Attaches the handbag's RAG to a personality if it doesn't have its own. |
+| `agent.handbag` | Property returning the loaded `Handbag` instance, or `None` if no handbag was provided. |
+| `agent.list_handbag_personalities()` | Lists all personalities available in the handbag as `{name: LollmsPersonality}`. |
+| `agent.switch_handbag_personality(name)` | Switches to a different personality from the handbag. Returns `True` on success. |
+
+### Tools Manager (`ToolsManager`)
+
+| Method | Description |
+|---|---|
+| `ToolsManager.list_available_files()` | Scans configured directories and returns a list of tool `.py` files. |
+| `ToolsManager.load_file(file_path)` | Loads a tool script as a Python module. |
+| `ToolsManager.get_callable_tools(file_path)` | Returns `{tool_name: callable}` for all `tool_` prefixed functions in a file. |
+| `ToolsManager.execute_tool(file_path, tool_name, args)` | Executes a specific tool from a file with the given arguments. |
+| `ToolsManager.build_tool_specs(sources)` | Builds OpenAI-compatible tool specifications from a list of sources. |
 
 ---
 
-## 🧩 CapabilityFlags Reference
+## 🧩 Data Structures & Constants
+
+### `AgentRole`
+
+Constants defining the semantic function of an agent:
+
+| Constant | String Value |
+|---|---|
+| `AgentRole.PROPOSER` | `"proposer"` |
+| `AgentRole.CRITIC` | `"critic"` |
+| `AgentRole.DEVIL_ADVOCATE` | `"devil_advocate"` |
+| `AgentRole.DOMAIN_EXPERT` | `"domain_expert"` |
+| `AgentRole.SYNTHESIZER` | `"synthesizer"` |
+| `AgentRole.MODERATOR` | `"moderator"` |
+| `AgentRole.IMPLEMENTER` | `"implementer"` |
+| `AgentRole.TESTER` | `"tester"` |
+| `AgentRole.NARRATOR` | `"narrator"` |
+| `AgentRole.PLAYER` | `"player"` |
+| `AgentRole.FREEFORM` | `"freeform"` |
+
+### `Skill` (Dataclass)
+
+Represents a single skill loaded from a `SKILL.md` file.
+
+| Field | Type | Description |
+|---|---|---|
+| `title` | `str` | The title of the skill. |
+| `description` | `str` | A short summary of the skill. |
+| `category` | `str` | Domain or category (e.g., 'python', 'data_analysis'). |
+| `tags` | `List[str]` | Tags for searchability. |
+| `content` | `str` | The full Markdown content of the skill. |
+| `file_path` | `Optional[Path]` | The path to the `SKILL.md` file on disk. |
+| `always_visible` | `bool` | Whether the skill's content is always injected into the system prompt. |
+
+### `CapabilityFlags` (Dataclass)
+
+Controls what the agent is allowed to do. All dangerous capabilities default to `False`.
 
 | Flag | Default | Description |
 |---|---|---|

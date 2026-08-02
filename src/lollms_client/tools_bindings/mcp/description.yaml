@@ -1,0 +1,17 @@
+title: Unified MCP Binding
+author: ParisNeo
+creation_date: 2026-08-01
+last_update_date: 2026-08-01
+description: >
+  This binding connects to MCP-compliant tool servers via standard input/output (stdio) for local subprocesses 
+  or streamable HTTP for remote servers. It aggregates tools from all connected servers, prefixing each tool 
+  name with a server alias. It fully supports authentication via headers, API keys, bearer tokens, and 
+  custom token introspection (OAuth).
+input_parameters:
+  - name: servers
+    type: list
+    description: >
+      A list of dictionaries representing MCP servers to connect to.
+      For stdio servers, include 'type': 'stdio', 'command': [...], 'cwd' (optional), and 'env' (optional).
+      For http servers, include 'type': 'http', 'url': 'http://...', and 'auth_config' (optional).
+    mandatory: false

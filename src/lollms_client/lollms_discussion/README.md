@@ -2,14 +2,48 @@
 
 This module implements the **Sovereign Discussion Session**, a stateful, thread-safe conversational engine that bridges the gap between transient LLM tokens and permanent, versioned knowledge storage.
 
-It is composed of five orthogonal mixins:
+It is composed of nine orthogonal mixins:
 1.  **`CoreMixin`**: Lifecycle, ORM proxy, message CRUD, and thread-safe DB commits.
 2.  **`ChatMixin`**: The agentic reasoning loop, tool execution orchestration, and stream parsing.
 3.  **`UtilsMixin`**: Branch management, export normalization, and context token auditing.
 4.  **`PromptMixin`**: System prompt construction and XML tag post-processing.
-5.  **`FileImportMixin`**: Multi-modal ingestion (PDF, DOCX, Data) and Dual-Stream storage.
+5.  **`MemoryMixin`**: Integration with `LollmsMemoryManager` for tiered persistent memory, episodic memory saving, and graph relationship traversal.
+6.  **`FileImportMixin`**: Multi-modal ingestion (PDF, DOCX, Data) and Dual-Stream storage.
+7.  **`InternetImportMixin`**: Web content extraction and quality scoring for internet-based RAG.
+8.  **`ExportMixin`**: Standalone Artefact Archive (`.laa`) and Linked Artefact Bundle (`.lab`) export/import protocols.
+9.  **`BranchMixin`**: Directed Acyclic Graph (DAG) branch discovery, navigation, forking, and merging.
 
 ---
+
+## 🧠 12. Persistent Memory & Graph Traversal API
+
+The `MemoryMixin` integrates the `LollmsMemoryManager` directly into the discussion session, exposing high-level APIs for persistent memory management and cognitive graph traversal. This enables the host application to build advanced UI dashboards for memory inspection and relationship mapping.
+
+### High-Level Memory Management
+
+These methods provide direct access to the persistent memory layer attached to the discussion.
+
+*   `add_memory(content, importance, tags, subject_group, level)`: Manually inject a memory.
+*   `get_memory(memory_id)`: Retrieve a specific memory by ID.
+*   `update_memory(memory_id, new_content)`: Overwrite the content of an existing memory.
+*   `edit_memory(memory_id, content, importance, level, tags, subject_group)`: Granular editing of any memory attribute.
+*   `delete_memory(memory_id)`: Permanently forget a memory.
+*   `clear_memories_of_level(level)`: Bulk delete all memories in a specific tier.
+*   `load_memory_to_working(memory_id)`: Promote a Deep Memory handle back to Level 1 Working Memory.
+*   `list_all_memories(level, search_query, page, page_size)`: Paginated, searchable list of all memories.
+*   `query_memories(text, top_k, level)`: Keyword search across the memory database.
+*   `dream_memories(lollms_client)`: Trigger an on-demand subconscious dream consolidation pass.
+
+### Cognitive Graph Traversal
+
+Memories can be explicitly linked using graph relationships, allowing the system to map how concepts connect across sessions.
+
+*   `add_memory_relationship(source_id, target_id, relationship_type, weight, metadata)`: Create an explicit graph edge between two memories.
+*   `remove_memory_relationship(source_id, target_id)`: Remove a graph edge.
+*   `get_memory_relationships(memory_id, relationship_type)`: Get all direct relationships for a specific node.
+*   `traverse_memory_graph(start_id, max_depth, relationship_types)`: Perform a Breadth-First Search (BFS) traversal from a starting node to discover distant connections.
+*   `get_high_centrality_memories(top_k, level)`: Retrieve the most connected/important memories based on graph centrality.
+*   `recalculate_memory_centrality()`: Force a recalculation of centrality scores (computationally expensive).
 
 ## 🏛️ 1. The Dual-Stream Artefact System (.lam Protocol)
 

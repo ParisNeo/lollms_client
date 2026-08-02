@@ -77,13 +77,14 @@ During local tool execution, the active directory is snapshotted immediately bef
 If a tool or script requests a physical file that is missing from the active `workspace_data/` folder, the manager intercepts the failure, queries the database version log, and restores the exact versioned physical bytes back to the disk folder automatically before the execution begins.
 
 ### C. Live Rendering Tags
-The chat interface interprets custom tags inserted into the message history:
-* `<lollms_artifact id="title" type="atype" version="N" />`: Renders an interactive file card in the chat bubble allowing the user to view or download the file.
+The chat interface interprets custom tags inserted into the message history. The parser uses a flexible regex that supports both `<artifact>` and `<artefact>` spellings:
+* `<artifact type="atype" name="title" version="N" />`: Renders an interactive file card in the chat bubble allowing the user to view or download the file.
 * `<artefact_image id="title::N" />`: Directs the chat bubble to render the decoded base64 image pixels inline (e.g., showing a generated plot directly in the conversation).
+* `<revert_artifact name="title" version="N" />`: Reverts the specified artifact to the requested version and updates the UI.
 
 ---
 
-## ✏️ 6. Updating Artefact Content
+## ✏️ 4. Updating Artefact Content
 
 You can modify the content of an existing artefact using the `update()` method. By default, this creates a new version in the database, preserving the history of previous states.
 
@@ -107,9 +108,14 @@ art = discussion.artefacts.update(
 )
 ```
 
+### The Content-First Update Doctrine (DATA Artifacts)
+When updating a `DATA` artifact (like a CSV or Excel file) where the raw bytes (`physical_data`) are not explicitly provided in the function call, the `ArtefactManager` enforces a strict **Content-First Update Doctrine**:
+1. If the new string content differs from the logical schema, the manager assumes the raw data itself is being updated. It encodes the new string to UTF-8 bytes and writes it as the new physical twin.
+2. If the artifact is a binary database (`.db`, `.sqlite`) and raw bytes are missing, the manager **refuses** to encode the string schema as binary data (which would corrupt the database header). Instead, it automatically rehydrates the physical bytes from the existing file on disk before applying the schema update.
+
 ---
 
-## ⚠️ 7. Import Conflict Resolution
+## ⚠️ 5. Import Conflict Resolution
 
 When importing files into the artefact system, there is a possibility of title collisions (e.g., importing `README.md` from two different sources). The `import_file` method provides an `on_conflict` parameter to define the resolution strategy.
 
@@ -149,8 +155,7 @@ discussion.import_file(
 
 ---
 
-## 🛠️ 4. Dynamic Tool Artefacts (`type="tool"`)
-
+## 🛠️ 6. Dynamic Tool Artefacts (`type="tool"`)
 
 The artefact system natively supports the LLM generating its own executable tools. When the LLM creates an artefact with `type="tool"`, the `ArtefactManager` attempts to register it dynamically.
 
@@ -167,7 +172,7 @@ To prevent untrusted LLMs from executing arbitrary code, dynamic tool registrati
 
 ---
 
-## 🧩 5. Artefact Properties Reference & Handling Guide
+## 🧩 7. Artefact Properties Reference & Handling Guide
 
 Every artifact in the system is represented as a dictionary (record) with a specific set of keys. Understanding the distinction between these properties is critical for correctly creating, updating, and referencing artifacts, especially when dealing with the Dual-Stream storage architecture.
 
@@ -205,7 +210,7 @@ The architecture decouples the logical database key (`title`) from the unique di
 
 #### 3. Visibility and Context Budget
 *   **Tool-Generated Files**: By default, tool-generated files >100KB are registered with `visibility=TREE_UNLOCKABLE` and `active=False` to prevent context bloat.
-*   **Unlocking**: The LLM can use `<unlock_file>` to promote a file to `FULL` visibility. However, the Context Budget Guard blocks unlocking files >50,000 tokens, instructing the LLM to use tools (SQL, grep) instead.
+*   **Unlocking**: The LLM can use `<add_files_to_context>` to promote a file to `FULL` visibility. However, the Context Budget Guard blocks unlocking files >50,000 tokens, instructing the LLM to use tools (SQL, grep) instead.
 
 #### 4. Image Artifacts
 *   Image artifacts store base64 encoded strings in the `images` list and their MIME types in `image_media_types`.
@@ -213,8 +218,36 @@ The architecture decouples the logical database key (`title`) from the unique di
 
 ---
 
-## 🛠️ 6. Class Reference
+## 🗄️ 8. Artefact Archiving (Export & Import)
+
+The `ArtefactManager` provides robust utilities to export and import artifacts as portable zip archives. This is essential for transferring complex multi-file applications or version histories between different discussions or projects.
+
+### A. Single Artefact Archives (`.laa`)
+The `.laa` (Lollms Artefact Archive) format bundles all versions, content, physical bytes, and metadata of a *single* artifact title into a zip file.
+
+*   **Export**: `export_artefact_to_archive(title, output_path)` creates a `.laa` file containing a `manifest.json` and separate files for each version's text content (`vN_content.txt`) and raw binary data (`vN_physical.bin`).
+*   **Import**: `import_artefact_from_archive(laa_path, activate)` extracts the archive, purges any existing artifact with the same title, and restores the full version history. If `activate=True`, the latest imported version is activated immediately.
+
+### B. Artefact Bundles (`.lab`)
+The `.lab` (Lollms Artefact Bundle) format allows exporting and importing *multiple* files or entire directories at once.
+
+*   **Export**: `export_artefact_bundle(paths, output_path, include_versions)` takes a list of file/directory paths from the `workspace_data` directory and zips them together. If `include_versions=True`, it also bundles the historical version files inside a `_versions/` directory.
+*   **Import**: `import_artefact_bundle(lab_path, activate)` extracts the `.lab` archive directly into the active `workspace_data` directory. It automatically classifies each file by extension (e.g., `.py` -> `CODE`, `.csv` -> `DATA`), reads text or physical bytes accordingly, and registers them as new artifacts. Binary files (like `.db` or `.png`) are read as raw bytes, while text files are injected directly into the artifact's `content`.
+
+### C. JSON Export/Import
+For lightweight, text-only integrations (such as passing an artifact via an API payload), the manager also supports standard JSON serialization:
+*   `export_artefact(title)`: Returns a JSON-serializable dictionary containing all versions and companion image versions.
+*   `import_artefact(artefact_data, activate)`: Reconstructs the artifact and its companion images from a JSON dictionary.
+*   `export_artefact_bundle(title)`: A legacy JSON-based single-artifact export that includes companion image artifacts.
+
+---
+
+## 🛠️ 9. Class Reference
 
 *   **`ArtefactType`**: Registry defining the supported categories (`DATA`, `CODE`, `DOCUMENT`, `IMAGE`, `PRESENTATION`, `NOTE`, `SKILL`, `TOOL`, `SCRATCHPAD`).
-* **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, manages version history squashing, and gates dynamic tool registration.
-* **`FileImportMixin`**: Contains multi-modal parser subroutines for importing PDFs, Word documents, PowerPoint presentations, and audio files.
+*   **`ArtefactVisibility`**: Enum-like class defining the context tiers (`FULL`, `TREE_UNLOCKABLE`, `METADATA`, `TREE_LOCKED`, `HIDDEN`).
+*   **`ArtefactStatus`**: Enum-like class defining the lifecycle states (`DRAFTING`, `STABLE`, `REVISING`, `ERROR`).
+*   **`ArtefactManager`**: Orchestrates database CRUD operations, applies search-and-replace patches, manages version history squashing, and gates dynamic tool registration.
+*   **`FileImportMixin`**: Contains multi-modal parser subroutines for importing PDFs, Word documents, PowerPoint presentations, and audio files.
+*   **`InternetImportMixin`**: Provides native web scraping and semantic search operations (Arxiv, GitHub, StackOverflow, Wikipedia, etc.).
+*   **`ExportMixin`**: Handles exporting artifacts to various formats (PDF, DOCX, PPTX, HTML, ZIP).

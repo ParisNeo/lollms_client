@@ -9,7 +9,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/ParisNeo/lollms_client.svg?style=social&label=Star&maxAge=2592000)](https://github.com/ParisNeo/lollms_client/stargazers/)
 [![GitHub issues](https://img.shields.io/github/issues/ParisNeo/lollms_client.svg)](https://github.com/ParisNeo/lollms_client/issues)
 
-<img width="941" height="1672" alt="ChatGPT Image 10 juin 2026, 12_43_49" src="https://github.com/user-attachments/assets/bebb5958-5037-4e7c-b167-a198530c1438" />
+<img width="941" height="1672" alt="lolms rchitecture" src="https://github.com/user-attachments/assets/bebb5958-5037-4e7c-b167-a198530c1438" />
 
 
 
@@ -529,6 +529,172 @@ blocks = tp.extract_code_blocks(
 * ✅ JSON Schema & Pydantic support
 * ✅ Decision helpers (yes/no, multichoice, ranking)
 * ✅ Graceful fallback strategies
+
+---
+
+## 🧠 The High-Grade Agent System (`lollms_agent`)
+
+The `Agent` class is the flagship autonomous execution engine. Unlike `LollmsDiscussion` (optimized for ~20 conversational turns), the Agent is designed for **long-horizon autonomous tasks** (50–200 reasoning rounds) such as build→test→fix loops and multi-file refactoring.
+
+### Core Subsystems
+
+| Subsystem | Purpose |
+|---|---|
+| **CapabilityFlags** | Boolean security gates (`enable_code_execution`, `enable_sub_agents`, `enable_model_switching`). Dangerous defaults are `False`. |
+| **SubAgentSpawner** | Spawns focused child agents with depth/count limits. Children cannot spawn further sub-agents. |
+| **SkillsManager** | Loads `SKILL.md` files. Supports "always_visible", "loadable", and "mixed" modes for cross-session learning. |
+| **_AgentStreamState** | Transactional stream parser that intercepts `<tool>` and `<done/>` tags during generation. |
+| **Handbag** | A unified, portable folder containing all agent resources (personalities, tools, skills, RAG, memory). |
+
+### Autonomous Build → Test → Fix Loop
+
+```python
+from lollms_client import LollmsClient
+from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags
+from lollms_client.lollms_personality import LollmsPersonality
+
+client = LollmsClient(
+    llm_binding_name="ollama",
+    llm_binding_config={"model_name": "qwen3:32b", "host_address": "http://localhost:11434"},
+)
+
+personality = LollmsPersonality(
+    name="AutonomousEngineer",
+    author="system",
+    category="engineering",
+    description="An autonomous software engineer.",
+    system_prompt=(
+        "You are an Autonomous Software Engineer.\n"
+        "1. WRITE the code (using tool_write_file)\n"
+        "2. WRITE unit tests\n"
+        "3. EXECUTE the tests (using tool_execute_python_code)\n"
+        "4. If tests FAIL, FIX the code and RE-EXECUTE.\n"
+        "5. When ALL tests pass, emit <done/>."
+    ),
+)
+
+caps = CapabilityFlags(
+    enable_code_execution=True,
+    enable_workspace_tools=True,
+    enable_skill_creation=True,
+)
+
+agent = Agent(
+    lc=client,
+    personality=personality,
+    name="BuildTestFixBot",
+    role=AgentRole.IMPLEMENTER,
+    workspace_path="./workspace",
+    capabilities=caps,
+    max_tokens_per_turn=8192,
+)
+
+result = agent.chat(
+    prompt="Build a Python module `string_utils.py` with `reverse_string` and `count_vowels`, write tests, and run them until they pass.",
+    max_reasoning_steps=100,
+    temperature=0.2,
+)
+
+print(f"Rounds: {result['rounds']}, Tool calls: {len(result['tool_calls'])}")
+```
+
+### The Handbag (Portable Agent Resources)
+
+The Handbag allows you to package ALL agent resources into a single folder. If you point the agent to a handbag path, it auto-configures personalities, tools, skills, RAG, and memory.
+
+```text
+my_handbag/
+├── handbag.yaml              # Optional manifest
+├── personalities/            # SOUL.md bundles
+├── tools/                    # LCP tools (.py)
+├── skills/                   # SKILL.md files
+├── rag/                      # Text documents for retrieval
+├── memory/                   # memory.db
+└── workspace/                # Isolated working directory
+```
+
+```python
+agent = Agent(
+    lc=client,
+    handbag_path="./my_handbag",  # Auto-loads everything
+    name="ResearchBot",
+    capabilities=CapabilityFlags(enable_code_execution=True),
+)
+```
+
+---
+
+## 🧠 LollmsDiscussion: Cognitive Sessions & Artefacts
+
+`LollmsDiscussion` is a stateful, thread-safe conversational engine that bridges transient LLM tokens and permanent, versioned knowledge storage. It implements the **Agentic State Machine** and the **Dual-Stream Artefact System**.
+
+### The Dual-Stream Artefact System (.lam Protocol)
+
+To solve the "Context vs. Tool" paradox, artefacts are split into two streams:
+1.  **Physical Twin**: Raw bytes on disk (CSV, SQLite, PNG). Executable by local tools.
+2.  **Logical Twin (`.lam`)**: High-density text schemas. Injected into the LLM context.
+
+**Visibility Tiers**:
+*   `[C]` FULL: Verbatim content injected.
+*   `[U]` TREE_UNLOCKABLE: Listed in directory, excluded from context. The LLM can unlock this via `<add_files_to_context>`.
+*   `[L]` TREE_LOCKED: Excluded from context. Cannot be unlocked by the LLM.
+
+### The Agentic Loop & `<done/>` Protocol
+
+The `chat()` method is an Agentic State Machine. The LLM is given explicit control via the `<done/>` tag.
+1.  **Round 1 Short-Circuit**: If the LLM generates pure text without functional tags, the loop breaks immediately.
+2.  **Action Continuation**: If the LLM emits `<tool>` or `<artifact>`, the action is executed, and a mandate is injected.
+3.  **Explicit Termination**: The loop only breaks if the LLM emits `<done/>` on a new line, or if `max_reasoning_steps` is reached.
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+db_manager = LollmsDataManager("sqlite:///discussion.db")
+discussion = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
+
+response = discussion.chat(
+    user_message="Analyze data.csv and build a plot.",
+    enable_artefacts=True,
+    enable_code_execution=True,
+    max_reasoning_steps=20
+)
+```
+
+### Multi-Source Tool Orchestration (LCP)
+
+The `chat()` method enforces a **Strict Sovereign Opt-In Doctrine**. Tools are ONLY activated if explicitly requested:
+1.  **Personality Handbag Tools**: Auto-mounted if the personality contains a `tools` attribute.
+2.  **Explicit `tools` parameter**: Accepts a dict of callables OR a list of string names matching the LCP registry.
+3.  **Auto-Mounted Data Tools**: `semantic_data_engineer` is auto-mounted IF `enable_data_tools=True` AND data files exist.
+
+```python
+# Explicitly activate default LCP tools by name
+discussion.chat(
+    user_message="Search the internet and run python code.",
+    tools=["tool_internet_search", "tool_execute_python_code"],
+    enable_code_execution=True
+)
+```
+
+---
+
+## 👜 Personality Bundles & RAG
+
+Personalities are packaged using the **Bundle Format**. A bundle is a directory containing a `SOUL.md` file and optional resource folders (`tools/`, `skills/`, `knowledge/`).
+
+```python
+from lollms_client.lollms_personality import PersonalityBundle
+
+# Import a personality from a folder
+personality = PersonalityBundle.import_bundle(
+    bundle_path="./personalities/my_cinema_agent",
+    lollms_client=client
+)
+
+# Use it in a discussion
+discussion.chat(user_message="Pitch a sci-fi movie.", personality=personality)
+```
 
 ---
 
@@ -1898,6 +2064,191 @@ else:
 
 This powerful feature allows for complex creative tasks like character swapping, background replacement, and style transfer directly through the `lollms_client` library.
 
+## 🔌 Tool Bindings: LCP & MCP
+
+The library supports two primary tool execution frameworks:
+
+### 1. LCP (LollmsCommunicationProtocol)
+A lightweight, zero-dependency local tool execution framework. LCP uses AST parsing to automatically extract tool schemas from Python docstrings.
+
+**Writing an LCP Tool:**
+```python
+# my_tool.py
+def tool_analyze_data(file_name: str) -> dict:
+    """
+    Analyzes a file and returns statistics.
+
+    Args:
+        file_name (str): Name of the file to inspect in the workspace.
+    """
+    from pathlib import Path
+    path = Path(file_name)
+    if not path.exists():
+        return {"success": False, "error": f"File '{file_name}' not found."}
+
+    return {
+        "success": True, 
+        "output": f"File contains {len(path.read_text())} characters.",
+        "prompt_injection": "Tell the user the analysis is complete."
+    }
+```
+
+**Security Gates:**
+*   `enable_code_execution=True`: Registers `tool_execute_python_code` (arbitrary Python string execution).
+*   `allow_dynamic_tools=True`: Allows the LLM to write and execute its own `.py` tools on the fly via `type="tool"` artifacts.
+
+### 2. MCP (Model Context Protocol)
+Connects to external MCP-compliant servers (local `stdio` or remote `http`). Tools are namespaced using `alias::tool_name`.
+
+```python
+from lollms_client.tools_bindings.mcp import MCPBinding
+
+mcp_binding = MCPBinding(servers=[
+    {
+        "alias": "local_fs",
+        "type": "stdio",
+        "command": ["python", "-m", "mcp_server_filesystem", "/path/to/allowed/dir"]
+    }
+])
+
+result = mcp_binding.execute_tool(
+    tool_name="local_fs::read_file",
+    params={"path": "/path/to/allowed/dir/test.txt"}
+)
+```
+
+---
+
+## 🧠 Cognitive Memory Architecture (`lollms_memory`)
+
+The memory system is a stateful, human-brain-inspired cognitive graph that persists across sessions. It combines mathematical decay with semantic graph traversal to manage context efficiently.
+
+### Multi-Level Memory Tiers
+
+| Tier | Type | Scope | Context Behavior |
+|---|---|---|---|
+| **Level 0** | Volatile Scratchpad | Single Turn | Appended before the last user prompt. Cleared after turn. |
+| **Level 1** | Working Memory | Active Session | Rendered verbatim in the system prompt context. |
+| **Level 2** | Deep Memory | Inactive / Latent | Injected as lightweight ID handles only. The LLM must use `<mem_load>` to promote them. |
+| **Level 3** | Archived Memory | Deep Storage | Completely excluded from context. Evaluated during the Dream Cycle for permanent deletion or restoration. |
+| **Level 4** | Episodic Memory | Permanent History | Chronological, immutable logs of past interactions. Used for retrospective queries. |
+
+### Petroff's Power-Law Decay & Spreading Activation
+
+Memories do not expire linearly. Their activation energy ($B_i$) decays logarithmically based on retrieval history:
+$$B_i = \ln \left( \sum_{j} (t - t_j)^{-d} \right)$$
+If $B_i$ drops below the `demotion_threshold`, the memory is demoted from Level 1 to Level 2. 
+
+When a memory is retrieved, energy is spread **multiplicatively** to its semantically linked neighbors (defined via `RELATED_TO`, `SUPPORTS`, `CONTRADICTS` graph edges). This pre-warms related concepts in Deep Memory without injecting them into the context.
+
+### The Dream Cycle (`dream()`)
+
+An asynchronous consolidation pass that runs periodically or on-demand:
+1.  **Soft-Delete Purge**: Permanently deletes nodes with `0.0` importance.
+2.  **Centrality Auditing**: Computes PageRank-like centrality to identify keystone memories.
+3.  **Synaptic Fusion**: Merges redundant memories sharing identical tags.
+4.  **LLM-Assisted Forgetting**: Evaluates faded memories and decides whether to restore or permanently purge them.
+
+### Memory XML Commands
+
+The LLM interacts with the memory graph using stream tags:
+*   `<mem_new tags="..." subject="..." predicate="..." object="..." importance="0.9">Fact</mem_new>`
+*   `<mem_update id="UUID">Updated Fact</mem_update>`
+*   `<mem_tag id="UUID" />` (Boosts importance)
+*   `<mem_load id="UUID" />` (Promotes Deep Memory to Working Memory)
+*   `<mem_rel source="UUID" target="UUID" type="SUPPORTS" weight="1.0" />`
+
+### Dual-Database Architecture & Graph Traversal
+
+The system utilizes a **Dual-Database Attachment** paradigm over SQLite:
+1.  **Private Local Database (`main.memories`)**: Bound strictly to the current discussion session.
+2.  **Shared Semantic Database (`shared_mem_db.memories`)**: Shared across all discussions inside a given project workspace.
+
+When a `shared_db_path` is provided, the manager executes `ATTACH DATABASE` and constructs a cross-schema `UNION ALL` query layer, allowing the application to query both local and shared schemas transparently as a single unified graph.
+
+**Graph Traversal API (`MemoryMixin`)**:
+*   `add_memory_relationship(source_id, target_id, relationship_type, weight)`: Create an explicit graph edge.
+*   `traverse_memory_graph(start_id, max_depth, relationship_types)`: Perform a Breadth-First Search (BFS) traversal to discover distant connections.
+*   `get_high_centrality_memories(top_k, level)`: Retrieve the most connected/important memories based on graph centrality.
+
+---
+
+## 👁️ Multi-Tier Artefact Visibility & Context Budget (`lollms_artefact`)
+
+To prevent context window exhaustion, the Artefact System enforces a strict visibility state machine. **All newly registered or tool-generated files default to `TREE_UNLOCKABLE` (`[U]`)** to prevent automatic context pollution.
+
+### Visibility Tiers
+
+| Tier | Symbol | Context Behavior |
+|---|---|---|
+| **FULL** | `[C]` | Content (or `.lam` schema) fully injected into the prompt. |
+| **METADATA** | `[M]` | Only basic metadata (filename, size, type) is injected. |
+| **TREE_UNLOCKABLE** | `[U]` | Listed in the directory index, but excluded from context. **The default state.** |
+| **TREE_LOCKED** | `[L]` | Excluded from context. The LLM **cannot** unlock this. |
+| **HIDDEN** | — | Completely excluded from both context and the directory tree. |
+
+### LLM Control Tags
+
+The LLM can dynamically manage its context budget by emitting these tags:
+```xml
+<unlock_file>
+filename.ext
+</unlock_file>
+
+<lock_file>
+filename.ext
+</lock_file>
+
+<hide_file>
+filename.ext
+</hide_file>
+```
+The `ChatMixin` intercepts these tags, applies the visibility changes via `ArtefactManager.set_visibility()`, and forces a continuation round so the LLM immediately utilizes the newly available (or freed) context.
+
+### The Context Budget Guard
+
+The system actively blocks the LLM from unlocking files >50,000 tokens, instructing it to use tools (SQL, grep) instead. Tool-generated files >100KB are automatically registered as `[U]` to protect the context window.
+
+---
+
+## 🧬 Advanced Agentic Loop Mechanics (`lollms_discussion`)
+
+The `LollmsDiscussion.chat()` method is an **Agentic State Machine** that goes far beyond simple tool execution.
+
+### The `<done/>` Termination Protocol
+
+The loop does not rely on heuristics to decide when to stop.
+1.  **Round 1 Short-Circuit**: If the LLM generates pure text without `<tool>` or `<artifact>` tags on the first round, the loop breaks immediately.
+2.  **Action Continuation**: If the LLM emits a functional tag, the action is executed. A mandate is injected: "When you think you finished your task, issue a final conversational text and end it with a `<done/>` tag."
+3.  **Explicit Termination**: The loop only breaks if the LLM emits `<done/>` on a new line, or if `max_reasoning_steps` is reached. The tag is stripped from the final UI output.
+
+### The Context Diet Protocol (Three-View Protocol)
+
+To prevent context bloat during long autonomous sessions, historical messages are sanitized using a three-view protocol:
+1.  **Recent View (Last 2 Functional Actions)**: Raw content is preserved **verbatim**, including `<tool>` tags and `<processing>` logs. This maintains perfect KV-cache alignment for multi-turn tool chaining.
+2.  **Reduced View (Older Turns)**: Functional XML is replaced with opaque placeholders (e.g., `[🔒SYSTEM_ARTIFACT_ANCHOR:main.py]`). Execution logs are scrubbed completely.
+3.  **User View (Always Verbatim)**: User messages are **never** sanitized.
+
+### Dual-Copy Virtual History Persistence
+
+To solve **Multi-Turn Context Amnesia**, the system stores two copies of assistant messages involving multi-step tool calls:
+*   **UI Content**: The sanitized, user-facing text.
+*   **Virtual History**: The raw, unsanitized alternation of `<tool>` tags and `<tool_result>` payloads.
+
+When building the context for the *next* turn, the sanitized UI content is discarded and replaced with the raw Virtual History. This ensures the LLM sees its exact previous execution path, preventing it from repeating tools or halting prematurely.
+
+---
+
+## 🏗️ Agent Application Build Guide
+
+To build a robust autonomous application using `lollms_client`, follow this architectural pattern:
+
+1.  **Initialize the Client**: Configure your LLM and Tool bindings using the unified `llm_binding_config` dictionary.
+2.  **Define the Personality**: Use `LollmsPersonality` or import a bundle via `PersonalityBundle.import_bundle()`. Include explicit autonomous instructions in the `system_prompt` (e.g., "NEVER ask the user for help", "Emit `<done/>` when finished").
+3.  **Set Capability Flags**: Use `CapabilityFlags` to strictly gate dangerous capabilities (`enable_code_execution=True`, `enable_sub_agents=True`).
+4.  **Configure the Workspace**: Point the `Agent` or `LollmsDiscussion` to an isolated `workspace_path`.
+5.  **Execute the Loop**: Call `agent.chat()` with a high `max_reasoning_steps` (80-150 for build→test→fix loops) and low `temperature` (0.1-0.3 for code).
+
 ### Listing Available Models
 
 You can query the active LLM binding to get a list of models it supports or has available. The exact information returned depends on the binding (e.g., Ollama lists local models, OpenAI lists all its API models).
@@ -1935,468 +2286,3 @@ except Exception as e:
     ASCIIColors.error(f"An error occurred: {e}")
 
 ```
-
-# 📚 LollmsClient: Binding Discovery & Initialization Guide
-
-This guide covers how to programmatically discover available LLM bindings, inspect their configuration requirements (`description.yaml`), instantiate a `LollmsClient` instance, and execute text generation.
-
----
-
-## 1. Listing Available LLM Bindings
-
-The `LollmsLLMBindingManager` automatically scans the `llm_bindings/` directory for subfolders containing an `__init__.py` file. You can retrieve the list of available binding names programmatically.
-
-```python
-from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
-
-manager = LollmsLLMBindingManager()
-
-# Get a list of all available binding names (e.g., ['ollama', 'openai', 'llama_cpp_server', ...])
-available_bindings = manager.get_available_bindings()
-
-print("Available LLM Bindings:")
-for binding_name in available_bindings:
-    print(f"  - {binding_name}")
-```
-
----
-
-## 2. Inspecting Binding Descriptions (`description.yaml`)
-
-Every binding ships with a `description.yaml` file that defines its metadata, supported features, and required configuration parameters. You can load this YAML file and export it as a JSON-serializable dictionary.
-
-```python
-import json
-from lollms_client.lollms_llm_binding import LollmsLLMBindingManager
-
-manager = LollmsLLMBindingManager()
-
-# Select a specific binding to inspect
-target_binding = "ollama"
-
-# Retrieve the parsed description.yaml content as a dictionary
-description = manager.get_binding_description(target_binding)
-
-if description:
-    # Print as formatted JSON content
-    print(f"--- {target_binding} description.json ---")
-    print(json.dumps(description, indent=2))
-else:
-    print(f"No description found for {target_binding}")
-```
-
-**Example JSON Output:**
-```json
-{
-  "name": "ollama",
-  "author": "Lollms Team",
-  "version": "1.0",
-  "description": "Binding for the Ollama local LLM server.",
-  "supported_features": ["text_generation", "streaming", "vision"],
-  "config_requirements": [
-    {
-      "name": "host_address",
-      "type": "str",
-      "required": false,
-      "default": "http://localhost:11434"
-    }
-  ]
-}
-```
-
----
-
-## 3. Populating a `LollmsClient` Instance
-
-The `LollmsClient` is the sovereign entry point for all LLM operations. You initialize it by specifying the `llm_binding_name` and passing a dictionary of configuration parameters (`llm_binding_config`) that match the requirements found in the `description.yaml`.
-
-```python
-from lollms_client import LollmsClient
-
-# 1. Define the configuration for the binding
-#    Keys must match the parameters expected by the specific binding's __init__.py
-llm_config = {
-    "model_name": "gpt-4o",          # The specific model to use
-    "host_address": "http://localhost:11434", # Required by ollama/llama_cpp_server
-    # "api_key": "sk-...",           # Required by openai, mistral, groq, etc.
-}
-
-# 2. Instantiate the LollmsClient
-#    This automatically initializes the LLM binding, TTI, TTS, and Tool bindings if specified.
-client = LollmsClient(
-    llm_binding_name="ollama",
-    llm_binding_config=llm_config,
-    debug=True
-)
-
-print(f"Successfully initialized LollmsClient with binding: {client.llm.binding_name}")
-print(f"Active model: {client.llm.model_name}")
-```
-
-### Initialization Parameters
-*   `llm_binding_name` (`str`): The exact name of the binding folder (e.g., `"openai"`, `"ollama"`, `"llama_cpp_server"`).
-*   `llm_binding_config` (`dict`): A dictionary of keyword arguments passed directly to the binding's constructor.
-*   `tools_binding_name` (`Optional[str]`): Name of the tools/MCP binding to mount (e.g., `"lcp"`).
-*   `tools_binding_config` (`Optional[dict]`): Configuration for the tools binding.
-*   `debug` (`bool`): Enables verbose ASCII-color logging.
-
----
-
-## 4. Using the Client for Text Generation
-
-Once the `LollmsClient` is instantiated, you can access the underlying binding via `client.llm` to generate text, either as a direct string or via a streaming callback.
-
-### A. Simple Text Generation
-
-```python
-prompt = "Explain the concept of sovereignty in software architecture in one paragraph."
-
-# generate_text is a standard method exposed by all LLM bindings
-response = client.generate_text(
-    prompt=prompt,
-    temperature=0.7,
-    max_size=4096
-)
-
-print("\n=== LLM Response ===")
-print(response)
-```
-
-### B. Streaming Generation (Token by Token)
-
-For UI integration or real-time feedback, use a streaming callback function.
-
-```python
-from lollms_client.lollms_types import MSG_TYPE
-
-def stream_callback(chunk: str, msg_type: MSG_TYPE, metadata: dict):
-    # Print each chunk without a newline for continuous streaming
-    print(chunk, end="", flush=True)
-
-print("\n=== Streaming LLM Response ===")
-client.generate_text(
-    prompt="Write a haiku about neural networks.",
-    streaming_callback=stream_callback,
-    temperature=0.5
-)
-print("\n")
-```
-
-### C. Chat-Formatted Generation
-
-If the binding supports chat templates (most modern bindings do), you can use `generate_from_messages`.
-
-```python
-messages = [
-    {"role": "system", "content": "You are a strict and concise technical auditor."},
-    {"role": "user", "content": "What are the three most critical vulnerabilities in legacy PHP applications?"}
-]
-
-response = client.generate_from_messages(
-    messages=messages,
-    temperature=0.2
-)
-
-print("\n=== Chat Response ===")
-print(response)
-```
-
-### Long Context Processing for Long Texts (`long_context_processing`)
-
-When dealing with a document, article, or transcript that is too large to fit into a model's context window, the `long_context_processing` method is the solution. It intelligently chunks the text, summarizes or processes each piece, and then synthesizes those into a final, coherent output.
-
-```python
-from lollms_client import LollmsClient, MSG_TYPE
-from ascii_colors import ASCIIColors
-import os
-
-# --- A very long text (imagine this is 10,000+ tokens) ---
-long_text = """
-The history of computing is a fascinating journey from mechanical contraptions to the powerful devices we use today. 
-It began with devices like the abacus, used for arithmetic tasks. In the 19th century, Charles Babbage conceived 
-the Analytical Engine, a mechanical computer that was never fully built but laid the groundwork for modern computing. 
-Ada Lovelace, daughter of Lord Byron, is often credited as the first computer programmer for her work on Babbage's Engine.
-The 20th century saw the rise of electronic computers, starting with vacuum tubes and progressing to transistors and integrated circuits. 
-Early computers like ENIAC were massive machines, but technological advancements rapidly led to smaller, more powerful, and more accessible devices.
-The invention of the microprocessor in 1971 by Intel's Ted Hoff was a pivotal moment, leading to the personal computer revolution. 
-Companies like Apple and Microsoft brought computing to the masses. The internet, initially ARPANET, transformed communication and information access globally.
-In recent decades, cloud computing, big data, and artificial intelligence have become dominant themes. AI, particularly machine learning and deep learning, 
-has enabled breakthroughs in areas like image recognition, natural language processing, and autonomous systems.
-Today, a new revolution is on the horizon with quantum computing, which promises to solve problems that are currently intractable 
-for even the most powerful supercomputers. Researchers are exploring qubits and quantum entanglement to create 
-machines that will redefine what is computationally possible, impacting fields from medicine to materials science.
-This continuous evolution demonstrates humanity's relentless pursuit of greater computational power and intelligence.
-""" * 10 # Simulate a very long text (repeated 10 times)
-
-# --- Callback to see the process in action ---
-def lcp_callback(chunk: str, msg_type: MSG_TYPE, params: dict = None, **kwargs):
-    if msg_type in [MSG_TYPE.MSG_TYPE_STEP_START, MSG_TYPE.MSG_TYPE_STEP_END]:
-        ASCIIColors.yellow(f">> {chunk}")
-    elif msg_type == MSG_TYPE.MSG_TYPE_STEP:
-        ASCIIColors.cyan(f"   {chunk}")
-    elif msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
-        # Only print final answer chunks, not internal step chunks
-        pass
-    return True
-
-try:
-    lc = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
-
-    # The contextual prompt guides the focus of the processing
-    context_prompt = "Summarize the text, focusing on the key technological milestones, notable figures, and future directions in computing history."
-
-    ASCIIColors.blue("--- Starting Long Context Processing (Summarization) ---")
-    
-    final_summary = lc.long_context_processing(
-        text_to_process=long_text,
-        contextual_prompt=context_prompt,
-        chunk_size_tokens=1000, # Adjust based on your model's context size
-        overlap_tokens=200,
-        streaming_callback=lcp_callback,
-        temperature=0.1 # Good for factual summarization
-    )
-    
-    ASCIIColors.blue("\n--- Final Comprehensive Summary ---")
-    ASCIIColors.green(final_summary)
-
-except Exception as e:
-    ASCIIColors.error(f"An error occurred during long context processing: {e}")
-```
-## low level text processing
-Here is the **English, README-ready version**, clean and aligned with LOLLMS documentation standards.
-
----
-
-## 🧠 Lollms Text Processor
-
-The **Lollms Text Processor** is a high-level utility designed to turn raw LLM generations into **production-ready workflows**.
-It handles long documents, structured outputs, robust code generation, intelligent editing, and reliable parsing.
-
-It is directly accessible via:
-
-```python
-lc.llm.tp
-```
-
----
-
-## 🔧 Initialization
-
-```python
-from lollms_client import LollmsClient
-
-lc = LollmsClient(
-    llm_binding_name="lollms",
-    llm_binding_config={
-        "model_name": "llama3",
-        "host_address": "http://localhost:9642",
-        "service_key": "the service key"
-    }
-)
-
-llm = lc.llm
-tp = lc.llm.tp
-```
-
-* `llm` provides low-level text generation primitives
-* `tp` is the **Text Processor**, ready to use out of the box
-
----
-
-## 📚 1. Long Context Processing
-
-The Text Processor automatically handles documents that exceed the model’s context window by chunking, synthesizing intermediate results, and producing a final consolidated output.
-
-### Text generation from a very long document
-
-```python
-summary = tp.long_context_processing(
-    text_to_process=long_document,
-    contextual_prompt="Summarize the main findings about climate change",
-    processing_type="text"
-)
-```
-
-### Structured extraction from long context
-
-```python
-result = tp.long_context_processing(
-    text_to_process=long_document,
-    contextual_prompt="Extract all people mentioned with their roles",
-    processing_type="structured",
-    schema={
-        "type": "object",
-        "properties": {
-            "people": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "role": {"type": "string"}
-                    }
-                }
-            }
-        }
-    }
-)
-```
-
-### Yes / No question over long documents
-
-```python
-answer = tp.long_context_processing(
-    text_to_process=long_document,
-    contextual_prompt="Does this document mention Marie Curie?",
-    processing_type="yes_no",
-    return_explanation=True
-)
-```
-
----
-
-## 💻 2. Code Generation and Editing
-
-### Single-file code generation
-
-```python
-code = tp.generate_code(
-    prompt="Create a binary search function",
-    language="python"
-)
-```
-
-### Multi-file project generation
-
-```python
-files = tp.generate_codes(
-    prompt="Create a Flask web app with an HTML frontend"
-)
-```
-
-### Efficient code editing (non-destructive)
-
-```python
-updated_code = tp.edit_code(
-    original_code=existing_code,
-    edit_instruction="Add error handling and logging",
-    language="python"
-)
-```
-
-Unlike naïve prompting, edits are **structural**, not full rewrites.
-
----
-
-## 🧩 3. Structured Content Generation
-
-### Using JSON Schema
-
-```python
-data = tp.generate_structured_content(
-    prompt="Create a presentation about AI",
-    schema={
-        "type": "object",
-        "properties": {
-            "slides": {
-                "type": "array",
-                "items": {"type": "object"}
-            }
-        }
-    }
-)
-```
-
-### Using Pydantic models
-
-```python
-from pydantic import BaseModel
-
-class Person(BaseModel):
-    name: str
-    age: int
-
-person = tp.generate_structured_content_pydantic(
-    prompt="Create a person named Alice, age 30",
-    pydantic_model=Person
-)
-```
-
-✔ Automatic validation
-✔ Truncation recovery
-✔ Agent-friendly outputs
-
----
-
-## 🧠 4. LLM Helper Utilities
-
-### Yes / No questions
-
-```python
-answer = tp.yes_no(
-    question="Is Marie Curie a scientist?",
-    context="Marie Curie was a physicist...",
-    return_explanation=True
-)
-```
-
-### Multiple-choice questions
-
-```python
-choice = tp.multichoice_question(
-    question="What field did Marie Curie work in?",
-    possible_answers=["Biology", "Physics", "Chemistry"]
-)
-```
-
-### Text summarization
-
-```python
-summary = tp.summerize_text(text="Long article...")
-```
-
-### Keyword extraction
-
-```python
-keywords = tp.extract_keywords(
-    text="Long article...",
-    num_keywords=5
-)
-```
-
----
-
-## 🧪 5. Response Parsing and Cleanup
-
-### Extract reasoning / thinking blocks
-
-```python
-thoughts = tp.extract_thinking_blocks(llm_response)
-```
-
-### Remove reasoning blocks
-
-```python
-clean_text = tp.remove_thinking_blocks(llm_response)
-```
-
-### Extract code blocks (legacy support)
-
-```python
-blocks = tp.extract_code_blocks(
-    text=llm_response,
-    format="markdown"
-)
-```
-
----
-
-## ✨ Key Features
-
-* ✅ Automatic **long-context handling**
-* ✅ XML-based code generation (no fragile backticks)
-* ✅ Truncation recovery for JSON and code
-* ✅ Non-destructive, structured code editing
-* ✅ JSON Schema & Pydantic support
-* ✅ Decision helpers (yes/no, multichoice, ranking)
-* ✅ Graceful fallback strategies

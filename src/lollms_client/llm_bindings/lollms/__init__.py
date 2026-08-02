@@ -538,28 +538,17 @@ class LollmsBinding(LollmsLLMBinding):
 
         # ── Inject think / reasoning params ───────────────────────────────────
         if think:
-            if self.is_vllm:
-                params.setdefault("extra_body", {}).setdefault(
-                    "chat_template_kwargs", {}
-                )["enable_thinking"] = True
-            else:
-                # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
-                # Chat Completions uses flat reasoning_effort, not the
-                # nested `reasoning` dict (that is Responses API only).
-                params["reasoning_effort"] = reasoning_effort or "low"
-                # Some providers extend the API with a summary field;
-                # pass it via extra_body so the SDK doesn't reject it.
-                if reasoning_summary and reasoning_summary != "auto":
-                    params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
-                # These models reject temperature / top_p
-                params.pop("temperature", None)
-                params.pop("top_p", None)
-        else:
-            if self.is_vllm:
-                # Explicitly disable so vLLM doesn't carry over a cached state
-                params.setdefault("extra_body", {}).setdefault(
-                    "chat_template_kwargs", {}
-                )["enable_thinking"] = False
+            # OpenAI extended-thinking models (o3, o4-mini, gpt-5 …)
+            # Chat Completions uses flat reasoning_effort, not the
+            # nested `reasoning` dict (that is Responses API only).
+            params["reasoning_effort"] = reasoning_effort or "low"
+            # Some providers extend the API with a summary field;
+            # pass it via extra_body so the SDK doesn't reject it.
+            if reasoning_summary and reasoning_summary != "auto":
+                params.setdefault("extra_body", {})["reasoning_summary"] = reasoning_summary
+            # These models reject temperature / top_p
+            params.pop("temperature", None)
+            params.pop("top_p", None)
 
         output = ""
 

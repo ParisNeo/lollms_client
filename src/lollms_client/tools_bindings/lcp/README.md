@@ -16,7 +16,7 @@ LCP is a lightweight, zero-dependency local tool execution framework for Lollms.
 
 ### 3. Discussion-Isolated Workspaces
 **Secure, Sandbox-Per-Chat.** Every discussion gets its own isolated workspace folder (`data_workspace/discussions/{discussion_id}/`).
-*   **Automatic Sync:** When a tool creates a file, it is instantly synced as an Artifact in that specific discussion.
+*   **Automatic Sync:** When a tool creates a file, it is instantly synced as an Artifact in that specific discussion by the ChatMixin orchestrator.
 *   **No Path Conflicts:** Tools operate on simple relative paths (e.g., `data.csv`) because the CWD is automatically set to the discussion's folder before execution.
 *   **Binary Safety:** The system intelligently handles binary files (images, databases) by creating placeholder artifacts with download links, preventing context bloat.
 
@@ -27,14 +27,20 @@ LCP is a lightweight, zero-dependency local tool execution framework for Lollms.
 *   **`tools_folders`**: Scan multiple local directories simultaneously.
 *   **`tool_files`**: Import standalone Python tool files directly from anywhere on disk.
 
-### 6. Context Awareness
-Tools can optionally receive the active `LollmsClient` instance and `LollmsDiscussion` session state directly via keyword arguments (`lollms_client_instance`, `discussion_instance`).
+### 6. Context Awareness (Advanced Agentic Patterns)
+Tools can optionally receive the active `LollmsClient` instance and `LollmsDiscussion` session state directly via keyword arguments (`lollms_client_instance`, `discussion_instance`). The AST parser automatically filters these out when building the JSON schema for the LLM, ensuring the LLM never sees them.
 
 ### 7. Dynamic Tool Generation from Artefacts
 **LLM-Authored Tools.** LCP integrates seamlessly with the Artefact system. If the LLM generates a `type="tool"` artefact, LCP can dynamically compile and register it in memory.
 *   **`register_tool_from_code(tool_name_prefix, code)`**: Executes raw Python code in an isolated module namespace, extracts `tool_*` functions via AST, and registers them as active tools.
 *   **`unregister_tools_by_prefix(tool_name_prefix)`**: Cleanly removes dynamically generated tools when the artefact is updated or deleted.
 *   **Security Gate**: This feature is disabled by default. The host application must explicitly pass `allow_dynamic_tools=True` to `discussion.chat()` to permit the LLM to execute its own code.
+
+### 8. Early Initialization & Health Gate
+LCP enforces a strict validation phase during tool discovery. If a tool file defines an `init_tools_library()` function, LCP executes it immediately upon loading the module. If this initialization fails (e.g., missing system dependencies), the **entire tool file is rejected** and none of its tools are registered. This prevents the LLM from hallucinating calls to broken or unprepared tools.
+
+### 9. Persistent Module Caching
+To maximize performance and preserve state across multiple tool calls, LCP loads tool files into `sys.modules` under the `lollms_client.tools_bindings.lcp.persistent_{file_stem}` namespace. The binding trusts that this cache exists at execution time. If the Early Initialization Gate rejects a file, it is purged from the cache, ensuring broken modules are never executed.
 
 ---
 
@@ -112,7 +118,7 @@ def tool_file_analyzer(file_name: str) -> dict:
     Args:
         file_name (str): Name of the file to inspect in the workspace.
     """
-    # The binding automatically sets CWD to the discussion workspace.
+    # The orchestrator automatically sets CWD to the discussion workspace.
     # No discussion_instance is needed or allowed.
     path = Path(file_name)
     
@@ -194,14 +200,15 @@ default_tools/
 
 1.  **Context Detection:** The chat layer detects data files in the workspace.
 2.  **Dynamic Mounting:** `LCPBinding.mount_tool_library("semantic_data_engineer")` is called automatically.
-3.  **AST Parsing:** LCP scans the file, finds all `tool_*` functions, and registers them.
-4.  **Invocation:** User asks "Filter the data". LLM calls `tool_filter_and_slice_data`.
-5.  **Workspace Sync:**
-    *   LCP changes CWD to `data_workspace/discussions/{id}/`.
+3.  **AST Parsing & Health Gate:** LCP scans the file, finds all `tool_*` functions, and executes `init_tools_library()`. If initialization fails, the tool is rejected.
+4.  **Module Caching:** The validated module is stored in `sys.modules` to preserve state for subsequent calls.
+5.  **Invocation:** User asks "Filter the data". LLM calls `tool_filter_and_slice_data`.
+6.  **Workspace Sync:**
+    *   The ChatMixin orchestrator changes CWD to `data_workspace/discussions/{id}/`.
     *   Tool executes and creates `filtered_data.csv`.
-    *   LCP detects the new file and syncs it as an Artifact.
-6.  **Response:** The tool returns `prompt_injection`, instructing the LLM: "Here is the filtered CSV. Reference it in your answer."
-7.  **Final Answer:** LLM presents the result to the user seamlessly.
+    *   The orchestrator detects the new file and syncs it as an Artifact.
+7.  **Response:** The tool returns `prompt_injection`, instructing the LLM: "Here is the filtered CSV. Reference it in your answer."
+8.  **Final Answer:** LLM presents the result to the user seamlessly.
 
 ### Dynamic Tool Lifecycle (LLM-Authored Tools)
 1.  **Generation:** LLM outputs `<artifact type="tool" name="my_tool">def tool_run(): ...</artifact>`.
@@ -257,28 +264,3 @@ discussion_a.artefacts.export_artefact_bundle(
 # Import the bundle into a new discussion
 discussion_b.artefacts.import_artefact_bundle("my_tool_ecosystem.lab")
 ```
-### 8. Context Visibility & Physical Paths
-
-**Path Sovereignty**: The LLM does not see flat filenames; it sees the exact relative path of the artifact from the workspace root (e.g., `path/to/artefact.py`). This ensures that when the LLM writes Python code to read a CSV or import a module, it uses the correct relative path, preventing `FileNotFoundError`.
-
-**Multi-Tier Visibility**: To prevent context bloat, the LLM only sees files that are explicitly unlocked. The system presents a directory tree index to the LLM:
-```text
-## artefacts list
-path/to/artefact.py[F]
-path/to/artefact2.py[L]
-path/to/file.md[F]
-path/to/file.csv[M]
-
-## Full artefacts content
-```python:path/to/artefact.py
-# here is the content
-```
-
-```markdown:path/to/file.md
-here is the content
-``` 
-```markdown:path/to/file.csv
-here is metadata infos about the file
-``` 
-```
-The LLM can dynamically request to load (`[U]` -> `[F]`) or lock (`[F]` -> `[L]`) files using `<unlock_file>` and `<lock_file>` tags.

@@ -47,6 +47,7 @@ import json
 import re
 import hashlib
 import time
+import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -55,40 +56,19 @@ from datetime import datetime, timedelta
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent / ".env")
-except ImportError:
-    pass
-
 from lollms_client import LollmsClient
 from lollms_client.lollms_agent.lollms_agent import Agent, AgentRole
 from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 from lollms_client.lollms_types import MSG_TYPE
 
-import os
-
-MODEL_ZOO_INDEX = 1
-
-BINDING_CONFIG = {
-    "models_path": os.getenv("MODELS_PATH", "data/models/llama_cpp_models"),
-    "binaries_path": os.getenv("BINARIES_PATH", "data/bin/llm/llama_cpp_server"),
-    "ctx_size": int(os.getenv("CONTEXT_SIZE", "8192")),
-    "n_gpu_layers": int(os.getenv("N_GPU_LAYERS", "-1")),
-    "n_threads": int(os.getenv("N_THREADS", "4")),
-    "n_parallel": 1,
-    "batch_size": 512,
-    "idle_timeout": 300,
-}
-
-TOOLS_DIR = Path.home() / ".lollms_hub" / "tools"
-CACHE_DIR = PROJECT_ROOT / "data" / "web"
-CACHE_EXPIRATION_HOURS = 24  # How long cached content remains fresh
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache Helpers (used by main script and tools)
 # ─────────────────────────────────────────────────────────────────────────────
+
+CACHE_DIR = PROJECT_ROOT / "data" / "web"
+CACHE_EXPIRATION_HOURS = 24  # How long cached content remains fresh
+
 
 def get_cache_path_for_url(url: str) -> Path:
     """Compute the cache file path for a given URL."""
@@ -443,23 +423,19 @@ def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'requests': '>=2.28.0'})
 
-def tool_web_search(args: dict):
+def tool_web_search(query: str = "", num_results: int = 5, **kwargs):
     """
     Search the web for relevant content.
 
     Args:
-        args: dict with keys:
-            - query (str): Search query string
-            - num_results (int, optional): Number of results to return (default: 5)
+        query (str): Search query string
+        num_results (int, optional): Number of results to return (default: 5)
     """
     import requests
     import json
     import urllib.parse
-    
+
     try:
-        query = args.get('query', '')
-        num_results = args.get('num_results', 5)
-        
         if not query:
             return "Error: Query is required."
         
@@ -601,32 +577,25 @@ def _save_to_cache(cache_path: str, data: dict) -> bool:
         return False
 
 
-def tool_download_content(args: dict):
+def tool_download_content(url: str = "", max_length: int = 10000, use_cache: bool = True, cache_dir: str = "data/web", cache_max_age_hours: int = 24, **kwargs):
     """
     Download content from a URL with intelligent caching.
     Checks data/web/ cache first; only downloads if cache miss or stale.
 
     Args:
-        args: dict with keys:
-            - url (str): The URL to download
-            - max_length (int, optional): Max characters to return (default: 10000)
-            - use_cache (bool, optional): Whether to use caching (default: True)
-            - cache_dir (str, optional): Cache directory (default: "data/web")
-            - cache_max_age_hours (int, optional): Cache freshness in hours (default: 24)
+        url (str): The URL to download
+        max_length (int, optional): Max characters to return (default: 10000)
+        use_cache (bool, optional): Whether to use caching (default: True)
+        cache_dir (str, optional): Cache directory (default: "data/web")
+        cache_max_age_hours (int, optional): Cache freshness in hours (default: 24)
     """
     import requests
     from bs4 import BeautifulSoup
     import re
     import os
     import sys
-    
+
     try:
-        url = args.get('url', '')
-        max_length = args.get('max_length', 10000)
-        use_cache = args.get('use_cache', True)
-        cache_dir = args.get('cache_dir', 'data/web')
-        cache_max_age_hours = args.get('cache_max_age_hours', 24)
-        
         if not url:
             return "Error: URL is required."
         
@@ -722,24 +691,20 @@ def tool_download_content(args: dict):
         return {"success": False, "error": f"Processing error: {str(e)}", "url": url}
 
 
-def tool_check_cache(args: dict):
+def tool_check_cache(action: str = "stats", url: str = "", cache_dir: str = "data/web", **kwargs):
     """
     Check cache statistics or inspect a specific cached URL.
 
     Args:
-        args: dict with keys:
-            - action (str): "stats" or "inspect"
-            - url (str, optional): URL to inspect (required for action="inspect")
-            - cache_dir (str, optional): Cache directory (default: "data/web")
+        action (str): "stats" or "inspect"
+        url (str, optional): URL to inspect (required for action="inspect")
+        cache_dir (str, optional): Cache directory (default: "data/web")
     """
     import os
     import json
     from datetime import datetime, timedelta
-    
+
     try:
-        action = args.get('action', 'stats')
-        cache_dir = args.get('cache_dir', 'data/web')
-        
         if action == 'stats':
             if not os.path.exists(cache_dir):
                 return {"success": True, "total_files": 0, "total_size_mb": 0, "domains": []}
@@ -772,7 +737,6 @@ def tool_check_cache(args: dict):
             }
         
         elif action == 'inspect':
-            url = args.get('url', '')
             if not url:
                 return {"success": False, "error": "URL required for inspect action"}
             
@@ -804,22 +768,18 @@ def tool_check_cache(args: dict):
         return {"success": False, "error": f"Cache check error: {str(e)}"}
 
 
-def tool_clear_cache(args: dict):
+def tool_clear_cache(target: str = "", cache_dir: str = "data/web", **kwargs):
     """
     Clear cached content for a specific URL or entire domain.
 
     Args:
-        args: dict with keys:
-            - target (str): "all", a domain name, or a specific URL
-            - cache_dir (str, optional): Cache directory (default: "data/web")
+        target (str): "all", a domain name, or a specific URL
+        cache_dir (str, optional): Cache directory (default: "data/web")
     """
     import os
     import shutil
-    
+
     try:
-        target = args.get('target', '')
-        cache_dir = args.get('cache_dir', 'data/web')
-        
         if not target:
             return {"success": False, "error": "Target required: 'all', domain name, or URL"}
         
@@ -868,32 +828,29 @@ def init_tools_library() -> None:
     import pipmaster as pm
     pm.ensure_packages({'numpy': '>=1.21.0'})
 
-def tool_build_data_lake(args: dict):
+def tool_build_data_lake(documents: list = None, prefer_cache: bool = True, cache_dir: str = "data/web", **kwargs):
     """
     Add documents to the data lake for RAG querying.
     Can load from cache directly if documents have cache paths.
 
     Args:
-        args: dict with keys:
-            - documents (list): List of document dicts with 'url', 'title', 'content'
-            - prefer_cache (bool, optional): Load content from cache if available (default: True)
-            - cache_dir (str, optional): Cache directory to read from (default: "data/web")
+        documents (list): List of document dicts with 'url', 'title', 'content'
+        prefer_cache (bool, optional): Load content from cache if available (default: True)
+        cache_dir (str, optional): Cache directory to read from (default: "data/web")
     """
     try:
         import sys
         import os
         import json
-        
+
         main_module = sys.modules.get('__main__')
         if main_module and hasattr(main_module, 'get_or_create_data_lake'):
             data_lake = main_module.get_or_create_data_lake()
         else:
             return {"success": False, "error": "Data lake not available. Run from main script."}
-        
-        documents = args.get('documents', [])
-        prefer_cache = args.get('prefer_cache', True)
-        cache_dir = args.get('cache_dir', 'data/web')
-        
+
+        documents = documents or []
+
         if not documents:
             return {"success": False, "error": "No documents provided."}
         
@@ -939,14 +896,13 @@ def tool_build_data_lake(args: dict):
     except Exception as e:
         return {"success": False, "error": f"Data lake build error: {str(e)}"}
 
-def tool_query_data_lake(args: dict):
+def tool_query_data_lake(query: str = "", top_k: int = 5, **kwargs):
     """
     Query the data lake with semantic search.
 
     Args:
-        args: dict with keys:
-            - query (str): The search query
-            - top_k (int, optional): Number of results (default: 5)
+        query (str): The search query
+        top_k (int, optional): Number of results (default: 5)
     """
     try:
         import sys
@@ -955,10 +911,7 @@ def tool_query_data_lake(args: dict):
             data_lake = main_module.get_or_create_data_lake()
         else:
             return {"success": False, "error": "Data lake not available."}
-        
-        query = args.get('query', '')
-        top_k = args.get('top_k', 5)
-        
+
         if not query:
             return {"success": False, "error": "Query is required."}
         
@@ -968,13 +921,12 @@ def tool_query_data_lake(args: dict):
     except Exception as e:
         return {"success": False, "error": f"Data lake query error: {str(e)}"}
 
-def tool_data_lake_stats(args: dict):
+def tool_data_lake_stats(**kwargs):
     """
     Get statistics about the data lake.
 
     Args:
-        args: dict with keys:
-            - (none required)
+        (none required)
     """
     try:
         import sys
@@ -983,9 +935,9 @@ def tool_data_lake_stats(args: dict):
             data_lake = main_module.get_or_create_data_lake()
         else:
             return {"success": False, "error": "Data lake not available."}
-        
+
         return data_lake.get_stats()
-        
+
     except Exception as e:
         return {"success": False, "error": f"Stats error: {str(e)}"}
 '''
@@ -995,13 +947,13 @@ def tool_data_lake_stats(args: dict):
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ensure_tools() -> Tuple[str, str, str]:
+def ensure_tools(tools_dir: Path) -> Tuple[str, str, str]:
     """Create tool files if they don't exist."""
-    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    tools_dir.mkdir(parents=True, exist_ok=True)
     
-    web_search_path = TOOLS_DIR / "web_search.py"
-    download_path = TOOLS_DIR / "content_downloader.py"
-    data_lake_path = TOOLS_DIR / "data_lake_tools.py"
+    web_search_path = tools_dir / "web_search.py"
+    download_path = tools_dir / "content_downloader.py"
+    data_lake_path = tools_dir / "data_lake_tools.py"
     
     if not web_search_path.exists():
         print(f"📝 Creating web search tool: {web_search_path}")
@@ -1105,6 +1057,27 @@ def print_research_summary(result: Dict[str, Any]):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── 0. Environment & Configuration ─────────────────────────────────
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent / ".env")
+    except ImportError:
+        pass
+
+    LLM_BINDING_NAME = os.getenv("LLM_BINDING_NAME", "llama_cpp_server")
+    MODEL_NAME = os.getenv("MODEL_NAME", "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf")
+    HOST_ADDRESS = os.getenv("HOST_ADDRESS", "http://localhost:11434")
+    VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+    API_KEY = os.getenv("API_KEY")
+
+    MODELS_PATH = os.getenv("MODELS_PATH", str(Path.home() / ".lollms_hub" / "models"))
+    BINARIES_PATH = os.getenv("BINARIES_PATH", str(Path.home() / ".lollms_hub" / "bin"))
+    CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "8192"))
+    N_GPU_LAYERS = int(os.getenv("N_GPU_LAYERS", "-1"))
+
+    TOOLS_DIR = Path.home() / ".lollms_hub" / "tools"
+    MODEL_ZOO_INDEX = 1
+    
     print("=" * 70)
     print("🔬 Deep Research Agent — RAG Pipeline with Smart Caching")
     print("=" * 70)
@@ -1116,7 +1089,7 @@ def main():
     print("  5. Synthesizing a comprehensive, cited answer")
     print()
 
-    # ── 0. Show cache status ────────────────────────────────────────────
+    # ── 1. Show cache status ────────────────────────────────────────────
     print("📁 Cache Status:")
     cache_stats = get_cache_stats()
     if cache_stats['total_files'] > 0:
@@ -1126,52 +1099,79 @@ def main():
     else:
         print("   Cache is empty — all content will be downloaded fresh")
 
-    # ── 1. Ensure tools exist ─────────────────────────────────────────
-    web_search_path, download_path, data_lake_path = ensure_tools()
+    # ── 2. Ensure tools exist ─────────────────────────────────────────
+    web_search_path, download_path, data_lake_path = ensure_tools(TOOLS_DIR)
     print(f"\n📁 Tools ready:")
     print(f"   • {web_search_path}")
     print(f"   • {download_path}")
     print(f"   • {data_lake_path}")
 
-    # ── 2. Create LollmsClient ────────────────────────────────────────
-    print("\n🚀 Creating LollmsClient with llama_cpp_server binding...")
+    # ── 3. Create LollmsClient ────────────────────────────────────────
+    print(f"\n🚀 Creating LollmsClient with {LLM_BINDING_NAME} binding...")
+    
+    if LLM_BINDING_NAME == "llama_cpp_server":
+        BINDING_CONFIG = {
+            "models_path": MODELS_PATH,
+            "binaries_path": BINARIES_PATH,
+            "ctx_size": CONTEXT_SIZE,
+            "n_gpu_layers": N_GPU_LAYERS,
+            "n_threads": 4,
+            "n_parallel": 1,
+            "batch_size": 512,
+            "idle_timeout": 300,
+        }
+    else:
+        # Remote bindings (ollama, openai, groq, etc.)
+        BINDING_CONFIG = {
+            "model_name": MODEL_NAME,
+            "host_address": HOST_ADDRESS,
+            "verify_ssl_certificate": VERIFY_SSL
+        }
+        # Conditionally inject API key for gated services (OpenAI, Mistral, Groq, etc.)
+        if API_KEY:
+            BINDING_CONFIG["service_key"] = API_KEY
+
     client = LollmsClient(
-        llm_binding_name="llama_cpp_server",
+        llm_binding_name=LLM_BINDING_NAME,
         llm_binding_config=BINDING_CONFIG,
         user_name="user",
         ai_name="assistant",
     )
 
-    # ── 3. Download model if missing ──────────────────────────────────
-    zoo = client.llm.get_zoo()
-    chosen = zoo[MODEL_ZOO_INDEX]
-    model_filename = chosen["filename"]
+    # ── 4. Download model if missing (Local Bindings Only) ────────────
+    load_time = 0.0
+    if LLM_BINDING_NAME == "llama_cpp_server":
+        zoo = client.llm.get_zoo()
+        chosen = zoo[MODEL_ZOO_INDEX]
+        model_filename = chosen["filename"]
 
-    model_path = Path(BINDING_CONFIG["models_path"]) / model_filename
-    if not model_path.exists():
-        print(f"\n⬇️  Downloading {chosen['name']} ({chosen['size']}) ...")
-        result = client.llm.download_from_zoo(MODEL_ZOO_INDEX, progress_callback=progress_callback)
-        if not result.get("status"):
-            print(f"❌ Download failed: {result.get('error')}")
+        model_path = Path(MODELS_PATH) / model_filename
+        if not model_path.exists():
+            print(f"\n⬇️  Downloading {chosen['name']} ({chosen['size']}) ...")
+            result = client.llm.download_from_zoo(MODEL_ZOO_INDEX, progress_callback=progress_callback)
+            if not result.get("status"):
+                print(f"❌ Download failed: {result.get('error')}")
+                sys.exit(1)
+            print("✅ Download complete.")
+        else:
+            print(f"\n📁 Model already exists: {model_filename}")
+
+        # ── 5. Load the model ─────────────────────────────────────────
+        print(f"\n🔌 Loading model '{model_filename}' ...")
+        t0 = time.time()
+        success = client.llm.load_model(model_filename)
+        if not success:
+            print("❌ Failed to load model.")
             sys.exit(1)
-        print("✅ Download complete.")
+        load_time = time.time() - t0
+        print(f"✅ Model loaded in {load_time:.1f}s")
+
+        for srv in client.llm.ps():
+            print(f"   Server: PID {srv['pid']} | Port {srv['port']} | RSS {srv['rss_mb']} MB")
     else:
-        print(f"\n📁 Model already exists: {model_filename}")
+        print("\n☁️  Using remote binding. No model download or local loading required.")
 
-    # ── 4. Load the model ─────────────────────────────────────────────
-    print(f"\n🔌 Loading model '{model_filename}' ...")
-    t0 = time.time()
-    success = client.llm.load_model(model_filename)
-    if not success:
-        print("❌ Failed to load model.")
-        sys.exit(1)
-    load_time = time.time() - t0
-    print(f"✅ Model loaded in {load_time:.1f}s")
-
-    for srv in client.llm.ps():
-        print(f"   Server: PID {srv['pid']} | Port {srv['port']} | RSS {srv['rss_mb']} MB")
-
-    # ── 5. Create Deep Research Personality ───────────────────────────
+    # ── 6. Create Deep Research Personality ───────────────────────────
     print("\n🎭 Creating DeepResearchAgent personality...")
     personality = LollmsPersonality(
         name="DeepResearchAgent",
@@ -1202,7 +1202,7 @@ def main():
         ),
     )
 
-    # ── 6. Create Agent ───────────────────────────────────────────────
+    # ── 7. Create Agent ───────────────────────────────────────────────
     print("🤖 Creating Agent with deep research capabilities...")
     agent = Agent(
         lc=client,
@@ -1215,7 +1215,7 @@ def main():
     )
     print(f"   Agent: {agent.display_name} | Role: {agent.role} | ID: {agent._agent_id[:8]}")
 
-    # ── 7. Define deep research query ─────────────────────────────────
+    # ── 8. Define deep research query ─────────────────────────────────
     research_query = (
         "What are the latest developments in quantum computing for 2024-2025? "
         "I want to understand:"
@@ -1232,7 +1232,7 @@ def main():
     print(research_query)
     print("-" * 70)
 
-    # ── 8. Execute deep research ──────────────────────────────────────
+    # ── 9. Execute deep research ──────────────────────────────────────
     print("\n🔍 Starting deep research pipeline (this may take several minutes)...\n")
     print("=" * 70)
     print("🤖 AGENT RESPONSE (streaming):")
@@ -1255,16 +1255,16 @@ def main():
 
     print("\n")  # Newline after streaming
 
-    # ── 9. Display execution metadata ─────────────────────────────────
+    # ── 10. Display execution metadata ─────────────────────────────────
     print_research_summary(result)
 
-    # ── 10. Display final report ──────────────────────────────────────
+    # ── 11. Display final report ──────────────────────────────────────
     print("\n" + "=" * 70)
     print("📝 FINAL RESEARCH REPORT")
     print("=" * 70)
     print(result["response"])
 
-    # ── 11. Data lake statistics ──────────────────────────────────────
+    # ── 12. Data lake statistics ──────────────────────────────────────
     print("\n" + "=" * 70)
     print("🗄️  DATA LAKE STATISTICS")
     print("=" * 70)
@@ -1278,7 +1278,7 @@ def main():
         for src in stats['sources'][:5]:
             print(f"  • {src}")
 
-    # ── 12. Cache statistics ──────────────────────────────────────────
+    # ── 13. Cache statistics ──────────────────────────────────────────
     print("\n" + "=" * 70)
     print("💾 CACHE STATISTICS")
     print("=" * 70)
@@ -1290,7 +1290,7 @@ def main():
         for domain in final_cache_stats['domains'][:5]:
             print(f"  • {domain['domain']}: {domain['files']} files ({domain['size_mb']} MB)")
 
-    # ── 13. Performance summary ─────────────────────────────────────────
+    # ── 14. Performance summary ─────────────────────────────────────────
     print("\n" + "=" * 70)
     print("⏱️  PERFORMANCE SUMMARY")
     print("=" * 70)
@@ -1300,12 +1300,13 @@ def main():
     print(f"Tools utilized:        {len(result['tool_calls'])}")
     print(f"Final response length: {len(result['response'])} chars")
 
-    # ── 14. Cleanup ─────────────────────────────────────────────────────
+    # ── 15. Cleanup ─────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("🧹 Cleanup")
     print("=" * 70)
-    print("Unloading model...")
-    client.llm.unload_model()
+    if LLM_BINDING_NAME == "llama_cpp_server" and hasattr(client.llm, "unload_model"):
+        print("Unloading model...")
+        client.llm.unload_model()
     print("👋 Done!")
 
 
