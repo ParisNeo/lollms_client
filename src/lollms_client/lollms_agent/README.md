@@ -19,6 +19,15 @@ The Agent is composed of several orthogonal subsystems, each fully isolated and 
 | **_AgentStreamState** | Transactional stream parser that intercepts `<tool>` and `<done/>` tags during generation, handles code-fence protection, and prevents anti-mimicry. |
 | **Handbag** | A self-contained folder that carries ALL of an agent's resources (personalities, tools, skills, RAG, memory). |
 
+### 🔒 Sovereign Tool Opt-In Doctrine
+The Agent strictly enforces a **Sovereign Tool Opt-In Doctrine**. It will **NEVER** automatically pull all available tools from the LCP binding's registry into its system prompt. The Agent's context remains pristine and unpolluted unless tools are explicitly requested via one of the following mechanisms:
+1. **`enable_code_execution=True`**: Conditionally mounts *only* the `tool_execute_python_code` tool.
+2. **`tool_files` parameter**: Explicitly mounts tools from specified file paths.
+3. **`tools` parameter**: Explicitly mounts inline tool dictionaries.
+4. **Binding Tools**: TTI/TTS/STT tools are only mounted if their respective `CapabilityFlags` are `True`.
+
+This ensures the LLM's context window is not flooded with 30+ default tool schemas, drastically improving reasoning quality and reducing token costs.
+
 ### Agentic Loop Lifecycle
 
 ```

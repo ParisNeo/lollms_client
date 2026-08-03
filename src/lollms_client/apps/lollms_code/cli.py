@@ -5,7 +5,6 @@ lollms_code — Autonomous CLI Coding Agent
 
 A production-grade CLI tool that turns a single prompt into a full autonomous
 coding session. It uses the lollms_client Agent system to:
-
   1. Analyze the target codebase (workspace context injection)
   2. Plan the implementation strategy
   3. Write code, execute tests, and fix failures iteratively
@@ -13,49 +12,6 @@ coding session. It uses the lollms_client Agent system to:
   5. Save episodic memories for cross-session continuity
   6. Delegate sub-tasks to focused child agents when needed
   7. Switch models mid-task for optimal performance
-
-Usage
------
-  # Single-prompt autonomous mode
-  lollms-code "Implement a REST API client with retry logic"
-
-  # Interactive REPL mode
-  lollms-code -i
-
-  # Target a specific project directory
-  lollms-code --workspace ./myproject "add unit tests for all modules"
-
-  # Use a specific model
-  lollms-code --model qwen3:32b "refactor the database layer"
-
-  # Enable model switching
-  lollms-code --enable-model-switching "build and test a CLI tool"
-
-  # List learned skills
-  lollms-code --list-skills
-
-  # Clear conversation history
-  lollms-code --clear-history
-
-Configuration
--------------
-  The tool reads configuration from (in priority order):
-    1. CLI arguments
-    2. Environment variables
-    3. .env file in the current directory
-    4. config.json in ~/.lollms_hub/lollms_code/
-    5. Built-in defaults
-
-  Key environment variables:
-    LOLLMS_CODE_LLM_BINDING     (default: ollama)
-    LOLLMS_CODE_MODEL            (default: qwen3:32b)
-    LOLLMS_CODE_HOST             (default: http://localhost:11434)
-    LOLLMS_CODE_API_KEY          (default: None)
-    LOLLMS_CODE_VERIFY_SSL       (default: false)
-    LOLLMS_CODE_CONTEXT_SIZE     (default: 8192)
-    LOLLMS_CODE_MAX_STEPS        (default: 100)
-    LOLLMS_CODE_TEMPERATURE      (default: 0.3)
-    LOLLMS_CODE_MAX_TOKENS       (default: 8192)
 """
 
 from __future__ import annotations
@@ -71,20 +27,19 @@ import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-# ── Ensure project source is importable ────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from ascii_colors import ASCIIColors
+from ascii_colors import questionary
 
+from lollms_client.lollms_config_cli_env import get_client_from_env
 from lollms_client import LollmsClient
 from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags, SkillsManager
 from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 from lollms_client.lollms_types import MSG_TYPE
-
-# ── Constants ──────────────────────────────────────────────────────────────
 
 APP_NAME = "lollms_code"
 APP_VERSION = "1.0.0"
@@ -93,8 +48,6 @@ APP_CONFIG_FILE = APP_CONFIG_DIR / "config.json"
 APP_DEFAULT_WORKSPACE = Path.cwd()
 APP_DEFAULT_SKILLS_DIR = APP_CONFIG_DIR / "skills"
 APP_DEFAULT_MEMORY_DB = APP_CONFIG_DIR / "memory.db"
-
-# ── Default Coding Personality ─────────────────────────────────────────────
 
 CODING_SYSTEM_PROMPT = """\
 You are lollms_code, an elite autonomous software engineering agent.
@@ -186,13 +139,8 @@ For every task, follow this structured pipeline:
 """
 
 
-# ── Configuration ──────────────────────────────────────────────────────────
-
 class CodeAgentConfig:
-    """Holds all configuration for the lollms_code CLI."""
-
     def __init__(self):
-        # LLM settings
         self.llm_binding: str = "ollama"
         self.model_name: str = "qwen3:32b"
         self.host_address: str = "http://localhost:11434"
@@ -202,17 +150,11 @@ class CodeAgentConfig:
         self.n_gpu_layers: int = -1
         self.models_path: str = ""
         self.binaries_path: str = ""
-
-        # Wizard state
         self.wizard_completed: bool = False
         self.llm_binding_config: Dict[str, Any] = {}
-
-        # Agent settings
         self.max_reasoning_steps: int = 100
         self.temperature: float = 0.3
         self.max_tokens_per_turn: int = 8192
-
-        # Feature flags
         self.enable_code_execution: bool = True
         self.enable_sub_agents: bool = True
         self.enable_model_switching: bool = False
@@ -222,13 +164,9 @@ class CodeAgentConfig:
         self.skills_mode: str = "mixed"
         self.max_sub_agent_depth: int = 2
         self.max_sub_agents_per_turn: int = 3
-
-        # Paths
         self.workspace_path: str = str(APP_DEFAULT_WORKSPACE)
         self.skills_dir: str = str(APP_DEFAULT_SKILLS_DIR)
         self.memory_db: str = f"sqlite:///{APP_DEFAULT_MEMORY_DB}"
-
-        # Display
         self.show_tool_calls: bool = True
         self.show_workspace_changes: bool = True
         self.show_skills: bool = True
@@ -237,10 +175,7 @@ class CodeAgentConfig:
 
     @classmethod
     def load(cls, cli_args: argparse.Namespace) -> "CodeAgentConfig":
-        """Loads configuration from CLI args, env vars, config file, and defaults."""
         config = cls()
-
-        # 1. Load config file if it exists
         APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if APP_CONFIG_FILE.exists():
             try:
@@ -249,41 +184,30 @@ class CodeAgentConfig:
                     if hasattr(config, key):
                         setattr(config, key, val)
             except Exception as e:
-                ASCIIColors.warning(f"Failed to read config file {APP_CONFIG_FILE}: {e}")
+                ASCIIColors.warning(f"Failed to read config file: {e}")
 
-        # 2. Load .env file if python-dotenv is available
-        env_path = Path.cwd() / ".env"
-        if env_path.exists():
-            try:
-                from dotenv import load_dotenv
-                load_dotenv(env_path)
-            except ImportError:
-                pass
+        try:
+            get_client_from_env(
+                create_llm=True,
+                create_tti=False,
+                create_tts=False,
+                create_stt=False,
+                create_ttm=False,
+                create_ttv=False,
+                run_wizard_if_fail=False
+            )
+        except Exception:
+            pass
 
-        # 3. Override with environment variables
-        env_map = {
-            "LOLLMS_CODE_LLM_BINDING": ("llm_binding", str),
-            "LOLLMS_CODE_MODEL": ("model_name", str),
-            "LOLLMS_CODE_HOST": ("host_address", str),
-            "LOLLMS_CODE_API_KEY": ("api_key", str),
-            "LOLLMS_CODE_VERIFY_SSL": ("verify_ssl", lambda v: v.lower() in ("true", "1", "yes")),
-            "LOLLMS_CODE_CONTEXT_SIZE": ("context_size", int),
-            "LOLLMS_CODE_MAX_STEPS": ("max_reasoning_steps", int),
-            "LOLLMS_CODE_TEMPERATURE": ("temperature", float),
-            "LOLLMS_CODE_MAX_TOKENS": ("max_tokens_per_turn", int),
-            "LOLLMS_CODE_WORKSPACE": ("workspace_path", str),
-            "LOLLMS_CODE_SKILLS_DIR": ("skills_dir", str),
-            "LOLLMS_CODE_DEBUG": ("debug", lambda v: v.lower() in ("true", "1", "yes")),
-        }
-        for env_key, (attr, caster) in env_map.items():
-            env_val = os.environ.get(env_key)
-            if env_val is not None:
-                try:
-                    setattr(config, attr, caster(env_val))
-                except (ValueError, TypeError):
-                    pass
+        config.llm_binding = os.getenv("LLM_BINDING_NAME", config.llm_binding)
+        config.model_name = os.getenv("MODEL_NAME", config.model_name)
+        config.host_address = os.getenv("HOST_ADDRESS", config.host_address)
+        config.api_key = os.getenv("API_KEY", config.api_key)
 
-        # 4. Override with CLI arguments (highest priority)
+        ssl_env = os.getenv("VERIFY_SSL_CERTIFICATE")
+        if ssl_env is not None:
+            config.verify_ssl = ssl_env.lower() in ("true", "1", "yes")
+
         if cli_args.llm_binding:
             config.llm_binding = cli_args.llm_binding
         if cli_args.model:
@@ -318,7 +242,6 @@ class CodeAgentConfig:
         return config
 
     def save(self):
-        """Persists the current config to the config file."""
         APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
         try:
@@ -327,14 +250,10 @@ class CodeAgentConfig:
             ASCIIColors.warning(f"Failed to save config: {e}")
 
     def is_configured(self) -> bool:
-        """Check if minimal configuration exists (binding + model)."""
         return self.wizard_completed and bool(self.llm_binding) and bool(self.llm_binding_config)
 
 
-# ── Client Creation ────────────────────────────────────────────────────────
-
 def create_client(config: CodeAgentConfig) -> LollmsClient:
-    """Creates a LollmsClient based on the configuration."""
     if config.llm_binding_config:
         llm_config = dict(config.llm_binding_config)
     else:
@@ -361,7 +280,6 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
         llm_config["verify_ssl_certificate"] = config.verify_ssl
 
     default_tools_path = PROJECT_ROOT / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools"
-
     client = LollmsClient(
         llm_binding_name=config.llm_binding,
         llm_binding_config=llm_config,
@@ -373,22 +291,16 @@ def create_client(config: CodeAgentConfig) -> LollmsClient:
     return client
 
 
-# ── Memory Manager Creation ────────────────────────────────────────────────
-
 def create_memory_manager(config: CodeAgentConfig) -> Optional[Any]:
-    """Creates a LollmsMemoryManager if memory is enabled."""
     if not config.enable_memory:
         return None
     try:
         from lollms_client.lollms_memory import LollmsMemoryManager, MemoryConfig
-        memory_db_path = config.memory_db
-        # Ensure parent directory exists
-        db_file = memory_db_path.replace("sqlite:///", "")
+        db_file = config.memory_db.replace("sqlite:///", "")
         Path(db_file).parent.mkdir(parents=True, exist_ok=True)
-
         mem_config = MemoryConfig(working_token_budget=2000)
         manager = LollmsMemoryManager(
-            db_path=memory_db_path,
+            db_path=config.memory_db,
             owner_id=f"lollms_code_{Path(config.workspace_path).name}",
             config=mem_config,
         )
@@ -398,23 +310,15 @@ def create_memory_manager(config: CodeAgentConfig) -> Optional[Any]:
         return None
 
 
-# ── Personality Creation ────────────────────────────────────────────────────
-
 def create_coding_personality() -> LollmsPersonality:
-    """Creates the default coding agent personality."""
     return LollmsPersonality(
         name="lollms_code",
         author="ParisNeo",
         category="software_engineering",
-        description=(
-            "An elite autonomous software engineering agent that writes, tests, "
-            "and fixes code iteratively while learning from each session."
-        ),
+        description="An elite autonomous software engineering agent that writes, tests, and fixes code iteratively.",
         system_prompt=CODING_SYSTEM_PROMPT,
     )
 
-
-# ── Agent Creation ──────────────────────────────────────────────────────────
 
 def create_agent(
     config: CodeAgentConfig,
@@ -422,12 +326,8 @@ def create_agent(
     personality: LollmsPersonality,
     memory_manager: Optional[Any],
 ) -> Agent:
-    """Creates a fully configured Agent with all subsystems enabled."""
-    # Ensure workspace exists
     workspace = Path(config.workspace_path)
     workspace.mkdir(parents=True, exist_ok=True)
-
-    # Ensure skills directory exists
     skills_dir = Path(config.skills_dir)
     skills_dir.mkdir(parents=True, exist_ok=True)
 
@@ -462,20 +362,12 @@ def create_agent(
         model_params={"temperature": config.temperature},
         max_tokens_per_turn=config.max_tokens_per_turn,
         memory_manager=memory_manager,
-        metadata={
-            "version": APP_VERSION,
-            "workspace": str(workspace.resolve()),
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        },
+        metadata={"version": APP_VERSION, "workspace": str(workspace.resolve())},
     )
     return agent
 
 
-# ── Streaming Callback ──────────────────────────────────────────────────────
-
 class StreamRenderer:
-    """Renders streaming tokens to the terminal with color coding."""
-
     def __init__(self, config: CodeAgentConfig):
         self.config = config
         self._in_processing = False
@@ -484,110 +376,87 @@ class StreamRenderer:
     def __call__(self, chunk: str, msg_type: Any = None, meta: Optional[Dict] = None) -> bool:
         if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
             if meta and meta.get("was_processed"):
-                # Processing block content — render in dim color
                 if "<processing" in chunk:
                     self._in_processing = True
-                    ASCIIColors.cyan(chunk, end="", flush=True)
+                    ASCIIColors.rich_print(f"\n[dim cyan]{chunk}[/dim cyan]", end="")
                 elif "</processing>" in chunk:
                     self._in_processing = False
-                    ASCIIColors.cyan(chunk, end="", flush=True)
+                    ASCIIColors.rich_print(f"[dim cyan]{chunk}[/dim cyan]", end="")
                 elif self._in_processing:
-                    ASCIIColors.cyan(chunk, end="", flush=True)
+                    ASCIIColors.rich_print(f"[dim cyan]{chunk}[/dim cyan]", end="")
                 else:
-                    # Regular processed content
-                    ASCIIColors.white(chunk, end="", flush=True)
-            elif meta and meta.get("is_heartbeat"):
-                ASCIIColors.yellow(f"\n{chunk}", end="", flush=True)
+                    ASCIIColors.rich_print(chunk, end="")
             else:
-                # Normal conversational text — bright white
-                ASCIIColors.white(chunk, end="", flush=True)
+                ASCIIColors.rich_print(chunk, end="")
         elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
-            ASCIIColors.gray(chunk, end="", flush=True)
+            ASCIIColors.rich_print(f"[dim]{chunk}[/dim]", end="")
         elif msg_type == MSG_TYPE.MSG_TYPE_INFO:
-            ASCIIColors.blue(f"\n[INFO] {chunk}", flush=True)
-        elif msg_type == MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED:
-            if self.config.show_workspace_changes and meta:
-                art_type = meta.get("type", "update")
-                title = meta.get("title", "")
-                if art_type == "artifact_created":
-                    ASCIIColors.green(f"\n  📄 Created: {title}")
-                elif art_type == "artifact_updated":
-                    ASCIIColors.green(f"\n  📝 Updated: {title}")
-        elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
-            if self.config.show_tool_calls and meta:
-                tool_name = meta.get("tool", "unknown")
-                self._tool_call_count += 1
-                ASCIIColors.magenta(f"\n  🔧 Tool call #{self._tool_call_count}: {tool_name}")
+            ASCIIColors.rich_print(f"\n[blue][INFO] {chunk}[/blue]")
         return True
 
 
-# ── Result Display ──────────────────────────────────────────────────────────
-
 def display_result(result: Dict[str, Any], config: CodeAgentConfig, elapsed: float):
-    """Pretty-prints the structured result from Agent.chat()."""
-    print()
-    ASCIIColors.cyan("=" * 70)
-    ASCIIColors.cyan("📊 SESSION REPORT")
-    ASCIIColors.cyan("=" * 70)
-
-    ASCIIColors.white(f"  Total rounds:              {result['rounds']}")
-    ASCIIColors.white(f"  Tool calls:                {len(result['tool_calls'])}")
-    ASCIIColors.white(f"  Was cancelled:             {result['was_cancelled']}")
-    ASCIIColors.white(f"  Elapsed time:              {elapsed:.1f}s")
+    ASCIIColors.rule("[bold cyan]📊 SESSION REPORT[/bold cyan]")
+    
+    summary_table = ASCIIColors.table(
+        "Metric", "Value",
+        rows=[
+            ["Total rounds", str(result['rounds'])],
+            ["Tool calls", str(len(result['tool_calls']))],
+            ["Was cancelled", str(result['was_cancelled'])],
+            ["Elapsed time", f"{elapsed:.1f}s"]
+        ],
+        title="[bold]Execution Summary[/bold]",
+        box="round"
+    )
+    ASCIIColors.rich_print(summary_table)
 
     if config.show_workspace_changes and result.get("workspace_changes"):
-        ASCIIColors.green("\n  📁 Workspace changes:")
-        for change in result["workspace_changes"]:
-            action = change.get("action", "unknown")
-            path = change.get("path", "?")
-            size = change.get("size", 0)
-            icon = "✨" if action == "created" else "📝" if action == "modified" else "🗑️"
-            ASCIIColors.green(f"    {icon} {action}: {path} ({size:,} bytes)")
+        changes_table = ASCIIColors.table(
+            "Action", "Path", "Size",
+            rows=[[c.get("action", "?"), c.get("path", "?"), f"{c.get('size', 0):,} bytes"] for c in result["workspace_changes"]],
+            title="[bold green]📁 Workspace Changes[/bold green]",
+            box="round"
+        )
+        ASCIIColors.rich_print(changes_table)
 
-    if config.show_skills:
-        if result.get("skills_created"):
-            ASCIIColors.yellow("\n  🎓 Skills created:")
-            for skill in result["skills_created"]:
-                ASCIIColors.yellow(f"    + {skill}")
-        if result.get("skills_updated"):
-            ASCIIColors.yellow("\n  🔄 Skills updated:")
-            for skill in result["skills_updated"]:
-                ASCIIColors.yellow(f"    ↻ {skill}")
+    if config.show_skills and (result.get("skills_created") or result.get("skills_updated")):
+        skills_table = ASCIIColors.table(
+            "Action", "Skill",
+            rows=([["Created", s] for s in result["skills_created"]] + 
+                  [["Updated", s] for s in result["skills_updated"]]),
+            title="[bold yellow]🎓 Skills Activity[/bold yellow]",
+            box="round"
+        )
+        ASCIIColors.rich_print(skills_table)
 
     if result.get("sub_agents_spawned", 0) > 0:
-        ASCIIColors.magenta(f"\n  🧠 Sub-agents spawned:      {result['sub_agents_spawned']}")
+        ASCIIColors.magenta(f"\n  🧠 Sub-agents spawned: {result['sub_agents_spawned']}")
 
     if result.get("model_switches"):
-        ASCIIColors.blue(f"\n  🔄 Model switches:         {result['model_switches']}")
+        ASCIIColors.blue(f"  🔄 Model switches: {result['model_switches']}")
 
-    ASCIIColors.cyan("=" * 70)
-
-
-# ── Single-Prompt Mode ─────────────────────────────────────────────────────
 
 def run_single_prompt(agent: Agent, prompt: str, config: CodeAgentConfig) -> int:
-    """Runs a single autonomous prompt and returns exit code."""
     renderer = StreamRenderer(config)
 
-    ASCIIColors.cyan("\n" + "=" * 70)
-    ASCIIColors.cyan(f"🚀 lollms_code v{APP_VERSION} — Autonomous Coding Agent")
-    ASCIIColors.cyan("=" * 70)
-    ASCIIColors.white(f"  Workspace:  {config.workspace_path}")
-    ASCIIColors.white(f"  Model:      {config.model_name}")
-    ASCIIColors.white(f"  Binding:    {config.llm_binding}")
-    ASCIIColors.white(f"  Max steps:  {config.max_reasoning_steps}")
-    ASCIIColors.white(f"  Memory:     {'enabled' if config.enable_memory else 'disabled'}")
-    ASCIIColors.white(f"  Skills:     {config.skills_mode}")
-    ASCIIColors.white(f"  Sub-agents: {'enabled' if config.enable_sub_agents else 'disabled'}")
-    ASCIIColors.cyan("-" * 70)
-    ASCIIColors.magenta(f"\n  📝 Task: {prompt[:200]}{'...' if len(prompt) > 200 else ''}\n")
-    ASCIIColors.cyan("-" * 70)
-    ASCIIColors.white("\n🤖 Agent output:\n")
-    ASCIIColors.cyan("-" * 70 + "\n")
+    config_panel_content = (
+        f"[cyan]Workspace:[/cyan] {config.workspace_path}\n"
+        f"[cyan]Model:[/cyan]      {config.model_name}\n"
+        f"[cyan]Binding:[/cyan]    {config.llm_binding}\n"
+        f"[cyan]Max steps:[/cyan]  {config.max_reasoning_steps}\n"
+        f"[cyan]Memory:[/cyan]     {'enabled' if config.enable_memory else 'disabled'}\n"
+        f"[cyan]Skills:[/cyan]     {config.skills_mode}\n"
+        f"[cyan]Sub-agents:[/cyan] {'enabled' if config.enable_sub_agents else 'disabled'}"
+    )
+    ASCIIColors.panel(config_panel_content, title=f"[bold green]🚀 lollms_code v{APP_VERSION}[/bold green]", border_style="green")
+    
+    ASCIIColors.panel(f"[magenta]{prompt[:200]}{'...' if len(prompt) > 200 else ''}[/magenta]", title="[bold]📝 Task[/bold]", border_style="magenta")
+    
+    ASCIIColors.rule("[bold]🤖 Agent output[/bold]")
 
     start_time = time.time()
 
-    # Handle Ctrl+C gracefully
     def _signal_handler(sig, frame):
         ASCIIColors.yellow("\n\n⚠️  Interrupt received. Cancelling generation...")
         agent.cancel_generation()
@@ -610,48 +479,30 @@ def run_single_prompt(agent: Agent, prompt: str, config: CodeAgentConfig) -> int
         return 130
     except Exception as e:
         ASCIIColors.red(f"\n\n💥 Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
         return 1
 
     elapsed = time.time() - start_time
-
     display_result(result, config, elapsed)
 
-    # Show the final response
-    ASCIIColors.cyan("\n" + "=" * 70)
-    ASCIIColors.cyan("📝 FINAL OUTPUT")
-    ASCIIColors.cyan("=" * 70)
-    print(result.get("response", ""))
-    ASCIIColors.cyan("=" * 70)
+    ASCIIColors.panel(result.get("response", ""), title="[bold cyan]📝 FINAL OUTPUT[/bold cyan]", border_style="cyan")
 
     return 0 if not result.get("was_cancelled") else 130
 
 
-# ── Interactive REPL Mode ──────────────────────────────────────────────────
-
 def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
-    """Runs an interactive REPL session."""
     renderer = StreamRenderer(config)
 
-    ASCIIColors.cyan("\n" + "=" * 70)
-    ASCIIColors.cyan(f"🚀 lollms_code v{APP_VERSION} — Interactive Mode")
-    ASCIIColors.cyan("=" * 70)
-    ASCIIColors.white(f"  Workspace:  {config.workspace_path}")
-    ASCIIColors.white(f"  Model:      {config.model_name}")
-    ASCIIColors.white(f"  Type 'exit' or Ctrl+C to quit.")
-    ASCIIColors.white(f"  Type 'skills' to list learned skills.")
-    ASCIIColors.white(f"  Type 'clear' to clear conversation history.")
-    ASCIIColors.white(f"  Type 'models' to list available models.")
-    ASCIIColors.white(f"  Type 'config' to re-run the configuration wizard.")
-    ASCIIColors.cyan("=" * 70 + "\n")
+    ASCIIColors.panel(
+        f"[cyan]Workspace:[/cyan] {config.workspace_path}\n[cyan]Model:[/cyan] {config.model_name}\n[dim]Type 'exit' or Ctrl+C to quit.[/dim]",
+        title=f"[bold green]🚀 lollms_code v{APP_VERSION} — Interactive Mode[/bold green]",
+        border_style="green"
+    )
 
     while True:
         try:
-            ASCIIColors.magenta("\n👤 You> ", end="")
-            user_input = input().strip()
+            user_input = questionary.text("👤 You>").ask()
         except (EOFError, KeyboardInterrupt):
-            ASCIIColors.cyan("\n\n👋 Goodbye!")
+            ASCIIColors.cyan("\n👋 Goodbye!")
             return 0
 
         if not user_input:
@@ -664,11 +515,13 @@ def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
             if not skills:
                 ASCIIColors.yellow("  No skills learned yet.")
             else:
-                ASCIIColors.green(f"\n  📚 Learned Skills ({len(skills)}):")
-                for s in skills:
-                    vis = " [always visible]" if s.get("always_visible") else ""
-                    cat = f" [{s.get('category', '')}]" if s.get("category") else ""
-                    ASCIIColors.white(f"    • {s['title']}{cat}{vis}: {s.get('description', '')}")
+                skills_table = ASCIIColors.table(
+                    "Title", "Category", "Description",
+                    rows=[[s['title'], s.get('category', ''), s.get('description', '')] for s in skills],
+                    title="[bold yellow]📚 Learned Skills[/bold yellow]",
+                    box="round"
+                )
+                ASCIIColors.rich_print(skills_table)
             continue
         if user_input.lower() == "clear":
             agent.clear_conversation()
@@ -680,21 +533,21 @@ def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
             if not models:
                 ASCIIColors.yellow("  No models available for switching.")
             else:
-                ASCIIColors.green(f"\n  📋 Available models (current: {current}):")
-                for m in models:
-                    marker = " ← current" if m == current else ""
-                    ASCIIColors.white(f"    • {m}{marker}")
+                models_table = ASCIIColors.table(
+                    "Model", "Status",
+                    rows=[[m, "← current" if m == current else ""] for m in models],
+                    title="[bold blue]📋 Available Models[/bold blue]",
+                    box="round"
+                )
+                ASCIIColors.rich_print(models_table)
             continue
         if user_input.lower() == "config":
-            from lollms_client.apps.lollms_code.config_wizard import run_config_wizard
-            run_config_wizard(config)
-            config.save()
+            from lollms_client.lollms_config_cli_env import run_wizard_and_save
+            run_wizard_and_save()
             ASCIIColors.green("  Configuration updated. Restart lollms-code for changes to take effect.")
             continue
 
-        # Run the prompt
-        ASCIIColors.cyan("\n🤖 Agent> ")
-        ASCIIColors.cyan("-" * 50)
+        ASCIIColors.rule("[bold green]🤖 Agent[/bold green]")
 
         start_time = time.time()
         try:
@@ -716,27 +569,10 @@ def run_interactive(agent: Agent, config: CodeAgentConfig) -> int:
             continue
 
         elapsed = time.time() - start_time
+        ASCIIColors.rich_print(f"\n[dim]⏱️  {elapsed:.1f}s | Rounds: {result['rounds']} | Tools: {len(result['tool_calls'])}[/dim]")
 
-        ASCIIColors.cyan(f"\n  ⏱️  {elapsed:.1f}s | Rounds: {result['rounds']} | Tools: {len(result['tool_calls'])}")
-
-        if result.get("skills_created") or result.get("skills_updated"):
-            all_skills = (result.get("skills_created", []) or []) + (result.get("skills_updated", []) or [])
-            ASCIIColors.yellow(f"  🎓 Skills: {', '.join(all_skills)}")
-
-        if result.get("workspace_changes"):
-            changes = result["workspace_changes"]
-            created = [c for c in changes if c["action"] == "created"]
-            modified = [c for c in changes if c["action"] == "modified"]
-            if created:
-                ASCIIColors.green(f"  ✨ Created: {', '.join(c['path'] for c in created)}")
-            if modified:
-                ASCIIColors.green(f"  📝 Modified: {', '.join(c['path'] for c in modified)}")
-
-
-# ── Skills Listing ─────────────────────────────────────────────────────────
 
 def list_skills(config: CodeAgentConfig):
-    """Lists all learned skills."""
     skills_dir = Path(config.skills_dir)
     if not skills_dir.exists():
         ASCIIColors.yellow("No skills directory found. Run a task first to generate skills.")
@@ -748,17 +584,14 @@ def list_skills(config: CodeAgentConfig):
         ASCIIColors.yellow("No skills learned yet.")
         return
 
-    ASCIIColors.green(f"\n📚 Learned Skills ({len(skills)}):\n")
-    for s in skills:
-        vis = " [always visible]" if s.get("always_visible") else ""
-        cat = f" [{s.get('category', '')}]" if s.get("category") else ""
-        desc = s.get("description", "No description")
-        ASCIIColors.white(f"  • {s['title']}{cat}{vis}")
-        ASCIIColors.gray(f"    {desc}")
-    print()
+    skills_table = ASCIIColors.table(
+        "Title", "Category", "Description",
+        rows=[[s['title'], s.get('category', ''), s.get('description', '')] for s in skills],
+        title="[bold yellow]📚 Learned Skills[/bold yellow]",
+        box="round"
+    )
+    ASCIIColors.rich_print(skills_table)
 
-
-# ── Argument Parser ────────────────────────────────────────────────────────
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -775,147 +608,46 @@ Examples:
   lollms-code --list-skills
 """,
     )
-
-    parser.add_argument(
-        "prompt",
-        nargs="?",
-        default=None,
-        help="The task prompt for the autonomous agent. If omitted, enters interactive mode (unless -i is set).",
-    )
-    parser.add_argument(
-        "-i", "--interactive",
-        action="store_true",
-        help="Start in interactive REPL mode.",
-    )
-    parser.add_argument(
-        "--workspace",
-        type=str,
-        default=None,
-        help="Path to the workspace directory (default: current directory).",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Model name to use (e.g., qwen3:32b, gpt-4o).",
-    )
-    parser.add_argument(
-        "--llm-binding",
-        type=str,
-        default=None,
-        help="LLM binding name (ollama, openai, llama_cpp_server, etc.).",
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default=None,
-        help="Host address for remote bindings (e.g., http://localhost:11434).",
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="API key for gated services (OpenAI, Mistral, etc.).",
-    )
-    parser.add_argument(
-        "--context-size",
-        type=int,
-        default=None,
-        help="Context window size for local models (default: 8192).",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=None,
-        help="Maximum reasoning steps (default: 100). Increase for complex loops.",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="Sampling temperature (default: 0.3 for code, 0.7 for creative).",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=None,
-        help="Maximum tokens per generation turn (default: 8192).",
-    )
-    parser.add_argument(
-        "--skills-dir",
-        type=str,
-        default=None,
-        help="Directory for SKILL.md files (default: ~/.lollms_hub/lollms_code/skills).",
-    )
-    parser.add_argument(
-        "--enable-model-switching",
-        action="store_true",
-        help="Allow the agent to switch models mid-task.",
-    )
-    parser.add_argument(
-        "--no-code-execution",
-        action="store_true",
-        help="Disable Python code execution (safer but less capable).",
-    )
-    parser.add_argument(
-        "--no-sub-agents",
-        action="store_true",
-        help="Disable sub-agent delegation.",
-    )
-    parser.add_argument(
-        "--no-memory",
-        action="store_true",
-        help="Disable persistent memory (no cross-session learning).",
-    )
-    parser.add_argument(
-        "--list-skills",
-        action="store_true",
-        help="List all learned skills and exit.",
-    )
-    parser.add_argument(
-        "--clear-history",
-        action="store_true",
-        help="Clear the agent's conversation history file and exit.",
-    )
-    parser.add_argument(
-        "--config",
-        action="store_true",
-        help="Run the interactive configuration wizard and exit.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging.",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"lollms_code v{APP_VERSION}",
-    )
-
+    parser.add_argument("prompt", nargs="?", default=None, help="The task prompt for the autonomous agent.")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Start in interactive REPL mode.")
+    parser.add_argument("--workspace", type=str, default=None, help="Path to the workspace directory.")
+    parser.add_argument("--model", type=str, default=None, help="Model name to use.")
+    parser.add_argument("--llm-binding", type=str, default=None, help="LLM binding name.")
+    parser.add_argument("--host", type=str, default=None, help="Host address for remote bindings.")
+    parser.add_argument("--api-key", type=str, default=None, help="API key for gated services.")
+    parser.add_argument("--context-size", type=int, default=None, help="Context window size for local models.")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum reasoning steps.")
+    parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Maximum tokens per generation turn.")
+    parser.add_argument("--skills-dir", type=str, default=None, help="Directory for SKILL.md files.")
+    parser.add_argument("--enable-model-switching", action="store_true", help="Allow the agent to switch models.")
+    parser.add_argument("--no-code-execution", action="store_true", help="Disable Python code execution.")
+    parser.add_argument("--no-sub-agents", action="store_true", help="Disable sub-agent delegation.")
+    parser.add_argument("--no-memory", action="store_true", help="Disable persistent memory.")
+    parser.add_argument("--list-skills", action="store_true", help="List all learned skills and exit.")
+    parser.add_argument("--clear-history", action="store_true", help="Clear conversation history and exit.")
+    parser.add_argument("--config", action="store_true", help="Run configuration wizard and exit.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("--version", action="version", version=f"lollms_code v{APP_VERSION}")
     return parser
 
 
-# ── Main Entry Point ───────────────────────────────────────────────────────
-
 def main():
-    """Main CLI entry point."""
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    # Load configuration
     config = CodeAgentConfig.load(args)
 
-    # Run configuration wizard if needed or requested
     if args.config or not config.is_configured():
-        from lollms_client.apps.lollms_code.config_wizard import run_config_wizard
-        run_config_wizard(config)
+        from lollms_client.lollms_config_cli_env import run_wizard_and_save
+        run_wizard_and_save()
+        config = CodeAgentConfig.load(args)
+        config.wizard_completed = True
         config.save()
         if args.config:
             ASCIIColors.green("\n✅ Configuration saved successfully!")
             return 0
 
-    # Handle non-agent commands
     if args.list_skills:
         list_skills(config)
         return 0
@@ -929,32 +661,25 @@ def main():
             ASCIIColors.yellow("No conversation history found.")
         return 0
 
-    # Determine mode
     if args.interactive:
         mode = "interactive"
     elif args.prompt:
         mode = "single"
     else:
-        # No prompt and no -i flag — default to interactive
         mode = "interactive"
 
-    # Create components
     try:
         client = create_client(config)
     except Exception as e:
         ASCIIColors.red(f"Failed to create LollmsClient: {e}")
-        import traceback
-        traceback.print_exc()
         return 1
 
     personality = create_coding_personality()
     memory_manager = create_memory_manager(config)
     agent = create_agent(config, client, personality, memory_manager)
 
-    # Save config for future sessions
     config.save()
 
-    # Run
     if mode == "single":
         return run_single_prompt(agent, args.prompt, config)
     else:

@@ -43,29 +43,16 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any
 
-# Ensure the source is importable when running from the repo root
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-# ── ENVIRONMENT LOADING ─────────────────────────────────────────────────────
-# Safely load environment variables from .env if it exists.
-# If python-dotenv is not installed or the file is missing, we gracefully fallback
-# to hardcoded defaults that work out-of-the-box for local llama_cpp_server.
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent / ".env")
-except ImportError:
-    pass  # Fallback to system environment variables or defaults below
-
+from ascii_colors import ASCIIColors
+from lollms_client.lollms_config_cli_env import get_client_from_env
 from lollms_client import LollmsClient
 from lollms_client.lollms_agent.lollms_agent import Agent, AgentRole
 from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 from lollms_client.lollms_types import MSG_TYPE
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool Definitions (lollms format)
-# ─────────────────────────────────────────────────────────────────────────────
 
 ARXIV_TOOL_CONTENT = '''TOOL_LIBRARY_NAME = 'ArXiv Explorer'
 TOOL_LIBRARY_DESC = 'Search scientific papers and pre-prints on ArXiv.'
@@ -86,6 +73,7 @@ def tool_search_papers(query: str, count: int = 3, year_start: int = None, year_
         year_end (int, optional): End year for filtering papers (inclusive).
     """
     import arxiv
+    import time
     try:
         if not query:
             return "Error: Query is required."
@@ -116,6 +104,7 @@ def tool_search_papers(query: str, count: int = 3, year_start: int = None, year_
 
             if len(results) >= count:
                 break
+            time.sleep(1)  # Be polite to the API
 
         return "\\n\\n".join(results) if results else "No papers found matching the criteria."
     except Exception as e:
@@ -144,8 +133,7 @@ def tool_search_wikipedia(query: str, max_results: int = 3):
         if not query:
             return "Error: Query is required."
         
-        # Wikipedia API blocks rapid successive requests.
-        time.sleep(1.0)
+        time.sleep(1.0)  # Be polite to the API
         
         search_results = wikipedia.search(query)
         output = []
@@ -155,13 +143,11 @@ def tool_search_wikipedia(query: str, max_results: int = 3):
                 page = wikipedia.summary(title, sentences=5)
                 output.append(f"--- {title} ---\\n{page}")
             except wikipedia.exceptions.DisambiguationError as e:
-                # Pick the first option if it's a disambiguation page
                 if e.options:
                     time.sleep(0.5)
                     page = wikipedia.summary(e.options[0], sentences=5)
                     output.append(f"--- {e.options[0]} ---\\n{page}")
             except Exception as inner_e:
-                # Skip individual page failures, but keep searching other results
                 continue
                 
         if not output:
@@ -171,71 +157,19 @@ def tool_search_wikipedia(query: str, max_results: int = 3):
         return f"Error: Wikipedia search failed ({str(e)}). The API may be temporarily unavailable. Please proceed using the available ArXiv papers or other tools."
 '''
 
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Read variables from the environment with safe defaults for local execution.
-# This allows the script to run out-of-the-box with llama_cpp_server, but
-# easily switch to remote (e.g., openai, groq) by modifying the .env file.
-
-LLM_BINDING_NAME = os.getenv("LLM_BINDING_NAME", "llama_cpp_server")
-MODEL_NAME = os.getenv("MODEL_NAME", "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf")
-HOST_ADDRESS = os.getenv("HOST_ADDRESS", "http://localhost:11434")
-VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() in ("true", "1", "yes")
-API_KEY = os.getenv("API_KEY")
-
-MODELS_PATH = os.getenv("MODELS_PATH", str(PROJECT_ROOT / "data" / "models" / "llama_cpp_models"))
-BINARIES_PATH = os.getenv("BINARIES_PATH", str(PROJECT_ROOT / "data" / "bin" / "llm" / "llama_cpp_server"))
-CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "8192"))
-N_GPU_LAYERS = int(os.getenv("N_GPU_LAYERS", "-1"))
-
 TOOLS_DIR = Path.home() / ".lollms_hub" / "tools"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Startup Panel
-# ─────────────────────────────────────────────────────────────────────────────
-
-def print_config_panel():
+def print_config_panel(client: LollmsClient):
     """Prints a formatted panel of all configuration variables at startup."""
-    is_local = LLM_BINDING_NAME == "llama_cpp_server"
-
-    def fmt(val, condition=True):
-        if not condition:
-            return "N/A (remote binding)"
-        return str(val) if val is not None else "None"
-
-    panel_width = 64
-    print("\n" + "┌" + "─" * panel_width + "┐")
-    print("│" + " CONFIGURATION SUMMARY".center(panel_width) + "│")
-    print("├" + "─" * panel_width + "┤")
-
-    rows = [
-        ("LLM Binding", LLM_BINDING_NAME),
-        ("Model Name", MODEL_NAME),
-        ("Host Address", HOST_ADDRESS if not is_local else "localhost (managed)"),
-        ("Verify SSL", VERIFY_SSL),
-        ("API Key", "Loaded" if API_KEY else "None"),
-        ("Local Models Path", fmt(MODELS_PATH, is_local)),
-        ("Binaries Path", fmt(BINARIES_PATH, is_local)),
-        ("Context Size", fmt(CONTEXT_SIZE, is_local)),
-        ("GPU Layers", fmt(N_GPU_LAYERS, is_local)),
-        ("Tools Directory", TOOLS_DIR),
-    ]
-
-    for label, value in rows:
-        line = f" {label}: {value}"
-        print(f"│{line.ljust(panel_width)}│")
-
-    print("└" + "─" * panel_width + "┘\n")
-
-
- # ─────────────────────────────────────────────────────────────────────────────
- # Helpers
- # ─────────────────────────────────────────────────────────────────────────────
+    binding_name = client.llm.binding_name
+    model_name = client.llm.model_name if hasattr(client.llm, 'model_name') else "N/A"
+    
+    config_content = (
+        f"[cyan]LLM Binding:[/cyan]   {binding_name}\n"
+        f"[cyan]Model Name:[/cyan]    {model_name}\n"
+        f"[cyan]Tools Directory:[/cyan] {TOOLS_DIR}"
+    )
+    ASCIIColors.panel(config_content, title="[bold]CONFIGURATION SUMMARY[/bold]", border_style="cyan")
 
 def ensure_tools() -> tuple:
     """Create tool files if they don't exist. Returns (arxiv_path, wiki_path)."""
@@ -245,15 +179,14 @@ def ensure_tools() -> tuple:
     wiki_path = TOOLS_DIR / "wikipedia_search.py"
     
     if not arxiv_path.exists():
-        print(f"📝 Creating arXiv tool: {arxiv_path}")
+        ASCIIColors.info(f"📝 Creating arXiv tool: {arxiv_path}")
         arxiv_path.write_text(ARXIV_TOOL_CONTENT, encoding="utf-8")
     
     if not wiki_path.exists():
-        print(f"📝 Creating Wikipedia tool: {wiki_path}")
+        ASCIIColors.info(f"📝 Creating Wikipedia tool: {wiki_path}")
         wiki_path.write_text(WIKIPEDIA_TOOL_CONTENT, encoding="utf-8")
     
     return str(arxiv_path), str(wiki_path)
-
 
 def progress_callback(payload: dict):
     """Called during model download."""
@@ -264,140 +197,116 @@ def progress_callback(payload: dict):
 
     if status == "downloading":
         pct = (completed / total * 100) if total else 0
-        print(f"⬇️  [{pct:5.1f}%] {message}")
+        ASCIIColors.cyan(f"⬇️  [{pct:5.1f}%] {message}")
     elif status == "success":
-        print(f"✅ {message}")
+        ASCIIColors.green(f"✅ {message}")
     elif status == "error":
-        print(f"❌ ERROR: {message}")
-
+        ASCIIColors.red(f"❌ ERROR: {message}")
 
 def streaming_callback(chunk: str, msg_type: MSG_TYPE, meta: dict = None) -> bool:
     """Stream tokens to console."""
     if msg_type == MSG_TYPE.MSG_TYPE_CHUNK and chunk:
-        print(chunk, end="", flush=True)
+        ASCIIColors.rich_print(chunk, end="", flush=True)
     return True
-
 
 def print_tool_execution_summary(result: Dict[str, Any]):
     """Pretty-print the tool execution metadata."""
-    print("\n" + "=" * 70)
-    print("📊 EXECUTION METADATA")
-    print("=" * 70)
-    print(f"Total agentic rounds:  {result['rounds']}")
-    print(f"Tool calls executed:   {len(result['tool_calls'])}")
+    ASCIIColors.rule("[bold cyan]📊 EXECUTION METADATA[/bold cyan]")
+    
+    metrics_table = ASCIIColors.table(
+        "Metric", "Value",
+        rows=[
+            ["Total agentic rounds", str(result['rounds'])],
+            ["Tool calls executed", str(len(result['tool_calls']))]
+        ],
+        title="[bold]Execution Summary[/bold]",
+        box="round"
+    )
+    ASCIIColors.rich_print(metrics_table)
     
     if not result['tool_calls']:
-        print("  (No tools were called — model answered directly)")
+        ASCIIColors.yellow("  (No tools were called — model answered directly)")
         return
     
+    tool_rows = []
     for tc in result['tool_calls']:
-        print(f"\n  🔹 Round {tc['round']}: {tc['name']}")
-        print(f"     Parameters: {json.dumps(tc['parameters'], indent=2, ensure_ascii=False)}")
+        tool_rows.append([f"Round {tc['round']}", tc['name'], json.dumps(tc['parameters'], indent=2, ensure_ascii=False)])
         
-        # Find matching result
         tr = next((r for r in result['tool_results'] if r['round'] == tc['round']), None)
         if tr:
             res = tr['result']
             status = "✅ SUCCESS" if res.get('success') else "❌ FAILED"
             output = str(res.get('output', res.get('error', 'No output')))
-            # Truncate very long outputs for display
             if len(output) > 300:
                 output = output[:300] + f"... [{len(output) - 300} more chars]"
-            print(f"     Result: {status}")
-            print(f"     Output: {output}")
-    
+            tool_rows.append(["", "Result", f"{status}\n{output}"])
+            
+    tools_table = ASCIIColors.table(
+        "Round", "Tool / Status", "Parameters / Output",
+        rows=tool_rows,
+        title="[bold magenta]🛠️ Tool Execution Details[/bold magenta]",
+        box="round",
+        show_lines=True
+    )
+    ASCIIColors.rich_print(tools_table)
+
     if result.get('pending_tool'):
-        print(f"\n  ⏸️  PENDING (manual execution):")
+        ASCIIColors.yellow(f"\n  ⏸️  PENDING (manual execution):")
         pt = result['pending_tool']
-        print(f"     {pt['name']}({json.dumps(pt['parameters'])})")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+        ASCIIColors.cyan(f"     {pt['name']}({json.dumps(pt['parameters'])})")
 
 def main():
-    print("=" * 70)
-    print("🔬 Research Agent — Multi-Step Reasoning with Personality + Tools")
-    print("=" * 70)
-    print("This demo shows an agent that:")
-    print("  1. Searches arXiv for recent academic papers")
-    print("  2. Searches Wikipedia for background concepts")
-    print("  3. Synthesizes a comprehensive report with citations")
-    print()
-
-    print_config_panel()
-
-    # ── 1. Ensure tools exist ─────────────────────────────────────────
-    arxiv_path, wiki_path = ensure_tools()
-    print(f"📁 Tools ready:")
-    print(f"   • {arxiv_path}")
-    print(f"   • {wiki_path}")
-
-    # ── 2. Create LollmsClient ────────────────────────────────────────
-    print(f"\n🚀 Creating LollmsClient with {LLM_BINDING_NAME} binding...")
-    
-    # Dynamically construct the binding configuration based on the target binding type.
-    if LLM_BINDING_NAME == "llama_cpp_server":
-        BINDING_CONFIG = {
-            "models_path": MODELS_PATH,
-            "binaries_path": BINARIES_PATH,
-            "ctx_size": CONTEXT_SIZE,
-            "n_gpu_layers": N_GPU_LAYERS,
-            "n_threads": 4,
-            "n_parallel": 1,
-            "batch_size": 512,
-            "idle_timeout": 300,
-        }
-    else:
-        # Remote bindings (ollama, openai, groq, etc.)
-        BINDING_CONFIG = {
-            "model_name": MODEL_NAME,
-            "host_address": HOST_ADDRESS,
-            "verify_ssl_certificate": VERIFY_SSL
-        }
-        # Conditionally inject API key for gated services (OpenAI, Mistral, Groq, etc.)
-        if API_KEY:
-            BINDING_CONFIG["service_key"] = API_KEY
-
-    client = LollmsClient(
-        llm_binding_name=LLM_BINDING_NAME,
-        llm_binding_config=BINDING_CONFIG,
-        user_name="user",
-        ai_name="assistant",
+    ASCIIColors.panel(
+        "[bold]🔬 Research Agent — Multi-Step Reasoning with Personality + Tools[/bold]\n[dim]This demo shows an agent that:\n  1. Searches arXiv for recent academic papers\n  2. Searches Wikipedia for background concepts\n  3. Synthesizes a comprehensive report with citations[/dim]",
+        title="[bold green]🤖 AGENTIC PERSONALITY DEMO[/bold green]",
+        border_style="green"
     )
 
-    # ── 3. Download model if missing (Local Bindings Only) ────────────
-    if LLM_BINDING_NAME == "llama_cpp_server":
-        model_path = Path(MODELS_PATH) / MODEL_NAME
+    try:
+        with ASCIIColors.status("[cyan]Initializing client...[/cyan]", spinner="dots"):
+            client = get_client_from_env()
+    except Exception as e:
+        ASCIIColors.red(f"❌ Configuration failed: {e}")
+        sys.exit(1)
+
+    print_config_panel(client)
+
+    arxiv_path, wiki_path = ensure_tools()
+    ASCIIColors.green(f"📁 Tools ready:")
+    ASCIIColors.cyan(f"   • {arxiv_path}")
+    ASCIIColors.cyan(f"   • {wiki_path}")
+
+    if client.llm.binding_name == "llama_cpp_server":
+        model_name = client.llm.model_name
+        models_path = client.llm.models_path
+        model_path = Path(models_path) / model_name
+        
         if not model_path.exists():
-            print(f"\n⬇️  Downloading {MODEL_NAME} ...")
+            ASCIIColors.panel(f"[yellow]⬇️  Downloading {model_name} ...[/yellow]", title="[bold]Model Download[/bold]", border_style="yellow")
             result = client.llm.download_from_zoo(MODEL_ZOO_INDEX, progress_callback=progress_callback)
             if not result.get("status"):
-                print(f"❌ Download failed: {result.get('error')}")
+                ASCIIColors.red(f"❌ Download failed: {result.get('error')}")
                 sys.exit(1)
-            print("✅ Download complete.")
+            ASCIIColors.green("✅ Download complete.")
         else:
-            print(f"\n📁 Model already exists: {MODEL_NAME}")
+            ASCIIColors.green(f"\n📁 Model already exists: {model_name}")
 
-        # ── 4. Load the model ─────────────────────────────────────────
-        print(f"\n🔌 Loading model '{MODEL_NAME}' ...")
+        ASCIIColors.panel(f"[cyan]🔌 Loading model '{model_name}' ...[/cyan]", title="[bold]Model Loading[/bold]", border_style="cyan")
         t0 = time.time()
-        success = client.llm.load_model(MODEL_NAME)
+        success = client.llm.load_model(model_name)
         if not success:
-            print("❌ Failed to load model.")
+            ASCIIColors.red("❌ Failed to load model.")
             sys.exit(1)
         load_time = time.time() - t0
-        print(f"✅ Model loaded in {load_time:.1f}s")
+        ASCIIColors.green(f"✅ Model loaded in {load_time:.1f}s")
 
         for srv in client.llm.ps():
-            print(f"   Server: PID {srv['pid']} | Port {srv['port']} | RSS {srv['rss_mb']} MB")
+            ASCIIColors.cyan(f"   Server: PID {srv['pid']} | Port {srv['port']} | RSS {srv['rss_mb']} MB")
     else:
         load_time = 0.0
-        print("\n☁️  Using remote binding. No model download or local loading required.")
+        ASCIIColors.blue("\n☁️  Using remote binding. No model download or local loading required.")
 
-    # ── 5. Create Research Personality ──────────────────────────────────
-    print("\n🎭 Creating ResearchAgent personality...")
+    ASCIIColors.panel("[magenta]Creating ResearchAgent personality...[/magenta]", title="[bold]🎭 Personality[/bold]", border_style="magenta")
     personality = LollmsPersonality(
         name="ResearchAgent",
         author="lollms-client",
@@ -422,8 +331,7 @@ def main():
         ),
     )
 
-    # ── 6. Create Agent ───────────────────────────────────────────────
-    print("🤖 Creating Agent with personality and tools...")
+    ASCIIColors.panel("[blue]Creating Agent with personality and tools...[/blue]", title="[bold]🤖 Agent[/bold]", border_style="blue")
     agent = Agent(
         lc=client,
         personality=personality,
@@ -433,9 +341,8 @@ def main():
         max_tokens_per_turn=4096,
         metadata={"specialization": "AI/CS research synthesis"},
     )
-    print(f"   Agent: {agent.display_name} | Role: {agent.role} | ID: {agent._agent_id[:8]}")
+    ASCIIColors.cyan(f"   Agent: {agent.display_name} | Role: {agent.role} | ID: {agent._agent_id[:8]}")
 
-    # ── 7. Define multi-step research query ─────────────────────────────
     research_query = (
         "I want to understand the current state of reasoning in large language models. "
         "Specifically:\n"
@@ -445,63 +352,60 @@ def main():
         "summarizes the latest research directions, and highlights open challenges"
     )
 
-    print("\n" + "-" * 70)
-    print("📝 RESEARCH QUERY:")
-    print("-" * 70)
-    print(research_query)
-    print("-" * 70)
+    ASCIIColors.panel(f"[yellow]{research_query}[/yellow]", title="[bold]📝 RESEARCH QUERY[/bold]", border_style="yellow")
 
-    # ── 8. Execute agentic generation ─────────────────────────────────
-    print("\n🔍 Starting multi-step research (streaming enabled)...\n")
-    print("=" * 70)
-    print("🤖 AGENT RESPONSE (streaming):")
-    print("=" * 70)
-
+    ASCIIColors.panel("[cyan]🔍 Starting multi-step research (streaming enabled)...[/cyan]", title="[bold]🚀 EXECUTION[/bold]", border_style="cyan")
     overall_t0 = time.time()
     
-    result = agent.generate_with_tools(
-        prompt=research_query,
-        tools=[arxiv_path, wiki_path],
-        system_prompt=personality.system_prompt,
-        temperature=0.7,
-        n_predict=4096,
-        max_tool_rounds=10,
-        streaming_callback=streaming_callback,
-        auto_execute=True,
-    )
+    try:
+        result = agent.generate_with_tools(
+            prompt=research_query,
+            tools=[arxiv_path, wiki_path],
+            system_prompt=personality.system_prompt,
+            temperature=0.7,
+            n_predict=4096,
+            max_tool_rounds=10,
+            streaming_callback=streaming_callback,
+            auto_execute=True,
+        )
+    except Exception as e:
+        ASCIIColors.red(f"\n💥 Fatal error during agent execution: {e}")
+        sys.exit(1)
 
     overall_elapsed = time.time() - overall_t0
 
-    print("\n")  # Newline after streaming
-
-    # ── 9. Display execution metadata ─────────────────────────────────
     print_tool_execution_summary(result)
 
-    # ── 10. Display final report ──────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("📝 FINAL SYNTHESIZED REPORT")
-    print("=" * 70)
-    print(result["response"])
+    final_response = result.get("response", "")
+    if not final_response.strip():
+        ASCIIColors.panel(
+            "[red]The agent did not produce a final response. This usually happens if the LLM connection fails or the model returns an empty string.[/red]",
+            title="[bold red]⚠️ EMPTY RESPONSE[/bold red]",
+            border_style="red"
+        )
+    else:
+        ASCIIColors.rule("[bold cyan]📝 FINAL SYNTHESIZED REPORT[/bold cyan]")
+        ASCIIColors.rich_print(final_response)
 
-    # ── 11. Performance summary ─────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("⏱️  PERFORMANCE SUMMARY")
-    print("=" * 70)
-    print(f"Model load time:       {load_time:.1f}s")
-    print(f"Total generation time:   {overall_elapsed:.1f}s")
-    print(f"Agentic rounds:          {result['rounds']}")
-    print(f"Tools utilized:          {len(result['tool_calls'])}")
-    print(f"Final response length:   {len(result['response'])} chars")
+    perf_table = ASCIIColors.table(
+        "Metric", "Value",
+        rows=[
+            ["Model load time", f"{load_time:.1f}s"],
+            ["Total generation time", f"{overall_elapsed:.1f}s"],
+            ["Agentic rounds", str(result['rounds'])],
+            ["Tools utilized", str(len(result['tool_calls']))],
+            ["Final response length", f"{len(final_response)} chars"]
+        ],
+        title="[bold]⏱️ PERFORMANCE SUMMARY[/bold]",
+        box="round"
+    )
+    ASCIIColors.rich_print(perf_table)
 
-    # ── 12. Cleanup ─────────────────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("🧹 Cleanup")
-    print("=" * 70)
-    if LLM_BINDING_NAME == "llama_cpp_server" and hasattr(client.llm, "unload_model"):
-        print("Unloading model...")
+    ASCIIColors.panel("[magenta]🧹 Cleanup[/magenta]", title="[bold]🧹 CLEANUP[/bold]", border_style="magenta")
+    if client.llm.binding_name == "llama_cpp_server" and hasattr(client.llm, "unload_model"):
+        ASCIIColors.cyan("Unloading model...")
         client.llm.unload_model()
-    print("👋 Done!")
-
+    ASCIIColors.green("👋 Done!")
 
 if __name__ == "__main__":
     main()

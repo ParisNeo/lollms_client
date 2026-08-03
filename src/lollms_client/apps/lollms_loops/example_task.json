@@ -1,0 +1,10 @@
+{
+  "goal": "Analyze the text file 'data.txt' in the workspace, count the frequency of each word, and save the top 10 most frequent words to 'top_words.txt'.",
+  "success_criteria": "The file 'top_words.txt' exists in the workspace and contains exactly 10 lines, each with a word and its count.",
+  "allowed_tools": ["tool_read_file", "tool_write_file", "tool_execute_python_code"],
+  "max_reasoning_steps": 20,
+  "timeout_seconds": 180,
+  "temperature": 0.1,
+  "enable_code_execution": true,
+  "enable_file_ops": true
+}

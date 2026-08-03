@@ -1626,6 +1626,7 @@ class _AgentStreamState:
         self._code_fence_buffer = ""
         self._code_fence_hold_buffer = ""
         self._in_inline_code = False
+        self._in_processing_block = False
 
     def _cb(self, text: str, msg_type=None, meta: Optional[Dict] = None):
         if self.callback is None:
@@ -1656,7 +1657,7 @@ class _AgentStreamState:
                 return False
 
         # Anti-mimicry: prevent LLM from generating <processing> blocks
-        if not self._is_accumulating_tool and not self._in_code_fence and not self._in_inline_code:
+        if not self._is_accumulating_tool and not self._in_code_fence and not self._in_inline_code and not self._in_processing_block:
             proc_match = re.search(r'(?m)^\s*<processing', self._pending_buffer, re.IGNORECASE)
             if proc_match:
                 ASCIIColors.warning("[AgentStreamState] LLM attempted to generate a <processing> block. Halting.")
@@ -1789,11 +1790,26 @@ class _AgentStreamState:
                 self._is_accumulating_tool = True
                 self._tool_buffer = self._pending_buffer[tag_start_idx:]
                 self._pending_buffer = ""
-                # CRITICAL FIX: Check if closing </tool> is already in the buffer (single-chunk dispatch)
+                
                 if self._try_complete_tool():
                     return False
-                return True
+                    
+                # Wait for JSON payload if only the tag is present
+                if self._tool_buffer.strip() == "<tool>":
+                    return True
+                    
+                # Attempt to extract tool name if it's separated by a newline
+                match = re.search(r'<tool>\s*([a-zA-Z0-9_]+)\s*({.*})', self._tool_buffer, re.DOTALL)
+                if match:
+                    tool_name = match.group(1)
+                    json_str = match.group(2)
+                    normalized_json = json.dumps({"name": tool_name, "parameters": json.loads(json_str)})
+                    self._tool_buffer = f"<tool>{normalized_json}</tool>"
+                    if self._try_complete_tool():
+                        return False
 
+                return True
+            
         # Partial tag detection
         def _ends_with_partial_tag(buffer: str) -> int:
             tags_to_check = ["<tool", "<done"]
@@ -1893,11 +1909,12 @@ class _AgentStreamState:
 
         tool_open_tag = f'\n<processing type="tool" title="Tool Execution: {ui_tool_name}" params="{escaped_params}">\n'
         self.content += tool_open_tag
-        self._cb(tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+        self._in_processing_block = True
+        self._cb(tool_open_tag, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "is_processing_block": True, "processing_event": "start"})
 
         status_line = f"* Calling tool '{ui_tool_name}'...\n"
         self.content += status_line
-        self._cb(status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+        self._cb(status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "is_processing_block": True})
 
         return True
 
@@ -2401,14 +2418,13 @@ class Agent:
                 trace_exception(ex)
                 lcp_binding = None
 
-        if lcp_binding and hasattr(lcp_binding, 'to_chat_tool_specs'):
+        if lcp_binding:
             try:
                 if enable_code_execution and hasattr(lcp_binding, 'mount_tool_library'):
                     lcp_binding.mount_tool_library('execute_python_code')
-                lcp_tools = lcp_binding.to_chat_tool_specs()
-                if not enable_code_execution:
-                    lcp_tools = {k: v for k, v in lcp_tools.items() if k != 'tool_execute_python_code'}
-                active_tools.update(lcp_tools)
+                    lcp_tools = lcp_binding.to_chat_tool_specs()
+                    code_tool = {k: v for k, v in lcp_tools.items() if k == 'tool_execute_python_code'}
+                    active_tools.update(code_tool)
             except Exception as ex:
                 trace_exception(ex)
 
@@ -2649,6 +2665,9 @@ class Agent:
         ]
 
         for t_name, t_spec in active_tools.items():
+            if not isinstance(t_spec, dict):
+                ASCIIColors.warning(f"[Agent] Tool '{t_name}' has an invalid specification (None). Skipping.")
+                continue
             desc = t_spec.get("description", "")
             params_list = t_spec.get("parameters", [])
             param_desc = ", ".join([f"{p['name']}: {p['type']}" for p in params_list])
@@ -3158,7 +3177,7 @@ class Agent:
                                     pass
                     context_aware_signature = f"{full_signature}::{json.dumps(current_file_hashes, sort_keys=True)}"
 
-                    if context_aware_signature in successful_tool_signatures:
+                    if context_aware_signature in successful_tool_signatures and tool_name not in ["tool_execute_python", "tool_execute_python_code"]:
                         ASCIIColors.warning(f"[Agent.chat] Repetitive SUCCESS loop blocked for '{tool_name}'.")
                         tool_res = {
                             "success": False,
@@ -3265,7 +3284,8 @@ class Agent:
                     tool_close = f"{status_done}{details}<!-- status:{status_meta} -->\n</processing>\n\n"
 
                     if streaming_callback:
-                        streaming_callback(tool_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                        streaming_callback(tool_close, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True, "is_processing_block": True, "processing_event": "end"})
+                    ss._in_processing_block = False
 
                     # Record failure in FailureMemory
                     if is_failure and self._failure_memory and hasattr(self._failure_memory, '_signatures'):

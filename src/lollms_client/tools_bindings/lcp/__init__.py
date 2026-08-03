@@ -166,47 +166,12 @@ class LCPBinding(LollmsToolBinding):
             "_python_file_path": str(Path(__file__).parent / "default_tools" / file_stem / f"{file_stem}.py") # Store path for execution
         }
 
-    def _load_tool_file(self, py_file: Path) -> bool:
+    def _load_tool_file(self, py_file: Path) -> int:
         file_stem = py_file.stem
 
         tool_defs = self._parse_tool_via_ast(py_file)
         if not tool_defs:
-            ASCIIColors.red(f"[LCP Discovery] ❌ No tool_ functions found in '{file_stem}'")
-            return False
-
-        # ── 🛡️ EARLY INITIALIZATION & HEALTH GATE ──
-        # Load the module once to check for and execute init_tools_library().
-        # If initialization fails, we reject the entire toolset to prevent
-        # the LLM from hallucinating calls to broken tools.
-        module_name = f"lollms_client.tools_bindings.lcp.persistent_{file_stem}"
-        try:
-            if module_name not in sys.modules:
-                spec = importlib.util.spec_from_file_location(module_name, str(py_file.resolve()))
-                if not spec or not spec.loader:
-                    ASCIIColors.warning(f"[LCP Discovery] ⚠️ Failed to create module spec for '{file_stem}'. Skipping.")
-                    return False
-                tool_module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = tool_module
-                spec.loader.exec_module(tool_module)
-            else:
-                tool_module = sys.modules[module_name]
-
-            if hasattr(tool_module, "init_tools_library") and callable(tool_module.init_tools_library):
-                try:
-                    tool_module.init_tools_library()
-                    ASCIIColors.success(f"[LCP Init] ✅ Initialized library for '{file_stem}'")
-                except Exception as init_ex:
-                    ASCIIColors.error(f"[LCP Discovery] ❌ Toolset '{file_stem}' REJECTED: init_tools_library() failed: {init_ex}")
-                    # Clean up the broken module from cache
-                    if module_name in sys.modules:
-                        del sys.modules[module_name]
-                    return False
-
-        except Exception as load_ex:
-            ASCIIColors.error(f"[LCP Discovery] ❌ Toolset '{file_stem}' REJECTED: Failed to load module: {load_ex}")
-            if module_name in sys.modules:
-                del sys.modules[module_name]
-            return False
+            return 0
 
         count = 0
         for tool_def in tool_defs:
@@ -214,16 +179,12 @@ class LCPBinding(LollmsToolBinding):
             tool_def['_python_file_path'] = str(py_file.resolve())
 
             if any(t.get("name") == tool_name for t in self.discovered_tools):
-                ASCIIColors.yellow(f"[LCP Discovery] Skipping '{tool_name}' (already registered)")
                 continue
 
             self.discovered_tools.append(tool_def)
             count += 1
 
-        if count > 0:
-            ASCIIColors.success(f"[LCP Discovery] 📦 Loaded {count} tools from '{file_stem}'")
-            return True
-        return False
+        return count
 
     def mount_tool_library(self, library_name: str) -> bool:
         """
@@ -274,7 +235,7 @@ class LCPBinding(LollmsToolBinding):
         new_tool_count = len(self.discovered_tools) - initial_tool_count
 
         if new_tool_count > 0:
-            ASCIIColors.success(f"[LCP Mount] ✅ Successfully mounted '{library_name}': {new_tool_count} tools registered.")
+            ASCIIColors.success(f"[LCP Mount] ✅ Successfully mounted '{library_name}': {new_tool_count} tools registered (lazy init).")
             return True
         else:
             ASCIIColors.warning(f"[LCP Mount] ⚠️ Library '{library_name}' mounted but no tools discovered.")
@@ -284,40 +245,30 @@ class LCPBinding(LollmsToolBinding):
         self.discovered_tools = []
 
         for folder in self.tools_folders:
-            if not folder or not folder.is_dir(): 
-                ASCIIColors.warning(f"[LCP Discovery] Folder does not exist or is not a directory: {folder}")
+            if not folder or not folder.is_dir():
                 continue
 
             for item in folder.iterdir():
                 py_file = None
                 if item.is_dir():
-                    # Standard convention: directory name matches filename (e.g., my_lib/my_lib.py)
                     py_file = item / f"{item.name}.py"
                     if not py_file.exists():
-                        # Fallback: Scan for any .py file inside the directory (excluding __init__.py)
-                        # This ensures tools are discovered even if the strict naming convention isn't met.
                         sub_py_files = [f for f in item.iterdir() if f.is_file() and f.suffix == ".py" and f.stem != "__init__"]
                         if sub_py_files:
-                            ASCIIColors.info(f"[LCP Discovery] Standard file '{py_file.name}' not found in '{item.name}'. Falling back to scan: {[f.name for f in sub_py_files]}")
                             for fallback_py in sub_py_files:
                                 self._load_tool_file(fallback_py)
                             continue
                         else:
-                            ASCIIColors.warning(f"[LCP Discovery]   Directory '{item.name}' has no matching .py tool file.")
                             continue
                 elif item.suffix == ".py" and item.stem != "__init__":
                     py_file = item
 
                 if py_file and py_file.exists():
                     self._load_tool_file(py_file)
-                elif py_file:
-                    ASCIIColors.warning(f"[LCP Discovery]   File missing: {py_file}")
 
         for py_file in self.tool_files:
             if py_file and py_file.exists() and py_file.suffix == ".py":
                 self._load_tool_file(py_file)
-            elif py_file:
-                ASCIIColors.warning(f"[LCP Discovery] Explicit tool file missing: {py_file}")
 
     def discover_tools(self, specific_tool_names: Optional[List[str]] = None, **kwargs) -> List[Dict[str, Any]]:
         if kwargs.get("force_refresh", False) or not self.discovered_tools:
@@ -387,6 +338,7 @@ class LCPBinding(LollmsToolBinding):
     def execute_tool(self, tool_name: str, params: Dict[str, Any], discussion_instance=None, **kwargs) -> Dict[str, Any]:
         """
         Executes a specific tool function from a potentially multi-tool file.
+        Handles lazy initialization of the tool module on first call.
         """
         ASCIIColors.info(f"[LCP execute_tool] Calling: '{tool_name}'")
 
@@ -406,15 +358,30 @@ class LCPBinding(LollmsToolBinding):
             if python_file_path:
                 module_name = f"lollms_client.tools_bindings.lcp.persistent_{python_file_path.stem}"
 
-                # 🛑 CRITICAL ARCHITECTURAL RULE: Trust the Early Initialization.
-                # The module MUST already exist in sys.modules because _load_tool_file()
-                # loaded it and ran init_tools_library() at construction time.
-                # If it's missing here, the tool was rejected or the registry is corrupted.
+                # ── 🛡️ LAZY INITIALIZATION ──
+                # If the module is not yet loaded, import it and run init_tools_library()
+                # ONLY when the tool is actually being called. This prevents eager loading
+                # of heavy dependencies (like pandas, numpy) at startup.
                 if module_name not in sys.modules:
-                    ASCIIColors.error(f"[LCP execute_tool] CRITICAL: Module '{module_name}' for tool '{tool_name}' is missing from cache!")
-                    return {"error": f"Module for '{tool_name}' not initialized. The tool may have been rejected at startup.", "status_code": 500}
+                    try:
+                        spec = importlib.util.spec_from_file_location(module_name, str(python_file_path.resolve()))
+                        if not spec or not spec.loader:
+                            return {"error": f"Failed to create module spec for '{python_file_path.stem}'.", "status_code": 500}
 
-                tool_module = sys.modules[module_name]
+                        tool_module = importlib.util.module_from_spec(spec)
+                        sys.modules[module_name] = tool_module
+                        spec.loader.exec_module(tool_module)
+
+                        if hasattr(tool_module, "init_tools_library") and callable(tool_module.init_tools_library):
+                            tool_module.init_tools_library()
+                            ASCIIColors.success(f"[LCP Lazy Init] ✅ Initialized library for '{python_file_path.stem}'")
+                    except Exception as init_ex:
+                        ASCIIColors.error(f"[LCP execute_tool] ❌ Toolset '{python_file_path.stem}' FAILED lazy init: {init_ex}")
+                        if module_name in sys.modules:
+                            del sys.modules[module_name]
+                        return {"error": f"Tool initialization failed: {init_ex}", "status_code": 500}
+                else:
+                    tool_module = sys.modules[module_name]
             else:
                 # Use the dynamically loaded module
                 tool_module = tool_def.get("_dynamic_module")

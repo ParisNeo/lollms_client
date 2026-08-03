@@ -36,11 +36,13 @@ Tools can optionally receive the active `LollmsClient` instance and `LollmsDiscu
 *   **`unregister_tools_by_prefix(tool_name_prefix)`**: Cleanly removes dynamically generated tools when the artefact is updated or deleted.
 *   **Security Gate**: This feature is disabled by default. The host application must explicitly pass `allow_dynamic_tools=True` to `discussion.chat()` to permit the LLM to execute its own code.
 
-### 8. Early Initialization & Health Gate
-LCP enforces a strict validation phase during tool discovery. If a tool file defines an `init_tools_library()` function, LCP executes it immediately upon loading the module. If this initialization fails (e.g., missing system dependencies), the **entire tool file is rejected** and none of its tools are registered. This prevents the LLM from hallucinating calls to broken or unprepared tools.
+### 8. Lazy Initialization & Health Gate
+LCP enforces a **Lazy Initialization** protocol. During tool discovery, LCP only uses AST parsing to extract tool metadata (name, description, schema). It does **NOT** import the module or execute `init_tools_library()` at startup. This prevents eager loading of heavy dependencies (like `pandas`, `numpy`, or `matplotlib`) and eliminates startup log noise.
+
+The actual module import and `init_tools_library()` execution are deferred to `execute_tool()`. The first time a specific tool is invoked, its module is imported into `sys.modules`, its `init_tools_library()` is executed, and the resulting state is cached. If initialization fails at that moment, the error is returned to the LLM, preventing silent failures.
 
 ### 9. Persistent Module Caching
-To maximize performance and preserve state across multiple tool calls, LCP loads tool files into `sys.modules` under the `lollms_client.tools_bindings.lcp.persistent_{file_stem}` namespace. The binding trusts that this cache exists at execution time. If the Early Initialization Gate rejects a file, it is purged from the cache, ensuring broken modules are never executed.
+To maximize performance and preserve state across multiple tool calls, LCP loads tool files into `sys.modules` under the `lollms_client.tools_bindings.lcp.persistent_{file_stem}` namespace upon first execution. The binding trusts that this cache exists at execution time. If a lazy initialization fails, the module is purged from the cache, ensuring broken modules are not re-used.
 
 ---
 

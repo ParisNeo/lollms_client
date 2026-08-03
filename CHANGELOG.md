@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-03 16:35]
+
+- refactor(agent): remove config_wizard and update lollms_agent examples
+
 ## [2026-08-02 14:52]
 
 - docs: update READMEs and enhance MCP tool bindings security
