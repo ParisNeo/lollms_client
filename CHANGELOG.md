@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-05 13:48]
+
+- docs(readme): update unified configuration description
+
 ## [2026-08-04 16:15]
 
 - feat(agent): integrate artefact system with agent and discussion modules

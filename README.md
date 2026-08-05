@@ -44,6 +44,11 @@ Whether you're connecting to a remote LoLLMs server, an Ollama instance, the Ope
 *   **Unified Configuration**: Run local GGUFs (via llama.cpp/python), local Ollama instances, or scale to OpenAI, Anthropic, Gemini, Groq, and OpenRouter using a single, unified `llm_binding_config` block.
 *   **Automatic Context Compression**: Dynamically monitors context token sizes, summarizes old turns using targeted AI-synthesizers, and collapses long historical sequences into a clean, single-turn **Project State Synopsis** to keep models sharp and conversational context pristine.
 
+### 🧠 Universal Lazy Profiles & Multi-Model Routing
+*   **Memory-Efficient Multi-Binding**: Define declarative registries of `LollmsBindingProfile` configurations for *any* modality (LLM, TTI, TTS, STT, TTV, TTM). Only the binding marked as `is_default` is eagerly loaded at startup. Other bindings are instantiated lazily *on-demand* when you switch to them, saving massive amounts of RAM and VRAM.
+*   **Dynamic Switching**: Seamlessly switch between a local coding model, a cloud vision model, and a fast text model at runtime using `client.switch_model("alias")` or `client.switch_tti("alias")`. Instantiated bindings are cached for zero-latency re-activation.
+*   **100% Backward Compatible**: If you use the legacy `llm_binding_name` or `extra_llms` parameters, they are automatically registered as the `"master"` profiles and eagerly instantiated, ensuring older code runs without modification.
+
 ## Installation
 
 You can install `lollms_client` directly from PyPI:
@@ -532,6 +537,139 @@ blocks = tp.extract_code_blocks(
 
 ---
 
+## 🧠 Universal Lazy Profiles & Multi-Model Routing
+
+`lollms_client` features a powerful, memory-efficient multi-binding architecture via **Universal Lazy Profiles**. Instead of eagerly instantiating all models/engines at startup (which wastes RAM and VRAM), you define declarative registries of `LollmsBindingProfile` configurations for *any* modality (LLM, TTI, TTS, STT, TTV, TTM). 
+
+Only the binding marked as `is_default` is loaded at startup. Other bindings are instantiated lazily *on-demand* when you switch to them. This system is 100% backward compatible. If you use the legacy `llm_binding_name` or `tti_binding_name` parameters, they are automatically registered as the `"master"` profiles and marked as defaults.
+
+### 1. Multi-Model LLM Routing
+Define multiple LLM profiles to handle different domains or complexity tiers.
+
+```python
+from lollms_client import LollmsClient, LollmsBindingProfile
+
+# 1. Define LLM profiles declaratively (None of these are instantiated yet)
+llm_profiles = {
+    "cloud_vision": LollmsBindingProfile(
+        name="cloud_vision",
+        binding_name="openai",
+        binding_config={"model_name": "gpt-4o", "service_key": "your-key"},
+        vision_enabled=True,
+        is_default=True  # This one will be loaded at startup
+    ),
+    "local_coder": LollmsBindingProfile(
+        name="local_coder",
+        binding_name="ollama",
+        binding_config={"host_address": "http://localhost:11434", "model_name": "qwen2.5-coder:7b"},
+        forced_context_size=32768
+    ),
+    "local_fast": LollmsBindingProfile(
+        name="local_fast",
+        binding_name="ollama",
+        binding_config={"host_address": "http://localhost:11434", "model_name": "llama3.2:3b"}
+    )
+}
+
+# 2. Initialize the client (Only "cloud_vision" is instantiated)
+lc = LollmsClient(llm_profiles=llm_profiles)
+
+# 3. Use the default model
+response1 = lc.generate_text("Explain quantum physics.")
+
+# 4. Dynamically switch to the local coder (Instantiated on-the-fly and cached)
+lc.switch_model("local_coder")
+response2 = lc.generate_text("Write a Python script to sort a list.")
+
+# 5. Switch back to the default cloud vision model (Retrieved from cache, no re-instantiation)
+lc.switch_model("cloud_vision")
+```
+
+### 2. Multi-Engine TTI (Text-to-Image) Routing
+The profile system is universal. You can define profiles for image generation engines and switch between a local Stable Diffusion model and a cloud DALL-E API seamlessly.
+
+```python
+# Define TTI profiles
+tti_profiles = {
+    "local_sd": LollmsBindingProfile(
+        name="local_sd",
+        binding_name="diffusers",
+        binding_config={"model_name": "stable-diffusion-v1-5"},
+        is_default=True
+    ),
+    "cloud_dalle": LollmsBindingProfile(
+        name="cloud_dalle",
+        binding_name="openai",
+        binding_config={"model_name": "dall-e-3", "service_key": "your-key"}
+    )
+}
+
+lc = LollmsClient(llm_binding_name="ollama", tti_profiles=tti_profiles)
+
+# Generate with default local SD
+img_bytes = lc.generate_image("A cyberpunk cat")
+
+# Switch to DALL-E 3 for a specific prompt
+lc.switch_tti("cloud_dalle")
+img_bytes = lc.generate_image("A hyperrealistic oil painting of a dog")
+```
+
+### 3. The Smart Router Binding
+For automated routing, the `smart_router` meta-binding evaluates incoming prompts using TF-IDF (subject matching), complexity heuristics, and weighted constraints (cost/latency) to delegate generation to the optimal child model automatically.
+
+```python
+from lollms_client import LollmsClient
+
+router_config = {
+    "routing_strategy": "cost_optimized",
+    "model_profiles": {
+        "cheap_fast": {
+            "binding_name": "ollama",
+            "binding_config": {"model_name": "qwen2.5:3b"},
+            "routing_profile": {"description": "fast simple tasks", "complexity_tier": 1}
+        },
+        "smart_coder": {
+            "binding_name": "ollama",
+            "binding_config": {"model_name": "qwen2.5-coder:7b"},
+            "routing_profile": {"description": "python code debugging", "complexity_tier": 2}
+        }
+    }
+}
+
+lc = LollmsClient(llm_binding_name="smart_router", llm_binding_config=router_config)
+
+# The router automatically selects "cheap_fast" for simple prompts
+response = lc.generate_text("What is 2+2?")
+
+# The router automatically selects "smart_coder" for coding prompts
+response = lc.generate_text("Write a Python script to sort a list.")
+```
+
+### 4. VLM as a Tool (`vlm_query`)
+When using a text-only LLM (or Smart Router without a VLM child), you can enable VLM collaboration via the `vlm_query` LCP tool. This allows the text LLM to delegate visual analysis to a secondary VLM on-demand.
+
+```python
+# Client with a text-only LLM and a separate VLM profile
+lc = LollmsClient(
+    llm_profiles={
+        "text_llm": LollmsBindingProfile(name="text_llm", binding_name="ollama", binding_config={"model_name": "llama3"}, is_default=True),
+        "vlm": LollmsBindingProfile(name="vlm", binding_name="ollama", binding_config={"model_name": "llava"}, vision_enabled=True)
+    }
+)
+
+# The user sends an image and asks a question
+discussion.chat(
+    user_message="Look at the diagram in the image. What are the main components?",
+    images=["base64_encoded_image_data..."],
+    enable_vlm_query=True, # CRITICAL: Explicitly enable the fallback tool
+    max_reasoning_steps=10
+)
+# The LLM (llama3) will realize it needs vision, call `tool_vlm_query(0, "Identify the main components.")`,
+# receive the text description from the VLM (llava), and synthesize the final answer.
+```
+
+---
+
 ## 🧠 The High-Grade Agent System (`lollms_agent`)
 
 The `Agent` class is the flagship autonomous execution engine. Unlike `LollmsDiscussion` (optimized for ~20 conversational turns), the Agent is designed for **long-horizon autonomous tasks** (50–200 reasoning rounds) such as build→test→fix loops and multi-file refactoring.
@@ -600,25 +738,122 @@ print(f"Rounds: {result['rounds']}, Tool calls: {len(result['tool_calls'])}")
 
 ### The Handbag (Portable Agent Resources)
 
-The Handbag allows you to package ALL agent resources into a single folder. If you point the agent to a handbag path, it auto-configures personalities, tools, skills, RAG, and memory.
+The **Handbag** is a self-contained, portable folder that carries ALL of an agent's resources. It allows you to package personalities, tools, skills, RAG knowledge, memory, and an isolated workspace into a single directory. When you point an `Agent` to a handbag path, it automatically discovers and loads these resources.
+
+#### 1. Folder Structure
+
+A Handbag follows a strict, convention-based directory structure:
 
 ```text
 my_handbag/
-├── handbag.yaml              # Optional manifest
-├── personalities/            # SOUL.md bundles
-├── tools/                    # LCP tools (.py)
-├── skills/                   # SKILL.md files
-├── rag/                      # Text documents for retrieval
-├── memory/                   # memory.db
-└── workspace/                # Isolated working directory
+├── handbag.yaml              # Optional manifest (name, default_personality, skills_mode)
+├── personalities/            # Personality bundles (subdirs with SOUL.md)
+│   ├── researcher/
+│   │   └── SOUL.md
+│   └── coder/
+│       └── SOUL.md
+├── tools/                    # Extra LCP tools (.py files or subdirs)
+│   ├── my_custom_tool.py
+│   └── another_tool/
+│       └── another_tool.py
+├── skills/                   # SKILL.md files (agent creates/updates these)
+│   ├── python_patterns/
+│   │   └── SKILL.md
+│   └── ...
+├── rag/                      # RAG documents (text files for retrieval)
+│   ├── doc1.txt
+│   └── doc2.md
+├── memory/                   # Memory database
+│   └── memory.db
+└── workspace/                # Optional isolated workspace
 ```
 
+#### 2. Creating a Handbag
+
+You can automatically scaffold a new, empty Handbag folder using the `Handbag.create_structure()` helper. This creates all required subdirectories and a default `handbag.yaml` manifest.
+
 ```python
+from lollms_client.lollms_agent.handbag import Handbag
+
+# Scaffolds the complete folder structure at the specified path
+hb_path = Handbag.create_structure("./my_research_handbag", name="Research Handbag")
+print(f"Handbag created at: {hb_path}")
+```
+
+#### 3. Populating the Handbag
+
+Once the structure is created, you populate the folders with your resources:
+
+*   **Personalities (`personalities/`)**: Create a subdirectory for each personality. Inside each, place a `SOUL.md` file containing the system prompt and YAML frontmatter (name, author, category, etc.).
+*   **Tools (`tools/`)**: Place LCP tool scripts (`.py` files) directly in this folder, or create a subdirectory with a `.py` file matching the directory name.
+*   **Skills (`skills/`)**: Create subdirectories for each skill, each containing a `SKILL.md` file.
+*   **RAG (`rag/`)**: Place any text files (`.txt`, `.md`, `.pdf`, etc.) here. The Handbag will automatically index them. If `safestore` is installed, it uses semantic search; otherwise, it falls back to keyword-based scoring.
+*   **Memory (`memory/`)**: A `memory.db` SQLite file will be automatically created here when the agent starts.
+
+You can optionally configure the `handbag.yaml` manifest to set a default personality or skills mode:
+
+```yaml
+name: Research Handbag
+version: '1.0'
+description: A handbag for research tasks.
+default_personality: researcher  # Name of the folder in personalities/
+skills_mode: always_visible      # "always_visible", "loadable", or "mixed"
+```
+
+#### 4. Using the Handbag in an Agent
+
+When you pass `handbag_path` to the `Agent` constructor, it automatically loads the resources as defaults. Explicit constructor parameters (like `personality` or `workspace_path`) always override the Handbag's values.
+
+```python
+from lollms_client import LollmsClient
+from lollms_client.lollms_agent import Agent, AgentRole, CapabilityFlags
+
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+
+# The Agent automatically loads the default personality, tools, skills, RAG, and memory
 agent = Agent(
     lc=client,
-    handbag_path="./my_handbag",  # Auto-loads everything
+    handbag_path="./my_research_handbag",
     name="ResearchBot",
+    role=AgentRole.DOMAIN_EXPERT,
     capabilities=CapabilityFlags(enable_code_execution=True),
+)
+
+# You can switch between personalities loaded from the handbag
+print("Available personalities:", agent.list_handbag_personalities())
+agent.switch_handbag_personality("coder")
+
+# Run the agent
+result = agent.chat("Analyze the latest trends in AI.")
+```
+
+#### 5. Using the Handbag in a Discussion
+
+The Handbag's resources can also be accessed directly for use in a standard `LollmsDiscussion`. This is useful when you want the rich RAG and memory features of the Handbag without the full autonomous Agent loop.
+
+```python
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_agent.handbag import Handbag
+
+client = LollmsClient(llm_binding_name="ollama", llm_binding_config={"model_name": "llama3"})
+db_manager = LollmsDataManager("sqlite:///discussion.db")
+discussion = LollmsDiscussion.create_new(lollms_client=client, db_manager=db_manager)
+
+# Load the handbag directly
+handbag = Handbag("./my_research_handbag")
+
+# Get the default personality (with RAG automatically attached)
+personality = handbag.get_default_personality()
+
+# Get the memory manager
+memory_manager = handbag.create_memory_manager()
+
+# Use them in a discussion chat
+discussion.chat(
+    user_message="What does the knowledge base say about recursion?",
+    personality=personality,
+    memory_manager=memory_manager,
+    tools=handbag.get_tool_files() # Pass the handbag's tools
 )
 ```
 
