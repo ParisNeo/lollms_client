@@ -69,6 +69,8 @@ if __name__ == "__main__":
 ## Available Examples
 
 - `agentic_personality_tools_example.py`: A full agentic workflow demonstrating custom personality definitions, multi-step reasoning, and external tool chaining (arXiv + Wikipedia).
+- `universal_profiles_example.py`: Demonstrates the Universal Lazy Profile System (multi-model LLM/TTI routing) dynamically loaded from the `.env` file. Shows how to switch between models configured via the wizard.
+- `example.env`: A template configuration file showing the syntax for defining Master Bindings and Universal Lazy Profiles.
 - `test_discussion.py`: A smoke test for the `LollmsDiscussion` package, demonstrating in-memory and DB-backed chats, as well as artefact management.
 - `llama_cpp_server_example.py`: Basic usage specific to the local `llama_cpp_server` binding.
 - `ollama_vision_flux_klein_loop.py`: Demonstrates a multimodal loop using Ollama for vision and Flux for image generation.

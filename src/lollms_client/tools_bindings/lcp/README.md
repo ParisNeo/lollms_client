@@ -194,7 +194,25 @@ default_tools/
 │   └── semantic_data_engineer.py  # Exposes: tool_get_schema, tool_filter, tool_plot, etc.
 ├── matter_controller/
 │   └── matter_controller.py       # Exposes: tool_discover, tool_commission, tool_control
+├── debug_toolset/
+│   └── debug_toolset.py           # Exposes: tool_dump_context (Opt-in via debug=True)
 ```
+
+---
+
+## 🐛 Debug Toolset (Opt-In Diagnostic Library)
+
+The `debug_toolset` library provides diagnostic tools for inspecting the LLM's active context and conversation state. It is strictly **opt-in** and is not mounted by default.
+
+### Activation
+To mount the debug toolset, pass `debug=True` to `LollmsDiscussion.chat()` or `Agent.chat()`. The orchestrator will dynamically call `lcp_binding.mount_tool_library("debug_toolset")` and inject the tools into the active session.
+
+### `tool_dump_context`
+Dumps the raw, active conversation context (system prompt and message history) into a JSON file in the current working directory.
+
+*   **Context Injection**: This tool declares `discussion_instance` in its function signature. The LCP AST parser automatically filters this parameter out when building the JSON schema for the LLM, but the ChatMixin/Agent orchestrator intercepts it and injects the active `LollmsDiscussion` (or Agent proxy) instance at execution time.
+*   **Agnosticism**: The tool relies entirely on the standard `.export(format_type="openai_chat")` method available on all discussion-like objects, ensuring it works seamlessly for both `LollmsDiscussion` and the `Agent`'s internal proxy.
+*   **Usage**: The LLM can call this tool to dump its exact prompt history to a file (e.g., `context_dump.json`) to debug visibility issues, verify tool call history, or inspect the exact payload sent to the LLM binding.
 
 ---
 

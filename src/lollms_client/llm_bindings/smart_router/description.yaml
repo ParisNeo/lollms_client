@@ -1,0 +1,25 @@
+title: 'Smart Router (Multi-Model Routing)'
+author: 'ParisNeo'
+version: 1.0.0
+binding_name: 'smart_router'
+creation_date: 2026-08-04
+description: >
+  A meta-binding that routes generation requests to child LLM bindings based on 
+  subject matter (TF-IDF), complexity heuristics, cost weights, and latency.
+  It enables cost-effective and highly capable multi-model ecosystems.
+input_parameters:
+  - name: routing_strategy
+    type: str
+    description: "The routing strategy to use."
+    mandatory: false
+    default: "balanced"
+    options: ["balanced", "cost_optimized", "quality_optimized"]
+    
+  - name: model_profiles
+    type: dict
+    description: >
+      A dictionary of model profiles. Each key is an alias, and the value contains 
+      the binding_name, binding_config, vision_enabled, forced_context_size, and 
+      a routing_profile dictionary (description, cost_per_1k_tokens, avg_latency_ms, complexity_tier).
+    mandatory: true
+    default: {}

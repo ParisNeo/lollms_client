@@ -535,6 +535,32 @@ class ArtefactManager:
                 seen[t] = v
         return list(seen.keys())
 
+    def _read_content_from_disk(self, art: Dict[str, Any]) -> str:
+        title = art.get("title", "")
+        atype = art.get("type", "document")
+        language = art.get("language")
+        file_ext = art.get("file_ext") or Path(title).suffix
+
+        if getattr(self._discussion, "workspace_data_path", None):
+            ws_data_dir = Path(self._discussion.workspace_data_path)
+        else:
+            base_workspace_dir = Path(self._discussion.workspace_path) if self._discussion.workspace_path else Path("./data_workspace")
+            disc_id = self._discussion.id
+            ws_data_dir = base_workspace_dir / disc_id / "workspace_data"
+
+        path_source = art.get("physical_path") or title
+        clean_path = self._sanitize_path_segments(path_source.replace("workspace/", "").replace("data_workspace/", ""))
+        filename = self._get_filename_with_ext(clean_path, atype, language, file_ext)
+        file_path = ws_data_dir / filename
+
+        if file_path.exists():
+            try:
+                return file_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception as e:
+                ASCIIColors.warning(f"[ArtefactManager] Failed to read content from disk for '{title}': {e}")
+                return ""
+        return ""
+
     def add(
         self,
         title:             str,
@@ -560,8 +586,6 @@ class ArtefactManager:
     ) -> Dict[str, Any]:
         title = self._sanitize_path_segments(title)
 
-        # 🛑 CRITICAL FIX: physical_path is the absolute source of truth for disk operations.
-        # We must sanitize it and only fall back to the title if it is explicitly missing.
         raw_physical_path = extra_data.pop("physical_path", None)
         if raw_physical_path:
             physical_path = self._sanitize_path_segments(raw_physical_path)
@@ -597,6 +621,52 @@ class ArtefactManager:
         if artefact_type not in ArtefactType.ALL:
             raise ValueError(f"Unknown artefact type '{artefact_type}'.")
         artefacts = self._get_all_raw()
+
+        disable_versioning = getattr(self._discussion, "disable_artefact_versioning", False)
+
+        if disable_versioning:
+            existing_art = None
+            for a in artefacts:
+                if a.get('title') == title:
+                    existing_art = a
+                    break
+
+            if existing_art:
+                existing_art['content_source'] = 'disk'
+                existing_art['content'] = ""
+                existing_art['type'] = artefact_type
+                existing_art['physical_path'] = physical_path
+                existing_art['updated_at'] = datetime.utcnow().isoformat()
+                if language is not None:
+                    existing_art['language'] = language
+                existing_art['images'] = images or existing_art.get('images', [])
+                existing_art['image_media_types'] = image_media_types or existing_art.get('image_media_types', [])
+                if file_ext is not None:
+                    existing_art['file_ext'] = file_ext
+                for k, v in extra_data.items():
+                    existing_art[k] = v
+                version = existing_art.get('version', 1)
+
+                if visibility:
+                    existing_art['visibility'] = visibility
+                    existing_art['active'] = (visibility == ArtefactVisibility.FULL)
+                elif active is not None:
+                    existing_art['active'] = active
+                    existing_art['visibility'] = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
+
+                self._save_all(artefacts)
+
+                if existing_art.get("visibility") != ArtefactVisibility.HIDDEN:
+                    self._sync_to_disk_workspace(
+                        title, content, version, artefact_type, language, file_ext,
+                        physical_data=physical_data, physical_path=physical_path,
+                        logical_content=logical_content
+                    )
+
+                return_artefact = existing_art.copy()
+                return_artefact["physical_data"] = physical_data
+                return return_artefact
+
         artefacts = [a for a in artefacts if not (a.get('title') == title and a.get('version') == version)]
         for a in artefacts:
             if a.get('title') == title:
@@ -619,13 +689,18 @@ class ArtefactManager:
 
         now = datetime.utcnow().isoformat()
         token_count = self._discussion.lollmsClient.count_tokens(content) if (self._discussion and self._discussion.lollmsClient) else len(content) // 4
+        
+        content_source = "disk" if disable_versioning else "db"
+        db_content = "" if disable_versioning else content
+
         new_artefact: Dict[str, Any] = {
             "id":               str(uuid.uuid4()),
             "title":            title,
             "type":             artefact_type,
             "physical_path":    physical_path,
             "version":          version,
-            "content":          content,
+            "content":          db_content,
+            "content_source":   content_source,
             "token_count":      token_count,
             "images":           imgs,
             "image_media_types": mtypes,
@@ -648,6 +723,7 @@ class ArtefactManager:
 
         return_artefact = new_artefact.copy()
         return_artefact["physical_data"] = physical_data
+        return_artefact["content"] = content
 
         if "physical_data" in new_artefact:
             new_artefact.pop("physical_data", None)
@@ -661,8 +737,7 @@ class ArtefactManager:
                 physical_data=physical_data, physical_path=physical_path,
                 logical_content=logical_content
             )
-        return return_artefact
-    
+        return return_artefact 
     
     def get(self, title: Optional[str] = None, version: Optional[int] = None, physical_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if title is not None and physical_path is not None:
@@ -1665,7 +1740,10 @@ class ArtefactManager:
                 if item.get("type") == ArtefactType.DATA:
                     content_text = self._get_lam_content(item).strip()
                 else:
-                    content_text = (item.get("content") or "").strip()
+                    if item.get("content_source") == "disk":
+                        content_text = self._read_content_from_disk(item).strip()
+                    else:
+                        content_text = (item.get("content") or "").strip()
 
                 if not content_text:
                     continue
@@ -1718,7 +1796,7 @@ class ArtefactManager:
             context_parts.append("\n## Fully Loaded File Contents [C]\n" + "\n\n---\n\n".join(full_visible_parts))
 
         return "\n\n".join(context_parts)
-
+    
     def get_context_images(self) -> List[Dict[str, Any]]:
         result: List[Dict[str, Any]] = []
         raw_list = self._get_all_raw()

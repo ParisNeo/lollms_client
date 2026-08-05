@@ -2430,7 +2430,6 @@ class ChatMixin:
         tools=None,
         add_user_message: bool = True,
         images=None,
-        debug: bool = False,
         remove_thinking_blocks: bool = True,
         enable_image_generation: bool = True,
         enable_image_editing:    bool = True,
@@ -2458,6 +2457,8 @@ class ChatMixin:
         enable_code_execution:        bool = False,
         suppress_images:              bool = False,
         debug_export:                 bool = False,
+        debug:                        bool = False,
+        enable_vlm_query:             bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -2719,6 +2720,45 @@ class ChatMixin:
                         active_tools[t_name] = t_spec
             except Exception as ex:
                 trace_exception(ex)
+
+        if debug and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            lcp_binding.mount_tool_library("debug_toolset")
+            try:
+                lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                for t_name, t_spec in lcp_tools.items():
+                    if t_name == "tool_dump_context":
+                        active_tools[t_name] = t_spec
+            except Exception as ex:
+                trace_exception(ex)
+
+        # 5. Mount VLM Query Tool (Conditional Fallback)
+        if enable_vlm_query and lcp_binding and hasattr(lcp_binding, "mount_tool_library"):
+            def _active_llm_has_vision() -> bool:
+                active_llm = getattr(self.lollmsClient, "llm", None)
+                if not active_llm:
+                    return False
+                if getattr(active_llm, "vision_enabled", False):
+                    return True
+                if hasattr(active_llm, "child_bindings"):
+                    for child in active_llm.child_bindings.values():
+                        if getattr(child, "vision_enabled", False):
+                            return True
+                return False
+
+            if not _active_llm_has_vision():
+                has_vlm_fallback = any(
+                    getattr(b, "vision_enabled", False) 
+                    for b in getattr(self.lollmsClient, "llms", {}).values()
+                )
+                if has_vlm_fallback:
+                    lcp_binding.mount_tool_library("vlm_query")
+                    try:
+                        lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=self, lollms_client_instance=self.lollmsClient)
+                        for t_name, t_spec in lcp_tools.items():
+                            if t_name == "tool_vlm_query":
+                                active_tools[t_name] = t_spec
+                    except Exception as ex:
+                        trace_exception(ex)
 
         # Optionally merge spinoff agents as dynamic local tools
         if enable_sub_agents:

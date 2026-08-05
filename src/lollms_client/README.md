@@ -407,3 +407,44 @@ The client also provides quick wrappers for common tasks:
 *   `client.extract_keywords(text, num_keywords=5)`: Returns a list of keywords.
 *   `client.mount_tti(alias)` / `client.mount_llm(alias)`: Switches the active binding for a modality among mounted aliases.
 *   `client.list_models()`: Aggregates model lists across all active bindings (LLM, TTI, TTS, STT).
+
+---
+
+## 9. Smart Routing & VLM Collaboration
+
+The library supports advanced multi-model routing via the `smart_router` binding and stateful VLM collaboration via the `vlm_query` LCP tool.
+
+### The Smart Router Binding (`smart_router`)
+
+The `LollmsSmartBinding` (located at `llm_bindings/smart_router/`) is a meta-binding that routes generation requests to child bindings. It evaluates prompts using:
+1.  **TF-IDF Similarity**: Matches the prompt against the `description` in each model's `routing_profile`.
+2.  **Complexity Heuristics**: Classifies prompt complexity (1-3) based on keywords and length.
+3.  **Weighted Constraints**: Balances subject match and complexity against `cost_per_1k_tokens` and `avg_latency_ms`.
+
+**Configuration Example**:
+```python
+client = LollmsClient(
+    llm_binding_name="smart_router",
+    llm_binding_config={
+        "routing_strategy": "balanced",
+        "model_profiles": {
+            "model_a": {
+                "binding_name": "ollama",
+                "binding_config": {"model_name": "llama3"},
+                "routing_profile": {"description": "general tasks", "complexity_tier": 1}
+            }
+        }
+    }
+)
+```
+
+### VLM as a Tool (`vlm_query`)
+
+Because bindings are stateless, VLM+LLM collaboration is handled by a dynamic LCP tool (`tools_bindings/lcp/default_tools/vlm_query/`). 
+
+The `LollmsDiscussion` chat loop conditionally mounts the `vlm_query` tool **only if all of the following are true**:
+1.  The host application/user explicitly passes `enable_vlm_query=True` to `chat()`.
+2.  The active binding (`lc.llm`) does **not** natively support vision (checked via `vision_enabled`, including `SmartRouter` children).
+3.  There is at least one other instantiated binding in `lc.llms` that **does** support vision, providing a valid backend for the tool to delegate to.
+
+When mounted, the LLM can call `tool_vlm_query(image_index, query)` to ask the secondary VLM specific questions about images on-demand. This architecture prevents wasted compute when the primary model is already a VLM, while providing a seamless fallback for text-only models.

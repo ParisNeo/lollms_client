@@ -1007,6 +1007,36 @@ my_agent_skills/
 
 ---
 
+## 📦 Optional Artefact System & Versioning Control
+
+The Agent supports an opt-in **Artefact System** that replaces the default flat workspace text dump with the sophisticated multi-tier visibility model from `lollms_artefact`. When enabled, the system prompt is generated using `build_artefacts_context_zone()`, which provides a directory tree index with markers (`[C]`, `[M]`, `[U]`, `[L]`) instead of injecting all file contents verbatim.
+
+### Enabling the Artefact System
+
+```python
+agent = Agent(
+    lc=client,
+    personality=personality,
+    workspace_path="./my_workspace",
+    enable_artefact_system=True,          # Replaces flat dump with ArtefactManager context zone
+    disable_artefact_versioning=True,     # Overwrite files in-place (Git-style) instead of versioning
+)
+```
+
+### Disabling Artefact Versioning
+
+By default, the `ArtefactManager` creates a new version entry in the database every time a file is updated. For long-running autonomous agents operating on deep folders, this can bloat the database and degrade performance.
+
+When `disable_artefact_versioning=True` is set:
+- The `ArtefactManager.add()` method detects the flag on the discussion proxy and **overwrites the existing version in-place**.
+- No new database rows are created.
+- The version counter remains at `1`.
+- The artefact record is flagged with `content_source: "disk"`, and the `content` field is **cleared from the DB metadata** to prevent memory duplication.
+- `build_artefacts_context_zone()` detects this flag and reads content directly from the physical file via a `_read_content_from_disk()` helper.
+- This transforms the DB into a lightweight relational index while the filesystem becomes the single source of truth for content.
+- This is ideal for agentic workflows where Git (or the host application) handles versioning externally.
+
+---
 ## 🧩 Data Structures & Constants
 
 ### `AgentRole`
@@ -1063,7 +1093,9 @@ Controls what the agent is allowed to do. All dangerous capabilities default to 
 | `skills_mode` | `"loadable"` | `"always_visible"`, `"loadable"`, or `"mixed"` |
 | `max_sub_agent_depth` | `3` | Max recursion depth for sub-agents |
 | `max_sub_agents_per_turn` | `5` | Max sub-agents spawned per turn |
-| `enable_workspace_tools` | `True` | Built-in file tools (always safe) |
+| `enable_workspace_tools` | `True` | Built-in file tools: `tool_write_file`, `tool_read_file`, `tool_list_files`, `tool_search_files` |
+| `enable_artefact_system` | `False` | Opt-in to the `ArtefactManager` context zone (replaces flat workspace dump) |
+| `disable_artefact_versioning` | `False` | If `True`, updates overwrite the current version in-place (Git-style) instead of creating new DB rows |
 
 ---
 

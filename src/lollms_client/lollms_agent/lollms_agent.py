@@ -1379,7 +1379,6 @@ _BINARY_EXTS = {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet", ".png
 
 
 def _build_workspace_context(workspace_path: Path, max_file_size: int = 12000, max_total_chars: int = 30000) -> str:
-    """Lists all files in the workspace and includes content for small text files."""
     if not workspace_path or not workspace_path.exists():
         return ""
 
@@ -1436,7 +1435,6 @@ def _build_workspace_context(workspace_path: Path, max_file_size: int = 12000, m
 
     lines.append("=== END WORKSPACE FILES ===")
     return "\n".join(lines)
-
 
 # ===========================================================================
 # Helper: Message normalization for OpenAI API compliance
@@ -1551,6 +1549,59 @@ def _tool_read_file(file_name: str) -> dict:
         return {"success": False, "error": f"Failed to read file '{file_name}': {e}"}
 
 
+def _tool_search_files(pattern: str, file_extension: str = "", max_results: int = 50, case_sensitive: bool = False) -> dict:
+    """
+    Search for a regex pattern across files in the workspace.
+    Useful for exploring hidden files or finding specific content without loading full files into context.
+
+    Args:
+        pattern (str): The regular expression pattern to search for.
+        file_extension (str, optional): Filter to specific extensions (e.g., '.py'). Empty = all text files.
+        max_results (int): Max matching lines to return. Defaults to 50.
+        case_sensitive (bool): Whether the search is case-sensitive. Defaults to False.
+    """
+    try:
+        import re as _re
+        cwd = Path.cwd()
+        flags = 0 if case_sensitive else _re.IGNORECASE
+        regex = _re.compile(pattern, flags)
+
+        results = []
+        files_scanned = 0
+        binary_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".pdf", ".docx", ".xlsx", ".db", ".sqlite", ".zip"}
+
+        for f_path in cwd.rglob("*"):
+            if not f_path.is_file():
+                continue
+            if file_extension and not f_path.name.lower().endswith(file_extension.lower()):
+                continue
+            if f_path.suffix.lower() in binary_exts or f_path.suffix.lower() in _IGNORED_WS_EXTS:
+                continue
+            rel_parts = f_path.relative_to(cwd).parts
+            if any(part in _IGNORED_WS_DIRS for part in rel_parts):
+                continue
+
+            files_scanned += 1
+            try:
+                with open(f_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line_num, line in enumerate(f, 1):
+                        if regex.search(line):
+                            results.append({"file": str(f_path.relative_to(cwd)), "line": line_num, "text": line.strip()[:500]})
+                            if len(results) >= max_results:
+                                break
+            except Exception:
+                pass
+            if len(results) >= max_results:
+                break
+
+        output = f"Found {len(results)} match(es) in {files_scanned} file(s).\n\n"
+        for r in results:
+            output += f"[{r['file']}:{r['line']}] {r['text']}\n"
+
+        return {"success": True, "output": output, "matches": len(results)}
+    except Exception as e:
+        return {"success": False, "error": f"Search failed: {e}"}
+
 def _tool_list_files() -> dict:
     """
     List all files in the workspace directory recursively.
@@ -1570,10 +1621,22 @@ def _tool_list_files() -> dict:
         return {"success": False, "error": f"Failed to list files: {e}"}
 
 
-def _get_builtin_workspace_tools() -> Dict[str, Dict[str, Any]]:
-    """Returns the built-in workspace tool specs in the active_tools format."""
-    return {
-        "tool_write_file": {
+def _get_builtin_workspace_tools(include_file_io: bool = True) -> Dict[str, Dict[str, Any]]:
+    tools = {
+        "tool_search_files": {
+            "name": "tool_search_files",
+            "description": "Search for a regex pattern across files in the workspace. Use this to explore hidden files or find specific content without loading full files.",
+            "parameters": [
+                {"name": "pattern", "type": "str", "description": "The regular expression pattern to search for."},
+                {"name": "file_extension", "type": "str", "description": "Filter to specific extensions (e.g. '.py'). Empty = all text files.", "optional": True},
+                {"name": "max_results", "type": "int", "description": "Max matching lines to return (default 50).", "optional": True},
+                {"name": "case_sensitive", "type": "bool", "description": "Whether the search is case-sensitive (default False).", "optional": True}
+            ],
+            "callable": _tool_search_files
+        }
+    }
+    if include_file_io:
+        tools["tool_write_file"] = {
             "name": "tool_write_file",
             "description": "Write text content to a file in the workspace. Use this to create or overwrite files.",
             "parameters": [
@@ -1581,22 +1644,22 @@ def _get_builtin_workspace_tools() -> Dict[str, Dict[str, Any]]:
                 {"name": "content", "type": "str", "description": "The text content to write to the file."}
             ],
             "callable": _tool_write_file
-        },
-        "tool_read_file": {
+        }
+        tools["tool_read_file"] = {
             "name": "tool_read_file",
             "description": "Read the content of a text file from the workspace.",
             "parameters": [
                 {"name": "file_name", "type": "str", "description": "Name or relative path of the file to read."}
             ],
             "callable": _tool_read_file
-        },
-        "tool_list_files": {
+        }
+        tools["tool_list_files"] = {
             "name": "tool_list_files",
             "description": "List all files in the workspace directory recursively with their sizes.",
             "parameters": [],
             "callable": _tool_list_files
         }
-    }
+    return tools
 
 
 # ===========================================================================
@@ -1879,10 +1942,24 @@ class _AgentStreamState:
                 raw_data = None
 
         if isinstance(raw_data, dict):
-            tool_name = raw_data.get("name", "")
+            # CRITICAL FIX: Normalize flat structures where the tool name is incorrectly
+            # nested inside the parameters dict (e.g., {"name": "", "parameters": {"tool_name": "tool_write_file", ...}})
             if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                # Check if the 'name' field is missing or empty, but the parameters contain a tool name key
+                if not raw_data.get("name"):
+                    params_dict = raw_data["parameters"]
+                    # Look for common keys like "tool_name" or "name" inside parameters
+                    nested_name = params_dict.get("tool_name") or params_dict.get("name")
+                    if nested_name:
+                        # Remove the nested name key from parameters to clean them
+                        params_cleaned = {k: v for k, v in params_dict.items() if k not in ("tool_name", "name")}
+                        normalized = {"name": nested_name, "parameters": params_cleaned}
+                        self.tool_json_data = json.dumps(normalized)
+                        return
                 self.tool_json_data = json_body
             else:
+                # Flat structure: {"name": "tool_x", "param1": "val1"}
+                tool_name = raw_data.get("name", "")
                 params = {k: v for k, v in raw_data.items() if k != "name"}
                 normalized = {"name": tool_name, "parameters": params}
                 self.tool_json_data = json.dumps(normalized)
@@ -1957,13 +2034,22 @@ class _AgentStreamState:
                         raw_data = None
 
                 if isinstance(raw_data, dict):
-                    tool_name = raw_data.get("name", "")
-                    if "parameters" not in raw_data or not isinstance(raw_data.get("parameters"), dict):
+                    # CRITICAL FIX: Normalize flat structures (duplicate logic from _try_complete_tool)
+                    if "parameters" in raw_data and isinstance(raw_data["parameters"], dict):
+                        if not raw_data.get("name"):
+                            params_dict = raw_data["parameters"]
+                            nested_name = params_dict.get("tool_name") or params_dict.get("name")
+                            if nested_name:
+                                params_cleaned = {k: v for k, v in params_dict.items() if k not in ("tool_name", "name")}
+                                normalized = {"name": nested_name, "parameters": params_cleaned}
+                                self.tool_json_data = json.dumps(normalized)
+                                return
+                        self.tool_json_data = json_body
+                    else:
+                        tool_name = raw_data.get("name", "")
                         params = {k: v for k, v in raw_data.items() if k != "name"}
                         normalized = {"name": tool_name, "parameters": params}
                         self.tool_json_data = json.dumps(normalized)
-                    else:
-                        self.tool_json_data = json_body
                 else:
                     self.tool_json_data = json_body
 
@@ -2089,6 +2175,9 @@ class Agent:
     metadata:            Dict[str, Any] = field(default_factory=dict)
     memory_manager:      Optional[Any] = None
     _parent_depth:       int = field(default=0, repr=False)
+    
+    enable_artefact_system: bool = False
+    disable_artefact_versioning: bool = False    
 
     _agent_id: str = field(default_factory=lambda: str(uuid.uuid4()), init=False)
     _cancel_flag: bool = field(default=False, init=False)
@@ -2098,51 +2187,42 @@ class Agent:
     _sub_agent_spawner: Optional[SubAgentSpawner] = field(default=None, init=False)
     _model_switcher: Optional[ModelSwitcher] = field(default=None, init=False)
     _handbag: Any = field(default=None, init=False)
-
+    _artefact_manager: Any = field(default=None, init=False)
+    _artefact_unlocked_files: List[str] = field(default_factory=list, init=False)
+    _artefact_db_discussion: Any = field(default=None, init=False)
     # ---------------------------------------------------------------- init
 
     def __post_init__(self):
-        # ── Handbag Loading ──
-        # A handbag is a folder containing all agent resources (personalities, tools,
-        # skills, RAG, memory). If handbag_path is provided, its values are used as
-        # DEFAULTS. Explicit constructor parameters always take precedence.
         if self.handbag_path:
             from lollms_client.lollms_agent.handbag import Handbag
             handbag = Handbag(self.handbag_path)
             object.__setattr__(self, '_handbag', handbag)
 
-            # Personality: use handbag default if not explicitly provided
             if self.personality is None:
                 hb_personality = handbag.get_default_personality()
                 if hb_personality is not None:
                     handbag.attach_rag_to_personality(hb_personality)
                     object.__setattr__(self, 'personality', hb_personality)
 
-            # Workspace: use handbag workspace if not explicitly provided
             if self.workspace_path is None:
                 hb_ws = handbag.get_workspace_path()
                 if hb_ws:
                     object.__setattr__(self, 'workspace_path', hb_ws)
 
-            # Tool files: append handbag tools to any explicitly provided ones
             hb_tool_files = handbag.get_tool_files()
             if hb_tool_files:
                 existing_tools = self.tool_files or []
                 object.__setattr__(self, 'tool_files', list(existing_tools) + hb_tool_files)
 
-            # Skills dirs: append handbag skills dir to any explicitly provided ones
             hb_skills_dirs = handbag.get_skills_dirs()
             if hb_skills_dirs:
                 existing_dirs = self.skills_dirs or []
                 object.__setattr__(self, 'skills_dirs', list(existing_dirs) + hb_skills_dirs)
 
-            # Skills mode from manifest (if not explicitly set via capabilities)
             hb_skills_mode = handbag.get_skills_mode()
             if hb_skills_mode and self.capabilities.skills_mode == "loadable":
-                # Only override if the user hasn't explicitly changed the default
                 self.capabilities.skills_mode = hb_skills_mode
 
-            # Memory manager: create from handbag if not explicitly provided
             if self.memory_manager is None:
                 hb_mem = handbag.create_memory_manager()
                 if hb_mem is not None:
@@ -2150,7 +2230,6 @@ class Agent:
         else:
             object.__setattr__(self, '_handbag', None)
 
-        # Validate that we have a personality (from explicit param or handbag)
         if self.personality is None:
             raise ValueError(
                 "Agent requires a personality. Either:\n"
@@ -2158,7 +2237,6 @@ class Agent:
                 "  2. Provide 'handbag_path' pointing to a folder with a 'personalities/' subdirectory."
             )
 
-        # Resolve workspace path
         if self.workspace_path:
             ws = Path(self.workspace_path)
             ws.mkdir(parents=True, exist_ok=True)
@@ -2166,13 +2244,11 @@ class Agent:
         else:
             object.__setattr__(self, '_resolved_workspace', None)
 
-        # Initialize failure memory
         if FailureMemory is not None:
             object.__setattr__(self, '_failure_memory', FailureMemory())
         else:
             object.__setattr__(self, '_failure_memory', SimpleNamespace(failures=[], _signatures=set()))
 
-        # Initialize skills manager if not provided
         if self.skills_manager is None:
             object.__setattr__(self, 'skills_manager', SkillsManager(
                 skills_dirs=self.skills_dirs,
@@ -2180,7 +2256,6 @@ class Agent:
                 mode=self.capabilities.skills_mode,
             ))
 
-        # Initialize sub-agent spawner
         object.__setattr__(self, '_sub_agent_spawner', SubAgentSpawner(
             parent_agent=self,
             max_depth=self.capabilities.max_sub_agent_depth,
@@ -2188,9 +2263,66 @@ class Agent:
         ))
         self._sub_agent_spawner.set_depth(self._parent_depth)
 
-        # Initialize model switcher
         object.__setattr__(self, '_model_switcher', ModelSwitcher(self.lc))
 
+        if self.enable_artefact_system and self._resolved_workspace:
+            self._init_artefact_system()
+            
+    # ---------------------------------------------------------------- artefact system       
+    def _init_artefact_system(self):
+        try:
+            from lollms_client.lollms_artefact import ArtefactManager, ArtefactVisibility
+            from types import SimpleNamespace
+            import uuid as _uuid
+
+            ws_path = self._resolved_workspace
+
+            proxy = SimpleNamespace(
+                id=f"agent_{self._agent_id[:8]}",
+                workspace_path=str(ws_path),
+                workspace_data_path=str(ws_path),
+                artefacts_metadata_path=str(ws_path / "artefacts_metadata"),
+                lollmsClient=self.lc,
+                metadata={},
+                _is_db_backed=False,
+                commit=lambda: None,
+                disable_artefact_versioning=self.disable_artefact_versioning
+            )
+
+            class _VersionlessArtefactManager(ArtefactManager):
+                pass
+
+            object.__setattr__(self, '_artefact_db_discussion', proxy)
+            am = _VersionlessArtefactManager(proxy)
+            object.__setattr__(self, '_artefact_manager', am)
+
+            if ws_path.exists():
+                for f_path in sorted(ws_path.rglob("*")):
+                    if f_path.is_file():
+                        rel_parts = f_path.relative_to(ws_path).parts
+                        if any(part in _IGNORED_WS_DIRS for part in rel_parts):
+                            continue
+                        if f_path.suffix.lower() in _IGNORED_WS_EXTS:
+                            continue
+                        file_name = f_path.name
+                        try:
+                            content = f_path.read_text(encoding="utf-8", errors="ignore")
+                            am.add(
+                                title=file_name,
+                                artefact_type="code" if f_path.suffix.lower() in _TEXT_EXTS else "document",
+                                content=content,
+                                active=False,
+                                visibility=ArtefactVisibility.TREE_UNLOCKABLE
+                            )
+                        except Exception:
+                            pass
+            ASCIIColors.success(f"[Agent] Artefact system initialized for workspace: {ws_path}")
+        except Exception as e:
+            ASCIIColors.warning(f"[Agent] Failed to initialise artefact system: {e}")
+            object.__setattr__(self, '_artefact_manager', None)
+            object.__setattr__(self, '_artefact_db_discussion', None)    
+            
+                
     # ---------------------------------------------------------------- derived
 
     @property
@@ -2380,8 +2512,11 @@ class Agent:
         active_tools = {}
 
         # 1. Built-in workspace tools
+        # If the artefact system is enabled, we suppress file I/O tools to force the LLM
+        # to use <artifact> tags for file creation and updates. We retain tool_search_files.
         if self._resolved_workspace and self.capabilities.enable_workspace_tools:
-            active_tools.update(_get_builtin_workspace_tools())
+            include_file_io = not self.enable_artefact_system
+            active_tools.update(_get_builtin_workspace_tools(include_file_io=include_file_io))
 
         # 2. Binding tools (TTI, TTS, STT, TTM, TTV)
         binding_tools = BindingToolsBuilder.build_tools(self.lc, self.capabilities, self._resolved_workspace)
@@ -2640,6 +2775,37 @@ class Agent:
 
     # ---------------------------------------------------------------- prompt builders
 
+    def _build_artefact_instructions(self) -> str:
+        """Builds system prompt instructions for the <artifact> tag system."""
+        if not self.enable_artefact_system:
+            return ""
+        return (
+            "\n=== ARTEFACT SYSTEM (FILE CREATION & UPDATES) ===\n"
+            "You have access to an integrated Artefact System for managing files in your workspace.\n"
+            "Instead of using file-writing tools, you MUST use XML tags to create or update files.\n\n"
+            "1. **CREATING A NEW FILE**: To create a new file, emit an `<artifact>` tag with the file name, type, and content.\n"
+            "   The system will automatically save the file to your workspace and make it available for execution.\n"
+            "   Example:\n"
+            "   <artifact name=\"script.py\" type=\"code\" language=\"python\">\n"
+            "   print('Hello World')\n"
+            "   </artifact>\n\n"
+            "2. **UPDATING AN EXISTING FILE**: To modify an existing file, use the SEARCH/REPLACE block format inside an `<artifact>` tag.\n"
+            "   The `name` must match an existing file in your workspace.\n"
+            "   Example:\n"
+            "   <artifact name=\"script.py\" type=\"code\" language=\"python\">\n"
+            "   <<<<<<< SEARCH\n"
+            "   print('Hello World')\n"
+            "   =======\n"
+            "   print('Hello Updated World')\n"
+            "   >>>>>>> REPLACE\n"
+            "   </artifact>\n\n"
+            "3. **TYPES**: Supported types include `code`, `document`, `data`, `presentation`, `note`, `skill`, and `tool`.\n"
+            "   Always specify the `language` attribute for code files (e.g., `python`, `javascript`, `html`).\n\n"
+            "4. **AVOID TOOLS FOR FILES**: Do NOT use `tool_write_file` or `tool_read_file` if the Artefact System is active.\n"
+            "   The system parses your `<artifact>` tags in real-time and materializes the files on disk immediately.\n"
+            "=== END ARTEFACT SYSTEM ===\n"
+        )
+
     def _build_tool_descriptions(self, active_tools: Dict[str, Dict[str, Any]]) -> str:
         if not active_tools:
             return ""
@@ -2710,28 +2876,33 @@ class Agent:
             "Use `tool_list_models` to see available models, then `tool_switch_model` to switch.\n"
             "This is useful when a task requires a model with different strengths.\n"
             "\n=== THINKING & REASONING CONSTRAINT ===\n"
-            "If you output thoughts enclosed in <think> tags, you MUST output all functional XML tags AFTER the closing tag.\n"
+            "If you output thoughts enclosed in  tags, you MUST output all functional XML tags AFTER the closing tag.\n"
             "\n=== ANTI-MIMICRY PROTOCOL (CRITICAL) ===\n"
             "1. **NEVER OUTPUT SYSTEM MARKERS**: You are STRICTLY FORBIDDEN from generating `<processing>` blocks or `[SYSTEM:` markers.\n"
             "2. **USE REAL TAGS**: To call tools, use the actual `<tool>` XML tags.\n"
         )
 
-        # Workspace context
         workspace_ctx = ""
-        if self._resolved_workspace:
+        if self._artefact_manager:
+            try:
+                zone = self._artefact_manager.build_artefacts_context_zone()
+                if zone:
+                    workspace_ctx = "\n" + zone
+            except Exception:
+                pass
+        elif self._resolved_workspace:
             workspace_ctx = "\n" + _build_workspace_context(self._resolved_workspace)
 
-        # Skills context
+        artefact_instructions = self._build_artefact_instructions()
+
         skills_ctx = ""
         if self.skills_manager:
             skills_ctx_str = self.skills_manager.build_context()
             if skills_ctx_str:
                 skills_ctx = "\n" + skills_ctx_str
 
-        # Tool descriptions
         tool_desc = "\n" + self._build_tool_descriptions(active_tools) if active_tools else ""
 
-        # Memory context
         mem_ctx = ""
         if self.memory_manager:
             try:
@@ -2743,11 +2914,9 @@ class Agent:
             except Exception:
                 pass
 
-        # Capability summary
         caps_summary = f"\n=== CAPABILITIES ===\n{json.dumps(self.capabilities.to_dict(), indent=2)}\n=== END CAPABILITIES ==="
 
-        return sys_prompt + "\n" + rules + workspace_ctx + skills_ctx + tool_desc + mem_ctx + caps_summary
-
+        return sys_prompt + "\n" + rules + artefact_instructions + workspace_ctx + skills_ctx + tool_desc + mem_ctx + caps_summary
     # ---------------------------------------------------------------- tool execution
 
     def _execute_tool(self, tool_name: str, tool_params: Dict[str, Any], active_tools: Dict) -> Dict[str, Any]:
@@ -2838,6 +3007,7 @@ class Agent:
         enable_memory: bool = True,
         remove_thinking_blocks: bool = True,
         use_internal_history: bool = True,
+        debug: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -2928,8 +3098,35 @@ class Agent:
             except Exception as ex:
                 trace_exception(ex)
 
+        explicit_debug_tools = {}
+        if debug:
+            lcp_binding = getattr(self.lc, 'tools', None)
+            if lcp_binding is None:
+                try:
+                    from lollms_client.tools_bindings.lcp import LCPBinding
+                    default_tools = Path(__file__).parent.parent / "tools_bindings" / "lcp" / "default_tools"
+                    lcp_binding = LCPBinding(
+                        tools_folders=[str(default_tools)] if default_tools.exists() else []
+                    )
+                    object.__setattr__(self.lc, 'tools', lcp_binding)
+                except Exception as ex:
+                    trace_exception(ex)
+                    lcp_binding = None
+
+            if lcp_binding and hasattr(lcp_binding, 'mount_tool_library'):
+                lcp_binding.mount_tool_library("debug_toolset")
+                try:
+                    lcp_tools = lcp_binding.to_chat_tool_specs(discussion_instance=None, lollms_client_instance=self.lc)
+                    for t_name, t_spec in lcp_tools.items():
+                        if t_name == "tool_dump_context":
+                            explicit_debug_tools[t_name] = t_spec
+                except Exception as ex:
+                    trace_exception(ex)
+
+        merged_explicit_tools = {**(tools or {}), **explicit_debug_tools}
+
         # Discover tools
-        active_tools = self._discover_tools(tools, tool_files or self.tool_files, code_exec)
+        active_tools = self._discover_tools(merged_explicit_tools if merged_explicit_tools else None, tool_files or self.tool_files, code_exec)
 
         # Build system prompt
         full_system_prompt = self._build_system_prompt(active_tools, code_exec)

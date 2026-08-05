@@ -2,8 +2,9 @@
 """
 minimal_agent_example.py
 ========================
-Demonstrates how to create an autonomous agent with a minimal, zero-dependency toolset.
-The agent can read, write, and execute Python code in an isolated workspace.
+Demonstrates how to create an autonomous agent with the built-in artefact system.
+The agent can read, write, search, and execute Python code in an isolated workspace
+using the integrated ArtefactManager for context-optimized file management.
 """
 
 import sys
@@ -63,7 +64,7 @@ def streaming_callback(chunk: str, msg_type: MSG_TYPE, meta: dict = None) -> boo
 
 def main():
     ASCIIColors.panel(
-        "[bold]Minimal Agent — Zero-Dependency Toolset Demo[/bold]",
+        "[bold]Minimal Agent — Built-in Artefact System Demo[/bold]",
         title="[bold green]📦 Minimal Agent[/bold green]",
         border_style="green"
     )
@@ -77,19 +78,18 @@ def main():
 
     workspace = Path("./minimal_agent_workspace").resolve()
     workspace.mkdir(parents=True, exist_ok=True)
-    
-    minimal_tool_path = PROJECT_ROOT / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools" / "minimal_agent_toolset" / "minimal_agent_toolset.py"
 
     personality = LollmsPersonality(
         name="MinimalAgent",
         author="lollms-client",
         category="general",
-        description="A minimalist autonomous agent that writes and executes Python scripts.",
+        description="A minimalist autonomous agent that writes, searches, and executes Python scripts.",
         system_prompt=(
             "You are a Minimal Autonomous Agent.\n"
-            "You have three tools: tool_read_file, tool_write_file, and tool_execute_python.\n"
+            "You have access to built-in workspace tools: tool_write_file, tool_read_file, tool_list_files, tool_search_files, and tool_execute_python_code.\n"
             "When asked to perform a task, write a Python script to accomplish it, "
             "execute the script, read the output, and report the results.\n"
+            "If you need to find specific content across files, use tool_search_files with a regex pattern.\n"
             "Always emit <done/> when your task is complete."
         ),
     )
@@ -110,13 +110,15 @@ def main():
         role=AgentRole.IMPLEMENTER,
         workspace_path=str(workspace),
         capabilities=caps,
-        tool_files=[str(minimal_tool_path)],
+        enable_artefact_system=True,
+        disable_artefact_versioning=True,
         max_tokens_per_turn=4096,
     )
 
     prompt = (
         "Write a Python script named 'fibonacci.py' that calculates the first 10 numbers of the Fibonacci sequence, "
-        "prints them to the console, and then executes the script."
+        "prints them to the console, and then executes the script. "
+        "After execution, use tool_search_files to search for the word 'fibonacci' in the workspace to verify the file was created."
     )
 
     ASCIIColors.panel(f"[cyan]{prompt}[/cyan]", title="[bold]📝 Task[/bold]", border_style="cyan")
@@ -128,7 +130,7 @@ def main():
         max_reasoning_steps=15,
         temperature=0.2,
     )
-
+    print()
     ASCIIColors.rule("[bold cyan]📊 EXECUTION METRICS[/bold cyan]")
     
     metrics_rows = [
@@ -158,7 +160,8 @@ def main():
         ASCIIColors.rich_print(tools_table)
 
     ASCIIColors.rule("[bold cyan]📝 FINAL RESPONSE[/bold cyan]")
-    ASCIIColors.panel(result["response"], title="[bold cyan]Agent Response[/bold cyan]", border_style="cyan")
+    ASCIIColors.rich_print("[bold cyan]Agent Response[/bold cyan]")
+    ASCIIColors.rich_print(result["response"])
 
 if __name__ == "__main__":
     main()

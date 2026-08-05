@@ -42,6 +42,10 @@ All notable changes to this project will be documented in this file.
 
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
+## [2026-08-04 16:15]
+
+- feat(agent): integrate artefact system with agent and discussion modules
+
 ## [2026-08-03 16:35]
 
 - refactor(agent): remove config_wizard and update lollms_agent examples

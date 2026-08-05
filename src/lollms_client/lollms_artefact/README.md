@@ -108,6 +108,34 @@ art = discussion.artefacts.update(
 )
 ```
 
+### Disabling Versioning Globally (Git-Style Mode)
+
+For autonomous agent workflows operating on deep folders where version control is handled externally (e.g., via Git), you can disable versioning entirely. Set the `disable_artefact_versioning` attribute on the discussion object (or proxy) to `True`. When this flag is active, the `add()` method will **overwrite the existing version in-place** instead of appending a new row and deactivating the old ones. The version number will remain at `1`.
+
+```python
+# On a LollmsDiscussion instance:
+discussion.disable_artefact_versioning = True
+
+# Or on an Agent's internal proxy:
+agent = Agent(
+    lc=client,
+    personality=personality,
+    workspace_path="./workspace",
+    enable_artefact_system=True,
+    disable_artefact_versioning=True
+)
+```
+
+### The Disk-Source Strategy (Non-Versioned Mode)
+
+When `disable_artefact_versioning=True` is active, the `ArtefactManager` employs a **Disk-Source Strategy** to prevent memory duplication and bloat:
+
+1. **Lightweight DB Index**: The `add()` method sets `content_source: "disk"` on the artefact record and **stops storing content in the DB metadata** (`art["content"] = ""`).
+2. **Filesystem as Source of Truth**: The physical file on disk becomes the single source of truth for the artefact's content.
+3. **On-the-Fly Hydration**: When `build_artefacts_context_zone()` is called, it detects the `content_source: "disk"` flag and reads content directly from the physical file via a `_read_content_from_disk()` helper.
+
+This architecture transforms the database into a lightweight relational index (tracking visibility, status, and physical paths) while delegating blob storage entirely to the filesystem, significantly reducing memory usage for long-running autonomous agents.
+
 ### The Content-First Update Doctrine (DATA Artifacts)
 When updating a `DATA` artifact (like a CSV or Excel file) where the raw bytes (`physical_data`) are not explicitly provided in the function call, the `ArtefactManager` enforces a strict **Content-First Update Doctrine**:
 1. If the new string content differs from the logical schema, the manager assumes the raw data itself is being updated. It encodes the new string to UTF-8 bytes and writes it as the new physical twin.
